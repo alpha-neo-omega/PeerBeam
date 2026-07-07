@@ -6,6 +6,8 @@
 //! never on a runtime, never on a frontend. Use-cases are written against
 //! the registry, so they are unit-testable with mock providers.
 
+pub mod discovery;
 pub mod registry;
 
+pub use discovery::{merge_discovery, DiscoveryRegistry};
 pub use registry::ProviderRegistry;

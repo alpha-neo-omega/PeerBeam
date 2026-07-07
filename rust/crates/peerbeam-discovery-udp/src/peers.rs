@@ -12,8 +12,6 @@ use peerbeam_domain::entity::Device;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::DiscoveryEvent;
 
-use crate::proto::same_identity;
-
 struct Entry {
     device: Device,
     last_seen: Instant,
@@ -49,7 +47,7 @@ impl PeerTable {
                 Some(DiscoveryEvent::Found(device))
             }
             Some(entry) => {
-                let changed = !same_identity(&entry.device, &device);
+                let changed = !entry.device.same_identity(&device);
                 entry.device = device.clone();
                 entry.last_seen = now;
                 changed.then_some(DiscoveryEvent::Updated(device))

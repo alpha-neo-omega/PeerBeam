@@ -1,11 +1,14 @@
 //! The engine handle exposed to frontends.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use peerbeam_app::ProviderRegistry;
+use futures::StreamExt;
+use peerbeam_app::{merge_discovery, ProviderRegistry};
 use peerbeam_config::EngineConfig;
+use peerbeam_domain::entity::Device;
 use peerbeam_domain::event::DomainEvent;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::error::EngineError;
 
@@ -23,6 +26,8 @@ pub struct Engine {
     config: Arc<EngineConfig>,
     registry: Arc<ProviderRegistry>,
     events: broadcast::Sender<DomainEvent>,
+    /// Handle to the running discovery-merge task, if discovery is active.
+    discovery_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Engine {
@@ -45,6 +50,7 @@ impl Engine {
             config: Arc::new(config),
             registry: Arc::new(registry),
             events,
+            discovery_task: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -71,5 +77,47 @@ impl Engine {
     /// listening). Use-cases call this as work progresses.
     pub fn publish(&self, event: DomainEvent) -> usize {
         self.events.send(event).unwrap_or(0)
+    }
+
+    /// Start discovery across every registered [`DiscoveryProvider`].
+    ///
+    /// Advertises `me` and begins scanning on each provider, then merges all
+    /// their event streams into one deduplicated stream (see
+    /// [`peerbeam_app::merge_discovery`]) and republishes the result on the
+    /// engine event channel. Idempotent: calling it while discovery is
+    /// already running restarts the merge task.
+    pub async fn start_discovery(&self, me: Device) -> Result<(), EngineError> {
+        let providers = self.registry.discovery();
+        for provider in providers {
+            provider.advertise(&me).await?;
+            provider.scan().await?;
+        }
+
+        let mut merged = merge_discovery(providers);
+        let engine = self.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = merged.next().await {
+                engine.publish(event);
+            }
+        });
+
+        // Replace any prior task, aborting it first.
+        if let Some(prev) = self.discovery_task.lock().unwrap().replace(handle) {
+            prev.abort();
+        }
+        tracing::info!(providers = providers.len(), "discovery started");
+        Ok(())
+    }
+
+    /// Stop discovery: halt the merge task and every provider.
+    pub async fn stop_discovery(&self) -> Result<(), EngineError> {
+        if let Some(handle) = self.discovery_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        for provider in self.registry.discovery() {
+            provider.stop().await?;
+        }
+        tracing::info!("discovery stopped");
+        Ok(())
     }
 }

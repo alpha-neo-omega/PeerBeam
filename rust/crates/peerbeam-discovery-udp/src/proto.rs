@@ -106,18 +106,6 @@ pub(crate) fn wire_to_device(wire: &Wire, src_ip: String, now: DateTime<Utc>) ->
     }
 }
 
-/// Whether two devices share the same observable identity (ignoring the
-/// `last_seen` timestamp). Used to decide `Found`/`Updated` vs a silent
-/// liveness refresh.
-pub(crate) fn same_identity(a: &Device, b: &Device) -> bool {
-    a.id == b.id
-        && a.name == b.name
-        && a.platform == b.platform
-        && a.device_type == b.device_type
-        && a.addresses == b.addresses
-        && a.port == b.port
-}
-
 fn encode_device_type(dt: DeviceType) -> &'static str {
     match dt {
         DeviceType::Desktop => "Desktop",
@@ -241,9 +229,9 @@ mod tests {
         let a = sample_device();
         let mut b = a.clone();
         b.last_seen = Utc::now(); // timestamp change is ignored
-        assert!(same_identity(&a, &b));
+        assert!(a.same_identity(&b));
 
         b.name = "Alice-renamed".to_string();
-        assert!(!same_identity(&a, &b));
+        assert!(!a.same_identity(&b));
     }
 }

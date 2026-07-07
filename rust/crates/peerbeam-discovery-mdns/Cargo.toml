@@ -1,6 +1,6 @@
 [package]
-name = "peerbeam-engine"
-description = "Composition root: builds the provider registry from configuration and exposes a single engine handle to all frontends."
+name = "peerbeam-discovery-mdns"
+description = "mDNS/DNS-SD device discovery — an adapter implementing peerbeam-domain's DiscoveryProvider port."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,14 @@ license.workspace = true
 
 [dependencies]
 peerbeam-domain = { workspace = true }
-peerbeam-app = { workspace = true }
-peerbeam-config = { workspace = true }
+mdns-sd = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
-thiserror = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
+tokio = { workspace = true }
 chrono = { workspace = true }

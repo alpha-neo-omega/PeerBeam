@@ -8,6 +8,7 @@ members = [
     "crates/peerbeam-app",
     "crates/peerbeam-engine",
     "crates/peerbeam-discovery-udp",
+    "crates/peerbeam-discovery-mdns",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ hostname = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 socket2 = { version = "0.5", features = ["all"] }
+mdns-sd = "0.11"
 
 # Internal crates
 peerbeam-domain = { path = "crates/peerbeam-domain" }

@@ -59,3 +59,19 @@ pub struct Device {
     /// When the device was last observed.
     pub last_seen: DateTime<Utc>,
 }
+
+impl Device {
+    /// Whether this device shares the same observable identity as `other`,
+    /// ignoring the volatile `last_seen` timestamp.
+    ///
+    /// Used to decide whether a re-observation is a meaningful change
+    /// (worth a `Updated`/`PeerUpdated` event) or a silent liveness refresh.
+    pub fn same_identity(&self, other: &Device) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.platform == other.platform
+            && self.device_type == other.device_type
+            && self.addresses == other.addresses
+            && self.port == other.port
+    }
+}

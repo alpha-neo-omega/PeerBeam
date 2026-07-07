@@ -58,8 +58,70 @@ The provider self-filters its own broadcast echo by device id.
   by a plain `UdpSocket` peer — discovery, self-filter, query-response, and
   TTL expiry, end-to-end, without needing a broadcast-capable network.
 
-### Limits / next providers
+### Limits
 
 UDP broadcast does not cross subnets or NAT (`crosses_subnet = false`).
-Reaching peers over Tailscale, VPN, or the internet is the job of other
-providers that implement the same port and are merged alongside this one.
+Managed Wi-Fi sometimes filters broadcast — mDNS covers that case.
+
+## mDNS discovery (`peerbeam-discovery-mdns`)
+
+Second provider. Advertises this device as a `_peerbeam._tcp.local.` DNS-SD
+service and browses for peers of the same type. Often succeeds on managed
+Wi-Fi where UDP broadcast is dropped.
+
+### Design
+
+| Concern | Mechanism |
+|---|---|
+| Advertise | Register a service; identity in TXT records (`id`, `name`, `device_type`, `platform`, `version`); interface addresses auto-detected (`enable_addr_auto`). |
+| Scan | Browse the service type; `ServiceResolved` → `Found`, `ServiceRemoved` → `Lost` (a fullname→id map recovers the device id on removal). |
+| Self-filter | Ignore any resolved service whose TXT `id` equals ours. |
+| Cross-platform | Delegated to `mdns-sd`; no per-OS code here. |
+
+Identity comes from TXT; addresses come from the resolved records. Also
+link-local (`crosses_subnet = false`). `MdnsDiscovery::new` returns an error
+if the mDNS daemon can't start, so a host can fall back to UDP-only.
+
+### Testing
+
+- **Unit**: `parse_service` (full record, missing id → `None`, name/type/
+  platform defaults) and type/platform mapping — built from an in-memory
+  `ServiceInfo`, no network.
+- **Integration** (`tests/lifecycle.rs`): advertise → scan → stop runs to
+  completion (incl. idempotent repeat calls) without hanging; skips
+  gracefully when the daemon is unavailable.
+
+## Merge (`peerbeam_app::merge_discovery`)
+
+Every provider runs independently; the engine fuses their streams into one
+deduplicated device list. The pure reducer is `DiscoveryRegistry`.
+
+| Situation | Emitted |
+|---|---|
+| First sighting of a device (any provider) | `PeerFound` |
+| Later sighting that adds info (e.g. a Tailscale address) | `PeerUpdated` (addresses unioned) |
+| Redundant sighting, nothing new | *(nothing)* — no UI churn |
+| `Lost` from one provider while another still sees it | *(nothing)* |
+| `Lost` from the **last** provider seeing it | `PeerLost` |
+
+Each device tracks the set of providers currently reporting it, so a peer
+visible via both mDNS and UDP survives either one dropping. The engine's
+`start_discovery` advertises + scans every registered provider, runs
+`merge_discovery`, and republishes the merged `DomainEvent`s;
+`stop_discovery` halts the merge task and every provider.
+
+### Testing the merge
+
+- **Unit** (`DiscoveryRegistry`): found/dedup/union-update/partial-loss/
+  final-loss/unknown-loss — pure, deterministic.
+- **Integration** (`peerbeam-app/tests/merge.rs`): two fake providers with
+  overlapping scripts fused at the stream level.
+- **Engine** (`peerbeam-engine/tests/discovery_merge.rs`): two providers
+  registered via the builder, merged through `start_discovery`, deduped
+  events observed on the engine event stream — end-to-end.
+
+## Next providers
+
+Reaching peers over Tailscale, VPN, or the internet is the job of further
+providers implementing the same port (`crosses_subnet = true`), merged
+alongside these two with no change to the merge logic.
