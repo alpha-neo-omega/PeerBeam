@@ -120,8 +120,49 @@ visible via both mDNS and UDP survives either one dropping. The engine's
   registered via the builder, merged through `start_discovery`, deduped
   events observed on the engine event stream — end-to-end.
 
+## Tailscale discovery (`peerbeam-discovery-tailscale`)
+
+Third provider, and the first with `crosses_subnet = true`: surfaces tailnet
+peers reachable across subnets, NAT, and the internet wherever Tailscale is
+up.
+
+### Design
+
+Tailscale has no push API, so the provider **polls** `tailscale status` on an
+interval and diffs successive snapshots into Found/Updated/Lost.
+
+| Concern | Mechanism |
+|---|---|
+| Status source | `tailscale status --json` via CLI, **or** `tailscaled` **LocalAPI** over its Unix socket (no subprocess). `default_source()` prefers the socket when present. |
+| Poll + diff | `SnapshotDiffer` turns each full snapshot into incremental events (new → Found, identity change → Updated, absent → Lost). |
+| MagicDNS | The peer's MagicDNS name (trailing dot stripped) is added as an address, so peers are reachable by name as well as IP. |
+| Tailnet IPs | `TailscaleIPs` (100.64.0.0/10 and `fd7a:…`) become addresses. |
+| Advertise | No-op (`can_advertise = false`) — `tailscaled` already advertises the node. |
+| Self-filter | Inherent: `status` lists other nodes under `Peer`, never `Self`. |
+
+The status source is a trait (`StatusSource`), so the provider is fully
+testable with injected JSON — no Tailscale install required.
+
+Defaults: `poll_interval = 5s`, offline peers excluded. Discovered ids are
+Tailscale-scoped (`ts:<node-id>`).
+
+### Testing
+
+- **Unit** (`status.rs`): `parse_status` (online-only filter, MagicDNS +
+  IP addresses, OS→platform, invalid JSON) and the `SnapshotDiffer` state
+  machine — pure, no Tailscale.
+- **Integration** (`tests/discovery.rs`): a scripted `StatusSource` drives
+  poll → diff → events, asserting Found for peers and Lost when a peer
+  leaves a later snapshot.
+
+### Known limitation
+
+A device found via Tailscale carries a Tailscale-scoped id, so it does not
+yet dedup against the same device found via mDNS/UDP (different id space).
+Reconciling to the canonical app identity happens in the transfer handshake
+— future work.
+
 ## Next providers
 
-Reaching peers over Tailscale, VPN, or the internet is the job of further
-providers implementing the same port (`crosses_subnet = true`), merged
-alongside these two with no change to the merge logic.
+Further providers (Bluetooth, ZeroTier, a relay) implement the same port and
+are merged alongside these three with no change to the merge logic.
