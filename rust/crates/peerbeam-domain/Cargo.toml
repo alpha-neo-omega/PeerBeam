@@ -1,0 +1,15 @@
+[package]
+name = "peerbeam-domain"
+description = "Pure domain layer: entities, ports (interfaces), events, and errors. Zero IO, no runtime, no frontend dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }

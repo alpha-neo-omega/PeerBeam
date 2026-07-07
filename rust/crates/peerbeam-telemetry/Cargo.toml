@@ -1,0 +1,12 @@
+[package]
+name = "peerbeam-telemetry"
+description = "Structured logging setup for all PeerBeam frontends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

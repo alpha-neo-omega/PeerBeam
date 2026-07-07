@@ -1,0 +1,12 @@
+[package]
+name = "peerbeam-platform"
+description = "Platform layer: OS detection, host identity, and standard directory resolution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+dirs = { workspace = true }
+hostname = { workspace = true }

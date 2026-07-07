@@ -1,0 +1,15 @@
+[package]
+name = "peerbeam-engine"
+description = "Composition root: builds the provider registry from configuration and exposes a single engine handle to all frontends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+peerbeam-app = { workspace = true }
+peerbeam-config = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

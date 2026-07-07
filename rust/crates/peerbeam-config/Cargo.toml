@@ -1,0 +1,13 @@
+[package]
+name = "peerbeam-config"
+description = "Typed, layered configuration for the PeerBeam engine and frontends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

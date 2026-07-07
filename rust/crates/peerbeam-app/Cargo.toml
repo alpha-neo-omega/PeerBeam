@@ -1,0 +1,10 @@
+[package]
+name = "peerbeam-app"
+description = "Application layer: dependency-injection registry and use-case seams. Depends only on domain ports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
