@@ -1,15 +1,15 @@
 //! The engine handle exposed to frontends.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use futures::StreamExt;
-use peerbeam_app::{merge_discovery, ProviderRegistry};
+use peerbeam_app::ProviderRegistry;
 use peerbeam_config::EngineConfig;
-use peerbeam_domain::entity::Device;
-use peerbeam_domain::event::DomainEvent;
+use peerbeam_domain::entity::{Device, ManagedDevice};
+use peerbeam_domain::event::{DeviceChange, DomainEvent};
+use peerbeam_domain::id::DeviceId;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 
+use crate::device_manager::DeviceManager;
 use crate::error::EngineError;
 
 /// Capacity of the outbound event broadcast channel.
@@ -17,17 +17,16 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// The single handle every frontend holds.
 ///
-/// Owns the resolved provider registry, the active configuration, and the
-/// outbound event channel. Cloning shares the same underlying engine
-/// (registry is `Arc`, the broadcast sender is cheaply cloneable), so a
-/// frontend can hand copies to multiple tasks.
+/// Owns the resolved provider registry, configuration, the general event
+/// channel, and the [`DeviceManager`]. Cloning shares the same underlying
+/// engine (all fields are `Arc`/cloneable), so a frontend can hand copies to
+/// multiple tasks.
 #[derive(Clone)]
 pub struct Engine {
     config: Arc<EngineConfig>,
     registry: Arc<ProviderRegistry>,
     events: broadcast::Sender<DomainEvent>,
-    /// Handle to the running discovery-merge task, if discovery is active.
-    discovery_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    devices: Arc<DeviceManager>,
 }
 
 impl Engine {
@@ -40,6 +39,7 @@ impl Engine {
         registry: ProviderRegistry,
     ) -> Result<Self, EngineError> {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let devices = Arc::new(DeviceManager::new(registry.discovery().to_vec()));
         tracing::info!(
             device = %config.device.name,
             discovery = registry.discovery().len(),
@@ -50,7 +50,7 @@ impl Engine {
             config: Arc::new(config),
             registry: Arc::new(registry),
             events,
-            discovery_task: Arc::new(Mutex::new(None)),
+            devices,
         })
     }
 
@@ -64,9 +64,9 @@ impl Engine {
         &self.registry
     }
 
-    /// Subscribe to the engine's event stream. Frontends render these
-    /// events; each subscriber receives every event published after it
-    /// subscribes.
+    /// Subscribe to the engine's general event stream (transfers, clipboard,
+    /// errors). Device changes have their own stream — see
+    /// [`device_changes`](Self::device_changes).
     pub fn subscribe(&self) -> broadcast::Receiver<DomainEvent> {
         self.events.subscribe()
     }
@@ -79,45 +79,31 @@ impl Engine {
         self.events.send(event).unwrap_or(0)
     }
 
-    /// Start discovery across every registered [`DiscoveryProvider`].
-    ///
-    /// Advertises `me` and begins scanning on each provider, then merges all
-    /// their event streams into one deduplicated stream (see
-    /// [`peerbeam_app::merge_discovery`]) and republishes the result on the
-    /// engine event channel. Idempotent: calling it while discovery is
-    /// already running restarts the merge task.
+    // ── Devices ─────────────────────────────────────────────────
+
+    /// Start discovery: advertise `me` and scan on every registered provider,
+    /// merging results into the device manager.
     pub async fn start_discovery(&self, me: Device) -> Result<(), EngineError> {
-        let providers = self.registry.discovery();
-        for provider in providers {
-            provider.advertise(&me).await?;
-            provider.scan().await?;
-        }
-
-        let mut merged = merge_discovery(providers);
-        let engine = self.clone();
-        let handle = tokio::spawn(async move {
-            while let Some(event) = merged.next().await {
-                engine.publish(event);
-            }
-        });
-
-        // Replace any prior task, aborting it first.
-        if let Some(prev) = self.discovery_task.lock().unwrap().replace(handle) {
-            prev.abort();
-        }
-        tracing::info!(providers = providers.len(), "discovery started");
-        Ok(())
+        self.devices.start(me).await
     }
 
-    /// Stop discovery: halt the merge task and every provider.
+    /// Stop discovery on every provider.
     pub async fn stop_discovery(&self) -> Result<(), EngineError> {
-        if let Some(handle) = self.discovery_task.lock().unwrap().take() {
-            handle.abort();
-        }
-        for provider in self.registry.discovery() {
-            provider.stop().await?;
-        }
-        tracing::info!("discovery stopped");
-        Ok(())
+        self.devices.stop().await
+    }
+
+    /// Current merged, deduplicated device list (online first).
+    pub fn devices(&self) -> Vec<ManagedDevice> {
+        self.devices.snapshot()
+    }
+
+    /// Subscribe to device changes for the UI to render.
+    pub fn device_changes(&self) -> broadcast::Receiver<DeviceChange> {
+        self.devices.changes()
+    }
+
+    /// Record a measured latency for a device (from the networking layer).
+    pub fn record_device_latency(&self, id: &DeviceId, latency_ms: Option<u32>) {
+        self.devices.record_latency(id, latency_ms);
     }
 }

@@ -4,7 +4,7 @@
 //! (Flutter, CLI, daemon) renders the same stream. Frontends never poll
 //! internal state — they react to events.
 
-use crate::entity::{ClipboardItem, Device, Progress, Route, TransferSession};
+use crate::entity::{ClipboardItem, Device, ManagedDevice, Progress, Route, TransferSession};
 use crate::id::{DeviceId, TransferId};
 
 /// A single event emitted by the engine.
@@ -40,4 +40,31 @@ pub enum DomainEvent {
     ClipboardUpdated(ClipboardItem),
     /// A non-fatal engine error worth surfacing.
     Error(String),
+}
+
+/// A change to the managed device list, emitted by the `DeviceManager` for
+/// the UI to render. The UI diffs its view from these; it never polls or
+/// touches networking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeviceChange {
+    /// A device newly appeared.
+    Added(ManagedDevice),
+    /// A device's identity, addresses, or capabilities changed.
+    Updated(ManagedDevice),
+    /// A device went online or offline (still tracked either way).
+    StatusChanged {
+        /// The affected device.
+        id: DeviceId,
+        /// New online state.
+        online: bool,
+    },
+    /// A device's measured latency changed.
+    LatencyChanged {
+        /// The affected device.
+        id: DeviceId,
+        /// New latency in milliseconds, if known.
+        latency_ms: Option<u32>,
+    },
+    /// A device was pruned from tracking entirely.
+    Removed(DeviceId),
 }

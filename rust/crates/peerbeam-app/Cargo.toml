@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 peerbeam-domain = { workspace = true }
 futures = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

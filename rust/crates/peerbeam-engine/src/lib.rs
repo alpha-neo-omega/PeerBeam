@@ -6,18 +6,21 @@
 //! interact only through the resulting handle and its event stream. They
 //! never see tokio, sockets, or a concrete provider.
 //!
-//! No transfer/discovery behaviour lives here yet — this is the wiring
-//! seam. Use-cases from `peerbeam-app` attach on top of it.
+//! Discovery is wired through the [`DeviceManager`], which the [`Engine`]
+//! owns; transfer use-cases attach on top of the same seam.
 
 mod builder;
+mod device_manager;
 mod engine;
 mod error;
 
 pub use builder::EngineBuilder;
+pub use device_manager::DeviceManager;
 pub use engine::Engine;
 pub use error::EngineError;
 
 // Re-export the pieces frontends need so they depend on one crate.
 pub use peerbeam_app::ProviderRegistry;
 pub use peerbeam_config::EngineConfig;
-pub use peerbeam_domain::event::DomainEvent;
+pub use peerbeam_domain::entity::{DeviceCapabilities, ManagedDevice};
+pub use peerbeam_domain::event::{DeviceChange, DomainEvent};

@@ -1,6 +1,6 @@
-//! Engine-level discovery integration: two providers registered via the
-//! builder, merged through `start_discovery`, surfacing deduplicated
-//! `DomainEvent`s on the engine's event stream.
+//! Engine-level device management: providers registered via the builder are
+//! merged, deduped, tracked (online/offline), capability-tagged, and surfaced
+//! to the UI as `DeviceChange`s and a `devices()` snapshot.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +13,12 @@ use tokio::time::timeout;
 use peerbeam_domain::entity::{Device, DeviceType, Platform};
 use peerbeam_domain::id::{DeviceId, ProviderId};
 use peerbeam_domain::port::{DiscoveryCaps, DiscoveryEvent, DiscoveryProvider};
-use peerbeam_engine::{DomainEvent, EngineBuilder};
+use peerbeam_engine::{DeviceChange, EngineBuilder};
 
-/// Provider replaying a fixed script.
+/// Provider replaying a fixed script with declared capabilities.
 struct Fake {
     id: ProviderId,
+    caps: DiscoveryCaps,
     script: Vec<DiscoveryEvent>,
 }
 
@@ -27,11 +28,7 @@ impl DiscoveryProvider for Fake {
         self.id.clone()
     }
     fn capabilities(&self) -> DiscoveryCaps {
-        DiscoveryCaps {
-            can_advertise: true,
-            can_scan: true,
-            ..DiscoveryCaps::default()
-        }
+        self.caps
     }
     async fn advertise(&self, _me: &Device) -> peerbeam_domain::Result<()> {
         Ok(())
@@ -50,7 +47,7 @@ impl DiscoveryProvider for Fake {
 fn device(id: &str, addr: &str) -> Device {
     Device {
         id: DeviceId::from(id),
-        name: "Peer".to_string(),
+        name: id.to_string(),
         device_type: DeviceType::Desktop,
         platform: Platform::Linux,
         addresses: vec![addr.to_string()],
@@ -60,49 +57,92 @@ fn device(id: &str, addr: &str) -> Device {
 }
 
 #[tokio::test]
-async fn engine_merges_registered_providers() {
+async fn manages_devices_across_providers() {
     let udp = Arc::new(Fake {
         id: ProviderId::from("udp"),
+        caps: DiscoveryCaps {
+            can_advertise: true,
+            can_scan: true,
+            crosses_subnet: false,
+            requires_tailscale: false,
+        },
         script: vec![
             DiscoveryEvent::Found(device("shared", "10.0.0.1")),
-            DiscoveryEvent::Found(device("only-udp", "10.0.0.2")),
+            DiscoveryEvent::Found(device("only-lan", "10.0.0.2")),
+            DiscoveryEvent::Lost(DeviceId::from("only-lan")),
         ],
     });
-    let mdns = Arc::new(Fake {
-        id: ProviderId::from("mdns"),
-        script: vec![DiscoveryEvent::Found(device("shared", "10.0.0.1"))],
+    let tailscale = Arc::new(Fake {
+        id: ProviderId::from("tailscale"),
+        caps: DiscoveryCaps {
+            can_advertise: false,
+            can_scan: true,
+            crosses_subnet: true,
+            requires_tailscale: true,
+        },
+        script: vec![DiscoveryEvent::Found(device("shared", "100.64.0.1"))],
     });
 
     let engine = EngineBuilder::with_defaults()
         .with_discovery(udp)
-        .with_discovery(mdns)
+        .with_discovery(tailscale)
         .build()
         .expect("engine builds");
 
-    // Subscribe before starting so no events are missed.
-    let mut rx = engine.subscribe();
+    let mut changes = engine.device_changes();
+    engine
+        .start_discovery(device("me", "10.0.0.99"))
+        .await
+        .expect("discovery starts");
 
-    let me = device("me", "10.0.0.99");
-    engine.start_discovery(me).await.expect("discovery starts");
-
-    // Collect what arrives within a short window.
-    let mut events = Vec::new();
-    while let Ok(Ok(ev)) = timeout(Duration::from_millis(300), rx.recv()).await {
-        events.push(ev);
+    // Drain changes over a short window.
+    let mut added = Vec::new();
+    let mut offline = Vec::new();
+    while let Ok(Ok(change)) = timeout(Duration::from_millis(300), changes.recv()).await {
+        match change {
+            DeviceChange::Added(m) => added.push(m.device.id.to_string()),
+            DeviceChange::StatusChanged { id, online: false } => offline.push(id.to_string()),
+            _ => {}
+        }
     }
 
-    let founds: Vec<String> = events
-        .iter()
-        .filter_map(|e| match e {
-            DomainEvent::PeerFound(d) => Some(d.id.to_string()),
-            _ => None,
-        })
-        .collect();
+    // Dedup: "shared" added once even though two providers report it.
+    assert_eq!(added.iter().filter(|id| *id == "shared").count(), 1);
+    assert!(added.contains(&"only-lan".to_string()));
+    // only-lan's sole provider dropped it → offline.
+    assert!(offline.contains(&"only-lan".to_string()));
 
-    // "shared" (seen by both) deduped to one; plus the unique "only-udp".
-    assert_eq!(founds.iter().filter(|id| *id == "shared").count(), 1);
-    assert!(founds.contains(&"only-udp".to_string()));
-    assert_eq!(founds.len(), 2, "got {founds:?}");
+    // Snapshot: merged view with capabilities and online/offline state.
+    let snap = engine.devices();
+    assert_eq!(snap.len(), 2, "shared + only-lan tracked");
+
+    let shared = snap
+        .iter()
+        .find(|m| m.device.id == DeviceId::from("shared"))
+        .unwrap();
+    assert!(shared.online);
+    assert!(shared.capabilities.reachable_lan, "seen via udp");
+    assert!(shared.capabilities.reachable_remote, "seen via tailscale");
+    assert!(!shared.capabilities.requires_tailscale, "also on LAN");
+    assert_eq!(shared.capabilities.providers.len(), 2);
+    assert!(shared.device.addresses.contains(&"10.0.0.1".to_string()));
+    assert!(shared.device.addresses.contains(&"100.64.0.1".to_string()));
+
+    let lan = snap
+        .iter()
+        .find(|m| m.device.id == DeviceId::from("only-lan"))
+        .unwrap();
+    assert!(!lan.online, "dropped by its only provider");
+
+    // Latency is recorded on the managed device.
+    engine.record_device_latency(&DeviceId::from("shared"), Some(23));
+    let shared_latency = engine
+        .devices()
+        .into_iter()
+        .find(|m| m.device.id == DeviceId::from("shared"))
+        .unwrap()
+        .latency_ms;
+    assert_eq!(shared_latency, Some(23));
 
     engine.stop_discovery().await.expect("discovery stops");
 }

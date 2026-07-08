@@ -1,0 +1,493 @@
+//! The device tracking reducer — pure heart of the `DeviceManager`.
+//!
+//! Folds per-provider [`DiscoveryEvent`]s into a merged, deduplicated set of
+//! [`ManagedDevice`]s and reports every change as a [`DeviceChange`]. No IO,
+//! no runtime — the async `DeviceManager` (in the engine) just drives this.
+//!
+//! Responsibilities:
+//! - **Merge / dedup** — one entry per [`DeviceId`] regardless of how many
+//!   providers see it; addresses are unioned.
+//! - **Online / offline** — a device stays tracked when its last provider
+//!   drops it, flipped to offline rather than deleted (the UI can grey it
+//!   out); [`prune`](DeviceStore::prune) removes long-gone devices.
+//! - **Latency** — stored per device via [`record_latency`](DeviceStore::record_latency);
+//!   measurement lives in the networking layer, not here.
+//! - **Capabilities** — derived from the capabilities of the providers that
+//!   see the device (LAN vs remote vs Tailscale-only).
+
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Duration, Utc};
+
+use peerbeam_domain::entity::{Device, DeviceCapabilities, ManagedDevice};
+use peerbeam_domain::event::DeviceChange;
+use peerbeam_domain::id::{DeviceId, ProviderId};
+use peerbeam_domain::port::{DiscoveryCaps, DiscoveryEvent};
+
+/// Internal per-device state.
+struct Entry {
+    device: Device,
+    online: bool,
+    last_seen: DateTime<Utc>,
+    latency_ms: Option<u32>,
+    /// Providers currently reporting this device.
+    providers: HashSet<ProviderId>,
+}
+
+/// Tracks all known devices and turns provider events into [`DeviceChange`]s.
+pub struct DeviceStore {
+    /// Capabilities of each registered provider, for deriving reachability.
+    provider_caps: HashMap<ProviderId, DiscoveryCaps>,
+    devices: HashMap<DeviceId, Entry>,
+}
+
+impl DeviceStore {
+    /// Create a store aware of each provider's capabilities.
+    pub fn new(provider_caps: HashMap<ProviderId, DiscoveryCaps>) -> Self {
+        Self {
+            provider_caps,
+            devices: HashMap::new(),
+        }
+    }
+
+    /// Fold one provider event into the tracked set, returning the changes to
+    /// notify the UI about (possibly empty).
+    pub fn observe(&mut self, provider: &ProviderId, event: DiscoveryEvent) -> Vec<DeviceChange> {
+        match event {
+            DiscoveryEvent::Found(device) | DiscoveryEvent::Updated(device) => {
+                self.upsert(provider, device)
+            }
+            DiscoveryEvent::Lost(id) => self.drop_provider(provider, &id),
+        }
+    }
+
+    fn upsert(&mut self, provider: &ProviderId, device: Device) -> Vec<DeviceChange> {
+        let id = device.id.clone();
+        let last_seen = device.last_seen;
+
+        match self.devices.get_mut(&id) {
+            None => {
+                let mut providers = HashSet::new();
+                providers.insert(provider.clone());
+                let entry = Entry {
+                    device,
+                    online: true,
+                    last_seen,
+                    latency_ms: None,
+                    providers,
+                };
+                let managed = self.to_managed(&entry);
+                self.devices.insert(id, entry);
+                vec![DeviceChange::Added(managed)]
+            }
+            Some(entry) => {
+                let was_online = entry.online;
+                let new_provider = entry.providers.insert(provider.clone());
+                let merged = merge_addresses(&entry.device, &device);
+                let identity_changed = !entry.device.same_identity(&merged);
+                entry.device = merged;
+                entry.online = true;
+                entry.last_seen = last_seen;
+
+                let mut changes = Vec::new();
+                if !was_online {
+                    changes.push(DeviceChange::StatusChanged {
+                        id: id.clone(),
+                        online: true,
+                    });
+                }
+                // Address/name change or a new provider (→ capabilities change)
+                // is a meaningful Updated; a plain re-sighting is silent.
+                if identity_changed || new_provider {
+                    // Re-borrow immutably to build the managed view.
+                    let managed = self.to_managed(self.devices.get(&id).unwrap());
+                    changes.push(DeviceChange::Updated(managed));
+                }
+                changes
+            }
+        }
+    }
+
+    fn drop_provider(&mut self, provider: &ProviderId, id: &DeviceId) -> Vec<DeviceChange> {
+        let Some(entry) = self.devices.get_mut(id) else {
+            return Vec::new();
+        };
+        entry.providers.remove(provider);
+
+        if entry.providers.is_empty() {
+            entry.online = false;
+            vec![DeviceChange::StatusChanged {
+                id: id.clone(),
+                online: false,
+            }]
+        } else {
+            // Fewer providers → capabilities may have shrunk → Updated.
+            let managed = self.to_managed(self.devices.get(id).unwrap());
+            vec![DeviceChange::Updated(managed)]
+        }
+    }
+
+    /// Record a measured latency for a device. Returns a change if it moved.
+    pub fn record_latency(&mut self, id: &DeviceId, latency_ms: Option<u32>) -> Vec<DeviceChange> {
+        match self.devices.get_mut(id) {
+            Some(entry) if entry.latency_ms != latency_ms => {
+                entry.latency_ms = latency_ms;
+                vec![DeviceChange::LatencyChanged {
+                    id: id.clone(),
+                    latency_ms,
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Remove offline devices last seen longer ago than `ttl`, returning a
+    /// `Removed` change for each.
+    pub fn prune(&mut self, now: DateTime<Utc>, ttl: Duration) -> Vec<DeviceChange> {
+        let stale: Vec<DeviceId> = self
+            .devices
+            .iter()
+            .filter(|(_, e)| !e.online && now.signed_duration_since(e.last_seen) > ttl)
+            .map(|(id, _)| id.clone())
+            .collect();
+        stale
+            .into_iter()
+            .map(|id| {
+                self.devices.remove(&id);
+                DeviceChange::Removed(id)
+            })
+            .collect()
+    }
+
+    /// Snapshot of all tracked devices, online first then by name.
+    pub fn snapshot(&self) -> Vec<ManagedDevice> {
+        let mut out: Vec<ManagedDevice> =
+            self.devices.values().map(|e| self.to_managed(e)).collect();
+        out.sort_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then_with(|| a.device.name.cmp(&b.device.name))
+        });
+        out
+    }
+
+    /// Number of tracked devices.
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Whether no devices are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    fn to_managed(&self, entry: &Entry) -> ManagedDevice {
+        ManagedDevice {
+            device: entry.device.clone(),
+            online: entry.online,
+            last_seen: entry.last_seen,
+            latency_ms: entry.latency_ms,
+            capabilities: self.capabilities_for(&entry.providers),
+        }
+    }
+
+    fn capabilities_for(&self, providers: &HashSet<ProviderId>) -> DeviceCapabilities {
+        let mut provs: Vec<ProviderId> = providers.iter().cloned().collect();
+        provs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        let mut reachable_lan = false;
+        let mut reachable_remote = false;
+        let mut any = false;
+        let mut all_require_tailscale = true;
+
+        for provider in &provs {
+            any = true;
+            match self.provider_caps.get(provider) {
+                Some(caps) => {
+                    if caps.crosses_subnet {
+                        reachable_remote = true;
+                    } else {
+                        reachable_lan = true;
+                    }
+                    if !caps.requires_tailscale {
+                        all_require_tailscale = false;
+                    }
+                }
+                // Unknown provider: assume plain LAN reach.
+                None => {
+                    reachable_lan = true;
+                    all_require_tailscale = false;
+                }
+            }
+        }
+
+        DeviceCapabilities {
+            reachable_lan,
+            reachable_remote,
+            requires_tailscale: any && all_require_tailscale,
+            providers: provs,
+        }
+    }
+}
+
+/// Union `incoming`'s addresses onto `existing`, keeping `incoming`'s
+/// identity fields.
+fn merge_addresses(existing: &Device, incoming: &Device) -> Device {
+    let mut addresses = incoming.addresses.clone();
+    for addr in &existing.addresses {
+        if !addresses.contains(addr) {
+            addresses.push(addr.clone());
+        }
+    }
+    Device {
+        addresses,
+        ..incoming.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerbeam_domain::entity::{DeviceType, Platform};
+
+    fn caps_map() -> HashMap<ProviderId, DiscoveryCaps> {
+        let mut m = HashMap::new();
+        m.insert(
+            ProviderId::from("udp"),
+            DiscoveryCaps {
+                can_advertise: true,
+                can_scan: true,
+                crosses_subnet: false,
+                requires_tailscale: false,
+            },
+        );
+        m.insert(
+            ProviderId::from("tailscale"),
+            DiscoveryCaps {
+                can_advertise: false,
+                can_scan: true,
+                crosses_subnet: true,
+                requires_tailscale: true,
+            },
+        );
+        m
+    }
+
+    fn device(id: &str, name: &str, addr: &str) -> Device {
+        Device {
+            id: DeviceId::from(id),
+            name: name.to_string(),
+            device_type: DeviceType::Desktop,
+            platform: Platform::Linux,
+            addresses: vec![addr.to_string()],
+            port: 9000,
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn first_sighting_adds_online_device() {
+        let mut store = DeviceStore::new(caps_map());
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        assert!(matches!(changes.as_slice(), [DeviceChange::Added(m)] if m.online));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn second_provider_dedups_and_updates_capabilities() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        let changes = store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "A", "100.64.0.1")),
+        );
+        assert_eq!(store.len(), 1, "same device, not duplicated");
+        match changes.as_slice() {
+            [DeviceChange::Updated(m)] => {
+                assert!(m.capabilities.reachable_lan);
+                assert!(m.capabilities.reachable_remote);
+                assert!(!m.capabilities.requires_tailscale, "reachable on LAN too");
+                assert_eq!(m.capabilities.providers.len(), 2);
+                assert!(m.device.addresses.contains(&"10.0.0.1".to_string()));
+                assert!(m.device.addresses.contains(&"100.64.0.1".to_string()));
+            }
+            other => panic!("expected one Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_resighting_is_silent() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn tailscale_only_device_requires_tailscale() {
+        let mut store = DeviceStore::new(caps_map());
+        let changes = store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "A", "100.64.0.1")),
+        );
+        match changes.as_slice() {
+            [DeviceChange::Added(m)] => {
+                assert!(m.capabilities.reachable_remote);
+                assert!(!m.capabilities.reachable_lan);
+                assert!(m.capabilities.requires_tailscale);
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lost_from_one_of_two_providers_keeps_online() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "A", "100.64.0.1")),
+        );
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        // Still online via tailscale; capabilities shrink → Updated.
+        match changes.as_slice() {
+            [DeviceChange::Updated(m)] => {
+                assert!(m.online);
+                assert!(!m.capabilities.reachable_lan);
+                assert!(m.capabilities.reachable_remote);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lost_from_last_provider_goes_offline_but_stays_tracked() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        assert_eq!(
+            changes,
+            vec![DeviceChange::StatusChanged {
+                id: DeviceId::from("a"),
+                online: false
+            }]
+        );
+        assert_eq!(store.len(), 1, "offline device still tracked");
+    }
+
+    #[test]
+    fn rediscovery_brings_back_online() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        assert!(changes.contains(&DeviceChange::StatusChanged {
+            id: DeviceId::from("a"),
+            online: true
+        }));
+    }
+
+    #[test]
+    fn record_latency_reports_only_on_change() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        let first = store.record_latency(&DeviceId::from("a"), Some(12));
+        assert_eq!(
+            first,
+            vec![DeviceChange::LatencyChanged {
+                id: DeviceId::from("a"),
+                latency_ms: Some(12)
+            }]
+        );
+        // Same value → no change.
+        assert!(store
+            .record_latency(&DeviceId::from("a"), Some(12))
+            .is_empty());
+        // Unknown device → no change.
+        assert!(store
+            .record_latency(&DeviceId::from("ghost"), Some(1))
+            .is_empty());
+    }
+
+    #[test]
+    fn prune_removes_only_stale_offline_devices() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "A", "10.0.0.1")),
+        );
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+
+        // Not yet stale.
+        let now = Utc::now();
+        assert!(store.prune(now, Duration::seconds(60)).is_empty());
+
+        // Far in the future → stale → removed.
+        let later = now + Duration::seconds(120);
+        let changes = store.prune(later, Duration::seconds(60));
+        assert_eq!(changes, vec![DeviceChange::Removed(DeviceId::from("a"))]);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn snapshot_lists_online_before_offline() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("b", "Bravo", "10.0.0.2")),
+        );
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alpha", "10.0.0.1")),
+        );
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("b")),
+        );
+
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!(snap[0].online, "online device first");
+        assert_eq!(snap[0].device.name, "Alpha");
+        assert!(!snap[1].online);
+    }
+}
