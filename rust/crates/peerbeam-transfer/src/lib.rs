@@ -16,9 +16,11 @@
 //! and temp files.
 
 mod control;
+mod folder;
 mod protocol;
 mod stream;
 
 pub use control::TransferControl;
+pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use protocol::{Control, TransferMeta};
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};

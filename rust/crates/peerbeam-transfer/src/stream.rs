@@ -222,7 +222,7 @@ pub async fn receive_file(
 }
 
 /// Send one frame, retrying transient errors up to `retries` times.
-async fn send_with_retry(link: &mut dyn Link, frame: Frame, retries: u32) -> Result<()> {
+pub(crate) async fn send_with_retry(link: &mut dyn Link, frame: Frame, retries: u32) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         match link.send_frame(frame.clone()).await {
@@ -239,7 +239,6 @@ async fn send_with_retry(link: &mut dyn Link, frame: Frame, retries: u32) -> Res
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn make_progress(
     transfer_id: &str,
     direction: Direction,
@@ -247,6 +246,31 @@ fn make_progress(
     total: u64,
     done: u64,
     name: &str,
+) -> Progress {
+    let files_completed = u32::from(status == TransferStatus::Completed);
+    build_progress(
+        transfer_id,
+        direction,
+        status,
+        total,
+        done,
+        name,
+        files_completed,
+        1,
+    )
+}
+
+/// General progress builder shared by single-file and folder transfers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_progress(
+    transfer_id: &str,
+    direction: Direction,
+    status: TransferStatus,
+    total: u64,
+    done: u64,
+    name: &str,
+    files_completed: u32,
+    files_total: u32,
 ) -> Progress {
     Progress {
         transfer: TransferId::from(transfer_id),
@@ -256,12 +280,8 @@ fn make_progress(
         transferred_bytes: done,
         speed_bps: 0.0,
         current_file: Some(name.to_string()),
-        files_completed: if status == TransferStatus::Completed {
-            1
-        } else {
-            0
-        },
-        files_total: 1,
+        files_completed,
+        files_total,
         eta_secs: None,
     }
 }

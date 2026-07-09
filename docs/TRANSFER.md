@@ -62,9 +62,58 @@ blocks while paused (woken on resume/cancel), aborts promptly on cancel.
   - pause → resume → `Completed`, file matches.
   - flaky link failing the first sends → retry recovers, file matches.
 
+## Recursive folder transfer
+
+Built on the single-file core, adding structure preservation and resume.
+
+### Wire protocol
+
+```
+Manifest(root, [(rel_path, size) …])        S→R   announce the tree
+ResumeState([bytes_already_on_disk …])       R→S   what the receiver has
+for each not-yet-complete file:
+  FileHeader(index, rel_path, size, offset)  S→R
+  Chunk … Chunk                              S→R   (streamed from offset)
+  FileEnd(index)                             S→R
+Complete                                      S→R
+```
+
+Folder messages are small JSON in `Control` frames; file bytes stay raw in
+`Chunk` frames. Chunks between a `FileHeader` and `FileEnd` belong to that
+file (the link is ordered).
+
+### Preserve structure
+
+Each file keeps its path relative to the folder root; the receiver recreates
+the tree under `dest_dir/<root>/…`. Relative paths are **sanitized** — empty,
+`.`, `..`, and absolute components are rejected — so a malicious manifest
+cannot escape the destination.
+
+### Resume
+
+The receiver inspects the destination and reports, per file, how many bytes
+it already has (`StorageProvider::size`). The sender then:
+
+- **skips** files already complete (`have == size`) — no `FileHeader`, no
+  chunks; and
+- **resumes** partial files by streaming from `offset` (`open_read(offset)`)
+  while the receiver **appends** (`open_append`).
+
+So a re-run after an interruption sends only what is missing. Requires three
+storage-port methods: `list_files`, `size`, `open_append`.
+
+### Testing
+
+- **Unit**: folder-message codec round-trip; path sanitization (traversal
+  rejected); `dest_path` composition; plus `FsStorage` `list_files` / `size`
+  / `open_append`.
+- **Integration** (`tests/folder.rs`): nested tree transferred with
+  structure + content preserved; **resume** with a pre-populated destination
+  asserting *exactly* the missing remainder crosses the wire (complete file
+  skipped, partial appended); cancel-then-rerun completing the tree.
+
 ## Not yet (future milestones)
 
-Resume from checkpoint, parallel chunks/files, per-chunk checksums,
-compression, and encryption are separate layers that compose onto this same
-pipeline (see the transfer architecture). This milestone is the streaming
-core: one file, one ordered link, memory-bounded, controllable.
+Parallel chunks/files, per-chunk checksums, compression, and encryption are
+separate layers that compose onto this same pipeline. Empty directories are
+not transferred (only files and their parent paths).
