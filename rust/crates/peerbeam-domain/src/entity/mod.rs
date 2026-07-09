@@ -10,7 +10,7 @@ mod route;
 mod transfer;
 mod trust;
 
-pub use clipboard::{ClipboardItem, ClipboardKind};
+pub use clipboard::{classify, ClipboardData, ClipboardItem, ClipboardKind};
 pub use device::{Device, DeviceType, Platform};
 pub use managed_device::{DeviceCapabilities, ManagedDevice};
 pub use route::{Route, RouteHealth, RouteKind};

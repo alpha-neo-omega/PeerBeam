@@ -1,0 +1,15 @@
+[package]
+name = "peerbeam-clipboard-mem"
+description = "In-memory ClipboardProvider — a headless/default clipboard for servers and tests. Real OS adapters implement the same port."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }

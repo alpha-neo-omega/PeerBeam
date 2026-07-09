@@ -12,6 +12,7 @@ members = [
     "crates/peerbeam-discovery-tailscale",
     "crates/peerbeam-storage-fs",
     "crates/peerbeam-transfer",
+    "crates/peerbeam-clipboard-mem",
 ]
 
 [workspace.package]

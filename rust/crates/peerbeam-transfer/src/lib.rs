@@ -15,11 +15,13 @@
 //! `StorageProvider`, so this crate is fully testable with in-memory links
 //! and temp files.
 
+mod clipboard;
 mod control;
 mod folder;
 mod protocol;
 mod stream;
 
+pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use protocol::{Control, TransferMeta};
