@@ -112,6 +112,60 @@ storage-port methods: `list_files`, `size`, `open_append`.
   asserting *exactly* the missing remainder crosses the wire (complete file
   skipped, partial appended); cancel-then-rerun completing the tree.
 
+## Interrupted-transfer recovery
+
+Single-file transfers negotiate a resume offset and verify integrity, and a
+recovery driver reconnects and resumes automatically.
+
+### Resume + integrity (single file)
+
+The single-file protocol gained a resume handshake and a checksum:
+
+```
+Meta(name, size, chunk_size)   S→R
+ResumeAck(offset)              R→S   receiver's bytes-on-disk
+Chunk … Chunk                 S→R   streamed from offset
+Complete(checksum)            S→R   whole-file SHA-256
+Verify(ok)                    R→S   receiver's integrity verdict
+```
+
+- **Resume** — the receiver reports how many bytes it already has; the sender
+  streams from that offset and the receiver appends. The sender seeds its
+  hash with the already-present prefix (read once) so the whole-file checksum
+  is correct even on a resumed run.
+- **Integrity** — both sides compute a streaming SHA-256; the receiver
+  compares against `Complete`'s checksum and reports `Verify(ok)`. A mismatch
+  surfaces as `DomainError::Integrity` on both ends — corrupt data is never
+  silently accepted.
+
+### State persistence (`peerbeam-reliability-fs`)
+
+`FsReliability` implements the `ReliabilityStore` port: SHA-256 checksums and
+per-transfer checkpoints written as `<dir>/<id>.json`. A checkpoint records
+the in-flight session so a transfer can be resumed even after a **process
+restart** (a fresh store reads the same file). Saved when a recoverable
+transfer starts, cleared on success.
+
+### Automatic retry (`send_file_recover` / `receive_file_recover`)
+
+A `LinkFactory` supplies a fresh `Link` on demand. The recovery drivers retry
+across new links up to `max_attempts` with backoff; because each attempt
+re-runs the resume handshake, it continues from the receiver's on-disk bytes
+rather than restarting. Cancellations and integrity failures are terminal
+(never retried).
+
+### Testing
+
+- **Unit**: `FsReliability` — known-answer SHA-256, save/load/resume/clear
+  round-trip, and survival across a store reopen (restart).
+- **Integration**:
+  - `integrity.rs` — a link that corrupts one chunk → both sides fail with
+    `Integrity`; a clean transfer verifies OK.
+  - `recovery.rs` — a broker that fails the first connect on each side, then
+    succeeds; with a pre-existing 20 KiB partial of a 50 KiB file the drivers
+    reconnect, resume, and complete — asserting **only the missing remainder
+    crosses the wire**, the file matches, and the checkpoint is cleared.
+
 ## Not yet (future milestones)
 
 Parallel chunks/files, per-chunk checksums, compression, and encryption are

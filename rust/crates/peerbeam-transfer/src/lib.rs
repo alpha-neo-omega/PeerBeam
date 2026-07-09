@@ -19,10 +19,12 @@ mod clipboard;
 mod control;
 mod folder;
 mod protocol;
+mod recover;
 mod stream;
 
 pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use protocol::{Control, TransferMeta};
+pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};

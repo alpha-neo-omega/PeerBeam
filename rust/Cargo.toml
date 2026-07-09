@@ -13,6 +13,7 @@ members = [
     "crates/peerbeam-storage-fs",
     "crates/peerbeam-transfer",
     "crates/peerbeam-clipboard-mem",
+    "crates/peerbeam-reliability-fs",
 ]
 
 [workspace.package]
@@ -44,6 +45,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 socket2 = { version = "0.5", features = ["all"] }
 mdns-sd = "0.11"
 tempfile = "3"
+sha2 = "0.10"
 
 # Internal crates
 peerbeam-domain = { path = "crates/peerbeam-domain" }

@@ -33,10 +33,13 @@ pub struct TransferMeta {
 /// A control message (small JSON in a [`FrameKind::Control`] frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
-    /// Cumulative bytes received (receiver → sender), for progress/backpressure.
-    Ack { received: u64 },
-    /// The sender has sent the whole file.
-    Complete,
+    /// Receiver → sender: bytes already on disk; the sender resumes from here.
+    ResumeAck { offset: u64 },
+    /// Sender → receiver: the whole file has been sent; carries the SHA-256
+    /// checksum of the complete file for integrity verification.
+    Complete { checksum: String },
+    /// Receiver → sender: whether the received file matched the checksum.
+    Verify { ok: bool },
     /// Either side is aborting the transfer.
     Cancel,
 }
@@ -97,8 +100,11 @@ mod tests {
     #[test]
     fn control_roundtrip() {
         for c in [
-            Control::Ack { received: 42 },
-            Control::Complete,
+            Control::ResumeAck { offset: 42 },
+            Control::Complete {
+                checksum: "abc123".into(),
+            },
+            Control::Verify { ok: true },
             Control::Cancel,
         ] {
             let frame = control_frame(&c);

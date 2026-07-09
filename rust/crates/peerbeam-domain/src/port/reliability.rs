@@ -18,4 +18,7 @@ pub trait ReliabilityStore: Send + Sync {
 
     /// Byte offset a transfer can safely resume from.
     fn resumable_offset(&self, transfer: &TransferId) -> Result<u64>;
+
+    /// Delete a checkpoint (called once a transfer completes successfully).
+    fn clear_checkpoint(&self, transfer: &TransferId) -> Result<()>;
 }
