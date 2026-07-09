@@ -10,6 +10,8 @@ members = [
     "crates/peerbeam-discovery-udp",
     "crates/peerbeam-discovery-mdns",
     "crates/peerbeam-discovery-tailscale",
+    "crates/peerbeam-storage-fs",
+    "crates/peerbeam-transfer",
 ]
 
 [workspace.package]
@@ -35,10 +37,12 @@ uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 dirs = "6"
 hostname = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time", "process", "io-util", "fs"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 socket2 = { version = "0.5", features = ["all"] }
 mdns-sd = "0.11"
+tempfile = "3"
 
 # Internal crates
 peerbeam-domain = { path = "crates/peerbeam-domain" }

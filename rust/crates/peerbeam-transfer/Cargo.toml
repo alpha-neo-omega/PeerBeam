@@ -1,0 +1,22 @@
+[package]
+name = "peerbeam-transfer"
+description = "Streaming, chunked file transfer over a Link: progress, pause, cancel, retry — never loads a whole file into memory."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
+tokio = { workspace = true }
+tempfile = { workspace = true }

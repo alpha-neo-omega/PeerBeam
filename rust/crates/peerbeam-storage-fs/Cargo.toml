@@ -1,0 +1,15 @@
+[package]
+name = "peerbeam-storage-fs"
+description = "Filesystem StorageProvider — streamed reads/writes, never loading a whole file into memory."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
