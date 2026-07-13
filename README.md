@@ -20,8 +20,10 @@ two frontends over the same core.
 > **Status.** The engine, discovery, security, transfer pipeline, QUIC
 > transport, CLI, and Flutter UI are implemented and tested. Networked
 > `send`/`receive` work end to end over QUIC with mutual authentication
-> (verified by a two-process integration test). Remaining gaps: folder send,
-> `clipboard`/`history` CLI execution, and desktop packaging for Windows/macOS.
+> (verified by a two-process integration test). All three desktop platforms
+> (Windows/macOS/Linux) are scaffolded; Linux is build-verified, Windows/macOS
+> need a host build ([Desktop](docs/DESKTOP.md)). Remaining gaps: folder send,
+> `clipboard`/`history` CLI execution, desktop OS notifications/tray.
 > See [Migration](docs/MIGRATION.md) and the per-component docs below.
 
 ## Highlights
@@ -94,6 +96,7 @@ flutter run              # desktop, or an attached Android device
 | Embedding the Rust engine | [API](docs/API.md) |
 | Command-line interface | [CLI](docs/CLI.md) |
 | Flutter UI | [UI](docs/UI.md) |
+| Desktop support & compatibility | [Desktop](docs/DESKTOP.md) |
 | Android platform integration | [Android](docs/ANDROID.md) |
 | Devices & merge/dedup | [Devices](docs/DEVICES.md) |
 | Test strategy | [Testing](docs/TESTING.md) |

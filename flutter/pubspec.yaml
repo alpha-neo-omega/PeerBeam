@@ -42,6 +42,9 @@ dependencies:
   desktop_drop: ^0.7.0
   cross_file: ^0.3.4
 
+  # Native file picker + directory chooser (desktop + mobile).
+  file_selector: ^1.0.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

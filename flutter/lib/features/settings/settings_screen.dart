@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../platform/bridge.dart';
+import '../../platform/desktop_files.dart';
 import '../../platform/services.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
@@ -86,6 +87,12 @@ class SettingsScreen extends StatelessWidget {
                         leading: const Icon(Icons.folder_rounded),
                         title: const Text('Save to'),
                         subtitle: Text(state.settings.saveDirectory),
+                        trailing: isDesktop
+                            ? const Icon(Icons.chevron_right_rounded)
+                            : null,
+                        onTap: isDesktop
+                            ? () => _pickSaveDir(context)
+                            : null,
                       ),
                     ],
                   ),
@@ -206,6 +213,15 @@ class SettingsScreen extends StatelessWidget {
     );
     if (result != null && result.isNotEmpty) {
       state.settings.setDeviceName(result);
+    }
+  }
+
+  /// Choose the save directory with the native directory picker (desktop).
+  Future<void> _pickSaveDir(BuildContext context) async {
+    final settings = AppScope.of(context).settings;
+    final dir = await pickSaveDirectory();
+    if (dir != null && dir.isNotEmpty) {
+      settings.setSaveDirectory(dir);
     }
   }
 }

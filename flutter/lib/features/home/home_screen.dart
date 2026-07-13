@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../platform/desktop_files.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../../widgets/quick_action.dart';
+import '../send/staged_sheet.dart';
 
 /// Home — nearby devices, quick actions. Listens to the device store only, so
 /// transfer/history changes never rebuild it.
@@ -16,6 +18,21 @@ class HomeScreen extends StatelessWidget {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('$what — wiring lands with the engine bridge')),
     );
+  }
+
+  /// Pick files with the native picker (desktop) and open the staged sheet.
+  Future<void> _pickFiles(BuildContext context) async {
+    if (!isDesktop) {
+      _todo(context, 'Send files');
+      return;
+    }
+    final staging = AppScope.of(context).staging;
+    final picked = await pickFilesToStage();
+    if (picked.isEmpty || !context.mounted) return;
+    final added = staging.add(picked);
+    if (added > 0 && context.mounted) {
+      showStagedFilesSheet(context, staging);
+    }
   }
 
   @override
@@ -57,7 +74,7 @@ class HomeScreen extends StatelessWidget {
                                 icon: Icons.folder_open_rounded,
                                 label: 'Send Files',
                                 color: scheme.primary,
-                                onTap: () => _todo(context, 'Send files'),
+                                onTap: () => _pickFiles(context),
                               ),
                             ),
                             const SizedBox(width: 12),

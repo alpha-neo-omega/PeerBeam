@@ -100,6 +100,11 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setSaveDirectory(String v) {
+    saveDirectory = v;
+    notifyListeners();
+  }
+
   void setAutoAccept(bool v) {
     autoAcceptTrusted = v;
     notifyListeners();
