@@ -1,7 +1,6 @@
 # Rust
 /rust/target/
 **/*.rs.bk
-Cargo.lock
 
 # OS / editor
 .DS_Store

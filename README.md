@@ -17,14 +17,16 @@ of any size with end-to-end encryption and resumable, integrity-checked
 transfers. A Rust engine does the work; a Flutter app and a first-class CLI are
 two frontends over the same core.
 
-> **Status: 🟢 Beta.** Engine, discovery, security, QUIC transport, RouteManager,
-> full FFI, Dart SDK, and the Flutter app are implemented and tested. Networked
+> **Status: 🟢 Release Candidate.** Engine, discovery, security, QUIC transport,
+> RouteManager, full FFI, Dart SDK, and the Flutter app are implemented and
+> tested (204 Rust + 35 Flutter tests, clippy/fmt clean). Networked
 > `send`/`receive` work end to end over QUIC with mutual authentication —
 > **verified live on real hardware** (Android → Linux, byte-exact). Linux + CLI
-> are build-verified; Android runs the full engine on-device. Windows/macOS are
-> packaging-config-complete but need a host build. Remaining gaps: CLI folder
-> send, `clipboard`/`history` CLI, desktop OS notifications/tray, persistent
-> device identity. See [Beta Readiness](docs/BETA_READINESS.md),
+> are build- and run-verified; Android runs the full engine on-device.
+> **Stable v1.0 is gated on Windows/macOS host builds and a real multi-transport
+> matrix** (this project's audit ran on a single Linux host). Remaining gaps:
+> `clipboard`/`history` CLI, desktop OS notifications/tray, persistent device
+> identity. See [Stable Readiness](docs/STABLE_READINESS.md),
 > [Known Issues](docs/KNOWN_ISSUES.md), and the docs below.
 
 ## Highlights
@@ -119,6 +121,7 @@ flutter run              # desktop, or an attached Android device
 | Install / build / release | [Install](docs/INSTALL.md) · [Build](docs/BUILD.md) · [Release](docs/RELEASE.md) |
 | Release readiness & reports | [Beta Readiness](docs/BETA_READINESS.md) · [Compatibility](docs/COMPATIBILITY_MATRIX.md) · [Performance](docs/PERFORMANCE_REPORT.md) · [Security Report](docs/SECURITY_REPORT.md) · [Known Issues](docs/KNOWN_ISSUES.md) |
 | Project quality & OSS readiness | [Doc Audit](docs/DOCUMENTATION_AUDIT.md) · [API Review](docs/API_REVIEW.md) · [OSS Readiness](docs/OPEN_SOURCE_READINESS.md) · [Contributor Experience](docs/CONTRIBUTOR_EXPERIENCE.md) |
+| Release gate (v1.0 audit) | [Stable Readiness](docs/STABLE_READINESS.md) · [Final Audit](docs/FINAL_AUDIT.md) · [Security](docs/FINAL_SECURITY_REVIEW.md) · [Performance](docs/FINAL_PERFORMANCE_REVIEW.md) · [Compatibility](docs/FINAL_COMPATIBILITY_MATRIX.md) · [Release Notes](docs/RELEASE_NOTES_v1.0.md) · [Roadmap](docs/LONG_TERM_ROADMAP.md) |
 | UX & design | [UX Audit](docs/UX_AUDIT.md) · [Design Decisions](docs/DESIGN_DECISIONS.md) · [UX Notes](docs/UX_NOTES.md) · [UI Limitations](docs/KNOWN_UI_LIMITATIONS.md) |
 | How to contribute | [Contributing](CONTRIBUTING.md) |
 
@@ -136,5 +139,5 @@ flutter test
 
 ## License
 
-AGPL-3.0-or-later. See [Contributing](CONTRIBUTING.md) for the contribution
-flow.
+AGPL-3.0-or-later — full text in [LICENSE](LICENSE). See
+[Contributing](CONTRIBUTING.md) for the contribution flow.
