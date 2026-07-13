@@ -34,8 +34,7 @@ async fn transfers_edge_case_filenames_and_trees() {
     #[cfg(unix)]
     {
         std::fs::write(dir.path().join("outside-secret"), b"DO NOT SEND").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("outside-secret"), root.join("link"))
-            .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside-secret"), root.join("link")).unwrap();
     }
 
     let storage = FsStorage::new();
@@ -58,13 +57,32 @@ async fn transfers_edge_case_filenames_and_trees() {
     assert_eq!(ro.unwrap().outcome, TransferOutcome::Completed);
 
     let got = out.join("payload");
-    assert_eq!(std::fs::read(got.join(unicode)).unwrap(), pattern(1234), "unicode name");
-    assert_eq!(std::fs::read(got.join(&long)).unwrap(), pattern(2048), "long name");
-    assert_eq!(std::fs::read(got.join(hidden)).unwrap(), b"secret-ish", "hidden file");
-    assert_eq!(std::fs::read(got.join(deep_rel)).unwrap(), pattern(4096), "deep tree");
+    assert_eq!(
+        std::fs::read(got.join(unicode)).unwrap(),
+        pattern(1234),
+        "unicode name"
+    );
+    assert_eq!(
+        std::fs::read(got.join(&long)).unwrap(),
+        pattern(2048),
+        "long name"
+    );
+    assert_eq!(
+        std::fs::read(got.join(hidden)).unwrap(),
+        b"secret-ish",
+        "hidden file"
+    );
+    assert_eq!(
+        std::fs::read(got.join(deep_rel)).unwrap(),
+        pattern(4096),
+        "deep tree"
+    );
 
     // Empty dirs are not recreated (walk is file-only) — known, documented.
-    assert!(!got.join("empty-dir").exists(), "empty dirs not transferred");
+    assert!(
+        !got.join("empty-dir").exists(),
+        "empty dirs not transferred"
+    );
 
     // Symlinks are skipped, never followed → the outside file's content never
     // arrives as a regular file.
