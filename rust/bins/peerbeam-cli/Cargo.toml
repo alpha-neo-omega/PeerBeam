@@ -1,0 +1,39 @@
+[package]
+name = "peerbeam-cli"
+description = "PeerBeam command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "peerbeam_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peerbeam"
+path = "src/main.rs"
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+peerbeam-config = { workspace = true }
+peerbeam-platform = { workspace = true }
+peerbeam-engine = { path = "../../crates/peerbeam-engine" }
+peerbeam-app = { workspace = true }
+peerbeam-discovery-udp = { path = "../../crates/peerbeam-discovery-udp" }
+peerbeam-discovery-mdns = { path = "../../crates/peerbeam-discovery-mdns" }
+peerbeam-discovery-tailscale = { path = "../../crates/peerbeam-discovery-tailscale" }
+peerbeam-crypto = { path = "../../crates/peerbeam-crypto" }
+peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
+peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
