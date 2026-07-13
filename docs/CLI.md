@@ -105,6 +105,30 @@ Over SSH without a TTY, or into a pipe, colour/progress/prompts disable
 automatically — no flags needed. Force non-interactive with `-y`, plain output
 with `--no-color` or `--json`.
 
+### JSON output (scripting)
+
+With `--json`, human text and progress bars are suppressed and each command
+emits machine-readable JSON (NDJSON for streaming/long-running commands):
+
+- `send --json` → one object per file: `{"event":"sent","file","bytes","peer","newly_trusted"}`.
+- `receive --json` / `daemon` → a `{"event":"listening","addr","port","dir"}`
+  line on start, then `{"event":"received","file","bytes","peer","newly_trusted"}`
+  per transfer (or `{"event":"error","message"}`).
+- `status --json` → `{"device_name","platform","transfer_port","save_directory","data_directory","providers":[…],"listening":bool}`.
+- `discover --json` → array (or NDJSON with `--watch`) of devices.
+
+Branch on the exit code for success/failure; parse the JSON for details.
+
+```bash
+# One-shot receive; print each received file name as it lands
+peerbeam --json receive --once --dir ./in | while read -r ev; do
+  echo "$ev" | jq -r 'select(.event=="received") | .file'
+done
+
+# Is a receiver already up on this host?
+peerbeam --json status | jq -e '.listening' >/dev/null && echo "listening"
+```
+
 ## Verification
 
 `cargo clippy -D warnings` clean; `cargo test` green (parse + resolver +

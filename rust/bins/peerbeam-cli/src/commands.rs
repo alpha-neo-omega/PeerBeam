@@ -622,33 +622,71 @@ fn print_devices(ctx: &Ctx, devices: &[ManagedDevice]) {
 
 fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
-    let enc = AeadCrypto::new();
-    let fp = enc.fingerprint(&enc.generate_keypair().public).0;
+    let port = config.transfer.port;
+
+    // Real provider availability (mirrors `doctor`, concise).
+    let udp_ok = std::net::UdpSocket::bind("0.0.0.0:0").is_ok();
+    let mdns_ok = peerbeam_discovery_mdns::MdnsDiscovery::new(crate::engine::device_id()).is_ok();
+    let tailscale_ok = std::process::Command::new("tailscale")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let mut providers = vec![];
+    if udp_ok {
+        providers.push("udp");
+    }
+    if mdns_ok {
+        providers.push("mdns");
+    }
+    if tailscale_ok {
+        providers.push("tailscale");
+    }
+
+    // Is a receiver already listening on the transfer port? Binding the UDP
+    // port fails with AddrInUse when the QUIC server holds it.
+    let listening = std::net::UdpSocket::bind(("0.0.0.0", port)).is_err();
+
     if ctx.json {
         ctx.json_line(&json!({
             "device_name": config.device.name,
+            "platform": peerbeam_platform::current().as_str(),
+            "transfer_port": port,
             "save_directory": config.storage.save_directory,
-            "fingerprint": fp,
-            "daemon_running": false,
-            "providers": ["udp", "mdns", "tailscale"],
+            "data_directory": config.storage.data_directory,
+            "providers": providers,
+            "listening": listening,
         }));
     } else {
-        ctx.line(&format!("{}  {}", ctx.bold("Device:"), config.device.name));
+        ctx.line(&format!("{}   {}", ctx.bold("Device:"), config.device.name));
+        ctx.line(&format!(
+            "{} {}",
+            ctx.bold("Platform:"),
+            peerbeam_platform::current().as_str()
+        ));
+        ctx.line(&format!("{}     {}", ctx.bold("Port:"), port));
         ctx.line(&format!(
             "{}  {}",
             ctx.bold("Save to:"),
             config.storage.save_directory
         ));
-        ctx.line(&format!("{} {}…", ctx.bold("Fingerprint:"), &fp[..16]));
         ctx.line(&format!(
-            "{}  {}",
+            "{} {}",
             ctx.bold("Providers:"),
-            "udp, mdns, tailscale"
+            if providers.is_empty() {
+                "none".to_string()
+            } else {
+                providers.join(", ")
+            }
         ));
         ctx.line(&format!(
-            "{}  {}",
-            ctx.bold("Daemon:"),
-            ctx.dim("not running")
+            "{} {}",
+            ctx.bold("Listening:"),
+            if listening {
+                ctx.green("yes")
+            } else {
+                ctx.dim("no")
+            }
         ));
     }
     Ok(())
@@ -811,8 +849,10 @@ async fn secure_send_file(
     let sess = authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust)
         .await
         .map_err(CliError::from)?;
-    if sess.newly_trusted {
-        ctx.line(&ctx.dim(&format!("pinned new peer {}", sess.peer_id.0)));
+    let newly_trusted = sess.newly_trusted;
+    let peer_id = sess.peer_id.0.clone();
+    if newly_trusted && !ctx.json {
+        ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
     }
 
     let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
@@ -840,7 +880,18 @@ async fn secure_send_file(
     };
     let (r, _) = tokio::join!(send, pump);
     r.map_err(CliError::from)?;
-    ctx.line(&ctx.green(&format!("sent {name}")));
+
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "sent",
+            "file": name,
+            "bytes": size,
+            "peer": peer_id,
+            "newly_trusted": newly_trusted,
+        }));
+    } else {
+        ctx.line(&ctx.green(&format!("sent {name}")));
+    }
     Ok(())
 }
 
@@ -863,11 +914,20 @@ async fn serve_loop(
         .serve_addr(Bind { port })
         .await
         .map_err(CliError::from)?;
-    ctx.line(&format!(
-        "listening on {} — saving to {}",
-        ctx.bold(&local.to_string()),
-        dir
-    ));
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "listening",
+            "addr": local.to_string(),
+            "port": local.port(),
+            "dir": dir,
+        }));
+    } else {
+        ctx.line(&format!(
+            "listening on {} — saving to {}",
+            ctx.bold(&local.to_string()),
+            dir
+        ));
+    }
 
     // Best-effort discoverability (so `send --to <name>` can find us).
     let engine = build_engine(config.clone());
@@ -877,7 +937,9 @@ async fn serve_loop(
         let mut link = match incoming.next().await {
             Some(Ok(l)) => l,
             Some(Err(e)) => {
-                ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
+                if !ctx.json {
+                    ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
+                }
                 continue;
             }
             None => break,
@@ -885,12 +947,20 @@ async fn serve_loop(
         let sess = match authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust).await {
             Ok(s) => s,
             Err(e) => {
-                ctx.line(&ctx.dim(&format!("auth failed: {e}")));
+                if ctx.json {
+                    ctx.json_line(
+                        &json!({"event": "error", "message": format!("auth failed: {e}")}),
+                    );
+                } else {
+                    ctx.line(&ctx.dim(&format!("auth failed: {e}")));
+                }
                 continue;
             }
         };
-        if sess.newly_trusted {
-            ctx.line(&ctx.dim(&format!("pinned new peer {}", sess.peer_id.0)));
+        let newly_trusted = sess.newly_trusted;
+        let peer_id = sess.peer_id.0.clone();
+        if newly_trusted && !ctx.json {
+            ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
         }
 
         let storage_ref = &storage;
@@ -902,13 +972,41 @@ async fn serve_loop(
             drop(ptx);
             r
         };
-        let pump = async move { while prx.recv().await.is_some() {} };
+        // Human progress bar (created lazily once the total size is known).
+        let pump = async move {
+            let mut bar: Option<crate::output::Bar> = None;
+            while let Some(p) = prx.recv().await {
+                if !ctx.json {
+                    let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
+                    b.update(p.transferred_bytes);
+                }
+            }
+            if let Some(b) = bar {
+                b.finish();
+            }
+        };
         let (r, _) = tokio::join!(recv, pump);
         match r {
             Ok(rcv) => {
-                ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)))
+                if ctx.json {
+                    ctx.json_line(&json!({
+                        "event": "received",
+                        "file": rcv.name,
+                        "bytes": rcv.bytes,
+                        "peer": peer_id,
+                        "newly_trusted": newly_trusted,
+                    }));
+                } else {
+                    ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
+                }
             }
-            Err(e) => ctx.line(&ctx.red(&format!("transfer failed: {e}"))),
+            Err(e) => {
+                if ctx.json {
+                    ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
+                } else {
+                    ctx.line(&ctx.red(&format!("transfer failed: {e}")));
+                }
+            }
         }
         if once {
             break;
