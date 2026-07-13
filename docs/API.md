@@ -164,3 +164,8 @@ Domain operations return `peerbeam_domain::error::Result<T>` with
 `DomainError` (`Storage`, `Transfer`, `Connection`, `Integrity`, `Cancelled`,
 …). Engine construction returns `EngineError`. Map these to your frontend's
 error surface — the CLI maps them to stable exit codes (see [CLI](CLI.md)).
+
+## Frontend bridge
+
+This document covers embedding the engine in Rust. The Flutter app instead uses
+the stable C-ABI bridge — see [FFI](FFI.md).

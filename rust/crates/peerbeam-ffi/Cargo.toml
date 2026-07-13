@@ -21,8 +21,15 @@ peerbeam-engine = { path = "../peerbeam-engine" }
 peerbeam-discovery-udp = { path = "../peerbeam-discovery-udp" }
 peerbeam-discovery-mdns = { path = "../peerbeam-discovery-mdns" }
 peerbeam-discovery-tailscale = { path = "../peerbeam-discovery-tailscale" }
+peerbeam-transfer = { path = "../peerbeam-transfer" }
+peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

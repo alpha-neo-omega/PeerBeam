@@ -171,3 +171,11 @@ rather than restarting. Cancellations and integrity failures are terminal
 Parallel chunks/files, per-chunk checksums, compression, and encryption are
 separate layers that compose onto this same pipeline. Empty directories are
 not transferred (only files and their parent paths).
+
+## Exposed to Flutter
+
+The transfer engine is driven from the Flutter app through the stable C-ABI
+bridge (`peerbeam-ffi`): id-addressed send/receive with accept/reject, pause/
+resume/cancel, live stats, and an ordered per-transfer event stream. No file
+bytes cross the boundary — only paths, ids, metadata, progress. See
+[FFI](FFI.md) (M2) for the API, event schema, and sequence diagrams.

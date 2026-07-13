@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// The C callback type Dart registers. Receives an owned `char*` (JSON) that
 /// the callee frees via `pb_free_string`.
@@ -19,8 +19,8 @@ pub fn set_callback(cb: Option<EventCallback>) {
     *CALLBACK.lock().unwrap() = cb;
 }
 
-/// Emit an event to Dart, if a callback is registered. Ownership of the string
-/// transfers to the callee (Dart frees it) — required because
+/// Emit a pre-built event value to Dart, if a callback is registered. Ownership
+/// of the string transfers to the callee (Dart frees it) — required because
 /// `NativeCallable.listener` processes it asynchronously on the Dart isolate.
 pub fn emit(event: &Value) {
     let cb = *CALLBACK.lock().unwrap();
@@ -29,4 +29,20 @@ pub fn emit(event: &Value) {
             cb(s.into_raw());
         }
     }
+}
+
+/// Alias for [`emit`] used where a full event object is already assembled.
+pub fn event(value: &Value) {
+    emit(value);
+}
+
+/// Emit a transfer event with the standard envelope: `type`, `transfer_id`,
+/// `timestamp`, `payload`.
+pub fn transfer(id: &str, ty: &str, payload: Value) {
+    emit(&json!({
+        "type": ty,
+        "transfer_id": id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": payload,
+    }));
 }

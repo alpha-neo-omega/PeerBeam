@@ -14,6 +14,7 @@ mod dto;
 mod error;
 mod events;
 mod runtime;
+mod transfer;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -135,6 +136,116 @@ pub extern "C" fn pb_discovery_stop() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn pb_devices_json() -> *mut c_char {
     guard(|| error::envelope(runtime::devices()))
+}
+
+// ── transfer ────────────────────────────────────────────────────
+
+/// Parse a JSON argument into a value.
+unsafe fn read_json(ptr: *const c_char) -> Result<Value, (Code, String)> {
+    let s = read_str(ptr)?;
+    serde_json::from_str(&s).map_err(|e| (Code::InvalidArgument, format!("bad json: {e}")))
+}
+
+/// Extract a required string `id` field.
+fn id_of(v: &Value) -> Result<String, (Code, String)> {
+    v.get("id")
+        .and_then(|i| i.as_str())
+        .map(|s| s.to_string())
+        .ok_or((Code::InvalidArgument, "id required".into()))
+}
+
+/// Queue file(s) to a peer: `{peer:{name,addresses[],port}, paths:[…]}` → `{ids}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_send(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            let v = read_json(json)?;
+            runtime::manager()?.send(&v)
+        })())
+    })
+}
+
+/// Queue a folder to a peer: `{peer, path}` → `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_send_folder(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            let v = read_json(json)?;
+            runtime::manager()?.send_folder(&v)
+        })())
+    })
+}
+
+/// Pause a transfer: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_pause(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.pause(&id_of(&read_json(json)?)?))()))
+}
+
+/// Resume a transfer: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_resume(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.resume(&id_of(&read_json(json)?)?))()))
+}
+
+/// Cancel a transfer: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_cancel(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.cancel(&id_of(&read_json(json)?)?))()))
+}
+
+/// Accept an incoming transfer: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_accept(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.accept(&id_of(&read_json(json)?)?))()))
+}
+
+/// Reject an incoming transfer: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_reject(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.reject(&id_of(&read_json(json)?)?))()))
+}
+
+/// All active transfers with live stats.
+#[no_mangle]
+pub extern "C" fn pb_transfers_active() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.active_list())()))
+}
+
+/// One transfer by id: `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_get(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.get(&id_of(&read_json(json)?)?))()))
+}
+
+/// Completed-transfer history.
+#[no_mangle]
+pub extern "C" fn pb_history_get() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.history())()))
 }
 
 #[cfg(test)]

@@ -2,26 +2,34 @@
 //! the high-level operations the FFI surface wraps. All async work lives here;
 //! FFI functions are thin and non-blocking (discovery start/stop are quick).
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tokio::runtime::{Builder, Runtime};
 
 use peerbeam_config::EngineConfig;
+use peerbeam_crypto::AeadCrypto;
 use peerbeam_discovery_mdns::MdnsDiscovery;
 use peerbeam_discovery_tailscale::{Config as TsConfig, TailscaleDiscovery};
 use peerbeam_discovery_udp::UdpDiscovery;
 use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::id::DeviceId;
-use peerbeam_engine::{Engine, EngineBuilder};
+use peerbeam_domain::port::EncryptionProvider;
+use peerbeam_engine::{Engine, EngineBuilder, RouteManager};
+use peerbeam_transfer::Identity;
+use peerbeam_transfer_quic::QuicTransport;
+use peerbeam_trust_fs::FsTrust;
 
 use crate::dto::DeviceDto;
 use crate::error::Code;
+use crate::transfer::Manager;
 use crate::{dto, events};
 
 static RT: OnceLock<Runtime> = OnceLock::new();
 static ENGINE: Mutex<Option<Arc<Engine>>> = Mutex::new(None);
 static ME: Mutex<Option<Device>> = Mutex::new(None);
+static MANAGER: Mutex<Option<Arc<Manager>>> = Mutex::new(None);
 
 type OpResult = Result<Value, (Code, String)>;
 
@@ -33,6 +41,23 @@ fn rt() -> &'static Runtime {
             .build()
             .expect("build tokio runtime")
     })
+}
+
+/// Spawn a background task on the shared runtime.
+pub fn spawn<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    rt().spawn(future);
+}
+
+/// The transfer manager, if initialised.
+pub fn manager() -> Result<Arc<Manager>, (Code, String)> {
+    MANAGER
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or((Code::NotInitialised, "engine not initialised".into()))
 }
 
 fn engine() -> Result<Arc<Engine>, (Code, String)> {
@@ -68,6 +93,10 @@ pub fn init(config_json: &str) -> OpResult {
             .map_err(|e| (Code::InvalidArgument, format!("bad config json: {e}")))?
     };
 
+    // quinn (QUIC) endpoint creation + spawns require a tokio runtime context;
+    // init runs on the caller's (Dart) thread, so enter the runtime here.
+    let _guard = rt().enter();
+
     let id = device_id();
     let mut builder =
         EngineBuilder::new(config.clone()).with_discovery(Arc::new(UdpDiscovery::new(id.clone())));
@@ -85,8 +114,37 @@ pub fn init(config_json: &str) -> OpResult {
         }
     });
 
+    // Transfer manager: its own QUIC transport (dial + serve) + identity.
+    let quic = Arc::new(QuicTransport::new().map_err(crate::error::from_domain)?);
+    let route_manager = Arc::new(RouteManager::new(quic.clone()));
+    let enc = Arc::new(AeadCrypto::new());
+    let keypair = enc.generate_keypair();
+    let identity = Identity {
+        device_id: id.clone(),
+        name: config.device.name.clone(),
+        keypair,
+    };
+    let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
+    let trust = Arc::new(FsTrust::open(trust_path).map_err(crate::error::from_domain)?);
+    let manager = Arc::new(Manager::new(
+        route_manager,
+        quic,
+        enc,
+        trust,
+        identity,
+        config.storage.save_directory.clone(),
+        config.device.auto_accept_trusted,
+        config.transfer.chunk_size as u32,
+    ));
+
+    // Start the receive server so accept/reject have incoming transfers.
+    let serving = manager.clone();
+    let port = config.transfer.port;
+    rt().spawn(async move { serving.serve(port).await });
+
     *ME.lock().unwrap() = Some(me(&config));
     *ENGINE.lock().unwrap() = Some(engine);
+    *MANAGER.lock().unwrap() = Some(manager);
     Ok(json!({ "initialised": true }))
 }
 
@@ -97,6 +155,7 @@ pub fn shutdown() {
     }
     *ENGINE.lock().unwrap() = None;
     *ME.lock().unwrap() = None;
+    *MANAGER.lock().unwrap() = None;
 }
 
 pub fn discovery_start() -> OpResult {

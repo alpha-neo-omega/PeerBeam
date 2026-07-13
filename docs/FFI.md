@@ -42,6 +42,96 @@ envelope/DTO shape. Error codes: `not_initialised`, `invalid_argument`,
 `connection`, `integrity`, `cancelled`, `storage`, `transfer`, `encryption`,
 `unimplemented`, `internal`.
 
+### Transfer (M2, additive — ABI still v1)
+
+```c
+char* pb_transfer_send(const char* json);        // {peer:{name,addresses[],port}, paths:[…]} → {ids:[…]}
+char* pb_transfer_send_folder(const char* json); // {peer, path} → {id}
+char* pb_transfer_pause(const char* json);       // {id}
+char* pb_transfer_resume(const char* json);      // {id}
+char* pb_transfer_cancel(const char* json);      // {id}
+char* pb_transfer_accept(const char* json);      // {id}  approve an incoming transfer
+char* pb_transfer_reject(const char* json);      // {id}
+char* pb_transfers_active(void);                 // {transfers:[{id,direction,peer,file,status,stats}]}
+char* pb_transfer_get(const char* json);         // {id} → {transfer} | invalid_argument
+char* pb_history_get(void);                       // {history:[…]}
+```
+
+`pb_init` also starts a **receive server** on `transfer.port` so incoming
+transfers can be accepted/rejected. `subscribe_to_transfer_events` is the M1
+`pb_set_event_callback` — one stream carries everything, tagged by `type`.
+
+**Stats** (in `transfer_progress` and `pb_transfer_get`):
+`{transferred_bytes, total_bytes, current_speed, average_speed, eta_secs}`.
+
+### Transfer events
+
+Every transfer event: `{ "type", "transfer_id", "timestamp": <rfc3339>,
+"payload": {…} }`. Types: `transfer_queued`, `transfer_started`,
+`transfer_progress` (payload = `{stats, file}`), `transfer_paused`,
+`transfer_resumed`, `transfer_retrying`, `transfer_completed`,
+`transfer_cancelled`, `transfer_failed` (payload = `{error:{code,message}}`),
+plus `history_updated`. Per-transfer ordering is guaranteed — each transfer's
+events are emitted from its own task in sequence.
+
+### Concurrency & performance
+
+Multiple transfers run at once, each its own background task on the shared
+runtime (they continue across UI navigation). Control (pause/resume/cancel) is
+by id via a shared `TransferControl`. **No file bytes cross FFI** — send takes
+paths, receive writes to the configured save directory; only ids, metadata,
+progress, and stats are marshalled. Folder receive is dispatched FFI-side with a
+`PeekLink` (peek the first frame → file vs folder receiver), so the transfer
+engine's public API is unchanged.
+
+### Sequence diagrams
+
+**Send**
+```
+Flutter        FFI (Rust)                         Peer
+  │ pb_transfer_send({peer,paths})                 │
+  │──────────────▶ register + spawn task           │
+  │◀── {ids}                                        │
+  │            emit transfer_queued                 │
+  │            RouteManager.connect ──── dial ─────▶│
+  │            authenticate ⇄ SecureLink ⇄─────────▶│
+  │            emit transfer_started                │
+  │            send_file (streamed) ───chunks──────▶│
+  │◀ transfer_progress (× N, ordered)               │
+  │◀ transfer_completed + history_updated           │
+```
+
+**Receive**
+```
+Peer                 FFI (Rust)                    Flutter
+  │── dial ──────────▶ accept + authenticate        │
+  │                    emit transfer_queued ────────▶│ (shows approval)
+  │  (parked)          await approval                │
+  │                    ◀───────── pb_transfer_accept │
+  │                    emit transfer_started ───────▶│
+  │── chunks ────────▶ receive_file (to save dir)    │
+  │                    ◀ transfer_progress ─────────▶│
+  │                    emit transfer_completed ─────▶│
+```
+(reject → `pb_transfer_reject` → connection closed, `transfer_cancelled`.)
+
+**Cancel**
+```
+Flutter        FFI (Rust)                          Peer
+  │ pb_transfer_cancel({id})                         │
+  │──────────────▶ TransferControl.cancel()          │
+  │◀ {cancelling:true}                               │
+  │            send/receive loop observes cancel ───▶│ Cancel frame
+  │◀ transfer_cancelled                              │
+```
+
+**Resume** (pause → resume; byte-level resume is engine-side)
+```
+Flutter        FFI (Rust)
+  │ pb_transfer_pause({id}) ─▶ TransferControl.pause()  →  ◀ transfer_paused
+  │ pb_transfer_resume({id})─▶ TransferControl.resume() →  ◀ transfer_resumed
+```
+
 ## Events (no polling)
 
 On `pb_init`, Rust spawns a forwarder subscribing to the engine's device-change
@@ -79,9 +169,13 @@ library into each Flutter runner) is wired in the Dart-integration milestone.
 - **M1 (done):** foundation — versioning, init/shutdown, event callback, error
   envelope, panic guard, tokio runtime + engine lifecycle, discovery
   (start/stop/list) + device events. Rust + dlopen FFI tests pass.
-- **M2:** transfer ops (send / send-folder / receive / pause / resume / cancel)
-  + progress/stats events, wrapping `RouteManager` + the recovery driver.
-- **M3:** clipboard, settings, history, daemon, status, logs.
+- **M2 (done):** transfer ops (send / send-folder / receive+accept/reject /
+  pause / resume / cancel), active/get/history state, live stats, and the full
+  transfer event set — wrapping RouteManager + authenticate + SecureLink. Real
+  E2E tests over QUIC (send-out, receive-in with accept), events/ordering,
+  stats, history. Route migration on the FFI path is deferred (SecureLink
+  lifetimes); pause/resume/cancel work.
+- **M3:** clipboard, settings, daemon, status, logs.
 - **M4:** Dart bridge (`flutter/lib/bridge/*`) — typed wrappers, models, event
   stream, typed exceptions — wire the stores, add platform build glue, Flutter
   integration + leak tests.
