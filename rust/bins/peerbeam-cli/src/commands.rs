@@ -1070,6 +1070,12 @@ fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
             "IPv6 address '{s}' must be bracketed — use [<addr>]:<port>"
         )));
     }
+    if s.starts_with('[') {
+        // Bracketed IPv6 that still failed: missing/invalid trailing port.
+        return Err(CliError::Usage(format!(
+            "IPv6 address '{s}' needs a valid trailing port — use [<addr>]:<port>"
+        )));
+    }
     Err(CliError::Usage(format!("bad address {s}: not resolvable")))
 }
 

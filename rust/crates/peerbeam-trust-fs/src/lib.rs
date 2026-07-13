@@ -7,7 +7,8 @@
 //! device reusing the id, or a man-in-the-middle) and must be rejected.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use peerbeam_domain::entity::TrustRecord;
@@ -49,15 +50,30 @@ impl FsTrust {
         let records: Vec<&TrustRecord> = cache.values().collect();
         let json = serde_json::to_vec_pretty(&records)
             .map_err(|e| DomainError::Storage(format!("serialize trust store: {e}")))?;
-        // Atomic: write to a temp file next to the target, then rename over it.
-        // A crash mid-write leaves the previous store intact rather than a
-        // truncated file that fails to parse (losing every pin).
-        let tmp = self.path.with_extension("json.tmp");
+        // Atomic: write to a *uniquely-named* temp file next to the target, then
+        // rename over it. A crash mid-write leaves the previous store intact
+        // rather than a truncated file that fails to parse (losing every pin).
+        // The temp name is per-process + per-call unique so two instances
+        // sharing this store can't rename the same temp out from under each
+        // other (which would ENOENT one of them).
+        let tmp = unique_tmp(&self.path);
         std::fs::write(&tmp, json)
             .map_err(|e| DomainError::Storage(format!("write trust store: {e}")))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| DomainError::Storage(format!("commit trust store: {e}")))
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DomainError::Storage(format!("commit trust store: {e}"))
+        })
     }
+}
+
+/// A temp path next to `path`, unique per process and per call, so concurrent
+/// writers never share a temp file.
+fn unique_tmp(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(s)
 }
 
 impl TrustStore for FsTrust {
@@ -121,6 +137,32 @@ mod tests {
                 .fingerprint,
             "fp-xyz"
         );
+    }
+
+    #[test]
+    fn concurrent_writers_on_same_path_do_not_collide() {
+        // Two independent stores on the same file (as two processes would be)
+        // persisting concurrently must never fail — a shared fixed temp name
+        // would ENOENT one writer whose temp the other already renamed away.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let a = std::sync::Arc::new(FsTrust::open(&path).unwrap());
+        let b = std::sync::Arc::new(FsTrust::open(&path).unwrap());
+        let mut handles = Vec::new();
+        for i in 0..25 {
+            let (a, b) = (a.clone(), b.clone());
+            handles.push(std::thread::spawn(move || {
+                a.record(record(&format!("a-{i}"), "fp"))
+                    .expect("a persist");
+                b.record(record(&format!("b-{i}"), "fp"))
+                    .expect("b persist");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // The final file is valid JSON (last-writer-wins content is fine).
+        FsTrust::open(&path).expect("store still parses after concurrent writes");
     }
 
     #[test]

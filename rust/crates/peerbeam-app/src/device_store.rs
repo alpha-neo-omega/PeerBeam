@@ -260,9 +260,24 @@ fn merge(existing: &Device, incoming: &Device, take_identity: bool) -> Device {
         }
     }
     if take_identity {
+        // The owner decides identity — but a blank name / zero port from the
+        // owner must not clobber good data another sighting already supplied.
         return Device {
+            id: existing.id.clone(),
+            name: if incoming.name.is_empty() {
+                existing.name.clone()
+            } else {
+                incoming.name.clone()
+            },
+            device_type: incoming.device_type,
+            platform: incoming.platform,
+            port: if incoming.port == 0 {
+                existing.port
+            } else {
+                incoming.port
+            },
             addresses,
-            ..incoming.clone()
+            last_seen: incoming.last_seen,
         };
     }
     Device {
@@ -429,6 +444,29 @@ mod tests {
         assert_eq!(
             snap[0].device.name, "Alice-TS",
             "ownership transferred to tailscale"
+        );
+    }
+
+    #[test]
+    fn owner_blank_resight_does_not_clobber() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "10.0.0.1")),
+        );
+        // The owner re-sights with a degraded packet (blank name, port 0). It
+        // must NOT wipe the good identity (would otherwise flap ""/0 ↔ real).
+        let mut blank = device("a", "", "10.0.0.1");
+        blank.port = 0;
+        store.observe(&ProviderId::from("udp"), DiscoveryEvent::Found(blank));
+        let snap = store.snapshot();
+        assert_eq!(
+            snap[0].device.name, "Alice",
+            "owner blank must not wipe name"
+        );
+        assert_eq!(
+            snap[0].device.port, 9000,
+            "owner zero port must not wipe port"
         );
     }
 

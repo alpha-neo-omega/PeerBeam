@@ -137,9 +137,24 @@ fn merge_devices(existing: &Device, incoming: &Device, take_identity: bool) -> D
         }
     }
     if take_identity {
+        // Owner decides identity, but never let a blank name / zero port
+        // overwrite good data a prior sighting already supplied.
         return Device {
+            id: existing.id.clone(),
+            name: if incoming.name.is_empty() {
+                existing.name.clone()
+            } else {
+                incoming.name.clone()
+            },
+            device_type: incoming.device_type,
+            platform: incoming.platform,
+            port: if incoming.port == 0 {
+                existing.port
+            } else {
+                incoming.port
+            },
             addresses,
-            ..incoming.clone()
+            last_seen: incoming.last_seen,
         };
     }
     Device {

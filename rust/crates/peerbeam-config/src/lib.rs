@@ -6,6 +6,7 @@
 //! override individual fields before building the engine.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -162,10 +163,20 @@ impl EngineConfig {
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        // Atomic write: temp + rename, so an interrupted save can't leave a
-        // truncated config that fails to parse on next load.
-        let tmp = path.with_extension("json.tmp");
+        // Atomic write: uniquely-named temp + rename, so an interrupted save
+        // can't leave a truncated config, and concurrent savers don't rename
+        // the same temp out from under each other.
+        let tmp = {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut s = path.as_os_str().to_owned();
+            s.push(format!(".{}.{}.tmp", std::process::id(), n));
+            std::path::PathBuf::from(s)
+        };
         std::fs::write(&tmp, json).map_err(|e| ConfigError::Io(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| ConfigError::Io(e.to_string()))
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            ConfigError::Io(e.to_string())
+        })
     }
 }

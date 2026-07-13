@@ -6,7 +6,8 @@
 //! was in flight and how far it got, so it can be resumed rather than
 //! restarted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -45,13 +46,16 @@ impl ReliabilityStore for FsReliability {
         let json = serde_json::to_vec_pretty(session)
             .map_err(|e| DomainError::Storage(format!("serialize checkpoint: {e}")))?;
         let path = self.path_for(&session.id);
-        // Atomic write: temp + rename, so a crash mid-write can't corrupt an
-        // existing checkpoint (which would forfeit resume).
-        let tmp = path.with_extension("json.tmp");
+        // Atomic write: uniquely-named temp + rename, so a crash mid-write can't
+        // corrupt an existing checkpoint (which would forfeit resume), and two
+        // writers to the same checkpoint can't rename the same temp away.
+        let tmp = unique_tmp(&path);
         std::fs::write(&tmp, json)
             .map_err(|e| DomainError::Storage(format!("write checkpoint: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| DomainError::Storage(format!("commit checkpoint: {e}")))
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DomainError::Storage(format!("commit checkpoint: {e}"))
+        })
     }
 
     fn load_checkpoint(&self, transfer: &TransferId) -> Result<Option<TransferSession>> {
@@ -82,6 +86,15 @@ impl ReliabilityStore for FsReliability {
             Err(e) => Err(DomainError::Storage(format!("clear checkpoint: {e}"))),
         }
     }
+}
+
+/// A temp path next to `path`, unique per process and per call.
+fn unique_tmp(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{}.{}.tmp", std::process::id(), n));
+    PathBuf::from(s)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
