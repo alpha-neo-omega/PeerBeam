@@ -105,6 +105,7 @@ design**, with authentication done at the application layer (X25519 mutual auth
 | 5 | Version is 0.2.0, not 1.0.0; no tags | **Blocker for “Stable”** | ⚠ Not bumped — decision is RC, not Stable (see below) |
 | 6 | Cross-platform / transport matrix largely unverified | **Blocker for “Stable”** | ⚪ Environment-limited |
 | 7 | No README badges/screenshots | Low | Open (cosmetic) |
+| 8 | **App shipped the default Flutter logo** on Android/macOS/Windows (only Linux packaging used the custom bolt) — missed in the initial audit pass | High | ✓ Fixed — `flutter_launcher_icons` wired to a single brand master (`packaging/icon-1024.png`, rendered from `peerbeam.svg`); all platform launcher icons regenerated and visually verified |
 
 ## Verdict
 

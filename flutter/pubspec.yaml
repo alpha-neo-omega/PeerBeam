@@ -62,6 +62,11 @@ dev_dependencies:
   # Windows MSIX installer generator (`dart run msix:create`).
   msix: ^3.16.0
 
+  # App-icon generator. Regenerates Android/macOS/Windows launcher icons from
+  # the brand master (`dart run flutter_launcher_icons`). Master is rendered
+  # from packaging/linux/peerbeam.svg.
+  flutter_launcher_icons: ^0.14.4
+
 # MSIX packaging (Windows). Signing cert is supplied at build time via env, not
 # committed — see docs/RELEASE.md. `dart run msix:create`.
 msix_config:
@@ -72,6 +77,20 @@ msix_config:
   logo_path: ../packaging/windows/peerbeam.png
   capabilities: "internetClient,privateNetworkClientServer"
   install_certificate: false
+
+# App-icon generation. Single brand source → all platform launcher icons.
+# Regenerate: `dart run flutter_launcher_icons`.
+flutter_launcher_icons:
+  image_path: "../packaging/icon-1024.png"
+  android: true
+  min_sdk_android: 21
+  macos:
+    generate: true
+    image_path: "../packaging/icon-1024.png"
+  windows:
+    generate: true
+    image_path: "../packaging/icon-1024.png"
+    icon_size: 256
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
