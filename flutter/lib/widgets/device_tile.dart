@@ -15,8 +15,7 @@ class DeviceTile extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
 
-    final reachText =
-        device.reach.map((r) => r.label).join(' and ');
+    final reachText = device.reach.map((r) => r.label).join(' and ');
     final latency = device.latencyMs != null ? ', ${device.latencyMs} ms' : '';
     final semantic =
         '${device.name}, ${device.kind.label}, ${device.online ? 'online' : 'offline'}, '
@@ -29,51 +28,58 @@ class DeviceTile extends StatelessWidget {
         child: Card(
           child: InkWell(
             onTap: device.online ? onSend : null,
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  _Avatar(device: device),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          device.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.titleSmall
-                              ?.copyWith(fontWeight: FontWeight.w600),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          device.online
-                              ? '${device.kind.label} · Online$latency'
-                              : '${device.kind.label} · Offline',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.bodySmall
-                              ?.copyWith(color: scheme.onSurfaceVariant),
-                        ),
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 4,
-                          children: [
-                            for (final r in device.reach) _ReachChip(reach: r),
-                          ],
-                        ),
-                      ],
+            // Offline devices are dimmed so reachable ones stand out.
+            child: Opacity(
+              opacity: device.online ? 1 : 0.55,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    _Avatar(device: device),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            device.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: text.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            device.online
+                                ? '${device.kind.label} · Online$latency'
+                                : '${device.kind.label} · Offline',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: text.bodySmall?.copyWith(
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            children: [
+                              for (final r in device.reach)
+                                _ReachChip(reach: r),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton.filledTonal(
-                    onPressed: device.online ? onSend : null,
-                    icon: const Icon(Icons.send_rounded),
-                    tooltip: 'Send to ${device.name}',
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    IconButton.filledTonal(
+                      onPressed: device.online ? onSend : null,
+                      icon: const Icon(Icons.send_rounded),
+                      tooltip: 'Send to ${device.name}',
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -144,9 +150,9 @@ class _ReachChip extends StatelessWidget {
           Text(
             reach.label,
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: scheme.onSecondaryContainer,
-                  fontWeight: FontWeight.w600,
-                ),
+              color: scheme.onSecondaryContainer,
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ],
       ),

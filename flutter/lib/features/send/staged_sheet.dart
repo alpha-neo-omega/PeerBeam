@@ -42,8 +42,9 @@ class _StagedSheet extends StatelessWidget {
                     children: [
                       Text(
                         'Ready to send',
-                        style: text.titleLarge
-                            ?.copyWith(fontWeight: FontWeight.w700),
+                        style: text.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                       const Spacer(),
                       if (items.isNotEmpty)
@@ -59,8 +60,9 @@ class _StagedSheet extends StatelessWidget {
                     padding: const EdgeInsets.all(32),
                     child: Text(
                       'No files staged.',
-                      style: text.bodyMedium
-                          ?.copyWith(color: scheme.onSurfaceVariant),
+                      style: text.bodyMedium?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   )
                 else
@@ -102,8 +104,9 @@ class _StagedSheet extends StatelessWidget {
                           items.isEmpty
                               ? ''
                               : '${items.length} item(s) · ${formatBytes(staging.totalBytes)}',
-                          style: text.bodyMedium
-                              ?.copyWith(color: scheme.onSurfaceVariant),
+                          style: text.bodyMedium?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
                         ),
                       ),
                       FilledButton.icon(
@@ -111,13 +114,13 @@ class _StagedSheet extends StatelessWidget {
                             ? null
                             : () {
                                 Navigator.pop(context);
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text(
-                                      'Sending wires in with the engine bridge',
+                                ScaffoldMessenger.of(context)
+                                  ..hideCurrentSnackBar()
+                                  ..showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Sending is coming soon'),
                                     ),
-                                  ),
-                                );
+                                  );
                               },
                         icon: const Icon(Icons.send_rounded),
                         label: Text('Send ${items.length}'),

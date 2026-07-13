@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 
 import '../features/send/drop_zone.dart';
@@ -21,9 +22,9 @@ class AppShell extends StatelessWidget {
   ];
 
   void _go(int index) => navigationShell.goBranch(
-        index,
-        initialLocation: index == navigationShell.currentIndex,
-      );
+    index,
+    initialLocation: index == navigationShell.currentIndex,
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -36,66 +37,99 @@ class AppShell extends StatelessWidget {
 
     // Transfer badge count reacts only to the transfer store.
     Widget badgedIcon(Widget icon) => AnimatedBuilder(
-          animation: state.transfer,
-          builder: (context, _) {
-            final n = state.transfer.activeCount;
-            return Badge(
-              isLabelVisible: n > 0,
-              label: Text('$n'),
-              child: icon,
-            );
-          },
-        );
+      animation: state.transfer,
+      builder: (context, _) {
+        final n = state.transfer.activeCount;
+        return Badge(isLabelVisible: n > 0, label: Text('$n'), child: icon);
+      },
+    );
 
     if (width < Breakpoints.compact) {
-      return Scaffold(
-        body: body,
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: index,
-          onDestinationSelected: _go,
-          destinations: [
-            for (var i = 0; i < _destinations.length; i++)
-              NavigationDestination(
-                icon: _wrapBadge(i, _destinations[i].iconOf(false), badgedIcon),
-                selectedIcon:
-                    _wrapBadge(i, _destinations[i].iconOf(true), badgedIcon),
-                label: _destinations[i].label,
-                tooltip: _destinations[i].label,
-              ),
-          ],
+      return _withShortcuts(
+        Scaffold(
+          body: body,
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: index,
+            onDestinationSelected: _go,
+            destinations: [
+              for (var i = 0; i < _destinations.length; i++)
+                NavigationDestination(
+                  icon: _wrapBadge(
+                    i,
+                    _destinations[i].iconOf(false),
+                    badgedIcon,
+                  ),
+                  selectedIcon: _wrapBadge(
+                    i,
+                    _destinations[i].iconOf(true),
+                    badgedIcon,
+                  ),
+                  label: _destinations[i].label,
+                  tooltip: _destinations[i].label,
+                ),
+            ],
+          ),
         ),
       );
     }
 
     final extended = width >= Breakpoints.medium;
-    return Scaffold(
-      body: Row(
-        children: [
-          NavigationRail(
-            selectedIndex: index,
-            onDestinationSelected: _go,
-            extended: extended,
-            labelType: extended ? null : NavigationRailLabelType.all,
-            leading: _RailLeading(extended: extended),
-            destinations: [
-              for (var i = 0; i < _destinations.length; i++)
-                NavigationRailDestination(
-                  icon: _wrapBadge(i, _destinations[i].iconOf(false), badgedIcon),
-                  selectedIcon:
-                      _wrapBadge(i, _destinations[i].iconOf(true), badgedIcon),
-                  label: Text(_destinations[i].label),
-                ),
-            ],
-          ),
-          const VerticalDivider(width: 1, thickness: 1),
-          Expanded(child: body),
-        ],
+    return _withShortcuts(
+      Scaffold(
+        body: Row(
+          children: [
+            NavigationRail(
+              selectedIndex: index,
+              onDestinationSelected: _go,
+              extended: extended,
+              labelType: extended ? null : NavigationRailLabelType.all,
+              leading: _RailLeading(extended: extended),
+              destinations: [
+                for (var i = 0; i < _destinations.length; i++)
+                  NavigationRailDestination(
+                    icon: _wrapBadge(
+                      i,
+                      _destinations[i].iconOf(false),
+                      badgedIcon,
+                    ),
+                    selectedIcon: _wrapBadge(
+                      i,
+                      _destinations[i].iconOf(true),
+                      badgedIcon,
+                    ),
+                    label: Text(_destinations[i].label),
+                  ),
+              ],
+            ),
+            const VerticalDivider(width: 1, thickness: 1),
+            Expanded(child: body),
+          ],
+        ),
       ),
     );
   }
 
   Widget _wrapBadge(int i, Widget icon, Widget Function(Widget) badge) =>
       i == 1 ? badge(icon) : icon;
+
+  /// Desktop keyboard navigation: Ctrl/⌘ + 1..4 jumps to a destination.
+  Widget _withShortcuts(Widget child) {
+    const keys = [
+      LogicalKeyboardKey.digit1,
+      LogicalKeyboardKey.digit2,
+      LogicalKeyboardKey.digit3,
+      LogicalKeyboardKey.digit4,
+    ];
+    final bindings = <ShortcutActivator, VoidCallback>{};
+    for (var i = 0; i < keys.length; i++) {
+      bindings[SingleActivator(keys[i], control: true)] = () => _go(i);
+      bindings[SingleActivator(keys[i], meta: true)] = () => _go(i);
+    }
+    return CallbackShortcuts(
+      bindings: bindings,
+      child: Focus(autofocus: true, child: child),
+    );
+  }
 }
 
 class _Dest {
@@ -127,16 +161,19 @@ class _RailLeading extends StatelessWidget {
               ),
               borderRadius: BorderRadius.circular(10),
             ),
-            child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 22),
+            child: const Icon(
+              Icons.bolt_rounded,
+              color: Colors.white,
+              size: 22,
+            ),
           ),
           if (extended) ...[
             const SizedBox(width: 10),
             Text(
               'PeerBeam',
-              style: Theme.of(context)
-                  .textTheme
-                  .titleMedium
-                  ?.copyWith(fontWeight: FontWeight.w700),
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
           ],
         ],

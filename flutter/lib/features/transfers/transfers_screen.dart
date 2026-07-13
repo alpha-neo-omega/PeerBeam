@@ -84,13 +84,15 @@ class _TransferCard extends StatelessWidget {
                         transfer.fileName,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style:
-                            text.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                        style: text.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                       Text(
                         '${sending ? 'To' : 'From'} ${transfer.peerName} · ${transfer.state.label}',
-                        style: text.bodySmall
-                            ?.copyWith(color: scheme.onSurfaceVariant),
+                        style: text.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
                       ),
                     ],
                   ),
@@ -100,7 +102,7 @@ class _TransferCard extends StatelessWidget {
             const SizedBox(height: 14),
             TweenAnimationBuilder<double>(
               tween: Tween(begin: 0, end: transfer.progress),
-              duration: AppMotion.slow,
+              duration: AppMotion.duration(context, AppMotion.slow),
               curve: AppMotion.curve,
               builder: (context, value, _) => ClipRRect(
                 borderRadius: BorderRadius.circular(8),
@@ -116,8 +118,9 @@ class _TransferCard extends StatelessWidget {
               children: [
                 Text(
                   '${formatBytes(transfer.doneBytes)} / ${formatBytes(transfer.totalBytes)}',
-                  style: text.bodySmall
-                      ?.copyWith(color: scheme.onSurfaceVariant),
+                  style: text.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
                 ),
                 const Spacer(),
                 IconButton(

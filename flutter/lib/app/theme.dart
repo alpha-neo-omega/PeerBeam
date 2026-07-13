@@ -13,7 +13,10 @@ class PeerBeamTheme {
   static ThemeData dark() => _build(Brightness.dark);
 
   static ThemeData _build(Brightness brightness) {
-    final scheme = ColorScheme.fromSeed(seedColor: seed, brightness: brightness);
+    final scheme = ColorScheme.fromSeed(
+      seedColor: seed,
+      brightness: brightness,
+    );
     final base = ThemeData(colorScheme: scheme, useMaterial3: true);
 
     return base.copyWith(
@@ -50,7 +53,9 @@ class PeerBeamTheme {
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
         ),
       ),
       listTileTheme: const ListTileThemeData(
@@ -74,6 +79,26 @@ class AppMotion {
   static const Duration slow = Duration(milliseconds: 420);
   static const Curve curve = Curves.easeOutCubic;
   static const Curve emphasized = Curves.easeInOutCubicEmphasized;
+
+  /// Respect the OS "reduce motion" accessibility setting: `false` when the
+  /// platform asks animations to be disabled. Decorative motion should be
+  /// skipped when this is `false`.
+  static bool enabled(BuildContext context) =>
+      !MediaQuery.of(context).disableAnimations;
+
+  /// A duration that collapses to zero when reduced motion is requested, so
+  /// implicit animations resolve instantly instead of moving.
+  static Duration duration(BuildContext context, Duration normal) =>
+      enabled(context) ? normal : Duration.zero;
+}
+
+/// Semantic colours not carried by the [ColorScheme] (kept consistent in one
+/// place). Presence green is the same in light and dark.
+class AppColors {
+  AppColors._();
+
+  /// Online / success presence indicator.
+  static const Color online = Color(0xFF22C55E);
 }
 
 /// Layout breakpoints (Material 3 window size classes, simplified).

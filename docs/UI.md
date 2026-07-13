@@ -60,11 +60,37 @@ staged-files sheet opens for review (per-file remove, running total). Staging
 lives in a pure `StagingStore` (dedup by path), unit-tested independently of
 any native drag.
 
+## UX polish pass
+
+A dedicated pass over the whole app (no new features — experience only):
+
+- **Accessibility — reduced motion.** All decorative animation now respects the
+  OS "reduce motion" setting via `AppMotion.enabled(context)` /
+  `AppMotion.duration(context, …)`. The presence-dot pulse stops, list
+  entrance stagger (`Appear`) resolves instantly, the empty-state icon skips its
+  scale-in, and transfer progress jumps rather than tweening. Screen-reader
+  labels/semantics were already in place (device tiles, quick actions, status).
+- **Keyboard shortcuts.** Desktop navigation with **Ctrl/⌘ + 1–4** to jump to
+  Home / Transfers / History / Settings (`CallbackShortcuts` at the shell).
+- **Destructive-action confirmation.** "Clear history" now asks for confirmation
+  ("cannot be undone") before wiping records.
+- **Copy.** User-facing placeholder text is friendly ("… is coming soon")
+  instead of developer wording; snackbars replace the previous one instead of
+  stacking.
+- **Visual hierarchy.** Offline device tiles are dimmed so reachable peers stand
+  out.
+- **Theme consistency.** The online/success green is a single semantic token
+  (`AppColors.online`) rather than a per-widget literal; motion tokens
+  (`AppMotion`) remain the single source for durations/curves.
+
+These are covered by widget tests in `test/ux_test.dart` (reduced-motion pulse,
+keyboard tab switch) plus the existing regression tests.
+
 ## Verification
 
-`flutter analyze` — no issues. `flutter test` — boots-to-Home smoke test
-passes. (Native desktop/Android builds require their platform toolchains,
-not run here.)
+`flutter analyze` — no issues. `flutter test` — all pass (smoke, drop-zone,
+staging, platform, regression, desktop, and UX polish tests). (Native
+desktop/Android builds require their platform toolchains, not run here.)
 
 ## Not yet
 

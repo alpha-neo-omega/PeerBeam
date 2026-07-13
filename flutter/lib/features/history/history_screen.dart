@@ -10,6 +10,31 @@ import '../../widgets/common.dart';
 class HistoryScreen extends StatelessWidget {
   const HistoryScreen({super.key});
 
+  /// Confirm before clearing — a destructive, irreversible action.
+  Future<void> _confirmClear(BuildContext context) async {
+    final state = AppScope.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear history?'),
+        content: const Text(
+          'This removes all completed-transfer records. It cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) state.history.clear();
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
@@ -21,8 +46,9 @@ class HistoryScreen extends StatelessWidget {
             animation: state.history,
             builder: (context, _) => IconButton(
               tooltip: 'Clear history',
-              onPressed:
-                  state.history.items.isEmpty ? null : state.history.clear,
+              onPressed: state.history.items.isEmpty
+                  ? null
+                  : () => _confirmClear(context),
               icon: const Icon(Icons.delete_sweep_rounded),
             ),
           ),
@@ -65,8 +91,7 @@ class _HistoryRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final sending = item.direction == TransferDirection.sending;
-    final statusColor =
-        item.success ? const Color(0xFF22C55E) : scheme.error;
+    final statusColor = item.success ? const Color(0xFF22C55E) : scheme.error;
 
     return Card(
       margin: const EdgeInsets.only(bottom: 10),

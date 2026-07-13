@@ -16,9 +16,18 @@ class Appear extends StatefulWidget {
 class _AppearState extends State<Appear> {
   bool _visible = false;
 
+  bool _scheduled = false;
+
   @override
-  void initState() {
-    super.initState();
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_scheduled) return;
+    _scheduled = true;
+    // Reduced motion: appear immediately, no stagger.
+    if (!AppMotion.enabled(context)) {
+      _visible = true;
+      return;
+    }
     final delay = Duration(milliseconds: (widget.index * 45).clamp(0, 320));
     Future.delayed(delay, () {
       if (mounted) setState(() => _visible = true);
@@ -27,13 +36,14 @@ class _AppearState extends State<Appear> {
 
   @override
   Widget build(BuildContext context) {
+    final d = AppMotion.duration(context, AppMotion.medium);
     return AnimatedSlide(
       offset: _visible ? Offset.zero : const Offset(0, 0.06),
-      duration: AppMotion.medium,
+      duration: d,
       curve: AppMotion.curve,
       child: AnimatedOpacity(
         opacity: _visible ? 1 : 0,
-        duration: AppMotion.medium,
+        duration: d,
         curve: AppMotion.curve,
         child: widget.child,
       ),

@@ -15,9 +15,9 @@ class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
 
   void _todo(BuildContext context, String what) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('$what — wiring lands with the engine bridge')),
-    );
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('$what is coming soon')));
   }
 
   /// Pick files with the native picker (desktop) and open the staged sheet.
@@ -44,8 +44,9 @@ class HomeScreen extends StatelessWidget {
       body: SafeArea(
         child: Center(
           child: ConstrainedBox(
-            constraints:
-                const BoxConstraints(maxWidth: Breakpoints.contentMaxWidth),
+            constraints: const BoxConstraints(
+              maxWidth: Breakpoints.contentMaxWidth,
+            ),
             child: AnimatedBuilder(
               animation: state.device,
               builder: (context, _) {
@@ -118,7 +119,9 @@ class HomeScreen extends StatelessWidget {
                                 size: 18,
                               ),
                             ),
-                            label: Text(state.device.scanning ? 'Stop' : 'Scan'),
+                            label: Text(
+                              state.device.scanning ? 'Stop' : 'Scan',
+                            ),
                           ),
                         ),
                       ),
@@ -141,11 +144,11 @@ class HomeScreen extends StatelessWidget {
                         sliver: SliverGrid.builder(
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
-                            maxCrossAxisExtent: 420,
-                            mainAxisExtent: 132,
-                            crossAxisSpacing: 12,
-                            mainAxisSpacing: 12,
-                          ),
+                                maxCrossAxisExtent: 420,
+                                mainAxisExtent: 132,
+                                crossAxisSpacing: 12,
+                                mainAxisSpacing: 12,
+                              ),
                           itemCount: devices.length,
                           itemBuilder: (context, i) => Appear(
                             index: i,

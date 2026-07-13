@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../app/theme.dart';
+
 /// A presence indicator. Online dots pulse; offline are muted. The state is
 /// exposed via [Semantics] (and callers pair it with text elsewhere), so it is
 /// never conveyed by colour alone.
@@ -19,22 +21,12 @@ class _StatusDotState extends State<StatusDot>
   @override
   void initState() {
     super.initState();
-    // Created eagerly so dispose() never has to lazily build a ticker.
+    // Created eagerly so dispose() never has to lazily build a ticker. The
+    // repeat is started/stopped in build() (which can read reduced-motion).
     _c = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1600),
     );
-    if (widget.online) _c.repeat();
-  }
-
-  @override
-  void didUpdateWidget(StatusDot old) {
-    super.didUpdateWidget(old);
-    if (widget.online && !_c.isAnimating) {
-      _c.repeat();
-    } else if (!widget.online && _c.isAnimating) {
-      _c.stop();
-    }
   }
 
   @override
@@ -46,7 +38,15 @@ class _StatusDotState extends State<StatusDot>
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final color = widget.online ? const Color(0xFF22C55E) : scheme.outline;
+    final color = widget.online ? AppColors.online : scheme.outline;
+
+    // Pulse only when online AND the OS isn't asking for reduced motion.
+    final pulse = widget.online && AppMotion.enabled(context);
+    if (pulse && !_c.isAnimating) {
+      _c.repeat();
+    } else if (!pulse && _c.isAnimating) {
+      _c.stop();
+    }
 
     return Semantics(
       label: widget.online ? 'Online' : 'Offline',
@@ -57,7 +57,7 @@ class _StatusDotState extends State<StatusDot>
           child: Stack(
             alignment: Alignment.center,
             children: [
-              if (widget.online)
+              if (pulse)
                 AnimatedBuilder(
                   animation: _c,
                   builder: (context, _) {
