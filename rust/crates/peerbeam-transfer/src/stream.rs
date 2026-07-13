@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::io::AsyncRead;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
@@ -29,7 +31,7 @@ use peerbeam_domain::port::{Frame, FrameKind, Link, StorageProvider};
 
 use crate::control::TransferControl;
 use crate::protocol::{
-    chunk_frame, control_frame, meta_frame, parse_control, parse_meta, Control, TransferMeta,
+    chunk_frame_owned, control_frame, meta_frame, parse_control, parse_meta, Control, TransferMeta,
 };
 
 /// Base backoff between retry attempts (grows linearly with attempts).
@@ -108,22 +110,24 @@ pub async fn send_file(
     }
 
     let mut reader = storage.open_read(&req.path, offset).await?;
-    let mut buf = vec![0u8; req.chunk_size.max(1) as usize];
+    let chunk = req.chunk_size.max(1) as usize;
     let mut sent = offset;
 
     loop {
         if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
             return Ok(outcome);
         }
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| DomainError::Storage(format!("read chunk: {e}")))?;
+        // Fresh owned buffer per chunk, read-filled to full `chunk` size (short
+        // reads coalesced). It is moved straight into the frame — no per-chunk
+        // copy on the hot path.
+        let mut buf = vec![0u8; chunk];
+        let n = read_fill(reader.as_mut(), &mut buf).await?;
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        send_with_retry(link, chunk_frame(&buf[..n]), retries).await?;
+        buf.truncate(n);
+        hasher.update(&buf);
+        send_with_retry(link, chunk_frame_owned(Bytes::from(buf)), retries).await?;
         sent += n as u64;
         let _ = progress.send(make_progress(
             &req.transfer_id,
@@ -349,6 +353,28 @@ async fn recv_verify(link: &mut dyn Link) -> Result<bool> {
             None => return Err(DomainError::Transfer("link closed before verify".into())),
         }
     }
+}
+
+/// Read into `buf` until it is full or EOF, coalescing short reads. Returns the
+/// number of bytes read (0 only at EOF). Keeps chunk framing at full
+/// `chunk_size` even when the underlying reader returns partial reads, cutting
+/// frame count and per-chunk overhead.
+pub(crate) async fn read_fill(
+    reader: &mut (dyn AsyncRead + Unpin + Send),
+    buf: &mut [u8],
+) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader
+            .read(&mut buf[filled..])
+            .await
+            .map_err(|e| DomainError::Storage(format!("read chunk: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Feed the first `len` bytes of `path` into `hasher` (used to resume a hash).

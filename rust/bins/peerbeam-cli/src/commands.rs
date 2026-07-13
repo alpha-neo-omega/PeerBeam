@@ -216,7 +216,8 @@ fn writable_check(name: &str, dir: &str) -> (String, &'static str, String) {
 async fn benchmark(ctx: &Ctx, args: BenchmarkArgs) -> CliResult {
     match args.target {
         BenchTarget::Crypto => bench_crypto(ctx),
-        BenchTarget::Loopback { size } => bench_loopback(ctx, size).await,
+        BenchTarget::Hash => bench_hash(ctx),
+        BenchTarget::Loopback { size, chunk } => bench_loopback(ctx, size, chunk).await,
     }
 }
 
@@ -270,7 +271,32 @@ fn bench_crypto(ctx: &Ctx) -> CliResult {
     Ok(())
 }
 
-async fn bench_loopback(ctx: &Ctx, size_mib: u64) -> CliResult {
+fn bench_hash(ctx: &Ctx) -> CliResult {
+    use sha2::{Digest, Sha256};
+    use std::hint::black_box;
+    let chunk = vec![0xABu8; 64 * 1024];
+    let iterations = 4096u64; // 256 MiB
+    let start = Instant::now();
+    let mut hasher = Sha256::new();
+    for _ in 0..iterations {
+        hasher.update(black_box(&chunk));
+    }
+    black_box(hasher.finalize());
+    let secs = start.elapsed().as_secs_f64();
+    let mib = (iterations * 64) as f64 / 1024.0;
+    let mbs = mib / secs;
+    if ctx.json {
+        ctx.json_line(&json!({"sha256_mib_s": mbs}));
+    } else {
+        ctx.line(&format!(
+            "SHA-256: {}",
+            ctx.bold(&format!("{mbs:.0} MiB/s"))
+        ));
+    }
+    Ok(())
+}
+
+async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
     let dir = std::env::temp_dir().join(format!("pb-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("bench.bin");
@@ -302,7 +328,7 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64) -> CliResult {
         name: "bench.bin".into(),
         path: src.to_string_lossy().into(),
         size: bytes as u64,
-        chunk_size: 256 * 1024,
+        chunk_size: chunk_kib * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
     let bar = ctx.bar(bytes as u64, "loopback");

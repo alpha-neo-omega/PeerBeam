@@ -52,11 +52,23 @@ pub fn meta_frame(meta: &TransferMeta) -> Frame {
     }
 }
 
-/// Build a data chunk frame from raw bytes.
+/// Build a data chunk frame from raw bytes (copies `data`).
+///
+/// Prefer [`chunk_frame_owned`] on the hot send path: it moves an owned buffer
+/// into the frame with no per-chunk copy. This borrowing variant stays for
+/// callers that only hold a slice (e.g. small/one-shot payloads).
 pub fn chunk_frame(data: &[u8]) -> Frame {
     Frame {
         kind: FrameKind::Chunk,
         payload: Bytes::copy_from_slice(data),
+    }
+}
+
+/// Build a data chunk frame from an owned buffer with no copy.
+pub fn chunk_frame_owned(payload: Bytes) -> Frame {
+    Frame {
+        kind: FrameKind::Chunk,
+        payload,
     }
 }
 

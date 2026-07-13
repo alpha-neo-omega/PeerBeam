@@ -185,10 +185,15 @@ pub struct BenchmarkArgs {
 pub enum BenchTarget {
     /// AES-256-GCM seal/open throughput.
     Crypto,
+    /// SHA-256 throughput (the transfer integrity hash).
+    Hash,
     /// End-to-end transfer over an in-process link.
     Loopback {
         /// Payload size in MiB.
         #[arg(long, default_value_t = 128)]
         size: u64,
+        /// Chunk size in KiB.
+        #[arg(long, default_value_t = 256)]
+        chunk: u32,
     },
 }

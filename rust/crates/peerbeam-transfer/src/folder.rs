@@ -22,7 +22,7 @@
 //! fully loaded into memory.
 
 use futures::io::AsyncWrite;
-use futures::{AsyncReadExt, AsyncWriteExt};
+use futures::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -31,8 +31,10 @@ use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::port::{Frame, FrameKind, Link, StorageProvider};
 
 use crate::control::TransferControl;
-use crate::protocol::chunk_frame;
-use crate::stream::{build_progress, send_with_retry, TransferOutcome};
+use bytes::Bytes;
+
+use crate::protocol::chunk_frame_owned;
+use crate::stream::{build_progress, read_fill, send_with_retry, TransferOutcome};
 
 // ── Wire messages ───────────────────────────────────────────────
 
@@ -136,7 +138,7 @@ pub async fn send_folder(
 
     let mut done: u64 = 0;
     let mut files_completed: u32 = 0;
-    let mut buf = vec![0u8; req.chunk_size.max(1) as usize];
+    let chunk = req.chunk_size.max(1) as usize;
 
     for (i, (rel, size)) in files.iter().enumerate() {
         let already = have.get(i).copied().unwrap_or(0).min(*size);
@@ -182,14 +184,13 @@ pub async fn send_folder(
             if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
                 return Ok(outcome);
             }
-            let n = reader
-                .read(&mut buf)
-                .await
-                .map_err(|e| DomainError::Storage(format!("read chunk: {e}")))?;
+            let mut buf = vec![0u8; chunk];
+            let n = read_fill(reader.as_mut(), &mut buf).await?;
             if n == 0 {
                 break;
             }
-            send_with_retry(link, chunk_frame(&buf[..n]), retries).await?;
+            buf.truncate(n);
+            send_with_retry(link, chunk_frame_owned(Bytes::from(buf)), retries).await?;
             done += n as u64;
             emit(
                 progress,

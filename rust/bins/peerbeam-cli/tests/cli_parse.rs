@@ -55,10 +55,22 @@ fn config_subcommands() {
 
 #[test]
 fn benchmark_loopback_size() {
-    let cli = Cli::try_parse_from(["peerbeam", "benchmark", "loopback", "--size", "64"]).unwrap();
+    let cli = Cli::try_parse_from([
+        "peerbeam",
+        "benchmark",
+        "loopback",
+        "--size",
+        "64",
+        "--chunk",
+        "512",
+    ])
+    .unwrap();
     match cli.command {
         Command::Benchmark(a) => match a.target {
-            BenchTarget::Loopback { size } => assert_eq!(size, 64),
+            BenchTarget::Loopback { size, chunk } => {
+                assert_eq!(size, 64);
+                assert_eq!(chunk, 512);
+            }
             _ => panic!("expected loopback"),
         },
         _ => panic!("expected benchmark"),
