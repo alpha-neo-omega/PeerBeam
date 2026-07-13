@@ -24,6 +24,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    # Needs signing secrets; don't block the release if they're absent.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +42,8 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    # Needs signing/notarization secrets; don't block the release if absent.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,3 +81,29 @@ jobs:
       - run: bash scripts/package-android.sh
       - uses: actions/upload-artifact@v4
         with: { name: android, path: dist/* }
+
+  # Publish the GitHub Release once the no-secret builds (Linux + Android) are
+  # done. macOS/Windows are not required — they only produce extra assets when
+  # their signing secrets are configured. Uses the built-in GITHUB_TOKEN.
+  release:
+    needs: [linux, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/RELEASE_NOTES_v0.2.0.md
+          prerelease: true
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/linux/*
+            artifacts/android/*
+            artifacts/windows/*
+            artifacts/macos/*

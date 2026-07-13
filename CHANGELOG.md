@@ -6,23 +6,36 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
-Release-candidate hardening (M8) — independent release audit; no product
-features added.
+_Nothing yet._
+
+## [0.2.0] - 2026-07-14 — Beta
+
+First tagged release. See [Release Notes](docs/RELEASE_NOTES_v0.2.0.md).
 
 ### Added
-- `LICENSE` — full AGPL-3.0-or-later text at the repository root.
+- Branding: PeerBeam logo across all platform icons + README banner.
+- `LICENSE` (full AGPL-3.0-or-later), Code of Conduct, security policy,
+  supported-versions policy, issue/PR templates, dependabot.
 - Continuous integration (`.github/workflows/ci.yml`): fmt, clippy
-  (`-D warnings`), `cargo test`, examples build, `flutter analyze`/`test` on
-  every push and PR.
-- `Cargo.lock` is now committed for reproducible application builds.
-- Release-audit reports: `docs/FINAL_AUDIT.md`, `STABLE_READINESS.md`,
-  `FINAL_SECURITY_REVIEW.md`, `FINAL_PERFORMANCE_REVIEW.md`,
-  `FINAL_COMPATIBILITY_MATRIX.md`, `RELEASE_NOTES_v1.0.md`,
-  `LONG_TERM_ROADMAP.md`.
+  (`-D warnings`), `cargo test`, examples build, `flutter analyze`/`test`.
+- Tag-triggered release workflow that builds artifacts and publishes a GitHub
+  Release (Linux + Android without secrets; macOS/Windows when signing secrets
+  are set).
+- `Cargo.lock` committed for reproducible application builds.
+- Docs: Developer Guide, Transfer Protocol, runnable `quic_transfer` example,
+  and the M7/M8 readiness + audit reports.
+
+### Fixed
+- Security/correctness hardening from a full-project audit: clipboard alloc DoS,
+  Windows path-traversal in folder transfer, secure-link nonce-counter desync on
+  retry, atomic (unique-temp) writes for trust/checkpoint/config, FFI shutdown
+  stopping the daemon, cancel unblocking a pending transfer, poison-tolerant FFI
+  locks, device-identity flapping across providers, and Flutter
+  notify-after-dispose guards.
 
 ### Verified
-- 204 Rust tests + 35 Flutter tests pass; clippy/fmt clean; examples compile
-  and run byte-exact; release binaries build (Linux). See
+- 217 Rust tests + 35 Flutter tests pass; clippy/fmt clean; examples compile and
+  run byte-exact; Linux release build; live Android→Linux transfer. See
   [Stable Readiness](docs/STABLE_READINESS.md).
 
 ## M7 — Documentation, DX & open-source readiness
