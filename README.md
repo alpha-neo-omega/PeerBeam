@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/peerbeam-banner.png" alt="PeerBeam — Share freely. Connect securely." width="520">
+
 # PeerBeam
 
 **Zero-configuration, secure, cross-platform file & clipboard sharing.**
