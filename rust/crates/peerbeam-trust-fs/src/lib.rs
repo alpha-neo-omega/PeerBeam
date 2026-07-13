@@ -49,8 +49,14 @@ impl FsTrust {
         let records: Vec<&TrustRecord> = cache.values().collect();
         let json = serde_json::to_vec_pretty(&records)
             .map_err(|e| DomainError::Storage(format!("serialize trust store: {e}")))?;
-        std::fs::write(&self.path, json)
-            .map_err(|e| DomainError::Storage(format!("write trust store: {e}")))
+        // Atomic: write to a temp file next to the target, then rename over it.
+        // A crash mid-write leaves the previous store intact rather than a
+        // truncated file that fails to parse (losing every pin).
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)
+            .map_err(|e| DomainError::Storage(format!("write trust store: {e}")))?;
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| DomainError::Storage(format!("commit trust store: {e}")))
     }
 }
 

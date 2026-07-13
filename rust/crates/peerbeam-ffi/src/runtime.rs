@@ -59,19 +59,22 @@ where
     rt().spawn(future)
 }
 
+/// Recover a poisoned lock instead of panicking. These statics hold only an
+/// `Option<Arc<…>>`; a panic in some unrelated call while the lock was held must
+/// not brick every subsequent FFI call by poisoning the mutex forever.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The transfer manager, if initialised.
 pub fn manager() -> Result<Arc<Manager>, (Code, String)> {
-    MANAGER
-        .lock()
-        .unwrap()
+    lock(&MANAGER)
         .clone()
         .ok_or((Code::NotInitialised, "engine not initialised".into()))
 }
 
 fn engine() -> Result<Arc<Engine>, (Code, String)> {
-    ENGINE
-        .lock()
-        .unwrap()
+    lock(&ENGINE)
         .clone()
         .ok_or((Code::NotInitialised, "engine not initialised".into()))
 }
@@ -154,9 +157,9 @@ pub fn init(config_json: &str) -> OpResult {
     // transfers; controllable via pb_daemon_*.
     let _ = manager.start_daemon();
 
-    *ME.lock().unwrap() = Some(me(&config));
-    *ENGINE.lock().unwrap() = Some(engine);
-    *MANAGER.lock().unwrap() = Some(manager);
+    *lock(&ME) = Some(me(&config));
+    *lock(&ENGINE) = Some(engine);
+    *lock(&MANAGER) = Some(manager);
     Ok(json!({ "initialised": true }))
 }
 
@@ -179,16 +182,20 @@ pub fn shutdown() {
     if let Ok(engine) = engine() {
         let _ = rt().block_on(engine.stop_discovery());
     }
-    *ENGINE.lock().unwrap() = None;
-    *ME.lock().unwrap() = None;
-    *MANAGER.lock().unwrap() = None;
+    // Stop the daemon task explicitly: it holds its own `Arc<Manager>`, so
+    // merely dropping the global handle below would leave it running and the
+    // QUIC port bound — a later `pb_init()` would then fail to rebind.
+    if let Ok(manager) = manager() {
+        let _ = manager.stop_daemon();
+    }
+    *lock(&ENGINE) = None;
+    *lock(&ME) = None;
+    *lock(&MANAGER) = None;
 }
 
 pub fn discovery_start() -> OpResult {
     let engine = engine()?;
-    let me = ME
-        .lock()
-        .unwrap()
+    let me = lock(&ME)
         .clone()
         .ok_or((Code::NotInitialised, "no local identity".into()))?;
     rt().block_on(engine.start_discovery(me))

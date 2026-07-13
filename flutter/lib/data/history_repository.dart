@@ -14,6 +14,7 @@ class HistoryRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
   List<HistoryItem> _items = [];
   StreamSubscription<BridgeEvent>? _sub;
+  bool _disposed = false;
 
   HistoryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen((e) {
@@ -30,6 +31,7 @@ class HistoryRepository extends ChangeNotifier {
     if (api == null) return;
     try {
       final entries = await api.history();
+      if (_disposed) return; // disposed while the fetch was in flight
       _items = entries.map(_map).toList().reversed.toList();
       notifyListeners();
     } catch (_) {
@@ -46,6 +48,7 @@ class HistoryRepository extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _sub?.cancel();
     super.dispose();
   }

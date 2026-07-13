@@ -162,6 +162,10 @@ impl EngineConfig {
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        std::fs::write(path, json).map_err(|e| ConfigError::Io(e.to_string()))
+        // Atomic write: temp + rename, so an interrupted save can't leave a
+        // truncated config that fails to parse on next load.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json).map_err(|e| ConfigError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| ConfigError::Io(e.to_string()))
     }
 }

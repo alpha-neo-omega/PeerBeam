@@ -24,6 +24,12 @@ use crate::stream::send_with_retry;
 /// Chunk size for streaming image payloads.
 const CLIP_CHUNK: usize = 64 * 1024;
 
+/// Upper bound on a clipboard image, both for the peer-declared size and the
+/// actual bytes received. Clipboard content is small by nature; anything larger
+/// is rejected rather than allocated, so a malicious `BinaryMeta { size }`
+/// cannot exhaust memory.
+const MAX_CLIP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Clipboard control/metadata messages (carried in Control frames).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ClipMessage {
@@ -94,11 +100,27 @@ pub async fn receive_clipboard(link: &mut dyn Link) -> Result<ClipboardItem> {
     match msg {
         ClipMessage::Inline { item } => Ok(item),
         ClipMessage::BinaryMeta { mime, at, size } => {
-            let mut buf = Vec::with_capacity(size as usize);
+            // Never trust the peer's declared size for allocation. Reject an
+            // oversized declaration outright, and cap the pre-allocation.
+            if size > MAX_CLIP_BYTES {
+                return Err(DomainError::Transfer(format!(
+                    "clipboard payload too large: {size} bytes"
+                )));
+            }
+            let mut buf = Vec::with_capacity(size.min(CLIP_CHUNK as u64) as usize);
             loop {
                 match link.recv_frame().await? {
                     Some(frame) => match frame.kind {
-                        FrameKind::Chunk => buf.extend_from_slice(&frame.payload),
+                        FrameKind::Chunk => {
+                            // Bound actual receipt too, in case the peer streams
+                            // more than it declared (or never sends Complete).
+                            if buf.len() as u64 + frame.payload.len() as u64 > MAX_CLIP_BYTES {
+                                return Err(DomainError::Transfer(
+                                    "clipboard payload exceeded limit".into(),
+                                ));
+                            }
+                            buf.extend_from_slice(&frame.payload);
+                        }
                         FrameKind::Control => match parse_clip(&frame)? {
                             ClipMessage::Complete => break,
                             _ => continue,
@@ -144,5 +166,36 @@ mod tests {
         for m in msgs {
             assert_eq!(parse_clip(&clip_frame(&m)).unwrap(), m);
         }
+    }
+
+    /// A malicious `BinaryMeta { size }` must be rejected up front, never fed
+    /// into `Vec::with_capacity` (which would try to allocate that much and
+    /// abort the process). Regression for the clipboard alloc DoS.
+    #[tokio::test]
+    async fn rejects_oversized_declared_size() {
+        use std::collections::VecDeque;
+
+        struct MockLink(VecDeque<Frame>);
+        #[async_trait::async_trait]
+        impl Link for MockLink {
+            async fn send_frame(&mut self, _f: Frame) -> Result<()> {
+                Ok(())
+            }
+            async fn recv_frame(&mut self) -> Result<Option<Frame>> {
+                Ok(self.0.pop_front())
+            }
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let meta = clip_frame(&ClipMessage::BinaryMeta {
+            mime: "image/png".into(),
+            at: t0(),
+            size: u64::MAX,
+        });
+        let mut link = MockLink(VecDeque::from([meta]));
+        let err = receive_clipboard(&mut link).await.unwrap_err();
+        assert!(matches!(err, DomainError::Transfer(_)));
     }
 }

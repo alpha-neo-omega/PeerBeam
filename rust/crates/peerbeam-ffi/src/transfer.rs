@@ -261,7 +261,10 @@ impl Manager {
             .and_then(|p| p.as_array())
             .ok_or((Code::InvalidArgument, "paths[] required".into()))?;
 
-        let mut ids = Vec::new();
+        // Validate *every* path before registering or spawning anything, so a
+        // bad entry can't leave some transfers already queued while the call
+        // returns an error (the caller would never learn about the orphans).
+        let mut validated: Vec<(String, String, u64)> = Vec::new();
         for p in paths {
             let path = p
                 .as_str()
@@ -281,6 +284,11 @@ impl Manager {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file.bin".into());
             let size = std::fs::metadata(sp).map(|m| m.len()).unwrap_or(0);
+            validated.push((path.to_string(), name, size));
+        }
+
+        let mut ids = Vec::new();
+        for (path, name, size) in validated {
             let id = self.next_id();
             let active = self.register(&id, "sending", &device.name, &name);
             events::transfer(
@@ -292,7 +300,6 @@ impl Manager {
 
             let mgr = self.clone();
             let device = device.clone();
-            let path = path.to_string();
             crate::runtime::spawn(async move {
                 mgr.run_send(id, active, device, path, name, size).await;
             });
@@ -547,6 +554,13 @@ impl Manager {
     pub fn cancel(&self, id: &str) -> Op {
         let a = self.get_active(id)?;
         a.ctrl.cancel();
+        // If it is still awaiting accept/reject, the receive task is parked on
+        // the approval channel and never checks `ctrl`. Fire the pending sender
+        // with `false` so it unblocks, rejects, and cleans up — otherwise
+        // cancel would silently hang the transfer and leak the pending entry.
+        if let Some(tx) = self.pending.lock().unwrap().remove(id) {
+            let _ = tx.send(false);
+        }
         Ok(json!({ "cancelling": true }))
     }
 

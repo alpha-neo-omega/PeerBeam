@@ -18,6 +18,7 @@ class DiscoveryRepository extends ChangeNotifier {
   final Map<String, SdkDevice> _raw = {};
   bool _scanning = false;
   StreamSubscription<BridgeEvent>? _sub;
+  bool _disposed = false;
 
   DiscoveryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen(_onEvent);
@@ -40,6 +41,7 @@ class DiscoveryRepository extends ChangeNotifier {
     notifyListeners();
     final fut = _scanning ? _api?.startDiscovery() : _api?.stopDiscovery();
     fut?.catchError((_) {
+      if (_disposed) return; // disposed before the toggle resolved
       // Revert on failure; keep the UI honest.
       _scanning = !_scanning;
       notifyListeners();
@@ -69,6 +71,7 @@ class DiscoveryRepository extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _sub?.cancel();
     super.dispose();
   }

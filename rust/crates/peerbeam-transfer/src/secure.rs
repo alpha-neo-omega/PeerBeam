@@ -54,17 +54,23 @@ impl<'a> SecureLink<'a> {
 #[async_trait]
 impl Link for SecureLink<'_> {
     async fn send_frame(&mut self, frame: Frame) -> Result<()> {
+        // Seal with the *current* counter; only advance it once the inner send
+        // succeeds. A failed send (retried on the same link via
+        // `send_with_retry`) must re-seal with the same nonce/counter — the
+        // receiver never advanced, so a bumped counter would desync and every
+        // subsequent frame would be rejected as "reordered".
         let nonce = Self::nonce(self.session.send_prefix, self.send_ctr);
         let sealed = self
             .enc
             .seal(&self.session.send_key, &nonce, &encode_frame(&frame))?;
-        self.send_ctr += 1;
         self.inner
             .send_frame(Frame {
                 kind: FrameKind::Control,
                 payload: Bytes::from(sealed),
             })
-            .await
+            .await?;
+        self.send_ctr += 1;
+        Ok(())
     }
 
     async fn recv_frame(&mut self) -> Result<Option<Frame>> {
@@ -133,4 +139,116 @@ fn tag_kind(tag: u8) -> Result<FrameKind> {
         4 => FrameKind::Control,
         other => return Err(DomainError::Integrity(format!("unknown frame tag {other}"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Session;
+    use crate::stream::send_with_retry;
+    use peerbeam_crypto::AeadCrypto;
+    use peerbeam_domain::id::DeviceId;
+
+    /// Inner link that fails its first `send_frame`, then delivers every frame
+    /// into `wire`. Models a transient send error that succeeds on retry.
+    struct FlakySender {
+        wire: Vec<Frame>,
+        fail_first: bool,
+    }
+
+    #[async_trait]
+    impl Link for FlakySender {
+        async fn send_frame(&mut self, frame: Frame) -> Result<()> {
+            if self.fail_first {
+                self.fail_first = false;
+                return Err(DomainError::Connection("transient".into()));
+            }
+            self.wire.push(frame);
+            Ok(())
+        }
+        async fn recv_frame(&mut self) -> Result<Option<Frame>> {
+            Ok(None)
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Inner link that replays a fixed list of frames for the receiver.
+    struct Replayer(std::vec::IntoIter<Frame>);
+
+    #[async_trait]
+    impl Link for Replayer {
+        async fn send_frame(&mut self, _f: Frame) -> Result<()> {
+            Ok(())
+        }
+        async fn recv_frame(&mut self) -> Result<Option<Frame>> {
+            Ok(self.0.next())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sessions() -> (Session, Session) {
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let p1 = [9u8; 4];
+        let p2 = [7u8; 4];
+        let send = Session {
+            send_key: k1,
+            recv_key: k2,
+            send_prefix: p1,
+            recv_prefix: p2,
+            peer_id: DeviceId::from("peer"),
+            newly_trusted: false,
+        };
+        let recv = Session {
+            send_key: k2,
+            recv_key: k1,
+            send_prefix: p2,
+            recv_prefix: p1,
+            peer_id: DeviceId::from("me"),
+            newly_trusted: false,
+        };
+        (send, recv)
+    }
+
+    /// A send that fails once and is retried must NOT advance the nonce counter
+    /// on the failed attempt — otherwise the receiver rejects the re-sent frame
+    /// (and everything after) as reordered. Regression for the counter/nonce
+    /// desync in `send_frame`.
+    #[tokio::test]
+    async fn retry_after_transient_send_error_keeps_counter_in_sync() {
+        let enc = AeadCrypto::new();
+        let (send_sess, recv_sess) = sessions();
+
+        // Sender over a link that drops the first send, then delivers.
+        let mut inner = FlakySender {
+            wire: Vec::new(),
+            fail_first: true,
+        };
+        {
+            let mut secure = SecureLink::new(&mut inner, &enc, send_sess);
+            for i in 0..3u8 {
+                let frame = Frame {
+                    kind: FrameKind::Chunk,
+                    payload: Bytes::from(vec![i; 16]),
+                };
+                // retries = 1: the first frame's initial send fails, retry wins.
+                send_with_retry(&mut secure, frame, 1).await.unwrap();
+            }
+        }
+        // Exactly three frames reached the wire (the failed attempt delivered nothing).
+        assert_eq!(inner.wire.len(), 3);
+
+        // Receiver decodes all three in order — proves counters stayed aligned.
+        let mut replay = Replayer(inner.wire.into_iter());
+        let mut secure = SecureLink::new(&mut replay, &enc, recv_sess);
+        for i in 0..3u8 {
+            let got = secure.recv_frame().await.unwrap().expect("frame present");
+            assert_eq!(got.kind, FrameKind::Chunk);
+            assert_eq!(&got.payload[..], &vec![i; 16][..]);
+        }
+    }
 }

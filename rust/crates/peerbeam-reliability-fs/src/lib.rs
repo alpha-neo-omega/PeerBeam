@@ -45,8 +45,13 @@ impl ReliabilityStore for FsReliability {
         let json = serde_json::to_vec_pretty(session)
             .map_err(|e| DomainError::Storage(format!("serialize checkpoint: {e}")))?;
         let path = self.path_for(&session.id);
-        std::fs::write(&path, json)
-            .map_err(|e| DomainError::Storage(format!("write checkpoint: {e}")))
+        // Atomic write: temp + rename, so a crash mid-write can't corrupt an
+        // existing checkpoint (which would forfeit resume).
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)
+            .map_err(|e| DomainError::Storage(format!("write checkpoint: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| DomainError::Storage(format!("commit checkpoint: {e}")))
     }
 
     fn load_checkpoint(&self, transfer: &TransferId) -> Result<Option<TransferSession>> {

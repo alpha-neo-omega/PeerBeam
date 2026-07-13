@@ -469,9 +469,18 @@ fn dest_path(dest_dir: &str, root: &str, rel: &str) -> Option<String> {
 }
 
 /// Sanitize a relative path: reject empty, absolute, `.` and `..` components.
+///
+/// Splits on **both** `/` and `\`: a Windows receiver treats `\` as a path
+/// separator, so a peer sending `..\..\etc` would otherwise slip through a
+/// `/`-only split as one component and traverse out of the destination when the
+/// OS later normalizes it. Any component that is `..`, is empty/`.`, contains a
+/// NUL, or carries a drive/`:` marker is rejected.
 fn sanitize_rel(rel: &str) -> Option<String> {
     let mut parts = Vec::new();
-    for comp in rel.split('/') {
+    for comp in rel.split(['/', '\\']) {
+        if comp.contains('\0') || comp.contains(':') {
+            return None;
+        }
         match comp {
             "" | "." => continue,
             ".." => return None,
@@ -527,6 +536,18 @@ mod tests {
         assert_eq!(sanitize_rel("../etc/passwd"), None);
         assert_eq!(sanitize_rel("a/../../b"), None);
         assert_eq!(sanitize_rel(""), None);
+    }
+
+    #[test]
+    fn sanitize_rel_rejects_windows_traversal() {
+        // Backslash is a separator on Windows: reject `..` behind it, and treat
+        // mixed separators as a real path split (not one opaque component).
+        assert_eq!(sanitize_rel(r"..\..\Windows\System32"), None);
+        assert_eq!(sanitize_rel(r"a\..\..\b"), None);
+        assert_eq!(sanitize_rel(r"a\b\c.txt"), Some("a/b/c.txt".to_string()));
+        // Drive letters / colons and NULs are rejected outright.
+        assert_eq!(sanitize_rel(r"C:\evil"), None);
+        assert_eq!(sanitize_rel("a\0b"), None);
     }
 
     #[test]
