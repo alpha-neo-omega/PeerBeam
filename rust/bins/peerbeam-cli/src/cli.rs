@@ -196,4 +196,13 @@ pub enum BenchTarget {
         #[arg(long, default_value_t = 256)]
         chunk: u32,
     },
+    /// End-to-end transfer over a real QUIC connection (loopback).
+    Quic {
+        /// Payload size in MiB.
+        #[arg(long, default_value_t = 128)]
+        size: u64,
+        /// Chunk size in KiB.
+        #[arg(long, default_value_t = 1024)]
+        chunk: u32,
+    },
 }

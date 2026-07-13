@@ -14,6 +14,7 @@ use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::ManagedDevice;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{receive_file, send_file, SendRequest, TransferControl};
+use peerbeam_transfer_quic::{direct_route, QuicTransport};
 
 use crate::cli::*;
 use crate::engine::{build_engine, config_path, me};
@@ -218,6 +219,7 @@ async fn benchmark(ctx: &Ctx, args: BenchmarkArgs) -> CliResult {
         BenchTarget::Crypto => bench_crypto(ctx),
         BenchTarget::Hash => bench_hash(ctx),
         BenchTarget::Loopback { size, chunk } => bench_loopback(ctx, size, chunk).await,
+        BenchTarget::Quic { size, chunk } => bench_quic(ctx, size, chunk).await,
     }
 }
 
@@ -366,6 +368,119 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
             size_mib,
             secs,
             ctx.bold(&format!("{mbs:.0} MiB/s")),
+        ));
+    }
+    Ok(())
+}
+
+/// End-to-end transfer over a real QUIC connection on loopback. Reports
+/// throughput and the QUIC connect (handshake) latency.
+async fn bench_quic(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
+    use futures::StreamExt;
+    use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
+    use peerbeam_domain::id::{DeviceId, TransferId};
+    use peerbeam_domain::port::{Bind, TransferProvider};
+
+    let dir = std::env::temp_dir().join(format!("pb-quic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let src = dir.join("bench.bin");
+    let out = dir.join("out");
+    let bytes = (size_mib * 1024 * 1024) as usize;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&src)?;
+        let block = vec![0xABu8; 1024 * 1024];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let n = remaining.min(block.len());
+            f.write_all(&block[..n])?;
+            remaining -= n;
+        }
+        f.flush()?;
+    }
+
+    let map = |e: peerbeam_domain::error::DomainError| CliError::from(e);
+    let server = QuicTransport::new().map_err(map)?;
+    let (addr, mut incoming) = server.serve_addr(Bind { port: 0 }).await.map_err(map)?;
+    let client = QuicTransport::new().map_err(map)?;
+    let route = direct_route("127.0.0.1", addr.port());
+
+    let sess = TransferSession {
+        id: TransferId::from("bench"),
+        peer: DeviceId::from("loopback"),
+        direction: Direction::Sending,
+        status: TransferStatus::Transferring,
+        files: Vec::new(),
+        total_bytes: bytes as u64,
+        transferred_bytes: 0,
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        is_resume: false,
+    };
+
+    let storage_s = FsStorage::new();
+    let storage_r = FsStorage::new();
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let bar = ctx.bar(bytes as u64, "quic");
+    let (connect_tx, connect_rx) = tokio::sync::oneshot::channel::<f64>();
+
+    let out_str = out.to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+
+    let start = Instant::now();
+    let send = async move {
+        let td = Instant::now();
+        let mut link = client.dial(&route, &sess).await?;
+        let _ = connect_tx.send(td.elapsed().as_secs_f64() * 1000.0);
+        let req = SendRequest {
+            transfer_id: "bench".into(),
+            name: "bench.bin".into(),
+            path: src_str,
+            size: bytes as u64,
+            chunk_size: chunk_kib * 1024,
+        };
+        let r = send_file(&mut *link, &storage_s, req, &cs, &ptx, 0).await;
+        drop(ptx);
+        r
+    };
+    let recv = async move {
+        let mut link = incoming.next().await.ok_or_else(|| {
+            peerbeam_domain::error::DomainError::Connection("no inbound".into())
+        })??;
+        receive_file(&mut *link, &storage_r, &out_str, &cr, &{
+            let (rtx, _rrx) = mpsc::unbounded_channel();
+            rtx
+        })
+        .await
+    };
+    let pump = async {
+        while let Some(p) = prx.recv().await {
+            bar.update(p.transferred_bytes);
+        }
+        bar.finish();
+    };
+
+    let (rs, rr, _) = tokio::join!(send, recv, pump);
+    rs.map_err(CliError::from)?;
+    rr.map_err(CliError::from)?;
+    let secs = start.elapsed().as_secs_f64();
+    let mbs = size_mib as f64 / secs;
+    let connect_ms = connect_rx.await.unwrap_or(0.0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    if ctx.json {
+        ctx.json_line(&json!({
+            "mib": size_mib, "seconds": secs, "mib_s": mbs, "connect_ms": connect_ms
+        }));
+    } else {
+        ctx.line(&format!(
+            "QUIC: {} MiB in {:.2}s = {} · connect latency {}",
+            size_mib,
+            secs,
+            ctx.bold(&format!("{mbs:.0} MiB/s")),
+            ctx.bold(&format!("{connect_ms:.1} ms")),
         ));
     }
     Ok(())

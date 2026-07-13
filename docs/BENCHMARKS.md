@@ -109,12 +109,36 @@ integrity model. Further speedups require either a weaker integrity guarantee
 (don't hash both ends — rejected) or the real network path (where the bottleneck
 moves off the CPU). No further micro-optimization is worthwhile here.
 
+## QUIC transport (real network, loopback)
+
+The QUIC `TransferProvider` (`peerbeam-transfer-quic`) measured over two real
+endpoints on `127.0.0.1` via `peerbeam benchmark quic`:
+
+| Metric | Command | Value |
+|---|---|---|
+| Throughput | `benchmark quic --size 512 --chunk 1024` | **~430 MiB/s** (i5-1135G7) |
+| Connect latency | (handshake, same run) | **~0.7 ms** |
+
+This is a full real transfer: QUIC (TLS 1.3 + UDP) + the transfer engine's
+dual SHA-256. It lands at ~85% of the transport-free in-process loopback
+(~500 MiB/s), the difference being TLS record crypto + UDP/framing + the QUIC
+stack. Loopback (127.0.0.1) has no propagation delay, MTU limits, or loss —
+real-LAN/WAN numbers will differ and are the next thing to measure once QUIC is
+wired into `send`/`receive`.
+
+Reproduce:
+
+```
+target/release/peerbeam benchmark quic --size 512 --chunk 1024
+```
+
 ## Not yet measured
 
 - Flutter app startup / RAM / jank (needs a device or emulator).
 - On-device Android transfer + battery.
-- **Real network transfer speed** — requires the QUIC `TransferProvider`; the
-  in-process loopback is a stand-in until then.
+- **Real LAN/WAN transfer speed** — the QUIC transport is measured on
+  *loopback* above; over-the-wire numbers (propagation delay, MTU, loss) still
+  need two physical machines.
 
 ## Reproduce
 

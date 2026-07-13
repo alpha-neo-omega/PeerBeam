@@ -1,0 +1,25 @@
+[package]
+name = "peerbeam-transfer-quic"
+description = "QUIC TransferProvider for PeerBeam: dial/serve real network Links over quinn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+
+[dev-dependencies]
+peerbeam-transfer = { path = "../peerbeam-transfer" }
+peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }

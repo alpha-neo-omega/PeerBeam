@@ -38,9 +38,11 @@ Working now (no network transport needed):
 - `doctor [--json]` — environment checks (config/save dirs writable, UDP
   bindable, mDNS daemon, Tailscale CLI, crypto) with ✓/!/✗; non-zero exit if
   any fail.
-- `benchmark crypto|hash|loopback [--size N] [--chunk KiB]` — AES-256-GCM
-  seal/open and SHA-256 throughput (MiB/s); end-to-end transfer over an
-  in-process link with a live progress bar (`--chunk` tunes framing).
+- `benchmark crypto|hash|loopback|quic [--size N] [--chunk KiB]` — AES-256-GCM
+  seal/open and SHA-256 throughput (MiB/s); `loopback` = end-to-end transfer
+  over an in-process link; `quic` = end-to-end over a **real QUIC connection**
+  (loopback) reporting throughput + connect latency. Live progress bar;
+  `--chunk` tunes framing.
 - `discover [--timeout N] [--watch]` — scans via all providers; table or live
   NDJSON stream (Ctrl-C to stop).
 - `list [--online]`, `status` — device snapshot / identity + providers.

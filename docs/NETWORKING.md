@@ -70,20 +70,34 @@ future QUIC or TCP transport plugs in without touching transfer logic.
 Because a `Link` preserves order, data chunks carry no index — the receiver
 appends them in arrival order, keeping per-chunk overhead to zero.
 
-### Current transport status
+### Transport status
 
-No production network transport ships yet. The planned transport is **QUIC over
-HTTP/3** (multiplexed, congestion-controlled, encrypted). Until it lands:
+The **QUIC transport is implemented** (`peerbeam-transfer-quic`, built on
+[quinn](https://docs.rs/quinn)) — the first production `TransferProvider`.
 
-- The transfer pipeline is fully implemented and exercised over an **in-process
-  `Link`** (bounded channels) in tests and `peerbeam benchmark loopback` — this
-  gives real backpressure and validates streaming/resume/cancel without a
-  network.
-- CLI `send`/`receive`/`daemon` parse and resolve but stop at a gated message
-  (exit code 8).
+- **`dial(route, session)`** opens an outbound connection over the chosen route
+  and returns a `Link`. **`serve(bind)`** binds a UDP/QUIC endpoint and yields
+  inbound `Link`s as peers connect.
+- Each `Link` is one QUIC **bidirectional stream** with length-delimited
+  framing; the transfer engine runs over it unchanged.
+- **Zero-config TLS.** QUIC mandates TLS, but there is no PKI: each node uses a
+  fresh self-signed certificate and the client accepts any server cert. Real
+  peer identity comes from the application-layer `SecureLink` handshake, not
+  from certificates — QUIC alone is encrypted but unauthenticated by design (see
+  [Security](SECURITY.md)).
+- **Disconnects** surface as `DomainError::Connection`; the engine's recovery
+  driver (`send_file_recover`/`LinkFactory`) can redial and resume from the
+  receiver's offset.
+- Verified by **two-real-endpoint** integration tests (localhost, not mocks)
+  and measured by `peerbeam benchmark quic` — see [Benchmarks](BENCHMARKS.md).
 
-See [Benchmarks](BENCHMARKS.md) for measured throughput and
-[Migration](MIGRATION.md) for the roadmap.
+Still in progress: wiring QUIC into the end-user CLI `send`/`receive`/`daemon`
+commands (peer→route resolution + a receiving daemon loop) — the provider and
+engine are ready; those commands remain gated (exit code 8) until wired. See
+[Migration](MIGRATION.md).
+
+The in-process `Link` (bounded channels) remains for tests and
+`benchmark loopback` as a transport-free upper bound.
 
 ## Security on the wire
 

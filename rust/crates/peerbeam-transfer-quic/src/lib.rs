@@ -1,0 +1,154 @@
+//! QUIC [`TransferProvider`] for PeerBeam.
+//!
+//! Turns the abstract transfer [`Link`] into a real network connection using
+//! [quinn](https://docs.rs/quinn). It plugs into the existing transfer engine
+//! unchanged: `send_file`/`receive_file`/`send_folder` already operate on
+//! `&mut dyn Link`, so a [`QuicLink`] is a drop-in transport.
+//!
+//! - **Encryption** is provided by QUIC's mandatory TLS (see [`tls`]).
+//! - **Identity/trust** is *not* — it is layered on top by
+//!   `peerbeam-transfer`'s `authenticate` + `SecureLink`. QUIC here is an
+//!   encrypted-but-unauthenticated pipe by design (zero-config, no PKI).
+//!
+//! ```no_run
+//! # async fn ex() -> peerbeam_domain::error::Result<()> {
+//! use peerbeam_transfer_quic::QuicTransport;
+//! use peerbeam_domain::port::{Bind, TransferProvider};
+//!
+//! let quic = QuicTransport::new()?;
+//! let mut incoming = quic.serve(Bind { port: 0 }).await?; // receiver
+//! // ... meanwhile a sender calls quic.dial(route, session).await? ...
+//! # Ok(()) }
+//! ```
+
+mod link;
+mod tls;
+
+pub use link::QuicLink;
+
+use std::net::SocketAddr;
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+
+use peerbeam_domain::entity::{Route, TransferSession};
+use peerbeam_domain::error::{DomainError, Result};
+use peerbeam_domain::id::ProviderId;
+use peerbeam_domain::port::{Bind, Link, Protocol, TransferProvider};
+
+/// Server name presented to QUIC (ignored by the accept-any verifier, but the
+/// TLS layer requires one).
+const SERVER_NAME: &str = "peerbeam";
+
+fn conn_err(e: impl std::fmt::Display) -> DomainError {
+    DomainError::Connection(format!("quic: {e}"))
+}
+
+/// A QUIC transport that can dial peers and accept inbound connections.
+///
+/// One client [`quinn::Endpoint`] is held for outbound `dial`s; each `serve`
+/// call binds its own server endpoint (kept alive by the returned stream).
+pub struct QuicTransport {
+    id: ProviderId,
+    client: quinn::Endpoint,
+}
+
+impl QuicTransport {
+    /// Create a transport with a client endpoint bound to an ephemeral port.
+    pub fn new() -> Result<Self> {
+        let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid addr");
+        let mut client = quinn::Endpoint::client(bind).map_err(conn_err)?;
+        client.set_default_client_config(tls::client_config()?);
+        tracing::debug!(local = %client.local_addr().map(|a| a.to_string()).unwrap_or_default(), "quic client endpoint ready");
+        Ok(Self {
+            id: ProviderId::from("quic"),
+            client,
+        })
+    }
+
+    /// Like [`TransferProvider::serve`], but also returns the actual bound
+    /// local address. Needed when binding to port 0 (OS-assigned) — e.g. tests
+    /// and the benchmark — where the caller must learn the chosen port to dial.
+    pub async fn serve_addr(
+        &self,
+        bind: Bind,
+    ) -> Result<(SocketAddr, BoxStream<'static, Result<Box<dyn Link>>>)> {
+        let addr: SocketAddr = format!("0.0.0.0:{}", bind.port)
+            .parse()
+            .expect("valid addr");
+        let endpoint = quinn::Endpoint::server(tls::server_config()?, addr).map_err(conn_err)?;
+        let local = endpoint.local_addr().map_err(conn_err)?;
+        tracing::info!(%local, "quic serving");
+
+        let stream = futures::stream::unfold(endpoint, |ep| async move {
+            loop {
+                match ep.accept().await {
+                    Some(incoming) => match accept_link(incoming).await {
+                        Ok(link) => return Some((Ok(link), ep)),
+                        Err(e) => {
+                            // A single bad connection must not stop the server.
+                            tracing::warn!(error = %e, "quic inbound connection rejected");
+                            continue;
+                        }
+                    },
+                    None => return None, // endpoint closed
+                }
+            }
+        });
+        Ok((local, Box::pin(stream)))
+    }
+}
+
+#[async_trait]
+impl TransferProvider for QuicTransport {
+    fn id(&self) -> ProviderId {
+        self.id.clone()
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::Quic
+    }
+
+    async fn dial(&self, route: &Route, session: &TransferSession) -> Result<Box<dyn Link>> {
+        let addr: SocketAddr = format!("{}:{}", route.address, route.port)
+            .parse()
+            .map_err(|e| DomainError::Connection(format!("bad route address: {e}")))?;
+        tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
+
+        let conn = self
+            .client
+            .connect(addr, SERVER_NAME)
+            .map_err(conn_err)?
+            .await
+            .map_err(conn_err)?;
+        // Client opens the bidirectional stream; it materialises on the server
+        // once the first frame (transfer Meta) is written by the engine.
+        let (send, recv) = conn.open_bi().await.map_err(conn_err)?;
+        tracing::debug!(%addr, "quic link established (outbound)");
+        Ok(Box::new(QuicLink::new(conn, send, recv)))
+    }
+
+    async fn serve(&self, bind: Bind) -> Result<BoxStream<'static, Result<Box<dyn Link>>>> {
+        let (_addr, stream) = self.serve_addr(bind).await?;
+        Ok(stream)
+    }
+}
+
+/// Accept one inbound connection and its first bidirectional stream.
+async fn accept_link(incoming: quinn::Incoming) -> Result<Box<dyn Link>> {
+    let conn = incoming.await.map_err(conn_err)?;
+    let remote = conn.remote_address();
+    let (send, recv) = conn.accept_bi().await.map_err(conn_err)?;
+    tracing::debug!(%remote, "quic link established (inbound)");
+    Ok(Box::new(QuicLink::new(conn, send, recv)))
+}
+
+/// Build a [`Route`] for dialing a plain `address:port` over QUIC.
+pub fn direct_route(address: impl Into<String>, port: u16) -> Route {
+    use peerbeam_domain::entity::RouteKind;
+    Route {
+        kind: RouteKind::DirectInternet,
+        address: address.into(),
+        port,
+    }
+}

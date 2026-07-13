@@ -53,6 +53,7 @@ that's its job as the composition root.
 | `peerbeam-discovery-mdns` | Adapter | mDNS/DNS-SD discovery. |
 | `peerbeam-discovery-tailscale` | Adapter | Tailscale discovery via CLI + LocalAPI. |
 | `peerbeam-transfer` | Adapter/logic | Streaming file/folder/clipboard transfer, resume, auth, `SecureLink`. |
+| `peerbeam-transfer-quic` | Adapter | QUIC `TransferProvider` (quinn) — real network `Link`s via `dial`/`serve`. |
 | `peerbeam-storage-fs` | Adapter | Streaming filesystem `StorageProvider` + atomic finalize. |
 | `peerbeam-crypto` | Adapter | X25519 + AES-256-GCM `EncryptionProvider`. |
 | `peerbeam-reliability-fs` | Adapter | Checkpoint store for resume. |

@@ -25,6 +25,7 @@ peerbeam-discovery-mdns = { path = "../../crates/peerbeam-discovery-mdns" }
 peerbeam-discovery-tailscale = { path = "../../crates/peerbeam-discovery-tailscale" }
 peerbeam-crypto = { path = "../../crates/peerbeam-crypto" }
 peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
+peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }
 peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
 tokio = { workspace = true }
 futures = { workspace = true }
