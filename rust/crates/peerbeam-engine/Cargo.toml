@@ -10,11 +10,12 @@ license.workspace = true
 peerbeam-domain = { workspace = true }
 peerbeam-app = { workspace = true }
 peerbeam-config = { workspace = true }
+peerbeam-transfer = { path = "../peerbeam-transfer" }
 tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 chrono = { workspace = true }

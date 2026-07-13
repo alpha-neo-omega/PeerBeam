@@ -1,5 +1,6 @@
 //! Command implementations + dispatch.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
-use peerbeam_engine::ManagedDevice;
+use peerbeam_engine::{ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
     authenticate, receive_file, send_file, Identity, SecureLink, SendRequest, TransferControl,
@@ -714,10 +715,11 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
 
     let config = load_config(path_override)?;
 
-    // Resolve the target to an address:port — directly (--addr) or via discovery.
-    let (address, port, peer_label) = if let Some(addr) = &args.addr {
+    // Resolve the target peer — directly (--addr) or via discovery. The result
+    // is a `Device`; the RouteManager decides which of its routes to use.
+    let target = if let Some(addr) = &args.addr {
         let sa = resolve_addr(addr)?;
-        (sa.ip().to_string(), sa.port(), addr.clone())
+        target_device(addr.clone(), sa.ip().to_string(), sa.port())
     } else {
         let devices = snapshot(config.clone(), 2).await;
         let candidates: Vec<(String, String)> = devices
@@ -725,11 +727,13 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             .map(|m| (m.device.id.to_string(), m.device.name.clone()))
             .collect();
         let index = resolve_peer(ctx, &candidates, &args.to)?;
-        let dev = &devices[index].device;
-        let address =
-            dev.addresses.first().cloned().ok_or_else(|| {
-                CliError::NotFound(format!("no reachable address for {}", dev.name))
-            })?;
+        let dev = devices[index].device.clone();
+        if dev.addresses.is_empty() {
+            return Err(CliError::NotFound(format!(
+                "no reachable address for {}",
+                dev.name
+            )));
+        }
         if !prompt::confirm(
             ctx,
             &format!("Send {} file(s) to {}?", args.paths.len(), dev.name),
@@ -737,17 +741,20 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
         ) {
             return Err(CliError::Cancelled);
         }
-        (address, dev.port, dev.name.clone())
+        dev
     };
 
-    if port == 0 {
+    if target.port == 0 {
         return Err(CliError::NotFound(format!(
-            "{peer_label} did not advertise a transfer port"
+            "{} did not advertise a transfer port",
+            target.name
         )));
     }
 
     let sc = SecureCtx::build(&config)?;
-    let quic = QuicTransport::new().map_err(CliError::from)?;
+    // Everything flows through the RouteManager — the one API for reaching a
+    // peer. The CLI never picks or sees a route.
+    let routes = RouteManager::new(Arc::new(QuicTransport::new().map_err(CliError::from)?));
     let storage = FsStorage::new();
     let chunk = config.transfer.chunk_size.max(1) as u32;
 
@@ -758,10 +765,24 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file.bin".into());
         let size = std::fs::metadata(path)?.len();
-        let route = direct_route(address.clone(), port);
-        secure_send_file(ctx, &quic, &route, &sc, &storage, p, &name, size, chunk).await?;
+        secure_send_file(ctx, &routes, &target, &sc, &storage, p, &name, size, chunk).await?;
     }
     Ok(())
+}
+
+/// A minimal `Device` for a `--addr` target (a single explicit route).
+fn target_device(name: String, address: String, port: u16) -> peerbeam_domain::entity::Device {
+    use peerbeam_domain::entity::{Device, DeviceType};
+    use peerbeam_domain::id::DeviceId;
+    Device {
+        id: DeviceId::from("addr"),
+        name,
+        device_type: DeviceType::Desktop,
+        platform: peerbeam_platform::current(),
+        addresses: vec![address],
+        port,
+        last_seen: chrono::Utc::now(),
+    }
 }
 
 /// Receive incoming files: serve QUIC, accept, authenticate, stream to disk.
@@ -815,12 +836,14 @@ impl SecureCtx {
     }
 }
 
-/// Dial, authenticate, wrap in `SecureLink`, and stream one file with progress.
+/// Select a route (via the RouteManager), authenticate, wrap in `SecureLink`,
+/// and stream one file with progress. The route chosen is the manager's
+/// concern — this function never sees it.
 #[allow(clippy::too_many_arguments)]
 async fn secure_send_file(
     ctx: &Ctx,
-    quic: &QuicTransport,
-    route: &peerbeam_domain::entity::Route,
+    routes: &RouteManager,
+    device: &peerbeam_domain::entity::Device,
     sc: &SecureCtx,
     storage: &FsStorage,
     path: &str,
@@ -829,12 +852,11 @@ async fn secure_send_file(
     chunk: u32,
 ) -> CliResult {
     use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
-    use peerbeam_domain::id::{DeviceId, TransferId};
-    use peerbeam_domain::port::TransferProvider;
+    use peerbeam_domain::id::TransferId;
 
     let session = TransferSession {
         id: TransferId::from(name),
-        peer: DeviceId::from("peer"),
+        peer: device.id.clone(),
         direction: Direction::Sending,
         status: TransferStatus::Transferring,
         files: Vec::new(),
@@ -845,7 +867,10 @@ async fn secure_send_file(
         is_resume: false,
     };
 
-    let mut link = quic.dial(route, &session).await.map_err(CliError::from)?;
+    let mut link = routes
+        .connect(device, &session)
+        .await
+        .map_err(CliError::from)?;
     let sess = authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust)
         .await
         .map_err(CliError::from)?;

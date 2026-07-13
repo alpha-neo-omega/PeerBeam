@@ -48,7 +48,7 @@ that's its job as the composition root.
 | `peerbeam-config` | Config | Typed `EngineConfig` with JSON load/save and defaults. |
 | `peerbeam-telemetry` | Logging | `tracing` subscriber setup for frontends. |
 | `peerbeam-app` | Application | `ProviderRegistry` (DI), `DeviceStore` reducer, cross-provider `merge_discovery`. |
-| `peerbeam-engine` | Composition root | `EngineBuilder` wires providers → `Engine` handle + event/device streams + `DeviceManager`. |
+| `peerbeam-engine` | Composition root | `EngineBuilder` wires providers → `Engine` handle + event/device streams + `DeviceManager` + `RouteManager` (route selection/failover/migration). |
 | `peerbeam-discovery-udp` | Adapter | LAN UDP broadcast discovery. |
 | `peerbeam-discovery-mdns` | Adapter | mDNS/DNS-SD discovery. |
 | `peerbeam-discovery-tailscale` | Adapter | Tailscale discovery via CLI + LocalAPI. |

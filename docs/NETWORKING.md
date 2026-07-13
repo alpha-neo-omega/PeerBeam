@@ -29,18 +29,34 @@ and an internet relay.
 ## 2. Route selection — choosing how to connect
 
 A device may be reachable several ways at once (a LAN address *and* a Tailscale
-IP). The `RouteProvider` port selects the best one. The intended priority,
-fastest first:
+IP). **`RouteManager`** (`peerbeam-engine`) picks the best one automatically and
+hides the choice. Priority, fastest first:
 
 ```
 LAN  →  USB tethering  →  Ethernet  →  Wi-Fi  →  Tailscale direct
      →  direct internet  →  relay
 ```
 
-The engine records per-device latency (`record_device_latency`) to inform the
-choice. The design calls for automatic route switching, reconnect, and resume
-when a route changes mid-transfer — resume is already implemented at the
-transfer layer (see below); automatic switching lands with the transport.
+(This is exactly `RouteKind`'s ordering, so ranking is a sort.)
+
+- **One API.** `RouteManager::connect(peer, session) -> Link` is the only entry
+  point the rest of the app uses. Callers (UI, transfer engine, CLI) get a live
+  `Link` and **never learn which route was used** — the choice is logged, not
+  returned.
+- **Automatic failover.** It builds candidate routes from the peer's addresses
+  (a `RouteClassifier` maps each address to its class), ranks them, and dials in
+  priority order, failing over to the next on error. The returned link is always
+  the highest-priority route that is actually reachable — dialing *is* the
+  reachability probe.
+- **Migration.** `RouteManager::link_factory` yields a `LinkFactory`; each
+  reconnect re-selects the best route, so a transfer that loses its LAN link
+  resumes over the next best route automatically (driven by the recovery loop).
+- **Classification.** The default `AddressClassifier` recognises Tailscale
+  (`100.64.0.0/10` + its IPv6 ULA), loopback/RFC1918/ULA (LAN), and public
+  (direct internet). Ethernet/Wi-Fi/USB share private ranges and refine only
+  with interface info — an interface-aware classifier can be injected.
+- `RouteProvider` remains the domain port for pluggable candidate sources; the
+  engine records per-device latency (`record_device_latency`) to inform ranking.
 
 ## 3. Link layer — moving bytes
 

@@ -13,11 +13,15 @@ mod builder;
 mod device_manager;
 mod engine;
 mod error;
+mod route_classifier;
+mod route_manager;
 
 pub use builder::EngineBuilder;
 pub use device_manager::DeviceManager;
 pub use engine::Engine;
 pub use error::EngineError;
+pub use route_classifier::{AddressClassifier, RouteClassifier};
+pub use route_manager::{RouteLinkFactory, RouteManager};
 
 // Re-export the pieces frontends need so they depend on one crate.
 pub use peerbeam_app::ProviderRegistry;
