@@ -56,16 +56,20 @@ fn config(ctx: &Ctx, args: ConfigArgs, path_override: Option<&str>) -> CliResult
         ConfigAction::Path => ctx.line(&path.to_string_lossy()),
         ConfigAction::Show => {
             let cfg = load_config(path_override)?;
-            let value = serde_json::to_value(&cfg).unwrap();
+            let value = serde_json::to_value(&cfg)
+                .map_err(|e| CliError::Other(format!("serialize config: {e}")))?;
             if ctx.json {
                 ctx.json_line(&value);
             } else {
-                ctx.line(&serde_json::to_string_pretty(&value).unwrap());
+                let pretty = serde_json::to_string_pretty(&value)
+                    .map_err(|e| CliError::Other(format!("format config: {e}")))?;
+                ctx.line(&pretty);
             }
         }
         ConfigAction::Get { key } => {
             let cfg = load_config(path_override)?;
-            let value = serde_json::to_value(&cfg).unwrap();
+            let value = serde_json::to_value(&cfg)
+                .map_err(|e| CliError::Other(format!("serialize config: {e}")))?;
             let found = navigate(&value, &key)
                 .ok_or_else(|| CliError::NotFound(format!("config key {key}")))?;
             if ctx.json {
@@ -76,7 +80,8 @@ fn config(ctx: &Ctx, args: ConfigArgs, path_override: Option<&str>) -> CliResult
         }
         ConfigAction::Set { key, value } => {
             let cfg = load_config(path_override)?;
-            let mut root = serde_json::to_value(&cfg).unwrap();
+            let mut root = serde_json::to_value(&cfg)
+                .map_err(|e| CliError::Other(format!("serialize config: {e}")))?;
             set_path(&mut root, &key, parse_value(&value)).map_err(CliError::Usage)?;
             let updated: EngineConfig = serde_json::from_value(root)
                 .map_err(|e| CliError::Usage(format!("invalid value for {key}: {e}")))?;
@@ -1042,13 +1047,30 @@ async fn serve_loop(
     Ok(())
 }
 
-/// Resolve `host:port` (or `ip:port`) to a socket address.
+/// Resolve `host:port` (or `ip:port`) to a socket address. Parsing is attempted
+/// as-is first (so every address the resolver accepts still works); only on
+/// failure do we craft a clearer hint for the two common footguns — a missing
+/// port and an unbracketed IPv6 host.
 fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
     use std::net::ToSocketAddrs;
-    s.to_socket_addrs()
-        .map_err(|e| CliError::Usage(format!("bad address {s}: {e}")))?
-        .next()
-        .ok_or_else(|| CliError::Usage(format!("no address resolved for {s}")))
+    if let Ok(mut addrs) = s.to_socket_addrs() {
+        return addrs
+            .next()
+            .ok_or_else(|| CliError::Usage(format!("no address resolved for {s}")));
+    }
+    // Parsing failed — give a targeted hint rather than the opaque std error.
+    if !s.starts_with('[') && !s.contains(':') {
+        return Err(CliError::Usage(format!(
+            "address '{s}' is missing a port — use <host>:<port>, e.g. {s}:49600"
+        )));
+    }
+    if !s.starts_with('[') && s.matches(':').count() > 1 {
+        // Looks like a bare IPv6 literal (multiple colons, no brackets).
+        return Err(CliError::Usage(format!(
+            "IPv6 address '{s}' must be bracketed — use [<addr>]:<port>"
+        )));
+    }
+    Err(CliError::Usage(format!("bad address {s}: not resolvable")))
 }
 
 /// Resolve a `--to` query (or interactive pick) to a device index.
@@ -1193,5 +1215,37 @@ mod config_key_tests {
         assert_eq!(render_scalar(&json!("hi")), "hi");
         assert_eq!(render_scalar(&json!(7)), "7");
         assert_eq!(render_scalar(&json!(true)), "true");
+    }
+}
+
+#[cfg(test)]
+mod resolve_addr_tests {
+    use super::resolve_addr;
+
+    #[test]
+    fn parses_ipv4_and_bracketed_ipv6() {
+        assert!(resolve_addr("127.0.0.1:49600").is_ok());
+        assert!(resolve_addr("[::1]:49600").is_ok());
+    }
+
+    #[test]
+    fn accepts_unbracketed_ipv6_with_port_std_allows() {
+        // std splits on the last colon, so these resolve — must NOT be
+        // rejected by the friendly-error path (regression guard).
+        assert!(resolve_addr("2001:db8::1:8080").is_ok());
+        assert!(resolve_addr("::1:8080").is_ok());
+        assert!(resolve_addr("fe80::1:80").is_ok());
+    }
+
+    #[test]
+    fn missing_port_is_a_clear_error() {
+        let err = resolve_addr("192.168.1.5").unwrap_err().to_string();
+        assert!(err.contains("missing a port"), "got: {err}");
+    }
+
+    #[test]
+    fn bare_ipv6_asks_for_brackets() {
+        let err = resolve_addr("fe80::1").unwrap_err().to_string();
+        assert!(err.contains("bracketed"), "got: {err}");
     }
 }

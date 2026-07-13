@@ -42,6 +42,10 @@ struct Record {
     device: Device,
     /// Providers that currently report this device.
     providers: HashSet<ProviderId>,
+    /// Provider that owns the identity fields; only it may change name/type/
+    /// platform/port. Prevents cross-provider identity flapping while still
+    /// surfacing a real rename. Transfers when the owner drops.
+    identity_provider: ProviderId,
 }
 
 /// The pure cross-provider dedup reducer.
@@ -69,13 +73,19 @@ impl DiscoveryRegistry {
                             Record {
                                 device: device.clone(),
                                 providers: HashSet::from([provider.clone()]),
+                                identity_provider: provider.clone(),
                             },
                         );
                         Some(DomainEvent::PeerFound(device))
                     }
                     Some(record) => {
                         record.providers.insert(provider.clone());
-                        let merged = merge_devices(&record.device, &device);
+                        let owner_present = record.providers.contains(&record.identity_provider);
+                        let take_identity = *provider == record.identity_provider || !owner_present;
+                        if take_identity {
+                            record.identity_provider = provider.clone();
+                        }
+                        let merged = merge_devices(&record.device, &device, take_identity);
                         let changed = !record.device.same_identity(&merged);
                         record.device = merged.clone();
                         changed.then_some(DomainEvent::PeerUpdated(merged))
@@ -113,19 +123,41 @@ impl DiscoveryRegistry {
     }
 }
 
-/// Produce a device that keeps `incoming`'s latest identity while unioning
-/// addresses from both, so a device reachable via several routes lists all
-/// of them.
-fn merge_devices(existing: &Device, incoming: &Device) -> Device {
-    let mut addresses = incoming.addresses.clone();
-    for addr in &existing.addresses {
+/// Merge a re-sighting into an already-known device, always unioning addresses
+/// and freshening `last_seen`. When `take_identity` is true (the identity owner,
+/// or a takeover after the owner dropped) the incoming name/type/platform/port
+/// is adopted, so a genuine rename propagates; otherwise the established
+/// identity is kept and only blank/zero fields are filled, so alternating
+/// providers can't flap it. Mirrors [`crate::device_store`]'s merge.
+fn merge_devices(existing: &Device, incoming: &Device, take_identity: bool) -> Device {
+    let mut addresses = existing.addresses.clone();
+    for addr in &incoming.addresses {
         if !addresses.contains(addr) {
             addresses.push(addr.clone());
         }
     }
+    if take_identity {
+        return Device {
+            addresses,
+            ..incoming.clone()
+        };
+    }
     Device {
+        id: existing.id.clone(),
+        name: if existing.name.is_empty() {
+            incoming.name.clone()
+        } else {
+            existing.name.clone()
+        },
+        device_type: existing.device_type,
+        platform: existing.platform,
+        port: if existing.port == 0 {
+            incoming.port
+        } else {
+            existing.port
+        },
         addresses,
-        ..incoming.clone()
+        last_seen: incoming.last_seen,
     }
 }
 

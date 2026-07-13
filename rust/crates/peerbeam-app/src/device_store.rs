@@ -32,6 +32,11 @@ struct Entry {
     latency_ms: Option<u32>,
     /// Providers currently reporting this device.
     providers: HashSet<ProviderId>,
+    /// Provider that currently owns the identity fields (name/type/platform/
+    /// port). Only it may change them, so a genuine rename propagates while
+    /// alternating providers can't flap the identity. Ownership transfers when
+    /// the owner drops off.
+    identity_provider: ProviderId,
 }
 
 /// Tracks all known devices and turns provider events into [`DeviceChange`]s.
@@ -75,6 +80,7 @@ impl DeviceStore {
                     last_seen,
                     latency_ms: None,
                     providers,
+                    identity_provider: provider.clone(),
                 };
                 let managed = self.to_managed(&entry);
                 self.devices.insert(id, entry);
@@ -83,7 +89,16 @@ impl DeviceStore {
             Some(entry) => {
                 let was_online = entry.online;
                 let new_provider = entry.providers.insert(provider.clone());
-                let merged = merge_addresses(&entry.device, &device);
+                // Only the identity owner (or a takeover when the owner has
+                // dropped) may change name/type/platform/port; any other
+                // provider fills blank/zero fields only. Kills cross-provider
+                // flapping while still surfacing a real rename from the owner.
+                let owner_present = entry.providers.contains(&entry.identity_provider);
+                let take_identity = *provider == entry.identity_provider || !owner_present;
+                if take_identity {
+                    entry.identity_provider = provider.clone();
+                }
+                let merged = merge(&entry.device, &device, take_identity);
                 let identity_changed = !entry.device.same_identity(&merged);
                 entry.device = merged;
                 entry.online = true;
@@ -230,18 +245,42 @@ impl DeviceStore {
     }
 }
 
-/// Union `incoming`'s addresses onto `existing`, keeping `incoming`'s
-/// identity fields.
-fn merge_addresses(existing: &Device, incoming: &Device) -> Device {
-    let mut addresses = incoming.addresses.clone();
-    for addr in &existing.addresses {
+/// Merge a re-sighting into the tracked device, always unioning addresses and
+/// freshening `last_seen`. When `take_identity` is true the incoming identity
+/// (name/type/platform/port) is adopted — used only for the identity owner, so
+/// a genuine rename propagates. Otherwise the established identity is kept and
+/// only blank/zero fields are filled, so two providers that disagree can't flap
+/// the name.
+fn merge(existing: &Device, incoming: &Device, take_identity: bool) -> Device {
+    // Union addresses: keep the established order, append genuinely new ones.
+    let mut addresses = existing.addresses.clone();
+    for addr in &incoming.addresses {
         if !addresses.contains(addr) {
             addresses.push(addr.clone());
         }
     }
+    if take_identity {
+        return Device {
+            addresses,
+            ..incoming.clone()
+        };
+    }
     Device {
+        id: existing.id.clone(),
+        name: if existing.name.is_empty() {
+            incoming.name.clone()
+        } else {
+            existing.name.clone()
+        },
+        device_type: existing.device_type,
+        platform: existing.platform,
+        port: if existing.port == 0 {
+            incoming.port
+        } else {
+            existing.port
+        },
         addresses,
-        ..incoming.clone()
+        last_seen: incoming.last_seen,
     }
 }
 
@@ -319,6 +358,95 @@ mod tests {
             }
             other => panic!("expected one Updated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn conflicting_provider_names_do_not_flap() {
+        let mut store = DeviceStore::new(caps_map());
+        // First provider establishes the name.
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice's Laptop", "10.0.0.1")),
+        );
+        // A second provider reports the same device with a different name and a
+        // new address. The address is unioned, but the name must NOT change.
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice", "100.64.0.1")),
+        );
+        // The alternate provider sighting again must still not flip the name.
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice", "100.64.0.1")),
+        );
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].device.name, "Alice's Laptop", "name is stable");
+        assert!(snap[0].device.addresses.contains(&"10.0.0.1".to_string()));
+        assert!(snap[0].device.addresses.contains(&"100.64.0.1".to_string()));
+    }
+
+    #[test]
+    fn owner_provider_rename_propagates() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "10.0.0.1")),
+        );
+        // Same (owning) provider reports a genuine rename → it must propagate.
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Updated(device("a", "Alice-Renamed", "10.0.0.1")),
+        );
+        assert!(
+            matches!(changes.as_slice(), [DeviceChange::Updated(m)] if m.device.name == "Alice-Renamed"),
+            "owner rename should emit Updated with the new name, got {changes:?}"
+        );
+    }
+
+    #[test]
+    fn identity_ownership_transfers_when_owner_drops() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "10.0.0.1")),
+        );
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice-TS", "100.64.0.1")),
+        );
+        // udp (the owner) drops; tailscale is now the only provider.
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        // Next tailscale sighting takes over identity → its name wins.
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice-TS", "100.64.0.1")),
+        );
+        let snap = store.snapshot();
+        assert_eq!(
+            snap[0].device.name, "Alice-TS",
+            "ownership transferred to tailscale"
+        );
+    }
+
+    #[test]
+    fn merge_fills_blank_name_and_zero_port() {
+        let mut store = DeviceStore::new(caps_map());
+        // A provider that only knows the address (blank name, port 0).
+        let mut blank = device("a", "", "10.0.0.1");
+        blank.port = 0;
+        store.observe(&ProviderId::from("udp"), DiscoveryEvent::Found(blank));
+        // A richer sighting fills the gaps.
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice", "100.64.0.1")),
+        );
+        let snap = store.snapshot();
+        assert_eq!(snap[0].device.name, "Alice", "blank name gets filled");
+        assert_eq!(snap[0].device.port, 9000, "zero port gets filled");
     }
 
     #[test]
