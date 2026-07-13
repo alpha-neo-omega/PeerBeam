@@ -106,6 +106,7 @@ flutter run              # desktop, or an attached Android device
 | Common problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | v1 → v2 changes | [Migration](docs/MIGRATION.md) |
 | Install / build / release | [Install](docs/INSTALL.md) · [Build](docs/BUILD.md) · [Release](docs/RELEASE.md) |
+| Release readiness & reports | [Beta Readiness](docs/BETA_READINESS.md) · [Compatibility](docs/COMPATIBILITY_MATRIX.md) · [Performance](docs/PERFORMANCE_REPORT.md) · [Security Report](docs/SECURITY_REPORT.md) · [Known Issues](docs/KNOWN_ISSUES.md) |
 | How to contribute | [Contributing](CONTRIBUTING.md) |
 
 ## Development
