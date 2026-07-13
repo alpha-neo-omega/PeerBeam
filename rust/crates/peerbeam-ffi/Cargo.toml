@@ -1,0 +1,34 @@
+[package]
+name = "peerbeam-ffi"
+description = "Stable C-ABI bridge exposing the PeerBeam engine to Flutter (dart:ffi)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: Windows/Linux/macOS/Android dynamic linking.
+# staticlib: iOS static linking (future).
+# rlib: so in-process Rust tests can call the C-ABI fns directly.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+peerbeam-config = { workspace = true }
+peerbeam-app = { workspace = true }
+peerbeam-platform = { workspace = true }
+peerbeam-engine = { path = "../peerbeam-engine" }
+peerbeam-discovery-udp = { path = "../peerbeam-discovery-udp" }
+peerbeam-discovery-mdns = { path = "../peerbeam-discovery-mdns" }
+peerbeam-discovery-tailscale = { path = "../peerbeam-discovery-tailscale" }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+libloading = "0.8"
+serial_test = "3"
+tempfile = { workspace = true }

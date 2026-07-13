@@ -1,0 +1,187 @@
+//! PeerBeam FFI — a stable C-ABI bridge exposing the engine to Flutter.
+//!
+//! Design invariants:
+//! - **Only strings + one callback pointer cross.** No domain/internal structs.
+//! - **JSON DTOs** are the versioned wire contract ([`dto`]); every
+//!   `char*`-returning function yields a result envelope ([`error`]).
+//! - **Panic-safe:** every `extern "C"` function is `catch_unwind`-wrapped, so a
+//!   Rust panic becomes a structured `internal` error, never UB across FFI.
+//! - **Ownership:** Rust allocates every returned string; Dart frees it with
+//!   [`pb_free_string`]. Dart allocates argument strings and frees them itself.
+//! - **No bytes cross.** Files are referred to by path; streaming stays in Rust.
+
+mod dto;
+mod error;
+mod events;
+mod runtime;
+
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+
+use serde_json::{json, Value};
+
+use error::Code;
+
+/// ABI version. Bump on any breaking change to a function signature or the
+/// envelope/DTO contract. Dart checks this at startup.
+pub const ABI_VERSION: u32 = 1;
+
+// ── string helpers ──────────────────────────────────────────────
+
+/// Turn a value into an owned C string pointer (caller frees via
+/// [`pb_free_string`]). Never returns null for valid JSON.
+fn to_cstring(value: Value) -> *mut c_char {
+    match CString::new(value.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => CString::new(
+            "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"nul in json\"}}",
+        )
+        .unwrap()
+        .into_raw(),
+    }
+}
+
+/// Read a borrowed C string argument (null → empty).
+///
+/// # Safety
+/// `ptr` must be null or a valid NUL-terminated UTF-8 string for the duration
+/// of the call.
+unsafe fn read_str(ptr: *const c_char) -> Result<String, (Code, String)> {
+    if ptr.is_null() {
+        return Ok(String::new());
+    }
+    CStr::from_ptr(ptr)
+        .to_str()
+        .map(|s| s.to_string())
+        .map_err(|_| (Code::InvalidArgument, "argument is not valid UTF-8".into()))
+}
+
+/// Run `body`, catching any panic and turning it into an `internal` envelope —
+/// a panic must never unwind across the FFI boundary.
+fn guard(body: impl FnOnce() -> Value) -> *mut c_char {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    match result {
+        Ok(value) => to_cstring(value),
+        Err(_) => to_cstring(error::err(Code::Internal, "internal error (panic caught)")),
+    }
+}
+
+// ── lifecycle / meta ────────────────────────────────────────────
+
+/// Integer ABI version for a fast compatibility check.
+#[no_mangle]
+pub extern "C" fn pb_abi_version() -> u32 {
+    ABI_VERSION
+}
+
+/// `{ "abi": <u32>, "semver": "<crate version>" }` (a bare object, not an
+/// envelope — this call cannot fail).
+#[no_mangle]
+pub extern "C" fn pb_version_json() -> *mut c_char {
+    to_cstring(json!({ "abi": ABI_VERSION, "semver": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Initialise the engine. `config_json` may be empty for defaults.
+///
+/// # Safety
+/// `config_json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_init(config_json: *const c_char) -> *mut c_char {
+    guard(
+        || match read_str(config_json).and_then(|s| runtime::init(&s)) {
+            Ok(data) => error::ok(data),
+            Err((code, msg)) => error::err(code, msg),
+        },
+    )
+}
+
+/// Stop all work and release the engine.
+#[no_mangle]
+pub extern "C" fn pb_shutdown() {
+    let _ = std::panic::catch_unwind(runtime::shutdown);
+}
+
+/// Register (or clear, with a null pointer) the event callback.
+#[no_mangle]
+pub extern "C" fn pb_set_event_callback(cb: Option<events::EventCallback>) {
+    events::set_callback(cb);
+}
+
+/// Free a string previously returned by any `pb_*` function or delivered to the
+/// event callback.
+///
+/// # Safety
+/// `ptr` must be a pointer returned by this library and not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn pb_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(CString::from_raw(ptr));
+    }
+}
+
+// ── discovery ───────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn pb_discovery_start() -> *mut c_char {
+    guard(|| error::envelope(runtime::discovery_start()))
+}
+
+#[no_mangle]
+pub extern "C" fn pb_discovery_stop() -> *mut c_char {
+    guard(|| error::envelope(runtime::discovery_stop()))
+}
+
+/// Snapshot of the current merged device list.
+#[no_mangle]
+pub extern "C" fn pb_devices_json() -> *mut c_char {
+    guard(|| error::envelope(runtime::devices()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read + free a `pb_*` return value as JSON.
+    fn take(ptr: *mut c_char) -> Value {
+        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
+        unsafe { pb_free_string(ptr) };
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn version_reports_abi() {
+        assert_eq!(pb_abi_version(), ABI_VERSION);
+        let v = take(pb_version_json());
+        assert_eq!(v["abi"], ABI_VERSION);
+        assert!(v["semver"].is_string());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn calls_before_init_error_cleanly() {
+        pb_shutdown(); // ensure clean state
+        let v = take(pb_devices_json());
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "not_initialised");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn init_then_list_devices() {
+        let v = take(unsafe { pb_init(std::ptr::null()) });
+        assert_eq!(v["ok"], true, "init with defaults: {v}");
+        let v = take(pb_devices_json());
+        assert_eq!(v["ok"], true);
+        assert!(v["data"]["devices"].is_array());
+        pb_shutdown();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bad_config_is_invalid_argument() {
+        let bad = CString::new("{ not json ]").unwrap();
+        let v = take(unsafe { pb_init(bad.as_ptr()) });
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "invalid_argument");
+    }
+}

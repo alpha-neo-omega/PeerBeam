@@ -94,6 +94,7 @@ flutter run              # desktop, or an attached Android device
 | Clipboard sharing | [Clipboard](docs/CLIPBOARD.md) |
 | Encryption, auth, trust, safe writes | [Security](docs/SECURITY.md) |
 | Embedding the Rust engine | [API](docs/API.md) |
+| Flutter ⇄ Rust FFI bridge | [FFI](docs/FFI.md) |
 | Command-line interface | [CLI](docs/CLI.md) |
 | Flutter UI | [UI](docs/UI.md) |
 | Desktop support & compatibility | [Desktop](docs/DESKTOP.md) |
