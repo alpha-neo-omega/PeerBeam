@@ -49,6 +49,17 @@ lib/
 - Platform-adaptive controls (`Switch.adaptive`) and a transfer-count `Badge`
   on the nav.
 
+## Drag & drop (desktop only)
+
+`DropZone` (in `features/send/`) wraps the whole content area. On desktop
+(Linux/macOS/Windows) it accepts dropped files; on mobile/web it is a
+transparent passthrough. Dropped items are **staged by path + size only** —
+never read into memory — so dropping many files or multi-GB files is instant.
+A dashed, tinted `DropOverlay` fades/scales in while dragging, then the
+staged-files sheet opens for review (per-file remove, running total). Staging
+lives in a pure `StagingStore` (dedup by path), unit-tested independently of
+any native drag.
+
 ## Verification
 
 `flutter analyze` — no issues. `flutter test` — boots-to-Home smoke test

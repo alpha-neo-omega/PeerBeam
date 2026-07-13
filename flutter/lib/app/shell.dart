@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import '../features/send/drop_zone.dart';
 import '../state/app_scope.dart';
 import 'theme.dart';
 
@@ -30,6 +31,9 @@ class AppShell extends StatelessWidget {
     final width = MediaQuery.sizeOf(context).width;
     final index = navigationShell.currentIndex;
 
+    // Desktop-only drag & drop wraps the whole content area.
+    final body = DropZone(staging: state.staging, child: navigationShell);
+
     // Transfer badge count reacts only to the transfer store.
     Widget badgedIcon(Widget icon) => AnimatedBuilder(
           animation: state.transfer,
@@ -45,7 +49,7 @@ class AppShell extends StatelessWidget {
 
     if (width < Breakpoints.compact) {
       return Scaffold(
-        body: navigationShell,
+        body: body,
         bottomNavigationBar: NavigationBar(
           selectedIndex: index,
           onDestinationSelected: _go,
@@ -84,7 +88,7 @@ class AppShell extends StatelessWidget {
             ],
           ),
           const VerticalDivider(width: 1, thickness: 1),
-          Expanded(child: navigationShell),
+          Expanded(child: body),
         ],
       ),
     );

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'models.dart';
+import 'staging.dart';
 
 /// Per-domain [ChangeNotifier]s. Screens listen to only the store they need
 /// (via `AnimatedBuilder`), so a change in one domain never rebuilds the whole
@@ -113,6 +114,7 @@ class AppState {
   final TransferStore transfer;
   final HistoryStore history;
   final SettingsStore settings;
+  final StagingStore staging;
 
   AppState({
     required this.theme,
@@ -120,6 +122,7 @@ class AppState {
     required this.transfer,
     required this.history,
     required this.settings,
+    required this.staging,
   });
 
   void dispose() {
@@ -128,6 +131,7 @@ class AppState {
     transfer.dispose();
     history.dispose();
     settings.dispose();
+    staging.dispose();
   }
 
   /// Sample data so the modern UI is fully explorable without the engine.
@@ -224,6 +228,7 @@ class AppState {
         notifications: true,
         compression: true,
       ),
+      staging: StagingStore(),
     );
   }
 }
