@@ -633,3 +633,79 @@ impl Link for MemLink {
         Ok(())
     }
 }
+
+// ── unit tests: config dotted-key navigation ────────────────────
+#[cfg(test)]
+mod config_key_tests {
+    use super::{navigate, parse_value, render_scalar, set_path};
+    use serde_json::json;
+
+    fn sample() -> serde_json::Value {
+        json!({
+            "device": { "name": "box", "auto_accept_trusted": false },
+            "transfer": { "chunk_size": 1048576 },
+        })
+    }
+
+    #[test]
+    fn navigate_reaches_nested_scalar() {
+        let v = sample();
+        assert_eq!(navigate(&v, "device.name").unwrap(), &json!("box"));
+        assert_eq!(
+            navigate(&v, "transfer.chunk_size").unwrap(),
+            &json!(1048576)
+        );
+    }
+
+    #[test]
+    fn navigate_returns_none_for_unknown_key() {
+        let v = sample();
+        assert!(navigate(&v, "device.nope").is_none());
+        assert!(navigate(&v, "missing.section").is_none());
+        // Descending into a scalar is a miss, not a panic.
+        assert!(navigate(&v, "device.name.deeper").is_none());
+    }
+
+    #[test]
+    fn set_path_updates_existing_leaf() {
+        let mut v = sample();
+        set_path(&mut v, "device.name", json!("renamed")).unwrap();
+        assert_eq!(navigate(&v, "device.name").unwrap(), &json!("renamed"));
+    }
+
+    #[test]
+    fn set_path_rejects_unknown_leaf() {
+        let mut v = sample();
+        assert!(set_path(&mut v, "device.unknown", json!(1)).is_err());
+    }
+
+    #[test]
+    fn set_path_rejects_unknown_parent() {
+        let mut v = sample();
+        assert!(set_path(&mut v, "ghost.name", json!(1)).is_err());
+    }
+
+    #[test]
+    fn set_path_rejects_descending_into_scalar() {
+        let mut v = sample();
+        // `device.name` is a string, not an object — cannot set a child.
+        assert!(set_path(&mut v, "device.name.x", json!(1)).is_err());
+    }
+
+    #[test]
+    fn parse_value_infers_json_types_and_falls_back_to_string() {
+        assert_eq!(parse_value("42"), json!(42));
+        assert_eq!(parse_value("true"), json!(true));
+        assert_eq!(parse_value("1.5"), json!(1.5));
+        // Bare, unquoted text is not valid JSON → treated as a string.
+        assert_eq!(parse_value("peerbeam=debug"), json!("peerbeam=debug"));
+        assert_eq!(parse_value("MyLaptop"), json!("MyLaptop"));
+    }
+
+    #[test]
+    fn render_scalar_unquotes_strings_but_stringifies_others() {
+        assert_eq!(render_scalar(&json!("hi")), "hi");
+        assert_eq!(render_scalar(&json!(7)), "7");
+        assert_eq!(render_scalar(&json!(true)), "true");
+    }
+}

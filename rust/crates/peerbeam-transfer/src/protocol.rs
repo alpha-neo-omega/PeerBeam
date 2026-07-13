@@ -134,6 +134,18 @@ mod tests {
     }
 
     #[test]
+    fn chunk_frame_owned_matches_borrowed_variant() {
+        // The zero-copy send path must produce a byte-identical frame to the
+        // copying helper — same kind, same payload.
+        let data = vec![9u8, 8, 7, 6, 5];
+        let borrowed = chunk_frame(&data);
+        let owned = chunk_frame_owned(Bytes::from(data.clone()));
+        assert_eq!(owned.kind, borrowed.kind);
+        assert_eq!(owned.payload, borrowed.payload);
+        assert_eq!(&owned.payload[..], &data[..]);
+    }
+
+    #[test]
     fn parse_rejects_garbage() {
         let bad = Frame {
             kind: FrameKind::Meta,

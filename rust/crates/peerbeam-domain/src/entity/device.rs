@@ -75,3 +75,50 @@ impl Device {
             && self.port == other.port
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Device {
+        Device {
+            id: DeviceId::from("dev-1"),
+            name: "Laptop".into(),
+            device_type: DeviceType::Laptop,
+            platform: Platform::Linux,
+            addresses: vec!["10.0.0.2".into()],
+            port: 49500,
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn same_identity_ignores_last_seen() {
+        let a = sample();
+        let mut b = a.clone();
+        // A liveness refresh only bumps the timestamp — still the same device.
+        b.last_seen = a.last_seen + chrono::Duration::seconds(30);
+        assert!(a.same_identity(&b));
+    }
+
+    #[test]
+    fn same_identity_detects_meaningful_changes() {
+        let a = sample();
+        let mutations: [fn(&mut Device); 6] = [
+            |d| d.name = "Renamed".into(),
+            |d| d.addresses = vec!["10.0.0.3".into()],
+            |d| d.port = 40000,
+            |d| d.platform = Platform::Windows,
+            |d| d.device_type = DeviceType::Desktop,
+            |d| d.id = DeviceId::from("dev-2"),
+        ];
+        for mutate in mutations {
+            let mut b = a.clone();
+            mutate(&mut b);
+            assert!(
+                !a.same_identity(&b),
+                "a change to an identity field must be observable"
+            );
+        }
+    }
+}
