@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=PeerBeam
+GenericName=File Sharing
+Comment=Secure, zero-config file & clipboard sharing
+Exec=peerbeam
+Icon=peerbeam
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=share;transfer;files;lan;tailscale;p2p;
+StartupWMClass=peerbeam
+# Future file/URL association scaffold (harmless if unused):
+MimeType=x-scheme-handler/peerbeam;

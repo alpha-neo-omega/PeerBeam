@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 0.2.0+1
 
 environment:
   sdk: ^3.12.1
@@ -58,6 +58,20 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+  # Windows MSIX installer generator (`dart run msix:create`).
+  msix: ^3.16.0
+
+# MSIX packaging (Windows). Signing cert is supplied at build time via env, not
+# committed — see docs/RELEASE.md. `dart run msix:create`.
+msix_config:
+  display_name: PeerBeam
+  publisher_display_name: PeerBeam Contributors
+  identity_name: com.peerbeam.peerbeam
+  msix_version: 0.2.0.0
+  logo_path: ../packaging/windows/peerbeam.png
+  capabilities: "internetClient,privateNetworkClientServer"
+  install_certificate: false
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

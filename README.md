@@ -105,6 +105,7 @@ flutter run              # desktop, or an attached Android device
 | Performance baselines | [Benchmarks](docs/BENCHMARKS.md) |
 | Common problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | v1 → v2 changes | [Migration](docs/MIGRATION.md) |
+| Install / build / release | [Install](docs/INSTALL.md) · [Build](docs/BUILD.md) · [Release](docs/RELEASE.md) |
 | How to contribute | [Contributing](CONTRIBUTING.md) |
 
 ## Development

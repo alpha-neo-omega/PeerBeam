@@ -1,0 +1,8 @@
+# Copy to key.properties (git-ignored) and fill in for release signing.
+# Generate a keystore:
+#   keytool -genkey -v -keystore peerbeam-release.jks -keyalg RSA -keysize 2048 \
+#     -validity 10000 -alias peerbeam
+storePassword=CHANGEME
+keyPassword=CHANGEME
+keyAlias=peerbeam
+storeFile=/absolute/path/to/peerbeam-release.jks
