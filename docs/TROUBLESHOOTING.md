@@ -37,12 +37,19 @@ merged, so a device found by any provider shows once. See [Devices](DEVICES.md).
 
 ## Transfers
 
-**`send` / `receive` / `daemon` say "unavailable" (exit code 8).**
-This is expected in the current build: the network transport
-(`TransferProvider`, planned QUIC) isn't implemented yet, so these commands are
-gated. They parse and resolve peers but stop before moving bytes. Track this in
-[Migration](MIGRATION.md). The transfer pipeline itself works and can be
-exercised with `peerbeam benchmark loopback`.
+**`send` can't find the peer.**
+The receiver must be running (`peerbeam receive` or `daemon start`) so it
+advertises via discovery. Confirm with `peerbeam discover` on the sender. If
+discovery is blocked (firewall, subnots, client isolation — see above), dial the
+receiver directly: `peerbeam send FILE --addr <ip>:<port>` (default port 49600,
+configurable via `transfer.port`).
+
+**`send FILE` where FILE is a folder → usage error.**
+Folder send over the network isn't wired yet — send individual files. (The
+folder transfer engine exists; the CLI path is a follow-up.)
+
+**`clipboard` / `history` / `daemon stop|status` say "unavailable" (exit 8).**
+These remain gated in the current build. `send`/`receive`/`daemon start` work.
 
 **A transfer was interrupted.**
 - Transfers are resumable. Partly-received data is kept in a `<name>.part` file;

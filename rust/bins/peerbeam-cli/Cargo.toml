@@ -24,6 +24,7 @@ peerbeam-discovery-udp = { path = "../../crates/peerbeam-discovery-udp" }
 peerbeam-discovery-mdns = { path = "../../crates/peerbeam-discovery-mdns" }
 peerbeam-discovery-tailscale = { path = "../../crates/peerbeam-discovery-tailscale" }
 peerbeam-crypto = { path = "../../crates/peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../../crates/peerbeam-trust-fs" }
 peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
 peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }
 peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }

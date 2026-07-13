@@ -17,12 +17,12 @@ of any size with end-to-end encryption and resumable, integrity-checked
 transfers. A Rust engine does the work; a Flutter app and a first-class CLI are
 two frontends over the same core.
 
-> **Status.** The engine, discovery, security, transfer pipeline, CLI, and
-> Flutter UI are implemented and tested. The one missing adapter is the network
-> **transport** (`TransferProvider`, planned QUIC) that turns a `Link` into a
-> socket — until it lands, `send`/`receive`/`daemon` are gated and transfers are
-> exercised over an in-process link. See [Migration](docs/MIGRATION.md) and the
-> per-component docs below.
+> **Status.** The engine, discovery, security, transfer pipeline, QUIC
+> transport, CLI, and Flutter UI are implemented and tested. Networked
+> `send`/`receive` work end to end over QUIC with mutual authentication
+> (verified by a two-process integration test). Remaining gaps: folder send,
+> `clipboard`/`history` CLI execution, and desktop packaging for Windows/macOS.
+> See [Migration](docs/MIGRATION.md) and the per-component docs below.
 
 ## Highlights
 

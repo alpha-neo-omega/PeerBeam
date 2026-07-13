@@ -91,10 +91,11 @@ The **QUIC transport is implemented** (`peerbeam-transfer-quic`, built on
 - Verified by **two-real-endpoint** integration tests (localhost, not mocks)
   and measured by `peerbeam benchmark quic` — see [Benchmarks](BENCHMARKS.md).
 
-Still in progress: wiring QUIC into the end-user CLI `send`/`receive`/`daemon`
-commands (peer→route resolution + a receiving daemon loop) — the provider and
-engine are ready; those commands remain gated (exit code 8) until wired. See
-[Migration](MIGRATION.md).
+The CLI now uses this transport end to end: `receive`/`daemon` serve QUIC and
+advertise via discovery; `send --to <name>` resolves a peer's address+port from
+discovery (or `send --addr IP:PORT` dials directly) and streams over an
+authenticated `SecureLink`. Verified by an end-to-end test that spawns two real
+`peerbeam` processes. See [CLI](CLI.md).
 
 The in-process `Link` (bounded channels) remains for tests and
 `benchmark loopback` as a transport-free upper bound.

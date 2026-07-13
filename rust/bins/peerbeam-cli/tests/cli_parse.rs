@@ -39,6 +39,42 @@ fn send_requires_at_least_one_path() {
 }
 
 #[test]
+fn send_addr_conflicts_with_to() {
+    // --addr and --to are mutually exclusive.
+    assert!(Cli::try_parse_from([
+        "peerbeam",
+        "send",
+        "a.txt",
+        "--to",
+        "phone",
+        "--addr",
+        "1.2.3.4:9"
+    ])
+    .is_err());
+    let cli =
+        Cli::try_parse_from(["peerbeam", "send", "a.txt", "--addr", "1.2.3.4:49600"]).unwrap();
+    match cli.command {
+        Command::Send(a) => {
+            assert_eq!(a.addr.as_deref(), Some("1.2.3.4:49600"));
+            assert!(a.to.is_none());
+        }
+        _ => panic!("expected send"),
+    }
+}
+
+#[test]
+fn receive_accepts_port_and_once() {
+    let cli = Cli::try_parse_from(["peerbeam", "receive", "--once", "--port", "50000"]).unwrap();
+    match cli.command {
+        Command::Receive(a) => {
+            assert!(a.once);
+            assert_eq!(a.port, Some(50000));
+        }
+        _ => panic!("expected receive"),
+    }
+}
+
+#[test]
 fn config_subcommands() {
     let cli = Cli::try_parse_from(["peerbeam", "config", "set", "device.name", "Laptop"]).unwrap();
     match cli.command {

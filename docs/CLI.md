@@ -31,7 +31,7 @@ src/commands.rs   one fn per command + dispatch
 
 ## Commands
 
-Working now (no network transport needed):
+Working now:
 
 - `config show|get <key>|set <key> <val>|path` — reads/writes `EngineConfig`
   JSON; dotted keys (`transfer.chunk_size`).
@@ -47,10 +47,22 @@ Working now (no network transport needed):
   NDJSON stream (Ctrl-C to stop).
 - `list [--online]`, `status` — device snapshot / identity + providers.
 - `completions <shell>`.
+- `send <PATH>… [--to <device>] [--addr IP:PORT]` — send file(s) over QUIC with
+  mutual authentication. `--to` resolves a peer via discovery (id / name /
+  prefix, or interactive pick); `--addr` dials directly, skipping discovery
+  (headless/testing). Live progress bar; whole-file SHA-256 verified.
+- `receive [--dir DIR] [--port N] [--once]` — serve QUIC, authenticate each
+  peer, stream incoming files to `DIR` (default: config `save_directory`).
+  Advertises presence via discovery so `send --to` can find it. `--once` exits
+  after one transfer; `--port 0` picks an OS port (printed on start).
+- `daemon start [--foreground]` — run the receive loop until interrupted.
+  (`daemon stop|status` need the IPC layer — not built yet, exit code 8.)
 
-Present but gated until the QUIC transport lands (exit code 8, clear message):
-`send` (validates paths + resolves/──selects peer + confirms first), `receive`,
-`clipboard`, `history`, `daemon`.
+Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
+application-layer X25519 mutual-auth handshake with TOFU trust pinning and
+per-frame replay protection ([Security](SECURITY.md)).
+
+Still gated (exit code 8): `clipboard`, `history`, and `daemon stop|status`.
 
 ## Global flags
 
@@ -69,6 +81,11 @@ peerbeam doctor
 peerbeam discover --timeout 5
 peerbeam list --online
 peerbeam config set device.name "My Laptop"
+
+# Transfer: receive on one machine, send from another
+peerbeam receive                          # serve + advertise (Ctrl-C to stop)
+peerbeam send movie.mkv --to "My Laptop"  # discover peer by name and send
+peerbeam send movie.mkv --addr 192.168.1.5:49600   # or dial directly
 
 # Scripting (machine-readable, no colour/prompts, branch on exit code)
 peerbeam discover --timeout 3 --json | jq '.[].name'
@@ -91,12 +108,12 @@ with `--no-color` or `--json`.
 ## Verification
 
 `cargo clippy -D warnings` clean; `cargo test` green (parse + resolver +
-prompt); binary smoke-tested: `--version`, `doctor --json`, `benchmark crypto`
-(~5 GiB/s here), `config get/show`, `completions bash`, `status --json`,
-`send /missing --to x` → exit 3.
+prompt + config round-trip); an **end-to-end test spawns two `peerbeam`
+processes** and transfers a file over QUIC (`tests/transfer_e2e.rs`). Binary
+smoke-tested incl. `send`/`receive` over both discovery and `--addr`.
 
 ## Not yet
 
-`send`/`receive`/`clipboard`/`history`/`daemon` execution and the daemon IPC
-land with the transport bridge; they parse and resolve today but stop at a
-gated message.
+`clipboard` and `history` execution, and the `daemon stop|status` IPC, are still
+gated (exit code 8). Folder send (`send <dir>`) is not wired yet — send files
+for now.

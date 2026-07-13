@@ -67,6 +67,8 @@ pub struct TransferConfig {
     pub enable_compression: bool,
     /// Enable checkpoint-based resume.
     pub enable_resume: bool,
+    /// Port the transfer server (QUIC) listens on and advertises.
+    pub port: u16,
 }
 
 /// Encryption configuration.
@@ -112,6 +114,7 @@ impl Default for EngineConfig {
                 max_concurrent: 3,
                 enable_compression: true,
                 enable_resume: true,
+                port: 49600,
             },
             encryption: EncryptionConfig { required: true },
             storage: StorageConfig {

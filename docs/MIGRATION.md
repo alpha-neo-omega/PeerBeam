@@ -37,20 +37,24 @@ v1 proved the idea; v2 makes it maintainable at scale. The rewrite exists to:
 - Transfer engine: single file, folders, clipboard, resume, integrity, retry,
   pause/cancel ([Transfer](TRANSFER.md), [Clipboard](CLIPBOARD.md)).
 - Security layer: auth, `SecureLink`, trust, safe writes ([Security](SECURITY.md)).
+- **QUIC transport + networked transfer.** `send`/`receive`/`daemon` work end
+  to end over QUIC with mutual authentication — via discovery (`send --to`) or a
+  direct `--addr`. Verified by a two-process integration test ([CLI](CLI.md),
+  [Networking](NETWORKING.md)).
 - CLI: `discover`, `list`, `status`, `config`, `doctor`, `benchmark`,
-  `completions` ([CLI](CLI.md)).
+  `completions`, `send`, `receive`, `daemon start` ([CLI](CLI.md)).
 - Flutter UI (desktop + Android), drag & drop, notifications ([UI](UI.md), [Android](ANDROID.md)).
 
 **In progress / gated**
-- **Network transport.** The `TransferProvider` (planned QUIC) that turns a
-  `Link` into a socket is not implemented yet. Until it lands, the CLI
-  `send`/`receive`/`daemon`/`clipboard` commands are gated (exit code 8) — they
-  parse and resolve peers but don't move bytes over the network. The transfer
-  pipeline is validated over an in-process link (`benchmark loopback`, tests).
+- **Folder send** over the network is not wired yet (single files only); the
+  folder engine exists but the CLI path sends files. `clipboard`/`history` CLI
+  execution and `daemon stop|status` IPC remain gated (exit code 8).
 - **Automatic route switching** mid-transfer (resume is already implemented;
-  switching lands with the transport).
+  switching lands next).
 - **Folder receive** does not yet use the `.part`/atomic-finalize path that
   single-file receive uses.
+- **Stable device identity.** The CLI uses an ephemeral per-run keypair/id, so
+  TOFU re-pins each run; persisting a long-term identity is a follow-up.
 
 Track these in the relevant component docs; the [README](../README.md) status
 box is the quick reference.

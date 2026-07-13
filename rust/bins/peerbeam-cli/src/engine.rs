@@ -32,7 +32,7 @@ pub fn me(config: &EngineConfig) -> Device {
         device_type: DeviceType::Desktop,
         platform: peerbeam_platform::current(),
         addresses: vec![],
-        port: 0,
+        port: config.transfer.port,
         last_seen: chrono::Utc::now(),
     }
 }

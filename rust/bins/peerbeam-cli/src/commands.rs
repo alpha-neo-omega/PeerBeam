@@ -13,8 +13,11 @@ use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::ManagedDevice;
 use peerbeam_storage_fs::FsStorage;
-use peerbeam_transfer::{receive_file, send_file, SendRequest, TransferControl};
+use peerbeam_transfer::{
+    authenticate, receive_file, send_file, Identity, SecureLink, SendRequest, TransferControl,
+};
 use peerbeam_transfer_quic::{direct_route, QuicTransport};
+use peerbeam_trust_fs::FsTrust;
 
 use crate::cli::*;
 use crate::engine::{build_engine, config_path, me};
@@ -32,10 +35,10 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Status => status(ctx, cfg_override.as_deref()),
         Command::Completions { shell } => completions(shell),
         Command::Send(a) => send(ctx, a, cfg_override.as_deref()).await,
-        Command::Receive(_) => gated("receive"),
+        Command::Receive(a) => receive(ctx, a, cfg_override.as_deref()).await,
         Command::Clipboard(_) => gated("clipboard"),
         Command::History(_) => gated("history"),
-        Command::Daemon(_) => gated("daemon"),
+        Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
     }
 }
 
@@ -658,30 +661,289 @@ fn completions(shell: clap_complete::Shell) -> CliResult {
 }
 
 async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResult {
-    // Validate paths first.
+    // Validate paths first (files only for now; folder send is a follow-up).
     for p in &args.paths {
-        if !std::path::Path::new(p).exists() {
+        let path = std::path::Path::new(p);
+        if !path.exists() {
             return Err(CliError::NotFound(format!("path {p}")));
+        }
+        if path.is_dir() {
+            return Err(CliError::Usage(format!(
+                "folder send is not wired yet: {p} (send files for now)"
+            )));
         }
     }
 
     let config = load_config(path_override)?;
-    let devices = snapshot(config, 2).await;
-    let candidates: Vec<(String, String)> = devices
-        .iter()
-        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
-        .collect();
 
-    let index = match &args.to {
-        Some(q) => match resolve::resolve(&candidates, q) {
-            resolve::Resolution::Exact(i) => i,
-            resolve::Resolution::NotFound => return Err(CliError::NotFound(format!("device {q}"))),
+    // Resolve the target to an address:port — directly (--addr) or via discovery.
+    let (address, port, peer_label) = if let Some(addr) = &args.addr {
+        let sa = resolve_addr(addr)?;
+        (sa.ip().to_string(), sa.port(), addr.clone())
+    } else {
+        let devices = snapshot(config.clone(), 2).await;
+        let candidates: Vec<(String, String)> = devices
+            .iter()
+            .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+            .collect();
+        let index = resolve_peer(ctx, &candidates, &args.to)?;
+        let dev = &devices[index].device;
+        let address =
+            dev.addresses.first().cloned().ok_or_else(|| {
+                CliError::NotFound(format!("no reachable address for {}", dev.name))
+            })?;
+        if !prompt::confirm(
+            ctx,
+            &format!("Send {} file(s) to {}?", args.paths.len(), dev.name),
+            true,
+        ) {
+            return Err(CliError::Cancelled);
+        }
+        (address, dev.port, dev.name.clone())
+    };
+
+    if port == 0 {
+        return Err(CliError::NotFound(format!(
+            "{peer_label} did not advertise a transfer port"
+        )));
+    }
+
+    let sc = SecureCtx::build(&config)?;
+    let quic = QuicTransport::new().map_err(CliError::from)?;
+    let storage = FsStorage::new();
+    let chunk = config.transfer.chunk_size.max(1) as u32;
+
+    for p in &args.paths {
+        let path = std::path::Path::new(p);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file.bin".into());
+        let size = std::fs::metadata(path)?.len();
+        let route = direct_route(address.clone(), port);
+        secure_send_file(ctx, &quic, &route, &sc, &storage, p, &name, size, chunk).await?;
+    }
+    Ok(())
+}
+
+/// Receive incoming files: serve QUIC, accept, authenticate, stream to disk.
+async fn receive(ctx: &Ctx, args: ReceiveArgs, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let port = args.port.unwrap_or(config.transfer.port);
+    let dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| config.storage.save_directory.clone());
+    std::fs::create_dir_all(&dir)?;
+    serve_loop(ctx, &config, port, &dir, args.once).await
+}
+
+/// Background daemon: serve transfers until interrupted.
+async fn daemon(ctx: &Ctx, args: DaemonArgs, path_override: Option<&str>) -> CliResult {
+    match args.action {
+        DaemonAction::Start { foreground: _ } => {
+            let config = load_config(path_override)?;
+            let port = config.transfer.port;
+            let dir = config.storage.save_directory.clone();
+            std::fs::create_dir_all(&dir)?;
+            ctx.line(&ctx.dim("daemon: serving transfers (Ctrl-C to stop)"));
+            serve_loop(ctx, &config, port, &dir, false).await
+        }
+        DaemonAction::Stop | DaemonAction::Status => Err(CliError::Unavailable(
+            "daemon IPC (stop/status) is not implemented; run `daemon start --foreground`".into(),
+        )),
+    }
+}
+
+/// This device's authentication material (crypto + trust + identity).
+struct SecureCtx {
+    enc: AeadCrypto,
+    trust: FsTrust,
+    ident: Identity,
+}
+
+impl SecureCtx {
+    fn build(config: &EngineConfig) -> Result<Self, CliError> {
+        let enc = AeadCrypto::new();
+        let keypair = enc.generate_keypair();
+        let ident = Identity {
+            device_id: crate::engine::device_id(),
+            name: config.device.name.clone(),
+            keypair,
+        };
+        let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
+        let trust = FsTrust::open(trust_path).map_err(CliError::from)?;
+        Ok(Self { enc, trust, ident })
+    }
+}
+
+/// Dial, authenticate, wrap in `SecureLink`, and stream one file with progress.
+#[allow(clippy::too_many_arguments)]
+async fn secure_send_file(
+    ctx: &Ctx,
+    quic: &QuicTransport,
+    route: &peerbeam_domain::entity::Route,
+    sc: &SecureCtx,
+    storage: &FsStorage,
+    path: &str,
+    name: &str,
+    size: u64,
+    chunk: u32,
+) -> CliResult {
+    use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
+    use peerbeam_domain::id::{DeviceId, TransferId};
+    use peerbeam_domain::port::TransferProvider;
+
+    let session = TransferSession {
+        id: TransferId::from(name),
+        peer: DeviceId::from("peer"),
+        direction: Direction::Sending,
+        status: TransferStatus::Transferring,
+        files: Vec::new(),
+        total_bytes: size,
+        transferred_bytes: 0,
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        is_resume: false,
+    };
+
+    let mut link = quic.dial(route, &session).await.map_err(CliError::from)?;
+    let sess = authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust)
+        .await
+        .map_err(CliError::from)?;
+    if sess.newly_trusted {
+        ctx.line(&ctx.dim(&format!("pinned new peer {}", sess.peer_id.0)));
+    }
+
+    let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let bar = ctx.bar(size, name);
+    let ctrl = TransferControl::new();
+    let req = SendRequest {
+        transfer_id: name.to_string(),
+        name: name.to_string(),
+        path: path.to_string(),
+        size,
+        chunk_size: chunk,
+    };
+
+    let send = async move {
+        let r = send_file(&mut secure, storage, req, &ctrl, &ptx, 3).await;
+        drop(ptx);
+        r
+    };
+    let pump = async move {
+        while let Some(p) = prx.recv().await {
+            bar.update(p.transferred_bytes);
+        }
+        bar.finish();
+    };
+    let (r, _) = tokio::join!(send, pump);
+    r.map_err(CliError::from)?;
+    ctx.line(&ctx.green(&format!("sent {name}")));
+    Ok(())
+}
+
+/// Serve inbound QUIC connections, authenticate each, and receive one file per
+/// connection into `dir`. Advertises presence via discovery so senders find us.
+async fn serve_loop(
+    ctx: &Ctx,
+    config: &EngineConfig,
+    port: u16,
+    dir: &str,
+    once: bool,
+) -> CliResult {
+    use futures::StreamExt;
+    use peerbeam_domain::port::Bind;
+
+    let sc = SecureCtx::build(config)?;
+    let quic = QuicTransport::new().map_err(CliError::from)?;
+    let storage = FsStorage::new();
+    let (local, mut incoming) = quic
+        .serve_addr(Bind { port })
+        .await
+        .map_err(CliError::from)?;
+    ctx.line(&format!(
+        "listening on {} — saving to {}",
+        ctx.bold(&local.to_string()),
+        dir
+    ));
+
+    // Best-effort discoverability (so `send --to <name>` can find us).
+    let engine = build_engine(config.clone());
+    let _ = engine.start_discovery(me(config)).await;
+
+    loop {
+        let mut link = match incoming.next().await {
+            Some(Ok(l)) => l,
+            Some(Err(e)) => {
+                ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
+                continue;
+            }
+            None => break,
+        };
+        let sess = match authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust).await {
+            Ok(s) => s,
+            Err(e) => {
+                ctx.line(&ctx.dim(&format!("auth failed: {e}")));
+                continue;
+            }
+        };
+        if sess.newly_trusted {
+            ctx.line(&ctx.dim(&format!("pinned new peer {}", sess.peer_id.0)));
+        }
+
+        let storage_ref = &storage;
+        let (ptx, mut prx) = mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
+        let recv = async move {
+            let r = receive_file(&mut secure, storage_ref, dir, &ctrl, &ptx).await;
+            drop(ptx);
+            r
+        };
+        let pump = async move { while prx.recv().await.is_some() {} };
+        let (r, _) = tokio::join!(recv, pump);
+        match r {
+            Ok(rcv) => {
+                ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)))
+            }
+            Err(e) => ctx.line(&ctx.red(&format!("transfer failed: {e}"))),
+        }
+        if once {
+            break;
+        }
+    }
+
+    let _ = engine.stop_discovery().await;
+    Ok(())
+}
+
+/// Resolve `host:port` (or `ip:port`) to a socket address.
+fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
+    use std::net::ToSocketAddrs;
+    s.to_socket_addrs()
+        .map_err(|e| CliError::Usage(format!("bad address {s}: {e}")))?
+        .next()
+        .ok_or_else(|| CliError::Usage(format!("no address resolved for {s}")))
+}
+
+/// Resolve a `--to` query (or interactive pick) to a device index.
+fn resolve_peer(
+    ctx: &Ctx,
+    candidates: &[(String, String)],
+    to: &Option<String>,
+) -> Result<usize, CliError> {
+    match to {
+        Some(q) => match resolve::resolve(candidates, q) {
+            resolve::Resolution::Exact(i) => Ok(i),
+            resolve::Resolution::NotFound => Err(CliError::NotFound(format!("device {q}"))),
             resolve::Resolution::Ambiguous(list) => {
                 let names: Vec<String> = list.iter().map(|i| candidates[*i].1.clone()).collect();
-                return Err(CliError::Usage(format!(
+                Err(CliError::Usage(format!(
                     "'{q}' matches multiple devices: {}",
                     names.join(", ")
-                )));
+                )))
             }
         },
         None => {
@@ -689,24 +951,10 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
                 return Err(CliError::NotFound("no devices discovered".into()));
             }
             let names: Vec<String> = candidates.iter().map(|(_, n)| n.clone()).collect();
-            match prompt::select(ctx, "Select a device:", &names) {
-                Some(i) => i,
-                None => return Err(CliError::Usage("specify --to <device>".into())),
-            }
+            prompt::select(ctx, "Select a device:", &names)
+                .ok_or_else(|| CliError::Usage("specify --to <device>".into()))
         }
-    };
-
-    let peer = &candidates[index].1;
-    if !prompt::confirm(
-        ctx,
-        &format!("Send {} path(s) to {peer}?", args.paths.len()),
-        true,
-    ) {
-        return Err(CliError::Cancelled);
     }
-    Err(CliError::Unavailable(format!(
-        "resolved peer '{peer}', but the network transport isn't built yet"
-    )))
 }
 
 fn gated(what: &str) -> CliResult {

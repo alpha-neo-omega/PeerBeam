@@ -95,12 +95,15 @@ pub struct ListArgs {
 
 #[derive(Args)]
 pub struct SendArgs {
-    /// Files or folders to send.
+    /// Files to send.
     #[arg(required = true, value_name = "PATH")]
     pub paths: Vec<String>,
     /// Target device (id, name, or name prefix). Omit to pick interactively.
     #[arg(long)]
     pub to: Option<String>,
+    /// Dial a peer directly at `IP:PORT`, skipping discovery (headless/testing).
+    #[arg(long, value_name = "IP:PORT", conflicts_with = "to")]
+    pub addr: Option<String>,
 }
 
 #[derive(Args)]
@@ -111,6 +114,9 @@ pub struct ReceiveArgs {
     /// Exit after one transfer.
     #[arg(long)]
     pub once: bool,
+    /// Port to listen on (overrides `transfer.port` from config).
+    #[arg(long)]
+    pub port: Option<u16>,
 }
 
 #[derive(Args)]
