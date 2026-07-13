@@ -222,25 +222,37 @@ async fn benchmark(ctx: &Ctx, args: BenchmarkArgs) -> CliResult {
 
 fn bench_crypto(ctx: &Ctx) -> CliResult {
     let enc = AeadCrypto::new();
+    use std::hint::black_box;
     let key = [7u8; 32];
     let chunk = vec![0xABu8; 64 * 1024];
     let iterations = 1024u64; // 64 MiB
-    let nonce = Nonce([0u8; 12]);
 
+    // Vary the nonce per iteration and black_box the inputs/outputs so the
+    // optimizer can't hoist or elide the loop (which produced bogus numbers).
     let start = Instant::now();
     let mut sealed = Vec::new();
-    for _ in 0..iterations {
-        sealed = enc.seal(&key, &nonce, &chunk).map_err(CliError::from)?;
+    for i in 0..iterations {
+        let mut nb = [0u8; 12];
+        nb[0] = i as u8;
+        nb[1] = (i >> 8) as u8;
+        sealed = enc
+            .seal(black_box(&key), &Nonce(nb), black_box(&chunk))
+            .map_err(CliError::from)?;
+        black_box(&sealed);
     }
     let seal_secs = start.elapsed().as_secs_f64();
 
     let start = Instant::now();
     for _ in 0..iterations {
-        enc.open(&key, &sealed).map_err(CliError::from)?;
+        let plain = enc
+            .open(black_box(&key), black_box(&sealed))
+            .map_err(CliError::from)?;
+        black_box(&plain);
     }
     let open_secs = start.elapsed().as_secs_f64();
 
-    let mib = (iterations * 64) as f64;
+    // 64 KiB per iteration → MiB total.
+    let mib = (iterations * 64) as f64 / 1024.0;
     let seal_mbs = mib / seal_secs;
     let open_mbs = mib / open_secs;
     if ctx.json {
@@ -264,7 +276,20 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64) -> CliResult {
     let src = dir.join("bench.bin");
     let out = dir.join("out");
     let bytes = (size_mib * 1024 * 1024) as usize;
-    std::fs::write(&src, vec![0xABu8; bytes])?;
+    // Stream the sample file in 1 MiB blocks so the harness itself stays
+    // memory-bounded (the transfer under test is already streamed).
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&src)?;
+        let block = vec![0xABu8; 1024 * 1024];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let n = remaining.min(block.len());
+            f.write_all(&block[..n])?;
+            remaining -= n;
+        }
+        f.flush()?;
+    }
 
     let storage = FsStorage::new();
     let (mut la, mut lb) = MemLink::pair(8);
