@@ -1,7 +1,13 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../platform/bridge.dart';
+import '../../platform/services.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
+
+bool get _isAndroid =>
+    !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
 /// Settings. Listens to the settings + theme stores. Uses platform-adaptive
 /// controls (Switch.adaptive) for a native feel on each platform.
@@ -121,6 +127,43 @@ class SettingsScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 16),
+
+              // Android-only background/battery controls.
+              if (_isAndroid) ...[
+                const _GroupLabel('Background (Android)'),
+                AnimatedBuilder(
+                  animation: state.settings,
+                  builder: (context, _) => Card(
+                    child: Column(
+                      children: [
+                        SwitchListTile.adaptive(
+                          secondary: const Icon(Icons.dns_rounded),
+                          title: const Text('Keep receiving in background'),
+                          subtitle: const Text(
+                            'Runs a foreground service so transfers survive '
+                            'backgrounding',
+                          ),
+                          value: state.settings.backgroundReceive,
+                          onChanged: state.settings.setBackgroundReceive,
+                        ),
+                        const Divider(height: 1),
+                        ListTile(
+                          leading: const Icon(Icons.battery_saver_rounded),
+                          title: const Text('Ignore battery optimization'),
+                          subtitle: const Text(
+                            'Prevents the system from suspending transfers',
+                          ),
+                          trailing: const Icon(Icons.open_in_new_rounded),
+                          onTap: () =>
+                              BatteryOptimization(AndroidBridge())
+                                  .requestExemption(),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+              ],
 
               const _GroupLabel('About'),
               const Card(

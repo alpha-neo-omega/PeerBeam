@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
+import 'platform/android_integration.dart';
+import 'platform/bridge.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
 
@@ -19,9 +21,23 @@ class PeerBeamApp extends StatefulWidget {
 class _PeerBeamAppState extends State<PeerBeamApp> {
   final AppState _state = AppState.sample();
   final _router = buildRouter();
+  late final AndroidIntegration _android = AndroidIntegration(
+    bridge: AndroidBridge(),
+    staging: _state.staging,
+    transfer: _state.transfer,
+    settings: _state.settings,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    // No-op off Android; routes share/receive intents and drives the service.
+    _android.start();
+  }
 
   @override
   void dispose() {
+    _android.dispose();
     _state.dispose();
     _router.dispose();
     super.dispose();

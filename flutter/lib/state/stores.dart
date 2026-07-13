@@ -78,13 +78,22 @@ class SettingsStore extends ChangeNotifier {
   bool notifications;
   bool compression;
 
+  /// Keep a foreground service running to receive files while backgrounded.
+  bool backgroundReceive;
+
   SettingsStore({
     required this.deviceName,
     required this.saveDirectory,
     required this.autoAcceptTrusted,
     required this.notifications,
     required this.compression,
+    this.backgroundReceive = false,
   });
+
+  void setBackgroundReceive(bool v) {
+    backgroundReceive = v;
+    notifyListeners();
+  }
 
   void setDeviceName(String v) {
     deviceName = v;

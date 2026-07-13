@@ -39,7 +39,7 @@ dependencies:
   go_router: ^14.0.0
 
   # Desktop file drag & drop.
-  desktop_drop: ^0.6.0
+  desktop_drop: ^0.7.0
   cross_file: ^0.3.4
 
 dev_dependencies:
