@@ -26,7 +26,9 @@ mod tls;
 
 pub use link::QuicLink;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -44,6 +46,19 @@ fn conn_err(e: impl std::fmt::Display) -> DomainError {
     DomainError::Connection(format!("quic: {e}"))
 }
 
+/// Shared QUIC transport tuning: a keep-alive so idle connections (e.g. a
+/// paused transfer) stay up, and a generous idle timeout before giving up.
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(Duration::from_secs(5)));
+    tc.max_idle_timeout(Some(
+        Duration::from_secs(30)
+            .try_into()
+            .expect("valid idle timeout"),
+    ));
+    Arc::new(tc)
+}
+
 /// A QUIC transport that can dial peers and accept inbound connections.
 ///
 /// One client [`quinn::Endpoint`] is held for outbound `dial`s; each `serve`
@@ -54,11 +69,19 @@ pub struct QuicTransport {
 }
 
 impl QuicTransport {
-    /// Create a transport with a client endpoint bound to an ephemeral port.
+    /// Create a transport with an IPv4 client endpoint on an ephemeral port.
     pub fn new() -> Result<Self> {
-        let bind: SocketAddr = "0.0.0.0:0".parse().expect("valid addr");
+        Self::bound("0.0.0.0:0".parse().expect("valid addr"))
+    }
+
+    /// Create a transport whose client endpoint is bound to `bind`. Use an
+    /// IPv6 wildcard (`[::]:0`) to dial IPv6 peers, or a specific interface
+    /// address to pin outbound traffic to one NIC.
+    pub fn bound(bind: SocketAddr) -> Result<Self> {
         let mut client = quinn::Endpoint::client(bind).map_err(conn_err)?;
-        client.set_default_client_config(tls::client_config()?);
+        let mut client_config = tls::client_config()?;
+        client_config.transport_config(transport_config());
+        client.set_default_client_config(client_config);
         tracing::debug!(local = %client.local_addr().map(|a| a.to_string()).unwrap_or_default(), "quic client endpoint ready");
         Ok(Self {
             id: ProviderId::from("quic"),
@@ -69,6 +92,8 @@ impl QuicTransport {
     /// Like [`TransferProvider::serve`], but also returns the actual bound
     /// local address. Needed when binding to port 0 (OS-assigned) — e.g. tests
     /// and the benchmark — where the caller must learn the chosen port to dial.
+    /// Binds the IPv4 wildcard; use [`serve_addr_on`](Self::serve_addr_on) for
+    /// IPv6 or a specific interface.
     pub async fn serve_addr(
         &self,
         bind: Bind,
@@ -76,7 +101,18 @@ impl QuicTransport {
         let addr: SocketAddr = format!("0.0.0.0:{}", bind.port)
             .parse()
             .expect("valid addr");
-        let endpoint = quinn::Endpoint::server(tls::server_config()?, addr).map_err(conn_err)?;
+        self.serve_addr_on(addr).await
+    }
+
+    /// Serve on an explicit bind address (IPv4 or IPv6, specific interface or
+    /// wildcard), returning the bound local address and the inbound stream.
+    pub async fn serve_addr_on(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(SocketAddr, BoxStream<'static, Result<Box<dyn Link>>>)> {
+        let mut server_config = tls::server_config()?;
+        server_config.transport = transport_config();
+        let endpoint = quinn::Endpoint::server(server_config, addr).map_err(conn_err)?;
         let local = endpoint.local_addr().map_err(conn_err)?;
         tracing::info!(%local, "quic serving");
 
@@ -110,9 +146,7 @@ impl TransferProvider for QuicTransport {
     }
 
     async fn dial(&self, route: &Route, session: &TransferSession) -> Result<Box<dyn Link>> {
-        let addr: SocketAddr = format!("{}:{}", route.address, route.port)
-            .parse()
-            .map_err(|e| DomainError::Connection(format!("bad route address: {e}")))?;
+        let addr = resolve_addr(&route.address, route.port)?;
         tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
 
         let conn = self
@@ -132,6 +166,20 @@ impl TransferProvider for QuicTransport {
         let (_addr, stream) = self.serve_addr(bind).await?;
         Ok(stream)
     }
+}
+
+/// Resolve a route target (IPv4/IPv6 literal or hostname) + port to a socket
+/// address. Handles IPv6 bracketing correctly (unlike naive `host:port`).
+fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| DomainError::Connection(format!("resolve {host}: {e}")))?
+        .next()
+        .ok_or_else(|| DomainError::Connection(format!("no address for {host}")))
 }
 
 /// Accept one inbound connection and its first bidirectional stream.

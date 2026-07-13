@@ -20,6 +20,10 @@ rcgen = { workspace = true }
 [dev-dependencies]
 peerbeam-transfer = { path = "../peerbeam-transfer" }
 peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
+peerbeam-reliability-fs = { path = "../peerbeam-reliability-fs" }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+serial_test = "3"

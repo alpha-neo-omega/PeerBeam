@@ -100,6 +100,7 @@ flutter run              # desktop, or an attached Android device
 | Android platform integration | [Android](docs/ANDROID.md) |
 | Devices & merge/dedup | [Devices](docs/DEVICES.md) |
 | Test strategy | [Testing](docs/TESTING.md) |
+| Real-network integration tests | [Network Testing](docs/NETWORK_TESTING.md) |
 | Performance baselines | [Benchmarks](docs/BENCHMARKS.md) |
 | Common problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | v1 → v2 changes | [Migration](docs/MIGRATION.md) |
