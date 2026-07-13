@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../sdk/events.dart';
 import '../sdk/models.dart';
+import '../sdk/error_text.dart';
 import '../sdk/peerbeam.dart';
 import '../state/models.dart';
 
@@ -84,8 +85,8 @@ class TransferRepository extends ChangeNotifier {
         _byId.remove(id);
       case 'transfer_failed':
         final name = _byId[id]?.fileName ?? 'Transfer';
-        final msg = e.error?.message ?? 'failed';
-        _errors.add('$name failed: $msg');
+        final friendly = friendlyErrorForCode(e.error?.code ?? 'internal');
+        _errors.add('$name — $friendly');
         _byId.remove(id);
       default:
         return;

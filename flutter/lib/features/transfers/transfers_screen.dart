@@ -59,87 +59,95 @@ class _TransferCard extends StatelessWidget {
     final text = Theme.of(context).textTheme;
     final sending = transfer.direction == TransferDirection.sending;
     final paused = transfer.state == TransferState.paused;
+    final pct = (transfer.progress * 100).round();
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                CircleAvatar(
-                  backgroundColor: scheme.primaryContainer,
-                  child: Icon(
-                    sending ? Icons.upload_rounded : Icons.download_rounded,
-                    color: scheme.onPrimaryContainer,
+    return Semantics(
+      container: true,
+      label:
+          '${sending ? 'Sending' : 'Receiving'} ${transfer.fileName} '
+          '${sending ? 'to' : 'from'} ${transfer.peerName}, '
+          '$pct percent, ${transfer.state.label}',
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: scheme.primaryContainer,
+                    child: Icon(
+                      sending ? Icons.upload_rounded : Icons.download_rounded,
+                      color: scheme.onPrimaryContainer,
+                    ),
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        transfer.fileName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: text.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          transfer.fileName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: text.titleSmall?.copyWith(
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                      Text(
-                        '${sending ? 'To' : 'From'} ${transfer.peerName} · ${transfer.state.label}',
-                        style: text.bodySmall?.copyWith(
-                          color: scheme.onSurfaceVariant,
+                        Text(
+                          '${sending ? 'To' : 'From'} ${transfer.peerName} · ${transfer.state.label}',
+                          style: text.bodySmall?.copyWith(
+                            color: scheme.onSurfaceVariant,
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            TweenAnimationBuilder<double>(
-              tween: Tween(begin: 0, end: transfer.progress),
-              duration: AppMotion.duration(context, AppMotion.slow),
-              curve: AppMotion.curve,
-              builder: (context, value, _) => ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: LinearProgressIndicator(
-                  value: value,
-                  minHeight: 8,
-                  backgroundColor: scheme.surfaceContainerHighest,
+                ],
+              ),
+              const SizedBox(height: 14),
+              TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0, end: transfer.progress),
+                duration: AppMotion.duration(context, AppMotion.slow),
+                curve: AppMotion.curve,
+                builder: (context, value, _) => ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: LinearProgressIndicator(
+                    value: value,
+                    minHeight: 8,
+                    backgroundColor: scheme.surfaceContainerHighest,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Text(
-                  '${formatBytes(transfer.doneBytes)} / ${formatBytes(transfer.totalBytes)}',
-                  style: text.bodySmall?.copyWith(
-                    color: scheme.onSurfaceVariant,
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Text(
+                    '${formatBytes(transfer.doneBytes)} / ${formatBytes(transfer.totalBytes)}',
+                    style: text.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
-                ),
-                const Spacer(),
-                IconButton(
-                  tooltip: paused ? 'Resume' : 'Pause',
-                  onPressed: () => paused
-                      ? state.transfer.resume(transfer.id)
-                      : state.transfer.pause(transfer.id),
-                  icon: Icon(
-                    paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                  const Spacer(),
+                  IconButton(
+                    tooltip: paused ? 'Resume' : 'Pause',
+                    onPressed: () => paused
+                        ? state.transfer.resume(transfer.id)
+                        : state.transfer.pause(transfer.id),
+                    icon: Icon(
+                      paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                    ),
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Cancel',
-                  onPressed: () => state.transfer.cancel(transfer.id),
-                  icon: const Icon(Icons.close_rounded),
-                ),
-              ],
-            ),
-          ],
+                  IconButton(
+                    tooltip: 'Cancel',
+                    onPressed: () => state.transfer.cancel(transfer.id),
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );

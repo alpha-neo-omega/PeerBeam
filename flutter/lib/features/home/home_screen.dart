@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../platform/desktop_files.dart';
+import '../../sdk/error_text.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -53,7 +54,7 @@ class HomeScreen extends StatelessWidget {
       await scope.transfer.send(target, picked.map((f) => f.path).toList());
       if (context.mounted) snack('Sending ${picked.length} to ${device.name}');
     } catch (e) {
-      if (context.mounted) snack('Send failed: $e');
+      if (context.mounted) snack(friendlyError(e));
     }
   }
 

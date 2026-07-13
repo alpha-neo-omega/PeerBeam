@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../sdk/error_text.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../state/staging.dart';
@@ -61,7 +62,7 @@ Future<void> _send(BuildContext context, StagingStore staging) async {
       snack('Sending ${paths.length} to ${device.name}');
     }
   } catch (e) {
-    if (context.mounted) snack('Send failed: $e');
+    if (context.mounted) snack(friendlyError(e));
   }
 }
 
