@@ -80,6 +80,24 @@ impl StorageProvider for FsStorage {
         }
     }
 
+    async fn finalize(&self, temp: &str, dest: &str) -> Result<String> {
+        let final_path = unique_path(dest).await;
+
+        // Restrict permissions on the completed file before it becomes visible.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|e| DomainError::Storage(format!("set perms {temp}: {e}")))?;
+        }
+
+        tokio::fs::rename(temp, &final_path)
+            .await
+            .map_err(|e| DomainError::Storage(format!("finalize {temp} -> {final_path}: {e}")))?;
+        Ok(final_path)
+    }
+
     async fn list_files(&self, root: &str) -> Result<Vec<(String, u64)>> {
         let root_path = PathBuf::from(root);
         let mut out = Vec::new();
@@ -119,6 +137,41 @@ impl StorageProvider for FsStorage {
 
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+}
+
+async fn exists(path: &str) -> bool {
+    tokio::fs::metadata(path).await.is_ok()
+}
+
+/// Return `dest` if free, else `dest` with a ` (n)` suffix before the
+/// extension until an unused name is found.
+async fn unique_path(dest: &str) -> String {
+    if !exists(dest).await {
+        return dest.to_string();
+    }
+    let path = Path::new(dest);
+    let parent = path.parent();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+
+    let mut n: u32 = 1;
+    loop {
+        let name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = match parent {
+            Some(p) if !p.as_os_str().is_empty() => p.join(&name).to_string_lossy().to_string(),
+            _ => name,
+        };
+        if !exists(&candidate).await {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -200,6 +253,47 @@ mod tests {
         a.close().await.unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finalize_renames_and_avoids_clobber() {
+        let dir = std::env::temp_dir().join(format!("pb-fs-final-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = FsStorage::new();
+
+        let dest = dir.join("f.bin");
+        let dest_str = dest.to_string_lossy().to_string();
+
+        // First finalize: temp -> f.bin.
+        let t1 = dir.join("a.part");
+        std::fs::write(&t1, b"one").unwrap();
+        let final1 = storage
+            .finalize(&t1.to_string_lossy(), &dest_str)
+            .await
+            .unwrap();
+        assert_eq!(final1, dest_str);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"one");
+
+        // Second finalize to the same dest must NOT clobber → "f (1).bin".
+        let t2 = dir.join("b.part");
+        std::fs::write(&t2, b"two").unwrap();
+        let final2 = storage
+            .finalize(&t2.to_string_lossy(), &dest_str)
+            .await
+            .unwrap();
+        assert_ne!(final2, dest_str);
+        assert!(final2.ends_with("f (1).bin"), "got {final2}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"one", "original untouched");
+        assert_eq!(std::fs::read(&final2).unwrap(), b"two");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "finalized file is owner-only");
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

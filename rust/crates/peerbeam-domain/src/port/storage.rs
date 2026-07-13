@@ -32,4 +32,10 @@ pub trait StorageProvider: Send + Sync {
     /// relative to `root` (with `/` separators) and its size, sorted by path.
     /// Directories themselves are not returned.
     async fn list_files(&self, root: &str) -> Result<Vec<(String, u64)>>;
+
+    /// Atomically promote a fully-written temporary file to its final
+    /// destination. If `dest` already exists, a non-colliding name is chosen
+    /// (e.g. `file (1).ext`) so existing files are never overwritten.
+    /// Restrictive permissions are applied. Returns the actual final path.
+    async fn finalize(&self, temp: &str, dest: &str) -> Result<String>;
 }

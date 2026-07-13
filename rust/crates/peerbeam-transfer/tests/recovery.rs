@@ -159,10 +159,10 @@ async fn reconnects_resumes_and_verifies() {
     let bytes = pattern(50 * 1024);
     std::fs::write(&src, &bytes).unwrap();
 
-    // Destination already holds the first 20 KiB (a prior interrupted run).
+    // A prior interrupted run left the first 20 KiB in the `.part` file.
     let partial = 20 * 1024usize;
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("f.bin"), &bytes[..partial]).unwrap();
+    std::fs::write(out.join("f.bin.part"), &bytes[..partial]).unwrap();
     let out_str = out.to_string_lossy().to_string();
 
     let storage = FsStorage::new();

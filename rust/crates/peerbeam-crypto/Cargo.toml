@@ -1,0 +1,14 @@
+[package]
+name = "peerbeam-crypto"
+description = "EncryptionProvider adapter: X25519 key agreement, AES-256-GCM sealing, and key fingerprints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+x25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }

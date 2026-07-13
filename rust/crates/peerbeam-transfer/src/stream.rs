@@ -178,9 +178,12 @@ pub async fn receive_file(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "received.bin".to_string());
     let dest = format!("{}/{}", dest_dir.trim_end_matches('/'), base);
+    // Data is written to a `.part` file; the final name only appears once the
+    // whole file is received and verified (safe, atomic, no partial clobber).
+    let part = format!("{dest}.part");
 
-    // Resume from whatever we already have on disk.
-    let existing = storage.size(&dest).await?.unwrap_or(0).min(meta.size);
+    // Resume from whatever the in-progress `.part` already holds.
+    let existing = storage.size(&part).await?.unwrap_or(0).min(meta.size);
     send_with_retry(
         link,
         control_frame(&Control::ResumeAck { offset: existing }),
@@ -190,10 +193,10 @@ pub async fn receive_file(
 
     let mut hasher = Sha256::new();
     let mut writer = if existing > 0 {
-        hash_prefix(storage, &dest, existing, &mut hasher).await?;
-        storage.open_append(&dest).await?
+        hash_prefix(storage, &part, existing, &mut hasher).await?;
+        storage.open_append(&part).await?
     } else {
-        storage.open_write(&dest).await?
+        storage.open_write(&part).await?
     };
     let mut received = existing;
     let mut integrity_ok = true;
@@ -254,25 +257,36 @@ pub async fn receive_file(
         .await
         .map_err(|e| DomainError::Storage(format!("close: {e}")))?;
 
-    if outcome == TransferOutcome::Completed {
+    // On a verified completion, atomically promote `.part` to its final,
+    // non-colliding name. On integrity failure or cancel, the `.part` stays
+    // on disk (resumable) and the final file is never created/clobbered.
+    let final_name = if outcome == TransferOutcome::Completed {
         if !integrity_ok {
             return Err(DomainError::Integrity(format!(
                 "checksum mismatch for {base}"
             )));
         }
+        let final_path = storage.finalize(&part, &dest).await?;
+        let name = std::path::Path::new(&final_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| base.clone());
         let _ = progress.send(make_progress(
             &meta.transfer_id,
             Direction::Receiving,
             TransferStatus::Completed,
             meta.size.max(received),
             received,
-            &base,
+            &name,
         ));
-    }
+        name
+    } else {
+        base
+    };
 
     Ok(Received {
         outcome,
-        name: base,
+        name: final_name,
         bytes: received,
     })
 }
