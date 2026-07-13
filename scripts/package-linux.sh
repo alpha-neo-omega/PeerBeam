@@ -15,19 +15,20 @@ bash scripts/build-ffi.sh release
 BUNDLE="flutter/build/linux/x64/release/bundle"
 [ -d "$BUNDLE" ] || { echo "flutter bundle missing: $BUNDLE"; exit 1; }
 
-# Render icons from the SVG (hicolor sizes) if a rasterizer is available.
+# Render hicolor icon sizes from the brand master (packaging/icon-1024.png).
 ICONS="$DIST/icons"
 mkdir -p "$ICONS"
-if command -v rsvg-convert >/dev/null; then
+MASTER="packaging/icon-1024.png"
+if command -v magick >/dev/null; then
   for s in 32 64 128 256 512; do
-    rsvg-convert -w $s -h $s packaging/linux/peerbeam.svg -o "$ICONS/${s}.png"
+    magick "$MASTER" -resize ${s}x${s} "$ICONS/${s}.png"
   done
 elif command -v convert >/dev/null; then
   for s in 32 64 128 256 512; do
-    convert -background none -resize ${s}x${s} packaging/linux/peerbeam.svg "$ICONS/${s}.png"
+    convert "$MASTER" -resize ${s}x${s} "$ICONS/${s}.png"
   done
 else
-  echo "WARN: no SVG rasterizer; icons will be missing"
+  echo "WARN: no rasterizer; icons will be missing"
 fi
 
 # ---- staging tree (FHS layout) ----
