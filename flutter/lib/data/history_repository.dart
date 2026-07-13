@@ -12,12 +12,10 @@ import '../state/models.dart';
 /// `history_updated` (no polling). Same UI surface (`items`, `clear`).
 class HistoryRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
-  List<HistoryItem> _items;
+  List<HistoryItem> _items = [];
   StreamSubscription<BridgeEvent>? _sub;
 
-  HistoryRepository({PeerBeamApi? api, List<HistoryItem>? seed})
-      : _api = api,
-        _items = seed ?? [] {
+  HistoryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen((e) {
       if (e is HistoryUpdated) refresh();
     });

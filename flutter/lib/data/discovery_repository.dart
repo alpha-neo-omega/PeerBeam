@@ -14,21 +14,25 @@ import '../state/models.dart';
 class DiscoveryRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
   final Map<String, Device> _byId = {};
+  // Keep the raw SDK device (addresses + port) so a send can target it.
+  final Map<String, SdkDevice> _raw = {};
   bool _scanning = false;
   StreamSubscription<BridgeEvent>? _sub;
 
-  DiscoveryRepository({PeerBeamApi? api, List<Device>? seed}) : _api = api {
-    if (seed != null) {
-      for (final d in seed) {
-        _byId[d.id] = d;
-      }
-    }
+  DiscoveryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen(_onEvent);
   }
 
   List<Device> get devices => List.unmodifiable(_byId.values);
   bool get scanning => _scanning;
   int get onlineCount => _byId.values.where((d) => d.online).length;
+
+  /// A send target for a discovered device, or null if unknown/unaddressed.
+  PeerTarget? peerTarget(String id) {
+    final d = _raw[id];
+    if (d == null || d.addresses.isEmpty || d.port == 0) return null;
+    return PeerTarget(name: d.name, addresses: d.addresses, port: d.port);
+  }
 
   /// Start/stop discovery in the engine; UI state flips optimistically.
   void toggleScan() {
@@ -46,9 +50,11 @@ class DiscoveryRepository extends ChangeNotifier {
     switch (e) {
       case DeviceAdded(:final device):
       case DeviceUpdated(:final device):
+        _raw[device.id] = device;
         _byId[device.id] = _map(device);
       case DeviceRemoved(:final id):
         _byId.remove(id);
+        _raw.remove(id);
       case DeviceStatusChanged(:final id, :final online):
         final d = _byId[id];
         if (d != null) _byId[id] = _withOnline(d, online);

@@ -15,17 +15,16 @@ class TransferRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
   final Map<String, Transfer> _byId = {};
   StreamSubscription<BridgeEvent>? _sub;
+  final StreamController<String> _errors = StreamController<String>.broadcast();
 
-  TransferRepository({PeerBeamApi? api, List<Transfer>? seed}) : _api = api {
-    if (seed != null) {
-      for (final t in seed) {
-        _byId[t.id] = t;
-      }
-    }
+  TransferRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen(_onEvent);
   }
 
   List<Transfer> get transfers => List.unmodifiable(_byId.values);
+
+  /// User-facing failure messages (surface as a snackbar/notification).
+  Stream<String> get errors => _errors.stream;
 
   int get activeCount => _byId.values
       .where((t) =>
@@ -82,7 +81,9 @@ class TransferRepository extends ChangeNotifier {
       case 'transfer_cancelled':
         _byId.remove(id);
       case 'transfer_failed':
-        _update(id, state: TransferState.failed);
+        final name = _byId[id]?.fileName ?? 'Transfer';
+        final msg = e.error?.message ?? 'failed';
+        _errors.add('$name failed: $msg');
         _byId.remove(id);
       default:
         return;
@@ -108,6 +109,7 @@ class TransferRepository extends ChangeNotifier {
   @override
   void dispose() {
     _sub?.cancel();
+    _errors.close();
     super.dispose();
   }
 }

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../platform/desktop_files.dart';
 import '../../state/app_scope.dart';
+import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
@@ -32,6 +33,27 @@ class HomeScreen extends StatelessWidget {
     final added = staging.add(picked);
     if (added > 0 && context.mounted) {
       showStagedFilesSheet(context, staging);
+    }
+  }
+
+  /// Pick files and send them to [device] through the engine (real transfer).
+  Future<void> _sendTo(BuildContext context, Device device) async {
+    final scope = AppScope.of(context);
+    final target = scope.device.peerTarget(device.id);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+    if (target == null) {
+      snack('${device.name} is not reachable right now');
+      return;
+    }
+    final picked = await pickFilesToStage();
+    if (picked.isEmpty || !context.mounted) return;
+    try {
+      await scope.transfer.send(target, picked.map((f) => f.path).toList());
+      if (context.mounted) snack('Sending ${picked.length} to ${device.name}');
+    } catch (e) {
+      if (context.mounted) snack('Send failed: $e');
     }
   }
 
@@ -154,8 +176,7 @@ class HomeScreen extends StatelessWidget {
                             index: i,
                             child: DeviceTile(
                               device: devices[i],
-                              onSend: () =>
-                                  _todo(context, 'Send to ${devices[i].name}'),
+                              onSend: () => _sendTo(context, devices[i]),
                             ),
                           ),
                         ),

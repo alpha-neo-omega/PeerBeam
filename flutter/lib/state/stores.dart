@@ -4,7 +4,6 @@ import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
 import '../data/transfer_repository.dart';
 import '../sdk/peerbeam.dart';
-import 'models.dart';
 import 'staging.dart';
 
 /// Per-domain state. Screens listen to only the piece they need (via
@@ -119,101 +118,4 @@ class AppState {
     staging.dispose();
   }
 
-  /// Sample data so the modern UI is fully explorable without the engine.
-  factory AppState.sample() {
-    final now = DateTime.now();
-    return AppState(
-      theme: ThemeController(),
-      device: DiscoveryRepository(seed: [
-        const Device(
-          id: 'd1',
-          name: "Alice's MacBook",
-          kind: DeviceKind.laptop,
-          online: true,
-          reach: {Reach.lan, Reach.tailscale},
-          latencyMs: 4,
-        ),
-        const Device(
-          id: 'd2',
-          name: 'Pixel 9',
-          kind: DeviceKind.phone,
-          online: true,
-          reach: {Reach.lan},
-          latencyMs: 11,
-        ),
-        const Device(
-          id: 'd3',
-          name: 'home-server',
-          kind: DeviceKind.server,
-          online: true,
-          reach: {Reach.tailscale},
-          latencyMs: 38,
-        ),
-        const Device(
-          id: 'd4',
-          name: 'Studio PC',
-          kind: DeviceKind.desktop,
-          online: false,
-          reach: {Reach.lan},
-        ),
-      ]),
-      transfer: TransferRepository(seed: [
-        const Transfer(
-          id: 't1',
-          peerName: "Alice's MacBook",
-          fileName: 'holiday-photos.zip',
-          direction: TransferDirection.sending,
-          state: TransferState.transferring,
-          totalBytes: 512 * 1024 * 1024,
-          doneBytes: 331 * 1024 * 1024,
-        ),
-        const Transfer(
-          id: 't2',
-          peerName: 'Pixel 9',
-          fileName: 'presentation.pdf',
-          direction: TransferDirection.receiving,
-          state: TransferState.paused,
-          totalBytes: 24 * 1024 * 1024,
-          doneBytes: 8 * 1024 * 1024,
-        ),
-      ]),
-      history: HistoryRepository(seed: [
-        HistoryItem(
-          id: 'h1',
-          peerName: "Alice's MacBook",
-          fileName: 'design-review.sketch',
-          direction: TransferDirection.receiving,
-          at: now.subtract(const Duration(minutes: 12)),
-          success: true,
-          bytes: 84 * 1024 * 1024,
-        ),
-        HistoryItem(
-          id: 'h2',
-          peerName: 'home-server',
-          fileName: 'backup-2026.tar.zst',
-          direction: TransferDirection.sending,
-          at: now.subtract(const Duration(hours: 3)),
-          success: true,
-          bytes: 3 * 1024 * 1024 * 1024,
-        ),
-        HistoryItem(
-          id: 'h3',
-          peerName: 'Pixel 9',
-          fileName: 'video.mov',
-          direction: TransferDirection.sending,
-          at: now.subtract(const Duration(days: 1)),
-          success: false,
-          bytes: 1200 * 1024 * 1024,
-        ),
-      ]),
-      settings: SettingsStore(
-        deviceName: 'This Device',
-        saveDirectory: '~/Downloads/PeerBeam',
-        autoAcceptTrusted: false,
-        notifications: true,
-        compression: true,
-      ),
-      staging: StagingStore(),
-    );
-  }
 }

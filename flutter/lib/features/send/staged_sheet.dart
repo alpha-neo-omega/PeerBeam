@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../state/staging.dart';
 import '../../widgets/appear.dart';
@@ -13,6 +14,55 @@ Future<void> showStagedFilesSheet(BuildContext context, StagingStore staging) {
     isScrollControlled: true,
     builder: (context) => _StagedSheet(staging: staging),
   );
+}
+
+/// Choose an online device and send all staged files to it via the engine.
+Future<void> _send(BuildContext context, StagingStore staging) async {
+  final scope = AppScope.of(context);
+  void snack(String m) => ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(m)));
+
+  final online = scope.device.devices.where((d) => d.online).toList();
+  if (online.isEmpty) {
+    snack('No devices online to send to');
+    return;
+  }
+  final device = await showModalBottomSheet<Device>(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final d in online)
+            ListTile(
+              leading: Icon(d.kind.icon),
+              title: Text(d.name),
+              onTap: () => Navigator.pop(ctx, d),
+            ),
+        ],
+      ),
+    ),
+  );
+  if (device == null || !context.mounted) return;
+
+  final target = scope.device.peerTarget(device.id);
+  if (target == null) {
+    snack('${device.name} is not reachable right now');
+    return;
+  }
+  final paths = staging.items.map((f) => f.path).toList();
+  try {
+    await scope.transfer.send(target, paths);
+    staging.clear();
+    if (context.mounted) {
+      Navigator.pop(context); // close the staged sheet
+      snack('Sending ${paths.length} to ${device.name}');
+    }
+  } catch (e) {
+    if (context.mounted) snack('Send failed: $e');
+  }
 }
 
 class _StagedSheet extends StatelessWidget {
@@ -110,18 +160,8 @@ class _StagedSheet extends StatelessWidget {
                         ),
                       ),
                       FilledButton.icon(
-                        onPressed: items.isEmpty
-                            ? null
-                            : () {
-                                Navigator.pop(context);
-                                ScaffoldMessenger.of(context)
-                                  ..hideCurrentSnackBar()
-                                  ..showSnackBar(
-                                    const SnackBar(
-                                      content: Text('Sending is coming soon'),
-                                    ),
-                                  );
-                              },
+                        onPressed:
+                            items.isEmpty ? null : () => _send(context, staging),
                         icon: const Icon(Icons.send_rounded),
                         label: Text('Send ${items.length}'),
                       ),

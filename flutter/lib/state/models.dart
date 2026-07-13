@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 
-/// View models for the UI. These mirror the domain shapes the Rust engine
-/// will eventually feed over FFI; for now they carry mock data so the UI is
-/// fully explorable. No behavior/logic beyond presentation lives here.
+/// View models for the UI. Repositories (`lib/data/`) map the SDK's engine
+/// models into these from live FFI events. No behaviour/logic beyond
+/// presentation lives here.
 
 enum DeviceKind { desktop, laptop, phone, tablet, server }
 
