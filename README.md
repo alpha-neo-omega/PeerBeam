@@ -1,47 +1,120 @@
-# PeerBeam v2
+<div align="center">
 
-Zero-configuration, secure, cross-platform file & clipboard sharing.
+# PeerBeam
 
-This tree currently contains the **v2 architectural foundation** only — the
-clean-architecture skeleton the rest of the product is built on. No transfer,
-discovery, or crypto behaviour is implemented yet; those arrive as providers
-plugged into the seams defined here.
+**Zero-configuration, secure, cross-platform file & clipboard sharing.**
 
-## Rust workspace (`rust/`)
+Open the app → see nearby devices → click → send. No IP addresses, no pairing
+codes, no accounts, no cloud.
 
-Dependencies point inward. `domain` is the dependency sink.
+</div>
 
-| Crate | Layer | Responsibility |
-|-------|-------|----------------|
-| `peerbeam-domain` | Domain | Entities, **ports (interfaces)**, events, errors. Zero IO/runtime. |
-| `peerbeam-platform` | Platform | OS detection, host identity, standard directories. |
-| `peerbeam-config` | Config | Typed, layered `EngineConfig` with load/save. |
-| `peerbeam-telemetry` | Logging | Structured `tracing` setup for frontends. |
-| `peerbeam-app` | Application | **Dependency-injection registry**; use-case seams. Depends only on domain ports. |
-| `peerbeam-engine` | Composition root | `EngineBuilder` wires providers → `Engine` handle + event stream. |
+---
+
+PeerBeam is a modern take on LAN file sharing. It discovers peers across LAN,
+mDNS, and Tailscale at once, merges them into one device list, and streams files
+of any size with end-to-end encryption and resumable, integrity-checked
+transfers. A Rust engine does the work; a Flutter app and a first-class CLI are
+two frontends over the same core.
+
+> **Status.** The engine, discovery, security, transfer pipeline, CLI, and
+> Flutter UI are implemented and tested. The one missing adapter is the network
+> **transport** (`TransferProvider`, planned QUIC) that turns a `Link` into a
+> socket — until it lands, `send`/`receive`/`daemon` are gated and transfers are
+> exercised over an in-process link. See [Migration](docs/MIGRATION.md) and the
+> per-component docs below.
+
+## Highlights
+
+- **Zero config** — no addresses or codes; discovery is automatic and merged
+  across providers.
+- **Works where LAN doesn't** — Tailscale support (CLI + LocalAPI, MagicDNS)
+  for VPN / headless / cross-network reach.
+- **Streaming everything** — unlimited file size, chunked, never loads a whole
+  file into RAM; folders keep their structure.
+- **Resumable & verified** — receiver-reported offsets, whole-file SHA-256,
+  automatic retry, atomic safe writes.
+- **Secure by default** — X25519 + AES-256-GCM, mutual authentication, TOFU
+  trust pinning, per-frame replay protection.
+- **Two frontends, one core** — polished Material 3 Flutter app and a
+  scriptable, SSH-friendly CLI.
+- **Private** — no accounts, no telemetry, no cloud dependency.
+
+## Repository layout
 
 ```
-domain  ◄── platform ◄── config ◄── telemetry
-   ▲            ▲           ▲
-   └── app ◄────┴── engine ─┘   (engine = only multi-dependency crate)
+rust/       Rust workspace — engine, providers, CLI (the core)
+flutter/    Flutter app — desktop (Win/macOS/Linux) + Android
+docs/       Component and top-level documentation
 ```
 
-### Build & verify
+The Rust workspace follows Clean Architecture: dependencies point inward toward
+`peerbeam-domain`, which defines the *ports* (traits) every provider implements.
+See [Architecture](docs/ARCHITECTURE.md).
+
+## Quick start
+
+### Build the CLI
 
 ```bash
 cd rust
-cargo build --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo build --release -p peerbeam-cli
+./target/release/peerbeam --help
 ```
 
-## Ports (interfaces)
+### Try it
 
-Discovery · Transfer (+ `Link`/`Frame`) · Route · Encryption · Compression ·
-Reliability · Storage · Trust · Notification · Clipboard. Each is a trait in
-`peerbeam-domain::port`; adapters implement them and are registered via the
-engine builder.
+```bash
+peerbeam doctor            # check the environment
+peerbeam discover          # find nearby devices
+peerbeam list              # show known devices
+peerbeam config show       # view configuration
+peerbeam benchmark loopback --size 512
+```
+
+`send`/`receive` parse and resolve today but stop at a gated message until the
+transport lands. Full command reference: [CLI](docs/CLI.md).
+
+### Run the app
+
+```bash
+cd flutter
+flutter run              # desktop, or an attached Android device
+```
+
+## Documentation
+
+| Topic | Doc |
+|---|---|
+| System design, crates, ports, data flow | [Architecture](docs/ARCHITECTURE.md) |
+| Discovery, route selection, link layer | [Networking](docs/NETWORKING.md) · [Discovery](docs/DISCOVERY.md) |
+| Transfer engine (stream / folder / resume) | [Transfer](docs/TRANSFER.md) |
+| Clipboard sharing | [Clipboard](docs/CLIPBOARD.md) |
+| Encryption, auth, trust, safe writes | [Security](docs/SECURITY.md) |
+| Embedding the Rust engine | [API](docs/API.md) |
+| Command-line interface | [CLI](docs/CLI.md) |
+| Flutter UI | [UI](docs/UI.md) |
+| Android platform integration | [Android](docs/ANDROID.md) |
+| Devices & merge/dedup | [Devices](docs/DEVICES.md) |
+| Test strategy | [Testing](docs/TESTING.md) |
+| Performance baselines | [Benchmarks](docs/BENCHMARKS.md) |
+| Common problems | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| v1 → v2 changes | [Migration](docs/MIGRATION.md) |
+| How to contribute | [Contributing](CONTRIBUTING.md) |
+
+## Development
+
+```bash
+cd rust
+cargo test --workspace              # full test suite
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+
+cd ../flutter
+flutter test
+```
 
 ## License
 
-AGPL-3.0-or-later.
+AGPL-3.0-or-later. See [Contributing](CONTRIBUTING.md) for the contribution
+flow.

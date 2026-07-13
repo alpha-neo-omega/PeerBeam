@@ -59,6 +59,33 @@ Present but gated until the QUIC transport lands (exit code 8, clear message):
 `0` ok · `2` usage · `3` not-found · `4` connection · `5` integrity ·
 `6` cancelled · `7` daemon-unavailable · `8` unavailable · `1` other.
 
+## Examples
+
+```bash
+# Human use
+peerbeam doctor
+peerbeam discover --timeout 5
+peerbeam list --online
+peerbeam config set device.name "My Laptop"
+
+# Scripting (machine-readable, no colour/prompts, branch on exit code)
+peerbeam discover --timeout 3 --json | jq '.[].name'
+name=$(peerbeam config get device.name)
+if ! peerbeam config get transfer.chunk_size >/dev/null; then
+  echo "key missing"        # exit code 3
+fi
+
+# Live stream of discovery changes (NDJSON, Ctrl-C to stop)
+peerbeam discover --watch --json
+
+# Shell completion (bash; also zsh/fish/powershell)
+peerbeam completions bash > /etc/bash_completion.d/peerbeam
+```
+
+Over SSH without a TTY, or into a pipe, colour/progress/prompts disable
+automatically — no flags needed. Force non-interactive with `-y`, plain output
+with `--no-color` or `--json`.
+
 ## Verification
 
 `cargo clippy -D warnings` clean; `cargo test` green (parse + resolver +
