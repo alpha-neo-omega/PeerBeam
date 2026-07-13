@@ -21,8 +21,9 @@ class AndroidIntegration {
   final TransferRepository transfer;
   final SettingsStore settings;
 
-  late final ForegroundServiceController service =
-      ForegroundServiceController(bridge);
+  late final ForegroundServiceController service = ForegroundServiceController(
+    bridge,
+  );
   late final BatteryOptimization battery = BatteryOptimization(bridge);
 
   /// Latest text handed to us via a share intent (e.g. to send as clipboard).
@@ -52,11 +53,13 @@ class AndroidIntegration {
     for (final item in items) {
       switch (item.kind) {
         case SharedKind.file:
-          files.add(StagedFile(
-            path: item.path!,
-            name: item.name ?? item.path!,
-            size: 0, // size resolved lazily; intents don't carry it
-          ));
+          files.add(
+            StagedFile(
+              path: item.path!,
+              name: item.name ?? item.path!,
+              size: 0, // size resolved lazily; intents don't carry it
+            ),
+          );
         case SharedKind.text:
           sharedText.value = item.text;
       }
@@ -67,9 +70,9 @@ class AndroidIntegration {
   void _onStoreChanged() => unawaited(_syncService());
 
   Future<void> _syncService() => service.sync(
-        activeTransfers: transfer.activeCount,
-        receiving: settings.backgroundReceive,
-      );
+    activeTransfers: transfer.activeCount,
+    receiving: settings.backgroundReceive,
+  );
 
   void dispose() {
     _sub?.cancel();

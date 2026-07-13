@@ -66,10 +66,7 @@ CustomTransitionPage<void> _fade(Widget child) {
       final curved = CurvedAnimation(parent: animation, curve: AppMotion.curve);
       return FadeTransition(
         opacity: curved,
-        child: FadeTransition(
-          opacity: curved,
-          child: child,
-        ),
+        child: FadeTransition(opacity: curved, child: child),
       );
     },
   );

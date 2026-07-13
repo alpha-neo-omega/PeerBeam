@@ -15,7 +15,8 @@ class TransferNotifications {
   }) {
     final String body;
     if (activeTransfers > 0) {
-      body = '$activeTransfers transfer${activeTransfers == 1 ? '' : 's'} in progress';
+      body =
+          '$activeTransfers transfer${activeTransfers == 1 ? '' : 's'} in progress';
     } else if (receiving) {
       body = 'Ready to receive files';
     } else {

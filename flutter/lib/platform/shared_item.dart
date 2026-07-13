@@ -12,13 +12,13 @@ class SharedItem {
   final String? name;
 
   const SharedItem.text(this.text)
-      : kind = SharedKind.text,
-        path = null,
-        name = null;
+    : kind = SharedKind.text,
+      path = null,
+      name = null;
 
   const SharedItem.file(this.path, this.name)
-      : kind = SharedKind.file,
-        text = null;
+    : kind = SharedKind.file,
+      text = null;
 }
 
 /// Parse a platform event map into shared items. Pure — no channels — so it is

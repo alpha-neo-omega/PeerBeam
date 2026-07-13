@@ -51,14 +51,14 @@ class HistoryRepository extends ChangeNotifier {
   }
 
   static HistoryItem _map(HistoryEntry e) => HistoryItem(
-        id: e.id,
-        peerName: e.peer,
-        fileName: e.file,
-        direction: e.direction == 'receiving'
-            ? TransferDirection.receiving
-            : TransferDirection.sending,
-        at: DateTime.tryParse(e.at) ?? DateTime.now(),
-        success: e.success,
-        bytes: e.bytes,
-      );
+    id: e.id,
+    peerName: e.peer,
+    fileName: e.file,
+    direction: e.direction == 'receiving'
+        ? TransferDirection.receiving
+        : TransferDirection.sending,
+    at: DateTime.tryParse(e.at) ?? DateTime.now(),
+    success: e.success,
+    bytes: e.bytes,
+  );
 }

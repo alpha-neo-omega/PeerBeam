@@ -2,11 +2,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/state/staging.dart';
 
 StagedFile file(String path, int size, {bool dir = false}) => StagedFile(
-      path: path,
-      name: path.split('/').last,
-      size: size,
-      isDirectory: dir,
-    );
+  path: path,
+  name: path.split('/').last,
+  size: size,
+  isDirectory: dir,
+);
 
 void main() {
   group('StagingStore', () {

@@ -10,8 +10,9 @@ import 'package:peerbeam/sdk/models.dart';
 import 'sdk/fake_peerbeam.dart';
 
 void main() {
-  testWidgets('boots to Home and shows a device from a live event',
-      (tester) async {
+  testWidgets('boots to Home and shows a device from a live event', (
+    tester,
+  ) async {
     final fake = FakePeerBeam();
     await tester.pumpWidget(PeerBeamApp(api: fake));
     // Not pumpAndSettle: presence dots pulse forever.
@@ -22,18 +23,22 @@ void main() {
     expect(find.text('Nearby Devices'), findsOneWidget);
 
     // Emit a live discovery event; the UI must react (no polling, no seed).
-    fake.emit(const DeviceAdded(SdkDevice(
-      id: 'x1',
-      name: 'Live Laptop',
-      kind: 'laptop',
-      platform: 'linux',
-      addresses: ['127.0.0.1'],
-      port: 49600,
-      online: true,
-      latencyMs: 5,
-      reachableLan: true,
-      reachableRemote: false,
-    )));
+    fake.emit(
+      const DeviceAdded(
+        SdkDevice(
+          id: 'x1',
+          name: 'Live Laptop',
+          kind: 'laptop',
+          platform: 'linux',
+          addresses: ['127.0.0.1'],
+          port: 49600,
+          online: true,
+          latencyMs: 5,
+          reachableLan: true,
+          reachableRemote: false,
+        ),
+      ),
+    );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 

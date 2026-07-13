@@ -21,11 +21,13 @@ Future<List<StagedFile>> pickFilesToStage() async {
     try {
       size = await f.length(); // metadata only
     } catch (_) {}
-    staged.add(StagedFile(
-      path: f.path,
-      name: f.name.isNotEmpty ? f.name : _basename(f.path),
-      size: size,
-    ));
+    staged.add(
+      StagedFile(
+        path: f.path,
+        name: f.name.isNotEmpty ? f.name : _basename(f.path),
+        size: size,
+      ),
+    );
   }
   return staged;
 }

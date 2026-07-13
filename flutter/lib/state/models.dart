@@ -8,19 +8,19 @@ enum DeviceKind { desktop, laptop, phone, tablet, server }
 
 extension DeviceKindUi on DeviceKind {
   IconData get icon => switch (this) {
-        DeviceKind.desktop => Icons.desktop_windows_rounded,
-        DeviceKind.laptop => Icons.laptop_mac_rounded,
-        DeviceKind.phone => Icons.smartphone_rounded,
-        DeviceKind.tablet => Icons.tablet_mac_rounded,
-        DeviceKind.server => Icons.dns_rounded,
-      };
+    DeviceKind.desktop => Icons.desktop_windows_rounded,
+    DeviceKind.laptop => Icons.laptop_mac_rounded,
+    DeviceKind.phone => Icons.smartphone_rounded,
+    DeviceKind.tablet => Icons.tablet_mac_rounded,
+    DeviceKind.server => Icons.dns_rounded,
+  };
   String get label => switch (this) {
-        DeviceKind.desktop => 'Desktop',
-        DeviceKind.laptop => 'Laptop',
-        DeviceKind.phone => 'Phone',
-        DeviceKind.tablet => 'Tablet',
-        DeviceKind.server => 'Server',
-      };
+    DeviceKind.desktop => 'Desktop',
+    DeviceKind.laptop => 'Laptop',
+    DeviceKind.phone => 'Phone',
+    DeviceKind.tablet => 'Tablet',
+    DeviceKind.server => 'Server',
+  };
 }
 
 /// How a device is reachable — drives capability badges and route hints.
@@ -28,13 +28,13 @@ enum Reach { lan, tailscale }
 
 extension ReachUi on Reach {
   String get label => switch (this) {
-        Reach.lan => 'LAN',
-        Reach.tailscale => 'Tailscale',
-      };
+    Reach.lan => 'LAN',
+    Reach.tailscale => 'Tailscale',
+  };
   IconData get icon => switch (this) {
-        Reach.lan => Icons.wifi_rounded,
-        Reach.tailscale => Icons.shield_rounded,
-      };
+    Reach.lan => Icons.wifi_rounded,
+    Reach.tailscale => Icons.shield_rounded,
+  };
 }
 
 class Device {
@@ -61,12 +61,12 @@ enum TransferState { pending, transferring, paused, completed, failed }
 
 extension TransferStateUi on TransferState {
   String get label => switch (this) {
-        TransferState.pending => 'Pending',
-        TransferState.transferring => 'Transferring',
-        TransferState.paused => 'Paused',
-        TransferState.completed => 'Completed',
-        TransferState.failed => 'Failed',
-      };
+    TransferState.pending => 'Pending',
+    TransferState.transferring => 'Transferring',
+    TransferState.paused => 'Paused',
+    TransferState.completed => 'Completed',
+    TransferState.failed => 'Failed',
+  };
 }
 
 class Transfer {
@@ -91,14 +91,14 @@ class Transfer {
   double get progress => totalBytes == 0 ? 0 : doneBytes / totalBytes;
 
   Transfer copyWith({TransferState? state, int? doneBytes}) => Transfer(
-        id: id,
-        peerName: peerName,
-        fileName: fileName,
-        direction: direction,
-        state: state ?? this.state,
-        totalBytes: totalBytes,
-        doneBytes: doneBytes ?? this.doneBytes,
-      );
+    id: id,
+    peerName: peerName,
+    fileName: fileName,
+    direction: direction,
+    state: state ?? this.state,
+    totalBytes: totalBytes,
+    doneBytes: doneBytes ?? this.doneBytes,
+  );
 }
 
 class HistoryItem {

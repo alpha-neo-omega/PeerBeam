@@ -90,9 +90,7 @@ class SettingsScreen extends StatelessWidget {
                         trailing: isDesktop
                             ? const Icon(Icons.chevron_right_rounded)
                             : null,
-                        onTap: isDesktop
-                            ? () => _pickSaveDir(context)
-                            : null,
+                        onTap: isDesktop ? () => _pickSaveDir(context) : null,
                       ),
                     ],
                   ),
@@ -109,8 +107,9 @@ class SettingsScreen extends StatelessWidget {
                       SwitchListTile.adaptive(
                         secondary: const Icon(Icons.verified_user_rounded),
                         title: const Text('Auto-accept trusted devices'),
-                        subtitle:
-                            const Text('Skip the prompt for pinned devices'),
+                        subtitle: const Text(
+                          'Skip the prompt for pinned devices',
+                        ),
                         value: state.settings.autoAcceptTrusted,
                         onChanged: state.settings.setAutoAccept,
                       ),
@@ -161,9 +160,9 @@ class SettingsScreen extends StatelessWidget {
                             'Prevents the system from suspending transfers',
                           ),
                           trailing: const Icon(Icons.open_in_new_rounded),
-                          onTap: () =>
-                              BatteryOptimization(AndroidBridge())
-                                  .requestExemption(),
+                          onTap: () => BatteryOptimization(
+                            AndroidBridge(),
+                          ).requestExemption(),
                         ),
                       ],
                     ),
@@ -237,10 +236,10 @@ class _GroupLabel extends StatelessWidget {
       child: Text(
         text.toUpperCase(),
         style: Theme.of(context).textTheme.labelMedium?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.6,
-            ),
+          color: Theme.of(context).colorScheme.primary,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
       ),
     );
   }

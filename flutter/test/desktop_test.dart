@@ -15,8 +15,9 @@ void main() {
     expect(isDesktop, isFalse);
   });
 
-  testWidgets('tapping Send Files off-desktop shows guidance, does not crash',
-      (tester) async {
+  testWidgets('tapping Send Files off-desktop shows guidance, does not crash', (
+    tester,
+  ) async {
     await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));

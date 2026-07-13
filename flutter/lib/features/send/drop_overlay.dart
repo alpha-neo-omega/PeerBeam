@@ -28,7 +28,10 @@ class DropOverlay extends StatelessWidget {
               painter: _DashedBorderPainter(color: scheme.primary),
               child: Container(
                 width: 360,
-                padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 32),
+                padding: const EdgeInsets.symmetric(
+                  vertical: 40,
+                  horizontal: 32,
+                ),
                 decoration: BoxDecoration(
                   color: scheme.surface.withValues(alpha: 0.96),
                   borderRadius: BorderRadius.circular(24),
@@ -40,17 +43,16 @@ class DropOverlay extends StatelessWidget {
                     const SizedBox(height: 18),
                     Text(
                       'Drop to send',
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleLarge
-                          ?.copyWith(fontWeight: FontWeight.w700),
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                     const SizedBox(height: 6),
                     Text(
                       'Release to stage your files',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   ],
                 ),

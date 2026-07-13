@@ -29,18 +29,18 @@ class SdkDevice {
   });
 
   factory SdkDevice.fromJson(Map<String, dynamic> j) => SdkDevice(
-        id: j['id'] as String,
-        name: j['name'] as String? ?? 'Device',
-        kind: j['kind'] as String? ?? 'desktop',
-        platform: j['platform'] as String? ?? 'linux',
-        addresses:
-            (j['addresses'] as List?)?.map((e) => e as String).toList() ?? const [],
-        port: (j['port'] as num?)?.toInt() ?? 0,
-        online: j['online'] as bool? ?? false,
-        latencyMs: (j['latency_ms'] as num?)?.toInt(),
-        reachableLan: j['reachable_lan'] as bool? ?? false,
-        reachableRemote: j['reachable_remote'] as bool? ?? false,
-      );
+    id: j['id'] as String,
+    name: j['name'] as String? ?? 'Device',
+    kind: j['kind'] as String? ?? 'desktop',
+    platform: j['platform'] as String? ?? 'linux',
+    addresses:
+        (j['addresses'] as List?)?.map((e) => e as String).toList() ?? const [],
+    port: (j['port'] as num?)?.toInt() ?? 0,
+    online: j['online'] as bool? ?? false,
+    latencyMs: (j['latency_ms'] as num?)?.toInt(),
+    reachableLan: j['reachable_lan'] as bool? ?? false,
+    reachableRemote: j['reachable_remote'] as bool? ?? false,
+  );
 }
 
 @immutable
@@ -71,12 +71,12 @@ class TransferStats {
       totalBytes == 0 ? 0 : (transferredBytes / totalBytes).clamp(0, 1);
 
   factory TransferStats.fromJson(Map<String, dynamic> j) => TransferStats(
-        transferredBytes: (j['transferred_bytes'] as num?)?.toInt() ?? 0,
-        totalBytes: (j['total_bytes'] as num?)?.toInt() ?? 0,
-        currentSpeed: (j['current_speed'] as num?)?.toDouble() ?? 0,
-        averageSpeed: (j['average_speed'] as num?)?.toDouble() ?? 0,
-        etaSecs: (j['eta_secs'] as num?)?.toInt(),
-      );
+    transferredBytes: (j['transferred_bytes'] as num?)?.toInt() ?? 0,
+    totalBytes: (j['total_bytes'] as num?)?.toInt() ?? 0,
+    currentSpeed: (j['current_speed'] as num?)?.toDouble() ?? 0,
+    averageSpeed: (j['average_speed'] as num?)?.toDouble() ?? 0,
+    etaSecs: (j['eta_secs'] as num?)?.toInt(),
+  );
 }
 
 @immutable
@@ -100,25 +100,28 @@ class TransferSnapshot {
   bool get sending => direction == 'sending';
 
   factory TransferSnapshot.fromJson(Map<String, dynamic> j) => TransferSnapshot(
-        id: j['id'] as String,
-        direction: j['direction'] as String? ?? 'sending',
-        peer: j['peer'] as String? ?? '',
-        file: j['file'] as String? ?? '',
-        status: j['status'] as String? ?? 'queued',
-        stats: j['stats'] is Map
-            ? TransferStats.fromJson(Map<String, dynamic>.from(j['stats'] as Map))
-            : TransferStats.empty,
-      );
+    id: j['id'] as String,
+    direction: j['direction'] as String? ?? 'sending',
+    peer: j['peer'] as String? ?? '',
+    file: j['file'] as String? ?? '',
+    status: j['status'] as String? ?? 'queued',
+    stats: j['stats'] is Map
+        ? TransferStats.fromJson(Map<String, dynamic>.from(j['stats'] as Map))
+        : TransferStats.empty,
+  );
 
-  TransferSnapshot copyWith({String? status, TransferStats? stats, String? file}) =>
-      TransferSnapshot(
-        id: id,
-        direction: direction,
-        peer: peer,
-        file: file ?? this.file,
-        status: status ?? this.status,
-        stats: stats ?? this.stats,
-      );
+  TransferSnapshot copyWith({
+    String? status,
+    TransferStats? stats,
+    String? file,
+  }) => TransferSnapshot(
+    id: id,
+    direction: direction,
+    peer: peer,
+    file: file ?? this.file,
+    status: status ?? this.status,
+    stats: stats ?? this.stats,
+  );
 }
 
 @immutable
@@ -142,14 +145,14 @@ class HistoryEntry {
   });
 
   factory HistoryEntry.fromJson(Map<String, dynamic> j) => HistoryEntry(
-        id: j['id'] as String? ?? '',
-        direction: j['direction'] as String? ?? 'sending',
-        peer: j['peer'] as String? ?? '',
-        file: j['file'] as String? ?? '',
-        bytes: (j['bytes'] as num?)?.toInt() ?? 0,
-        success: j['success'] as bool? ?? false,
-        at: j['at'] as String? ?? '',
-      );
+    id: j['id'] as String? ?? '',
+    direction: j['direction'] as String? ?? 'sending',
+    peer: j['peer'] as String? ?? '',
+    file: j['file'] as String? ?? '',
+    bytes: (j['bytes'] as num?)?.toInt() ?? 0,
+    success: j['success'] as bool? ?? false,
+    at: j['at'] as String? ?? '',
+  );
 }
 
 /// A peer target for a send (matches the FFI `peer` JSON).
@@ -158,11 +161,15 @@ class PeerTarget {
   final String name;
   final List<String> addresses;
   final int port;
-  const PeerTarget({required this.name, required this.addresses, required this.port});
+  const PeerTarget({
+    required this.name,
+    required this.addresses,
+    required this.port,
+  });
 
   Map<String, dynamic> toJson() => {
-        'name': name,
-        'addresses': addresses,
-        'port': port,
-      };
+    'name': name,
+    'addresses': addresses,
+    'port': port,
+  };
 }

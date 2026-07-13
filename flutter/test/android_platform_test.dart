@@ -75,14 +75,20 @@ void main() {
   group('TransferNotifications', () {
     test('service notification reflects state', () {
       expect(
-        TransferNotifications.service(activeTransfers: 2, receiving: false).body,
+        TransferNotifications.service(
+          activeTransfers: 2,
+          receiving: false,
+        ).body,
         '2 transfers in progress',
       );
       expect(
         TransferNotifications.service(activeTransfers: 0, receiving: true).body,
         'Ready to receive files',
       );
-      final s = TransferNotifications.service(activeTransfers: 1, receiving: false);
+      final s = TransferNotifications.service(
+        activeTransfers: 1,
+        receiving: false,
+      );
       expect(s.ongoing, isTrue);
       expect(s.id, TransferNotifications.serviceId);
     });
@@ -105,7 +111,10 @@ void main() {
         'Received',
       );
       expect(
-        TransferNotifications.failed(notificationId: 5, fileName: 'f.bin').title,
+        TransferNotifications.failed(
+          notificationId: 5,
+          fileName: 'f.bin',
+        ).title,
         'Transfer failed',
       );
     });

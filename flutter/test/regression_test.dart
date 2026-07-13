@@ -14,8 +14,9 @@ import 'package:peerbeam/widgets/status_dot.dart';
 
 void main() {
   group('StatusDot dispose regression', () {
-    testWidgets('offline dot builds and disposes without crashing',
-        (tester) async {
+    testWidgets('offline dot builds and disposes without crashing', (
+      tester,
+    ) async {
       await tester.pumpWidget(
         const MaterialApp(home: Scaffold(body: StatusDot(online: false))),
       );
@@ -40,8 +41,9 @@ void main() {
     });
   });
 
-  testWidgets('DeviceTile does not overflow with a very long name',
-      (tester) async {
+  testWidgets('DeviceTile does not overflow with a very long name', (
+    tester,
+  ) async {
     final device = Device(
       id: 'dev-long',
       name: 'A' * 80, // pathologically long, no spaces to wrap on

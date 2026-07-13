@@ -9,8 +9,9 @@ import 'sdk/fake_peerbeam.dart';
 import 'package:peerbeam/widgets/status_dot.dart';
 
 void main() {
-  testWidgets('StatusDot does not pulse when reduced motion is requested',
-      (tester) async {
+  testWidgets('StatusDot does not pulse when reduced motion is requested', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       const MaterialApp(
         home: MediaQuery(
@@ -26,8 +27,9 @@ void main() {
     expect(find.byType(StatusDot), findsOneWidget);
   });
 
-  testWidgets('Ctrl+3 keyboard shortcut switches to the History tab',
-      (tester) async {
+  testWidgets('Ctrl+3 keyboard shortcut switches to the History tab', (
+    tester,
+  ) async {
     await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));

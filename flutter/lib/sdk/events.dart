@@ -18,10 +18,15 @@ sealed class BridgeEvent {
       case 'device_removed':
         return DeviceRemoved(j['id'] as String? ?? '');
       case 'status_changed':
-        return DeviceStatusChanged(j['id'] as String? ?? '', j['online'] as bool? ?? false);
+        return DeviceStatusChanged(
+          j['id'] as String? ?? '',
+          j['online'] as bool? ?? false,
+        );
       case 'latency_changed':
         return DeviceLatencyChanged(
-            j['id'] as String? ?? '', (j['latency_ms'] as num?)?.toInt());
+          j['id'] as String? ?? '',
+          (j['latency_ms'] as num?)?.toInt(),
+        );
       // Transfer (M2) — {transfer_id, timestamp, payload}.
       case 'transfer_queued':
       case 'transfer_started':
@@ -91,7 +96,9 @@ class TransferEvent extends BridgeEvent {
 
   TransferStats? get stats {
     final s = payload['stats'];
-    return s is Map ? TransferStats.fromJson(Map<String, dynamic>.from(s)) : null;
+    return s is Map
+        ? TransferStats.fromJson(Map<String, dynamic>.from(s))
+        : null;
   }
 
   String? get file => payload['file'] as String?;

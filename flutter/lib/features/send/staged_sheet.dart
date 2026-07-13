@@ -160,8 +160,9 @@ class _StagedSheet extends StatelessWidget {
                         ),
                       ),
                       FilledButton.icon(
-                        onPressed:
-                            items.isEmpty ? null : () => _send(context, staging),
+                        onPressed: items.isEmpty
+                            ? null
+                            : () => _send(context, staging),
                         icon: const Icon(Icons.send_rounded),
                         label: Text('Send ${items.length}'),
                       ),

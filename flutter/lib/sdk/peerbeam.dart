@@ -83,11 +83,13 @@ class PeerBeam implements PeerBeamApi {
     final b = _req();
     if (b.abiVersion() != kExpectedAbi) {
       throw InternalException(
-          'ABI mismatch: engine ${b.abiVersion()} vs expected $kExpectedAbi');
+        'ABI mismatch: engine ${b.abiVersion()} vs expected $kExpectedAbi',
+      );
     }
     // Register the event sink first, so no events are missed after init.
-    final callable =
-        NativeCallable<Void Function(Pointer<Utf8>)>.listener(_onNativeEvent);
+    final callable = NativeCallable<Void Function(Pointer<Utf8>)>.listener(
+      _onNativeEvent,
+    );
     _callable = callable;
     b.setEventCallback(callable.nativeFunction);
     _data(b.init(configJson));
@@ -136,15 +138,18 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<List<String>> sendFile(PeerTarget peer, List<String> paths) async {
-    final data = _data(_req().send(jsonEncode({'peer': peer.toJson(), 'paths': paths})));
+    final data = _data(
+      _req().send(jsonEncode({'peer': peer.toJson(), 'paths': paths})),
+    );
     final ids = data['ids'];
     return ids is List ? ids.map((e) => e as String).toList() : const [];
   }
 
   @override
   Future<String> sendFolder(PeerTarget peer, String path) async {
-    final data =
-        _data(_req().sendFolder(jsonEncode({'peer': peer.toJson(), 'path': path})));
+    final data = _data(
+      _req().sendFolder(jsonEncode({'peer': peer.toJson(), 'path': path})),
+    );
     return data['id'] as String;
   }
 

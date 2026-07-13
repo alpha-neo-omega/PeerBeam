@@ -17,17 +17,17 @@ import '../sdk/fake_peerbeam.dart';
 Future<void> flush() => Future(() {});
 
 SdkDevice dev(String id, {bool online = true}) => SdkDevice(
-      id: id,
-      name: 'Dev $id',
-      kind: 'laptop',
-      platform: 'linux',
-      addresses: const ['127.0.0.1'],
-      port: 49600,
-      online: online,
-      latencyMs: 5,
-      reachableLan: true,
-      reachableRemote: false,
-    );
+  id: id,
+  name: 'Dev $id',
+  kind: 'laptop',
+  platform: 'linux',
+  addresses: const ['127.0.0.1'],
+  port: 49600,
+  online: online,
+  latencyMs: 5,
+  reachableLan: true,
+  reachableRemote: false,
+);
 
 void main() {
   group('DiscoveryRepository', () {
@@ -64,7 +64,12 @@ void main() {
 
   group('TransferRepository', () {
     TransferEvent ev(String kind, String id, [Map<String, dynamic>? p]) =>
-        TransferEvent(kind: kind, transferId: id, timestamp: '', payload: p ?? {});
+        TransferEvent(
+          kind: kind,
+          transferId: id,
+          timestamp: '',
+          payload: p ?? {},
+        );
 
     test('builds and updates a transfer from its event sequence', () async {
       final fake = FakePeerBeam();
@@ -75,10 +80,12 @@ void main() {
       expect(repo.transfers.single.id, 't1');
       expect(repo.transfers.single.state, ui.TransferState.pending);
 
-      fake.emit(ev('transfer_progress', 't1', {
-        'stats': {'transferred_bytes': 50, 'total_bytes': 100},
-        'file': 'a.bin',
-      }));
+      fake.emit(
+        ev('transfer_progress', 't1', {
+          'stats': {'transferred_bytes': 50, 'total_bytes': 100},
+          'file': 'a.bin',
+        }),
+      );
       await flush();
       expect(repo.transfers.single.doneBytes, 50);
       expect(repo.transfers.single.totalBytes, 100);

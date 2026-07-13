@@ -24,7 +24,9 @@ String? _libPath() {
 
 void main() {
   final lib = _libPath();
-  final skip = lib == null ? 'cdylib not built (run: cargo build -p peerbeam-ffi)' : false;
+  final skip = lib == null
+      ? 'cdylib not built (run: cargo build -p peerbeam-ffi)'
+      : false;
 
   group('real FFI', () {
     late PeerBeam api;

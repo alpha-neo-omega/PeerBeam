@@ -38,11 +38,13 @@ class _DropZoneState extends State<DropZone> {
       try {
         size = await file.length(); // metadata only; no read
       } catch (_) {}
-      staged.add(StagedFile(
-        path: file.path,
-        name: file.name.isNotEmpty ? file.name : _basename(file.path),
-        size: size,
-      ));
+      staged.add(
+        StagedFile(
+          path: file.path,
+          name: file.name.isNotEmpty ? file.name : _basename(file.path),
+          size: size,
+        ),
+      );
     }
     final added = widget.staging.add(staged);
     if (added > 0 && mounted) {

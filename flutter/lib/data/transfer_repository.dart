@@ -27,10 +27,12 @@ class TransferRepository extends ChangeNotifier {
   Stream<String> get errors => _errors.stream;
 
   int get activeCount => _byId.values
-      .where((t) =>
-          t.state == TransferState.transferring ||
-          t.state == TransferState.paused ||
-          t.state == TransferState.pending)
+      .where(
+        (t) =>
+            t.state == TransferState.transferring ||
+            t.state == TransferState.paused ||
+            t.state == TransferState.pending,
+      )
       .length;
 
   void pause(String id) => _api?.pause(id).catchError((_) {});
@@ -91,8 +93,13 @@ class TransferRepository extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _update(String id,
-      {TransferState? state, int? done, int? total, String? file}) {
+  void _update(
+    String id, {
+    TransferState? state,
+    int? done,
+    int? total,
+    String? file,
+  }) {
     final t = _byId[id];
     if (t == null) return;
     _byId[id] = Transfer(

@@ -5,16 +5,14 @@ import 'package:peerbeam/features/send/drop_zone.dart';
 import 'package:peerbeam/state/staging.dart';
 
 void main() {
-  testWidgets('is a transparent passthrough on non-desktop platforms',
-      (tester) async {
+  testWidgets('is a transparent passthrough on non-desktop platforms', (
+    tester,
+  ) async {
     // Default test platform is Android → drag & drop disabled; the child
     // renders directly with no drop overlay attached.
     await tester.pumpWidget(
       MaterialApp(
-        home: DropZone(
-          staging: StagingStore(),
-          child: const Text('content'),
-        ),
+        home: DropZone(staging: StagingStore(), child: const Text('content')),
       ),
     );
 

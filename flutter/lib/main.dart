@@ -57,7 +57,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
 
     // Surface transfer failures as snackbars (reactive; never polled).
     _errSub = _state.transfer.errors.listen((message) {
-      _messengerKey.currentState?.showSnackBar(SnackBar(content: Text(message)));
+      _messengerKey.currentState?.showSnackBar(
+        SnackBar(content: Text(message)),
+      );
     });
 
     // No-op off Android; routes share/receive intents and drives the service.

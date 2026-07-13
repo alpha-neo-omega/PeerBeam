@@ -57,9 +57,9 @@ class AndroidBridge implements PlatformBridge {
   @override
   Stream<Map<String, dynamic>> events() {
     if (!_enabled) return const Stream.empty();
-    return _event
-        .receiveBroadcastStream()
-        .map((e) => Map<String, dynamic>.from(e as Map));
+    return _event.receiveBroadcastStream().map(
+      (e) => Map<String, dynamic>.from(e as Map),
+    );
   }
 
   Future<T?> _invoke<T>(String method, [Map<String, dynamic>? args]) async {
@@ -84,16 +84,14 @@ class AndroidBridge implements PlatformBridge {
   Future<void> stopForegroundService() => _invoke('stopForegroundService');
 
   @override
-  Future<void> showNotification(NotificationContent c) => _invoke(
-        'showNotification',
-        {
-          'id': c.id,
-          'title': c.title,
-          'body': c.body,
-          'ongoing': c.ongoing,
-          'progress': c.progress,
-        },
-      );
+  Future<void> showNotification(NotificationContent c) =>
+      _invoke('showNotification', {
+        'id': c.id,
+        'title': c.title,
+        'body': c.body,
+        'ongoing': c.ongoing,
+        'progress': c.progress,
+      });
 
   @override
   Future<void> cancelNotification(int id) =>

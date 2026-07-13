@@ -117,5 +117,4 @@ class AppState {
     settings.dispose();
     staging.dispose();
   }
-
 }

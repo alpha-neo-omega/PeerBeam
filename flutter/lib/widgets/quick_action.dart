@@ -45,7 +45,9 @@ class QuickAction extends StatelessWidget {
                     label,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: text.labelLarge?.copyWith(fontWeight: FontWeight.w600),
+                    style: text.labelLarge?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ],
               ),

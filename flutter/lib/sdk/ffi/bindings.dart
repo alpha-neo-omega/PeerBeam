@@ -19,8 +19,10 @@ typedef _VoidC = Void Function();
 typedef _VoidDart = void Function();
 typedef _FreeC = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
-typedef _SetCbC = Void Function(Pointer<NativeFunction<Void Function(Pointer<Utf8>)>>);
-typedef _SetCbDart = void Function(Pointer<NativeFunction<Void Function(Pointer<Utf8>)>>);
+typedef _SetCbC =
+    Void Function(Pointer<NativeFunction<Void Function(Pointer<Utf8>)>>);
+typedef _SetCbDart =
+    void Function(Pointer<NativeFunction<Void Function(Pointer<Utf8>)>>);
 
 /// Thrown when the native library cannot be located/opened.
 class NativeLoadError implements Exception {
@@ -53,28 +55,31 @@ class Bindings {
   final _RetDart _history;
 
   Bindings._(DynamicLibrary lib)
-      : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
-        _versionJson = lib.lookupFunction<_RetC, _RetDart>('pb_version_json'),
-        _init = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_init'),
-        _shutdown = lib.lookupFunction<_VoidC, _VoidDart>('pb_shutdown'),
-        _setEventCallback =
-            lib.lookupFunction<_SetCbC, _SetCbDart>('pb_set_event_callback'),
-        _freeString = lib.lookupFunction<_FreeC, _FreeDart>('pb_free_string'),
-        _discoveryStart =
-            lib.lookupFunction<_RetC, _RetDart>('pb_discovery_start'),
-        _discoveryStop = lib.lookupFunction<_RetC, _RetDart>('pb_discovery_stop'),
-        _devices = lib.lookupFunction<_RetC, _RetDart>('pb_devices_json'),
-        _send = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_send'),
-        _sendFolder =
-            lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_send_folder'),
-        _pause = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_pause'),
-        _resume = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_resume'),
-        _cancel = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_cancel'),
-        _accept = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_accept'),
-        _reject = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_reject'),
-        _active = lib.lookupFunction<_RetC, _RetDart>('pb_transfers_active'),
-        _get = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_get'),
-        _history = lib.lookupFunction<_RetC, _RetDart>('pb_history_get');
+    : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
+      _versionJson = lib.lookupFunction<_RetC, _RetDart>('pb_version_json'),
+      _init = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_init'),
+      _shutdown = lib.lookupFunction<_VoidC, _VoidDart>('pb_shutdown'),
+      _setEventCallback = lib.lookupFunction<_SetCbC, _SetCbDart>(
+        'pb_set_event_callback',
+      ),
+      _freeString = lib.lookupFunction<_FreeC, _FreeDart>('pb_free_string'),
+      _discoveryStart = lib.lookupFunction<_RetC, _RetDart>(
+        'pb_discovery_start',
+      ),
+      _discoveryStop = lib.lookupFunction<_RetC, _RetDart>('pb_discovery_stop'),
+      _devices = lib.lookupFunction<_RetC, _RetDart>('pb_devices_json'),
+      _send = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_send'),
+      _sendFolder = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_transfer_send_folder',
+      ),
+      _pause = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_pause'),
+      _resume = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_resume'),
+      _cancel = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_cancel'),
+      _accept = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_accept'),
+      _reject = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_reject'),
+      _active = lib.lookupFunction<_RetC, _RetDart>('pb_transfers_active'),
+      _get = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_get'),
+      _history = lib.lookupFunction<_RetC, _RetDart>('pb_history_get');
 
   /// Load the native library. `overridePath` forces a specific file (tests).
   static Bindings load({String? overridePath}) {
@@ -95,8 +100,7 @@ class Bindings {
   void freeString(Pointer<Utf8> ptr) => _freeString(ptr);
   void setEventCallback(
     Pointer<NativeFunction<Void Function(Pointer<Utf8>)>> cb,
-  ) =>
-      _setEventCallback(cb);
+  ) => _setEventCallback(cb);
 
   String discoveryStart() => _consume(_discoveryStart());
   String discoveryStop() => _consume(_discoveryStop());

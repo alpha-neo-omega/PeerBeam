@@ -75,21 +75,21 @@ class DiscoveryRepository extends ChangeNotifier {
 
   // ── SDK → UI model ──────────────────────────────────────────
   static Device _map(SdkDevice d) => Device(
-        id: d.id,
-        name: d.name,
-        kind: _kind(d.kind),
-        online: d.online,
-        reach: _reach(d),
-        latencyMs: d.latencyMs,
-      );
+    id: d.id,
+    name: d.name,
+    kind: _kind(d.kind),
+    online: d.online,
+    reach: _reach(d),
+    latencyMs: d.latencyMs,
+  );
 
   static DeviceKind _kind(String k) => switch (k) {
-        'laptop' => DeviceKind.laptop,
-        'phone' => DeviceKind.phone,
-        'tablet' => DeviceKind.tablet,
-        'server' => DeviceKind.server,
-        _ => DeviceKind.desktop,
-      };
+    'laptop' => DeviceKind.laptop,
+    'phone' => DeviceKind.phone,
+    'tablet' => DeviceKind.tablet,
+    'server' => DeviceKind.server,
+    _ => DeviceKind.desktop,
+  };
 
   static Set<Reach> _reach(SdkDevice d) {
     final r = <Reach>{};
@@ -100,20 +100,20 @@ class DiscoveryRepository extends ChangeNotifier {
   }
 
   static Device _withOnline(Device d, bool online) => Device(
-        id: d.id,
-        name: d.name,
-        kind: d.kind,
-        online: online,
-        reach: d.reach,
-        latencyMs: d.latencyMs,
-      );
+    id: d.id,
+    name: d.name,
+    kind: d.kind,
+    online: online,
+    reach: d.reach,
+    latencyMs: d.latencyMs,
+  );
 
   static Device _withLatency(Device d, int? latencyMs) => Device(
-        id: d.id,
-        name: d.name,
-        kind: d.kind,
-        online: d.online,
-        reach: d.reach,
-        latencyMs: latencyMs,
-      );
+    id: d.id,
+    name: d.name,
+    kind: d.kind,
+    online: d.online,
+    reach: d.reach,
+    latencyMs: latencyMs,
+  );
 }
