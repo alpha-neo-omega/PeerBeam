@@ -5,9 +5,11 @@
 //! events. No file bytes cross FFI — only paths in, metadata/progress out.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use tokio::task::JoinHandle;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -137,10 +139,13 @@ pub struct Manager {
     save_dir: String,
     auto_accept: bool,
     chunk_size: u32,
+    daemon_port: u16,
     active: Mutex<HashMap<String, Arc<Active>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     history: Mutex<Vec<Value>>,
     counter: AtomicU64,
+    daemon_task: Mutex<Option<JoinHandle<()>>>,
+    daemon_running: AtomicBool,
 }
 
 type Op = Result<Value, (Code, String)>;
@@ -156,6 +161,7 @@ impl Manager {
         save_dir: String,
         auto_accept: bool,
         chunk_size: u32,
+        daemon_port: u16,
     ) -> Self {
         Manager {
             rm,
@@ -166,11 +172,58 @@ impl Manager {
             save_dir,
             auto_accept,
             chunk_size: chunk_size.max(1),
+            daemon_port,
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             history: Mutex::new(Vec::new()),
             counter: AtomicU64::new(0),
+            daemon_task: Mutex::new(None),
+            daemon_running: AtomicBool::new(false),
         }
+    }
+
+    // ── daemon (receive server) control ─────────────────────────
+
+    pub fn active_len(&self) -> usize {
+        self.active.lock().unwrap().len()
+    }
+
+    pub fn daemon_status(&self) -> Value {
+        json!({
+            "running": self.daemon_running.load(Ordering::SeqCst),
+            "port": self.daemon_port,
+        })
+    }
+
+    /// Start the receive server if not already running (idempotent).
+    pub fn start_daemon(self: &Arc<Self>) -> Op {
+        if self.daemon_running.swap(true, Ordering::SeqCst) {
+            return Ok(json!({ "running": true, "already_running": true }));
+        }
+        let me = self.clone();
+        let port = self.daemon_port;
+        let handle = crate::runtime::spawn_handle(async move { me.serve(port).await });
+        *self.daemon_task.lock().unwrap() = Some(handle);
+        daemon_event("daemon_started", self.daemon_port);
+        Ok(json!({ "running": true }))
+    }
+
+    /// Stop the receive server (idempotent).
+    pub fn stop_daemon(&self) -> Op {
+        if let Some(handle) = self.daemon_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        self.daemon_running.store(false, Ordering::SeqCst);
+        daemon_event("daemon_stopped", self.daemon_port);
+        Ok(json!({ "running": false }))
+    }
+
+    /// Stop then start the receive server.
+    pub fn restart_daemon(self: &Arc<Self>) -> Op {
+        let _ = self.stop_daemon();
+        let _ = self.start_daemon();
+        daemon_event("daemon_restarted", self.daemon_port);
+        Ok(json!({ "running": true }))
     }
 
     fn next_id(&self) -> String {
@@ -721,6 +774,15 @@ impl Link for PeekLink<'_> {
 
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Emit a daemon lifecycle event.
+fn daemon_event(kind: &str, port: u16) {
+    events::emit(&json!({
+        "type": kind,
+        "timestamp": timestamp(),
+        "payload": { "port": port },
+    }));
 }
 
 /// Build a target `Device` from a `peer` JSON object.

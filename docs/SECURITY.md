@@ -95,3 +95,9 @@ absolute paths).
   pin → trust → reject-on-key-change; `SecureLink` rejects replayed and
   tampered frames; safe write refuses to overwrite and leaves `.part` on
   integrity failure.
+
+## Settings & trust over FFI
+
+The FFI `pb_settings_get` exposes the TOFU trusted-devices list (read from the
+trust store) and `auto_accept`; `pb_settings_set` persists changes (applied on
+next init). Trust pinning/verification itself is unchanged — see above.

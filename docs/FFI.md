@@ -175,8 +175,50 @@ library into each Flutter runner) is wired in the Dart-integration milestone.
   E2E tests over QUIC (send-out, receive-in with accept), events/ordering,
   stats, history. Route migration on the FFI path is deferred (SecureLink
   lifetimes); pause/resume/cancel work.
-- **M3:** clipboard, settings, daemon, status, logs.
+- **M3 (done):** clipboard, settings, daemon, status, logs — see below.
 - **M4 (done):** Dart SDK + repositories — see below.
+
+## Runtime management (M3)
+
+Additive C-ABI functions (ABI still v1); same envelope + typed codes.
+
+```c
+// Clipboard (text/url/code auto-classified; images = metadata only)
+char* pb_clipboard_get(void);              // {item|null}
+char* pb_clipboard_set(const char* json);  // {text} | {kind:"image",mime,size}
+char* pb_clipboard_subscribe(void);
+// Settings (versioned, persisted under the data dir; applied on next init)
+char* pb_settings_get(void);               // {version,transfer_directory,auto_accept,theme,
+                                           //  discovery_enabled,notifications,logging,
+                                           //  experimental,trusted_devices[]}
+char* pb_settings_set(const char* json);   // partial merge → persist → settings_changed
+char* pb_settings_reset(void);
+// Daemon = the receive server (idempotent; started at init)
+char* pb_daemon_start(void);  pb_daemon_stop(void);  pb_daemon_restart(void);
+char* pb_daemon_status(void);              // {running, port}
+// Status
+char* pb_status(void);                     // {runtime,build{version,abi,profile},devices,
+                                           //  active_transfers,daemon{running,port},memory_bytes}
+// Logs (structured ring buffer; severity/timestamp/source/component/message)
+char* pb_logs_get(const char* json);       // {limit?} → {logs:[…]}
+char* pb_logs_subscribe(const char* json); // {enabled} toggles log_received events
+char* pb_logs_export(const char* json);    // {path?} → {path,count}
+```
+
+New events (same `{type,timestamp,payload}` shape): `clipboard_updated`,
+`settings_changed`, `daemon_started`, `daemon_stopped`, `daemon_restarted`,
+`log_received`. All flow through the single event callback; ordering preserved.
+
+Notes / honest scope:
+- **Clipboard** is a local synchronized slot + events; cross-device clipboard
+  *over the network* (receive-side detection) is a follow-up.
+- **Settings** persist to `<data_dir>/ffi_settings.json` and are versioned; they
+  apply to the engine on next `pb_init` (no live engine-mutation API).
+- **Logs** are captured by a `tracing` layer installed once via `try_init`; if a
+  global subscriber already exists, capture degrades gracefully.
+- Thread-safe: clipboard slot, settings file, log ring + emit flag, and daemon
+  task/flag are all synchronized; daemon start/stop just (re)spawn/abort the
+  receive-server task and never block the UI.
 
 ## Dart side (M4)
 

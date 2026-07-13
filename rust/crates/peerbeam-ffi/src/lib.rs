@@ -10,10 +10,14 @@
 //!   [`pb_free_string`]. Dart allocates argument strings and frees them itself.
 //! - **No bytes cross.** Files are referred to by path; streaming stays in Rust.
 
+mod clipboard;
 mod dto;
 mod error;
 mod events;
+mod logs;
 mod runtime;
+mod settings;
+mod status;
 mod transfer;
 
 use std::ffi::{CStr, CString};
@@ -146,6 +150,14 @@ unsafe fn read_json(ptr: *const c_char) -> Result<Value, (Code, String)> {
     serde_json::from_str(&s).map_err(|e| (Code::InvalidArgument, format!("bad json: {e}")))
 }
 
+/// Parse an optional JSON argument; null/empty/invalid → empty object.
+unsafe fn read_json_or_empty(ptr: *const c_char) -> Value {
+    match read_str(ptr) {
+        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
+        _ => json!({}),
+    }
+}
+
 /// Extract a required string `id` field.
 fn id_of(v: &Value) -> Result<String, (Code, String)> {
     v.get("id")
@@ -246,6 +258,111 @@ pub unsafe extern "C" fn pb_transfer_get(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn pb_history_get() -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.history())()))
+}
+
+// ── clipboard ───────────────────────────────────────────────────
+
+/// Current clipboard item, or `{item:null}`.
+#[no_mangle]
+pub extern "C" fn pb_clipboard_get() -> *mut c_char {
+    guard(|| error::envelope(clipboard::get()))
+}
+
+/// Set the clipboard: `{text}` (auto-classified) or `{kind:"image",mime,size}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_clipboard_set(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| clipboard::set(&read_json(json)?))()))
+}
+
+/// Enable clipboard events (they flow through the event callback).
+#[no_mangle]
+pub extern "C" fn pb_clipboard_subscribe() -> *mut c_char {
+    guard(|| error::envelope(clipboard::subscribe()))
+}
+
+// ── settings ────────────────────────────────────────────────────
+
+/// Current settings (with trusted-devices list).
+#[no_mangle]
+pub extern "C" fn pb_settings_get() -> *mut c_char {
+    guard(|| error::envelope(settings::get()))
+}
+
+/// Merge a partial settings object, persist, emit `settings_changed`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_settings_set(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| settings::set(&read_json(json)?))()))
+}
+
+/// Restore default settings.
+#[no_mangle]
+pub extern "C" fn pb_settings_reset() -> *mut c_char {
+    guard(|| error::envelope(settings::reset()))
+}
+
+// ── daemon ──────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn pb_daemon_start() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.start_daemon())()))
+}
+
+#[no_mangle]
+pub extern "C" fn pb_daemon_stop() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.stop_daemon())()))
+}
+
+#[no_mangle]
+pub extern "C" fn pb_daemon_restart() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.restart_daemon())()))
+}
+
+#[no_mangle]
+pub extern "C" fn pb_daemon_status() -> *mut c_char {
+    guard(|| error::envelope((|| Ok(runtime::manager()?.daemon_status()))()))
+}
+
+// ── status ──────────────────────────────────────────────────────
+
+/// Aggregate runtime status (runtime/build/devices/transfers/daemon/memory).
+#[no_mangle]
+pub extern "C" fn pb_status() -> *mut c_char {
+    guard(|| error::envelope(runtime::status()))
+}
+
+// ── logs ────────────────────────────────────────────────────────
+
+/// Recent structured logs: `{limit?}` → `{logs:[…]}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_logs_get(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope(logs::get(&read_json_or_empty(json))))
+}
+
+/// Toggle `log_received` event streaming: `{enabled:bool}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_logs_subscribe(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope(logs::subscribe(&read_json_or_empty(json))))
+}
+
+/// Export buffered logs to a file: `{path?}` → `{path,count}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_logs_export(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope(logs::export(&read_json_or_empty(json))))
 }
 
 #[cfg(test)]

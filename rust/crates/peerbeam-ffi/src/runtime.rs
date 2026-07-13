@@ -51,6 +51,14 @@ where
     rt().spawn(future);
 }
 
+/// Spawn a task and return its handle (so it can be aborted — e.g. the daemon).
+pub fn spawn_handle<F>(future: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    rt().spawn(future)
+}
+
 /// The transfer manager, if initialised.
 pub fn manager() -> Result<Arc<Manager>, (Code, String)> {
     MANAGER
@@ -97,6 +105,10 @@ pub fn init(config_json: &str) -> OpResult {
     // init runs on the caller's (Dart) thread, so enter the runtime here.
     let _guard = rt().enter();
 
+    // Capture engine logs + point settings storage at the data directory.
+    crate::logs::install();
+    crate::settings::configure(&config.storage.data_directory);
+
     let id = device_id();
     let mut builder =
         EngineBuilder::new(config.clone()).with_discovery(Arc::new(UdpDiscovery::new(id.clone())));
@@ -135,17 +147,31 @@ pub fn init(config_json: &str) -> OpResult {
         config.storage.save_directory.clone(),
         config.device.auto_accept_trusted,
         config.transfer.chunk_size as u32,
+        config.transfer.port,
     ));
 
-    // Start the receive server so accept/reject have incoming transfers.
-    let serving = manager.clone();
-    let port = config.transfer.port;
-    rt().spawn(async move { serving.serve(port).await });
+    // Start the receive server (the "daemon") so accept/reject have incoming
+    // transfers; controllable via pb_daemon_*.
+    let _ = manager.start_daemon();
 
     *ME.lock().unwrap() = Some(me(&config));
     *ENGINE.lock().unwrap() = Some(engine);
     *MANAGER.lock().unwrap() = Some(manager);
     Ok(json!({ "initialised": true }))
+}
+
+/// Aggregate runtime status.
+pub fn status() -> OpResult {
+    let engine = engine()?;
+    let manager = crate::runtime::manager()?;
+    Ok(json!({
+        "runtime": "running",
+        "build": crate::status::build_info(),
+        "devices": engine.devices().len(),
+        "active_transfers": manager.active_len(),
+        "daemon": manager.daemon_status(),
+        "memory_bytes": crate::status::rss_bytes(),
+    }))
 }
 
 /// Stop work and release the engine.

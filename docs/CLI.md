@@ -141,3 +141,9 @@ smoke-tested incl. `send`/`receive` over both discovery and `--addr`.
 `clipboard` and `history` execution, and the `daemon stop|status` IPC, are still
 gated (exit code 8). Folder send (`send <dir>`) is not wired yet — send files
 for now.
+
+## Engine daemon vs CLI
+
+The CLI `daemon` command runs a foreground receive loop. The embeddable engine
+also exposes daemon control over FFI (`pb_daemon_start/stop/restart/status`) for
+the Flutter app — see [FFI](FFI.md).
