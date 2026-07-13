@@ -1,11 +1,18 @@
 import 'package:flutter/material.dart';
 
+import '../data/discovery_repository.dart';
+import '../data/history_repository.dart';
+import '../data/transfer_repository.dart';
+import '../sdk/peerbeam.dart';
 import 'models.dart';
 import 'staging.dart';
 
-/// Per-domain [ChangeNotifier]s. Screens listen to only the store they need
-/// (via `AnimatedBuilder`), so a change in one domain never rebuilds the whole
-/// app — the opposite of a single god-provider driving the entire tree.
+/// Per-domain state. Screens listen to only the piece they need (via
+/// `AnimatedBuilder`), so a change in one domain never rebuilds the whole app.
+///
+/// Device/transfer/history state now lives in **repositories** that are driven
+/// by engine events (see `lib/data/`); the classes below are the remaining
+/// UI-local pieces (theme, settings, staging).
 
 class ThemeController extends ChangeNotifier {
   ThemeMode _mode = ThemeMode.system;
@@ -13,60 +20,6 @@ class ThemeController extends ChangeNotifier {
   void setMode(ThemeMode mode) {
     if (mode == _mode) return;
     _mode = mode;
-    notifyListeners();
-  }
-}
-
-class DeviceStore extends ChangeNotifier {
-  final List<Device> _devices;
-  bool _scanning = true;
-
-  DeviceStore(this._devices);
-
-  List<Device> get devices => List.unmodifiable(_devices);
-  bool get scanning => _scanning;
-  int get onlineCount => _devices.where((d) => d.online).length;
-
-  void toggleScan() {
-    _scanning = !_scanning;
-    notifyListeners();
-  }
-}
-
-class TransferStore extends ChangeNotifier {
-  final List<Transfer> _transfers;
-  TransferStore(this._transfers);
-
-  List<Transfer> get transfers => List.unmodifiable(_transfers);
-  int get activeCount => _transfers
-      .where((t) =>
-          t.state == TransferState.transferring ||
-          t.state == TransferState.paused ||
-          t.state == TransferState.pending)
-      .length;
-
-  void _replace(String id, Transfer Function(Transfer) f) {
-    final i = _transfers.indexWhere((t) => t.id == id);
-    if (i < 0) return;
-    _transfers[i] = f(_transfers[i]);
-    notifyListeners();
-  }
-
-  void pause(String id) => _replace(id, (t) => t.copyWith(state: TransferState.paused));
-  void resume(String id) =>
-      _replace(id, (t) => t.copyWith(state: TransferState.transferring));
-  void cancel(String id) {
-    _transfers.removeWhere((t) => t.id == id);
-    notifyListeners();
-  }
-}
-
-class HistoryStore extends ChangeNotifier {
-  final List<HistoryItem> _items;
-  HistoryStore(this._items);
-  List<HistoryItem> get items => List.unmodifiable(_items);
-  void clear() {
-    _items.clear();
     notifyListeners();
   }
 }
@@ -121,12 +74,12 @@ class SettingsStore extends ChangeNotifier {
   }
 }
 
-/// Top-level container of all stores, created once and shared via [AppScope].
+/// Top-level container of all state, created once and shared via [AppScope].
 class AppState {
   final ThemeController theme;
-  final DeviceStore device;
-  final TransferStore transfer;
-  final HistoryStore history;
+  final DiscoveryRepository device;
+  final TransferRepository transfer;
+  final HistoryRepository history;
   final SettingsStore settings;
   final StagingStore staging;
 
@@ -138,6 +91,24 @@ class AppState {
     required this.settings,
     required this.staging,
   });
+
+  /// Production wiring: repositories driven by the live engine over [api].
+  factory AppState.live(PeerBeamApi api) {
+    return AppState(
+      theme: ThemeController(),
+      device: DiscoveryRepository(api: api),
+      transfer: TransferRepository(api: api),
+      history: HistoryRepository(api: api),
+      settings: SettingsStore(
+        deviceName: 'This Device',
+        saveDirectory: '~/Downloads/PeerBeam',
+        autoAcceptTrusted: false,
+        notifications: true,
+        compression: true,
+      ),
+      staging: StagingStore(),
+    );
+  }
 
   void dispose() {
     theme.dispose();
@@ -153,7 +124,7 @@ class AppState {
     final now = DateTime.now();
     return AppState(
       theme: ThemeController(),
-      device: DeviceStore([
+      device: DiscoveryRepository(seed: [
         const Device(
           id: 'd1',
           name: "Alice's MacBook",
@@ -186,7 +157,7 @@ class AppState {
           reach: {Reach.lan},
         ),
       ]),
-      transfer: TransferStore([
+      transfer: TransferRepository(seed: [
         const Transfer(
           id: 't1',
           peerName: "Alice's MacBook",
@@ -206,7 +177,7 @@ class AppState {
           doneBytes: 8 * 1024 * 1024,
         ),
       ]),
-      history: HistoryStore([
+      history: HistoryRepository(seed: [
         HistoryItem(
           id: 'h1',
           peerName: "Alice's MacBook",

@@ -176,9 +176,51 @@ library into each Flutter runner) is wired in the Dart-integration milestone.
   stats, history. Route migration on the FFI path is deferred (SecureLink
   lifetimes); pause/resume/cancel work.
 - **M3:** clipboard, settings, daemon, status, logs.
-- **M4:** Dart bridge (`flutter/lib/bridge/*`) — typed wrappers, models, event
-  stream, typed exceptions — wire the stores, add platform build glue, Flutter
-  integration + leak tests.
+- **M4 (done):** Dart SDK + repositories — see below.
+
+## Dart side (M4)
+
+The Flutter app is now presentation-only; it talks to the engine through a Dart
+SDK and never touches `dart:ffi`.
+
+```
+Flutter widgets → ChangeNotifier repositories (lib/data) → PeerBeam SDK
+  (lib/sdk) → dart:ffi (lib/sdk/ffi) → peerbeam-ffi → Rust engine
+```
+
+- **SDK** (`lib/sdk/`): `PeerBeamApi` (interface) + `PeerBeam` (FFI-backed);
+  `models.dart` (immutable), `events.dart` (typed `BridgeEvent`),
+  `exceptions.dart` (typed `PeerBeamException` per error code),
+  `ffi/bindings.dart` (the only `dart:ffi` file). Clean API:
+  `initialize`, `startDiscovery`/`stopDiscovery`, `devices`, `sendFile`,
+  `sendFolder`, `pause`/`resume`/`cancel`, `accept`/`reject`, `activeTransfers`,
+  `history`, `events` (broadcast stream).
+- **Repositories** (`lib/data/`): `DiscoveryRepository`, `TransferRepository`,
+  `HistoryRepository` — `ChangeNotifier`s driven by the SDK event stream (no
+  polling), delegating commands to the engine. They back the existing app state,
+  so no widget changes. (Settings stays local until the M3 settings ops land.)
+- **Memory ownership:** Rust allocates returned strings; Dart frees them
+  (`pb_free_string`) after copying. Dart allocates argument strings and frees
+  them. The event `NativeCallable.listener` is held for the SDK's lifetime and
+  closed on `shutdown`. A stress/leak test hammers the boundary.
+- **Graceful degradation:** if the native library isn't present (e.g. a test
+  host, unbuilt platform), `PeerBeam.available` is false and calls throw
+  `PeerBeamUnavailable`; the app still runs (empty state).
+
+### Tests
+- Repository unit tests over a `FakePeerBeam` (no native lib).
+- Real-FFI Dart test (`test/sdk/ffi_test.dart`): `dlopen` the built cdylib,
+  init, list, **typed error mapping over real FFI**, **event delivery through
+  the callback**, and a stress loop. Skipped if the lib isn't built.
+
+### Platform packaging
+- **Linux:** bundled by `linux/CMakeLists.txt` (installs
+  `rust/target/{release,debug}/libpeerbeam_ffi.so`). Build the crate first.
+- **Windows/macOS/Android/iOS (to wire):** copy `peerbeam_ffi.dll` beside the
+  runner / add the `.dylib` to the macOS bundle & `DynamicLibrary.process()` /
+  place `libpeerbeam_ffi.so` under `android/app/src/main/jniLibs/<abi>/` /
+  static-link for iOS. The loader (`ffi/bindings.dart`) already picks the right
+  name per platform.
 
 Until M4, the Flutter app still renders sample data; the Rust boundary it will
 consume is what M1–M3 build and test.

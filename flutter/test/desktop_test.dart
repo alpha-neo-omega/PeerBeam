@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/main.dart';
+import 'package:peerbeam/state/stores.dart';
 import 'package:peerbeam/platform/desktop_files.dart';
 
 void main() {
@@ -16,7 +17,7 @@ void main() {
 
   testWidgets('tapping Send Files off-desktop shows guidance, does not crash',
       (tester) async {
-    await tester.pumpWidget(const PeerBeamApp());
+    await tester.pumpWidget(PeerBeamApp(state: AppState.sample()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 

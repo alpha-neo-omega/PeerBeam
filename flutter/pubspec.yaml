@@ -45,6 +45,9 @@ dependencies:
   # Native file picker + directory chooser (desktop + mobile).
   file_selector: ^1.0.3
 
+  # FFI helpers (Utf8 marshalling) for the Rust engine bridge.
+  ffi: ^2.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

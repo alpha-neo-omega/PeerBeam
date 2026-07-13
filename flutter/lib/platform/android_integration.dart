@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../data/transfer_repository.dart';
 import '../state/staging.dart';
 import '../state/stores.dart';
 import 'bridge.dart';
@@ -17,7 +18,7 @@ import 'shared_item.dart';
 class AndroidIntegration {
   final PlatformBridge bridge;
   final StagingStore staging;
-  final TransferStore transfer;
+  final TransferRepository transfer;
   final SettingsStore settings;
 
   late final ForegroundServiceController service =

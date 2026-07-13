@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/main.dart';
+import 'package:peerbeam/state/stores.dart';
 import 'package:peerbeam/widgets/status_dot.dart';
 
 void main() {
@@ -27,7 +28,7 @@ void main() {
 
   testWidgets('Ctrl+3 keyboard shortcut switches to the History tab',
       (tester) async {
-    await tester.pumpWidget(const PeerBeamApp());
+    await tester.pumpWidget(PeerBeamApp(state: AppState.sample()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 

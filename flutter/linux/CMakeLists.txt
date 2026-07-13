@@ -106,6 +106,17 @@ foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
     COMPONENT Runtime)
 endforeach(bundled_library)
 
+# Bundle the PeerBeam Rust engine (peerbeam-ffi). Build it first with:
+#   cargo build --release -p peerbeam-ffi   (or debug for dev)
+# so it exists at configure time; otherwise it is skipped (best-effort).
+foreach(profile release debug)
+  set(PB_FFI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../rust/target/${profile}/libpeerbeam_ffi.so")
+  if(EXISTS "${PB_FFI_LIB}")
+    install(FILES "${PB_FFI_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+    break()
+  endif()
+endforeach()
+
 # Copy the native assets provided by the build.dart from all packages.
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/linux/")
 install(DIRECTORY "${NATIVE_ASSETS_DIR}"

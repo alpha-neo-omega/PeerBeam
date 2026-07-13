@@ -3,10 +3,11 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/main.dart';
+import 'package:peerbeam/state/stores.dart';
 
 void main() {
   testWidgets('boots to Home with nearby devices', (tester) async {
-    await tester.pumpWidget(const PeerBeamApp());
+    await tester.pumpWidget(PeerBeamApp(state: AppState.sample()));
     // Not pumpAndSettle: the presence dots pulse forever.
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 500));
