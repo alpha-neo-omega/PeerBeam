@@ -123,6 +123,24 @@ impl DeviceStore {
         }
     }
 
+    /// Mark every tracked device offline, dropping all provider claims — used
+    /// when discovery stops and liveness can no longer be observed. Devices
+    /// stay tracked (offline) for later prune/re-discovery.
+    pub fn offline_all(&mut self) -> Vec<DeviceChange> {
+        let mut out = Vec::new();
+        for (id, entry) in self.devices.iter_mut() {
+            if entry.online {
+                entry.online = false;
+                entry.providers.clear();
+                out.push(DeviceChange::StatusChanged {
+                    id: id.clone(),
+                    online: false,
+                });
+            }
+        }
+        out
+    }
+
     fn drop_provider(&mut self, provider: &ProviderId, id: &DeviceId) -> Vec<DeviceChange> {
         let Some(entry) = self.devices.get_mut(id) else {
             return Vec::new();
@@ -710,6 +728,27 @@ mod tests {
             "expected offline, got {changes:?}"
         );
         assert!(!store.snapshot()[0].online);
+    }
+
+    /// Stopping discovery marks everything offline (liveness unobservable) —
+    /// once per device, and devices stay tracked.
+    #[test]
+    fn offline_all_flips_online_devices_once() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "192.168.1.9")),
+        );
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("b", "Bob", "100.64.0.9")),
+        );
+
+        let changes = store.offline_all();
+        assert_eq!(changes.len(), 2, "one offline change per device");
+        assert!(store.snapshot().iter().all(|d| !d.online));
+        assert_eq!(store.snapshot().len(), 2, "devices remain tracked");
+        assert!(store.offline_all().is_empty(), "idempotent");
     }
 
     /// A cross-subnet claim (Tailscale) is a different network path — it keeps

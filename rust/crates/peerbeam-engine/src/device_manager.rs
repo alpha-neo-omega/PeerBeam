@@ -81,15 +81,20 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Stop the merge task and every provider. Tracked devices remain in the
-    /// snapshot (marked offline by their providers stopping is not automatic;
-    /// callers may `prune` via the store if needed).
+    /// Stop the merge task and every provider, then mark all devices offline
+    /// (with liveness no longer observed, "online" would be a stale claim).
+    /// Devices stay tracked for re-discovery; subscribers get the offline
+    /// changes so UIs don't show frozen presence.
     pub async fn stop(&self) -> Result<(), EngineError> {
         if let Some(handle) = self.task.lock().unwrap().take() {
             handle.abort();
         }
         for provider in &self.providers {
             provider.stop().await?;
+        }
+        let emitted = self.store.lock().unwrap().offline_all();
+        for change in emitted {
+            let _ = self.changes.send(change);
         }
         Ok(())
     }
