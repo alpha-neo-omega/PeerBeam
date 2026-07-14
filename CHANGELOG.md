@@ -7,6 +7,11 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Trusted devices**: Settings lists every pinned device with its key
+  fingerprint; revoke to require fresh approval on the next connection.
+- **Edit saved devices**: rename or re-address a saved device from its menu
+  (share QR / edit / remove).
+- **Open the save folder** from Settings (desktop).
 - **Open from History**: history entries record the item's local path; tap to
   open the file (or the save folder for folder receives) with the OS handler.
 - **Clipboard receive**: a received clipboard payload shows a snackbar with the

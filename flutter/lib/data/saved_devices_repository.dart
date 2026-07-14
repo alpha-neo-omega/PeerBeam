@@ -77,6 +77,23 @@ class SavedDevicesRepository extends ChangeNotifier {
     return device;
   }
 
+  /// Update a device's details (same id) and persist.
+  Future<void> update(
+    String id, {
+    required String name,
+    required String host,
+    required int port,
+  }) async {
+    _items = [
+      for (final d in _items)
+        d.id == id
+            ? SavedDevice(id: d.id, name: name, host: host, port: port)
+            : d,
+    ];
+    if (!_disposed) notifyListeners();
+    await _persist();
+  }
+
   /// Remove a device by id and persist.
   Future<void> remove(String id) async {
     _items = _items.where((d) => d.id != id).toList();

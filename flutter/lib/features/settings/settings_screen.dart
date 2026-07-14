@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../platform/bridge.dart';
 import '../../platform/desktop_files.dart';
+import '../../platform/open_path.dart';
 import '../../platform/services.dart';
 import '../../sdk/models.dart' show TrustedDevice;
 import '../../state/app_scope.dart';
@@ -89,8 +90,14 @@ class SettingsScreen extends StatelessWidget {
                         leading: const Icon(Icons.folder_rounded),
                         title: const Text('Save to'),
                         subtitle: Text(state.settings.saveDirectory),
+                        // Desktop: open the folder in the file manager; tap
+                        // the row to change it.
                         trailing: isDesktop
-                            ? const Icon(Icons.chevron_right_rounded)
+                            ? IconButton(
+                                tooltip: 'Open folder',
+                                icon: const Icon(Icons.open_in_new_rounded),
+                                onPressed: () => _openSaveDir(context),
+                              )
                             : null,
                         onTap: isDesktop ? () => _pickSaveDir(context) : null,
                       ),
@@ -300,6 +307,17 @@ class SettingsScreen extends StatelessWidget {
       groups.add(head.substring(i, (i + 4).clamp(0, head.length)));
     }
     return groups.join(' ');
+  }
+
+  /// Open the save directory in the system file manager (desktop).
+  Future<void> _openSaveDir(BuildContext context) async {
+    final dir = AppScope.of(context).settings.saveDirectory;
+    final error = await openLocalPath(dir);
+    if (error != null && context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(error)));
+    }
   }
 
   /// Choose the save directory with the native directory picker (desktop).

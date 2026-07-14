@@ -227,6 +227,59 @@ class HomeScreen extends StatelessWidget {
     await scope.saved.add(name: n, host: h, port: p);
   }
 
+  /// Edit a saved device's name/address in place.
+  Future<void> _editSavedDevice(BuildContext context, SavedDevice d) async {
+    final scope = AppScope.of(context);
+    final name = TextEditingController(text: d.name);
+    final host = TextEditingController(text: d.host);
+    final port = TextEditingController(text: '${d.port}');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit device'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: name,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Name'),
+            ),
+            const Gap(AppSpace.sm),
+            TextField(
+              controller: host,
+              decoration: const InputDecoration(
+                labelText: 'Host / IP or MagicDNS name',
+              ),
+            ),
+            const Gap(AppSpace.sm),
+            TextField(
+              controller: port,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Port'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final h = host.text.trim();
+    final p = int.tryParse(port.text.trim()) ?? 0;
+    final n = name.text.trim().isEmpty ? h : name.text.trim();
+    if (h.isEmpty || p <= 0 || p > 65535) return;
+    await scope.saved.update(d.id, name: n, host: h, port: p);
+  }
+
   /// Pick files and send them to a saved device (real transfer).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
@@ -446,6 +499,8 @@ class HomeScreen extends StatelessWidget {
                                 device: saved[i],
                                 onTap: () => _sendToSaved(context, saved[i]),
                                 onShare: () => _shareSaved(context, saved[i]),
+                                onEdit: () =>
+                                    _editSavedDevice(context, saved[i]),
                                 onRemove: () => state.saved.remove(saved[i].id),
                               ),
                             ),
@@ -586,11 +641,13 @@ class _SavedDeviceCard extends StatelessWidget {
   final SavedDevice device;
   final VoidCallback onTap;
   final VoidCallback onShare;
+  final VoidCallback onEdit;
   final VoidCallback onRemove;
   const _SavedDeviceCard({
     required this.device,
     required this.onTap,
     required this.onShare,
+    required this.onEdit,
     required this.onRemove,
   });
 
@@ -641,15 +698,36 @@ class _SavedDeviceCard extends StatelessWidget {
                   ],
                 ),
               ),
-              IconButton(
-                tooltip: 'Share via QR',
-                icon: const Icon(Icons.qr_code_2_rounded),
-                onPressed: onShare,
-              ),
-              IconButton(
-                tooltip: 'Remove',
-                icon: const Icon(Icons.delete_outline_rounded),
-                onPressed: onRemove,
+              PopupMenuButton<String>(
+                tooltip: 'Device actions',
+                onSelected: (v) => switch (v) {
+                  'share' => onShare(),
+                  'edit' => onEdit(),
+                  _ => onRemove(),
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'share',
+                    child: ListTile(
+                      leading: Icon(Icons.qr_code_2_rounded),
+                      title: Text('Share via QR'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'edit',
+                    child: ListTile(
+                      leading: Icon(Icons.edit_rounded),
+                      title: Text('Edit'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'remove',
+                    child: ListTile(
+                      leading: Icon(Icons.delete_outline_rounded),
+                      title: Text('Remove'),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
