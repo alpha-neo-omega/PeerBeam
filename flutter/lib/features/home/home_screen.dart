@@ -76,6 +76,16 @@ class HomeScreen extends StatelessWidget {
     await sendTextToDevice(context, txt);
   }
 
+  /// Pick a folder (desktop) and stage it for sending.
+  Future<void> _pickFolder(BuildContext context) async {
+    final staging = AppScope.of(context).staging;
+    final folder = await pickFolderToStage();
+    if (folder == null || !context.mounted) return;
+    if (staging.add([folder]) > 0 && context.mounted) {
+      showStagedFilesSheet(context, staging);
+    }
+  }
+
   /// Pick files with the native picker and open the staged sheet. Works on
   /// desktop and Android (file_selector copies picks to app storage there).
   Future<void> _pickFiles(BuildContext context) async {
@@ -328,18 +338,36 @@ class HomeScreen extends StatelessWidget {
                             const Gap(AppSpace.sm),
                             Row(
                               children: [
+                                // Desktop: folder send (no camera anyway).
+                                // Mobile: QR scan.
                                 Expanded(
-                                  child: FilledButton.tonalIcon(
-                                    onPressed: () => _scanQr(context),
-                                    style: FilledButton.styleFrom(
-                                      minimumSize: const Size.fromHeight(48),
-                                    ),
-                                    icon: const Icon(
-                                      Icons.qr_code_scanner_rounded,
-                                      size: AppIcons.sm,
-                                    ),
-                                    label: const Text('Scan QR'),
-                                  ),
+                                  child: isDesktop
+                                      ? FilledButton.tonalIcon(
+                                          onPressed: () => _pickFolder(context),
+                                          style: FilledButton.styleFrom(
+                                            minimumSize: const Size.fromHeight(
+                                              48,
+                                            ),
+                                          ),
+                                          icon: const Icon(
+                                            Icons.folder_copy_rounded,
+                                            size: AppIcons.sm,
+                                          ),
+                                          label: const Text('Send folder'),
+                                        )
+                                      : FilledButton.tonalIcon(
+                                          onPressed: () => _scanQr(context),
+                                          style: FilledButton.styleFrom(
+                                            minimumSize: const Size.fromHeight(
+                                              48,
+                                            ),
+                                          ),
+                                          icon: const Icon(
+                                            Icons.qr_code_scanner_rounded,
+                                            size: AppIcons.sm,
+                                          ),
+                                          label: const Text('Scan QR'),
+                                        ),
                                 ),
                                 const Gap(AppSpace.sm),
                                 Expanded(

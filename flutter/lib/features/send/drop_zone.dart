@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:cross_file/cross_file.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
@@ -34,15 +36,20 @@ class _DropZoneState extends State<DropZone> {
     setState(() => _active = false);
     final staged = <StagedFile>[];
     for (final XFile file in detail.files) {
+      // Folders drop too — flag them so the send splits file vs folder.
+      final isDir = FileSystemEntity.isDirectorySync(file.path);
       int size = 0;
-      try {
-        size = await file.length(); // metadata only; no read
-      } catch (_) {}
+      if (!isDir) {
+        try {
+          size = await file.length(); // metadata only; no read
+        } catch (_) {}
+      }
       staged.add(
         StagedFile(
           path: file.path,
           name: file.name.isNotEmpty ? file.name : _basename(file.path),
           size: size,
+          isDirectory: isDir,
         ),
       );
     }

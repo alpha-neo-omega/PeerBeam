@@ -29,13 +29,18 @@ Future<void> _send(BuildContext context, StagingStore staging) async {
   final picked = await showDevicePicker(context);
   if (picked == null || !context.mounted) return;
 
-  final paths = staging.items.map((f) => f.path).toList();
+  final items = staging.items;
+  final files = items.where((f) => !f.isDirectory).map((f) => f.path).toList();
+  final folders = items.where((f) => f.isDirectory).map((f) => f.path).toList();
   try {
-    await scope.transfer.send(picked.target, paths);
+    if (files.isNotEmpty) await scope.transfer.send(picked.target, files);
+    for (final folder in folders) {
+      await scope.transfer.sendFolder(picked.target, folder);
+    }
     staging.clear();
     if (context.mounted) {
       Navigator.pop(context); // close the staged sheet
-      snack('Sending ${paths.length} to ${picked.name}');
+      snack('Sending ${items.length} to ${picked.name}');
     }
   } catch (e) {
     if (context.mounted) snack(friendlyError(e));
@@ -119,7 +124,11 @@ class _StagedSheet extends StatelessWidget {
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                           ),
-                          subtitle: Text(formatBytes(items[i].size)),
+                          subtitle: Text(
+                            items[i].isDirectory
+                                ? 'Folder'
+                                : formatBytes(items[i].size),
+                          ),
                           trailing: IconButton(
                             icon: const Icon(Icons.close_rounded),
                             tooltip: 'Remove ${items[i].name}',

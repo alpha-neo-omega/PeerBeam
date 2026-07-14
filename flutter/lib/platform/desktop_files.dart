@@ -37,6 +37,19 @@ Future<List<StagedFile>> pickFilesToStage() async {
 /// the selected absolute path, or null if cancelled.
 Future<String?> pickSaveDirectory() => getDirectoryPath();
 
+/// Pick a folder to send (desktop). Returns it as a staged directory entry,
+/// or null if cancelled.
+Future<StagedFile?> pickFolderToStage() async {
+  final dir = await getDirectoryPath();
+  if (dir == null || dir.isEmpty) return null;
+  return StagedFile(
+    path: dir,
+    name: _basename(dir),
+    size: 0,
+    isDirectory: true,
+  );
+}
+
 String _basename(String path) {
   final norm = path.replaceAll('\\', '/');
   final i = norm.lastIndexOf('/');

@@ -57,6 +57,11 @@ class TransferRepository extends ChangeNotifier {
     await _api?.sendFile(peer, paths);
   }
 
+  /// Send a whole folder to a peer (engine walks it and streams entries).
+  Future<void> sendFolder(PeerTarget peer, String path) async {
+    await _api?.sendFolder(peer, path);
+  }
+
   void _onEvent(BridgeEvent e) {
     if (e is! TransferEvent) return;
     final id = e.transferId;
