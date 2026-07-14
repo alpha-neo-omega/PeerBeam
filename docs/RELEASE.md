@@ -32,3 +32,44 @@ use `android/key.properties.example` as a template.
 Config reads certs/keys from env/secrets. Without them, builds still produce
 **unsigned/test** artifacts (Linux tar.gz, unsigned MSIX, un-notarized DMG,
 debug-signed APK) — usable for testing, not for distribution.
+
+## Signing a macOS build locally
+`scripts/package-macos.sh` does codesign → DMG → notarize → staple. Run it on a
+Mac with three env vars set. Requires an **Apple Developer Program** membership.
+
+One-time setup:
+
+1. Create a **Developer ID Application** certificate (Xcode → Settings →
+   Accounts → Manage Certificates → +, or developer.apple.com → Certificates).
+   Find its identity string and your Team ID:
+   ```
+   security find-identity -v -p codesigning
+   # → "Developer ID Application: Your Name (TEAMID)"
+   ```
+2. Store notarization credentials in the keychain under a name you choose:
+   ```
+   xcrun notarytool store-credentials "peerbeam-notary" \
+     --apple-id "you@example.com" --team-id "TEAMID" \
+     --password "APP-SPECIFIC-PASSWORD"   # appleid.apple.com → App-Specific Passwords
+   ```
+
+Build:
+```
+brew install create-dmg                # optional (nicer DMG; falls back to hdiutil)
+export PB_SIGN_ID="Developer ID Application: Your Name (TEAMID)"
+export PB_TEAM_ID="TEAMID"
+export PB_NOTARY_PROFILE="peerbeam-notary"
+bash scripts/package-macos.sh          # → dist/PeerBeam-<version>.dmg
+```
+
+Verify, then upload the DMG to the GitHub release:
+```
+codesign --verify --deep --strict --verbose=2 dist/PeerBeam-*.dmg
+xcrun stapler validate dist/PeerBeam-*.dmg
+spctl -a -t open --context context:primary-signature -v dist/PeerBeam-*.dmg
+```
+
+> CI (`release.yml`) does **not** sign macOS yet: a fresh runner has no cert in
+> its keychain and no notary profile. Automating it requires importing a
+> base64 `.p12` cert into a temp keychain and recreating the notary profile
+> from App Store Connect API-key secrets. Until then, sign locally as above.
