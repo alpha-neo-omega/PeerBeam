@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -111,6 +113,14 @@ class _QrScanScreenState extends State<_QrScanScreen> {
     formats: const [BarcodeFormat.qrCode],
   );
   bool _handled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // With a self-managed controller, mobile_scanner does not auto-start the
+    // camera — we must start it (this also triggers the permission prompt).
+    unawaited(_controller.start());
+  }
 
   @override
   void dispose() {
