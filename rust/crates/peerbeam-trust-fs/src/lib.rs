@@ -66,6 +66,26 @@ impl FsTrust {
     }
 }
 
+impl FsTrust {
+    /// All pinned records, newest trust first (for management UIs).
+    pub fn list(&self) -> Vec<TrustRecord> {
+        let mut records: Vec<TrustRecord> = self.cache.lock().unwrap().values().cloned().collect();
+        records.sort_by(|a, b| b.trusted_at.cmp(&a.trusted_at));
+        records
+    }
+
+    /// Revoke a pin. Returns whether the device was pinned. The next
+    /// connection from it will need to be trusted again (fresh TOFU).
+    pub fn remove(&self, device: &DeviceId) -> Result<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        let existed = cache.remove(&device.0).is_some();
+        if existed {
+            self.persist(&cache)?;
+        }
+        Ok(existed)
+    }
+}
+
 /// A temp path next to `path`, unique per process and per call, so concurrent
 /// writers never share a temp file.
 fn unique_tmp(path: &Path) -> PathBuf {
@@ -179,5 +199,24 @@ mod tests {
                 .fingerprint,
             "new"
         );
+    }
+
+    #[test]
+    fn list_and_remove_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        store.record(record("dev-a", "fp-a")).unwrap();
+        store.record(record("dev-b", "fp-b")).unwrap();
+        assert_eq!(store.list().len(), 2);
+
+        assert!(store.remove(&DeviceId::from("dev-a")).unwrap());
+        assert!(!store.remove(&DeviceId::from("dev-a")).unwrap(), "gone");
+        assert_eq!(store.list().len(), 1);
+
+        // Removal survives a reopen (persisted).
+        let reopened = FsTrust::open(&path).unwrap();
+        assert!(!reopened.is_trusted(&DeviceId::from("dev-a")));
+        assert!(reopened.is_trusted(&DeviceId::from("dev-b")));
     }
 }

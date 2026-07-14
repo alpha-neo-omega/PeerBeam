@@ -43,6 +43,12 @@ abstract class PeerBeamApi {
 
   Future<List<TransferSnapshot>> activeTransfers();
   Future<List<HistoryEntry>> history();
+
+  /// Pinned (trusted) devices, newest first.
+  Future<List<TrustedDevice>> trustList();
+
+  /// Revoke a pinned device. Returns whether it was pinned.
+  Future<bool> trustRemove(String id);
 }
 
 /// Real, FFI-backed implementation.
@@ -168,6 +174,18 @@ class PeerBeam implements PeerBeamApi {
   Future<List<TransferSnapshot>> activeTransfers() async {
     final data = _data(_req().active());
     return _list(data['transfers']).map(TransferSnapshot.fromJson).toList();
+  }
+
+  @override
+  Future<List<TrustedDevice>> trustList() async {
+    final data = _data(_req().trustList());
+    return _list(data['devices']).map(TrustedDevice.fromJson).toList();
+  }
+
+  @override
+  Future<bool> trustRemove(String id) async {
+    final data = _data(_req().trustRemove(jsonEncode({'id': id})));
+    return data['removed'] == true;
   }
 
   @override

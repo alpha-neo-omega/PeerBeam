@@ -179,3 +179,26 @@ class PeerTarget {
     'port': port,
   };
 }
+
+/// A pinned (trusted) peer, as recorded by the engine's TOFU store.
+class TrustedDevice {
+  final String id;
+  final String name;
+  final String fingerprint;
+  final DateTime trustedAt;
+
+  const TrustedDevice({
+    required this.id,
+    required this.name,
+    required this.fingerprint,
+    required this.trustedAt,
+  });
+
+  factory TrustedDevice.fromJson(Map<String, dynamic> j) => TrustedDevice(
+    id: j['id'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    fingerprint: j['fingerprint'] as String? ?? '',
+    trustedAt:
+        DateTime.tryParse(j['trusted_at'] as String? ?? '') ?? DateTime.now(),
+  );
+}

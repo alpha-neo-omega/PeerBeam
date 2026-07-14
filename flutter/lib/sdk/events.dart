@@ -45,6 +45,8 @@ sealed class BridgeEvent {
         );
       case 'history_updated':
         return const HistoryUpdated();
+      case 'trust_changed':
+        return const TrustChanged();
       default:
         return null;
     }
@@ -122,4 +124,8 @@ class TransferEvent extends BridgeEvent {
 
 class HistoryUpdated extends BridgeEvent {
   const HistoryUpdated();
+}
+
+class TrustChanged extends BridgeEvent {
+  const TrustChanged();
 }

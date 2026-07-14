@@ -5,6 +5,7 @@ import '../../app/theme.dart';
 import '../../platform/bridge.dart';
 import '../../platform/desktop_files.dart';
 import '../../platform/services.dart';
+import '../../sdk/models.dart' show TrustedDevice;
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
 
@@ -135,6 +136,53 @@ class SettingsScreen extends StatelessWidget {
               ),
               const Gap(AppSpace.md),
 
+              const _GroupLabel('Trusted devices'),
+              AnimatedBuilder(
+                animation: state.trust,
+                builder: (context, _) {
+                  final pins = state.trust.items;
+                  if (pins.isEmpty) {
+                    return const Card(
+                      child: ListTile(
+                        leading: Icon(Icons.verified_user_outlined),
+                        title: Text('No trusted devices yet'),
+                        subtitle: Text(
+                          'Devices you approve are pinned here by their key '
+                          'fingerprint.',
+                        ),
+                      ),
+                    );
+                  }
+                  return Card(
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < pins.length; i++) ...[
+                          if (i > 0) const Divider(height: 1),
+                          ListTile(
+                            leading: const Icon(Icons.verified_user_rounded),
+                            title: Text(
+                              pins[i].name.isEmpty ? pins[i].id : pins[i].name,
+                            ),
+                            subtitle: Text(
+                              _shortFingerprint(pins[i].fingerprint),
+                              style: const TextStyle(
+                                fontFeatures: [FontFeature.tabularFigures()],
+                              ),
+                            ),
+                            trailing: IconButton(
+                              tooltip: 'Revoke trust',
+                              icon: const Icon(Icons.link_off_rounded),
+                              onPressed: () => _confirmRevoke(context, pins[i]),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                },
+              ),
+              const Gap(AppSpace.md),
+
               // Android-only background/battery controls.
               if (_isAndroid) ...[
                 const _GroupLabel('Background (Android)'),
@@ -215,6 +263,43 @@ class SettingsScreen extends StatelessWidget {
     if (result != null && result.isNotEmpty) {
       state.settings.setDeviceName(result);
     }
+  }
+
+  /// Confirm before revoking a pin — the next connection re-prompts (TOFU).
+  Future<void> _confirmRevoke(BuildContext context, TrustedDevice d) async {
+    final state = AppScope.of(context);
+    final name = d.name.isEmpty ? d.id : d.name;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Revoke $name?'),
+        content: const Text(
+          'The device will need your approval again the next time it '
+          'connects.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Revoke'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await state.trust.remove(d.id);
+  }
+
+  /// First 16 hex chars of the fingerprint, grouped for readability.
+  static String _shortFingerprint(String fp) {
+    final head = fp.length > 16 ? fp.substring(0, 16) : fp;
+    final groups = <String>[];
+    for (var i = 0; i < head.length; i += 4) {
+      groups.add(head.substring(i, (i + 4).clamp(0, head.length)));
+    }
+    return groups.join(' ');
   }
 
   /// Choose the save directory with the native directory picker (desktop).

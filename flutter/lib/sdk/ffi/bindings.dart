@@ -53,6 +53,8 @@ class Bindings {
   final _RetDart _active;
   final _ArgRetDart _get;
   final _RetDart _history;
+  final _RetDart _trustList;
+  final _ArgRetDart _trustRemove;
 
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
@@ -79,7 +81,11 @@ class Bindings {
       _reject = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_reject'),
       _active = lib.lookupFunction<_RetC, _RetDart>('pb_transfers_active'),
       _get = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_get'),
-      _history = lib.lookupFunction<_RetC, _RetDart>('pb_history_get');
+      _history = lib.lookupFunction<_RetC, _RetDart>('pb_history_get'),
+      _trustList = lib.lookupFunction<_RetC, _RetDart>('pb_trust_list'),
+      _trustRemove = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_trust_remove',
+      );
 
   /// Load the native library. `overridePath` forces a specific file (tests).
   static Bindings load({String? overridePath}) {
@@ -115,6 +121,8 @@ class Bindings {
   String active() => _consume(_active());
   String get(String json) => _withArg(json, _get);
   String history() => _consume(_history());
+  String trustList() => _consume(_trustList());
+  String trustRemove(String json) => _withArg(json, _trustRemove);
 
   /// Read a Rust-owned string and free it (ownership contract).
   String _consume(Pointer<Utf8> ptr) {

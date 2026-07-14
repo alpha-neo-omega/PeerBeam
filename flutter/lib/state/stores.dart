@@ -4,6 +4,7 @@ import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
 import '../data/saved_devices_repository.dart';
 import '../data/transfer_repository.dart';
+import '../data/trust_repository.dart';
 import '../sdk/peerbeam.dart';
 import 'staging.dart';
 
@@ -81,6 +82,7 @@ class AppState {
   final TransferRepository transfer;
   final HistoryRepository history;
   final SavedDevicesRepository saved;
+  final TrustRepository trust;
   final SettingsStore settings;
   final StagingStore staging;
 
@@ -90,6 +92,7 @@ class AppState {
     required this.transfer,
     required this.history,
     required this.saved,
+    required this.trust,
     required this.settings,
     required this.staging,
   });
@@ -102,6 +105,7 @@ class AppState {
       transfer: TransferRepository(api: api),
       history: HistoryRepository(api: api),
       saved: SavedDevicesRepository()..load(),
+      trust: TrustRepository(api: api),
       settings: SettingsStore(
         deviceName: 'This Device',
         saveDirectory: '~/Downloads/PeerBeam',
@@ -116,6 +120,7 @@ class AppState {
   void dispose() {
     theme.dispose();
     device.dispose();
+    trust.dispose();
     transfer.dispose();
     history.dispose();
     saved.dispose();

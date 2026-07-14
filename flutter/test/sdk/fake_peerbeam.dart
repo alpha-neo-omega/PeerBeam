@@ -58,6 +58,18 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<TransferSnapshot>> activeTransfers() async => const [];
+    List<TrustedDevice> trusted = [];
+
+  @override
+  Future<List<TrustedDevice>> trustList() async => trusted;
+
+  @override
+  Future<bool> trustRemove(String id) async {
+    final before = trusted.length;
+    trusted.removeWhere((t) => t.id == id);
+    return trusted.length != before;
+  }
+
   @override
   Future<List<HistoryEntry>> history() async {
     calls.add('history');

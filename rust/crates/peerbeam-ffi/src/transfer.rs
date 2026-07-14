@@ -674,6 +674,38 @@ impl Manager {
         Ok(json!({ "history": *self.history.lock().unwrap() }))
     }
 
+    /// Pinned (trusted) devices, newest first.
+    pub fn trust_list(&self) -> Op {
+        let devices: Vec<Value> = self
+            .trust
+            .list()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.device.0,
+                    "name": r.name,
+                    "fingerprint": r.fingerprint,
+                    "trusted_at": r.trusted_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        Ok(json!({ "devices": devices }))
+    }
+
+    /// Revoke a pinned device; its next connection needs fresh approval.
+    pub fn trust_remove(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let removed = self
+            .trust
+            .remove(&DeviceId::from(id))
+            .map_err(from_domain)?;
+        events::event(&json!({ "type": "trust_changed", "timestamp": timestamp() }));
+        Ok(json!({ "removed": removed }))
+    }
+
     // ── receiving ───────────────────────────────────────────────
 
     /// Accept inbound connections forever; one task per incoming transfer.

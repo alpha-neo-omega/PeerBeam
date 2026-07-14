@@ -260,6 +260,23 @@ pub extern "C" fn pb_history_get() -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.history())()))
 }
 
+// ── trust ───────────────────────────────────────────────────────
+
+/// Pinned (trusted) devices: `{devices:[{id,name,fingerprint,trusted_at}]}`.
+#[no_mangle]
+pub extern "C" fn pb_trust_list() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.trust_list())()))
+}
+
+/// Revoke a pinned device: `{id}` → `{removed}`. Emits `trust_changed`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_remove(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.trust_remove(&read_json(json)?))()))
+}
+
 // ── clipboard ───────────────────────────────────────────────────
 
 /// Current clipboard item, or `{item:null}`.
