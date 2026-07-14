@@ -13,8 +13,17 @@
 - **Empty directories** are not recreated by folder transfer (walk is
   file-only). Symlinks are skipped (not followed).
 - **Ephemeral identity** (CLI/FFI) → TOFU re-pins each run; persistent identity
-  is a follow-up.
+  is a follow-up. A relaunch that reuses the same `app-<pid>` id but a fresh key
+  is rejected as a key change — clear the peer's pin or use a fresh id.
 - **Windows file permissions** not restricted (`0600` is Unix-only).
+- **Tailscale discovery on Android** — tailnet peers do **not** appear in the
+  Android app. Discovery needs `tailscaled`'s LocalAPI socket or the `tailscale`
+  CLI; a sandboxed Android app can reach neither (the system Tailscale app is
+  isolated, and there is no cross-app tailnet API). Desktop/CLI Tailscale
+  discovery is unaffected. **Workaround:** use **Send to address** (Home → ⛃)
+  with the peer's `100.x` Tailscale IP or MagicDNS name — the engine routes it
+  over the tunnel. Real auto-discovery would require embedding Tailscale
+  (`tsnet`/`libtailscale`), a large future item.
 
 ## Unverified in this environment (need hardware/toolchain)
 - Real LAN/WAN throughput between two machines; Ethernet / USB-tethering /
