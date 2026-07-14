@@ -22,7 +22,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    final sendFiles = find.text('Send Files');
+    final sendFiles = find.text('Send files');
     expect(sendFiles, findsOneWidget);
     await tester.tap(sendFiles);
     await tester.pump();

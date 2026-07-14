@@ -20,7 +20,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
 
     expect(find.text('PeerBeam'), findsWidgets);
-    expect(find.text('Nearby Devices'), findsOneWidget);
+    expect(find.text('Nearby devices'), findsOneWidget);
 
     // Emit a live discovery event; the UI must react (no polling, no seed).
     fake.emit(

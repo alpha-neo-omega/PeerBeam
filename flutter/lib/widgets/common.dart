@@ -42,12 +42,7 @@ class SectionHeader extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: Text(
-              title,
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
+            child: Text(title, style: Theme.of(context).textTheme.titleMedium),
           ),
           ?trailing,
         ],
@@ -56,37 +51,7 @@ class SectionHeader extends StatelessWidget {
   }
 }
 
-/// Wraps a tappable surface with a subtle hover lift on pointer devices
-/// (desktop/web); a no-op on touch. Reduced-motion collapses the animation.
-class HoverScale extends StatefulWidget {
-  final Widget child;
-  final double scale;
-  const HoverScale({super.key, required this.child, this.scale = 1.02});
-
-  @override
-  State<HoverScale> createState() => _HoverScaleState();
-}
-
-class _HoverScaleState extends State<HoverScale> {
-  bool _hover = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final on = _hover && AppMotion.enabled(context);
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hover = true),
-      onExit: (_) => setState(() => _hover = false),
-      child: AnimatedScale(
-        scale: on ? widget.scale : 1,
-        duration: AppMotion.fast,
-        curve: AppMotion.curve,
-        child: widget.child,
-      ),
-    );
-  }
-}
-
-/// A friendly, lightly-animated empty state.
+/// A quiet empty state: icon, one-line title, short hint.
 class EmptyState extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -110,39 +75,18 @@ class EmptyState extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TweenAnimationBuilder<double>(
-              tween: Tween(
-                begin: AppMotion.enabled(context) ? 0.85 : 1.0,
-                end: 1,
-              ),
-              duration: AppMotion.duration(context, AppMotion.slow),
-              curve: AppMotion.emphasized,
-              builder: (context, scale, child) =>
-                  Transform.scale(scale: scale, child: child),
-              child: Container(
-                width: 96,
-                height: 96,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      scheme.primaryContainer.withValues(alpha: 0.7),
-                      scheme.surfaceContainerHighest,
-                    ],
-                  ),
-                ),
-                child: Icon(icon, size: AppIcons.xl, color: scheme.primary),
+            CircleAvatar(
+              radius: 32,
+              backgroundColor: scheme.surfaceContainerHighest,
+              child: Icon(
+                icon,
+                size: AppIcons.lg,
+                color: scheme.onSurfaceVariant,
               ),
             ),
-            const Gap(AppSpace.lg),
-            Text(
-              title,
-              textAlign: TextAlign.center,
-              style: text.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const Gap(AppSpace.xs),
+            const Gap(AppSpace.md),
+            Text(title, textAlign: TextAlign.center, style: text.titleMedium),
+            const Gap(AppSpace.xxs),
             Text(
               message,
               textAlign: TextAlign.center,

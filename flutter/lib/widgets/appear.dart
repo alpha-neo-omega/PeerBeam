@@ -3,50 +3,34 @@ import 'package:flutter/material.dart';
 import '../app/theme.dart';
 
 /// Subtle entrance animation: fade + rise, staggered by [index] so lists
-/// cascade in. Uses implicit animations only (nothing to dispose).
-class Appear extends StatefulWidget {
+/// cascade in. Timer-free: the stagger is an [Interval] inside one implicit
+/// animation, so nothing is left pending when the tree is disposed.
+class Appear extends StatelessWidget {
   final int index;
   final Widget child;
   const Appear({super.key, this.index = 0, required this.child});
 
   @override
-  State<Appear> createState() => _AppearState();
-}
-
-class _AppearState extends State<Appear> {
-  bool _visible = false;
-
-  bool _scheduled = false;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    if (_scheduled) return;
-    _scheduled = true;
-    // Reduced motion: appear immediately, no stagger.
-    if (!AppMotion.enabled(context)) {
-      _visible = true;
-      return;
-    }
-    final delay = Duration(milliseconds: (widget.index * 45).clamp(0, 320));
-    Future.delayed(delay, () {
-      if (mounted) setState(() => _visible = true);
-    });
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final d = AppMotion.duration(context, AppMotion.medium);
-    return AnimatedSlide(
-      offset: _visible ? Offset.zero : const Offset(0, 0.06),
-      duration: d,
-      curve: AppMotion.curve,
-      child: AnimatedOpacity(
-        opacity: _visible ? 1 : 0,
-        duration: d,
-        curve: AppMotion.curve,
-        child: widget.child,
+    // Reduced motion: appear immediately, no stagger.
+    if (!AppMotion.enabled(context)) return child;
+
+    final delayMs = (index * 45).clamp(0, 320);
+    final totalMs = delayMs + AppMotion.medium.inMilliseconds;
+    final curve = Interval(delayMs / totalMs, 1, curve: AppMotion.curve);
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: totalMs),
+      curve: curve,
+      builder: (context, t, child) => Opacity(
+        opacity: t,
+        child: Transform.translate(
+          offset: Offset(0, (1 - t) * 8),
+          child: child,
+        ),
       ),
+      child: child,
     );
   }
 }

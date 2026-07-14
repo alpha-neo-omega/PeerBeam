@@ -155,7 +155,7 @@ class _StagedSheet extends StatelessWidget {
                         child: Text(
                           items.isEmpty
                               ? ''
-                              : '${items.length} item(s) · ${formatBytes(staging.totalBytes)}',
+                              : '${items.length} ${items.length == 1 ? 'item' : 'items'} · ${formatBytes(staging.totalBytes)}',
                           style: text.bodyMedium?.copyWith(
                             color: scheme.onSurfaceVariant,
                           ),

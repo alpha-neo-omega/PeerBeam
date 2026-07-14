@@ -104,22 +104,12 @@ class _TransferCard extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  Container(
-                    width: 44,
-                    height: 44,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          accent.withValues(alpha: 0.22),
-                          accent.withValues(alpha: 0.10),
-                        ],
-                      ),
-                      borderRadius: BorderRadius.circular(AppRadius.md),
-                    ),
+                  CircleAvatar(
+                    radius: 22,
+                    backgroundColor: accent.withValues(alpha: 0.15),
                     child: Icon(
                       sending ? Icons.upload_rounded : Icons.download_rounded,
+                      size: AppIcons.md,
                       color: accent,
                     ),
                   ),
@@ -146,7 +136,13 @@ class _TransferCard extends StatelessWidget {
                               ),
                             ),
                             const Gap(AppSpace.xs),
-                            _StatusChip(state: transfer.state, accent: accent),
+                            Text(
+                              transfer.state.label,
+                              style: text.labelSmall?.copyWith(
+                                color: accent,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
                           ],
                         ),
                       ],
@@ -221,31 +217,6 @@ class _TransferCard extends StatelessWidget {
               ),
             ],
           ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Compact status pill tinted by the transfer state.
-class _StatusChip extends StatelessWidget {
-  final TransferState state;
-  final Color accent;
-  const _StatusChip({required this.state, required this.accent});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpace.xs, vertical: 2),
-      decoration: BoxDecoration(
-        color: accent.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(AppRadius.sm),
-      ),
-      child: Text(
-        state.label,
-        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: accent,
-          fontWeight: FontWeight.w700,
         ),
       ),
     );

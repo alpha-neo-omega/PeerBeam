@@ -13,7 +13,6 @@ import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
-import '../../widgets/quick_action.dart';
 import '../qr/qr.dart';
 import '../send/staged_sheet.dart';
 
@@ -361,7 +360,7 @@ class HomeScreen extends StatelessWidget {
                       ),
                     ),
 
-                    // Quick actions.
+                    // Actions: one hero (send) and two secondary.
                     SliverPadding(
                       padding: const EdgeInsets.fromLTRB(
                         AppSpace.md,
@@ -370,33 +369,48 @@ class HomeScreen extends StatelessWidget {
                         AppSpace.xs,
                       ),
                       sliver: SliverToBoxAdapter(
-                        child: Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Expanded(
-                              child: QuickAction(
-                                icon: Icons.folder_open_rounded,
-                                label: 'Send Files',
-                                color: scheme.primary,
-                                onTap: () => _pickFiles(context),
+                            FilledButton.icon(
+                              onPressed: () => _pickFiles(context),
+                              style: FilledButton.styleFrom(
+                                minimumSize: const Size.fromHeight(56),
                               ),
+                              icon: const Icon(Icons.folder_open_rounded),
+                              label: const Text('Send files'),
                             ),
                             const Gap(AppSpace.sm),
-                            Expanded(
-                              child: QuickAction(
-                                icon: Icons.qr_code_2_rounded,
-                                label: 'QR Pair',
-                                color: scheme.tertiary,
-                                onTap: () => _scanQr(context),
-                              ),
-                            ),
-                            const Gap(AppSpace.sm),
-                            Expanded(
-                              child: QuickAction(
-                                icon: Icons.content_paste_rounded,
-                                label: 'Clipboard',
-                                color: scheme.secondary,
-                                onTap: () => _sendClipboard(context),
-                              ),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: FilledButton.tonalIcon(
+                                    onPressed: () => _scanQr(context),
+                                    style: FilledButton.styleFrom(
+                                      minimumSize: const Size.fromHeight(48),
+                                    ),
+                                    icon: const Icon(
+                                      Icons.qr_code_scanner_rounded,
+                                      size: AppIcons.sm,
+                                    ),
+                                    label: const Text('Scan QR'),
+                                  ),
+                                ),
+                                const Gap(AppSpace.sm),
+                                Expanded(
+                                  child: FilledButton.tonalIcon(
+                                    onPressed: () => _sendClipboard(context),
+                                    style: FilledButton.styleFrom(
+                                      minimumSize: const Size.fromHeight(48),
+                                    ),
+                                    icon: const Icon(
+                                      Icons.content_paste_rounded,
+                                      size: AppIcons.sm,
+                                    ),
+                                    label: const Text('Send clipboard'),
+                                  ),
+                                ),
+                              ],
                             ),
                           ],
                         ),
@@ -414,8 +428,8 @@ class HomeScreen extends StatelessWidget {
                       ),
                       sliver: SliverToBoxAdapter(
                         child: SectionHeader(
-                          title: 'Saved Devices',
-                          trailing: IconButton.filledTonal(
+                          title: 'Saved devices',
+                          trailing: IconButton(
                             tooltip: 'Add device by address',
                             icon: const Icon(Icons.add_rounded),
                             onPressed: () => _addSavedDevice(context),
@@ -433,9 +447,7 @@ class HomeScreen extends StatelessWidget {
                             AppSpace.xs,
                           ),
                           child: Text(
-                            'Add a device by its address (IP or MagicDNS name) '
-                            'to reach it without discovery — e.g. a Tailscale '
-                            'peer or a headless server.',
+                            'Reach servers and Tailscale peers by address.',
                             style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: scheme.onSurfaceVariant),
                           ),
@@ -454,7 +466,9 @@ class HomeScreen extends StatelessWidget {
                           itemBuilder: (context, i) => Appear(
                             index: i,
                             child: Padding(
-                              padding: const EdgeInsets.only(bottom: AppSpace.xs),
+                              padding: const EdgeInsets.only(
+                                bottom: AppSpace.xs,
+                              ),
                               child: _SavedDeviceCard(
                                 device: saved[i],
                                 onTap: () => _sendToSaved(context, saved[i]),
@@ -476,7 +490,7 @@ class HomeScreen extends StatelessWidget {
                       ),
                       sliver: SliverToBoxAdapter(
                         child: SectionHeader(
-                          title: 'Nearby Devices',
+                          title: 'Nearby devices',
                           trailing: FilledButton.tonalIcon(
                             onPressed: state.device.toggleScan,
                             style: FilledButton.styleFrom(
@@ -496,7 +510,9 @@ class HomeScreen extends StatelessWidget {
                                 size: AppIcons.sm,
                               ),
                             ),
-                            label: Text(state.device.scanning ? 'Stop' : 'Scan'),
+                            label: Text(
+                              state.device.scanning ? 'Stop' : 'Scan',
+                            ),
                           ),
                         ),
                       ),
@@ -507,10 +523,8 @@ class HomeScreen extends StatelessWidget {
                         hasScrollBody: false,
                         child: EmptyState(
                           icon: Icons.devices_other_rounded,
-                          title: 'No devices yet',
-                          message:
-                              'Make sure other devices are on the same network '
-                              'or tailnet, then scan.',
+                          title: 'No nearby devices',
+                          message: 'Devices on your network appear here.',
                         ),
                       )
                     else
@@ -525,9 +539,8 @@ class HomeScreen extends StatelessWidget {
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
                                 maxCrossAxisExtent: 420,
-                                // Tight fit for the tile's content — no dead
-                                // space below the reach chips.
-                                mainAxisExtent: 118,
+                                // Tight fit for the two-line tile.
+                                mainAxisExtent: 76,
                                 crossAxisSpacing: AppSpace.sm,
                                 mainAxisSpacing: AppSpace.sm,
                               ),
@@ -612,71 +625,60 @@ class _SavedDeviceCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
-    return HoverScale(
-      child: Card(
-        child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(AppSpace.sm),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    // Match DeviceTile's avatar so all device rows read alike.
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        scheme.primaryContainer,
-                        scheme.primaryContainer.withValues(alpha: 0.6),
-                      ],
+    return Card(
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppSpace.sm,
+            vertical: AppSpace.xs,
+          ),
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 22,
+                backgroundColor: scheme.primaryContainer,
+                child: Icon(
+                  Icons.dns_rounded,
+                  size: AppIcons.md,
+                  color: scheme.onPrimaryContainer,
+                ),
+              ),
+              const Gap(AppSpace.sm),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      device.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.titleSmall,
                     ),
-                    borderRadius: BorderRadius.circular(AppRadius.md),
-                  ),
-                  child: Icon(
-                    Icons.dns_rounded,
-                    color: scheme.onPrimaryContainer,
-                  ),
-                ),
-                const Gap(AppSpace.sm),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        device.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: text.titleSmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
+                    const Gap(2),
+                    Text(
+                      '${device.host}:${device.port}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
                       ),
-                      const Gap(AppSpace.xxs),
-                      Text(
-                        '${device.host}:${device.port}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: text.bodySmall?.copyWith(
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-                IconButton(
-                  tooltip: 'Share via QR',
-                  icon: const Icon(Icons.qr_code_2_rounded),
-                  onPressed: onShare,
-                ),
-                IconButton(
-                  tooltip: 'Remove',
-                  icon: const Icon(Icons.delete_outline_rounded),
-                  onPressed: onRemove,
-                ),
-              ],
-            ),
+              ),
+              IconButton(
+                tooltip: 'Share via QR',
+                icon: const Icon(Icons.qr_code_2_rounded),
+                onPressed: onShare,
+              ),
+              IconButton(
+                tooltip: 'Remove',
+                icon: const Icon(Icons.delete_outline_rounded),
+                onPressed: onRemove,
+              ),
+            ],
           ),
         ),
       ),

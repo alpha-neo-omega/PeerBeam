@@ -21,14 +21,10 @@ class PeerBeamMark extends StatelessWidget {
         label: 'PeerBeam',
         child: DecoratedBox(
           decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [scheme.primary, scheme.tertiary],
-            ),
+            color: scheme.primary,
             borderRadius: BorderRadius.circular(size * 0.3),
           ),
-          child: CustomPaint(painter: _BeamPainter(color: Colors.white)),
+          child: CustomPaint(painter: _BeamPainter(color: scheme.onPrimary)),
         ),
       ),
     );

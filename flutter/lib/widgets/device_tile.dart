@@ -2,11 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../app/theme.dart';
 import '../state/models.dart';
-import 'common.dart';
 import 'status_dot.dart';
 
-/// A device row: identity, live status, reach capabilities, and a send action.
-/// Semantics are merged into one meaningful announcement.
+/// A device row: identity, live status, and a send action. Reach and latency
+/// fold into the subtitle. Semantics merge into one announcement.
 class DeviceTile extends StatelessWidget {
   final Device device;
   final VoidCallback? onSend;
@@ -23,66 +22,63 @@ class DeviceTile extends StatelessWidget {
         '${device.name}, ${device.kind.label}, ${device.online ? 'online' : 'offline'}, '
         'reachable via $reachText$latency';
 
+    final subtitle = device.online
+        ? [
+            device.kind.label,
+            ...device.reach.map((r) => r.label),
+            if (device.latencyMs != null) '${device.latencyMs} ms',
+          ].join(' · ')
+        : '${device.kind.label} · Offline';
+
     return MergeSemantics(
       child: Semantics(
         button: true,
         label: semantic,
-        child: HoverScale(
-          child: Card(
-            child: InkWell(
-              onTap: device.online ? onSend : null,
-              // Offline devices are dimmed so reachable ones stand out.
-              child: Opacity(
-                opacity: device.online ? 1 : 0.5,
-                child: Padding(
-                  padding: const EdgeInsets.all(AppSpace.sm),
-                  child: Row(
-                    children: [
-                      _Avatar(device: device),
-                      const Gap(AppSpace.sm),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              device.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: text.titleSmall?.copyWith(
-                                fontWeight: FontWeight.w600,
-                              ),
+        child: Card(
+          child: InkWell(
+            onTap: device.online ? onSend : null,
+            // Offline devices are dimmed so reachable ones stand out.
+            child: Opacity(
+              opacity: device.online ? 1 : 0.5,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpace.sm,
+                  vertical: AppSpace.sm,
+                ),
+                child: Row(
+                  children: [
+                    _Avatar(device: device),
+                    const Gap(AppSpace.sm),
+                    Expanded(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            device.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: text.titleSmall,
+                          ),
+                          const Gap(2),
+                          Text(
+                            subtitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: text.bodySmall?.copyWith(
+                              color: scheme.onSurfaceVariant,
                             ),
-                            const Gap(AppSpace.xxs),
-                            Text(
-                              device.online
-                                  ? '${device.kind.label} · Online$latency'
-                                  : '${device.kind.label} · Offline',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: text.bodySmall?.copyWith(
-                                color: scheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const Gap(AppSpace.xs),
-                            Wrap(
-                              spacing: AppSpace.xs,
-                              runSpacing: AppSpace.xxs,
-                              children: [
-                                for (final r in device.reach)
-                                  _ReachChip(reach: r),
-                              ],
-                            ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
-                      const Gap(AppSpace.xs),
-                      IconButton.filledTonal(
-                        onPressed: device.online ? onSend : null,
-                        icon: const Icon(Icons.send_rounded),
-                        tooltip: 'Send to ${device.name}',
-                      ),
-                    ],
-                  ),
+                    ),
+                    const Gap(AppSpace.xs),
+                    IconButton.filledTonal(
+                      onPressed: device.online ? onSend : null,
+                      icon: const Icon(Icons.send_rounded, size: AppIcons.sm),
+                      tooltip: 'Send to ${device.name}',
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -101,68 +97,30 @@ class _Avatar extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return SizedBox(
-      width: 52,
-      height: 52,
+      width: 44,
+      height: 44,
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          Container(
-            width: 52,
-            height: 52,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  scheme.primaryContainer,
-                  scheme.primaryContainer.withValues(alpha: 0.6),
-                ],
-              ),
-              borderRadius: BorderRadius.circular(AppRadius.lg),
+          CircleAvatar(
+            radius: 22,
+            backgroundColor: scheme.primaryContainer,
+            child: Icon(
+              device.kind.icon,
+              size: AppIcons.md,
+              color: scheme.onPrimaryContainer,
             ),
-            child: Icon(device.kind.icon, color: scheme.onPrimaryContainer),
           ),
           Positioned(
-            right: -4,
-            bottom: -4,
+            right: -2,
+            bottom: -2,
             child: Container(
               padding: const EdgeInsets.all(2),
               decoration: BoxDecoration(
                 color: scheme.surface,
                 shape: BoxShape.circle,
               ),
-              child: StatusDot(online: device.online),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ReachChip extends StatelessWidget {
-  final Reach reach;
-  const _ReachChip({required this.reach});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpace.xs, vertical: 3),
-      decoration: BoxDecoration(
-        color: scheme.secondaryContainer,
-        borderRadius: BorderRadius.circular(AppRadius.sm),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(reach.icon, size: 12, color: scheme.onSecondaryContainer),
-          const Gap(AppSpace.xxs),
-          Text(
-            reach.label,
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: scheme.onSecondaryContainer,
-              fontWeight: FontWeight.w600,
+              child: StatusDot(online: device.online, size: 8),
             ),
           ),
         ],

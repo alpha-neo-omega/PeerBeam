@@ -102,26 +102,16 @@ class _HistoryRow extends StatelessWidget {
           padding: const EdgeInsets.all(AppSpace.sm),
           child: Row(
             children: [
-              Container(
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      statusColor.withValues(alpha: 0.22),
-                      statusColor.withValues(alpha: 0.10),
-                    ],
-                  ),
-                  borderRadius: BorderRadius.circular(AppRadius.md),
-                ),
+              CircleAvatar(
+                radius: 22,
+                backgroundColor: statusColor.withValues(alpha: 0.15),
                 child: Icon(
                   item.success
                       ? (sending
                             ? Icons.upload_rounded
                             : Icons.download_rounded)
                       : Icons.error_outline_rounded,
+                  size: AppIcons.md,
                   color: statusColor,
                 ),
               ),
