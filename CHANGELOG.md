@@ -6,7 +6,41 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Receiver-confirmed progress**: the sender's bar tracks the receiver's real
+  byte count over a dedicated QUIC back-channel (falls back to bytes-sent for
+  old/non-QUIC peers); 64 KiB chunks + throttled emission for smooth movement,
+  a 1s heartbeat so speed/ETA keep ticking, and speed/ETA shown on transfer
+  cards.
+- **Android file picking**: the Send files action uses the native picker on
+  every platform (no more desktop-only gate).
+- **Unified destination picker**: one sheet with Nearby + Saved sections for
+  file and clipboard sends — saved (Tailscale/by-address) peers are now
+  reachable from the phone flows.
+- **Send clipboard**: sends the OS text clipboard to a chosen device as a
+  `.txt`.
+- **QR**: share a saved device as a `peerbeam://` QR; scan one to add it
+  (mobile camera).
+- **Device search** on Home.
+
+### Changed
+- **UI overhaul**: stock Material 3 look (baseline seed), Google Sans Flex
+  typeface (bundled, OFL), flat tonal components, one hero send action,
+  sentence-case terse copy, seamless app bars, responsive polish. See
+  `docs/UI_REDESIGN_REPORT.md`.
+- **Nearby devices show live peers only** — offline devices disappear instead
+  of lingering greyed out; the Scan/Stop control reflects the engine state
+  from boot.
+
+### Fixed
+- Cancelling a transfer takes effect immediately, even mid-chunk on a slow
+  link.
+- Dialing an unreachable peer fails in ~8s with a clear error instead of a
+  silent 30s hang.
+- A dead peer no longer stays "online" via a stale mDNS cache claim after an
+  unclean exit; stopping discovery marks all devices offline instead of
+  freezing stale presence.
+- Fast transfers always emit a final progress update (fixed a flaky FFI test).
 
 ## [0.2.1] - 2026-07-14 — Beta
 

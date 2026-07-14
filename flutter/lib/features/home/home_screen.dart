@@ -169,7 +169,7 @@ class HomeScreen extends StatelessWidget {
                 PeerTarget(name: h, addresses: [h], port: p),
               );
             },
-            child: const Text('Choose file'),
+            child: const Text('Next'),
           ),
         ],
       ),
