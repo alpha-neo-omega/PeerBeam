@@ -46,6 +46,11 @@ fn conn_err(e: impl std::fmt::Display) -> DomainError {
     DomainError::Connection(format!("quic: {e}"))
 }
 
+/// How long an outbound handshake may take before the dial fails. Long enough
+/// for a slow Tailscale DERP round-trip, short enough that a dead peer fails
+/// while the user is still watching.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Shared QUIC transport tuning: a keep-alive so idle connections (e.g. a
 /// paused transfer) stay up, and a generous idle timeout before giving up.
 fn transport_config() -> Arc<quinn::TransportConfig> {
@@ -151,11 +156,12 @@ impl TransferProvider for QuicTransport {
         let addr = resolve_addr(&route.address, route.port)?;
         tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
 
-        let conn = self
-            .client
-            .connect(addr, SERVER_NAME)
-            .map_err(conn_err)?
+        // Bound the handshake: an unreachable peer must fail fast (the user is
+        // watching), not after the 30s idle timeout.
+        let connecting = self.client.connect(addr, SERVER_NAME).map_err(conn_err)?;
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
+            .map_err(|_| conn_err("connect timed out — peer unreachable"))?
             .map_err(conn_err)?;
         // Client opens the bidirectional stream; it materialises on the server
         // once the first frame (transfer Meta) is written by the engine.

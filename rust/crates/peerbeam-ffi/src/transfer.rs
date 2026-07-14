@@ -879,8 +879,10 @@ where
             }
             // Sender still waiting on the peer channel (within grace): don't show
             // bytes-sent yet — it would jump to the QUIC send-window size. Track
-            // stats silently; the in_task or the grace fallback will emit.
-            if peer_expected && !pump_fell_back.load(Ordering::SeqCst) {
+            // stats silently; the in_task or the grace fallback will emit. The
+            // final update always passes: a completed protocol means the bytes
+            // are confirmed, and a fast transfer may finish inside the grace.
+            if peer_expected && !pump_fell_back.load(Ordering::SeqCst) && !is_final {
                 stats
                     .lock()
                     .unwrap()
