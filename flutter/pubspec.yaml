@@ -112,6 +112,20 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Google Sans Flex (OFL, from Google Fonts) — bundled for offline use;
+  # no runtime font fetching. See assets/fonts/README.md.
+  fonts:
+    - family: Google Sans Flex
+      fonts:
+        - asset: assets/fonts/GoogleSansFlex-400.ttf
+          weight: 400
+        - asset: assets/fonts/GoogleSansFlex-500.ttf
+          weight: 500
+        - asset: assets/fonts/GoogleSansFlex-600.ttf
+          weight: 600
+        - asset: assets/fonts/GoogleSansFlex-700.ttf
+          weight: 700
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

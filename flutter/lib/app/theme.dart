@@ -19,7 +19,13 @@ class PeerBeamTheme {
       seedColor: seed,
       brightness: brightness,
     );
-    final base = ThemeData(colorScheme: scheme, useMaterial3: true);
+    final base = ThemeData(
+      colorScheme: scheme,
+      useMaterial3: true,
+      // Bundled Google Sans Flex (see pubspec fonts) — the Google Sans look,
+      // shipped offline under the OFL.
+      fontFamily: 'Google Sans Flex',
+    );
     final text = _typography(base.textTheme);
 
     return base.copyWith(
