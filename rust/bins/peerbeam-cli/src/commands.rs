@@ -996,26 +996,48 @@ async fn serve_loop(
         let storage_ref = &storage;
         let (ptx, mut prx) = mpsc::unbounded_channel();
         let ctrl = TransferControl::new();
+        // Report our received-byte progress back to the sender so its bar shows
+        // our real progress (over a slow link it otherwise sits at 100%).
+        let progress_sink = link.progress_sink();
         let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
         let recv = async move {
             let r = receive_file(&mut secure, storage_ref, dir, &ctrl, &ptx).await;
             drop(ptx);
             r
         };
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel::<u64>();
+        let report = async move {
+            let Some(mut sink) = progress_sink else {
+                while rep_rx.recv().await.is_some() {} // drain
+                return;
+            };
+            let mut last = u64::MAX;
+            while let Some(b) = rep_rx.recv().await {
+                if b == last {
+                    continue;
+                }
+                last = b;
+                if sink.report(b).await.is_err() {
+                    break; // sender gone / doesn't accept — stop quietly
+                }
+            }
+        };
         // Human progress bar (created lazily once the total size is known).
         let pump = async move {
             let mut bar: Option<crate::output::Bar> = None;
             while let Some(p) = prx.recv().await {
+                let _ = rep_tx.send(p.transferred_bytes);
                 if !ctx.json {
                     let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
                     b.update(p.transferred_bytes);
                 }
             }
+            drop(rep_tx);
             if let Some(b) = bar {
                 b.finish();
             }
         };
-        let (r, _) = tokio::join!(recv, pump);
+        let (r, _, _) = tokio::join!(recv, pump, report);
         match r {
             Ok(rcv) => {
                 if ctx.json {
