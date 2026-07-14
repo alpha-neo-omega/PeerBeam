@@ -50,3 +50,41 @@ jobs:
         run: flutter analyze
       - name: Test
         run: flutter test
+
+  # Cross-platform proof: the Rust engine and the desktop app must build (and
+  # the engine's tests pass) on every desktop OS — macOS on both Apple Silicon
+  # (macos-latest) and Intel (macos-13), plus Windows.
+  desktop:
+    name: Desktop (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            build: flutter build windows --release
+          - os: macos-latest
+            label: macos-arm64
+            build: flutter build macos --release
+          - os: macos-13
+            label: macos-x64
+            build: flutter build macos --release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Rust tests
+        working-directory: rust
+        run: cargo test --workspace
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Flutter pub get
+        working-directory: flutter
+        run: flutter pub get
+      - name: Build desktop app
+        working-directory: flutter
+        run: ${{ matrix.build }}
