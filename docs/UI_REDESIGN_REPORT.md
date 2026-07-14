@@ -83,6 +83,38 @@ New shared `HoverScale` gives tappable cards a subtle desktop hover lift.
 - **Dark-first, light-equal** — all styling derives from the seed's tonal
   scheme, so both brightnesses stay consistent.
 
+## Follow-up features (approved after the redesign)
+
+These go beyond pure styling; each was explicitly requested and approved.
+
+| Feature | Implementation | Dependency |
+| --- | --- | --- |
+| **Transfer speed / ETA** | Engine already emits `current_speed` / `eta_secs`; threaded through the `Transfer` view model (`speedBps` / `etaSecs` + `formatSpeed` / `formatEta`). Card shows `done/total · speed · ETA` while transferring. | none |
+| **Device search** | Home search action opens a native `SearchDelegate` over discovered devices (filter by name, tap to send). | none |
+| **Brand mark** | Custom-painted `PeerBeamMark` (concentric beam waves on the brand gradient) + `BrandLockup`, replacing the bolt glyph in the nav rail. | none (CustomPainter) |
+| **QR share / scan** | `qr_flutter` renders a saved device's address (`peerbeam://add?name&host&port`); `mobile_scanner` scans a peer's QR to save it. Scan is mobile-only (camera); desktop gets a hint. | `qr_flutter`, `mobile_scanner` |
+| **Send clipboard** | Dart reads the OS text clipboard, writes a temp `.txt`, sends it to a chosen online device via the existing transfer path. | none |
+
+### Deviation from CLAUDE.md — QR
+
+CLAUDE.md's UX section states "No QR codes. No pairing codes." QR share/scan was
+added on explicit user approval. It is scoped as **address sharing** (encode/scan
+a device's `host:port`), not cryptographic pairing, and does not replace
+zero-config discovery — it is an optional convenience for reaching by-address
+peers (Tailscale / headless). Recorded here so the deviation is intentional and
+traceable.
+
+### Known limitations
+
+- **Clipboard** and **QR scan → save** target picking currently use
+  *discovered-online* devices (LAN/mDNS). Over Tailscale-only / cellular there
+  are no discovered devices, so clipboard send needs the peer on the same
+  network. (QR *scan* saves a by-address device, which then works over
+  Tailscale for file send.) Extending the clipboard picker to saved-by-address
+  devices is a candidate follow-up.
+- **Rust cannot access the Android clipboard**; the OS clipboard read stays in
+  Dart by necessity.
+
 ## Remaining visual improvements (future, not done here)
 
 - Container-transform transition from a device/saved card into its send flow.
