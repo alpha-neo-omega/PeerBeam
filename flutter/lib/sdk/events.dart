@@ -103,6 +103,9 @@ class TransferEvent extends BridgeEvent {
 
   String? get file => payload['file'] as String?;
   String? get peer => payload['peer'] as String?;
+
+  /// Local path of the completed item (on `transfer_completed`).
+  String? get path => payload['path'] as String?;
   bool get incoming => payload['incoming'] == true;
 
   ({String code, String message})? get error {

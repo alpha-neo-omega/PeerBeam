@@ -520,14 +520,23 @@ impl Manager {
     /// Success path: emit completed + append history.
     fn record(&self, id: &str, success: bool, event: &str, extra: Value) {
         self.set_status(id, "completed");
-        let stats = self
-            .active
-            .lock()
-            .unwrap()
-            .get(id)
-            .map(|a| a.stats.lock().unwrap().dto())
-            .unwrap_or(json!({}));
-        let mut payload = json!({ "stats": stats });
+        let (stats, file, path) = {
+            let active = self.active.lock().unwrap();
+            match active.get(id) {
+                Some(a) => {
+                    let file = a.file.lock().unwrap().clone();
+                    let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
+                        std::path::Path::new(&self.save_dir)
+                            .join(&file)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    (a.stats.lock().unwrap().dto(), file, path)
+                }
+                None => (json!({}), String::new(), String::new()),
+            }
+        };
+        let mut payload = json!({ "stats": stats, "file": file, "path": path });
         if let Value::Object(m) = &mut payload {
             if let Value::Object(e) = extra {
                 m.extend(e);

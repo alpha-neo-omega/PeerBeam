@@ -27,6 +27,16 @@ class TransferRepository extends ChangeNotifier {
   /// User-facing failure messages (surface as a snackbar/notification).
   Stream<String> get errors => _errors.stream;
 
+  /// A clipboard payload arrived (a received `peerbeam-clipboard-*.txt`):
+  /// the saved file's path and the sending peer. The UI offers to copy it.
+  Stream<({String path, String peer})> get clipboardReceived =>
+      _clipboards.stream;
+  final StreamController<({String path, String peer})> _clipboards =
+      StreamController.broadcast();
+
+  /// Matches the wire-name convention the sender uses for clipboard sends.
+  static final _clipboardName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
+
   int get activeCount => _byId.values
       .where(
         (t) =>
@@ -82,6 +92,13 @@ class TransferRepository extends ChangeNotifier {
       case 'transfer_resumed':
         _update(id, state: TransferState.transferring);
       case 'transfer_completed':
+        final done = _byId[id];
+        if (done != null &&
+            done.direction == TransferDirection.receiving &&
+            _clipboardName.hasMatch(done.fileName) &&
+            (e.path?.isNotEmpty ?? false)) {
+          _clipboards.add((path: e.path!, peer: done.peerName));
+        }
         _update(id, state: TransferState.completed);
         _byId.remove(id);
       case 'transfer_cancelled':
@@ -129,6 +146,7 @@ class TransferRepository extends ChangeNotifier {
   void dispose() {
     _sub?.cancel();
     _errors.close();
+    _clipboards.close();
     super.dispose();
   }
 }
