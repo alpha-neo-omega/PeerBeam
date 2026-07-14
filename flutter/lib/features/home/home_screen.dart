@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/theme.dart';
 import '../../data/saved_devices_repository.dart' show SavedDevice;
@@ -11,6 +14,7 @@ import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../../widgets/quick_action.dart';
+import '../qr/qr.dart';
 import '../send/staged_sheet.dart';
 
 /// Home — nearby devices, quick actions. Listens to the device store only, so
@@ -33,6 +37,100 @@ class HomeScreen extends StatelessWidget {
     );
     if (device == null || !context.mounted) return;
     await _sendTo(context, device);
+  }
+
+  /// Scan a peer's QR (mobile only — needs a camera) and save it as a device.
+  Future<void> _scanQr(BuildContext context) async {
+    final scope = AppScope.of(context);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+    if (isDesktop) {
+      snack('QR scanning needs a camera — use a mobile device');
+      return;
+    }
+    final payload = await openQrScanner(context);
+    if (payload == null || !context.mounted) return;
+    await scope.saved.add(
+      name: payload.name,
+      host: payload.host,
+      port: payload.port,
+    );
+    snack('Added ${payload.name}');
+  }
+
+  /// Share a saved device's address as a QR for another phone to scan.
+  Future<void> _shareSaved(BuildContext context, SavedDevice d) {
+    return showShareQrDialog(
+      context,
+      QrPayload(name: d.name, host: d.host, port: d.port),
+    );
+  }
+
+  /// Send the current text clipboard to a chosen online device (as a .txt).
+  Future<void> _sendClipboard(BuildContext context) async {
+    final scope = AppScope.of(context);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final txt = data?.text?.trim() ?? '';
+    if (txt.isEmpty) {
+      snack('Clipboard is empty');
+      return;
+    }
+    if (!context.mounted) return;
+    final device = await _pickOnlineDevice(context);
+    if (device == null || !context.mounted) return;
+    final target = scope.device.peerTarget(device.id);
+    if (target == null) {
+      snack('${device.name} is not reachable right now');
+      return;
+    }
+    try {
+      final file = File(
+        '${Directory.systemTemp.path}/peerbeam-clipboard-'
+        '${DateTime.now().millisecondsSinceEpoch}.txt',
+      );
+      await file.writeAsString(txt);
+      await scope.transfer.send(target, [file.path]);
+      if (context.mounted) snack('Sending clipboard to ${device.name}');
+    } catch (e) {
+      if (context.mounted) snack(friendlyError(e));
+    }
+  }
+
+  /// Bottom-sheet picker of currently-online devices (snacks if none).
+  Future<Device?> _pickOnlineDevice(BuildContext context) {
+    final online = AppScope.of(
+      context,
+    ).device.devices.where((d) => d.online).toList();
+    if (online.isEmpty) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('No devices online to send to')),
+        );
+      return Future.value(null);
+    }
+    return showModalBottomSheet<Device>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final d in online)
+              ListTile(
+                leading: Icon(d.kind.icon),
+                title: Text(d.name),
+                onTap: () => Navigator.pop(ctx, d),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// Pick files with the native picker (desktop) and open the staged sheet.
@@ -278,7 +376,7 @@ class HomeScreen extends StatelessWidget {
                                 icon: Icons.qr_code_2_rounded,
                                 label: 'QR Pair',
                                 color: scheme.tertiary,
-                                onTap: () => _todo(context, 'QR pair'),
+                                onTap: () => _scanQr(context),
                               ),
                             ),
                             const Gap(AppSpace.sm),
@@ -287,7 +385,7 @@ class HomeScreen extends StatelessWidget {
                                 icon: Icons.content_paste_rounded,
                                 label: 'Clipboard',
                                 color: scheme.secondary,
-                                onTap: () => _todo(context, 'Clipboard'),
+                                onTap: () => _sendClipboard(context),
                               ),
                             ),
                           ],
@@ -350,6 +448,7 @@ class HomeScreen extends StatelessWidget {
                               child: _SavedDeviceCard(
                                 device: saved[i],
                                 onTap: () => _sendToSaved(context, saved[i]),
+                                onShare: () => _shareSaved(context, saved[i]),
                                 onRemove: () => state.saved.remove(saved[i].id),
                               ),
                             ),
@@ -439,10 +538,12 @@ class HomeScreen extends StatelessWidget {
 class _SavedDeviceCard extends StatelessWidget {
   final SavedDevice device;
   final VoidCallback onTap;
+  final VoidCallback onShare;
   final VoidCallback onRemove;
   const _SavedDeviceCard({
     required this.device,
     required this.onTap,
+    required this.onShare,
     required this.onRemove,
   });
 
@@ -501,6 +602,11 @@ class _SavedDeviceCard extends StatelessWidget {
                       ),
                     ],
                   ),
+                ),
+                IconButton(
+                  tooltip: 'Share via QR',
+                  icon: const Icon(Icons.qr_code_2_rounded),
+                  onPressed: onShare,
                 ),
                 IconButton(
                   tooltip: 'Remove',
