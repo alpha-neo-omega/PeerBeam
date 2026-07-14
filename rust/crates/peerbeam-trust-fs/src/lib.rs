@@ -70,7 +70,7 @@ impl FsTrust {
     /// All pinned records, newest trust first (for management UIs).
     pub fn list(&self) -> Vec<TrustRecord> {
         let mut records: Vec<TrustRecord> = self.cache.lock().unwrap().values().cloned().collect();
-        records.sort_by(|a, b| b.trusted_at.cmp(&a.trusted_at));
+        records.sort_by_key(|r| std::cmp::Reverse(r.trusted_at));
         records
     }
 

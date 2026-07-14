@@ -46,8 +46,27 @@ fn defaults() -> Value {
 /// Overlay the persisted settings onto an engine config (device identity,
 /// save directory, auto-accept). Called during init so what the user set in
 /// the UI actually reaches the engine, not just the JSON file.
+///
+/// Only an actually-persisted document applies — a missing settings file must
+/// never override the caller's explicit config with defaults. First run seeds
+/// the document from the effective config so `get` reflects reality.
 pub fn overlay(config: &mut EngineConfig) {
-    let s = load();
+    let Some(s) = load_persisted() else {
+        let mut seeded = defaults();
+        if let Value::Object(m) = &mut seeded {
+            m.insert("device_name".into(), json!(config.device.name));
+            m.insert(
+                "transfer_directory".into(),
+                json!(config.storage.save_directory),
+            );
+            m.insert(
+                "auto_accept".into(),
+                json!(config.device.auto_accept_trusted),
+            );
+        }
+        let _ = save(&seeded);
+        return;
+    };
     if let Some(name) = s.get("device_name").and_then(|v| v.as_str()) {
         if !name.trim().is_empty() {
             config.device.name = name.trim().to_string();
@@ -68,10 +87,14 @@ fn path() -> Option<PathBuf> {
 }
 
 fn load() -> Value {
-    match path().and_then(|p| std::fs::read(p).ok()) {
-        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| defaults()),
-        None => defaults(),
-    }
+    load_persisted().unwrap_or_else(defaults)
+}
+
+/// The persisted document only — None when no settings file exists yet (or it
+/// is unreadable). Callers that must not fall back to defaults use this.
+fn load_persisted() -> Option<Value> {
+    let bytes = path().and_then(|p| std::fs::read(p).ok())?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn save(value: &Value) -> Result<(), (Code, String)> {
