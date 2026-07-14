@@ -34,11 +34,14 @@ class PeerBeamTheme {
       splashFactory: InkSparkle.splashFactory,
       visualDensity: VisualDensity.standard,
 
+      // Seamless app bar: no scrolled-under tint band — the header always
+      // matches the page surface, so screens read as one continuous sheet.
       appBarTheme: AppBarTheme(
         centerTitle: false,
-        scrolledUnderElevation: 3,
+        elevation: 0,
+        scrolledUnderElevation: 0,
         backgroundColor: scheme.surface,
-        surfaceTintColor: scheme.surfaceTint,
+        surfaceTintColor: Colors.transparent,
         foregroundColor: scheme.onSurface,
         titleTextStyle: text.titleLarge?.copyWith(fontWeight: FontWeight.w700),
       ),

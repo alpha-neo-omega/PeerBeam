@@ -334,7 +334,7 @@ class HomeScreen extends StatelessWidget {
                 final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [
-                    SliverAppBar.large(
+                    SliverAppBar.medium(
                       title: const Text('PeerBeam'),
                       actions: [
                         IconButton(
@@ -479,6 +479,13 @@ class HomeScreen extends StatelessWidget {
                           title: 'Nearby Devices',
                           trailing: FilledButton.tonalIcon(
                             onPressed: state.device.toggleScan,
+                            style: FilledButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: AppSpace.md,
+                                vertical: AppSpace.xs,
+                              ),
+                            ),
                             icon: AnimatedSwitcher(
                               duration: AppMotion.fast,
                               child: Icon(
@@ -518,7 +525,9 @@ class HomeScreen extends StatelessWidget {
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
                                 maxCrossAxisExtent: 420,
-                                mainAxisExtent: 140,
+                                // Tight fit for the tile's content — no dead
+                                // space below the reach chips.
+                                mainAxisExtent: 118,
                                 crossAxisSpacing: AppSpace.sm,
                                 mainAxisSpacing: AppSpace.sm,
                               ),
@@ -615,19 +624,20 @@ class _SavedDeviceCard extends StatelessWidget {
                   width: 48,
                   height: 48,
                   decoration: BoxDecoration(
+                    // Match DeviceTile's avatar so all device rows read alike.
                     gradient: LinearGradient(
                       begin: Alignment.topLeft,
                       end: Alignment.bottomRight,
                       colors: [
-                        scheme.secondaryContainer,
-                        scheme.secondaryContainer.withValues(alpha: 0.6),
+                        scheme.primaryContainer,
+                        scheme.primaryContainer.withValues(alpha: 0.6),
                       ],
                     ),
                     borderRadius: BorderRadius.circular(AppRadius.md),
                   ),
                   child: Icon(
                     Icons.dns_rounded,
-                    color: scheme.onSecondaryContainer,
+                    color: scheme.onPrimaryContainer,
                   ),
                 ),
                 const Gap(AppSpace.sm),

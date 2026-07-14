@@ -33,7 +33,7 @@ class QuickAction extends StatelessWidget {
               onTap: onTap,
               child: Padding(
                 padding: const EdgeInsets.symmetric(
-                  vertical: AppSpace.xl,
+                  vertical: AppSpace.lg,
                   horizontal: AppSpace.sm,
                 ),
                 child: Column(
