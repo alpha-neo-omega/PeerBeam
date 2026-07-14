@@ -786,6 +786,12 @@ where
     // Sender: true once the peer's back-channel has started driving the bar, so
     // the pump stops emitting bytes-sent to avoid a fight.
     let peer_driving = Arc::new(AtomicBool::new(false));
+    // Sender with a peer channel: suppress the bytes-sent bar until either the
+    // peer starts reporting (realtime receiver progress from ~0) or the grace
+    // expires with no peer (then fall back to bytes-sent). Prevents the initial
+    // jump to the QUIC send-window size that bytes-sent would show.
+    let peer_expected = progress_in.is_some();
+    let fell_back = Arc::new(AtomicBool::new(false));
 
     // Receiver → sender mirroring runs on its own task fed by a channel, so a
     // slow/absent/old peer can never stall the pump or the transfer.
@@ -811,6 +817,7 @@ where
     let in_id = id.clone();
     let in_stats = stats.clone();
     let in_driving = peer_driving.clone();
+    let in_fell_back = fell_back.clone();
     let in_task = async move {
         let Some(mut source) = progress_in else {
             return;
@@ -823,7 +830,12 @@ where
                 emit_peer(&in_id, &in_stats, first);
                 first
             }
-            _ => return,
+            // No peer report within the grace: let the pump fall back to
+            // bytes-sent from here on.
+            _ => {
+                in_fell_back.store(true, Ordering::SeqCst);
+                return;
+            }
         };
         // Emit on each report (up to ~20/s), and at least once a second as a
         // heartbeat so speed/ETA keep ticking and the bar never looks frozen on
@@ -846,6 +858,7 @@ where
 
     let pump_id = id.clone();
     let pump_driving = peer_driving.clone();
+    let pump_fell_back = fell_back.clone();
     let pump = async move {
         // Throttle emission/mirroring to ~20/s so small chunks stay smooth
         // without flooding the event bridge; always let the final update through.
@@ -862,6 +875,16 @@ where
             // the in_task emits the peer's real count.
             if pump_driving.load(Ordering::SeqCst) {
                 stats.lock().unwrap().total = p.total_bytes;
+                continue;
+            }
+            // Sender still waiting on the peer channel (within grace): don't show
+            // bytes-sent yet — it would jump to the QUIC send-window size. Track
+            // stats silently; the in_task or the grace fallback will emit.
+            if peer_expected && !pump_fell_back.load(Ordering::SeqCst) {
+                stats
+                    .lock()
+                    .unwrap()
+                    .update(p.transferred_bytes, p.total_bytes);
                 continue;
             }
             if !due {
