@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
@@ -29,6 +30,11 @@ class AndroidIntegration {
   /// Latest text handed to us via a share intent (e.g. to send as clipboard).
   final ValueNotifier<String?> sharedText = ValueNotifier<String?>(null);
 
+  /// Fires after shared files land in staging, so the UI can surface the
+  /// staged sheet.
+  Stream<void> get filesShared => _filesShared.stream;
+  final StreamController<void> _filesShared = StreamController.broadcast();
+
   StreamSubscription<Map<String, dynamic>>? _sub;
 
   AndroidIntegration({
@@ -57,14 +63,24 @@ class AndroidIntegration {
             StagedFile(
               path: item.path!,
               name: item.name ?? item.path!,
-              size: 0, // size resolved lazily; intents don't carry it
+              size: _sizeOf(item.path!), // intents don't carry a size
             ),
           );
         case SharedKind.text:
           sharedText.value = item.text;
       }
     }
-    if (files.isNotEmpty) staging.add(files);
+    if (files.isNotEmpty && staging.add(files) > 0) {
+      _filesShared.add(null);
+    }
+  }
+
+  static int _sizeOf(String path) {
+    try {
+      return File(path).lengthSync();
+    } catch (_) {
+      return 0;
+    }
   }
 
   void _onStoreChanged() => unawaited(_syncService());
@@ -76,6 +92,7 @@ class AndroidIntegration {
 
   void dispose() {
     _sub?.cancel();
+    _filesShared.close();
     transfer.removeListener(_onStoreChanged);
     settings.removeListener(_onStoreChanged);
     sharedText.dispose();

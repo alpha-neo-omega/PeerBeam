@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
+import 'features/send/send_text.dart';
+import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
 import 'sdk/peerbeam.dart';
@@ -36,6 +38,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   final _messengerKey = GlobalKey<ScaffoldMessengerState>();
   StreamSubscription<String>? _errSub;
   StreamSubscription<({String path, String peer})>? _clipSub;
+  StreamSubscription<void>? _shareSub;
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
     staging: _state.staging,
@@ -70,8 +73,44 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     // clipboard instead of a buried .txt file.
     _clipSub = _state.transfer.clipboardReceived.listen(_offerClipboardCopy);
 
+    // Shared-in content ("Send to PeerBeam"): files open the staged sheet,
+    // text offers a one-tap send.
+    _shareSub = _android.filesShared.listen((_) => _openStagedSheet());
+    _android.sharedText.addListener(_onSharedText);
+
     // No-op off Android; routes share/receive intents and drives the service.
     _android.start();
+  }
+
+  /// Open the staged-files sheet over the current screen (post-frame so a
+  /// cold-start share waits for the first build).
+  void _openStagedSheet() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final context = rootNavigatorKey.currentContext;
+      if (context == null) return;
+      showStagedFilesSheet(context, _state.staging);
+    });
+  }
+
+  /// Shared text arrived: offer to send it (clipboard wire convention).
+  void _onSharedText() {
+    final text = _android.sharedText.value;
+    if (text == null || text.trim().isEmpty) return;
+    _android.sharedText.value = null; // consume
+    final preview = text.length > 60 ? '${text.substring(0, 60)}…' : text;
+    _messengerKey.currentState?.showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 8),
+        content: Text('Shared text: $preview'),
+        action: SnackBarAction(
+          label: 'Send',
+          onPressed: () {
+            final context = rootNavigatorKey.currentContext;
+            if (context != null) sendTextToDevice(context, text);
+          },
+        ),
+      ),
+    );
   }
 
   /// Read a received clipboard file (small text) and offer to copy it.
@@ -104,6 +143,8 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   void dispose() {
     _errSub?.cancel();
     _clipSub?.cancel();
+    _shareSub?.cancel();
+    _android.sharedText.removeListener(_onSharedText);
     _android.dispose();
     _api.shutdown();
     _state.dispose();

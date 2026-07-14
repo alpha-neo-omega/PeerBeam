@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -14,7 +12,7 @@ import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../qr/qr.dart';
-import '../send/pick_device.dart';
+import '../send/send_text.dart';
 import '../send/staged_sheet.dart';
 
 /// Home — nearby devices, quick actions. Listens to the device store only, so
@@ -63,33 +61,19 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
-  /// Send the current text clipboard to a chosen online device (as a .txt).
+  /// Send the current text clipboard to a chosen device (clipboard wire
+  /// convention — the receiver gets one-tap Copy).
   Future<void> _sendClipboard(BuildContext context) async {
-    final scope = AppScope.of(context);
-    void snack(String m) => ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(m)));
-
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final txt = data?.text?.trim() ?? '';
+    if (!context.mounted) return;
     if (txt.isEmpty) {
-      snack('Clipboard is empty');
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(content: Text('Clipboard is empty')));
       return;
     }
-    if (!context.mounted) return;
-    final picked = await showDevicePicker(context);
-    if (picked == null || !context.mounted) return;
-    try {
-      final file = File(
-        '${Directory.systemTemp.path}/peerbeam-clipboard-'
-        '${DateTime.now().millisecondsSinceEpoch}.txt',
-      );
-      await file.writeAsString(txt);
-      await scope.transfer.send(picked.target, [file.path]);
-      if (context.mounted) snack('Sending clipboard to ${picked.name}');
-    } catch (e) {
-      if (context.mounted) snack(friendlyError(e));
-    }
+    await sendTextToDevice(context, txt);
   }
 
   /// Pick files with the native picker and open the staged sheet. Works on

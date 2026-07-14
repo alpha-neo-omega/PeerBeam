@@ -8,11 +8,16 @@ import '../features/transfers/transfers_screen.dart';
 import 'shell.dart';
 import 'theme.dart';
 
+/// Root navigator key — lets non-widget layers (share-intent handling) open
+/// sheets/dialogs over whatever screen is current.
+final GlobalKey<NavigatorState> rootNavigatorKey = GlobalKey<NavigatorState>();
+
 /// Declarative routing with a **state-preserving** indexed shell: each tab
 /// keeps its state (scroll, animations, subscriptions) across switches, and
 /// every destination is URL-addressable / deep-linkable.
 GoRouter buildRouter() {
   return GoRouter(
+    navigatorKey: rootNavigatorKey,
     initialLocation: '/home',
     routes: [
       StatefulShellRoute.indexedStack(
