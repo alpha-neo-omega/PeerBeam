@@ -142,7 +142,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: docs/RELEASE_NOTES_v0.2.0.md
+          body_path: docs/RELEASE_NOTES_v0.2.1.md
           prerelease: true
           fail_on_unmatched_files: false
           files: |

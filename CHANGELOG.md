@@ -8,6 +8,21 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 _Nothing yet._
 
+## [0.2.1] - 2026-07-14 — Beta
+
+See [Release Notes](docs/RELEASE_NOTES_v0.2.1.md).
+
+### Added
+- The standalone `peerbeam` **CLI now ships in releases** for Linux, macOS
+  (arm64), and Windows, with Linux shell completions. Dedicated `cli-*` CI jobs
+  build them; the release attaches them alongside the Linux app + Android.
+- Local signing how-tos for macOS (Developer ID + notarytool) and Windows
+  (MSIX) in [RELEASE](docs/RELEASE.md); `msix_config.publisher` field.
+
+### Note
+- Signed macOS/Windows desktop apps (DMG/MSIX) are still not attached to
+  releases until host signing secrets are configured.
+
 ## [0.2.0] - 2026-07-14 — Beta
 
 First tagged release. See [Release Notes](docs/RELEASE_NOTES_v0.2.0.md).
