@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -108,25 +106,7 @@ class _QrScanScreen extends StatefulWidget {
 }
 
 class _QrScanScreenState extends State<_QrScanScreen> {
-  final MobileScannerController _controller = MobileScannerController(
-    detectionSpeed: DetectionSpeed.noDuplicates,
-    formats: const [BarcodeFormat.qrCode],
-  );
   bool _handled = false;
-
-  @override
-  void initState() {
-    super.initState();
-    // With a self-managed controller, mobile_scanner does not auto-start the
-    // camera — we must start it (this also triggers the permission prompt).
-    unawaited(_controller.start());
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
 
   void _onDetect(BarcodeCapture capture) {
     if (_handled) return;
@@ -143,21 +123,13 @@ class _QrScanScreenState extends State<_QrScanScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Scan a device QR'),
-        actions: [
-          IconButton(
-            tooltip: 'Toggle torch',
-            icon: const Icon(Icons.flashlight_on_rounded),
-            onPressed: () => _controller.toggleTorch(),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Scan a device QR')),
       body: Stack(
         fit: StackFit.expand,
         children: [
+          // No explicit controller: MobileScanner self-manages start, camera
+          // permission, and lifecycle — the reliable path on Android.
           MobileScanner(
-            controller: _controller,
             onDetect: _onDetect,
             errorBuilder: (context, error) => _ScanError(error: error),
           ),
