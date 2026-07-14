@@ -78,7 +78,7 @@ class HomeScreen extends StatelessWidget {
                 hintText: '100.73.134.21',
               ),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpace.sm),
             TextField(
               controller: port,
               keyboardType: TextInputType.number,
@@ -132,7 +132,7 @@ class HomeScreen extends StatelessWidget {
                 hintText: 'Living-room server',
               ),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpace.sm),
             TextField(
               controller: host,
               decoration: const InputDecoration(
@@ -140,7 +140,7 @@ class HomeScreen extends StatelessWidget {
                 hintText: '100.73.134.21',
               ),
             ),
-            const SizedBox(height: 12),
+            const Gap(AppSpace.sm),
             TextField(
               controller: port,
               keyboardType: TextInputType.number,
@@ -238,12 +238,18 @@ class HomeScreen extends StatelessWidget {
                           tooltip: 'Search devices',
                           onPressed: () => _todo(context, 'Search'),
                         ),
+                        const Gap(AppSpace.xs),
                       ],
                     ),
 
                     // Quick actions.
                     SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpace.md,
+                        0,
+                        AppSpace.md,
+                        AppSpace.xs,
+                      ),
                       sliver: SliverToBoxAdapter(
                         child: Row(
                           children: [
@@ -255,7 +261,7 @@ class HomeScreen extends StatelessWidget {
                                 onTap: () => _pickFiles(context),
                               ),
                             ),
-                            const SizedBox(width: 12),
+                            const Gap(AppSpace.sm),
                             Expanded(
                               child: QuickAction(
                                 icon: Icons.qr_code_2_rounded,
@@ -264,7 +270,7 @@ class HomeScreen extends StatelessWidget {
                                 onTap: () => _todo(context, 'QR pair'),
                               ),
                             ),
-                            const SizedBox(width: 12),
+                            const Gap(AppSpace.sm),
                             Expanded(
                               child: QuickAction(
                                 icon: Icons.content_paste_rounded,
@@ -281,11 +287,16 @@ class HomeScreen extends StatelessWidget {
                     // Saved devices — manual/Tailscale-by-address, always
                     // visible so peers discovery can't surface stay reachable.
                     SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpace.md,
+                        AppSpace.xs,
+                        AppSpace.md,
+                        AppSpace.xxs,
+                      ),
                       sliver: SliverToBoxAdapter(
                         child: SectionHeader(
                           title: 'Saved Devices',
-                          trailing: IconButton(
+                          trailing: IconButton.filledTonal(
                             tooltip: 'Add device by address',
                             icon: const Icon(Icons.add_rounded),
                             onPressed: () => _addSavedDevice(context),
@@ -296,7 +307,12 @@ class HomeScreen extends StatelessWidget {
                     if (saved.isEmpty)
                       SliverToBoxAdapter(
                         child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                          padding: const EdgeInsets.fromLTRB(
+                            AppSpace.md,
+                            0,
+                            AppSpace.md,
+                            AppSpace.xs,
+                          ),
                           child: Text(
                             'Add a device by its address (IP or MagicDNS name) '
                             'to reach it without discovery — e.g. a Tailscale '
@@ -308,34 +324,22 @@ class HomeScreen extends StatelessWidget {
                       )
                     else
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        padding: const EdgeInsets.fromLTRB(
+                          AppSpace.md,
+                          0,
+                          AppSpace.md,
+                          AppSpace.xs,
+                        ),
                         sliver: SliverList.builder(
                           itemCount: saved.length,
                           itemBuilder: (context, i) => Appear(
                             index: i,
                             child: Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Card(
-                                child: ListTile(
-                                  leading: CircleAvatar(
-                                    backgroundColor: scheme.secondaryContainer,
-                                    child: Icon(
-                                      Icons.dns_rounded,
-                                      color: scheme.onSecondaryContainer,
-                                    ),
-                                  ),
-                                  title: Text(saved[i].name),
-                                  subtitle: Text(
-                                    '${saved[i].host}:${saved[i].port}',
-                                  ),
-                                  onTap: () => _sendToSaved(context, saved[i]),
-                                  trailing: IconButton(
-                                    tooltip: 'Remove',
-                                    icon: const Icon(Icons.delete_outline_rounded),
-                                    onPressed: () =>
-                                        state.saved.remove(saved[i].id),
-                                  ),
-                                ),
+                              padding: const EdgeInsets.only(bottom: AppSpace.xs),
+                              child: _SavedDeviceCard(
+                                device: saved[i],
+                                onTap: () => _sendToSaved(context, saved[i]),
+                                onRemove: () => state.saved.remove(saved[i].id),
                               ),
                             ),
                           ),
@@ -344,7 +348,12 @@ class HomeScreen extends StatelessWidget {
 
                     // Section header + scan toggle.
                     SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpace.md,
+                        AppSpace.xs,
+                        AppSpace.md,
+                        AppSpace.xxs,
+                      ),
                       sliver: SliverToBoxAdapter(
                         child: SectionHeader(
                           title: 'Nearby Devices',
@@ -357,12 +366,10 @@ class HomeScreen extends StatelessWidget {
                                     ? Icons.stop_rounded
                                     : Icons.refresh_rounded,
                                 key: ValueKey(state.device.scanning),
-                                size: 18,
+                                size: AppIcons.sm,
                               ),
                             ),
-                            label: Text(
-                              state.device.scanning ? 'Stop' : 'Scan',
-                            ),
+                            label: Text(state.device.scanning ? 'Stop' : 'Scan'),
                           ),
                         ),
                       ),
@@ -381,14 +388,19 @@ class HomeScreen extends StatelessWidget {
                       )
                     else
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+                        padding: const EdgeInsets.fromLTRB(
+                          AppSpace.md,
+                          AppSpace.xxs,
+                          AppSpace.md,
+                          AppSpace.xl,
+                        ),
                         sliver: SliverGrid.builder(
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
                                 maxCrossAxisExtent: 420,
-                                mainAxisExtent: 132,
-                                crossAxisSpacing: 12,
-                                mainAxisSpacing: 12,
+                                mainAxisExtent: 140,
+                                crossAxisSpacing: AppSpace.sm,
+                                mainAxisSpacing: AppSpace.sm,
                               ),
                           itemCount: devices.length,
                           itemBuilder: (context, i) => Appear(
@@ -403,6 +415,88 @@ class HomeScreen extends StatelessWidget {
                   ],
                 );
               },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A saved-device card (by-address peer): gradient avatar, address, send-on-tap,
+/// remove action. Lifts on hover like the other cards.
+class _SavedDeviceCard extends StatelessWidget {
+  final SavedDevice device;
+  final VoidCallback onTap;
+  final VoidCallback onRemove;
+  const _SavedDeviceCard({
+    required this.device,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    return HoverScale(
+      child: Card(
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpace.sm),
+            child: Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        scheme.secondaryContainer,
+                        scheme.secondaryContainer.withValues(alpha: 0.6),
+                      ],
+                    ),
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                  ),
+                  child: Icon(
+                    Icons.dns_rounded,
+                    color: scheme.onSecondaryContainer,
+                  ),
+                ),
+                const Gap(AppSpace.sm),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        device.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: text.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const Gap(AppSpace.xxs),
+                      Text(
+                        '${device.host}:${device.port}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: text.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Remove',
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  onPressed: onRemove,
+                ),
+              ],
             ),
           ),
         ),
