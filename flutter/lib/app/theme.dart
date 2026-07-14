@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 
-/// PeerBeam Material 3 theme — a single seed drives a full, tonal light/dark
-/// palette. Both brightnesses share component shaping so the app reads as one
-/// system regardless of mode.
+/// PeerBeam Material 3 theme — one seed drives a full tonal light/dark palette,
+/// and a single set of design tokens (spacing, radius, elevation, motion) keeps
+/// every screen visually consistent. Both brightnesses share component shaping
+/// so the app reads as one system regardless of mode.
 class PeerBeamTheme {
   PeerBeamTheme._();
 
@@ -18,57 +19,255 @@ class PeerBeamTheme {
       brightness: brightness,
     );
     final base = ThemeData(colorScheme: scheme, useMaterial3: true);
+    final text = _typography(base.textTheme);
 
     return base.copyWith(
       scaffoldBackgroundColor: scheme.surface,
+      textTheme: text,
+      splashFactory: InkSparkle.splashFactory,
+      visualDensity: VisualDensity.standard,
+
       appBarTheme: AppBarTheme(
         centerTitle: false,
-        scrolledUnderElevation: 2,
+        scrolledUnderElevation: 3,
         backgroundColor: scheme.surface,
+        surfaceTintColor: scheme.surfaceTint,
         foregroundColor: scheme.onSurface,
-        titleTextStyle: base.textTheme.titleLarge?.copyWith(
-          fontWeight: FontWeight.w700,
-        ),
+        titleTextStyle: text.titleLarge?.copyWith(fontWeight: FontWeight.w700),
       ),
+
       cardTheme: CardThemeData(
-        elevation: 0,
+        elevation: AppElevation.level0,
         clipBehavior: Clip.antiAlias,
+        margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-          side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.6)),
+          borderRadius: BorderRadius.circular(AppRadius.xl),
+          side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
         ),
         color: scheme.surfaceContainerLow,
       ),
+
       navigationBarTheme: NavigationBarThemeData(
-        elevation: 2,
+        elevation: AppElevation.level2,
+        height: 68,
         backgroundColor: scheme.surfaceContainer,
+        surfaceTintColor: Colors.transparent,
         indicatorShape: const StadiumBorder(),
+        indicatorColor: scheme.secondaryContainer,
         labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
-      ),
-      navigationRailTheme: NavigationRailThemeData(
-        backgroundColor: scheme.surface,
-        indicatorShape: const StadiumBorder(),
-        useIndicator: true,
-      ),
-      filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+        labelTextStyle: WidgetStateProperty.resolveWith(
+          (s) => text.labelMedium?.copyWith(
+            fontWeight: s.contains(WidgetState.selected)
+                ? FontWeight.w700
+                : FontWeight.w500,
           ),
         ),
       ),
-      listTileTheme: const ListTileThemeData(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.all(Radius.circular(16)),
+
+      navigationRailTheme: NavigationRailThemeData(
+        backgroundColor: scheme.surface,
+        indicatorShape: const StadiumBorder(),
+        indicatorColor: scheme.secondaryContainer,
+        useIndicator: true,
+        selectedLabelTextStyle: text.labelMedium?.copyWith(
+          fontWeight: FontWeight.w700,
+          color: scheme.onSurface,
+        ),
+        unselectedLabelTextStyle: text.labelMedium?.copyWith(
+          color: scheme.onSurfaceVariant,
         ),
       ),
+
+      filledButtonTheme: FilledButtonThemeData(style: _btn(scheme)),
+      elevatedButtonTheme: ElevatedButtonThemeData(style: _btn(scheme)),
+      outlinedButtonTheme: OutlinedButtonThemeData(style: _btn(scheme)),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppSpace.md,
+            vertical: AppSpace.sm,
+          ),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadius.md),
+          ),
+          textStyle: text.labelLarge?.copyWith(fontWeight: FontWeight.w600),
+        ),
+      ),
+
+      segmentedButtonTheme: SegmentedButtonThemeData(
+        style: ButtonStyle(
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(AppRadius.md),
+            ),
+          ),
+        ),
+      ),
+
+      chipTheme: ChipThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        side: BorderSide.none,
+        labelStyle: text.labelMedium?.copyWith(fontWeight: FontWeight.w600),
+        backgroundColor: scheme.surfaceContainerHighest,
+        padding: const EdgeInsets.symmetric(horizontal: AppSpace.sm, vertical: 4),
+      ),
+
+      listTileTheme: ListTileThemeData(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.lg),
+        ),
+        iconColor: scheme.onSurfaceVariant,
+      ),
+
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: AppSpace.md,
+          vertical: AppSpace.sm + 2,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          borderSide: BorderSide.none,
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(AppRadius.md),
+          borderSide: BorderSide(color: scheme.primary, width: 2),
+        ),
+      ),
+
+      dialogTheme: DialogThemeData(
+        elevation: AppElevation.level3,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.xxl),
+        ),
+        backgroundColor: scheme.surfaceContainerHigh,
+      ),
+
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: scheme.surfaceContainerLow,
+        surfaceTintColor: Colors.transparent,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.xxl)),
+        ),
+        showDragHandle: true,
+      ),
+
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        elevation: AppElevation.level3,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.md),
+        ),
+      ),
+
+      dividerTheme: DividerThemeData(
+        thickness: 1,
+        space: 1,
+        color: scheme.outlineVariant.withValues(alpha: 0.5),
+      ),
+
+      tooltipTheme: TooltipThemeData(
+        decoration: BoxDecoration(
+          color: scheme.inverseSurface,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        textStyle: text.labelMedium?.copyWith(color: scheme.onInverseSurface),
       ),
     );
   }
+
+  /// Shared button shape/padding for filled/elevated/outlined variants.
+  static ButtonStyle _btn(ColorScheme scheme) => ButtonStyle(
+    padding: const WidgetStatePropertyAll(
+      EdgeInsets.symmetric(horizontal: AppSpace.lg, vertical: AppSpace.sm + 2),
+    ),
+    shape: WidgetStatePropertyAll(
+      RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.md)),
+    ),
+    textStyle: WidgetStatePropertyAll(
+      TextStyle(fontWeight: FontWeight.w600, fontSize: 14, letterSpacing: 0.1),
+    ),
+  );
+
+  /// Typography refinements: tighter tracking + confident weights on display /
+  /// headline / title roles, keeping M3 sizing so layouts stay stable.
+  static TextTheme _typography(TextTheme t) => t.copyWith(
+    headlineLarge: t.headlineLarge?.copyWith(
+      fontWeight: FontWeight.w700,
+      letterSpacing: -0.5,
+    ),
+    headlineMedium: t.headlineMedium?.copyWith(
+      fontWeight: FontWeight.w700,
+      letterSpacing: -0.25,
+    ),
+    headlineSmall: t.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+    titleLarge: t.titleLarge?.copyWith(
+      fontWeight: FontWeight.w700,
+      letterSpacing: -0.2,
+    ),
+    titleMedium: t.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+    titleSmall: t.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+    labelLarge: t.labelLarge?.copyWith(fontWeight: FontWeight.w600),
+  );
+}
+
+/// Spacing scale (8-pt grid, with a 4 half-step). Use everywhere instead of
+/// ad-hoc pixel values so rhythm stays consistent.
+class AppSpace {
+  AppSpace._();
+  static const double xxs = 4;
+  static const double xs = 8;
+  static const double sm = 12;
+  static const double md = 16;
+  static const double lg = 20;
+  static const double xl = 24;
+  static const double xxl = 32;
+  static const double xxxl = 40;
+}
+
+/// Corner-radius scale.
+class AppRadius {
+  AppRadius._();
+  static const double sm = 8;
+  static const double md = 12;
+  static const double lg = 16;
+  static const double xl = 20;
+  static const double xxl = 28;
+  static const double full = 999;
+}
+
+/// Elevation steps (Material 3 tonal levels).
+class AppElevation {
+  AppElevation._();
+  static const double level0 = 0;
+  static const double level1 = 1;
+  static const double level2 = 3;
+  static const double level3 = 6;
+}
+
+/// Standard icon sizes.
+class AppIcons {
+  AppIcons._();
+  static const double sm = 18;
+  static const double md = 22;
+  static const double lg = 28;
+  static const double xl = 40;
+}
+
+/// A square spacer that adds [size] along whichever axis its parent lays out —
+/// `Gap(AppSpace.md)` works in both a `Column` and a `Row`.
+class Gap extends StatelessWidget {
+  final double size;
+  const Gap(this.size, {super.key});
+  @override
+  Widget build(BuildContext context) => SizedBox(width: size, height: size);
 }
 
 /// Shared motion tokens so animations feel consistent and "native".
@@ -93,12 +292,18 @@ class AppMotion {
 }
 
 /// Semantic colours not carried by the [ColorScheme] (kept consistent in one
-/// place). Presence green is the same in light and dark.
+/// place). These read the same in light and dark.
 class AppColors {
   AppColors._();
 
   /// Online / success presence indicator.
   static const Color online = Color(0xFF22C55E);
+
+  /// Success (completed transfer).
+  static const Color success = Color(0xFF22C55E);
+
+  /// Warning / attention.
+  static const Color warning = Color(0xFFF59E0B);
 }
 
 /// Layout breakpoints (Material 3 window size classes, simplified).
