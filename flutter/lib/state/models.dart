@@ -125,6 +125,9 @@ class HistoryItem {
   final bool success;
   final int bytes;
 
+  /// Local path of the item; empty when unknown.
+  final String path;
+
   const HistoryItem({
     required this.id,
     required this.peerName,
@@ -133,6 +136,7 @@ class HistoryItem {
     required this.at,
     required this.success,
     required this.bytes,
+    this.path = '',
   });
 }
 

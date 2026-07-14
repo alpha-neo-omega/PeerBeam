@@ -63,5 +63,6 @@ class HistoryRepository extends ChangeNotifier {
     at: DateTime.tryParse(e.at) ?? DateTime.now(),
     success: e.success,
     bytes: e.bytes,
+    path: e.path,
   );
 }

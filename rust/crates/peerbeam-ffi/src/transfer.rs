@@ -113,6 +113,11 @@ struct Active {
     stats: Arc<Mutex<Stats>>,
     file: Arc<Mutex<String>>,
     status: Mutex<String>,
+    /// Local filesystem path of the transferred item, once known: the source
+    /// path for sends; the save directory (folders) or None (single files —
+    /// derived from the final name at history time) for receives. Lets the UI
+    /// open what was transferred.
+    path: Mutex<Option<String>>,
     /// The background task running this transfer, so cancel can abort it
     /// immediately even if a send is blocked on a slow link.
     task: Mutex<Option<JoinHandle<()>>>,
@@ -293,7 +298,7 @@ impl Manager {
         let mut ids = Vec::new();
         for (path, name, size) in validated {
             let id = self.next_id();
-            let active = self.register(&id, "sending", &device.name, &name);
+            let active = self.register(&id, "sending", &device.name, &name, Some(path.clone()));
             events::transfer(
                 &id,
                 "transfer_queued",
@@ -329,7 +334,7 @@ impl Manager {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "folder".into());
         let id = self.next_id();
-        let active = self.register(&id, "sending", &device.name, &name);
+        let active = self.register(&id, "sending", &device.name, &name, Some(path.clone()));
         events::transfer(
             &id,
             "transfer_queued",
@@ -346,7 +351,14 @@ impl Manager {
         Ok(json!({ "id": id }))
     }
 
-    fn register(&self, id: &str, direction: &'static str, peer: &str, file: &str) -> Arc<Active> {
+    fn register(
+        &self,
+        id: &str,
+        direction: &'static str,
+        peer: &str,
+        file: &str,
+        path: Option<String>,
+    ) -> Arc<Active> {
         let active = Arc::new(Active {
             id: id.to_string(),
             direction,
@@ -355,6 +367,7 @@ impl Manager {
             stats: Arc::new(Mutex::new(Stats::new())),
             file: Arc::new(Mutex::new(file.to_string())),
             status: Mutex::new("queued".to_string()),
+            path: Mutex::new(path),
             task: Mutex::new(None),
         });
         self.active
@@ -529,11 +542,22 @@ impl Manager {
         let entry = {
             let active = self.active.lock().unwrap();
             let Some(a) = active.get(id) else { return };
+            let file = a.file.lock().unwrap().clone();
+            // Local path of the item: explicit when known (sends, folder
+            // receives); otherwise a received file's final location under the
+            // save directory.
+            let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
+                std::path::Path::new(&self.save_dir)
+                    .join(&file)
+                    .to_string_lossy()
+                    .into_owned()
+            });
             json!({
                 "id": id,
                 "direction": a.direction,
                 "peer": a.peer,
-                "file": *a.file.lock().unwrap(),
+                "file": file,
+                "path": path,
                 "bytes": a.stats.lock().unwrap().transferred,
                 "success": success,
                 "at": timestamp(),
@@ -681,7 +705,7 @@ impl Manager {
         };
         let id = self.next_id();
         let peer = sess.peer_id.0.clone();
-        let active = self.register(&id, "receiving", &peer, "(incoming)");
+        let active = self.register(&id, "receiving", &peer, "(incoming)", None);
         events::transfer(
             &id,
             "transfer_queued",
@@ -719,6 +743,10 @@ impl Manager {
             Err(e) => return self.finish_failed(&id, from_domain(e)),
         };
         let is_folder = first.kind == FrameKind::Control;
+        if is_folder {
+            // A folder lands as many files; point history at the save dir.
+            *active.path.lock().unwrap() = Some(self.save_dir.clone());
+        }
         let save_dir = self.save_dir.clone();
         let storage = self.storage();
         let ctrl = active.ctrl.clone();

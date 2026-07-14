@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../platform/open_path.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -88,6 +89,16 @@ class _HistoryRow extends StatelessWidget {
   final HistoryItem item;
   const _HistoryRow({required this.item});
 
+  /// Open the transferred item with the OS handler; explain if it can't be.
+  Future<void> _open(BuildContext context) async {
+    final error = await openLocalPath(item.path);
+    if (error != null && context.mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(error)));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -98,51 +109,54 @@ class _HistoryRow extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpace.sm),
       child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(AppSpace.sm),
-          child: Row(
-            children: [
-              CircleAvatar(
-                radius: 22,
-                backgroundColor: statusColor.withValues(alpha: 0.15),
-                child: Icon(
-                  item.success
-                      ? (sending
-                            ? Icons.upload_rounded
-                            : Icons.download_rounded)
-                      : Icons.error_outline_rounded,
-                  size: AppIcons.md,
-                  color: statusColor,
+        child: InkWell(
+          onTap: () => _open(context),
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpace.sm),
+            child: Row(
+              children: [
+                CircleAvatar(
+                  radius: 22,
+                  backgroundColor: statusColor.withValues(alpha: 0.15),
+                  child: Icon(
+                    item.success
+                        ? (sending
+                              ? Icons.upload_rounded
+                              : Icons.download_rounded)
+                        : Icons.error_outline_rounded,
+                    size: AppIcons.md,
+                    color: statusColor,
+                  ),
                 ),
-              ),
-              const Gap(AppSpace.sm),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      item.fileName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w600,
+                const Gap(AppSpace.sm),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.fileName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: text.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    ),
-                    const Gap(AppSpace.xxs),
-                    Text(
-                      '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-                      '${formatBytes(item.bytes)} · ${_ago(item.at)}'
-                      '${item.success ? '' : ' · Failed'}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.bodySmall?.copyWith(
-                        color: scheme.onSurfaceVariant,
+                      const Gap(AppSpace.xxs),
+                      Text(
+                        '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
+                        '${formatBytes(item.bytes)} · ${_ago(item.at)}'
+                        '${item.success ? '' : ' · Failed'}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: text.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

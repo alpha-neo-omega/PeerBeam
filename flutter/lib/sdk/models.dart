@@ -130,6 +130,10 @@ class HistoryEntry {
   final String direction;
   final String peer;
   final String file;
+
+  /// Local path of the item (source for sends, saved location for receives).
+  /// Empty when the engine predates path recording.
+  final String path;
   final int bytes;
   final bool success;
   final String at;
@@ -139,6 +143,7 @@ class HistoryEntry {
     required this.direction,
     required this.peer,
     required this.file,
+    required this.path,
     required this.bytes,
     required this.success,
     required this.at,
@@ -149,6 +154,7 @@ class HistoryEntry {
     direction: j['direction'] as String? ?? 'sending',
     peer: j['peer'] as String? ?? '',
     file: j['file'] as String? ?? '',
+    path: j['path'] as String? ?? '',
     bytes: (j['bytes'] as num?)?.toInt() ?? 0,
     success: j['success'] as bool? ?? false,
     at: j['at'] as String? ?? '',

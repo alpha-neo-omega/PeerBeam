@@ -195,13 +195,20 @@ async fn receive_into_ffi_with_accept() {
     let got = std::fs::read(dir.path().join("recv").join("incoming.bin")).unwrap();
     assert_eq!(got, payload, "received file byte-exact");
 
-    // History updated.
+    // History updated, with the received file's local path so the UI can
+    // open it.
     let hist = take(pb_history_get());
-    assert!(hist["data"]["history"]
-        .as_array()
-        .unwrap()
+    let entries = hist["data"]["history"].as_array().unwrap().clone();
+    assert!(entries.iter().any(|h| h["success"] == true));
+    let received = entries
         .iter()
-        .any(|h| h["success"] == true));
+        .find(|h| h["direction"] == "receiving")
+        .expect("receiving entry");
+    let path = received["path"].as_str().expect("history path");
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "history path points at the received file: {path}"
+    );
     pb_shutdown();
 }
 

@@ -116,6 +116,7 @@ void main() {
             direction: 'sending',
             peer: 'Bob',
             file: 'a.bin',
+            path: '/tmp/a.bin',
             bytes: 100,
             success: true,
             at: '2026-01-01T00:00:00Z',
