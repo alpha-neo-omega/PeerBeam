@@ -58,7 +58,17 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<TransferSnapshot>> activeTransfers() async => const [];
-    List<TrustedDevice> trusted = [];
+    Map<String, dynamic> settings = {};
+
+  @override
+  Future<Map<String, dynamic>> settingsGet() async => settings;
+
+  @override
+  Future<void> settingsSet(Map<String, dynamic> partial) async {
+    settings.addAll(partial);
+  }
+
+  List<TrustedDevice> trusted = [];
 
   @override
   Future<List<TrustedDevice>> trustList() async => trusted;

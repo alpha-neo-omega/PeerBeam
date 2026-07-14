@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../data/discovery_repository.dart';
@@ -35,6 +37,11 @@ class SettingsStore extends ChangeNotifier {
   /// Keep a foreground service running to receive files while backgrounded.
   bool backgroundReceive;
 
+  /// Theme preference as persisted ('system' | 'light' | 'dark').
+  String theme;
+
+  PeerBeamApi? _api;
+
   SettingsStore({
     required this.deviceName,
     required this.saveDirectory,
@@ -42,35 +49,75 @@ class SettingsStore extends ChangeNotifier {
     required this.notifications,
     required this.compression,
     this.backgroundReceive = false,
+    this.theme = 'system',
   });
+
+  /// Load persisted settings from the engine (call once after initialize).
+  /// Later setters persist through the same document, and the engine applies
+  /// device name / save dir / auto-accept on next init.
+  Future<void> load(PeerBeamApi api) async {
+    _api = api;
+    try {
+      final s = await api.settingsGet();
+      deviceName = (s['device_name'] as String?)?.trim().isNotEmpty == true
+          ? (s['device_name'] as String).trim()
+          : deviceName;
+      saveDirectory = (s['transfer_directory'] as String?) ?? saveDirectory;
+      autoAcceptTrusted = (s['auto_accept'] as bool?) ?? autoAcceptTrusted;
+      notifications = (s['notifications'] as bool?) ?? notifications;
+      compression = (s['compression'] as bool?) ?? compression;
+      backgroundReceive =
+          (s['background_receive'] as bool?) ?? backgroundReceive;
+      theme = (s['theme'] as String?) ?? theme;
+      notifyListeners();
+    } catch (_) {
+      // Engine unavailable (tests/desktop without lib): keep defaults.
+    }
+  }
+
+  void _persist(String key, Object value) {
+    unawaited(_api?.settingsSet({key: value}).catchError((_) {}));
+  }
 
   void setBackgroundReceive(bool v) {
     backgroundReceive = v;
+    _persist('background_receive', v);
     notifyListeners();
   }
 
   void setDeviceName(String v) {
     deviceName = v;
+    _persist('device_name', v);
     notifyListeners();
   }
 
   void setSaveDirectory(String v) {
     saveDirectory = v;
+    _persist('transfer_directory', v);
     notifyListeners();
   }
 
   void setAutoAccept(bool v) {
     autoAcceptTrusted = v;
+    _persist('auto_accept', v);
     notifyListeners();
   }
 
   void setNotifications(bool v) {
     notifications = v;
+    _persist('notifications', v);
     notifyListeners();
   }
 
   void setCompression(bool v) {
     compression = v;
+    _persist('compression', v);
+    notifyListeners();
+  }
+
+  void setTheme(String v) {
+    theme = v;
+    _persist('theme', v);
     notifyListeners();
   }
 }

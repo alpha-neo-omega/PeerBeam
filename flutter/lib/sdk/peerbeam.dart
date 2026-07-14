@@ -44,6 +44,12 @@ abstract class PeerBeamApi {
   Future<List<TransferSnapshot>> activeTransfers();
   Future<List<HistoryEntry>> history();
 
+  /// Persisted engine settings (raw key/value document).
+  Future<Map<String, dynamic>> settingsGet();
+
+  /// Merge a partial settings object into the persisted document.
+  Future<void> settingsSet(Map<String, dynamic> partial);
+
   /// Pinned (trusted) devices, newest first.
   Future<List<TrustedDevice>> trustList();
 
@@ -175,6 +181,14 @@ class PeerBeam implements PeerBeamApi {
     final data = _data(_req().active());
     return _list(data['transfers']).map(TransferSnapshot.fromJson).toList();
   }
+
+  @override
+  Future<Map<String, dynamic>> settingsGet() async =>
+      _data(_req().settingsGet());
+
+  @override
+  Future<void> settingsSet(Map<String, dynamic> partial) async =>
+      _data(_req().settingsSet(jsonEncode(partial)));
 
   @override
   Future<List<TrustedDevice>> trustList() async {

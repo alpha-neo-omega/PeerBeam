@@ -32,6 +32,7 @@ fn defaults() -> Value {
     let c = EngineConfig::default();
     json!({
         "version": SCHEMA,
+        "device_name": c.device.name,
         "transfer_directory": c.storage.save_directory,
         "auto_accept": c.device.auto_accept_trusted,
         "theme": "system",
@@ -40,6 +41,26 @@ fn defaults() -> Value {
         "logging": c.log.filter,
         "experimental": {},
     })
+}
+
+/// Overlay the persisted settings onto an engine config (device identity,
+/// save directory, auto-accept). Called during init so what the user set in
+/// the UI actually reaches the engine, not just the JSON file.
+pub fn overlay(config: &mut EngineConfig) {
+    let s = load();
+    if let Some(name) = s.get("device_name").and_then(|v| v.as_str()) {
+        if !name.trim().is_empty() {
+            config.device.name = name.trim().to_string();
+        }
+    }
+    if let Some(dir) = s.get("transfer_directory").and_then(|v| v.as_str()) {
+        if !dir.trim().is_empty() {
+            config.storage.save_directory = dir.trim().to_string();
+        }
+    }
+    if let Some(auto) = s.get("auto_accept").and_then(|v| v.as_bool()) {
+        config.device.auto_accept_trusted = auto;
+    }
 }
 
 fn path() -> Option<PathBuf> {

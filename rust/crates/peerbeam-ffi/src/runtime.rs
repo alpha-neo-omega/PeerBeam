@@ -97,7 +97,7 @@ fn me(config: &EngineConfig) -> Device {
 
 /// Initialise the runtime + engine and start the event forwarder.
 pub fn init(config_json: &str) -> OpResult {
-    let config: EngineConfig = if config_json.trim().is_empty() {
+    let mut config: EngineConfig = if config_json.trim().is_empty() {
         EngineConfig::default()
     } else {
         serde_json::from_str(config_json)
@@ -108,9 +108,12 @@ pub fn init(config_json: &str) -> OpResult {
     // init runs on the caller's (Dart) thread, so enter the runtime here.
     let _guard = rt().enter();
 
-    // Capture engine logs + point settings storage at the data directory.
+    // Capture engine logs + point settings storage at the data directory,
+    // then overlay the user's persisted settings (device name, save dir,
+    // auto-accept) so they actually take effect.
     crate::logs::install();
     crate::settings::configure(&config.storage.data_directory);
+    crate::settings::overlay(&mut config);
 
     let id = device_id();
     let mut builder =

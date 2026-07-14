@@ -57,6 +57,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     () async {
       try {
         await _api.initialize();
+        // Persisted settings (device name, save dir, theme, toggles).
+        await _state.settings.load(_api);
+        _applyPersistedTheme();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
       } catch (_) {}
@@ -78,9 +81,23 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     _shareSub = _android.filesShared.listen((_) => _openStagedSheet());
     _android.sharedText.addListener(_onSharedText);
 
+    // Persist theme choices (the controller itself stays engine-agnostic).
+    _state.theme.addListener(_persistTheme);
+
     // No-op off Android; routes share/receive intents and drives the service.
     _android.start();
   }
+
+  void _applyPersistedTheme() {
+    final mode = switch (_state.settings.theme) {
+      'light' => ThemeMode.light,
+      'dark' => ThemeMode.dark,
+      _ => ThemeMode.system,
+    };
+    _state.theme.setMode(mode);
+  }
+
+  void _persistTheme() => _state.settings.setTheme(_state.theme.mode.name);
 
   /// Open the staged-files sheet over the current screen (post-frame so a
   /// cold-start share waits for the first build).
@@ -144,6 +161,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     _errSub?.cancel();
     _clipSub?.cancel();
     _shareSub?.cancel();
+    _state.theme.removeListener(_persistTheme);
     _android.sharedText.removeListener(_onSharedText);
     _android.dispose();
     _api.shutdown();
