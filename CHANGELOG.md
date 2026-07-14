@@ -7,6 +7,12 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Settings persist** and reach the engine: device name, save directory,
+  auto-accept, theme, and toggles survive restarts and apply at init.
+- **Transfer history persists** across restarts (bounded to the most recent
+  500); Clear now clears engine-side too.
+- **Auto-retry**: transient connect failures retry twice with backoff before
+  failing.
 - **Trusted devices**: Settings lists every pinned device with its key
   fingerprint; revoke to require fresh approval on the next connection.
 - **Edit saved devices**: rename or re-address a saved device from its menu
