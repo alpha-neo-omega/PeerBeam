@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/theme.dart';
 import '../../sdk/error_text.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
@@ -88,7 +89,7 @@ class _StagedSheet extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 4, 12, 8),
+                  padding: const EdgeInsets.fromLTRB(AppSpace.lg, AppSpace.xxs, AppSpace.sm, AppSpace.xs),
                   child: Row(
                     children: [
                       Text(
@@ -108,7 +109,7 @@ class _StagedSheet extends StatelessWidget {
                 ),
                 if (items.isEmpty)
                   Padding(
-                    padding: const EdgeInsets.all(32),
+                    padding: const EdgeInsets.all(AppSpace.xxl),
                     child: Text(
                       'No files staged.',
                       style: text.bodyMedium?.copyWith(
@@ -120,7 +121,7 @@ class _StagedSheet extends StatelessWidget {
                   Flexible(
                     child: ListView.builder(
                       shrinkWrap: true,
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      padding: const EdgeInsets.symmetric(horizontal: AppSpace.sm),
                       itemCount: items.length,
                       itemBuilder: (context, i) => Appear(
                         index: i,
@@ -147,7 +148,7 @@ class _StagedSheet extends StatelessWidget {
                     ),
                   ),
                 Padding(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(AppSpace.md),
                   child: Row(
                     children: [
                       Expanded(

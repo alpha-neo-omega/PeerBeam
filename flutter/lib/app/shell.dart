@@ -148,27 +148,32 @@ class _RailLeading extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 12),
+      padding: const EdgeInsets.symmetric(
+        vertical: AppSpace.lg,
+        horizontal: AppSpace.sm,
+      ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 36,
-            height: 36,
+            width: 38,
+            height: 38,
             decoration: BoxDecoration(
               gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
                 colors: [scheme.primary, scheme.tertiary],
               ),
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.circular(AppRadius.md),
             ),
             child: const Icon(
               Icons.bolt_rounded,
               color: Colors.white,
-              size: 22,
+              size: AppIcons.md,
             ),
           ),
           if (extended) ...[
-            const SizedBox(width: 10),
+            const Gap(AppSpace.xs),
             Text(
               'PeerBeam',
               style: Theme.of(
