@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
+import '../data/saved_devices_repository.dart';
 import '../data/transfer_repository.dart';
 import '../sdk/peerbeam.dart';
 import 'staging.dart';
@@ -79,6 +80,7 @@ class AppState {
   final DiscoveryRepository device;
   final TransferRepository transfer;
   final HistoryRepository history;
+  final SavedDevicesRepository saved;
   final SettingsStore settings;
   final StagingStore staging;
 
@@ -87,6 +89,7 @@ class AppState {
     required this.device,
     required this.transfer,
     required this.history,
+    required this.saved,
     required this.settings,
     required this.staging,
   });
@@ -98,6 +101,7 @@ class AppState {
       device: DiscoveryRepository(api: api),
       transfer: TransferRepository(api: api),
       history: HistoryRepository(api: api),
+      saved: SavedDevicesRepository()..load(),
       settings: SettingsStore(
         deviceName: 'This Device',
         saveDirectory: '~/Downloads/PeerBeam',
@@ -114,6 +118,7 @@ class AppState {
     device.dispose();
     transfer.dispose();
     history.dispose();
+    saved.dispose();
     settings.dispose();
     staging.dispose();
   }

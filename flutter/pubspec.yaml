@@ -48,6 +48,9 @@ dependencies:
   # FFI helpers (Utf8 marshalling) for the Rust engine bridge.
   ffi: ^2.1.0
 
+  # Local persistence for the saved-devices book (no cloud).
+  shared_preferences: ^2.5.5
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../data/saved_devices_repository.dart' show SavedDevice;
 import '../../platform/desktop_files.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/models.dart' show PeerTarget;
@@ -110,6 +111,80 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  /// Save a device (name + host/IP or MagicDNS + port) to the persistent book.
+  Future<void> _addSavedDevice(BuildContext context) async {
+    final scope = AppScope.of(context);
+    final name = TextEditingController();
+    final host = TextEditingController();
+    final port = TextEditingController(text: '49600');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Add device'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: name,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Name',
+                hintText: 'Living-room server',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: host,
+              decoration: const InputDecoration(
+                labelText: 'Host / IP or MagicDNS name',
+                hintText: '100.73.134.21',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: port,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Port'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final h = host.text.trim();
+    final p = int.tryParse(port.text.trim()) ?? 0;
+    final n = name.text.trim().isEmpty ? h : name.text.trim();
+    if (h.isEmpty || p <= 0 || p > 65535) return;
+    await scope.saved.add(name: n, host: h, port: p);
+  }
+
+  /// Pick files and send them to a saved device (real transfer).
+  Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
+    final scope = AppScope.of(context);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+    final picked = await pickFilesToStage();
+    if (picked.isEmpty || !context.mounted) return;
+    final target = PeerTarget(name: d.name, addresses: [d.host], port: d.port);
+    try {
+      await scope.transfer.send(target, picked.map((f) => f.path).toList());
+      if (context.mounted) snack('Sending ${picked.length} to ${d.name}');
+    } catch (e) {
+      if (context.mounted) snack(friendlyError(e));
+    }
+  }
+
   /// Pick files and send them to [device] through the engine (real transfer).
   Future<void> _sendTo(BuildContext context, Device device) async {
     final scope = AppScope.of(context);
@@ -144,9 +219,10 @@ class HomeScreen extends StatelessWidget {
               maxWidth: Breakpoints.contentMaxWidth,
             ),
             child: AnimatedBuilder(
-              animation: state.device,
+              animation: Listenable.merge([state.device, state.saved]),
               builder: (context, _) {
                 final devices = state.device.devices;
+                final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [
                     SliverAppBar.large(
@@ -201,6 +277,70 @@ class HomeScreen extends StatelessWidget {
                         ),
                       ),
                     ),
+
+                    // Saved devices — manual/Tailscale-by-address, always
+                    // visible so peers discovery can't surface stay reachable.
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                      sliver: SliverToBoxAdapter(
+                        child: SectionHeader(
+                          title: 'Saved Devices',
+                          trailing: IconButton(
+                            tooltip: 'Add device by address',
+                            icon: const Icon(Icons.add_rounded),
+                            onPressed: () => _addSavedDevice(context),
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (saved.isEmpty)
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                          child: Text(
+                            'Add a device by its address (IP or MagicDNS name) '
+                            'to reach it without discovery — e.g. a Tailscale '
+                            'peer or a headless server.',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: scheme.onSurfaceVariant),
+                          ),
+                        ),
+                      )
+                    else
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        sliver: SliverList.builder(
+                          itemCount: saved.length,
+                          itemBuilder: (context, i) => Appear(
+                            index: i,
+                            child: Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Card(
+                                child: ListTile(
+                                  leading: CircleAvatar(
+                                    backgroundColor: scheme.secondaryContainer,
+                                    child: Icon(
+                                      Icons.dns_rounded,
+                                      color: scheme.onSecondaryContainer,
+                                    ),
+                                  ),
+                                  title: Text(saved[i].name),
+                                  subtitle: Text(
+                                    '${saved[i].host}:${saved[i].port}',
+                                  ),
+                                  onTap: () => _sendToSaved(context, saved[i]),
+                                  trailing: IconButton(
+                                    tooltip: 'Remove',
+                                    icon: const Icon(Icons.delete_outline_rounded),
+                                    onPressed: () =>
+                                        state.saved.remove(saved[i].id),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
 
                     // Section header + scan toggle.
                     SliverPadding(
