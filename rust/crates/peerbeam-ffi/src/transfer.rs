@@ -390,6 +390,9 @@ impl Manager {
         );
         *active.status.lock().unwrap() = "transferring".into();
 
+        // Read the peer's live progress back-channel (receiver-confirmed bytes)
+        // so the bar reflects the receiver, not just bytes handed to transport.
+        let peer_progress = link.progress_source();
         let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
         let req = SendRequest {
             transfer_id: id.clone(),
@@ -409,6 +412,8 @@ impl Manager {
                 drop(ptx);
                 r
             },
+            None,
+            peer_progress,
         )
         .await;
         self.finish(&id, outcome);
@@ -441,6 +446,7 @@ impl Manager {
         events::transfer(&id, "transfer_started", json!({ "peer": device.name }));
         *active.status.lock().unwrap() = "transferring".into();
 
+        let peer_progress = link.progress_source();
         let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
         let req = FolderSendRequest {
             transfer_id: id.clone(),
@@ -458,6 +464,8 @@ impl Manager {
                 drop(ptx);
                 r
             },
+            None,
+            peer_progress,
         )
         .await;
         self.finish(&id, outcome);
@@ -681,6 +689,8 @@ impl Manager {
 
         events::transfer(&id, "transfer_started", json!({ "peer": peer }));
         *active.status.lock().unwrap() = "transferring".into();
+        // Report our received-byte progress back to the sender (best-effort).
+        let peer_progress = link.progress_sink();
         let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
 
         // Peek the first frame to dispatch file vs folder receive (no engine
@@ -718,45 +728,129 @@ impl Manager {
                 drop(ptx);
                 r
             },
+            peer_progress,
+            None,
         )
         .await;
         self.finish(&id, outcome);
     }
 }
 
-/// Run a transfer future while pumping its progress channel into stats +
-/// ordered `transfer_progress` events (one per update, per transfer).
+/// How long to wait for the peer's first progress report before assuming the
+/// peer doesn't support the back-channel and falling back to bytes-sent.
+const PEER_PROGRESS_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run a transfer while pumping its progress into stats + `transfer_progress`
+/// events.
+///
+/// `progress_out` (receiver): mirror our received-byte count to the sender over
+/// the back-channel. `progress_in` (sender): once the peer starts reporting,
+/// drive the displayed bar from the **peer's** confirmed bytes instead of
+/// bytes-sent — so the sender sees the receiver's real progress over a slow
+/// link. If the peer never reports (old build / non-QUIC), we fall back to
+/// bytes-sent after a short grace.
 async fn drive<F, Fut>(
     id: String,
     stats: Arc<Mutex<Stats>>,
     file: Arc<Mutex<String>>,
     run: F,
+    progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>>,
+    progress_in: Option<Box<dyn peerbeam_domain::port::ProgressSource>>,
 ) -> DResult<TransferOutcome>
 where
     F: FnOnce(mpsc::UnboundedSender<Progress>) -> Fut,
     Fut: std::future::Future<Output = DResult<TransferOutcome>>,
 {
     let (ptx, mut prx) = mpsc::unbounded_channel::<Progress>();
+
+    // Sender: true once the peer's back-channel has started driving the bar, so
+    // the pump stops emitting bytes-sent to avoid a fight.
+    let peer_driving = Arc::new(AtomicBool::new(false));
+
+    // Receiver → sender mirroring runs on its own task fed by a channel, so a
+    // slow/absent/old peer can never stall the pump or the transfer.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<u64>();
+    let out_task = async move {
+        let Some(mut sink) = progress_out else {
+            while out_rx.recv().await.is_some() {} // drain
+            return;
+        };
+        let mut last = u64::MAX;
+        while let Some(bytes) = out_rx.recv().await {
+            if bytes == last {
+                continue;
+            }
+            last = bytes;
+            if sink.report(bytes).await.is_err() {
+                break; // peer gone / doesn't accept — stop quietly
+            }
+        }
+    };
+
+    // Sender: read the peer's confirmed bytes and drive the bar from them.
+    let in_id = id.clone();
+    let in_stats = stats.clone();
+    let in_driving = peer_driving.clone();
+    let in_task = async move {
+        let Some(mut source) = progress_in else {
+            return;
+        };
+        // First report has a grace window; if it never comes, leave the bar to
+        // the bytes-sent fallback in the pump.
+        match tokio::time::timeout(PEER_PROGRESS_GRACE, source.recv()).await {
+            Ok(Ok(Some(first))) => {
+                in_driving.store(true, Ordering::SeqCst);
+                emit_peer(&in_id, &in_stats, first);
+            }
+            _ => return,
+        }
+        while let Ok(Some(bytes)) = source.recv().await {
+            emit_peer(&in_id, &in_stats, bytes);
+        }
+    };
+
+    let pump_id = id.clone();
+    let pump_driving = peer_driving.clone();
     let pump = async move {
         while let Some(p) = prx.recv().await {
+            let _ = out_tx.send(p.transferred_bytes); // receiver mirrors out
+            if let Some(f) = &p.current_file {
+                *file.lock().unwrap() = f.clone();
+            }
+            // If the peer channel is driving the bar, only keep `total` fresh;
+            // don't emit bytes-sent (the in_task emits the peer's real count).
+            if pump_driving.load(Ordering::SeqCst) {
+                stats.lock().unwrap().total = p.total_bytes;
+                continue;
+            }
             let dto = {
                 let mut s = stats.lock().unwrap();
                 s.update(p.transferred_bytes, p.total_bytes);
                 s.dto()
             };
-            if let Some(f) = &p.current_file {
-                *file.lock().unwrap() = f.clone();
-            }
             events::transfer(
-                &id,
+                &pump_id,
                 "transfer_progress",
                 json!({ "stats": dto, "file": p.current_file }),
             );
         }
+        drop(out_tx); // close the mirror channel so out_task ends
     };
+
     let work = run(ptx);
-    let (r, _) = tokio::join!(work, pump);
+    let (r, _, _, _) = tokio::join!(work, pump, in_task, out_task);
     r
+}
+
+/// Emit a `transfer_progress` event using the peer's confirmed byte count.
+fn emit_peer(id: &str, stats: &Arc<Mutex<Stats>>, peer_bytes: u64) {
+    let dto = {
+        let mut s = stats.lock().unwrap();
+        let total = s.total;
+        s.update(peer_bytes, total);
+        s.dto()
+    };
+    events::transfer(id, "transfer_progress", json!({ "stats": dto }));
 }
 
 // ── helpers ─────────────────────────────────────────────────────

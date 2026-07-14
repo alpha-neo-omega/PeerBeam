@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{Frame, Link, TransferProvider};
+use peerbeam_domain::port::{Frame, FrameKind, Link, TransferProvider};
 use peerbeam_reliability_fs::FsReliability;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
@@ -479,4 +479,54 @@ async fn large_file_over_quic() {
     let (so, ro) = tokio::join!(send, recv);
     assert_eq!(so, TransferOutcome::Completed);
     assert_eq!(ro.bytes, TOTAL, "all >10 GB must be accounted for");
+}
+
+/// The progress back-channel (dedicated QUIC uni-stream) carries the receiver's
+/// byte counts to the sender in order — the basis for showing the peer's real
+/// progress over a slow link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn progress_backchannel_delivers_counts() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = QuicTransport::bound(bind).unwrap();
+    let (addr, mut incoming) = server.serve_addr_on(bind).await.unwrap();
+    let client = QuicTransport::bound(bind).unwrap();
+    let route = direct_route("127.0.0.1", addr.port());
+
+    // Establish both links: dial + accept must run concurrently for the
+    // handshake, and the client must send one frame to open the main bi-stream
+    // (the server yields its link only after `accept_bi`) — exactly as a real
+    // transfer's first frame does.
+    let (client_link, server_link) = tokio::join!(
+        async {
+            let mut l = client.dial(&route, &session(0)).await.unwrap();
+            l.send_frame(Frame {
+                kind: FrameKind::Meta,
+                payload: bytes::Bytes::from_static(b"hi"),
+            })
+            .await
+            .unwrap();
+            l
+        },
+        async { incoming.next().await.unwrap().unwrap() },
+    );
+
+    // Receiver reports; sender reads (over the dedicated progress uni-stream).
+    let mut sink = server_link.progress_sink().expect("quic exposes a sink");
+    let mut source = client_link
+        .progress_source()
+        .expect("quic exposes a source");
+
+    let reporter = tokio::spawn(async move {
+        for n in [100u64, 500, 1000] {
+            sink.report(n).await.unwrap();
+        }
+        // Keep the sink alive to the end so a drop-reset can't race the reads.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    assert_eq!(source.recv().await.unwrap(), Some(100));
+    assert_eq!(source.recv().await.unwrap(), Some(500));
+    assert_eq!(source.recv().await.unwrap(), Some(1000));
+    reporter.await.unwrap();
 }

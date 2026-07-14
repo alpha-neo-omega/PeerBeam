@@ -26,5 +26,7 @@ pub use notification::{Notice, NotificationSink};
 pub use reliability::ReliabilityStore;
 pub use route::RouteProvider;
 pub use storage::StorageProvider;
-pub use transfer::{Bind, Frame, FrameKind, Link, Protocol, TransferProvider};
+pub use transfer::{
+    Bind, Frame, FrameKind, Link, ProgressSink, ProgressSource, Protocol, TransferProvider,
+};
 pub use trust::TrustStore;

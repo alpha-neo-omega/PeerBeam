@@ -51,6 +51,28 @@ pub struct Bind {
     pub port: u16,
 }
 
+/// Receiver → sender live progress back-channel: the **receiver** writes how
+/// many bytes it has actually taken in, so the **sender** can show the peer's
+/// real progress instead of just bytes-handed-to-the-transport (which, over a
+/// slow internet/Tailscale link, reaches 100% long before the receiver does).
+///
+/// It is a side-channel, independent of the frame stream — reporting must never
+/// block or interfere with the transfer, so implementations run it on their own
+/// resource (e.g. a separate QUIC stream) and callers drive it from a separate
+/// task.
+#[async_trait]
+pub trait ProgressSink: Send {
+    /// Report the total bytes received so far (monotonic). Best-effort.
+    async fn report(&mut self, received: u64) -> Result<()>;
+}
+
+/// The sender's read end of the [`ProgressSink`] back-channel.
+#[async_trait]
+pub trait ProgressSource: Send {
+    /// Next reported received-byte count, or `None` when the channel closes.
+    async fn recv(&mut self) -> Result<Option<u64>>;
+}
+
 /// A single live connection to a peer.
 #[async_trait]
 pub trait Link: Send + Sync {
@@ -62,6 +84,19 @@ pub trait Link: Send + Sync {
 
     /// Close the connection.
     async fn close(&mut self) -> Result<()>;
+
+    /// Receiver side: open the progress back-channel to report received bytes.
+    /// `None` if the transport doesn't support it (falls back to bytes-sent).
+    /// Owned so it can be driven concurrently with frame I/O.
+    fn progress_sink(&self) -> Option<Box<dyn ProgressSink>> {
+        None
+    }
+
+    /// Sender side: the read end of the peer's progress back-channel. `None` if
+    /// unsupported. Owned so it can be read concurrently with frame I/O.
+    fn progress_source(&self) -> Option<Box<dyn ProgressSource>> {
+        None
+    }
 }
 
 /// A transport that can dial peers and accept inbound connections.

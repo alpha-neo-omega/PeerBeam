@@ -51,6 +51,8 @@ fn conn_err(e: impl std::fmt::Display) -> DomainError {
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
+    // Allow the progress back-channel's dedicated uni-stream (receiver→sender).
+    tc.max_concurrent_uni_streams(4u8.into());
     tc.max_idle_timeout(Some(
         Duration::from_secs(30)
             .try_into()

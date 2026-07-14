@@ -18,7 +18,7 @@ use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 
 use peerbeam_domain::error::{DomainError, Result};
-use peerbeam_domain::port::{Frame, FrameKind, Link};
+use peerbeam_domain::port::{Frame, FrameKind, Link, ProgressSink, ProgressSource};
 
 /// Upper bound on a single frame (defensive: a malformed/hostile peer cannot
 /// make us allocate unbounded memory). Well above any real chunk size.
@@ -120,5 +120,61 @@ impl Link for QuicLink {
         let _ = self.send.finish();
         self.conn.close(CLOSE_OK.into(), b"bye");
         Ok(())
+    }
+
+    fn progress_sink(&self) -> Option<Box<dyn ProgressSink>> {
+        Some(Box::new(QuicProgressSink {
+            conn: self.conn.clone(),
+            stream: None,
+        }))
+    }
+
+    fn progress_source(&self) -> Option<Box<dyn ProgressSource>> {
+        Some(Box::new(QuicProgressSource {
+            conn: self.conn.clone(),
+            stream: None,
+        }))
+    }
+}
+
+/// Receiver side of the progress back-channel: a dedicated QUIC uni-stream on
+/// the same (TLS-encrypted, already-authenticated) connection, carrying 8-byte
+/// big-endian received-byte counts. Opened lazily on first report.
+struct QuicProgressSink {
+    conn: Connection,
+    stream: Option<SendStream>,
+}
+
+#[async_trait]
+impl ProgressSink for QuicProgressSink {
+    async fn report(&mut self, received: u64) -> Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(self.conn.open_uni().await.map_err(conn_err)?);
+        }
+        let s = self.stream.as_mut().expect("opened above");
+        s.write_all(&received.to_be_bytes()).await.map_err(conn_err)
+    }
+}
+
+/// Sender side: accepts the peer's progress uni-stream and reads received-byte
+/// counts. Accepts lazily on first `recv`.
+struct QuicProgressSource {
+    conn: Connection,
+    stream: Option<RecvStream>,
+}
+
+#[async_trait]
+impl ProgressSource for QuicProgressSource {
+    async fn recv(&mut self) -> Result<Option<u64>> {
+        if self.stream.is_none() {
+            self.stream = Some(self.conn.accept_uni().await.map_err(conn_err)?);
+        }
+        let s = self.stream.as_mut().expect("accepted above");
+        let mut buf = [0u8; 8];
+        match s.read_exact(&mut buf).await {
+            Ok(()) => Ok(Some(u64::from_be_bytes(buf))),
+            Err(quinn::ReadExactError::FinishedEarly { .. }) => Ok(None),
+            Err(e) => Err(conn_err(e)),
+        }
     }
 }
