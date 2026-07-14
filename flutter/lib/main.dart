@@ -51,7 +51,8 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     () async {
       try {
         await _api.initialize();
-        await _api.startDiscovery();
+        // Through the repo, so the Scan/Stop control reflects reality.
+        await _state.device.start();
       } catch (_) {}
     }();
 

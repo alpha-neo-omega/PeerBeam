@@ -35,6 +35,22 @@ class DiscoveryRepository extends ChangeNotifier {
     return PeerTarget(name: d.name, addresses: d.addresses, port: d.port);
   }
 
+  /// Start discovery and reflect it in [scanning] (used at boot, so the
+  /// Scan/Stop control is truthful from the first frame). Safe to call when
+  /// already scanning.
+  Future<void> start() async {
+    if (_scanning) return;
+    _scanning = true;
+    notifyListeners();
+    try {
+      await _api?.startDiscovery();
+    } catch (_) {
+      if (_disposed) return;
+      _scanning = false;
+      notifyListeners();
+    }
+  }
+
   /// Start/stop discovery in the engine; UI state flips optimistically.
   void toggleScan() {
     _scanning = !_scanning;
