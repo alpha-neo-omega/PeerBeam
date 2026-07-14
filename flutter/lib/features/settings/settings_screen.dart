@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../app/theme.dart';
 import '../../platform/bridge.dart';
 import '../../platform/desktop_files.dart';
 import '../../platform/services.dart';
@@ -24,12 +25,12 @@ class SettingsScreen extends StatelessWidget {
         child: ContentPane(
           maxWidth: 720,
           child: ListView(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(AppSpace.md),
             children: [
               const _GroupLabel('Appearance'),
               Card(
                 child: Padding(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(AppSpace.md),
                   child: AnimatedBuilder(
                     animation: state.theme,
                     builder: (context, _) => Column(
@@ -39,7 +40,7 @@ class SettingsScreen extends StatelessWidget {
                           'Theme',
                           style: Theme.of(context).textTheme.titleSmall,
                         ),
-                        const SizedBox(height: 12),
+                        const Gap(AppSpace.sm),
                         SegmentedButton<ThemeMode>(
                           segments: const [
                             ButtonSegment(
@@ -67,7 +68,7 @@ class SettingsScreen extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
+              const Gap(AppSpace.md),
 
               const _GroupLabel('Device'),
               AnimatedBuilder(
@@ -96,7 +97,7 @@ class SettingsScreen extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
+              const Gap(AppSpace.md),
 
               const _GroupLabel('Transfers'),
               AnimatedBuilder(
@@ -132,7 +133,7 @@ class SettingsScreen extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
+              const Gap(AppSpace.md),
 
               // Android-only background/battery controls.
               if (_isAndroid) ...[
@@ -168,7 +169,7 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
+                const Gap(AppSpace.md),
               ],
 
               const _GroupLabel('About'),

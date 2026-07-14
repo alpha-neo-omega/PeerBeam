@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../app/theme.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -68,7 +69,7 @@ class HistoryScreen extends StatelessWidget {
                 );
               }
               return ListView.builder(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpace.md),
                 itemCount: items.length,
                 itemBuilder: (context, i) => Appear(
                   index: i,
@@ -90,33 +91,70 @@ class _HistoryRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
     final sending = item.direction == TransferDirection.sending;
-    final statusColor = item.success ? const Color(0xFF22C55E) : scheme.error;
+    final statusColor = item.success ? AppColors.success : scheme.error;
 
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-        leading: CircleAvatar(
-          backgroundColor: statusColor.withValues(alpha: 0.16),
-          child: Icon(
-            item.success
-                ? (sending ? Icons.upload_rounded : Icons.download_rounded)
-                : Icons.error_outline_rounded,
-            color: statusColor,
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpace.sm),
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpace.sm),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      statusColor.withValues(alpha: 0.22),
+                      statusColor.withValues(alpha: 0.10),
+                    ],
+                  ),
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                ),
+                child: Icon(
+                  item.success
+                      ? (sending
+                            ? Icons.upload_rounded
+                            : Icons.download_rounded)
+                      : Icons.error_outline_rounded,
+                  color: statusColor,
+                ),
+              ),
+              const Gap(AppSpace.sm),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      item.fileName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const Gap(AppSpace.xxs),
+                    Text(
+                      '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
+                      '${formatBytes(item.bytes)} · ${_ago(item.at)}'
+                      '${item.success ? '' : ' · Failed'}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
-        title: Text(
-          item.fileName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        subtitle: Text(
-          '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-          '${formatBytes(item.bytes)} · ${_ago(item.at)}'
-          '${item.success ? '' : ' · Failed'}',
-        ),
-        isThreeLine: false,
       ),
     );
   }
