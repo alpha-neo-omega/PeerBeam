@@ -73,3 +73,46 @@ spctl -a -t open --context context:primary-signature -v dist/PeerBeam-*.dmg
 > its keychain and no notary profile. Automating it requires importing a
 > base64 `.p12` cert into a temp keychain and recreating the notary profile
 > from App Store Connect API-key secrets. Until then, sign locally as above.
+
+## Signing a Windows build
+`scripts/package-windows.ps1` builds the MSIX via `dart run msix:create` and
+signs it when `PB_CERT_PATH` / `PB_CERT_PASSWORD` are set. Run on Windows with
+the Flutter + Rust toolchains.
+
+**Config prerequisite:** `msix_config.publisher` in `flutter/pubspec.yaml` must
+**exactly** match the signing certificate's Subject (`CN=…`), or the signed MSIX
+fails to install. It ships as `CN=PeerBeam Contributors` — change it to match
+your cert.
+
+### Testing (self-signed — sideload only, not for public distribution)
+```powershell
+# 1. Code-signing cert whose CN matches msix_config.publisher
+$c = New-SelfSignedCertificate -Type CodeSigningCert `
+  -Subject "CN=PeerBeam Contributors" `
+  -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter (Get-Date).AddYears(3)
+# 2. Export .pfx (to sign) and .cer (for testers to trust)
+$pw = ConvertTo-SecureString "yourpass" -Force -AsPlainText
+Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($c.Thumbprint)" -FilePath peerbeam.pfx -Password $pw
+Export-Certificate  -Cert "Cert:\CurrentUser\My\$($c.Thumbprint)" -FilePath peerbeam.cer
+# 3. Build a signed MSIX
+$env:PB_CERT_PATH="peerbeam.pfx"; $env:PB_CERT_PASSWORD="yourpass"
+powershell -File scripts/package-windows.ps1
+# → flutter/build/windows/x64/runner/Release/*.msix
+```
+To install for testing, import `peerbeam.cer` into **Local Machine → Trusted
+People** (or Trusted Root), then double-click the `.msix`.
+
+### Distribution
+A plain purchased `.pfx` is largely unavailable now — since the 2023 CA/B rules,
+standard OV **and** EV code-signing certs ship on hardware tokens / cloud HSM,
+so `--certificate-path` (a file) doesn't fit them. Practical options:
+- **Azure Trusted Signing** — cloud signing (~$10/mo, no token), good SmartScreen
+  reputation. Signs via `signtool` + the Trusted Signing dlib, not
+  `--certificate-path`, so `package-windows.ps1` would need a signing-step tweak.
+- **EV cert on a token** — instant SmartScreen trust; signing goes through the
+  token provider, again not a file path.
+
+> CI (`release.yml`) passes `WINDOWS_CERT_PATH`/`PASSWORD` but a runner has no
+> cert file; automating requires injecting a base64 `.pfx` secret to disk and
+> pointing the env at it — which only works for a **file-based** cert
+> (self-signed / legacy .pfx), not token/cloud certs.

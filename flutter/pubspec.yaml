@@ -72,6 +72,10 @@ dev_dependencies:
 msix_config:
   display_name: PeerBeam
   publisher_display_name: PeerBeam Contributors
+  # MUST exactly equal the signing certificate's Subject (CN=…). A mismatch
+  # makes the signed MSIX fail to install. Update this to match your cert
+  # (self-signed or CA) — see docs/RELEASE.md → "Signing a Windows build".
+  publisher: CN=PeerBeam Contributors
   identity_name: com.peerbeam.peerbeam
   msix_version: 0.2.0.0
   logo_path: ../packaging/windows/peerbeam.png
