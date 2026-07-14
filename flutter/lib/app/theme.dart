@@ -7,8 +7,9 @@ import 'package:flutter/material.dart';
 class PeerBeamTheme {
   PeerBeamTheme._();
 
-  /// Brand seed (indigo). All roles are derived tonally from this.
-  static const Color seed = Color(0xFF6366F1);
+  /// Brand seed — the Material 3 baseline color, for the stock Material look
+  /// (LocalSend-style). All roles are derived tonally from this.
+  static const Color seed = Color(0xFF6750A4);
 
   static ThemeData light() => _build(Brightness.light);
   static ThemeData dark() => _build(Brightness.dark);
@@ -36,13 +37,13 @@ class PeerBeamTheme {
         titleTextStyle: text.titleLarge?.copyWith(fontWeight: FontWeight.w700),
       ),
 
+      // Flat, borderless, tonally-tinted cards — the soft stock-Material look.
       cardTheme: CardThemeData(
         elevation: AppElevation.level0,
         clipBehavior: Clip.antiAlias,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(AppRadius.xl),
-          side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
         ),
         color: scheme.surfaceContainerLow,
       ),
@@ -87,31 +88,25 @@ class PeerBeamTheme {
             horizontal: AppSpace.md,
             vertical: AppSpace.sm,
           ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppRadius.md),
-          ),
+          shape: const StadiumBorder(),
           textStyle: text.labelLarge?.copyWith(fontWeight: FontWeight.w600),
         ),
       ),
 
-      segmentedButtonTheme: SegmentedButtonThemeData(
-        style: ButtonStyle(
-          shape: WidgetStatePropertyAll(
-            RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(AppRadius.md),
-            ),
-          ),
-        ),
+      // Stock segmented (stadium) shape.
+      segmentedButtonTheme: const SegmentedButtonThemeData(
+        style: ButtonStyle(shape: WidgetStatePropertyAll(StadiumBorder())),
       ),
 
       chipTheme: ChipThemeData(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-        ),
+        shape: const StadiumBorder(),
         side: BorderSide.none,
         labelStyle: text.labelMedium?.copyWith(fontWeight: FontWeight.w600),
         backgroundColor: scheme.surfaceContainerHighest,
-        padding: const EdgeInsets.symmetric(horizontal: AppSpace.sm, vertical: 4),
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpace.sm,
+          vertical: 4,
+        ),
       ),
 
       listTileTheme: ListTileThemeData(
@@ -184,13 +179,12 @@ class PeerBeamTheme {
   }
 
   /// Shared button shape/padding for filled/elevated/outlined variants.
-  static ButtonStyle _btn(ColorScheme scheme) => ButtonStyle(
-    padding: const WidgetStatePropertyAll(
+  /// Stadium (pill) — the stock Material 3 button silhouette.
+  static ButtonStyle _btn(ColorScheme scheme) => const ButtonStyle(
+    padding: WidgetStatePropertyAll(
       EdgeInsets.symmetric(horizontal: AppSpace.lg, vertical: AppSpace.sm + 2),
     ),
-    shape: WidgetStatePropertyAll(
-      RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.md)),
-    ),
+    shape: WidgetStatePropertyAll(StadiumBorder()),
     textStyle: WidgetStatePropertyAll(
       TextStyle(fontWeight: FontWeight.w600, fontSize: 14, letterSpacing: 0.1),
     ),

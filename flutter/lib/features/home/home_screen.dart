@@ -342,13 +342,23 @@ class HomeScreen extends StatelessWidget {
                           tooltip: 'Send to address',
                           onPressed: () => _sendToAddress(context),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.search_rounded),
-                          tooltip: 'Search devices',
-                          onPressed: () => _searchDevices(context),
-                        ),
                         const Gap(AppSpace.xs),
                       ],
+                    ),
+
+                    // Search bar — tap to search discovered devices.
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpace.md,
+                        0,
+                        AppSpace.md,
+                        AppSpace.md,
+                      ),
+                      sliver: SliverToBoxAdapter(
+                        child: _SearchPill(
+                          onTap: () => _searchDevices(context),
+                        ),
+                      ),
                     ),
 
                     // Quick actions.
@@ -525,6 +535,48 @@ class HomeScreen extends StatelessWidget {
                   ],
                 );
               },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The tappable search pill under the app bar — looks like a Material search
+/// bar, opens the device search on tap.
+class _SearchPill extends StatelessWidget {
+  final VoidCallback onTap;
+  const _SearchPill({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      label: 'Search devices',
+      child: Material(
+        color: scheme.surfaceContainerHigh,
+        shape: const StadiumBorder(),
+        child: InkWell(
+          onTap: onTap,
+          customBorder: const StadiumBorder(),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpace.md,
+              vertical: AppSpace.sm + 2,
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.search_rounded, color: scheme.onSurfaceVariant),
+                const Gap(AppSpace.sm),
+                Text(
+                  'Search devices',
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
           ),
         ),
