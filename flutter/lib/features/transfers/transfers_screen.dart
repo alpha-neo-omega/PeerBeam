@@ -60,6 +60,10 @@ class _TransferCard extends StatelessWidget {
     final sending = transfer.direction == TransferDirection.sending;
     final paused = transfer.state == TransferState.paused;
     final pct = (transfer.progress * 100).round();
+    // An inbound transfer awaiting the user's approval — needs Accept/Decline,
+    // not the pause/cancel controls.
+    final awaitingApproval =
+        !sending && transfer.state == TransferState.pending;
 
     return Semantics(
       container: true,
@@ -130,20 +134,32 @@ class _TransferCard extends StatelessWidget {
                     ),
                   ),
                   const Spacer(),
-                  IconButton(
-                    tooltip: paused ? 'Resume' : 'Pause',
-                    onPressed: () => paused
-                        ? state.transfer.resume(transfer.id)
-                        : state.transfer.pause(transfer.id),
-                    icon: Icon(
-                      paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                  if (awaitingApproval) ...[
+                    TextButton(
+                      onPressed: () => state.transfer.reject(transfer.id),
+                      child: const Text('Decline'),
                     ),
-                  ),
-                  IconButton(
-                    tooltip: 'Cancel',
-                    onPressed: () => state.transfer.cancel(transfer.id),
-                    icon: const Icon(Icons.close_rounded),
-                  ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: () => state.transfer.accept(transfer.id),
+                      child: const Text('Accept'),
+                    ),
+                  ] else ...[
+                    IconButton(
+                      tooltip: paused ? 'Resume' : 'Pause',
+                      onPressed: () => paused
+                          ? state.transfer.resume(transfer.id)
+                          : state.transfer.pause(transfer.id),
+                      icon: Icon(
+                        paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Cancel',
+                      onPressed: () => state.transfer.cancel(transfer.id),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
                 ],
               ),
             ],
