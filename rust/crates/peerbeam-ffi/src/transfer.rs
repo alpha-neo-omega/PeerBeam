@@ -386,6 +386,45 @@ impl Manager {
         active
     }
 
+    /// Connect to the peer, retrying transient connection failures with a
+    /// short backoff (Wi-Fi blips, a receiver mid-restart). Emits
+    /// `transfer_retrying` per attempt; cancellation stops the retries.
+    async fn connect_with_retry(
+        &self,
+        id: &str,
+        active: &Active,
+        device: &Device,
+        session: &TransferSession,
+    ) -> Result<Box<dyn Link>, (Code, String)> {
+        const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+        let mut attempt = 0;
+        loop {
+            match self.rm.connect(device, session).await {
+                Ok(link) => return Ok(link),
+                Err(e) => {
+                    let mapped = from_domain(e);
+                    let transient = matches!(mapped.0, Code::Connection);
+                    if !transient || attempt >= BACKOFF.len() || active.ctrl.is_cancelled() {
+                        return Err(mapped);
+                    }
+                    let delay = BACKOFF[attempt];
+                    attempt += 1;
+                    *active.status.lock().unwrap() = "retrying".into();
+                    events::transfer(
+                        id,
+                        "transfer_retrying",
+                        json!({ "attempt": attempt, "delay_ms": delay.as_millis() as u64 }),
+                    );
+                    tokio::time::sleep(delay).await;
+                    if active.ctrl.is_cancelled() {
+                        return Err(mapped);
+                    }
+                    *active.status.lock().unwrap() = "connecting".into();
+                }
+            }
+        }
+    }
+
     async fn run_send(
         self: Arc<Self>,
         id: String,
@@ -398,9 +437,12 @@ impl Manager {
         *active.status.lock().unwrap() = "connecting".into();
         let session = self.session(&id, device.id.clone(), size);
 
-        let mut link = match self.rm.connect(&device, &session).await {
+        let mut link = match self
+            .connect_with_retry(&id, &active, &device, &session)
+            .await
+        {
             Ok(l) => l,
-            Err(e) => return self.finish_failed(&id, from_domain(e)),
+            Err(e) => return self.finish_failed(&id, e),
         };
         let sess = match authenticate(
             &mut *link,
@@ -458,9 +500,12 @@ impl Manager {
     ) {
         *active.status.lock().unwrap() = "connecting".into();
         let session = self.session(&id, device.id.clone(), 0);
-        let mut link = match self.rm.connect(&device, &session).await {
+        let mut link = match self
+            .connect_with_retry(&id, &active, &device, &session)
+            .await
+        {
             Ok(l) => l,
-            Err(e) => return self.finish_failed(&id, from_domain(e)),
+            Err(e) => return self.finish_failed(&id, e),
         };
         let sess = match authenticate(
             &mut *link,
