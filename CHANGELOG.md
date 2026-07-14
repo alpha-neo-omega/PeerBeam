@@ -7,6 +7,14 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Open from History**: history entries record the item's local path; tap to
+  open the file (or the save folder for folder receives) with the OS handler.
+- **Clipboard receive**: a received clipboard payload shows a snackbar with the
+  sender, a preview, and one-tap **Copy** — clipboard to clipboard.
+- **Android share sheet**: sharing files/text to PeerBeam now completes the
+  flow — files open the staged sheet, text offers one-tap send.
+- **Send folders**: desktop folder picker + folder drag-and-drop; staged
+  batches split into file and folder transfers automatically.
 - **Receiver-confirmed progress**: the sender's bar tracks the receiver's real
   byte count over a dedicated QUIC back-channel (falls back to bytes-sent for
   old/non-QUIC peers); 64 KiB chunks + throttled emission for smooth movement,
