@@ -39,8 +39,10 @@ class HistoryRepository extends ChangeNotifier {
     }
   }
 
-  /// Local view clear. (An engine-backed clear lands with the M3 history ops.)
+  /// Clear history in the engine (persisted); the local view empties
+  /// immediately and the engine's history_updated confirms.
   void clear() {
+    unawaited(_api?.historyClear().catchError((_) {}));
     if (_items.isEmpty) return;
     _items = [];
     notifyListeners();

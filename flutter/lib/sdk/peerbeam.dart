@@ -44,6 +44,9 @@ abstract class PeerBeamApi {
   Future<List<TransferSnapshot>> activeTransfers();
   Future<List<HistoryEntry>> history();
 
+  /// Clear all transfer history (persisted).
+  Future<void> historyClear();
+
   /// Persisted engine settings (raw key/value document).
   Future<Map<String, dynamic>> settingsGet();
 
@@ -207,6 +210,9 @@ class PeerBeam implements PeerBeamApi {
     final data = _data(_req().history());
     return _list(data['history']).map(HistoryEntry.fromJson).toList();
   }
+
+  @override
+  Future<void> historyClear() async => _data(_req().historyClear());
 
   // ── envelope handling ─────────────────────────────────────────
 

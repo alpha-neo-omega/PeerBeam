@@ -61,6 +61,11 @@ class FakePeerBeam implements PeerBeamApi {
     Map<String, dynamic> settings = {};
 
   @override
+  Future<void> historyClear() async {
+    historyEntries = [];
+  }
+
+  @override
   Future<Map<String, dynamic>> settingsGet() async => settings;
 
   @override

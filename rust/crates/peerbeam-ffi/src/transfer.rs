@@ -151,6 +151,8 @@ pub struct Manager {
     active: Mutex<HashMap<String, Arc<Active>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     history: Mutex<Vec<Value>>,
+    /// Where history persists across restarts (None = in-memory only, tests).
+    history_path: Option<std::path::PathBuf>,
     counter: AtomicU64,
     daemon_task: Mutex<Option<JoinHandle<()>>>,
     daemon_running: AtomicBool,
@@ -170,7 +172,13 @@ impl Manager {
         auto_accept: bool,
         chunk_size: u32,
         daemon_port: u16,
+        history_path: Option<std::path::PathBuf>,
     ) -> Self {
+        let history = history_path
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+            .unwrap_or_default();
         Manager {
             rm,
             quic,
@@ -183,7 +191,8 @@ impl Manager {
             daemon_port,
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(history),
+            history_path,
             counter: AtomicU64::new(0),
             daemon_task: Mutex::new(None),
             daemon_running: AtomicBool::new(false),
@@ -572,8 +581,43 @@ impl Manager {
                 "at": timestamp(),
             })
         };
-        self.history.lock().unwrap().push(entry);
+        {
+            let mut history = self.history.lock().unwrap();
+            history.push(entry);
+            // Bound growth: keep the most recent entries only.
+            const MAX_HISTORY: usize = 500;
+            if history.len() > MAX_HISTORY {
+                let drop = history.len() - MAX_HISTORY;
+                history.drain(..drop);
+            }
+            self.persist_history(&history);
+        }
         events::event(&json!({ "type": "history_updated", "timestamp": timestamp() }));
+    }
+
+    /// Best-effort write of the history document (atomic-enough for a cache:
+    /// history is convenience data, not integrity-critical).
+    fn persist_history(&self, history: &[Value]) {
+        let Some(path) = self.history_path.as_deref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(history) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Clear all history (persisted too) and notify.
+    pub fn history_clear(&self) -> Op {
+        {
+            let mut history = self.history.lock().unwrap();
+            history.clear();
+            self.persist_history(&history);
+        }
+        events::event(&json!({ "type": "history_updated", "timestamp": timestamp() }));
+        Ok(json!({ "cleared": true }))
     }
 
     fn set_status(&self, id: &str, status: &str) {

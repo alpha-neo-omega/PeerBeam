@@ -154,6 +154,7 @@ pub fn init(config_json: &str) -> OpResult {
         config.device.auto_accept_trusted,
         config.transfer.chunk_size as u32,
         config.transfer.port,
+        Some(std::path::Path::new(&config.storage.data_directory).join("history.json")),
     ));
 
     // Start the receive server (the "daemon") so accept/reject have incoming

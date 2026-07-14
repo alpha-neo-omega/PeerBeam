@@ -260,6 +260,12 @@ pub extern "C" fn pb_history_get() -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.history())()))
 }
 
+/// Clear all transfer history (persisted). Emits `history_updated`.
+#[no_mangle]
+pub extern "C" fn pb_history_clear() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.history_clear())()))
+}
+
 // ── trust ───────────────────────────────────────────────────────
 
 /// Pinned (trusted) devices: `{devices:[{id,name,fingerprint,trusted_at}]}`.
