@@ -1,7 +1,9 @@
-// Desktop wiring guards. The native picker can't be driven headlessly, but we
-// can prove the guarded entry points don't crash and the platform gating holds.
+// Picker wiring guards. The native picker can't be driven headlessly, but we
+// can prove the entry point is wired on every platform and that an empty or
+// cancelled pick is a clean no-op.
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/main.dart';
@@ -9,15 +11,27 @@ import 'sdk/fake_peerbeam.dart';
 import 'package:peerbeam/platform/desktop_files.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('isDesktop is false under the test target platform', () {
     // flutter_test defaults to a non-desktop target, so desktop-only paths
-    // (picker, save dialog) stay gated off.
+    // (drop zone, save-dir dialog) stay gated off.
     expect(isDesktop, isFalse);
   });
 
-  testWidgets('tapping Send Files off-desktop shows guidance, does not crash', (
+  testWidgets('Send files opens the picker; a cancelled pick is a no-op', (
     tester,
   ) async {
+    // Stub the file_selector channel: behave like a cancelled pick.
+    final calls = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/file_selector'),
+      (call) async {
+        calls.add(call.method);
+        return null; // no files chosen
+      },
+    );
+
     await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
@@ -27,8 +41,9 @@ void main() {
     await tester.tap(sendFiles);
     await tester.pump();
 
-    // Non-desktop falls back to the guidance snackbar (no native picker).
-    expect(find.textContaining('Send files'), findsWidgets);
+    // The picker was invoked (no platform gate) and nothing crashed or opened.
+    expect(calls, isNotEmpty);
+    expect(find.text('Ready to send'), findsNothing);
     expect(tester.takeException(), isNull);
   }, skip: kIsWeb);
 }

@@ -6,6 +6,7 @@ import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../state/staging.dart';
 import '../../widgets/appear.dart';
+import 'pick_device.dart';
 
 /// Show the staged-files sheet (opened after a drop). Lists what will be sent,
 /// with per-file removal and a total; the actual send wires in with the engine.
@@ -18,49 +19,23 @@ Future<void> showStagedFilesSheet(BuildContext context, StagingStore staging) {
   );
 }
 
-/// Choose an online device and send all staged files to it via the engine.
+/// Choose a destination (nearby or saved) and send all staged files to it.
 Future<void> _send(BuildContext context, StagingStore staging) async {
   final scope = AppScope.of(context);
   void snack(String m) => ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(SnackBar(content: Text(m)));
 
-  final online = scope.device.devices.where((d) => d.online).toList();
-  if (online.isEmpty) {
-    snack('No devices online to send to');
-    return;
-  }
-  final device = await showModalBottomSheet<Device>(
-    context: context,
-    showDragHandle: true,
-    builder: (ctx) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final d in online)
-            ListTile(
-              leading: Icon(d.kind.icon),
-              title: Text(d.name),
-              onTap: () => Navigator.pop(ctx, d),
-            ),
-        ],
-      ),
-    ),
-  );
-  if (device == null || !context.mounted) return;
+  final picked = await showDevicePicker(context);
+  if (picked == null || !context.mounted) return;
 
-  final target = scope.device.peerTarget(device.id);
-  if (target == null) {
-    snack('${device.name} is not reachable right now');
-    return;
-  }
   final paths = staging.items.map((f) => f.path).toList();
   try {
-    await scope.transfer.send(target, paths);
+    await scope.transfer.send(picked.target, paths);
     staging.clear();
     if (context.mounted) {
       Navigator.pop(context); // close the staged sheet
-      snack('Sending ${paths.length} to ${device.name}');
+      snack('Sending ${paths.length} to ${picked.name}');
     }
   } catch (e) {
     if (context.mounted) snack(friendlyError(e));
@@ -89,7 +64,12 @@ class _StagedSheet extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(AppSpace.lg, AppSpace.xxs, AppSpace.sm, AppSpace.xs),
+                  padding: const EdgeInsets.fromLTRB(
+                    AppSpace.lg,
+                    AppSpace.xxs,
+                    AppSpace.sm,
+                    AppSpace.xs,
+                  ),
                   child: Row(
                     children: [
                       Text(
@@ -121,7 +101,9 @@ class _StagedSheet extends StatelessWidget {
                   Flexible(
                     child: ListView.builder(
                       shrinkWrap: true,
-                      padding: const EdgeInsets.symmetric(horizontal: AppSpace.sm),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpace.sm,
+                      ),
                       itemCount: items.length,
                       itemBuilder: (context, i) => Appear(
                         index: i,

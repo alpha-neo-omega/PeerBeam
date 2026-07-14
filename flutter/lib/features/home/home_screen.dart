@@ -14,18 +14,13 @@ import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../qr/qr.dart';
+import '../send/pick_device.dart';
 import '../send/staged_sheet.dart';
 
 /// Home — nearby devices, quick actions. Listens to the device store only, so
 /// transfer/history changes never rebuild it.
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
-
-  void _todo(BuildContext context, String what) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text('$what is coming soon')));
-  }
 
   /// Open a search over discovered devices; on pick, send files to it.
   Future<void> _searchDevices(BuildContext context) async {
@@ -80,64 +75,24 @@ class HomeScreen extends StatelessWidget {
       return;
     }
     if (!context.mounted) return;
-    final device = await _pickOnlineDevice(context);
-    if (device == null || !context.mounted) return;
-    final target = scope.device.peerTarget(device.id);
-    if (target == null) {
-      snack('${device.name} is not reachable right now');
-      return;
-    }
+    final picked = await showDevicePicker(context);
+    if (picked == null || !context.mounted) return;
     try {
       final file = File(
         '${Directory.systemTemp.path}/peerbeam-clipboard-'
         '${DateTime.now().millisecondsSinceEpoch}.txt',
       );
       await file.writeAsString(txt);
-      await scope.transfer.send(target, [file.path]);
-      if (context.mounted) snack('Sending clipboard to ${device.name}');
+      await scope.transfer.send(picked.target, [file.path]);
+      if (context.mounted) snack('Sending clipboard to ${picked.name}');
     } catch (e) {
       if (context.mounted) snack(friendlyError(e));
     }
   }
 
-  /// Bottom-sheet picker of currently-online devices (snacks if none).
-  Future<Device?> _pickOnlineDevice(BuildContext context) {
-    final online = AppScope.of(
-      context,
-    ).device.devices.where((d) => d.online).toList();
-    if (online.isEmpty) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          const SnackBar(content: Text('No devices online to send to')),
-        );
-      return Future.value(null);
-    }
-    return showModalBottomSheet<Device>(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final d in online)
-              ListTile(
-                leading: Icon(d.kind.icon),
-                title: Text(d.name),
-                onTap: () => Navigator.pop(ctx, d),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Pick files with the native picker (desktop) and open the staged sheet.
+  /// Pick files with the native picker and open the staged sheet. Works on
+  /// desktop and Android (file_selector copies picks to app storage there).
   Future<void> _pickFiles(BuildContext context) async {
-    if (!isDesktop) {
-      _todo(context, 'Send files');
-      return;
-    }
     final staging = AppScope.of(context).staging;
     final picked = await pickFilesToStage();
     if (picked.isEmpty || !context.mounted) return;

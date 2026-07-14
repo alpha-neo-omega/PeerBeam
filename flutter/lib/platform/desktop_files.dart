@@ -11,8 +11,9 @@ bool get isDesktop =>
         defaultTargetPlatform == TargetPlatform.windows);
 
 /// Open the native file picker and return the chosen files as staged entries
-/// (path + size only — never read into memory). Empty if cancelled or if the
-/// platform has no picker. Works on Windows, macOS, and Linux.
+/// (path + size only — never read into memory). Empty if cancelled. Works on
+/// Windows, macOS, Linux, and Android (where picks are cached to app storage
+/// and a real file path is returned).
 Future<List<StagedFile>> pickFilesToStage() async {
   final files = await openFiles();
   final staged = <StagedFile>[];
