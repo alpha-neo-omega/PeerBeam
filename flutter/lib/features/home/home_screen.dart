@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../platform/desktop_files.dart';
 import '../../sdk/error_text.dart';
+import '../../sdk/models.dart' show PeerTarget;
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -35,6 +36,78 @@ class HomeScreen extends StatelessWidget {
     if (added > 0 && context.mounted) {
       showStagedFilesSheet(context, staging);
     }
+  }
+
+  /// Send to a manually-entered address (host/IP or MagicDNS name + port).
+  /// Covers peers that discovery can't surface — headless servers, or Tailscale
+  /// on platforms without a local tailnet API (e.g. Android).
+  Future<void> _sendToAddress(BuildContext context) async {
+    final scope = AppScope.of(context);
+    final target = await _promptForAddress(context);
+    if (target == null || !context.mounted) return;
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+    final picked = await pickFilesToStage();
+    if (picked.isEmpty || !context.mounted) return;
+    try {
+      await scope.transfer.send(target, picked.map((f) => f.path).toList());
+      if (context.mounted) snack('Sending ${picked.length} to ${target.name}');
+    } catch (e) {
+      if (context.mounted) snack(friendlyError(e));
+    }
+  }
+
+  /// Dialog to collect a host/IP (or MagicDNS name) and port → [PeerTarget].
+  Future<PeerTarget?> _promptForAddress(BuildContext context) {
+    final host = TextEditingController();
+    final port = TextEditingController(text: '49600');
+    return showDialog<PeerTarget>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Send to address'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: host,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Host / IP or MagicDNS name',
+                hintText: '100.73.134.21',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: port,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Port'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final h = host.text.trim();
+              final p = int.tryParse(port.text.trim()) ?? 0;
+              if (h.isEmpty || p <= 0 || p > 65535) {
+                Navigator.pop(context); // invalid → cancel
+                return;
+              }
+              Navigator.pop(
+                context,
+                PeerTarget(name: h, addresses: [h], port: p),
+              );
+            },
+            child: const Text('Choose file'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Pick files and send them to [device] through the engine (real transfer).
@@ -79,6 +152,11 @@ class HomeScreen extends StatelessWidget {
                     SliverAppBar.large(
                       title: const Text('PeerBeam'),
                       actions: [
+                        IconButton(
+                          icon: const Icon(Icons.dns_rounded),
+                          tooltip: 'Send to address',
+                          onPressed: () => _sendToAddress(context),
+                        ),
                         IconButton(
                           icon: const Icon(Icons.search_rounded),
                           tooltip: 'Search devices',
