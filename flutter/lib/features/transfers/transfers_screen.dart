@@ -30,12 +30,12 @@ class TransfersScreen extends StatelessWidget {
                 );
               }
               return ListView.builder(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(AppSpace.md),
                 itemCount: items.length,
                 itemBuilder: (context, i) => Appear(
                   index: i,
                   child: Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
+                    padding: const EdgeInsets.only(bottom: AppSpace.sm),
                     child: _TransferCard(transfer: items[i]),
                   ),
                 ),
@@ -47,6 +47,15 @@ class TransfersScreen extends StatelessWidget {
     );
   }
 }
+
+/// State → accent colour for the progress bar and status. Kept here (UI-only)
+/// so the shared model stays presentation-free.
+Color _stateColor(TransferState s, ColorScheme scheme) => switch (s) {
+  TransferState.completed => AppColors.success,
+  TransferState.failed => scheme.error,
+  TransferState.paused => AppColors.warning,
+  _ => scheme.primary,
+};
 
 class _TransferCard extends StatelessWidget {
   final Transfer transfer;
@@ -60,6 +69,7 @@ class _TransferCard extends StatelessWidget {
     final sending = transfer.direction == TransferDirection.sending;
     final paused = transfer.state == TransferState.paused;
     final pct = (transfer.progress * 100).round();
+    final accent = _stateColor(transfer.state, scheme);
     // An inbound transfer awaiting the user's approval — needs Accept/Decline,
     // not the pause/cancel controls.
     final awaitingApproval =
@@ -73,20 +83,32 @@ class _TransferCard extends StatelessWidget {
           '$pct percent, ${transfer.state.label}',
       child: Card(
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(AppSpace.md),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
                 children: [
-                  CircleAvatar(
-                    backgroundColor: scheme.primaryContainer,
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          accent.withValues(alpha: 0.22),
+                          accent.withValues(alpha: 0.10),
+                        ],
+                      ),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
+                    ),
                     child: Icon(
                       sending ? Icons.upload_rounded : Icons.download_rounded,
-                      color: scheme.onPrimaryContainer,
+                      color: accent,
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const Gap(AppSpace.sm),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -99,32 +121,48 @@ class _TransferCard extends StatelessWidget {
                             fontWeight: FontWeight.w600,
                           ),
                         ),
-                        Text(
-                          '${sending ? 'To' : 'From'} ${transfer.peerName} · ${transfer.state.label}',
-                          style: text.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                        const Gap(AppSpace.xxs),
+                        Row(
+                          children: [
+                            Text(
+                              '${sending ? 'To' : 'From'} ${transfer.peerName}',
+                              style: text.bodySmall?.copyWith(
+                                color: scheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const Gap(AppSpace.xs),
+                            _StatusChip(state: transfer.state, accent: accent),
+                          ],
                         ),
                       ],
                     ),
                   ),
+                  const Gap(AppSpace.xs),
+                  Text(
+                    '$pct%',
+                    style: text.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: accent,
+                    ),
+                  ),
                 ],
               ),
-              const SizedBox(height: 14),
+              const Gap(AppSpace.sm),
               TweenAnimationBuilder<double>(
                 tween: Tween(begin: 0, end: transfer.progress),
                 duration: AppMotion.duration(context, AppMotion.slow),
                 curve: AppMotion.curve,
                 builder: (context, value, _) => ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
                   child: LinearProgressIndicator(
                     value: value,
                     minHeight: 8,
+                    color: accent,
                     backgroundColor: scheme.surfaceContainerHighest,
                   ),
                 ),
               ),
-              const SizedBox(height: 8),
+              const Gap(AppSpace.xs),
               Row(
                 children: [
                   Text(
@@ -139,7 +177,7 @@ class _TransferCard extends StatelessWidget {
                       onPressed: () => state.transfer.reject(transfer.id),
                       child: const Text('Decline'),
                     ),
-                    const SizedBox(width: 8),
+                    const Gap(AppSpace.xs),
                     FilledButton(
                       onPressed: () => state.transfer.accept(transfer.id),
                       child: const Text('Accept'),
@@ -164,6 +202,31 @@ class _TransferCard extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact status pill tinted by the transfer state.
+class _StatusChip extends StatelessWidget {
+  final TransferState state;
+  final Color accent;
+  const _StatusChip({required this.state, required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpace.xs, vertical: 2),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: Text(
+        state.label,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: accent,
+          fontWeight: FontWeight.w700,
         ),
       ),
     );
