@@ -82,11 +82,54 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: android, path: dist/* }
 
-  # Publish the GitHub Release once the no-secret builds (Linux + Android) are
-  # done. macOS/Windows are not required — they only produce extra assets when
-  # their signing secrets are configured. Uses the built-in GITHUB_TOKEN.
+  # Standalone CLI binaries — pure cargo, no Flutter/signing, so they build fast
+  # and reliably for every desktop OS. The release waits on these (unlike the
+  # signed GUI jobs) so the CLI ships on every platform.
+  cli-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli
+      - name: Stage CLI + shell completions
+        run: |
+          mkdir -p out
+          cp rust/target/release/peerbeam out/peerbeam-linux-x64
+          rust/target/release/peerbeam completions bash > out/peerbeam.bash
+          rust/target/release/peerbeam completions zsh  > out/_peerbeam
+          rust/target/release/peerbeam completions fish > out/peerbeam.fish
+      - uses: actions/upload-artifact@v4
+        with: { name: cli-linux, path: out/* }
+
+  cli-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli
+      - run: mkdir -p out && cp rust/target/release/peerbeam out/peerbeam-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with: { name: cli-macos, path: out/* }
+
+  cli-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli
+      - name: Stage CLI
+        run: |
+          New-Item -ItemType Directory -Force -Path out
+          Copy-Item rust\target\release\peerbeam.exe out\peerbeam-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: cli-windows, path: out/* }
+
+  # Publish the GitHub Release. Requires the no-secret builds (Linux GUI +
+  # Android + the three CLI jobs); the signed GUI jobs (macOS/Windows DMG/MSIX)
+  # are intentionally NOT attached until their signing secrets exist. Uses the
+  # built-in GITHUB_TOKEN.
   release:
-    needs: [linux, android]
+    needs: [linux, android, cli-linux, cli-macos, cli-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -105,5 +148,6 @@ jobs:
           files: |
             artifacts/linux/*
             artifacts/android/*
-            artifacts/windows/*
-            artifacts/macos/*
+            artifacts/cli-linux/*
+            artifacts/cli-macos/*
+            artifacts/cli-windows/*

@@ -3,6 +3,31 @@
 `peerbeam` — a Rust frontend over `peerbeam-engine`, sibling to the Flutter
 client. Crate: `bins/peerbeam-cli` (lib + `peerbeam` bin).
 
+## Install
+
+**Prebuilt binaries** (attached to each [GitHub release](https://github.com/alpha-neo-omega/PeerBeam/releases)):
+
+```bash
+# Linux
+curl -LO https://github.com/alpha-neo-omega/PeerBeam/releases/latest/download/peerbeam-linux-x64
+chmod +x peerbeam-linux-x64 && sudo mv peerbeam-linux-x64 /usr/local/bin/peerbeam
+
+# macOS (arm64) — unsigned, so clear the download quarantine first
+chmod +x peerbeam-macos-arm64
+xattr -d com.apple.quarantine peerbeam-macos-arm64 2>/dev/null || true
+sudo mv peerbeam-macos-arm64 /usr/local/bin/peerbeam
+```
+
+Windows: download `peerbeam-windows-x64.exe` (SmartScreen may warn on an
+unsigned download — "More info" → "Run anyway"), put it on your `PATH`.
+
+Shell completions ship alongside the Linux binary (`peerbeam.bash`, `_peerbeam`,
+`peerbeam.fish`), or generate them anytime:
+`peerbeam completions <bash|zsh|fish|powershell>`.
+
+**From source:** `cargo build --release -p peerbeam-cli`
+(→ `rust/target/release/peerbeam`).
+
 ## The seven qualities
 
 | Quality | How |

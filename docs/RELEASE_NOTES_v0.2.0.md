@@ -36,12 +36,15 @@ Full, honest support status: [Stable Readiness](STABLE_READINESS.md) ·
 
 ## Artifacts
 
-- **Linux** — `peerbeam-*-linux-x64.tar.gz` (attached).
-- **Android** — APK (attached; debug-signed unless release keystore secrets are
-  configured in CI).
-- **Windows / macOS** — packaging is configured but not built in this release
-  (host signing secrets not yet set). Build from source meanwhile — see
-  [Build](BUILD.md).
+- **Desktop app (Linux)** — `peerbeam-*-linux-x64.tar.gz` + `.deb` (attached).
+- **CLI (all desktops)** — `peerbeam-linux-x64`, `peerbeam-macos-arm64`,
+  `peerbeam-windows-x64.exe`, plus Linux shell completions (attached; unsigned —
+  macOS/Windows may warn on a browser download, see [CLI](CLI.md)).
+- **Android** — APK/AAB (attached; debug-signed unless release keystore secrets
+  are configured in CI).
+- **Windows / macOS desktop app (DMG/MSIX)** — packaging is configured but not
+  attached until host signing secrets are set. Build from source meanwhile —
+  see [Build](BUILD.md).
 
 ## Install
 
