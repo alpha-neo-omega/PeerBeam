@@ -111,7 +111,9 @@ impl Default for EngineConfig {
                 scan_interval_ms: 2000,
             },
             transfer: TransferConfig {
-                chunk_size: 1024 * 1024,
+                // 64 KiB: fine-grained, smooth progress. Progress emission is
+                // time-throttled so small chunks don't flood the event bridge.
+                chunk_size: 64 * 1024,
                 max_concurrent: 3,
                 enable_compression: true,
                 enable_resume: true,

@@ -1023,10 +1023,20 @@ async fn serve_loop(
             }
         };
         // Human progress bar (created lazily once the total size is known).
+        // Throttle the back-channel report to ~20/s (always send the final) so
+        // small chunks don't spam the sender.
         let pump = async move {
+            use std::time::{Duration, Instant};
             let mut bar: Option<crate::output::Bar> = None;
+            let mut last = Instant::now()
+                .checked_sub(Duration::from_millis(100))
+                .unwrap_or_else(Instant::now);
             while let Some(p) = prx.recv().await {
-                let _ = rep_tx.send(p.transferred_bytes);
+                let is_final = p.total_bytes > 0 && p.transferred_bytes >= p.total_bytes;
+                if is_final || last.elapsed() >= Duration::from_millis(50) {
+                    last = Instant::now();
+                    let _ = rep_tx.send(p.transferred_bytes);
+                }
                 if !ctx.json {
                     let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
                     b.update(p.transferred_bytes);

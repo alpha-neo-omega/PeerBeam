@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
@@ -738,7 +738,11 @@ impl Manager {
 
 /// How long to wait for the peer's first progress report before assuming the
 /// peer doesn't support the back-channel and falling back to bytes-sent.
-const PEER_PROGRESS_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const PEER_PROGRESS_GRACE: Duration = Duration::from_secs(3);
+
+/// Minimum spacing between emitted progress updates (~20/s) — keeps small-chunk
+/// progress smooth without flooding the event bridge.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Run a transfer while pumping its progress into stats + `transfer_progress`
 /// events.
@@ -812,17 +816,32 @@ where
     let pump_id = id.clone();
     let pump_driving = peer_driving.clone();
     let pump = async move {
+        // Throttle emission/mirroring to ~20/s so small chunks stay smooth
+        // without flooding the event bridge; always let the final update through.
+        let mut last = Instant::now()
+            .checked_sub(PROGRESS_INTERVAL)
+            .unwrap_or_else(Instant::now);
         while let Some(p) = prx.recv().await {
-            let _ = out_tx.send(p.transferred_bytes); // receiver mirrors out
             if let Some(f) = &p.current_file {
                 *file.lock().unwrap() = f.clone();
             }
+            let is_final = p.total_bytes > 0 && p.transferred_bytes >= p.total_bytes;
+            let due = is_final || last.elapsed() >= PROGRESS_INTERVAL;
             // If the peer channel is driving the bar, only keep `total` fresh;
-            // don't emit bytes-sent (the in_task emits the peer's real count).
+            // the in_task emits the peer's real count.
             if pump_driving.load(Ordering::SeqCst) {
                 stats.lock().unwrap().total = p.total_bytes;
                 continue;
             }
+            if !due {
+                stats
+                    .lock()
+                    .unwrap()
+                    .update(p.transferred_bytes, p.total_bytes);
+                continue;
+            }
+            last = Instant::now();
+            let _ = out_tx.send(p.transferred_bytes); // receiver mirrors out
             let dto = {
                 let mut s = stats.lock().unwrap();
                 s.update(p.transferred_bytes, p.total_bytes);
