@@ -113,6 +113,9 @@ struct Active {
     stats: Arc<Mutex<Stats>>,
     file: Arc<Mutex<String>>,
     status: Mutex<String>,
+    /// The background task running this transfer, so cancel can abort it
+    /// immediately even if a send is blocked on a slow link.
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Active {
@@ -300,9 +303,11 @@ impl Manager {
 
             let mgr = self.clone();
             let device = device.clone();
-            crate::runtime::spawn(async move {
+            let active_handle = active.clone();
+            let h = crate::runtime::spawn_handle(async move {
                 mgr.run_send(id, active, device, path, name, size).await;
             });
+            *active_handle.task.lock().unwrap() = Some(h);
         }
         Ok(json!({ "ids": ids }))
     }
@@ -333,9 +338,11 @@ impl Manager {
 
         let mgr = self.clone();
         let id2 = id.clone();
-        crate::runtime::spawn(async move {
+        let active_handle = active.clone();
+        let h = crate::runtime::spawn_handle(async move {
             mgr.run_send_folder(id2, active, device, path).await;
         });
+        *active_handle.task.lock().unwrap() = Some(h);
         Ok(json!({ "id": id }))
     }
 
@@ -348,6 +355,7 @@ impl Manager {
             stats: Arc::new(Mutex::new(Stats::new())),
             file: Arc::new(Mutex::new(file.to_string())),
             status: Mutex::new("queued".to_string()),
+            task: Mutex::new(None),
         });
         self.active
             .lock()
@@ -562,14 +570,22 @@ impl Manager {
     pub fn cancel(&self, id: &str) -> Op {
         let a = self.get_active(id)?;
         a.ctrl.cancel();
+        // Abort the running task so cancel is immediate even if a chunk send is
+        // blocked on a slow link (the loop only checks `ctrl` between chunks).
+        if let Some(h) = a.task.lock().unwrap().take() {
+            h.abort();
+        }
         // If it is still awaiting accept/reject, the receive task is parked on
         // the approval channel and never checks `ctrl`. Fire the pending sender
-        // with `false` so it unblocks, rejects, and cleans up — otherwise
-        // cancel would silently hang the transfer and leak the pending entry.
+        // with `false` so it unblocks and cleans up.
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
             let _ = tx.send(false);
         }
-        Ok(json!({ "cancelling": true }))
+        // An aborted task won't run finish(); do the cleanup + notify here.
+        *a.status.lock().unwrap() = "cancelled".into();
+        events::transfer(id, "transfer_cancelled", json!({}));
+        self.active.lock().unwrap().remove(id);
+        Ok(json!({ "cancelled": true }))
     }
 
     pub fn accept(&self, id: &str) -> Op {
@@ -801,15 +817,30 @@ where
         };
         // First report has a grace window; if it never comes, leave the bar to
         // the bytes-sent fallback in the pump.
-        match tokio::time::timeout(PEER_PROGRESS_GRACE, source.recv()).await {
+        let mut latest = match tokio::time::timeout(PEER_PROGRESS_GRACE, source.recv()).await {
             Ok(Ok(Some(first))) => {
                 in_driving.store(true, Ordering::SeqCst);
                 emit_peer(&in_id, &in_stats, first);
+                first
             }
             _ => return,
-        }
-        while let Ok(Some(bytes)) = source.recv().await {
-            emit_peer(&in_id, &in_stats, bytes);
+        };
+        // Emit on each report (up to ~20/s), and at least once a second as a
+        // heartbeat so speed/ETA keep ticking and the bar never looks frozen on
+        // a slow/stalled link.
+        let mut beat = tokio::time::interval(Duration::from_secs(1));
+        beat.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                r = source.recv() => match r {
+                    Ok(Some(bytes)) => {
+                        latest = bytes;
+                        emit_peer(&in_id, &in_stats, latest);
+                    }
+                    _ => break,
+                },
+                _ = beat.tick() => emit_peer(&in_id, &in_stats, latest),
+            }
         }
     };
 
