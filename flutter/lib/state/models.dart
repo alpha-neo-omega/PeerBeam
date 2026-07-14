@@ -78,6 +78,12 @@ class Transfer {
   final int totalBytes;
   final int doneBytes;
 
+  /// Current speed in bytes/second (0 when unknown/idle).
+  final double speedBps;
+
+  /// Estimated seconds remaining, or null when unknown.
+  final int? etaSecs;
+
   const Transfer({
     required this.id,
     required this.peerName,
@@ -86,11 +92,18 @@ class Transfer {
     required this.state,
     required this.totalBytes,
     required this.doneBytes,
+    this.speedBps = 0,
+    this.etaSecs,
   });
 
   double get progress => totalBytes == 0 ? 0 : doneBytes / totalBytes;
 
-  Transfer copyWith({TransferState? state, int? doneBytes}) => Transfer(
+  Transfer copyWith({
+    TransferState? state,
+    int? doneBytes,
+    double? speedBps,
+    int? etaSecs,
+  }) => Transfer(
     id: id,
     peerName: peerName,
     fileName: fileName,
@@ -98,6 +111,8 @@ class Transfer {
     state: state ?? this.state,
     totalBytes: totalBytes,
     doneBytes: doneBytes ?? this.doneBytes,
+    speedBps: speedBps ?? this.speedBps,
+    etaSecs: etaSecs ?? this.etaSecs,
   );
 }
 
@@ -132,4 +147,21 @@ String formatBytes(int bytes) {
   }
   final rounded = unit == 0 ? size.toStringAsFixed(0) : size.toStringAsFixed(1);
   return '$rounded ${units[unit]}';
+}
+
+/// Human-readable transfer speed, e.g. `1.2 MB/s`. Empty when idle/unknown.
+String formatSpeed(double bytesPerSecond) {
+  if (bytesPerSecond <= 0) return '';
+  return '${formatBytes(bytesPerSecond.round())}/s';
+}
+
+/// Human-readable ETA, e.g. `45s left` / `3m 20s left`. Empty when unknown.
+String formatEta(int? seconds) {
+  if (seconds == null || seconds < 0) return '';
+  if (seconds < 60) return '${seconds}s left';
+  final m = seconds ~/ 60;
+  final s = seconds % 60;
+  if (m < 60) return s == 0 ? '${m}m left' : '${m}m ${s}s left';
+  final h = m ~/ 60;
+  return '${h}h ${m % 60}m left';
 }

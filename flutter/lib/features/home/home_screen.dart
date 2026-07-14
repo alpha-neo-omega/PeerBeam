@@ -24,6 +24,17 @@ class HomeScreen extends StatelessWidget {
       ..showSnackBar(SnackBar(content: Text('$what is coming soon')));
   }
 
+  /// Open a search over discovered devices; on pick, send files to it.
+  Future<void> _searchDevices(BuildContext context) async {
+    final devices = AppScope.of(context).device.devices;
+    final device = await showSearch<Device?>(
+      context: context,
+      delegate: _DeviceSearchDelegate(devices),
+    );
+    if (device == null || !context.mounted) return;
+    await _sendTo(context, device);
+  }
+
   /// Pick files with the native picker (desktop) and open the staged sheet.
   Future<void> _pickFiles(BuildContext context) async {
     if (!isDesktop) {
@@ -236,7 +247,7 @@ class HomeScreen extends StatelessWidget {
                         IconButton(
                           icon: const Icon(Icons.search_rounded),
                           tooltip: 'Search devices',
-                          onPressed: () => _todo(context, 'Search'),
+                          onPressed: () => _searchDevices(context),
                         ),
                         const Gap(AppSpace.xs),
                       ],
@@ -499,6 +510,65 @@ class _SavedDeviceCard extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Searches the discovered-device list by name. Returns the chosen [Device] via
+/// `close`, or null when dismissed. Operates on a snapshot passed at open time.
+class _DeviceSearchDelegate extends SearchDelegate<Device?> {
+  final List<Device> devices;
+  _DeviceSearchDelegate(this.devices)
+    : super(searchFieldLabel: 'Search devices');
+
+  List<Device> get _matches {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return devices;
+    return devices.where((d) => d.name.toLowerCase().contains(q)).toList();
+  }
+
+  @override
+  List<Widget> buildActions(BuildContext context) => [
+    if (query.isNotEmpty)
+      IconButton(
+        tooltip: 'Clear',
+        icon: const Icon(Icons.clear_rounded),
+        onPressed: () => query = '',
+      ),
+  ];
+
+  @override
+  Widget buildLeading(BuildContext context) => IconButton(
+    tooltip: 'Back',
+    icon: const Icon(Icons.arrow_back_rounded),
+    onPressed: () => close(context, null),
+  );
+
+  @override
+  Widget buildResults(BuildContext context) => _list(context);
+
+  @override
+  Widget buildSuggestions(BuildContext context) => _list(context);
+
+  Widget _list(BuildContext context) {
+    final matches = _matches;
+    if (matches.isEmpty) {
+      return const EmptyState(
+        icon: Icons.search_off_rounded,
+        title: 'No matches',
+        message: 'No discovered device matches that name.',
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(AppSpace.md),
+      itemCount: matches.length,
+      itemBuilder: (context, i) => Padding(
+        padding: const EdgeInsets.only(bottom: AppSpace.xs),
+        child: DeviceTile(
+          device: matches[i],
+          onSend: () => close(context, matches[i]),
         ),
       ),
     );

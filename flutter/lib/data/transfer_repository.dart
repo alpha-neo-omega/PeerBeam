@@ -72,10 +72,13 @@ class TransferRepository extends ChangeNotifier {
           state: TransferState.transferring,
           done: s?.transferredBytes,
           total: s?.totalBytes,
+          speed: s?.currentSpeed,
+          eta: s?.etaSecs,
           file: e.file,
         );
       case 'transfer_paused':
-        _update(id, state: TransferState.paused);
+        // Freeze the rate readout while paused.
+        _update(id, state: TransferState.paused, speed: 0, eta: null);
       case 'transfer_resumed':
         _update(id, state: TransferState.transferring);
       case 'transfer_completed':
@@ -94,11 +97,17 @@ class TransferRepository extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Sentinel for "leave etaSecs unchanged" — distinct from an explicit `null`
+  /// (which means "ETA now unknown", e.g. on pause).
+  static const Object _unset = Object();
+
   void _update(
     String id, {
     TransferState? state,
     int? done,
     int? total,
+    double? speed,
+    Object? eta = _unset,
     String? file,
   }) {
     final t = _byId[id];
@@ -111,6 +120,8 @@ class TransferRepository extends ChangeNotifier {
       state: state ?? t.state,
       totalBytes: total ?? t.totalBytes,
       doneBytes: done ?? t.doneBytes,
+      speedBps: speed ?? t.speedBps,
+      etaSecs: identical(eta, _unset) ? t.etaSecs : eta as int?,
     );
   }
 

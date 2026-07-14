@@ -57,6 +57,21 @@ Color _stateColor(TransferState s, ColorScheme scheme) => switch (s) {
   _ => scheme.primary,
 };
 
+/// Progress meta line: `done / total · speed · ETA`. Speed/ETA only while
+/// actively transferring (and only when the engine reports them).
+String _meta(Transfer t) {
+  final parts = <String>[
+    '${formatBytes(t.doneBytes)} / ${formatBytes(t.totalBytes)}',
+  ];
+  if (t.state == TransferState.transferring) {
+    final speed = formatSpeed(t.speedBps);
+    final eta = formatEta(t.etaSecs);
+    if (speed.isNotEmpty) parts.add(speed);
+    if (eta.isNotEmpty) parts.add(eta);
+  }
+  return parts.join(' · ');
+}
+
 class _TransferCard extends StatelessWidget {
   final Transfer transfer;
   const _TransferCard({required this.transfer});
@@ -165,13 +180,17 @@ class _TransferCard extends StatelessWidget {
               const Gap(AppSpace.xs),
               Row(
                 children: [
-                  Text(
-                    '${formatBytes(transfer.doneBytes)} / ${formatBytes(transfer.totalBytes)}',
-                    style: text.bodySmall?.copyWith(
-                      color: scheme.onSurfaceVariant,
+                  Expanded(
+                    child: Text(
+                      _meta(transfer),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
-                  const Spacer(),
+                  const Gap(AppSpace.xs),
                   if (awaitingApproval) ...[
                     TextButton(
                       onPressed: () => state.transfer.reject(transfer.id),

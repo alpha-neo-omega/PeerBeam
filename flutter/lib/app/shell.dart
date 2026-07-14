@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../features/send/drop_zone.dart';
 import '../state/app_scope.dart';
+import '../widgets/brand_mark.dart';
 import 'theme.dart';
 
 /// Responsive application shell. Chooses the navigation affordance by window
@@ -146,43 +147,12 @@ class _RailLeading extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(
         vertical: AppSpace.lg,
         horizontal: AppSpace.sm,
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [scheme.primary, scheme.tertiary],
-              ),
-              borderRadius: BorderRadius.circular(AppRadius.md),
-            ),
-            child: const Icon(
-              Icons.bolt_rounded,
-              color: Colors.white,
-              size: AppIcons.md,
-            ),
-          ),
-          if (extended) ...[
-            const Gap(AppSpace.xs),
-            Text(
-              'PeerBeam',
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-            ),
-          ],
-        ],
-      ),
+      child: BrandLockup(showWordmark: extended),
     );
   }
 }
