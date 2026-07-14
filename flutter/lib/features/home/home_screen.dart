@@ -24,7 +24,9 @@ class HomeScreen extends StatelessWidget {
 
   /// Open a search over discovered devices; on pick, send files to it.
   Future<void> _searchDevices(BuildContext context) async {
-    final devices = AppScope.of(context).device.devices;
+    final devices = AppScope.of(
+      context,
+    ).device.devices.where((d) => d.online).toList();
     final device = await showSearch<Device?>(
       context: context,
       delegate: _DeviceSearchDelegate(devices),
@@ -284,7 +286,11 @@ class HomeScreen extends StatelessWidget {
             child: AnimatedBuilder(
               animation: Listenable.merge([state.device, state.saved]),
               builder: (context, _) {
-                final devices = state.device.devices;
+                // Nearby shows live peers only — a device that drops offline
+                // disappears (the engine still tracks it; the CLI can list it).
+                final devices = state.device.devices
+                    .where((d) => d.online)
+                    .toList();
                 final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [
