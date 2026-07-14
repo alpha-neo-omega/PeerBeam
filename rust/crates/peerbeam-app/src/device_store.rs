@@ -129,6 +129,23 @@ impl DeviceStore {
         };
         entry.providers.remove(provider);
 
+        // A LAN provider's Lost is subnet-wide liveness evidence: the peer's
+        // heartbeat on this network stopped. Other LAN claims (e.g. an mDNS
+        // cache entry that never got a goodbye because the peer died
+        // uncleanly) are not independent proof of life — drop them with it.
+        // Cross-subnet claims (Tailscale) are a different path and keep the
+        // device online.
+        let lost_lan = self
+            .provider_caps
+            .get(provider)
+            .is_some_and(|c| !c.crosses_subnet);
+        if lost_lan {
+            let caps = &self.provider_caps;
+            entry
+                .providers
+                .retain(|p| caps.get(p).is_some_and(|c| c.crosses_subnet));
+        }
+
         if entry.providers.is_empty() {
             entry.online = false;
             vec![DeviceChange::StatusChanged {
@@ -322,6 +339,15 @@ mod tests {
                 can_scan: true,
                 crosses_subnet: true,
                 requires_tailscale: true,
+            },
+        );
+        m.insert(
+            ProviderId::from("mdns"),
+            DiscoveryCaps {
+                can_advertise: true,
+                can_scan: true,
+                crosses_subnet: false,
+                requires_tailscale: false,
             },
         );
         m
@@ -655,5 +681,59 @@ mod tests {
         assert!(snap[0].online, "online device first");
         assert_eq!(snap[0].device.name, "Alpha");
         assert!(!snap[1].online);
+    }
+
+    /// A LAN provider's Lost must also drop other LAN claims: an mDNS cache
+    /// entry with no goodbye is not independent liveness, so the device goes
+    /// offline instead of lingering "online" for the mDNS TTL (~minutes).
+    #[test]
+    fn lan_lost_collapses_other_lan_claims() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "192.168.1.9")),
+        );
+        store.observe(
+            &ProviderId::from("mdns"),
+            DiscoveryEvent::Found(device("a", "Alice", "192.168.1.9")),
+        );
+
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        assert!(
+            matches!(
+                changes.as_slice(),
+                [DeviceChange::StatusChanged { online: false, .. }]
+            ),
+            "expected offline, got {changes:?}"
+        );
+        assert!(!store.snapshot()[0].online);
+    }
+
+    /// A cross-subnet claim (Tailscale) is a different network path — it keeps
+    /// the device online when a LAN provider loses it.
+    #[test]
+    fn lan_lost_keeps_cross_subnet_claim() {
+        let mut store = DeviceStore::new(caps_map());
+        store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Found(device("a", "Alice", "192.168.1.9")),
+        );
+        store.observe(
+            &ProviderId::from("tailscale"),
+            DiscoveryEvent::Found(device("a", "Alice", "100.64.0.9")),
+        );
+
+        let changes = store.observe(
+            &ProviderId::from("udp"),
+            DiscoveryEvent::Lost(DeviceId::from("a")),
+        );
+        assert!(
+            matches!(changes.as_slice(), [DeviceChange::Updated(_)]),
+            "expected Updated (still online), got {changes:?}"
+        );
+        assert!(store.snapshot()[0].online);
     }
 }
