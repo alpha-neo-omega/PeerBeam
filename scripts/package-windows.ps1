@@ -27,4 +27,17 @@ if ($env:PB_CERT_PATH) {
 dart run msix:create @args
 Pop-Location
 
-Write-Host "== done. MSIX under flutter/build/windows/x64/runner/Release/ =="
+Write-Host "== portable zip (no signing needed; unzip and run peerbeam.exe) =="
+$ver = (Get-Content VERSION -Raw).Trim()
+if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME.StartsWith("v")) {
+  $ver = $env:GITHUB_REF_NAME.Substring(1)
+}
+New-Item -ItemType Directory -Force -Path dist | Out-Null
+$release = "flutter\build\windows\x64\runner\Release"
+$zip = "dist\peerbeam-$ver-windows-x64-portable.zip"
+# Everything in the runner output except the MSIX (shipped separately).
+# (-Path with an array: piping into Compress-Archive -Force would recreate
+# the archive per item and keep only the last one.)
+$items = (Get-ChildItem $release -Exclude *.msix).FullName
+Compress-Archive -Path $items -DestinationPath $zip -Force
+Write-Host "== done. MSIX under $release; portable zip under dist/ =="

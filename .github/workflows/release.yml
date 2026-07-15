@@ -38,7 +38,11 @@ jobs:
           PB_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: powershell -File scripts/package-windows.ps1
       - uses: actions/upload-artifact@v4
-        with: { name: windows, path: flutter/build/windows/x64/runner/Release/*.msix }
+        with:
+          name: windows
+          path: |
+            flutter/build/windows/x64/runner/Release/*.msix
+            dist/*.zip
 
   macos:
     runs-on: macos-latest
@@ -133,7 +137,7 @@ jobs:
   # are intentionally NOT attached until their signing secrets exist. Uses the
   # built-in GITHUB_TOKEN.
   release:
-    needs: [linux, android, cli-linux, cli-macos, cli-windows]
+    needs: [linux, windows, android, cli-linux, cli-macos, cli-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -166,6 +170,11 @@ jobs:
           mapfile -t files < <(find artifacts/linux artifacts/android \
             artifacts/cli-linux artifacts/cli-macos artifacts/cli-windows \
             -maxdepth 1 -type f 2>/dev/null)
+          # Windows GUI ships as the portable zip only (MSIX awaits signing).
+          # The windows artifact preserves subdirs (multi-path upload), so
+          # search at any depth; the basename is unique.
+          mapfile -t -O "${#files[@]}" files < <(find artifacts/windows \
+            -type f -name '*.zip' 2>/dev/null)
           printf 'upload: %s\n' "${files[@]}"
           if ! gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
