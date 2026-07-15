@@ -4,7 +4,10 @@
 # failed, when absent).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VER="$(cat VERSION)"
+# In CI the tag is the source of truth; VERSION is the local fallback.
+VER="${GITHUB_REF_NAME:-}"
+VER="${VER#v}"
+[ -n "$VER" ] || VER="$(cat VERSION)"
 DIST="dist"
 APP="peerbeam"
 mkdir -p "$DIST"

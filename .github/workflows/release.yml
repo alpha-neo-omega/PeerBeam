@@ -24,6 +24,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    # Needs the MSIX signing cert; don't fail the release run if absent.
+    continue-on-error: true
     # Needs signing secrets; don't block the release if they're absent.
     continue-on-error: true
     steps:
@@ -146,7 +148,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: docs/RELEASE_NOTES_v0.2.1.md
+          body_path: docs/RELEASE_NOTES_${{ github.ref_name }}.md
           prerelease: true
           fail_on_unmatched_files: false
           files: |
