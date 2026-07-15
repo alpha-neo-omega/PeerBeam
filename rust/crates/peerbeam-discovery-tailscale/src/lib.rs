@@ -68,8 +68,10 @@ pub struct Config {
     pub poll_interval: Duration,
     /// Include peers Tailscale reports as offline.
     pub include_offline: bool,
-    /// Transfer port stamped on discovered peers (0 = unknown; the transfer
-    /// handshake resolves the real port).
+    /// Transfer port stamped on discovered peers. `tailscale status` reports
+    /// only tailnet IPs, not the app's port, so callers stamp their configured
+    /// transfer port (peers use the same port by convention). 0 leaves peers
+    /// portless — and therefore un-dialable — so set this.
     pub peer_port: u16,
 }
 

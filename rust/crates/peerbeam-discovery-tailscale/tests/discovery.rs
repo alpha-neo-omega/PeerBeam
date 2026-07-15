@@ -73,12 +73,25 @@ async fn discovers_then_loses_tailnet_peers() {
     let deadline = Duration::from_secs(2);
     while founds.len() < 2 || losts.is_empty() {
         match timeout(deadline, events.next()).await {
-            Ok(Some(DiscoveryEvent::Found(d))) => founds.push(d.id),
+            Ok(Some(DiscoveryEvent::Found(d))) => founds.push(d),
             Ok(Some(DiscoveryEvent::Lost(id))) => losts.push(id),
             Ok(Some(_)) => {}
             _ => break,
         }
     }
+
+    // Discovered peers must carry the configured transfer port + an address,
+    // or a send can't dial them ("not reachable"). Regression: peer_port used
+    // to default to 0, leaving Tailscale peers un-dialable.
+    for d in &founds {
+        assert_eq!(d.port, 4200, "peer {} must carry the stamped port", d.id.0);
+        assert!(
+            !d.addresses.is_empty(),
+            "peer {} must have an address",
+            d.id.0
+        );
+    }
+    let founds: Vec<DeviceId> = founds.into_iter().map(|d| d.id).collect();
 
     assert!(
         founds.contains(&DeviceId::from("ts:n1")),

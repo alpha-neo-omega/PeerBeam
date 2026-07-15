@@ -41,13 +41,19 @@ pub fn me(config: &EngineConfig) -> Device {
 /// daemon can't start; Tailscale is scan-only and harmless when absent.
 pub fn build_engine(config: EngineConfig) -> Engine {
     let id = device_id();
+    // Stamp our transfer port on Tailscale-discovered peers so they're
+    // dialable (tailscale status reports IPs only; peers share the port).
+    let ts = TsConfig {
+        peer_port: config.transfer.port,
+        ..TsConfig::default()
+    };
     let mut builder =
         EngineBuilder::new(config).with_discovery(Arc::new(UdpDiscovery::new(id.clone())));
 
     if let Ok(mdns) = MdnsDiscovery::new(id.clone()) {
         builder = builder.with_discovery(Arc::new(mdns));
     }
-    builder = builder.with_discovery(Arc::new(TailscaleDiscovery::new(TsConfig::default())));
+    builder = builder.with_discovery(Arc::new(TailscaleDiscovery::new(ts)));
 
     // No required singleton providers, so build never fails here.
     builder.build().expect("engine builds")

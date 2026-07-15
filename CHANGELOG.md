@@ -72,6 +72,10 @@ See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
   from boot.
 
 ### Fixed
+- Tailscale-discovered peers are now reachable: they were stamped with port 0
+  ('not reachable right now' on send) because `tailscale status` reports only
+  tailnet IPs. Both frontends now stamp the configured transfer port on
+  Tailscale peers. Live-verified desktop -> phone over Tailscale.
 - Windows GUI no longer flashes a console window on every discovery tick
   (the Tailscale status probe now spawns with CREATE_NO_WINDOW).
 - Folder transfers no longer silently drop zero-byte files (both the send-side

@@ -121,7 +121,10 @@ pub fn init(config_json: &str) -> OpResult {
     if let Ok(mdns) = MdnsDiscovery::new(id.clone()) {
         builder = builder.with_discovery(Arc::new(mdns));
     }
-    builder = builder.with_discovery(Arc::new(TailscaleDiscovery::new(TsConfig::default())));
+    builder = builder.with_discovery(Arc::new(TailscaleDiscovery::new(TsConfig {
+        peer_port: config.transfer.port,
+        ..TsConfig::default()
+    })));
     let engine = Arc::new(builder.build().map_err(crate::error::from_engine)?);
 
     // Forward device-list changes to Dart as events (no polling).
