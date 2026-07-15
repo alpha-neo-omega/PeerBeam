@@ -9,6 +9,7 @@ import '../../sdk/models.dart' show PeerTarget;
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
+import '../../widgets/brand_mark.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../qr/qr.dart';
@@ -134,7 +135,6 @@ class HomeScreen extends StatelessWidget {
               autofocus: true,
               decoration: const InputDecoration(
                 labelText: 'Host / IP or MagicDNS name',
-                hintText: '100.73.134.21',
               ),
             ),
             const Gap(AppSpace.sm),
@@ -186,17 +186,13 @@ class HomeScreen extends StatelessWidget {
             TextField(
               controller: name,
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Name',
-                hintText: 'Living-room server',
-              ),
+              decoration: const InputDecoration(labelText: 'Name'),
             ),
             const Gap(AppSpace.sm),
             TextField(
               controller: host,
               decoration: const InputDecoration(
                 labelText: 'Host / IP or MagicDNS name',
-                hintText: '100.73.134.21',
               ),
             ),
             const Gap(AppSpace.sm),
@@ -341,8 +337,15 @@ class HomeScreen extends StatelessWidget {
                 final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [
-                    SliverAppBar.medium(
-                      title: const Text('PeerBeam'),
+                    // Brand only on compact (no rail): the nav rail already
+                    // shows the logo + wordmark on wider layouts, so the bar
+                    // there carries just its actions — no duplicate "PeerBeam".
+                    SliverAppBar(
+                      pinned: true,
+                      title:
+                          MediaQuery.sizeOf(context).width < Breakpoints.compact
+                          ? const BrandLockup()
+                          : null,
                       actions: [
                         IconButton(
                           icon: const Icon(Icons.dns_rounded),

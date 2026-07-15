@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.peerbeam" "\0"
-            VALUE "FileDescription", "peerbeam" "\0"
+            VALUE "FileDescription", "PeerBeam" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "peerbeam" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.peerbeam. All rights reserved." "\0"
             VALUE "OriginalFilename", "peerbeam.exe" "\0"
-            VALUE "ProductName", "peerbeam" "\0"
+            VALUE "ProductName", "PeerBeam" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

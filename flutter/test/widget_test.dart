@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/main.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/widgets/brand_mark.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
@@ -19,7 +20,9 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.text('PeerBeam'), findsWidgets);
+    // Branding is the logo mark (rail/app bar), not a literal word at every
+    // width — assert the mark renders.
+    expect(find.byType(PeerBeamMark), findsWidgets);
     expect(find.text('Nearby devices'), findsOneWidget);
 
     // Emit a live discovery event; the UI must react (no polling, no seed).

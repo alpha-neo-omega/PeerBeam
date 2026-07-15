@@ -10,6 +10,9 @@ class MainFlutterWindow: NSWindow {
 
     RegisterGeneratedPlugins(registry: flutterViewController)
 
+    // Display title (PRODUCT_NAME stays lowercase for the bundle/binary name).
+    self.title = "PeerBeam"
+
     super.awakeFromNib()
   }
 }
