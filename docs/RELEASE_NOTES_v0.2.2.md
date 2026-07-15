@@ -22,6 +22,11 @@ share flows people actually use — plus a full visual overhaul.
 - **Trusted devices** get a management screen: see every pinned peer's key
   fingerprint, revoke to force re-approval.
 
+### CLI grows up
+- `peerbeam clipboard send|get` and `peerbeam history` are real commands now
+  (previously gated stubs) — stdin-friendly for headless boxes, NDJSON for
+  scripts, same wire convention as the app.
+
 ### Sharing, everywhere
 - **Android share sheet**: "Share → PeerBeam" from any app now completes the
   whole flow — files or text.

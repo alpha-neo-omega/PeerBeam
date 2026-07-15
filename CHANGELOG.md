@@ -13,6 +13,10 @@ _Nothing yet._
 See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
 
 ### Added
+- **CLI clipboard + history**: `peerbeam clipboard send` (argument, stdin, or
+  system clipboard; same wire convention as the app, so receivers offer Copy),
+  `clipboard get` (prints the newest received text), and `peerbeam history`
+  (persisted, `--limit`/`--clear`, human or NDJSON). Both were gated stubs.
 - **Settings persist** and reach the engine: device name, save directory,
   auto-accept, theme, and toggles survive restarts and apply at init.
 - **Transfer history persists** across restarts (bounded to the most recent

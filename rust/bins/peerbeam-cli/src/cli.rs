@@ -127,10 +127,15 @@ pub struct ClipboardArgs {
 
 #[derive(Subcommand)]
 pub enum ClipboardAction {
-    /// Send text (argument, or stdin) to a peer.
+    /// Send text (argument, stdin, or the system clipboard) to a peer.
     Send {
+        /// Target device (id, name, or name prefix).
         #[arg(long)]
         to: Option<String>,
+        /// Dial a peer directly at `IP:PORT`, skipping discovery.
+        #[arg(long, value_name = "IP:PORT", conflicts_with = "to")]
+        addr: Option<String>,
+        /// Text to send. Omit to read stdin (if piped) or the system clipboard.
         text: Option<String>,
     },
     /// Print the last received clipboard content.

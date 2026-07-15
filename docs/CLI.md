@@ -82,12 +82,21 @@ Working now:
   after one transfer; `--port 0` picks an OS port (printed on start).
 - `daemon start [--foreground]` — run the receive loop until interrupted.
   (`daemon stop|status` need the IPC layer — not built yet, exit code 8.)
+- `clipboard send [--to NAME | --addr IP:PORT] [TEXT]` — send text using the
+  clipboard wire convention (receiving apps offer one-tap Copy). Text source
+  priority: argument → piped stdin → the system clipboard. Headless-friendly:
+  `echo hi | peerbeam clipboard send --addr host:49600`.
+- `clipboard get` — print the newest received clipboard text raw to stdout
+  (pipes cleanly, e.g. `peerbeam clipboard get | wl-copy`).
+- `history [--limit N] [--clear]` — persisted transfer history (sends and
+  receives, success or failure), `<data_dir>/history.json`, same schema as the
+  app engine's history, bounded to the 500 most recent.
 
 Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
 application-layer X25519 mutual-auth handshake with TOFU trust pinning and
 per-frame replay protection ([Security](SECURITY.md)).
 
-Still gated (exit code 8): `clipboard`, `history`, and `daemon stop|status`.
+Still gated (exit code 8): `daemon stop|status`.
 
 ## Global flags
 
@@ -163,9 +172,8 @@ smoke-tested incl. `send`/`receive` over both discovery and `--addr`.
 
 ## Not yet
 
-`clipboard` and `history` execution, and the `daemon stop|status` IPC, are still
-gated (exit code 8). Folder send (`send <dir>`) is not wired yet — send files
-for now.
+The `daemon stop|status` IPC is still gated (exit code 8). Folder send
+(`send <dir>`) is not wired yet — send files for now.
 
 ## Engine daemon vs CLI
 

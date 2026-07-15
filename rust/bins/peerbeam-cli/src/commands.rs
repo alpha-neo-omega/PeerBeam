@@ -24,7 +24,7 @@ use crate::cli::*;
 use crate::engine::{build_engine, config_path, me};
 use crate::exit::{CliError, CliResult};
 use crate::output::Ctx;
-use crate::{prompt, resolve};
+use crate::{history, prompt, resolve};
 
 pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> CliResult {
     match cmd {
@@ -37,8 +37,8 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Completions { shell } => completions(shell),
         Command::Send(a) => send(ctx, a, cfg_override.as_deref()).await,
         Command::Receive(a) => receive(ctx, a, cfg_override.as_deref()).await,
-        Command::Clipboard(_) => gated("clipboard"),
-        Command::History(_) => gated("history"),
+        Command::Clipboard(a) => clipboard(ctx, a, cfg_override.as_deref()).await,
+        Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
     }
 }
@@ -763,6 +763,7 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
     let storage = FsStorage::new();
     let chunk = config.transfer.chunk_size.max(1) as u32;
 
+    let hist = history::path_for(&config.storage.data_directory);
     for p in &args.paths {
         let path = std::path::Path::new(p);
         let name = path
@@ -770,7 +771,12 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file.bin".into());
         let size = std::fs::metadata(path)?.len();
-        secure_send_file(ctx, &routes, &target, &sc, &storage, p, &name, size, chunk).await?;
+        let r = secure_send_file(ctx, &routes, &target, &sc, &storage, p, &name, size, chunk).await;
+        history::record(
+            &hist,
+            history::entry("sending", &target.name, &name, p, size, r.is_ok()),
+        );
+        r?;
     }
     Ok(())
 }
@@ -1048,8 +1054,17 @@ async fn serve_loop(
             }
         };
         let (r, _, _) = tokio::join!(recv, pump, report);
+        let hist = history::path_for(&config.storage.data_directory);
         match r {
             Ok(rcv) => {
+                let saved = std::path::Path::new(dir)
+                    .join(&rcv.name)
+                    .to_string_lossy()
+                    .into_owned();
+                history::record(
+                    &hist,
+                    history::entry("receiving", &peer_id, &rcv.name, &saved, rcv.bytes, true),
+                );
                 if ctx.json {
                     ctx.json_line(&json!({
                         "event": "received",
@@ -1063,6 +1078,10 @@ async fn serve_loop(
                 }
             }
             Err(e) => {
+                history::record(
+                    &hist,
+                    history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
+                );
                 if ctx.json {
                     ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
                 } else {
@@ -1140,11 +1159,150 @@ fn resolve_peer(
     }
 }
 
-fn gated(what: &str) -> CliResult {
-    Err(CliError::Unavailable(format!(
-        "`{what}` needs the transport bridge (QUIC provider), not built yet"
-    )))
+/// `peerbeam history` — list (or clear) the persisted transfer history.
+fn history_cmd(ctx: &Ctx, args: HistoryArgs, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let path = history::path_for(&config.storage.data_directory);
+
+    if args.clear {
+        history::clear(&path);
+        if ctx.json {
+            ctx.json_line(&json!({"event": "history_cleared"}));
+        } else {
+            ctx.line("history cleared");
+        }
+        return Ok(());
+    }
+
+    let entries = history::load(&path);
+    let shown = entries.iter().rev().take(args.limit).collect::<Vec<_>>();
+    if ctx.json {
+        for e in shown.iter().rev() {
+            ctx.json_line(&json!({
+                "event": "history",
+                "id": e.id, "direction": e.direction, "peer": e.peer,
+                "file": e.file, "path": e.path, "bytes": e.bytes,
+                "success": e.success, "at": e.at,
+            }));
+        }
+        return Ok(());
+    }
+    if shown.is_empty() {
+        ctx.line("no transfers yet");
+        return Ok(());
+    }
+    for e in shown.iter().rev() {
+        let arrow = if e.direction == "sending" { "->" } else { "<-" };
+        let status = if e.success {
+            ctx.green("ok")
+        } else {
+            ctx.red("failed")
+        };
+        ctx.line(&format!(
+            "{}  {} {} {}  {} bytes  {}",
+            e.at, arrow, e.peer, e.file, e.bytes, status
+        ));
+    }
+    Ok(())
 }
+
+/// `peerbeam clipboard` — send text to a peer / print the last received text.
+async fn clipboard(ctx: &Ctx, args: ClipboardArgs, path_override: Option<&str>) -> CliResult {
+    match args.action {
+        ClipboardAction::Get => clipboard_get(ctx, path_override),
+        ClipboardAction::Send { to, addr, text } => {
+            clipboard_send(ctx, to, addr, text, path_override).await
+        }
+    }
+}
+
+/// Print the newest received clipboard payload (the `peerbeam-clipboard-*.txt`
+/// wire convention) from the save directory.
+fn clipboard_get(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let dir = std::path::Path::new(&config.storage.save_directory);
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("peerbeam-clipboard-") && name.ends_with(".txt") {
+                if let Ok(meta) = e.metadata() {
+                    let t = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    if newest.as_ref().map_or(true, |(bt, _)| t > *bt) {
+                        newest = Some((t, e.path()));
+                    }
+                }
+            }
+        }
+    }
+    let Some((_, path)) = newest else {
+        return Err(CliError::NotFound("no received clipboard content".into()));
+    };
+    let text = std::fs::read_to_string(&path)?;
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "clipboard",
+            "file": path.to_string_lossy(),
+            "text": text,
+        }));
+    } else {
+        // Raw to stdout so it pipes cleanly (e.g. `peerbeam clipboard get | wl-copy`).
+        print!("{text}");
+    }
+    Ok(())
+}
+
+/// Send text to a peer using the clipboard wire convention. Text source
+/// priority: argument > piped stdin > system clipboard.
+async fn clipboard_send(
+    ctx: &Ctx,
+    to: Option<String>,
+    addr: Option<String>,
+    text: Option<String>,
+    path_override: Option<&str>,
+) -> CliResult {
+    use std::io::{IsTerminal, Read};
+
+    let text = if let Some(t) = text {
+        t
+    } else if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(CliError::Usage(format!(
+                    "no text given and the system clipboard is unavailable ({e}) — \
+                     pass TEXT or pipe stdin: echo hi | peerbeam clipboard send --to <peer>"
+                )))
+            }
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(CliError::Usage(
+            "nothing to send: clipboard/stdin is empty".into(),
+        ));
+    }
+
+    // Stage as a wire-convention temp file so receivers offer one-tap Copy.
+    let tmp = std::env::temp_dir().join(format!(
+        "peerbeam-clipboard-{}.txt",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    std::fs::write(&tmp, &text)?;
+
+    let send_args = SendArgs {
+        paths: vec![tmp.to_string_lossy().into_owned()],
+        to,
+        addr,
+    };
+    let result = send(ctx, send_args, path_override).await;
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 
 // ── in-process link for benchmark ───────────────────────────────
 

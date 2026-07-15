@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod engine;
 pub mod exit;
+pub mod history;
 pub mod output;
 pub mod prompt;
 pub mod resolve;
