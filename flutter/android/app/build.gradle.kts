@@ -33,7 +33,13 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
+        // Monotonic versionCode: seconds since 2020-01-01, so any build (local
+        // sideload or CI) always sorts newer than the last install. Flutter's
+        // pubspec build number is tiny (e.g. 2) and caused INSTALL_FAILED_
+        // VERSION_DOWNGRADE when reinstalling. An explicit --build-number still
+        // wins if it's higher. ~2.1e8 today; fits a signed int until ~2088.
+        val timeCode = ((System.currentTimeMillis() / 1000L) - 1577836800L).toInt()
+        versionCode = maxOf(flutter.versionCode, timeCode)
         versionName = flutter.versionName
     }
 
