@@ -160,17 +160,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -x
-          ls -laR artifacts | head -50
-          files=$(ls artifacts/linux/* artifacts/android/* \
-                     artifacts/cli-linux/* artifacts/cli-macos/* \
-                     artifacts/cli-windows/* 2>/dev/null)
-          echo "files to upload: $files"
+          # Files only (artifacts may contain subdirectories; `ls` emits
+          # 'dir:' header lines that are not paths).
+          mapfile -t files < <(find artifacts/linux artifacts/android \
+            artifacts/cli-linux artifacts/cli-macos artifacts/cli-windows \
+            -type f 2>/dev/null)
+          printf 'upload: %s\n' "${files[@]}"
           if ! gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --prerelease --verify-tag \
             --notes-file "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md" \
-            $files 2> /tmp/gh-err.txt; then
+            "${files[@]}" 2> /tmp/gh-err.txt; then
             # Surface the real error as annotations (readable without log auth).
             while IFS= read -r line; do echo "::error::gh: ${line}"; done < /tmp/gh-err.txt
             exit 1
