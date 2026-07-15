@@ -6,6 +6,12 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.2] - 2026-07-15 — Beta
+
+See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
+
 ### Added
 - **Settings persist** and reach the engine: device name, save directory,
   auto-accept, theme, and toggles survive restarts and apply at init.
