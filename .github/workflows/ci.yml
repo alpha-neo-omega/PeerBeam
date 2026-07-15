@@ -52,8 +52,10 @@ jobs:
         run: flutter test
 
   # Cross-platform proof: the Rust engine and the desktop app must build (and
-  # the engine's tests pass) on every desktop OS — macOS on both Apple Silicon
-  # (macos-latest) and Intel (macos-13), plus Windows.
+  # the engine's tests pass) on every desktop OS. Intel macOS is covered from
+  # the Apple Silicon runner: x86_64 tests execute under Rosetta 2 (real
+  # Intel-arch binaries) and the Flutter app builds universal — GitHub's
+  # Intel (macos-13) runners are deprecated and queue-starved.
   desktop:
     name: Desktop (${{ matrix.label }})
     strategy:
@@ -64,10 +66,7 @@ jobs:
             label: windows-x64
             build: flutter build windows --release
           - os: macos-latest
-            label: macos-arm64
-            build: flutter build macos --release
-          - os: macos-13
-            label: macos-x64
+            label: macos-arm64+x64
             build: flutter build macos --release
     runs-on: ${{ matrix.os }}
     steps:
@@ -88,6 +87,18 @@ jobs:
               | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
             exit 1
           fi
+      - name: Rust tests (x86_64 under Rosetta)
+        if: runner.os == 'macOS'
+        working-directory: rust
+        shell: bash
+        run: |
+          set -o pipefail
+          rustup target add x86_64-apple-darwin
+          if ! cargo test --workspace --no-fail-fast --target x86_64-apple-darwin 2>&1 | tee /tmp/test-x64.txt; then
+            grep -E "^(test .+ \.\.\. FAILED|---- .+ ----|thread .+ panicked.*|error(\[[^]]+\])?:.*)" /tmp/test-x64.txt \
+              | head -40 | while IFS= read -r line; do echo "::error::x86_64: ${line}"; done
+            exit 1
+          fi
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -97,3 +108,10 @@ jobs:
       - name: Build desktop app
         working-directory: flutter
         run: ${{ matrix.build }}
+      - name: Verify universal mac binary (arm64 + x86_64)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          BIN=$(find flutter/build/macos -name peerbeam -type f -path "*MacOS*" | head -1)
+          lipo -archs "$BIN"
+          lipo -archs "$BIN" | grep -q x86_64 || { echo "::error::mac app is not universal"; exit 1; }
