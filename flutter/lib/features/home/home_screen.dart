@@ -596,6 +596,18 @@ class HomeScreen extends StatelessWidget {
                           ),
                         ),
                       ),
+
+                    // Keep the last row clear of the persistent selection bar,
+                    // which overlays the body (Scaffold.bottomSheet does not
+                    // inset the content).
+                    SliverToBoxAdapter(
+                      child: AnimatedBuilder(
+                        animation: state.staging,
+                        builder: (context, _) => SizedBox(
+                          height: state.staging.count > 0 ? 80 : 0,
+                        ),
+                      ),
+                    ),
                   ],
                 );
               },
