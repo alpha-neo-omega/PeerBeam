@@ -24,8 +24,6 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    # Needs the MSIX signing cert; don't fail the release run if absent.
-    continue-on-error: true
     # Needs signing secrets; don't block the release if they're absent.
     continue-on-error: true
     steps:
