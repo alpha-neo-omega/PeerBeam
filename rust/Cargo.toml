@@ -54,7 +54,7 @@ sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = "0.10"
 rand = "0.8"
-hmac = "0.12"
+hmac = "0.13"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 anyhow = "1"
