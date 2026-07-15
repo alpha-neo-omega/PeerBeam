@@ -98,3 +98,50 @@ async fn transfers_edge_case_filenames_and_trees() {
         }
     }
 }
+
+/// Zero-byte files must arrive: `0 >= 0` used to match the "receiver already
+/// has it" resume skip, so empty files silently vanished from folder sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_byte_files_are_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("payload");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("empty.bin"), b"").unwrap();
+    std::fs::write(root.join("sub/also-empty"), b"").unwrap();
+    std::fs::write(root.join("real.txt"), b"data").unwrap();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _p) = mpsc::unbounded_channel();
+    let (ptx2, _p2) = mpsc::unbounded_channel();
+
+    let req = FolderSendRequest {
+        transfer_id: "zeroes".into(),
+        root_path: root.to_string_lossy().into(),
+        chunk_size: 64 * 1024,
+    };
+    let out_str = out.to_string_lossy().to_string();
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let (so, ro) = tokio::join!(send, recv);
+    assert_eq!(so.unwrap(), TransferOutcome::Completed);
+    let fr = ro.unwrap();
+    assert_eq!(fr.outcome, TransferOutcome::Completed);
+    assert_eq!(fr.files, 3, "all files counted, including empty ones");
+
+    let got = out.join("payload");
+    assert_eq!(std::fs::read(got.join("real.txt")).unwrap(), b"data");
+    assert_eq!(
+        std::fs::metadata(got.join("empty.bin")).unwrap().len(),
+        0,
+        "top-level empty file created"
+    );
+    assert_eq!(
+        std::fs::metadata(got.join("sub/also-empty")).unwrap().len(),
+        0,
+        "nested empty file created"
+    );
+}

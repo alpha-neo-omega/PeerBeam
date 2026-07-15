@@ -13,6 +13,8 @@ _Nothing yet._
 See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
 
 ### Added
+- **CLI folder transfer**: `peerbeam send <dir>` streams whole folders, and
+  `receive` dispatches folder transfers (previously file-only on both sides).
 - **CLI clipboard + history**: `peerbeam clipboard send` (argument, stdin, or
   system clipboard; same wire convention as the app, so receivers offer Copy),
   `clipboard get` (prints the newest received text), and `peerbeam history`
@@ -62,6 +64,11 @@ See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
   from boot.
 
 ### Fixed
+- Folder transfers no longer silently drop zero-byte files (both the send-side
+  resume skip and the receiver's completed-count treated `0 >= 0` as "already
+  transferred").
+- A config file from an older or newer version now loads (missing fields fall
+  back to defaults) instead of failing to parse; corrupt values still error.
 - Cancelling a transfer takes effect immediately, even mid-chunk on a slow
   link.
 - Dialing an unreachable peer fails in ~8s with a clear error instead of a

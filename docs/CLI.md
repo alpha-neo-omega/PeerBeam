@@ -172,8 +172,7 @@ smoke-tested incl. `send`/`receive` over both discovery and `--addr`.
 
 ## Not yet
 
-The `daemon stop|status` IPC is still gated (exit code 8). Folder send
-(`send <dir>`) is not wired yet — send files for now.
+The `daemon stop|status` IPC is still gated (exit code 8).
 
 ## Engine daemon vs CLI
 

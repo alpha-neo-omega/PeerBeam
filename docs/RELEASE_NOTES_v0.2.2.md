@@ -26,6 +26,10 @@ share flows people actually use — plus a full visual overhaul.
 - `peerbeam clipboard send|get` and `peerbeam history` are real commands now
   (previously gated stubs) — stdin-friendly for headless boxes, NDJSON for
   scripts, same wire convention as the app.
+- `peerbeam send <dir>` streams whole folders, and `receive` accepts them —
+  verified byte-exact incl. unicode names, spaces, nesting, and empty files.
+- Configs survive upgrades: missing fields load as defaults instead of
+  failing the parse.
 
 ### Sharing, everywhere
 - **Android share sheet**: "Share → PeerBeam" from any app now completes the

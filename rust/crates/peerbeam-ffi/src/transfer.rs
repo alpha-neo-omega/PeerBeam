@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -22,12 +21,12 @@ use peerbeam_domain::entity::{
 };
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{Frame, FrameKind, Link};
+use peerbeam_domain::port::{FrameKind, Link};
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
     authenticate, receive_file, receive_folder, send_file, send_folder, FolderSendRequest,
-    Identity, SecureLink, SendRequest, TransferControl, TransferOutcome,
+    Identity, PeekLink, SecureLink, SendRequest, TransferControl, TransferOutcome,
 };
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
@@ -886,10 +885,7 @@ impl Manager {
             active.stats.clone(),
             active.file.clone(),
             |ptx| async move {
-                let mut peek = PeekLink {
-                    first: Some(first),
-                    inner: &mut secure,
-                };
+                let mut peek = PeekLink::new(first, &mut secure);
                 let r = if is_folder {
                     receive_folder(&mut peek, &storage, &save_dir, &ctrl, &ptx)
                         .await
@@ -1087,31 +1083,6 @@ fn emit_peer(id: &str, stats: &Arc<Mutex<Stats>>, peer_bytes: u64) {
 }
 
 // ── helpers ─────────────────────────────────────────────────────
-
-/// A link that replays one already-read frame before delegating — lets the FFI
-/// peek the first frame (to choose file vs folder receive) without the engine
-/// knowing.
-struct PeekLink<'a> {
-    first: Option<Frame>,
-    inner: &'a mut dyn Link,
-}
-
-#[async_trait]
-impl Link for PeekLink<'_> {
-    async fn send_frame(&mut self, frame: Frame) -> DResult<()> {
-        self.inner.send_frame(frame).await
-    }
-    async fn recv_frame(&mut self) -> DResult<Option<Frame>> {
-        if let Some(f) = self.first.take() {
-            Ok(Some(f))
-        } else {
-            self.inner.recv_frame().await
-        }
-    }
-    async fn close(&mut self) -> DResult<()> {
-        self.inner.close().await
-    }
-}
 
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()

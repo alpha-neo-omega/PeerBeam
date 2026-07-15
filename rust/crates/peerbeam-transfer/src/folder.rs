@@ -143,7 +143,9 @@ pub async fn send_folder(
     for (i, (rel, size)) in files.iter().enumerate() {
         let already = have.get(i).copied().unwrap_or(0).min(*size);
 
-        if already >= *size {
+        // Zero-byte files must not match the "already complete" skip
+        // (0 >= 0): the receiver still needs the FileHeader to create them.
+        if *size > 0 && already >= *size {
             // Receiver already has the whole file — skip it.
             done += *size;
             files_completed += 1;
@@ -258,10 +260,13 @@ pub async fn receive_folder(
     .await?;
 
     let mut done: u64 = have.iter().sum();
+    // Zero-byte files are never pre-counted: the sender always re-sends their
+    // header (0 >= 0 must not read as "already have it"), and they complete
+    // via FileEnd like everything else.
     let mut files_completed: u32 = have
         .iter()
         .zip(&files)
-        .filter(|(h, f)| **h >= f.size)
+        .filter(|(h, f)| f.size > 0 && **h >= f.size)
         .count() as u32;
 
     let mut current: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;

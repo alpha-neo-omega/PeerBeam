@@ -23,7 +23,8 @@ pub enum ConfigError {
 }
 
 /// Top-level engine configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EngineConfig {
     /// This device's identity settings.
     pub device: DeviceConfig,
@@ -41,6 +42,7 @@ pub struct EngineConfig {
 
 /// Device identity configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeviceConfig {
     /// Human-friendly device name.
     pub name: String,
@@ -50,6 +52,7 @@ pub struct DeviceConfig {
 
 /// Discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DiscoveryConfig {
     /// Master switch for discovery.
     pub enabled: bool,
@@ -59,6 +62,7 @@ pub struct DiscoveryConfig {
 
 /// Transfer configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TransferConfig {
     /// Preferred data chunk size in bytes.
     pub chunk_size: u64,
@@ -74,6 +78,7 @@ pub struct TransferConfig {
 
 /// Encryption configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EncryptionConfig {
     /// Require encryption for all transfers.
     pub required: bool,
@@ -81,6 +86,7 @@ pub struct EncryptionConfig {
 
 /// Storage/location configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     /// Directory received files are written to.
     pub save_directory: String,
@@ -90,6 +96,7 @@ pub struct StorageConfig {
 
 /// Logging configuration consumed by `peerbeam-telemetry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogConfig {
     /// `tracing` env-filter directive (e.g. `peerbeam=info`).
     pub filter: String,
@@ -99,34 +106,51 @@ pub struct LogConfig {
     pub json: bool,
 }
 
-impl Default for EngineConfig {
+impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
-            device: DeviceConfig {
-                name: peerbeam_platform::hostname(),
-                auto_accept_trusted: false,
-            },
-            discovery: DiscoveryConfig {
-                enabled: true,
-                scan_interval_ms: 2000,
-            },
-            transfer: TransferConfig {
-                // 64 KiB: fine-grained, smooth progress. Progress emission is
-                // time-throttled so small chunks don't flood the event bridge.
-                chunk_size: 64 * 1024,
-                max_concurrent: 3,
-                enable_compression: true,
-                enable_resume: true,
-                port: 49600,
-            },
-            encryption: EncryptionConfig { required: true },
-            storage: StorageConfig {
-                save_directory: peerbeam_platform::download_dir()
-                    .to_string_lossy()
-                    .into_owned(),
-                data_directory: peerbeam_platform::data_dir().to_string_lossy().into_owned(),
-            },
-            log: LogConfig::default(),
+            name: peerbeam_platform::hostname(),
+            auto_accept_trusted: false,
+        }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_interval_ms: 2000,
+        }
+    }
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            // 64 KiB: fine-grained, smooth progress. Progress emission is
+            // time-throttled so small chunks don't flood the event bridge.
+            chunk_size: 64 * 1024,
+            max_concurrent: 3,
+            enable_compression: true,
+            enable_resume: true,
+            port: 49600,
+        }
+    }
+}
+
+impl Default for EncryptionConfig {
+    fn default() -> Self {
+        Self { required: true }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            save_directory: peerbeam_platform::download_dir()
+                .to_string_lossy()
+                .into_owned(),
+            data_directory: peerbeam_platform::data_dir().to_string_lossy().into_owned(),
         }
     }
 }
@@ -180,5 +204,23 @@ impl EngineConfig {
             let _ = std::fs::remove_file(&tmp);
             ConfigError::Io(e.to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    /// A config written by an older (or newer) version must load: missing
+    /// fields fall back to defaults instead of failing the parse.
+    #[test]
+    fn partial_config_loads_with_defaults() {
+        let json = r#"{"device":{"name":"old-box"},"transfer":{"port":50000}}"#;
+        let cfg: EngineConfig = serde_json::from_str(json).expect("partial config parses");
+        assert_eq!(cfg.device.name, "old-box");
+        assert!(!cfg.device.auto_accept_trusted, "missing field -> default");
+        assert_eq!(cfg.transfer.port, 50000);
+        assert_eq!(cfg.transfer.chunk_size, 64 * 1024, "missing -> default");
+        assert!(cfg.encryption.required, "missing section -> default");
     }
 }

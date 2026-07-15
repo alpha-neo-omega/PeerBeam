@@ -79,19 +79,32 @@ fn malformed_json_is_a_parse_error() {
 }
 
 #[test]
-fn missing_required_field_is_a_parse_error() {
+fn missing_section_loads_with_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("partial.json");
 
-    // Valid JSON, but a whole required section is absent. Fields have no
-    // `#[serde(default)]`, so this must fail loudly rather than half-load.
+    // Valid JSON with a whole section absent — a config from an older version.
+    // Forward/backward compatibility: it must load, with defaults filling in.
     let mut value = serde_json::to_value(EngineConfig::default()).unwrap();
     value.as_object_mut().unwrap().remove("transfer");
     std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
 
+    let cfg = EngineConfig::load(&path).expect("partial config loads");
+    assert_eq!(cfg.transfer.port, 49600, "missing section -> defaults");
+}
+
+#[test]
+fn wrong_type_is_still_a_parse_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.json");
+
+    // Compatibility tolerates *missing* fields, not corrupt ones: a value of
+    // the wrong type must still fail loudly rather than half-load.
+    std::fs::write(&path, r#"{"transfer":{"port":"not-a-number"}}"#).unwrap();
+
     match EngineConfig::load(&path) {
         Err(ConfigError::Parse(_)) => {}
-        other => panic!("expected Parse error for missing field, got {other:?}"),
+        other => panic!("expected Parse error for wrong type, got {other:?}"),
     }
 }
 
