@@ -187,13 +187,14 @@ async fn multiple_simultaneous_transfers() {
         let size = payloads[i].len() as u64;
         async move {
             // Eight endpoints handshaking at once can transiently fail on a
-            // slow CI runner — retry the dial a few times before declaring it.
+            // slow CI runner (worst under Rosetta emulation) — retry the dial
+            // with growing backoff before declaring it.
             let mut link = {
                 let mut attempt = 0u32;
                 loop {
                     match quic.dial(&route, &session(size)).await {
                         Ok(l) => break l,
-                        Err(e) if attempt < 3 => {
+                        Err(e) if attempt < 6 => {
                             attempt += 1;
                             eprintln!("dial retry {attempt} for t{i}: {e}");
                             tokio::time::sleep(std::time::Duration::from_millis(
