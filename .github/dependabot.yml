@@ -1,13 +1,18 @@
+# Security updates remain enabled (repo setting); routine version-bump PRs are
+# off (limit 0) — dependency upgrades happen as deliberate, tested milestones
+# instead of drive-by merges. Dependabot closes its open version PRs when the
+# limit drops.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /rust
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
   - package-ecosystem: pub
     directory: /flutter
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    open-pull-requests-limit: 0
