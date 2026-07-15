@@ -53,9 +53,13 @@ impl Default for CliStatusSource {
 #[async_trait]
 impl StatusSource for CliStatusSource {
     async fn fetch(&self) -> Result<String> {
-        let output = tokio::process::Command::new(&self.binary)
-            .arg("status")
-            .arg("--json")
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.arg("status").arg("--json");
+        // In a Windows GUI process every child spawn pops a console window —
+        // and this runs on every scan tick. CREATE_NO_WINDOW suppresses it.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000 /* CREATE_NO_WINDOW */);
+        let output = cmd
             .output()
             .await
             .map_err(|e| DomainError::Discovery(format!("tailscale cli: {e}")))?;

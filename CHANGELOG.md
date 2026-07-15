@@ -64,6 +64,8 @@ See [Release Notes](docs/RELEASE_NOTES_v0.2.2.md).
   from boot.
 
 ### Fixed
+- Windows GUI no longer flashes a console window on every discovery tick
+  (the Tailscale status probe now spawns with CREATE_NO_WINDOW).
 - Folder transfers no longer silently drop zero-byte files (both the send-side
   resume skip and the receiver's completed-count treated `0 >= 0` as "already
   transferred").
