@@ -34,6 +34,13 @@ class TransferRepository extends ChangeNotifier {
   final StreamController<({String path, String peer})> _clipboards =
       StreamController.broadcast();
 
+  /// A regular file finished downloading: its saved path and file name. Used to
+  /// copy it into the user's chosen folder on platforms (Android) where the
+  /// engine's write location isn't user-visible.
+  Stream<({String path, String name})> get fileReceived => _files.stream;
+  final StreamController<({String path, String name})> _files =
+      StreamController.broadcast();
+
   /// Matches the wire-name convention the sender uses for clipboard sends.
   static final _clipboardName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
 
@@ -100,9 +107,13 @@ class TransferRepository extends ChangeNotifier {
         final done = _byId[id];
         if (done != null &&
             done.direction == TransferDirection.receiving &&
-            _clipboardName.hasMatch(done.fileName) &&
             (e.path?.isNotEmpty ?? false)) {
-          _clipboards.add((path: e.path!, peer: done.peerName));
+          if (_clipboardName.hasMatch(done.fileName)) {
+            _clipboards.add((path: e.path!, peer: done.peerName));
+          } else {
+            // A real received file — offer it for copy into the user's folder.
+            _files.add((path: e.path!, name: done.fileName));
+          }
         }
         _update(id, state: TransferState.completed);
         _byId.remove(id);
@@ -152,6 +163,7 @@ class TransferRepository extends ChangeNotifier {
     _sub?.cancel();
     _errors.close();
     _clipboards.close();
+    _files.close();
     super.dispose();
   }
 }

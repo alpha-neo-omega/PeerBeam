@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../platform/open_path.dart';
+import '../../platform/saf.dart';
 import '../../features/send/send_text.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
@@ -124,7 +125,15 @@ class _HistoryRow extends StatelessWidget {
       return;
     }
     final error = await openLocalPath(item.path);
-    if (error != null && context.mounted) {
+    if (error == null) return;
+    // On Android a received file may have been moved into the user's SAF folder
+    // (so the engine's private copy is gone) — open it from there by name.
+    if (item.direction == TransferDirection.receiving &&
+        Saf.isSupported &&
+        await Saf.open(item.fileName)) {
+      return;
+    }
+    if (context.mounted) {
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(content: Text(error)));

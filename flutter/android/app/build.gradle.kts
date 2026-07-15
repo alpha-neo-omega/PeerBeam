@@ -79,6 +79,12 @@ kotlin {
     }
 }
 
+dependencies {
+    // Storage Access Framework helper: copy received files into the user's
+    // chosen folder (a content:// tree the Rust engine can't write directly).
+    implementation("androidx.documentfile:documentfile:1.0.1")
+}
+
 flutter {
     source = "../.."
 }

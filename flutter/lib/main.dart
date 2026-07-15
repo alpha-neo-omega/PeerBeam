@@ -10,6 +10,7 @@ import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
 import 'platform/engine_config.dart';
+import 'platform/saf.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
@@ -38,6 +39,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   final _messengerKey = GlobalKey<ScaffoldMessengerState>();
   StreamSubscription<String>? _errSub;
   StreamSubscription<({String path, String peer})>? _clipSub;
+  StreamSubscription<({String path, String name})>? _fileSub;
   StreamSubscription<void>? _shareSub;
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
@@ -77,6 +79,10 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     // A received clipboard payload gets a one-tap Copy — clipboard-to-
     // clipboard instead of a buried .txt file.
     _clipSub = _state.transfer.clipboardReceived.listen(_offerClipboardCopy);
+
+    // A received file: on Android copy it into the user's chosen folder (the
+    // engine's write location is hidden by scoped storage), then drop the copy.
+    _fileSub = _state.transfer.fileReceived.listen(_publishReceivedFile);
 
     // Shared-in content ("Send to PeerBeam"): files open the staged sheet,
     // text offers a one-tap send.
@@ -121,6 +127,25 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     _openStagedSheet();
   }
 
+  /// On Android, copy a freshly received file into the user's chosen SAF folder
+  /// (so it's visible in Files/Gallery) and drop the engine's private copy.
+  /// No-op off Android, for directories (folder transfers), or when no folder is
+  /// chosen yet — the file then stays in app storage.
+  Future<void> _publishReceivedFile(({String path, String name}) f) async {
+    if (!Saf.isSupported) return;
+    try {
+      final file = File(f.path);
+      if (FileSystemEntity.isDirectorySync(f.path) || !await file.exists()) {
+        return;
+      }
+      if (await Saf.save(f.path, f.name)) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Leave the file in app storage if the copy fails.
+    }
+  }
+
   /// Read a received text payload and show it as a message dialog (LocalSend
   /// style) — content + Copy — instead of it looking like a downloaded file.
   Future<void> _offerClipboardCopy(({String path, String peer}) c) async {
@@ -150,6 +175,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   void dispose() {
     _errSub?.cancel();
     _clipSub?.cancel();
+    _fileSub?.cancel();
     _shareSub?.cancel();
     _state.theme.removeListener(_persistTheme);
     _android.sharedText.removeListener(_onSharedText);

@@ -5,6 +5,7 @@ import '../../app/theme.dart';
 import '../../platform/bridge.dart';
 import '../../platform/desktop_files.dart';
 import '../../platform/open_path.dart';
+import '../../platform/saf.dart';
 import '../../platform/services.dart';
 import '../../sdk/models.dart' show TrustedDevice;
 import '../../state/app_scope.dart';
@@ -86,21 +87,25 @@ class SettingsScreen extends StatelessWidget {
                         onTap: () => _editName(context),
                       ),
                       const Divider(height: 1),
-                      ListTile(
-                        leading: const Icon(Icons.folder_rounded),
-                        title: const Text('Save to'),
-                        subtitle: Text(state.settings.saveDirectory),
-                        // Desktop: open the folder in the file manager; tap
-                        // the row to change it.
-                        trailing: isDesktop
-                            ? IconButton(
-                                tooltip: 'Open folder',
-                                icon: const Icon(Icons.open_in_new_rounded),
-                                onPressed: () => _openSaveDir(context),
-                              )
-                            : null,
-                        onTap: isDesktop ? () => _pickSaveDir(context) : null,
-                      ),
+                      // Android saves via a user-chosen SAF folder (a plain
+                      // path isn't user-visible under scoped storage); desktop
+                      // uses a real directory path.
+                      if (_isAndroid)
+                        const _AndroidSaveToTile()
+                      else
+                        ListTile(
+                          leading: const Icon(Icons.folder_rounded),
+                          title: const Text('Save to'),
+                          subtitle: Text(state.settings.saveDirectory),
+                          // Desktop: open the folder in the file manager; tap
+                          // the row to change it.
+                          trailing: IconButton(
+                            tooltip: 'Open folder',
+                            icon: const Icon(Icons.open_in_new_rounded),
+                            onPressed: () => _openSaveDir(context),
+                          ),
+                          onTap: () => _pickSaveDir(context),
+                        ),
                     ],
                   ),
                 ),
@@ -338,6 +343,54 @@ class _GroupLabel extends StatelessWidget {
           letterSpacing: 0.6,
         ),
       ),
+    );
+  }
+}
+
+/// The "Save to" row on Android: shows the chosen SAF folder (received files are
+/// copied there so they're visible in Files/Gallery); tap to pick a folder.
+class _AndroidSaveToTile extends StatefulWidget {
+  const _AndroidSaveToTile();
+
+  @override
+  State<_AndroidSaveToTile> createState() => _AndroidSaveToTileState();
+}
+
+class _AndroidSaveToTileState extends State<_AndroidSaveToTile> {
+  SafFolder? _folder;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final f = await Saf.currentFolder();
+    if (!mounted) return;
+    setState(() {
+      _folder = f;
+      _loading = false;
+    });
+  }
+
+  Future<void> _pick() async {
+    final f = await Saf.pickFolder();
+    if (f != null && mounted) setState(() => _folder = f);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = _loading
+        ? 'Checking…'
+        : _folder?.name ?? 'Tap to choose a folder for received files';
+    return ListTile(
+      leading: const Icon(Icons.folder_rounded),
+      title: const Text('Save to'),
+      subtitle: Text(subtitle),
+      trailing: const Icon(Icons.edit_rounded),
+      onTap: _pick,
     );
   }
 }

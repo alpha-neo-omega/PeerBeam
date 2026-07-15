@@ -8,12 +8,15 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.webkit.MimeTypeMap
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {
     private val methodName = "peerbeam/android"
@@ -22,6 +25,14 @@ class MainActivity : FlutterActivity() {
     private var events: EventChannel.EventSink? = null
     private var pendingInitial: Map<String, Any?>? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    // Storage Access Framework: the user picks a destination folder once; we
+    // persist the grant and copy received files into it (the Rust engine writes
+    // via std::fs to app storage, which the OS hides — SAF makes files visible).
+    private val reqPickTree = 4210
+    private var pendingPick: MethodChannel.Result? = null
+    private val safPrefs
+        get() = getSharedPreferences("peerbeam_saf", Context.MODE_PRIVATE)
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -107,8 +118,134 @@ class MainActivity : FlutterActivity() {
                 setMulticast(call.argument<Boolean>("enabled") ?: false)
                 result.success(null)
             }
+            "safCurrentFolder" -> result.success(currentTree())
+            "safPickFolder" -> pickTree(result)
+            "safSave" -> {
+                val path = call.argument<String>("path")
+                val name = call.argument<String>("name")
+                if (path == null || name == null) {
+                    result.error("args", "path and name required", null)
+                } else {
+                    result.success(saveToTree(path, name))
+                }
+            }
+            "safOpen" -> result.success(openInTree(call.argument<String>("name") ?: ""))
             else -> result.notImplemented()
         }
+    }
+
+    // ── Storage Access Framework ─────────────────────────────────────
+
+    private fun pickTree(result: MethodChannel.Result) {
+        // A picker was already in flight — abandon the old reply.
+        pendingPick?.success(null)
+        pendingPick = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+            )
+        }
+        try {
+            startActivityForResult(intent, reqPickTree)
+        } catch (e: Exception) {
+            pendingPick = null
+            result.error("no_picker", e.message, null)
+        }
+    }
+
+    @Deprecated("startActivityForResult flow for the folder picker")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != reqPickTree) return
+        val reply = pendingPick
+        pendingPick = null
+        val uri = if (resultCode == RESULT_OK) data?.data else null
+        if (uri == null) {
+            reply?.success(null)
+            return
+        }
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            safPrefs.edit().putString("tree_uri", uri.toString()).apply()
+            val doc = DocumentFile.fromTreeUri(this, uri)
+            reply?.success(mapOf("uri" to uri.toString(), "name" to folderName(doc, uri)))
+        } catch (e: Exception) {
+            reply?.error("persist", e.message, null)
+        }
+    }
+
+    /// The persisted destination tree, or null if none set / permission lost.
+    private fun persistedTree(): Uri? {
+        val stored = safPrefs.getString("tree_uri", null) ?: return null
+        val uri = Uri.parse(stored)
+        val held = contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isWritePermission
+        }
+        return if (held) uri else null
+    }
+
+    private fun currentTree(): Map<String, Any?>? {
+        val uri = persistedTree() ?: return null
+        val doc = DocumentFile.fromTreeUri(this, uri) ?: return null
+        return mapOf("uri" to uri.toString(), "name" to folderName(doc, uri))
+    }
+
+    /// Copy [path] into the chosen tree as [name] (overwriting a same-name file),
+    /// returning the new document URI, or null if no tree / the copy failed.
+    private fun saveToTree(path: String, name: String): String? {
+        val uri = persistedTree() ?: return null
+        val tree = DocumentFile.fromTreeUri(this, uri) ?: return null
+        val src = File(path)
+        if (!src.exists()) return null
+        tree.findFile(name)?.delete() // overwrite semantics
+        val doc = tree.createFile(mimeOf(name), name) ?: return null
+        return try {
+            contentResolver.openOutputStream(doc.uri)?.use { out ->
+                src.inputStream().use { it.copyTo(out) }
+            } ?: run {
+                doc.delete()
+                return null
+            }
+            doc.uri.toString()
+        } catch (e: Exception) {
+            doc.delete()
+            null
+        }
+    }
+
+    /// Open a previously-saved file from the tree by [name] with a view intent.
+    private fun openInTree(name: String): Boolean {
+        val uri = persistedTree() ?: return false
+        val tree = DocumentFile.fromTreeUri(this, uri) ?: return false
+        val doc = tree.findFile(name) ?: return false
+        return try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(doc.uri, doc.type ?: mimeOf(name))
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK,
+                    )
+                },
+            )
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun folderName(doc: DocumentFile?, uri: Uri): String =
+        doc?.name ?: uri.lastPathSegment ?: "Selected folder"
+
+    private fun mimeOf(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            ?: "application/octet-stream"
     }
 
     private fun setMulticast(enabled: Boolean) {
