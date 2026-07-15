@@ -10,7 +10,15 @@ class SafFolder {
   /// A human-readable folder name for display.
   final String name;
 
-  const SafFolder({required this.uri, required this.name});
+  /// True when this is the zero-config default (public Downloads/PeerBeam), not
+  /// a folder the user explicitly picked.
+  final bool isDefault;
+
+  const SafFolder({
+    required this.uri,
+    required this.name,
+    this.isDefault = false,
+  });
 }
 
 /// Storage Access Framework bridge (Android only).
@@ -27,7 +35,11 @@ class Saf {
 
   static SafFolder? _folder(Map<Object?, Object?>? m) => m == null
       ? null
-      : SafFolder(name: m['name'] as String? ?? 'Folder', uri: m['uri'] as String? ?? '');
+      : SafFolder(
+          name: m['name'] as String? ?? 'Folder',
+          uri: m['uri'] as String? ?? '',
+          isDefault: m['isDefault'] as bool? ?? false,
+        );
 
   /// The currently-chosen destination folder, or null if none is set (or the
   /// grant was revoked).

@@ -11,12 +11,12 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   handshake dropped the peer's human name, so History/Transfers read
   "Received from app-12345" (the internal device id). The name now flows through
   the session and into history + events.
-- **Android: received files land in a real, visible, persistent folder** — the
-  app passed no paths to the engine, so on Android it fell back to an app-private
-  temp dir (files invisible, OS-evictable; trust/history/settings not durable).
-  The app now supplies proper paths at startup: received files go to app external
-  storage (`Android/data/<app-id>/files/PeerBeam`) and engine data to the app
-  support dir.
+- **Android: received files are visible again** — they previously landed in an
+  app-private dir hidden by scoped storage (invisible in Files/Gallery, and the
+  engine data dir wasn't durable). Now received files default to public
+  **Downloads/PeerBeam** (via MediaStore — visible in Files, images in Gallery,
+  no permission prompt), or a **folder you pick** (Storage Access Framework);
+  engine data (trust/history/settings) moved to the persistent app support dir.
 - **Changing "Save to" takes effect immediately** — the receive directory was
   captured at startup, so a new folder (and the auto-accept toggle) only applied
   after a restart, and History reported a path the file wasn't at. Both now apply

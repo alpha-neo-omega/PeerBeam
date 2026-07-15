@@ -382,9 +382,14 @@ class _AndroidSaveToTileState extends State<_AndroidSaveToTile> {
 
   @override
   Widget build(BuildContext context) {
+    final f = _folder;
     final subtitle = _loading
         ? 'Checking…'
-        : _folder?.name ?? 'Tap to choose a folder for received files';
+        : f == null
+        ? 'Tap to choose a folder for received files'
+        : f.isDefault
+        ? '${f.name} · tap to change'
+        : f.name;
     return ListTile(
       leading: const Icon(Icons.folder_rounded),
       title: const Text('Save to'),

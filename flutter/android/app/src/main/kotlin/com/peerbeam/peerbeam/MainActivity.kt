@@ -1,11 +1,14 @@
 package com.peerbeam.peerbeam
 
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.webkit.MimeTypeMap
@@ -118,7 +121,7 @@ class MainActivity : FlutterActivity() {
                 setMulticast(call.argument<Boolean>("enabled") ?: false)
                 result.success(null)
             }
-            "safCurrentFolder" -> result.success(currentTree())
+            "safCurrentFolder" -> result.success(currentFolder())
             "safPickFolder" -> pickTree(result)
             "safSave" -> {
                 val path = call.argument<String>("path")
@@ -126,10 +129,14 @@ class MainActivity : FlutterActivity() {
                 if (path == null || name == null) {
                     result.error("args", "path and name required", null)
                 } else {
-                    result.success(saveToTree(path, name))
+                    // Chosen SAF folder if set, else the public Downloads default.
+                    result.success(saveToTree(path, name) ?: saveToDownloads(path, name))
                 }
             }
-            "safOpen" -> result.success(openInTree(call.argument<String>("name") ?: ""))
+            "safOpen" -> {
+                val name = call.argument<String>("name") ?: ""
+                result.success(openInTree(name) || openInDownloads(name))
+            }
             else -> result.notImplemented()
         }
     }
@@ -190,10 +197,25 @@ class MainActivity : FlutterActivity() {
         return if (held) uri else null
     }
 
-    private fun currentTree(): Map<String, Any?>? {
-        val uri = persistedTree() ?: return null
-        val doc = DocumentFile.fromTreeUri(this, uri) ?: return null
-        return mapOf("uri" to uri.toString(), "name" to folderName(doc, uri))
+    /// The current destination shown in Settings: a chosen SAF folder if set,
+    /// otherwise the zero-config public Downloads/PeerBeam default (API 29+),
+    /// otherwise null (old devices fall back to app storage).
+    private fun currentFolder(): Map<String, Any?>? {
+        val uri = persistedTree()
+        if (uri != null) {
+            val doc = DocumentFile.fromTreeUri(this, uri)
+            if (doc != null) {
+                return mapOf(
+                    "uri" to uri.toString(),
+                    "name" to folderName(doc, uri),
+                    "isDefault" to false,
+                )
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return mapOf("uri" to "", "name" to "Downloads/PeerBeam", "isDefault" to true)
+        }
+        return null
     }
 
     /// Copy [path] into the chosen tree as [name] (overwriting a same-name file),
@@ -228,6 +250,81 @@ class MainActivity : FlutterActivity() {
             startActivity(
                 Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(doc.uri, doc.type ?: mimeOf(name))
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK,
+                    )
+                },
+            )
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // ── MediaStore Downloads/PeerBeam (zero-config default, API 29+) ──
+
+    /// Copy [path] into public Downloads/PeerBeam via MediaStore (no runtime
+    /// permission), overwriting a same-name entry. Returns the URI, or null when
+    /// unsupported (API < 29) / the copy failed.
+    private fun saveToDownloads(path: String, name: String): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val src = File(path)
+        if (!src.exists()) return null
+        deleteFromDownloads(name) // overwrite semantics
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.RELATIVE_PATH, "Download/PeerBeam")
+            put(MediaStore.Downloads.MIME_TYPE, mimeOf(name))
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(collection, values) ?: return null
+        return try {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                src.inputStream().use { it.copyTo(out) }
+            } ?: run {
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+            contentResolver.update(
+                uri,
+                ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) },
+                null,
+                null,
+            )
+            uri.toString()
+        } catch (e: Exception) {
+            contentResolver.delete(uri, null, null)
+            null
+        }
+    }
+
+    private fun downloadsUriByName(name: String): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val sel = "${MediaStore.Downloads.RELATIVE_PATH} LIKE ? AND " +
+            "${MediaStore.Downloads.DISPLAY_NAME} = ?"
+        val args = arrayOf("%Download/PeerBeam%", name)
+        contentResolver.query(collection, arrayOf(MediaStore.Downloads._ID), sel, args, null)
+            ?.use { c ->
+                if (c.moveToFirst()) {
+                    val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Downloads._ID))
+                    return ContentUris.withAppendedId(collection, id)
+                }
+            }
+        return null
+    }
+
+    private fun deleteFromDownloads(name: String) {
+        downloadsUriByName(name)?.let { contentResolver.delete(it, null, null) }
+    }
+
+    private fun openInDownloads(name: String): Boolean {
+        val uri = downloadsUriByName(name) ?: return false
+        return try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, mimeOf(name))
                     addFlags(
                         Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK,
                     )
