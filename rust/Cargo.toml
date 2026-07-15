@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net",
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 socket2 = { version = "0.5", features = ["all"] }
-mdns-sd = "0.11"
+mdns-sd = "0.20"
 tempfile = "3"
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
