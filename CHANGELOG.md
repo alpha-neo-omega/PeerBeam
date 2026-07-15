@@ -7,9 +7,10 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Changed
-- In-app logo is now the real PeerBeam brand mark (bundled asset) instead of a
-  painted placeholder; window title reads "PeerBeam" (proper case) on Linux,
-  macOS, and Windows.
+- In-app logo is now the PeerBeam app icon (logo on its own dark tile, rounded
+  to a squircle), so it stays visible in both light and dark themes — the
+  earlier transparent mark's white paper-plane washed out on light surfaces.
+  Window title reads "PeerBeam" (proper case) on Linux, macOS, and Windows.
 - Removed the duplicate "PeerBeam" heading on Home — the nav rail (or, on
   phones, the app bar) carries the brand once. Dropped the example
   name/IP placeholders in the add-device and send-to-address dialogs.

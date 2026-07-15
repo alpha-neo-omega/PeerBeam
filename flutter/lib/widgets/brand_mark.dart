@@ -2,21 +2,24 @@ import 'package:flutter/material.dart';
 
 import '../app/theme.dart';
 
-/// The PeerBeam brand mark (bundled logo asset). Transparent PNG, so it sits
-/// on any surface without a tile behind it.
+/// The PeerBeam brand mark — the app icon (logo on its own dark tile), so it
+/// reads identically in light and dark themes. Rounded to an app-icon squircle.
 class PeerBeamMark extends StatelessWidget {
   final double size;
   const PeerBeamMark({super.key, this.size = 34});
 
   @override
   Widget build(BuildContext context) {
-    return Image.asset(
-      'assets/brand/peerbeam-mark.png',
-      width: size,
-      height: size,
-      fit: BoxFit.contain,
-      semanticLabel: 'PeerBeam',
-      filterQuality: FilterQuality.medium,
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(size * 0.28),
+      child: Image.asset(
+        'assets/brand/peerbeam-icon.png',
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        semanticLabel: 'PeerBeam',
+        filterQuality: FilterQuality.medium,
+      ),
     );
   }
 }

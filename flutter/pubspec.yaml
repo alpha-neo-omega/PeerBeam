@@ -114,7 +114,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/brand/peerbeam-mark.png
+    - assets/brand/peerbeam-icon.png
 
   # Google Sans Flex (OFL, from Google Fonts) — bundled for offline use;
   # no runtime font fetching. See assets/fonts/README.md.
