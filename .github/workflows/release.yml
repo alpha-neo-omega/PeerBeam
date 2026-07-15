@@ -145,6 +145,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+      # A re-pushed tag reruns this job against an existing release; wipe its
+      # assets first so stale/misnamed files from the previous run can't linger
+      # next to the fresh uploads (same-name files are replaced, renamed ones
+      # otherwise would not be).
+      - name: Remove stale assets (tag re-runs)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' 2>/dev/null \
+            | while read -r a; do
+                gh release delete-asset "$GITHUB_REF_NAME" "$a" -y \
+                  --repo "$GITHUB_REPOSITORY" || true
+              done
+          true
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
