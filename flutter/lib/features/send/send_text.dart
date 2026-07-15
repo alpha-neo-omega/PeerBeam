@@ -4,17 +4,32 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app/theme.dart';
-import '../../sdk/error_text.dart';
 import '../../state/app_scope.dart';
-import 'pick_device.dart';
+import 'staged_sheet.dart';
 
-/// Compose a text message (prefilled from the clipboard, editable) and send it
-/// to a chosen device — the LocalSend-style "send a message" flow.
-Future<void> composeAndSendText(BuildContext context) async {
-  final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
-  if (!context.mounted) return;
-  final controller = TextEditingController(text: clip);
-  final text = await showDialog<String>(
+/// The wire-name convention for a text/clipboard payload.
+final RegExp messageFileName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
+
+/// Monotonic, digits-only sequence for temp payload names — seeded from the
+/// clock so temp files from different runs never collide, and guaranteed unique
+/// within a run (two texts in one stack would otherwise share a millisecond).
+int _payloadSeq = DateTime.now().microsecondsSinceEpoch;
+
+/// Write [text] to a temp file using the wire convention
+/// (`peerbeam-clipboard-<digits>.txt`) and return its path. The receiver and
+/// History render files with this name as a message, not a downloaded file.
+Future<String> writeTextPayload(String text) async {
+  final file = File(
+    '${Directory.systemTemp.path}/peerbeam-clipboard-${_payloadSeq++}.txt',
+  );
+  await file.writeAsString(text);
+  return file.path;
+}
+
+/// The compose-message dialog. Returns the entered text, or null if cancelled.
+Future<String?> composeText(BuildContext context, {String prefill = ''}) {
+  final controller = TextEditingController(text: prefill);
+  return showDialog<String>(
     context: context,
     builder: (ctx) => AlertDialog(
       title: const Text('Send text'),
@@ -32,45 +47,37 @@ Future<void> composeAndSendText(BuildContext context) async {
         ),
         FilledButton(
           onPressed: () => Navigator.pop(ctx, controller.text),
-          child: const Text('Send'),
+          child: const Text('Add'),
         ),
       ],
     ),
   );
-  if (text == null || text.trim().isEmpty || !context.mounted) return;
-  await sendTextToDevice(context, text);
 }
 
-/// Send a piece of text to a chosen device using the text wire convention
-/// (a small `peerbeam-clipboard-*.txt`), so the receiver shows it as a message.
-/// Used by the compose flow and by shared-text intents.
-Future<void> sendTextToDevice(BuildContext context, String text) async {
-  final scope = AppScope.of(context);
-  void snack(String m) => ScaffoldMessenger.of(context)
-    ..hideCurrentSnackBar()
-    ..showSnackBar(SnackBar(content: Text(m)));
+/// Compose a message (prefilled from the clipboard) and add it to the stack,
+/// then open the selection tray — the LocalSend-style "add text" flow.
+Future<void> addTextToStack(BuildContext context) async {
+  final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
+  if (!context.mounted) return;
+  final text = await composeText(context, prefill: clip);
+  if (text == null || text.trim().isEmpty || !context.mounted) return;
+  final staging = AppScope.of(context).staging;
+  staging.addText(text);
+  showStagedFilesSheet(context, staging);
+}
 
-  if (text.trim().isEmpty) {
-    snack('Nothing to send');
+/// Add the current clipboard text to the stack (no dialog). Snackbars if empty.
+Future<void> addClipboardToStack(BuildContext context) async {
+  final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
+  if (!context.mounted) return;
+  if (clip.trim().isEmpty) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(const SnackBar(content: Text('Clipboard is empty')));
     return;
   }
-  final picked = await showDevicePicker(context);
-  if (picked == null || !context.mounted) return;
-  try {
-    final file = File(
-      '${Directory.systemTemp.path}/peerbeam-clipboard-'
-      '${DateTime.now().millisecondsSinceEpoch}.txt',
-    );
-    await file.writeAsString(text);
-    await scope.transfer.send(picked.target, [file.path]);
-    if (context.mounted) snack('Sending message to ${picked.name}');
-  } catch (e) {
-    if (context.mounted) snack(friendlyError(e));
-  }
+  AppScope.of(context).staging.addText(clip);
 }
-
-/// The wire-name convention for a text/clipboard payload.
-final RegExp messageFileName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
 
 /// Show a text payload as a message dialog (content + Copy), like LocalSend —
 /// instead of it looking like a downloaded file. [title] e.g. "Message from X".

@@ -108,25 +108,14 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     });
   }
 
-  /// Shared text arrived: offer to send it (clipboard wire convention).
+  /// Shared text arrived: add it to the selection stack and open the tray
+  /// (same path as any other staged item).
   void _onSharedText() {
     final text = _android.sharedText.value;
     if (text == null || text.trim().isEmpty) return;
     _android.sharedText.value = null; // consume
-    final preview = text.length > 60 ? '${text.substring(0, 60)}…' : text;
-    _messengerKey.currentState?.showSnackBar(
-      SnackBar(
-        duration: const Duration(seconds: 8),
-        content: Text('Shared text: $preview'),
-        action: SnackBarAction(
-          label: 'Send',
-          onPressed: () {
-            final context = rootNavigatorKey.currentContext;
-            if (context != null) sendTextToDevice(context, text);
-          },
-        ),
-      ),
-    );
+    _state.staging.addText(text);
+    _openStagedSheet();
   }
 
   /// Read a received text payload and show it as a message dialog (LocalSend
