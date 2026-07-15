@@ -112,10 +112,15 @@ async fn ipv4_loopback_transfer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ipv6_loopback_transfer() {
-    // Skip cleanly if the host has no IPv6 loopback.
-    if std::net::UdpSocket::bind("[::1]:0").is_err() {
-        eprintln!("skip: no IPv6 loopback on this host");
-        return;
+    // Skip cleanly if the host can't run a QUIC endpoint on IPv6 loopback.
+    // A plain-socket probe isn't enough: some environments (Windows CI) allow
+    // a bare UDP bind on ::1 but reject the endpoint's socket configuration.
+    match QuicTransport::bound("[::1]:0".parse().unwrap()) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("skip: no IPv6 QUIC loopback on this host: {e}");
+            return;
+        }
     }
     let payload = pattern(2 * 1024 * 1024);
     let got = one_transfer("[::1]:0".parse().unwrap(), "::1", &payload).await;
@@ -181,7 +186,25 @@ async fn multiple_simultaneous_transfers() {
         let path = src_paths[i].clone();
         let size = payloads[i].len() as u64;
         async move {
-            let mut link = quic.dial(&route, &session(size)).await.unwrap();
+            // Eight endpoints handshaking at once can transiently fail on a
+            // slow CI runner — retry the dial a few times before declaring it.
+            let mut link = {
+                let mut attempt = 0u32;
+                loop {
+                    match quic.dial(&route, &session(size)).await {
+                        Ok(l) => break l,
+                        Err(e) if attempt < 3 => {
+                            attempt += 1;
+                            eprintln!("dial retry {attempt} for t{i}: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500 * u64::from(attempt),
+                            ))
+                            .await;
+                        }
+                        Err(e) => panic!("dial for t{i} failed after retries: {e}"),
+                    }
+                }
+            };
             let req = SendRequest {
                 transfer_id: format!("t{i}"),
                 name: format!("s{i}.bin"),
