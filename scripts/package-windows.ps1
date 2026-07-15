@@ -22,7 +22,7 @@ if ($env:PB_CERT_PATH) {
   $args += @("--certificate-path", $env:PB_CERT_PATH)
   if ($env:PB_CERT_PASSWORD) { $args += @("--certificate-password", $env:PB_CERT_PASSWORD) }
 } else {
-  Write-Warning "No PB_CERT_PATH — producing an unsigned MSIX (test-install only)."
+  Write-Warning "No PB_CERT_PATH - producing an unsigned MSIX (test-install only)."
 }
 dart run msix:create @args
 Pop-Location
