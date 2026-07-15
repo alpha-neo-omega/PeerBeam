@@ -124,14 +124,6 @@ class SettingsScreen extends StatelessWidget {
                       ),
                       const Divider(height: 1),
                       SwitchListTile.adaptive(
-                        secondary: const Icon(Icons.compress_rounded),
-                        title: const Text('Compression'),
-                        subtitle: const Text('Compress compressible files'),
-                        value: state.settings.compression,
-                        onChanged: state.settings.setCompression,
-                      ),
-                      const Divider(height: 1),
-                      SwitchListTile.adaptive(
                         secondary: const Icon(Icons.notifications_rounded),
                         title: const Text('Notifications'),
                         value: state.settings.notifications,

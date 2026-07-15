@@ -45,6 +45,10 @@ dependencies:
   # Native file picker + directory chooser (desktop + mobile).
   file_selector: ^1.0.3
 
+  # Platform directories (used to give the engine real, writable, persistent
+  # paths on Android, where the Rust `dirs` crate has no Downloads/data dir).
+  path_provider: ^2.1.4
+
   # FFI helpers (Utf8 marshalling) for the Rust engine bridge.
   ffi: ^2.1.0
 

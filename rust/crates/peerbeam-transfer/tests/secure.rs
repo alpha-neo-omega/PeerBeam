@@ -135,6 +135,10 @@ async fn mutual_authentication_pins_trust_and_transfers() {
 
     assert_eq!(sa.peer_id, DeviceId::from("B"));
     assert_eq!(sb.peer_id, DeviceId::from("A"));
+    // The session must carry the peer's human name (not just the id), so the
+    // receiver can display "from Bob" instead of the raw device id.
+    assert_eq!(sa.peer_name, "Bob");
+    assert_eq!(sb.peer_name, "Alice");
     assert!(sa.newly_trusted && sb.newly_trusted);
     // Each side pinned the other.
     assert!(ta.lookup(&DeviceId::from("B")).unwrap().is_some());

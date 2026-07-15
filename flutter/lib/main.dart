@@ -9,6 +9,7 @@ import 'features/send/send_text.dart';
 import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
+import 'platform/engine_config.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
@@ -55,7 +56,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     // Failures (missing native lib) degrade gracefully to empty state.
     () async {
       try {
-        await _api.initialize();
+        // Hand the engine real platform paths (Android needs them; desktop
+        // returns '' and keeps the engine's own Downloads/data defaults).
+        await _api.initialize(configJson: await buildEngineConfigJson());
         // Persisted settings (device name, save dir, theme, toggles).
         await _state.settings.load(_api);
         _applyPersistedTheme();

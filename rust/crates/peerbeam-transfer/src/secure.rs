@@ -201,6 +201,7 @@ mod tests {
             send_prefix: p1,
             recv_prefix: p2,
             peer_id: DeviceId::from("peer"),
+            peer_name: "peer".into(),
             newly_trusted: false,
         };
         let recv = Session {
@@ -209,6 +210,7 @@ mod tests {
             send_prefix: p2,
             recv_prefix: p1,
             peer_id: DeviceId::from("me"),
+            peer_name: "me".into(),
             newly_trusted: false,
         };
         (send, recv)

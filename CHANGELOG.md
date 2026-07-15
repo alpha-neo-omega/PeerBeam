@@ -6,6 +6,24 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **Received transfers show the sender's name, not a raw id** — the auth
+  handshake dropped the peer's human name, so History/Transfers read
+  "Received from app-12345" (the internal device id). The name now flows through
+  the session and into history + events.
+- **Android: received files land in a real, visible, persistent folder** — the
+  app passed no paths to the engine, so on Android it fell back to an app-private
+  temp dir (files invisible, OS-evictable; trust/history/settings not durable).
+  The app now supplies proper paths at startup: received files go to app external
+  storage (`Android/data/<app-id>/files/PeerBeam`) and engine data to the app
+  support dir.
+- **Changing "Save to" takes effect immediately** — the receive directory was
+  captured at startup, so a new folder (and the auto-accept toggle) only applied
+  after a restart, and History reported a path the file wasn't at. Both now apply
+  live to the running engine.
+- **Removed the non-functional "Compression" toggle** — it was never wired to the
+  transfer path, so it did nothing even after a restart.
+
 ### Added
 - **Stacking selection** (LocalSend-style): build one selection from files,
   folders, text, and clipboard, review/edit it, then send the whole batch to a

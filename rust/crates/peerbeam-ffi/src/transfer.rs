@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
@@ -143,8 +143,11 @@ pub struct Manager {
     enc: Arc<AeadCrypto>,
     trust: Arc<FsTrust>,
     identity: Identity,
-    save_dir: String,
-    auto_accept: bool,
+    /// Received-files directory. Interior-mutable so a live settings change
+    /// (`set_save_dir`) reaches in-flight/future receives without a restart.
+    save_dir: RwLock<String>,
+    /// Approval policy. Interior-mutable so toggling auto-accept applies live.
+    auto_accept: AtomicBool,
     chunk_size: u32,
     daemon_port: u16,
     active: Mutex<HashMap<String, Arc<Active>>>,
@@ -184,8 +187,8 @@ impl Manager {
             enc,
             trust,
             identity,
-            save_dir,
-            auto_accept,
+            save_dir: RwLock::new(save_dir),
+            auto_accept: AtomicBool::new(auto_accept),
             chunk_size: chunk_size.max(1),
             daemon_port,
             active: Mutex::new(HashMap::new()),
@@ -202,6 +205,21 @@ impl Manager {
 
     pub fn active_len(&self) -> usize {
         self.active.lock().unwrap().len()
+    }
+
+    /// The current received-files directory (read fresh so a live change wins).
+    fn save_dir(&self) -> String {
+        self.save_dir.read().unwrap().clone()
+    }
+
+    /// Apply a new save directory live (persisted settings change; no restart).
+    pub fn set_save_dir(&self, dir: String) {
+        *self.save_dir.write().unwrap() = dir;
+    }
+
+    /// Apply the auto-accept policy live (persisted settings change; no restart).
+    pub fn set_auto_accept(&self, v: bool) {
+        self.auto_accept.store(v, Ordering::SeqCst);
     }
 
     pub fn daemon_status(&self) -> Value {
@@ -579,7 +597,7 @@ impl Manager {
                 Some(a) => {
                     let file = a.file.lock().unwrap().clone();
                     let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
-                        std::path::Path::new(&self.save_dir)
+                        std::path::Path::new(&self.save_dir())
                             .join(&file)
                             .to_string_lossy()
                             .into_owned()
@@ -609,7 +627,7 @@ impl Manager {
             // receives); otherwise a received file's final location under the
             // save directory.
             let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
-                std::path::Path::new(&self.save_dir)
+                std::path::Path::new(&self.save_dir())
                     .join(&file)
                     .to_string_lossy()
                     .into_owned()
@@ -833,7 +851,16 @@ impl Manager {
             }
         };
         let id = self.next_id();
-        let peer = sess.peer_id.0.clone();
+        // Prefer the peer's human name from the handshake; fall back to the raw
+        // device id only when the peer presented no name.
+        let peer = {
+            let n = sess.peer_name.trim();
+            if n.is_empty() {
+                sess.peer_id.0.clone()
+            } else {
+                n.to_string()
+            }
+        };
         let active = self.register(&id, "receiving", &peer, "(incoming)", None);
         events::transfer(
             &id,
@@ -842,7 +869,9 @@ impl Manager {
         );
 
         // Approval: auto-accept already-trusted peers when configured, else wait.
-        let accepted = if self.auto_accept && !sess.newly_trusted {
+        // Read the flag fresh so a live toggle applies without a restart.
+        let auto = self.auto_accept.load(Ordering::SeqCst);
+        let accepted = if auto && !sess.newly_trusted {
             true
         } else {
             let (tx, rx) = oneshot::channel();
@@ -874,9 +903,9 @@ impl Manager {
         let is_folder = first.kind == FrameKind::Control;
         if is_folder {
             // A folder lands as many files; point history at the save dir.
-            *active.path.lock().unwrap() = Some(self.save_dir.clone());
+            *active.path.lock().unwrap() = Some(self.save_dir());
         }
-        let save_dir = self.save_dir.clone();
+        let save_dir = self.save_dir();
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
 

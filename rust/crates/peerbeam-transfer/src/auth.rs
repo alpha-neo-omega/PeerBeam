@@ -57,6 +57,8 @@ pub struct Session {
     pub(crate) recv_prefix: [u8; 4],
     /// The authenticated peer's device id.
     pub peer_id: DeviceId,
+    /// The peer's human-friendly name, as presented in its Hello (may be empty).
+    pub peer_name: String,
     /// Whether the peer was newly pinned (true) or already trusted (false).
     pub newly_trusted: bool,
 }
@@ -149,6 +151,9 @@ pub async fn authenticate(
 
     // Trust-on-first-use.
     let peer_id = DeviceId::from(peer_device);
+    // Keep the peer's presented name for the returned Session (the copy below
+    // is moved into the trust record on first contact).
+    let peer_name_display = peer_name.clone();
     let fingerprint = enc.fingerprint(&PublicKey(peer_pub)).0;
     let newly_trusted = match trust.lookup(&peer_id)? {
         Some(rec) if rec.fingerprint != fingerprint => {
@@ -178,6 +183,7 @@ pub async fn authenticate(
         send_key,
         recv_key,
         peer_id,
+        peer_name: peer_name_display,
         newly_trusted,
     })
 }

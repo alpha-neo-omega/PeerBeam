@@ -79,6 +79,23 @@ fn engine() -> Result<Arc<Engine>, (Code, String)> {
         .ok_or((Code::NotInitialised, "engine not initialised".into()))
 }
 
+/// Push a persisted settings delta into the running engine so it takes effect
+/// without a restart. Only the keys present in `partial` are applied; a no-op
+/// when the engine isn't initialised (nothing to update). Called from
+/// `settings::set`/`reset` after the change is persisted.
+pub fn apply_live_settings(partial: &Value) {
+    let Ok(m) = manager() else { return };
+    if let Some(d) = partial.get("transfer_directory").and_then(|v| v.as_str()) {
+        let d = d.trim();
+        if !d.is_empty() {
+            m.set_save_dir(d.to_string());
+        }
+    }
+    if let Some(a) = partial.get("auto_accept").and_then(|v| v.as_bool()) {
+        m.set_auto_accept(a);
+    }
+}
+
 fn device_id() -> DeviceId {
     DeviceId::from(format!("app-{}", std::process::id()))
 }

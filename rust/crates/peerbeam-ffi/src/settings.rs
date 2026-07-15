@@ -145,6 +145,9 @@ pub fn set(partial: &Value) -> Op {
         m.insert("version".into(), json!(SCHEMA));
     }
     save(&current)?;
+    // Push the delta into the running engine so save-dir / auto-accept changes
+    // take effect without a restart (no-op if not yet initialised).
+    crate::runtime::apply_live_settings(partial);
     emit_changed(&current);
     Ok(json!({ "updated": true }))
 }
@@ -153,6 +156,7 @@ pub fn set(partial: &Value) -> Op {
 pub fn reset() -> Op {
     let d = defaults();
     save(&d)?;
+    crate::runtime::apply_live_settings(&d);
     emit_changed(&d);
     Ok(json!({ "reset": true }))
 }
