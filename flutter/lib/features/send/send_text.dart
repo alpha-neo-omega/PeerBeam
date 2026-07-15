@@ -69,11 +69,14 @@ Future<void> sendTextToDevice(BuildContext context, String text) async {
   }
 }
 
-/// Show a received text payload as a message dialog (content + Copy), like
-/// LocalSend — instead of it looking like a downloaded file.
-Future<void> showReceivedMessage(
+/// The wire-name convention for a text/clipboard payload.
+final RegExp messageFileName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
+
+/// Show a text payload as a message dialog (content + Copy), like LocalSend —
+/// instead of it looking like a downloaded file. [title] e.g. "Message from X".
+Future<void> showMessageDialog(
   BuildContext context, {
-  required String peer,
+  required String title,
   required String text,
 }) {
   return showDialog<void>(
@@ -81,7 +84,7 @@ Future<void> showReceivedMessage(
     builder: (ctx) {
       final scheme = Theme.of(ctx).colorScheme;
       return AlertDialog(
-        title: Text('Message from $peer'),
+        title: Text(title),
         content: ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 320),
           child: SingleChildScrollView(

@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../platform/open_path.dart';
+import '../../features/send/send_text.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -89,8 +92,37 @@ class _HistoryRow extends StatelessWidget {
   final HistoryItem item;
   const _HistoryRow({required this.item});
 
-  /// Open the transferred item with the OS handler; explain if it can't be.
-  Future<void> _open(BuildContext context) async {
+  /// A text message (sent/received via the message flow) vs a real file.
+  bool get _isMessage => messageFileName.hasMatch(item.fileName);
+
+  /// Files/folders: open with the OS handler. Messages: show the text + Copy.
+  Future<void> _tap(BuildContext context) async {
+    if (_isMessage) {
+      String content;
+      try {
+        content = await File(item.path).readAsString();
+      } catch (_) {
+        content = '';
+      }
+      if (!context.mounted) return;
+      if (content.trim().isEmpty) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            const SnackBar(
+              content: Text('Message content is no longer available'),
+            ),
+          );
+        return;
+      }
+      final dir = item.direction == TransferDirection.sending ? 'to' : 'from';
+      await showMessageDialog(
+        context,
+        title: 'Message $dir ${item.peerName}',
+        text: content,
+      );
+      return;
+    }
     final error = await openLocalPath(item.path);
     if (error != null && context.mounted) {
       ScaffoldMessenger.of(context)
@@ -104,13 +136,19 @@ class _HistoryRow extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
     final sending = item.direction == TransferDirection.sending;
+    final message = _isMessage;
     final statusColor = item.success ? AppColors.success : scheme.error;
+    final icon = !item.success
+        ? Icons.error_outline_rounded
+        : message
+        ? Icons.chat_bubble_outline_rounded
+        : (sending ? Icons.upload_rounded : Icons.download_rounded);
 
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpace.sm),
       child: Card(
         child: InkWell(
-          onTap: () => _open(context),
+          onTap: () => _tap(context),
           child: Padding(
             padding: const EdgeInsets.all(AppSpace.sm),
             child: Row(
@@ -118,15 +156,7 @@ class _HistoryRow extends StatelessWidget {
                 CircleAvatar(
                   radius: 22,
                   backgroundColor: statusColor.withValues(alpha: 0.15),
-                  child: Icon(
-                    item.success
-                        ? (sending
-                              ? Icons.upload_rounded
-                              : Icons.download_rounded)
-                        : Icons.error_outline_rounded,
-                    size: AppIcons.md,
-                    color: statusColor,
-                  ),
+                  child: Icon(icon, size: AppIcons.md, color: statusColor),
                 ),
                 const Gap(AppSpace.sm),
                 Expanded(
@@ -134,7 +164,7 @@ class _HistoryRow extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        item.fileName,
+                        message ? 'Text message' : item.fileName,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: text.titleSmall?.copyWith(
@@ -143,9 +173,13 @@ class _HistoryRow extends StatelessWidget {
                       ),
                       const Gap(AppSpace.xxs),
                       Text(
-                        '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-                        '${formatBytes(item.bytes)} · ${_ago(item.at)}'
-                        '${item.success ? '' : ' · Failed'}',
+                        message
+                            ? '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
+                                  '${_ago(item.at)} · tap to copy'
+                                  '${item.success ? '' : ' · Failed'}'
+                            : '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
+                                  '${formatBytes(item.bytes)} · ${_ago(item.at)}'
+                                  '${item.success ? '' : ' · Failed'}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: text.bodySmall?.copyWith(

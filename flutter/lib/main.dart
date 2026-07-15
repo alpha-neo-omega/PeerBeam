@@ -142,13 +142,16 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
       return; // unreadable/removed — the file still sits in History
     }
     if (text.trim().isEmpty) return;
+    _showMessage('Message from ${c.peer}', text);
+  }
 
-    // Fresh global-key context (looked up after the awaits, not captured), so
-    // it is current — the lint can't see that.
+  /// Present a message over the current screen (synchronous — no BuildContext
+  /// held across an async gap; the global-key context is looked up fresh).
+  void _showMessage(String title, String text) {
     final context = rootNavigatorKey.currentContext;
-    if (context == null) return;
-    // ignore: use_build_context_synchronously
-    await showReceivedMessage(context, peer: c.peer, text: text);
+    if (context != null) {
+      showMessageDialog(context, title: title, text: text);
+    }
   }
 
   @override
