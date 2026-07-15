@@ -6,6 +6,13 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Stacking selection** (LocalSend-style): build one selection from files,
+  folders, text, and clipboard, review/edit it, then send the whole batch to a
+  device in one go. Tapping a device now sends the current selection (empty
+  selection → pick files, as before). A persistent bar on Home shows the count
+  + total with a one-tap Send.
+
 ### Changed
 - In-app logo is a monochrome brand glyph tinted to the app's primary colour at
   runtime — matches the theme and stays visible in both light (deep purple) and

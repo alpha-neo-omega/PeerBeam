@@ -20,6 +20,11 @@ milestone. **Do NOT build the excluded item.**
   `.txt` under the hood (CLI-interop); a zero-file text frame is a possible
   future refinement.
 
+- **Stacking selection** *(LocalSend-style)* — build one selection from files,
+  folders, text, and clipboard, review/remove items, then send the whole batch
+  to one device. Tapping a device sends the current selection (empty selection
+  → pick files); a persistent Home bar shows the count + total with one-tap Send.
+
 ---
 
 ## Tier 1 — flagship, on-mission
