@@ -65,5 +65,38 @@ void main() {
       s.remove('/a');
       expect(notes, 2);
     });
+
+    test('text items are distinct, not deduped, and sized by content', () {
+      final s = StagingStore();
+      final a = s.addText('hello');
+      final b = s.addText('hello'); // identical content is still a new item
+      expect(s.count, 2);
+      expect(a.id == b.id, isFalse);
+      expect(a.isText, isTrue);
+      expect(a.kind, StagedKind.text);
+      expect(a.size, 5); // 'hello' = 5 UTF-8 bytes
+    });
+
+    test('totalBytes includes text byte length', () {
+      final s = StagingStore();
+      s.add([file('/a', 100)]);
+      s.addText('abc'); // 3 bytes
+      expect(s.totalBytes, 103);
+    });
+
+    test('remove by id removes a text item', () {
+      final s = StagingStore();
+      final t = s.addText('bye');
+      expect(s.count, 1);
+      s.remove(t.id);
+      expect(s.isEmpty, isTrue);
+    });
+
+    test('preview truncates a long single line', () {
+      final s = StagingStore();
+      final t = s.addText('x' * 200);
+      expect(t.preview.endsWith('…'), isTrue);
+      expect(t.preview.length, lessThanOrEqualTo(81));
+    });
   });
 }
