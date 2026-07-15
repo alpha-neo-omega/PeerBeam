@@ -51,7 +51,7 @@ socket2 = { version = "0.5", features = ["all"] }
 mdns-sd = "0.11"
 tempfile = "3"
 sha2 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 aes-gcm = "0.10"
 rand = "0.8"
 hmac = "0.12"
