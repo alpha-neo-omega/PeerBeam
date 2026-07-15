@@ -2,21 +2,27 @@ import 'package:flutter/material.dart';
 
 import '../app/theme.dart';
 
-/// The PeerBeam brand mark — the app icon (logo on its own dark tile), so it
-/// reads identically in light and dark themes. Rounded to an app-icon squircle.
+/// The PeerBeam brand mark. The asset is a monochrome silhouette used only as
+/// an alpha mask: it is tinted to the app's primary colour at runtime, so it
+/// matches the theme and stays visible in both light and dark (deep purple on
+/// light surfaces, light purple on dark).
 class PeerBeamMark extends StatelessWidget {
   final double size;
-  const PeerBeamMark({super.key, this.size = 34});
+
+  /// Override the tint; defaults to the colour scheme's primary.
+  final Color? color;
+  const PeerBeamMark({super.key, this.size = 34, this.color});
 
   @override
   Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(size * 0.28),
+    final tint = color ?? Theme.of(context).colorScheme.primary;
+    return ColorFiltered(
+      colorFilter: ColorFilter.mode(tint, BlendMode.srcIn),
       child: Image.asset(
-        'assets/brand/peerbeam-icon.png',
+        'assets/brand/peerbeam-glyph.png',
         width: size,
         height: size,
-        fit: BoxFit.cover,
+        fit: BoxFit.contain,
         semanticLabel: 'PeerBeam',
         filterQuality: FilterQuality.medium,
       ),
