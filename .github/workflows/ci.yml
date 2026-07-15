@@ -78,7 +78,16 @@ jobs:
           workspaces: rust
       - name: Rust tests
         working-directory: rust
-        run: cargo test --workspace
+        shell: bash
+        # On failure, surface the failing tests/panics as annotations so the
+        # cause is visible without downloading runner logs.
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/test-out.txt; then
+            grep -E "^(test .+ \.\.\. FAILED|---- .+ ----|thread .+ panicked.*|error(\[[^]]+\])?:.*)" /tmp/test-out.txt \
+              | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+            exit 1
+          fi
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
