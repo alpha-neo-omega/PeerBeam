@@ -12,11 +12,13 @@ item is a work order — build it with the full quality gate (fmt, clippy
 `-D warnings`, tests, `flutter analyze`/`test`), live-verify, and commit per
 milestone. **Do NOT build the excluded item.**
 
-## ❌ Excluded (owner decision)
+## ✅ Done since this roadmap
 
-- **Send text / quick message** *(was Tier 1 #3)* — deliberately **not**
-  planned. The clipboard-send flow already covers ad-hoc text. Do not add a
-  separate text-send feature unless the owner reverses this.
+- **Send text / quick message** *(LocalSend-style)* — compose a message
+  (type/paste), send to a picked device; receiver sees it in a **message
+  dialog** with Copy (not a downloaded file). Transport still uses a tiny
+  `.txt` under the hood (CLI-interop); a zero-file text frame is a possible
+  future refinement.
 
 ---
 

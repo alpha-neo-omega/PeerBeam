@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
@@ -130,9 +129,10 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     );
   }
 
-  /// Read a received clipboard file (small text) and offer to copy it.
+  /// Read a received text payload and show it as a message dialog (LocalSend
+  /// style) — content + Copy — instead of it looking like a downloaded file.
   Future<void> _offerClipboardCopy(({String path, String peer}) c) async {
-    const maxBytes = 256 * 1024; // clipboard payloads are small text
+    const maxBytes = 256 * 1024; // text payloads are small
     String text;
     try {
       final f = File(c.path);
@@ -143,17 +143,12 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     }
     if (text.trim().isEmpty) return;
 
-    final preview = text.length > 60 ? '${text.substring(0, 60)}…' : text;
-    _messengerKey.currentState?.showSnackBar(
-      SnackBar(
-        duration: const Duration(seconds: 8),
-        content: Text('Clipboard from ${c.peer}: $preview'),
-        action: SnackBarAction(
-          label: 'Copy',
-          onPressed: () => Clipboard.setData(ClipboardData(text: text)),
-        ),
-      ),
-    );
+    // Fresh global-key context (looked up after the awaits, not captured), so
+    // it is current — the lint can't see that.
+    final context = rootNavigatorKey.currentContext;
+    if (context == null) return;
+    // ignore: use_build_context_synchronously
+    await showReceivedMessage(context, peer: c.peer, text: text);
   }
 
   @override

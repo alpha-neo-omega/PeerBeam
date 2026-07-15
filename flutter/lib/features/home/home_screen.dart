@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../app/theme.dart';
 import '../../data/saved_devices_repository.dart' show SavedDevice;
@@ -60,21 +59,6 @@ class HomeScreen extends StatelessWidget {
       context,
       QrPayload(name: d.name, host: d.host, port: d.port),
     );
-  }
-
-  /// Send the current text clipboard to a chosen device (clipboard wire
-  /// convention — the receiver gets one-tap Copy).
-  Future<void> _sendClipboard(BuildContext context) async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final txt = data?.text?.trim() ?? '';
-    if (!context.mounted) return;
-    if (txt.isEmpty) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(const SnackBar(content: Text('Clipboard is empty')));
-      return;
-    }
-    await sendTextToDevice(context, txt);
   }
 
   /// Pick a folder (desktop) and stage it for sending.
@@ -428,15 +412,16 @@ class HomeScreen extends StatelessWidget {
                                 const Gap(AppSpace.sm),
                                 Expanded(
                                   child: FilledButton.tonalIcon(
-                                    onPressed: () => _sendClipboard(context),
+                                    onPressed: () =>
+                                        composeAndSendText(context),
                                     style: FilledButton.styleFrom(
                                       minimumSize: const Size.fromHeight(48),
                                     ),
                                     icon: const Icon(
-                                      Icons.content_paste_rounded,
+                                      Icons.chat_bubble_outline_rounded,
                                       size: AppIcons.sm,
                                     ),
-                                    label: const Text('Send clipboard'),
+                                    label: const Text('Send text'),
                                   ),
                                 ),
                               ],
