@@ -7,11 +7,14 @@ import '../../sdk/error_text.dart';
 import '../../sdk/models.dart' show PeerTarget;
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
+import '../../state/staging.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/brand_mark.dart';
 import '../../widgets/common.dart';
 import '../../widgets/device_tile.dart';
 import '../qr/qr.dart';
+import '../send/pick_device.dart';
+import '../send/send_staged.dart';
 import '../send/send_text.dart';
 import '../send/staged_sheet.dart';
 
@@ -84,8 +87,7 @@ class HomeScreen extends StatelessWidget {
   }
 
   /// Send to a manually-entered address (host/IP or MagicDNS name + port).
-  /// Covers peers that discovery can't surface — headless servers, or Tailscale
-  /// on platforms without a local tailnet API (e.g. Android).
+  /// Content-first: send the stack if non-empty, else pick files.
   Future<void> _sendToAddress(BuildContext context) async {
     final scope = AppScope.of(context);
     final target = await _promptForAddress(context);
@@ -93,6 +95,10 @@ class HomeScreen extends StatelessWidget {
     void snack(String m) => ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(m)));
+    if (scope.staging.isNotEmpty) {
+      await sendStaged(context, target, target.name);
+      return;
+    }
     final picked = await pickFilesToStage();
     if (picked.isEmpty || !context.mounted) return;
     try {
@@ -260,15 +266,19 @@ class HomeScreen extends StatelessWidget {
     await scope.saved.update(d.id, name: n, host: h, port: p);
   }
 
-  /// Pick files and send them to a saved device (real transfer).
+  /// Send to a saved device. Content-first (send the stack if non-empty).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
     void snack(String m) => ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(m)));
+    final target = PeerTarget(name: d.name, addresses: [d.host], port: d.port);
+    if (scope.staging.isNotEmpty) {
+      await sendStaged(context, target, d.name);
+      return;
+    }
     final picked = await pickFilesToStage();
     if (picked.isEmpty || !context.mounted) return;
-    final target = PeerTarget(name: d.name, addresses: [d.host], port: d.port);
     try {
       await scope.transfer.send(target, picked.map((f) => f.path).toList());
       if (context.mounted) snack('Sending ${picked.length} to ${d.name}');
@@ -277,7 +287,8 @@ class HomeScreen extends StatelessWidget {
     }
   }
 
-  /// Pick files and send them to [device] through the engine (real transfer).
+  /// Send to a discovered device. Content-first: if the stack has items, send
+  /// the whole stack; otherwise pick files and send those.
   Future<void> _sendTo(BuildContext context, Device device) async {
     final scope = AppScope.of(context);
     final target = scope.device.peerTarget(device.id);
@@ -286,6 +297,10 @@ class HomeScreen extends StatelessWidget {
       ..showSnackBar(SnackBar(content: Text(m)));
     if (target == null) {
       snack('${device.name} is not reachable right now');
+      return;
+    }
+    if (scope.staging.isNotEmpty) {
+      await sendStaged(context, target, device.name);
       return;
     }
     final picked = await pickFilesToStage();
@@ -298,12 +313,24 @@ class HomeScreen extends StatelessWidget {
     }
   }
 
+  /// Pick a device from the persistent bar and send the current stack.
+  Future<void> _pickAndSendFromBar(BuildContext context) async {
+    final picked = await showDevicePicker(context);
+    if (picked == null || !context.mounted) return;
+    await sendStaged(context, picked.target, picked.name);
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
     final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
+      bottomSheet: _SelectionBar(
+        staging: state.staging,
+        onOpen: () => showStagedFilesSheet(context, state.staging),
+        onSend: () => _pickAndSendFromBar(context),
+      ),
       body: SafeArea(
         child: Center(
           child: ConstrainedBox(
@@ -412,8 +439,7 @@ class HomeScreen extends StatelessWidget {
                                 const Gap(AppSpace.sm),
                                 Expanded(
                                   child: FilledButton.tonalIcon(
-                                    onPressed: () =>
-                                        composeAndSendText(context),
+                                    onPressed: () => addTextToStack(context),
                                     style: FilledButton.styleFrom(
                                       minimumSize: const Size.fromHeight(48),
                                     ),
@@ -780,6 +806,74 @@ class _DeviceSearchDelegate extends SearchDelegate<Device?> {
           onSend: () => close(context, matches[i]),
         ),
       ),
+    );
+  }
+}
+
+/// Slim bar pinned to the bottom of Home while the selection stack is
+/// non-empty: item count + total, tap to open the tray, Send to pick a device.
+class _SelectionBar extends StatelessWidget {
+  final StagingStore staging;
+  final VoidCallback onOpen;
+  final VoidCallback onSend;
+  const _SelectionBar({
+    required this.staging,
+    required this.onOpen,
+    required this.onSend,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    return AnimatedBuilder(
+      animation: staging,
+      builder: (context, _) {
+        final n = staging.count;
+        return AnimatedSize(
+          duration: AppMotion.fast,
+          curve: AppMotion.curve,
+          child: n == 0
+              ? const SizedBox(width: double.infinity)
+              : Material(
+                  color: scheme.surfaceContainerHigh,
+                  child: SafeArea(
+                    top: false,
+                    child: InkWell(
+                      onTap: onOpen,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(
+                          AppSpace.md,
+                          AppSpace.sm,
+                          AppSpace.sm,
+                          AppSpace.sm,
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.layers_rounded, color: scheme.primary),
+                            const Gap(AppSpace.sm),
+                            Expanded(
+                              child: Text(
+                                '$n ${n == 1 ? 'item' : 'items'} · ${formatBytes(staging.totalBytes)}',
+                                style: text.titleSmall,
+                              ),
+                            ),
+                            FilledButton.icon(
+                              onPressed: onSend,
+                              icon: const Icon(
+                                Icons.send_rounded,
+                                size: AppIcons.sm,
+                              ),
+                              label: const Text('Send'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+        );
+      },
     );
   }
 }
