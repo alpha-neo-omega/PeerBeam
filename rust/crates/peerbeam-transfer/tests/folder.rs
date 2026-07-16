@@ -227,6 +227,59 @@ async fn cancel_then_rerun_completes() {
     }
 }
 
+/// Regression test for a receiver-side pause being a no-op in
+/// `receive_folder`: before the fix, its loop never checked `ctrl`'s pause,
+/// so bytes kept being written while the sender streamed on. Pausing the
+/// *receiver's* own control before anything starts must park the receive
+/// loop until resumed instead of draining/writing any frames.
+#[tokio::test]
+async fn receiver_pause_actually_stops_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    // Small capacity: once the receiver stops draining, the sender soon
+    // blocks on backpressure instead of buffering everything unseen.
+    let (mut la, mut lb) = MemLink::pair(1);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // Pause the receiver up front so its very first loop iteration blocks in
+    // wait_while_paused rather than proceeding into the frame select.
+    cr.pause();
+
+    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    tokio::pin!(send);
+    tokio::pin!(recv);
+
+    let raced = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::select! {
+            _ = &mut send => "send",
+            _ = &mut recv => "recv",
+        }
+    })
+    .await;
+    assert!(
+        raced.is_err(),
+        "folder receive must stay parked while the receiver is paused, not complete"
+    );
+
+    cr.resume();
+    let (rs, rr) = tokio::join!(send, recv);
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    let rr = rr.unwrap();
+    assert_eq!(rr.outcome, TransferOutcome::Completed);
+    assert_eq!(rr.files, files.len());
+    for (rel, bytes) in &files {
+        let dest = out.join("myfolder").join(rel);
+        assert_eq!(&std::fs::read(&dest).unwrap(), bytes, "content of {rel}");
+    }
+}
+
 /// Regression test for the folder receive loop never observing cancellation
 /// while parked on `recv_frame` — the folder counterpart of
 /// `transfer.rs`'s `cancel_interrupts_parked_receive`.

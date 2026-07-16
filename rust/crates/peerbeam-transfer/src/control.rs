@@ -61,6 +61,8 @@ impl TransferControl {
         while self.is_paused() && !self.is_cancelled() {
             // Register for wake, then re-check to avoid a lost-notify race.
             let notified = self.state.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable(); // register BEFORE re-check or a wake is lost
             if !self.is_paused() || self.is_cancelled() {
                 break;
             }
@@ -84,6 +86,8 @@ impl TransferControl {
             }
             // Register for wake, then re-check to avoid a lost-notify race.
             let notified = self.state.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable(); // register BEFORE re-check or a wake is lost
             if self.is_cancelled() {
                 return;
             }
@@ -174,5 +178,52 @@ mod tests {
         assert!(!waiter.is_finished(), "resume must not resolve cancelled()");
         c.cancel();
         waiter.await.unwrap();
+    }
+
+    /// Regression test for the lost-wakeup race: `notified()` must be
+    /// registered (via `enable()`) *before* the pause re-check, or a
+    /// `resume()` that lands in the gap between building the `Notified`
+    /// future and its first poll is dropped and the waiter never wakes.
+    ///
+    /// A single-threaded executor can't preempt between two synchronous
+    /// statements with no `.await` between them, so this only manifests with
+    /// real OS-thread parallelism: a genuine `std::thread` races a raw
+    /// `resume()` against the waiter's build-then-await window, with no
+    /// synchronization at all, over many iterations to make the race land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_while_paused_never_misses_a_racing_resume() {
+        for _ in 0..300 {
+            let c = TransferControl::new();
+            c.pause();
+            let c2 = c.clone();
+            let waiter = tokio::spawn(async move { c2.wait_while_paused().await });
+
+            let c3 = c.clone();
+            std::thread::spawn(move || c3.resume());
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("resume racing wait_while_paused must not be lost")
+                .unwrap();
+        }
+    }
+
+    /// Same race, but against `cancelled()` and a racing `cancel()` — the
+    /// counterpart fix in that method must not miss a wake either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_never_misses_a_racing_cancel() {
+        for _ in 0..300 {
+            let c = TransferControl::new();
+            let c2 = c.clone();
+            let waiter = tokio::spawn(async move { c2.cancelled().await });
+
+            let c3 = c.clone();
+            std::thread::spawn(move || c3.cancel());
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("cancel racing cancelled() must not be lost")
+                .unwrap();
+        }
     }
 }

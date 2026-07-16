@@ -119,6 +119,67 @@ void main() {
       expect(received.single.peer, 'Alice');
     });
 
+    test('a progress heartbeat after pause stays paused, not transferring', () async {
+      // Regression test: `transfer_progress` used to unconditionally set
+      // state to `transferring`, so the engine's ~1s progress heartbeats
+      // flipped a paused transfer back to "transferring" in the UI even
+      // though nothing was moving — defeating pause. `transfer_paused` must
+      // stick until an explicit `transfer_resumed`.
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+
+      fake.emit(ev('transfer_queued', 't3', {'peer': 'Bob', 'file': 'a.bin'}));
+      await flush();
+      fake.emit(
+        ev('transfer_progress', 't3', {
+          'stats': {'transferred_bytes': 10, 'total_bytes': 100},
+        }),
+      );
+      await flush();
+      expect(repo.transfers.single.state, ui.TransferState.transferring);
+
+      fake.emit(ev('transfer_paused', 't3'));
+      await flush();
+      expect(repo.transfers.single.state, ui.TransferState.paused);
+
+      // A heartbeat lands while still paused — must not flip back.
+      fake.emit(
+        ev('transfer_progress', 't3', {
+          'stats': {
+            'transferred_bytes': 10,
+            'total_bytes': 100,
+            'current_speed': 999,
+            'eta_secs': 5,
+          },
+        }),
+      );
+      await flush();
+      final paused = repo.transfers.single;
+      expect(paused.state, ui.TransferState.paused);
+      expect(paused.speedBps, 0);
+      expect(paused.etaSecs, isNull);
+
+      // Resume: the next progress heartbeat goes back to transferring.
+      fake.emit(ev('transfer_resumed', 't3'));
+      await flush();
+      expect(repo.transfers.single.state, ui.TransferState.transferring);
+      fake.emit(
+        ev('transfer_progress', 't3', {
+          'stats': {
+            'transferred_bytes': 20,
+            'total_bytes': 100,
+            'current_speed': 42,
+            'eta_secs': 3,
+          },
+        }),
+      );
+      await flush();
+      final resumed = repo.transfers.single;
+      expect(resumed.state, ui.TransferState.transferring);
+      expect(resumed.speedBps, 42);
+      expect(resumed.etaSecs, 3);
+    });
+
     test('commands delegate to the engine', () async {
       final fake = FakePeerBeam();
       final repo = TransferRepository(api: fake);

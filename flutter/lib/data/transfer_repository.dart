@@ -91,13 +91,15 @@ class TransferRepository extends ChangeNotifier {
         _update(id, state: TransferState.transferring);
       case 'transfer_progress':
         final s = e.stats;
+        final cur = _byId[id];
+        final paused = cur?.state == TransferState.paused;
         _update(
           id,
-          state: TransferState.transferring,
+          state: paused ? TransferState.paused : TransferState.transferring,
           done: s?.transferredBytes,
           total: s?.totalBytes,
-          speed: s?.currentSpeed,
-          eta: s?.etaSecs,
+          speed: paused ? 0 : s?.currentSpeed,
+          eta: paused ? null : s?.etaSecs,
           file: e.file,
         );
       case 'transfer_paused':

@@ -275,6 +275,67 @@ async fn pause_then_resume_completes() {
     assert_eq!(std::fs::read(out.join("src.bin")).unwrap(), bytes);
 }
 
+/// Regression test for a receiver-side pause being a no-op: before the fix,
+/// `receive_file`'s loop never checked `ctrl`'s pause, so bytes kept being
+/// written while the sender streamed on. Pausing the *receiver's* own
+/// control before anything starts must park the receive loop in
+/// `wait_while_paused` (not draining/writing any frames) until resumed.
+#[tokio::test]
+async fn receiver_pause_actually_stops_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.bin");
+    let out = dir.path().join("out");
+    let bytes = pattern(4 * 1024 * 1024); // 4 MiB — many chunks, so a fast
+                                           // finish inside the window would
+                                           // signal the pause was ignored.
+    std::fs::write(&src, &bytes).unwrap();
+
+    let storage = FsStorage::new();
+    // Small capacity: once the receiver stops draining, the sender soon
+    // blocks on backpressure instead of buffering the whole file unseen.
+    let (mut la, mut lb) = MemLink::pair(1);
+    let ctrl_s = TransferControl::new();
+    let ctrl_r = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // Pause the receiver up front so its very first loop iteration blocks in
+    // wait_while_paused rather than proceeding into the frame select.
+    ctrl_r.pause();
+
+    let req = SendRequest {
+        transfer_id: "t-recv-pause".into(),
+        name: "src.bin".into(),
+        path: src.to_string_lossy().into(),
+        size: bytes.len() as u64,
+        chunk_size: 64 * 1024,
+    };
+
+    let send = send_file(&mut la, &storage, req, &ctrl_s, &ptx, 3);
+    let out_str = out.to_string_lossy().to_string();
+    let recv = receive_file(&mut lb, &storage, &out_str, &ctrl_r, &ptx);
+    tokio::pin!(send);
+    tokio::pin!(recv);
+
+    // Neither side should complete while the receiver stays paused.
+    let raced = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::select! {
+            _ = &mut send => "send",
+            _ = &mut recv => "recv",
+        }
+    })
+    .await;
+    assert!(
+        raced.is_err(),
+        "receive must stay parked while the receiver is paused, not complete"
+    );
+
+    ctrl_r.resume();
+    let (rs, rr) = tokio::join!(send, recv);
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    assert_eq!(std::fs::read(out.join("src.bin")).unwrap(), bytes);
+}
+
 #[tokio::test]
 async fn retries_transient_link_failures() {
     let dir = tempfile::tempdir().unwrap();

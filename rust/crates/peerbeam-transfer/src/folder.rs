@@ -277,6 +277,12 @@ pub async fn receive_folder(
             break TransferOutcome::Cancelled;
         }
 
+        // Honor a receiver-side pause: stop draining frames (transport
+        // backpressure stalls the sender) and stop writing. wait_while_paused
+        // is a no-op when not paused and also returns on cancel, which the
+        // biased cancelled() branch of the select below then handles.
+        ctrl.wait_while_paused().await;
+
         // Race the next frame against cancellation — see the identical
         // comment in `stream::receive_file`: without this, a sender that
         // stalls mid-folder would leave this parked on `recv_frame` forever
