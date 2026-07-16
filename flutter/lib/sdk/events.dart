@@ -104,6 +104,11 @@ class TransferEvent extends BridgeEvent {
   }
 
   String? get file => payload['file'] as String?;
+
+  /// Folder name for a folder-send's `transfer_queued` event, which carries
+  /// `folder` rather than `file` (the per-file `file` key only appears once
+  /// the walk starts producing entries).
+  String? get folder => payload['folder'] as String?;
   String? get peer => payload['peer'] as String?;
 
   /// Local path of the completed item (on `transfer_completed`).

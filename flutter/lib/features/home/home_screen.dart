@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
@@ -54,6 +56,7 @@ class HomeScreen extends StatelessWidget {
       host: payload.host,
       port: payload.port,
     );
+    if (!context.mounted) return;
     snack('Added ${payload.name}');
   }
 
@@ -187,43 +190,63 @@ class HomeScreen extends StatelessWidget {
     final name = TextEditingController();
     final host = TextEditingController();
     final port = TextEditingController(text: '49600');
+    String? error;
     final ok = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Add device'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: name,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: 'Name'),
-            ),
-            const Gap(AppSpace.sm),
-            TextField(
-              controller: host,
-              decoration: const InputDecoration(
-                labelText: 'Host / IP or MagicDNS name',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Add device'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: name,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Name'),
               ),
+              const Gap(AppSpace.sm),
+              TextField(
+                controller: host,
+                decoration: const InputDecoration(
+                  labelText: 'Host / IP or MagicDNS name',
+                ),
+              ),
+              const Gap(AppSpace.sm),
+              TextField(
+                controller: port,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Port'),
+              ),
+              if (error != null) ...[
+                const Gap(AppSpace.sm),
+                Text(
+                  error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
             ),
-            const Gap(AppSpace.sm),
-            TextField(
-              controller: port,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Port'),
+            FilledButton(
+              onPressed: () {
+                final h = host.text.trim();
+                final p = int.tryParse(port.text.trim()) ?? 0;
+                if (h.isEmpty || p <= 0 || p > 65535) {
+                  setState(
+                    () => error = 'Enter a host and a port between 1 and 65535',
+                  );
+                  return;
+                }
+                Navigator.pop(context, true);
+              },
+              child: const Text('Save'),
             ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Save'),
-          ),
-        ],
       ),
     );
     if (ok != true) return;
@@ -240,43 +263,63 @@ class HomeScreen extends StatelessWidget {
     final name = TextEditingController(text: d.name);
     final host = TextEditingController(text: d.host);
     final port = TextEditingController(text: '${d.port}');
+    String? error;
     final ok = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit device'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: name,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: 'Name'),
-            ),
-            const Gap(AppSpace.sm),
-            TextField(
-              controller: host,
-              decoration: const InputDecoration(
-                labelText: 'Host / IP or MagicDNS name',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Edit device'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: name,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Name'),
               ),
+              const Gap(AppSpace.sm),
+              TextField(
+                controller: host,
+                decoration: const InputDecoration(
+                  labelText: 'Host / IP or MagicDNS name',
+                ),
+              ),
+              const Gap(AppSpace.sm),
+              TextField(
+                controller: port,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Port'),
+              ),
+              if (error != null) ...[
+                const Gap(AppSpace.sm),
+                Text(
+                  error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
             ),
-            const Gap(AppSpace.sm),
-            TextField(
-              controller: port,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Port'),
+            FilledButton(
+              onPressed: () {
+                final h = host.text.trim();
+                final p = int.tryParse(port.text.trim()) ?? 0;
+                if (h.isEmpty || p <= 0 || p > 65535) {
+                  setState(
+                    () => error = 'Enter a host and a port between 1 and 65535',
+                  );
+                  return;
+                }
+                Navigator.pop(context, true);
+              },
+              child: const Text('Save'),
             ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Save'),
-          ),
-        ],
       ),
     );
     if (ok != true) return;
@@ -581,23 +624,37 @@ class HomeScreen extends StatelessWidget {
                           AppSpace.md,
                           AppSpace.xl,
                         ),
-                        sliver: SliverGrid.builder(
-                          gridDelegate:
-                              const SliverGridDelegateWithMaxCrossAxisExtent(
-                                maxCrossAxisExtent: 420,
-                                // Tight fit for the two-line tile.
-                                mainAxisExtent: 76,
-                                crossAxisSpacing: AppSpace.sm,
-                                mainAxisSpacing: AppSpace.sm,
+                        sliver: Builder(
+                          builder: (context) {
+                            final scale = MediaQuery.textScalerOf(
+                              context,
+                            ).scale(1.0);
+                            // Two text lines (~38px) grow with the OS font
+                            // size; the row never shrinks below the 44px
+                            // avatar. Plus 24px vertical padding and a small
+                            // slack for the inter-line Gap(2)/Card insets.
+                            final extent =
+                                24.0 + math.max(44.0, 38.0 * scale) + 4;
+                            return SliverGrid.builder(
+                              gridDelegate:
+                                  SliverGridDelegateWithMaxCrossAxisExtent(
+                                    maxCrossAxisExtent: 420,
+                                    // Tight fit at scale 1.0; grows with
+                                    // text scale to avoid overflow.
+                                    mainAxisExtent: extent,
+                                    crossAxisSpacing: AppSpace.sm,
+                                    mainAxisSpacing: AppSpace.sm,
+                                  ),
+                              itemCount: devices.length,
+                              itemBuilder: (context, i) => Appear(
+                                index: i,
+                                child: DeviceTile(
+                                  device: devices[i],
+                                  onSend: () => _sendTo(context, devices[i]),
+                                ),
                               ),
-                          itemCount: devices.length,
-                          itemBuilder: (context, i) => Appear(
-                            index: i,
-                            child: DeviceTile(
-                              device: devices[i],
-                              onSend: () => _sendTo(context, devices[i]),
-                            ),
-                          ),
+                            );
+                          },
                         ),
                       ),
 
@@ -607,9 +664,8 @@ class HomeScreen extends StatelessWidget {
                     SliverToBoxAdapter(
                       child: AnimatedBuilder(
                         animation: state.staging,
-                        builder: (context, _) => SizedBox(
-                          height: state.staging.count > 0 ? 80 : 0,
-                        ),
+                        builder: (context, _) =>
+                            SizedBox(height: state.staging.count > 0 ? 80 : 0),
                       ),
                     ),
                   ],

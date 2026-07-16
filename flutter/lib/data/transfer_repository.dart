@@ -80,7 +80,7 @@ class TransferRepository extends ChangeNotifier {
         _byId[id] = Transfer(
           id: id,
           peerName: e.peer ?? '',
-          fileName: e.file ?? '',
+          fileName: e.file ?? e.folder ?? '',
           direction: e.incoming
               ? TransferDirection.receiving
               : TransferDirection.sending,

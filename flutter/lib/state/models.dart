@@ -96,7 +96,8 @@ class Transfer {
     this.etaSecs,
   });
 
-  double get progress => totalBytes == 0 ? 0 : doneBytes / totalBytes;
+  double get progress =>
+      totalBytes == 0 ? 0 : (doneBytes / totalBytes).clamp(0, 1).toDouble();
 
   Transfer copyWith({
     TransferState? state,

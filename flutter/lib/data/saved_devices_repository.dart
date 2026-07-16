@@ -50,8 +50,18 @@ class SavedDevicesRepository extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_key);
       if (raw != null) {
-        final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
-        _items = list.map(SavedDevice.fromJson).toList();
+        final list = jsonDecode(raw) as List;
+        final parsed = <SavedDevice>[];
+        for (final entry in list) {
+          try {
+            parsed.add(
+              SavedDevice.fromJson((entry as Map).cast<String, dynamic>()),
+            );
+          } catch (_) {
+            // Skip only the corrupt entry; keep the rest.
+          }
+        }
+        _items = parsed;
       }
     } catch (_) {
       // Corrupt/absent store → start empty rather than crash.
