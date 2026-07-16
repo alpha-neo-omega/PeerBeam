@@ -143,6 +143,11 @@ pub struct Manager {
     enc: Arc<AeadCrypto>,
     trust: Arc<FsTrust>,
     identity: Identity,
+    /// The presented name, split out from `identity` so a live rename
+    /// (`set_identity_name`) reaches in-flight/future handshakes without a
+    /// restart. `identity.name` itself is left stale; always read the name
+    /// through [`Self::identity`].
+    identity_name: RwLock<String>,
     /// Received-files directory. Interior-mutable so a live settings change
     /// (`set_save_dir`) reaches in-flight/future receives without a restart.
     save_dir: RwLock<String>,
@@ -181,12 +186,14 @@ impl Manager {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
             .unwrap_or_default();
+        let identity_name = RwLock::new(identity.name.clone());
         Manager {
             rm,
             quic,
             enc,
             trust,
             identity,
+            identity_name,
             save_dir: RwLock::new(save_dir),
             auto_accept: AtomicBool::new(auto_accept),
             chunk_size: chunk_size.max(1),
@@ -220,6 +227,22 @@ impl Manager {
     /// Apply the auto-accept policy live (persisted settings change; no restart).
     pub fn set_auto_accept(&self, v: bool) {
         self.auto_accept.store(v, Ordering::SeqCst);
+    }
+
+    /// The identity presented in handshakes: same device id + keypair as
+    /// construction, but the name read fresh so a live rename applies to the
+    /// very next handshake without a restart.
+    fn identity(&self) -> Identity {
+        Identity {
+            device_id: self.identity.device_id.clone(),
+            name: self.identity_name.read().unwrap().clone(),
+            keypair: self.identity.keypair.clone(),
+        }
+    }
+
+    /// Apply a new device name live (persisted settings change; no restart).
+    pub fn set_identity_name(&self, name: String) {
+        *self.identity_name.write().unwrap() = name;
     }
 
     pub fn daemon_status(&self) -> Value {
@@ -463,7 +486,7 @@ impl Manager {
         };
         let sess = match authenticate(
             &mut *link,
-            &self.identity,
+            &self.identity(),
             self.enc.as_ref(),
             self.trust.as_ref(),
         )
@@ -526,7 +549,7 @@ impl Manager {
         };
         let sess = match authenticate(
             &mut *link,
-            &self.identity,
+            &self.identity(),
             self.enc.as_ref(),
             self.trust.as_ref(),
         )
@@ -838,7 +861,7 @@ impl Manager {
     async fn handle_incoming(self: Arc<Self>, mut link: Box<dyn Link>) {
         let sess = match authenticate(
             &mut *link,
-            &self.identity,
+            &self.identity(),
             self.enc.as_ref(),
             self.trust.as_ref(),
         )
@@ -1180,4 +1203,54 @@ fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)> {
         port,
         last_seen: chrono::Utc::now(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerbeam_domain::port::EncryptionProvider;
+
+    /// A `Manager` with no daemon/history wired up, just enough to exercise
+    /// identity/name plumbing in isolation (no network I/O beyond binding an
+    /// ephemeral local QUIC endpoint, no discovery).
+    fn test_manager(name: &str) -> Manager {
+        let quic = Arc::new(QuicTransport::new().expect("quic transport"));
+        let rm = Arc::new(RouteManager::new(quic.clone()));
+        let enc = Arc::new(AeadCrypto::new());
+        let keypair = enc.generate_keypair();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trust = Arc::new(FsTrust::open(dir.path().join("trust.json")).expect("trust store"));
+        let identity = Identity {
+            device_id: DeviceId::from("test-device"),
+            name: name.to_string(),
+            keypair,
+        };
+        Manager::new(
+            rm,
+            quic,
+            enc,
+            trust,
+            identity,
+            dir.path().to_string_lossy().into_owned(),
+            false,
+            1024,
+            0,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn set_identity_name_changes_identity() {
+        let mgr = test_manager("Original Name");
+        assert_eq!(mgr.identity().name, "Original Name");
+        // device_id/keypair stay stable across a rename.
+        let before = mgr.identity();
+
+        mgr.set_identity_name("Renamed Device".to_string());
+
+        let after = mgr.identity();
+        assert_eq!(after.name, "Renamed Device");
+        assert_eq!(after.device_id, before.device_id);
+        assert_eq!(after.keypair.public.0, before.keypair.public.0);
+    }
 }

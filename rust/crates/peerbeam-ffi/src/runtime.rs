@@ -3,6 +3,7 @@
 //! FFI functions are thin and non-blocking (discovery start/stop are quick).
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -30,6 +31,9 @@ static RT: OnceLock<Runtime> = OnceLock::new();
 static ENGINE: Mutex<Option<Arc<Engine>>> = Mutex::new(None);
 static ME: Mutex<Option<Device>> = Mutex::new(None);
 static MANAGER: Mutex<Option<Arc<Manager>>> = Mutex::new(None);
+/// Tracks whether discovery is currently running, so a live rename knows
+/// whether to re-announce (no equivalent query exists on `Engine` itself).
+static DISCOVERING: AtomicBool = AtomicBool::new(false);
 
 type OpResult = Result<Value, (Code, String)>;
 
@@ -93,6 +97,47 @@ pub fn apply_live_settings(partial: &Value) {
     }
     if let Some(a) = partial.get("auto_accept").and_then(|v| v.as_bool()) {
         m.set_auto_accept(a);
+    }
+    if let Some(name) = partial.get("device_name").and_then(|v| v.as_str()) {
+        let name = name.trim();
+        if !name.is_empty() {
+            apply_live_device_name(&m, name);
+        }
+    }
+}
+
+/// Rename the running device live: update the transfer identity (so the next
+/// handshake presents the new name) and re-announce to discovery peers.
+///
+/// Best-effort: the engine may not be initialised yet (nothing to update) or
+/// discovery may not be running (nothing to re-announce) — both are no-ops,
+/// not errors.
+fn apply_live_device_name(m: &Arc<Manager>, name: &str) {
+    m.set_identity_name(name.to_string());
+
+    let Some(mut me) = lock(&ME).clone() else {
+        return;
+    };
+    if me.name == name {
+        return;
+    }
+    me.name = name.to_string();
+    *lock(&ME) = Some(me.clone());
+
+    // Re-announce so peers see the new name — but only if discovery is
+    // actually running; otherwise this would have the side effect of
+    // starting it. `UdpDiscovery`/`MdnsDiscovery` snapshot the `me` passed to
+    // `advertise()` once and no-op on a second call while already advertising
+    // (see their `advertising` guard), so a plain `start_discovery(me)` would
+    // not propagate the rename — restart discovery so `advertise()` runs
+    // again with the updated device.
+    if DISCOVERING.load(Ordering::SeqCst) {
+        if let Ok(engine) = engine() {
+            rt().block_on(async {
+                let _ = engine.stop_discovery().await;
+                let _ = engine.start_discovery(me).await;
+            });
+        }
     }
 }
 
@@ -206,6 +251,7 @@ pub fn shutdown() {
     if let Ok(engine) = engine() {
         let _ = rt().block_on(engine.stop_discovery());
     }
+    DISCOVERING.store(false, Ordering::SeqCst);
     // Stop the daemon task explicitly: it holds its own `Arc<Manager>`, so
     // merely dropping the global handle below would leave it running and the
     // QUIC port bound — a later `pb_init()` would then fail to rebind.
@@ -224,6 +270,7 @@ pub fn discovery_start() -> OpResult {
         .ok_or((Code::NotInitialised, "no local identity".into()))?;
     rt().block_on(engine.start_discovery(me))
         .map_err(crate::error::from_engine)?;
+    DISCOVERING.store(true, Ordering::SeqCst);
     Ok(json!({ "discovering": true }))
 }
 
@@ -231,6 +278,7 @@ pub fn discovery_stop() -> OpResult {
     let engine = engine()?;
     rt().block_on(engine.stop_discovery())
         .map_err(crate::error::from_engine)?;
+    DISCOVERING.store(false, Ordering::SeqCst);
     Ok(json!({ "discovering": false }))
 }
 
