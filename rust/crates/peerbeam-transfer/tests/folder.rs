@@ -226,3 +226,51 @@ async fn cancel_then_rerun_completes() {
         assert_eq!(&std::fs::read(&dest).unwrap(), bytes, "content of {rel}");
     }
 }
+
+/// Regression test for the folder receive loop never observing cancellation
+/// while parked on `recv_frame` — the folder counterpart of
+/// `transfer.rs`'s `cancel_interrupts_parked_receive`.
+///
+/// The sender pauses right after the manifest/resume-state handshake and
+/// never sends a `FileHeader`, standing in for a peer that has stalled; it's
+/// spawned rather than joined because its own control (`cs`) is never
+/// resumed or cancelled, so it never resolves on its own. Only the
+/// **receiver's** control (`cr`) is cancelled — the receive loop must
+/// interrupt its own parked `recv_frame` rather than depend on anything
+/// arriving from the sender.
+#[tokio::test]
+async fn cancel_interrupts_parked_receive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, _files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let storage_send = storage.clone();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+    let ptx_send = ptx.clone();
+
+    cs.pause();
+    let send_req = req(&root_path);
+    let send_task = tokio::spawn(async move {
+        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3).await;
+    });
+
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let canceller = async {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cr.cancel();
+    };
+
+    let (rr, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(recv, canceller)
+    })
+    .await
+    .expect("cancel must interrupt a folder receive parked on recv_frame, not hang");
+
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Cancelled);
+    send_task.abort();
+}

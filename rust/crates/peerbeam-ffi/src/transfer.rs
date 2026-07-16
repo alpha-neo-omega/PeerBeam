@@ -587,6 +587,17 @@ impl Manager {
     }
 
     fn finish(&self, id: &str, outcome: DResult<TransferOutcome>) {
+        // `cancel()` may already have removed this id and emitted the
+        // terminal `transfer_cancelled` event synchronously (it doesn't wait
+        // for the task to unwind). Once the receive loop reacts to
+        // cancellation via `TransferControl::cancelled()`, its task also
+        // lands here with `Ok(Cancelled)` — without this guard that would
+        // emit a second terminal event for an id the UI no longer knows
+        // about. `cancel()` removes the entry before the task can observe
+        // cancellation and return, so this check reliably catches it.
+        if !self.active.lock().unwrap().contains_key(id) {
+            return;
+        }
         match outcome {
             Ok(TransferOutcome::Completed) => {
                 self.record(id, true, "transfer_completed", json!({}));
@@ -601,6 +612,12 @@ impl Manager {
     }
 
     fn finish_failed(&self, id: &str, (code, msg): (Code, String)) {
+        // Same rationale as the guard in `finish`: a task that raced past a
+        // `cancel()` (already removed + terminal event emitted) must not
+        // emit a second terminal event.
+        if !self.active.lock().unwrap().contains_key(id) {
+            return;
+        }
         self.set_status(id, "failed");
         events::transfer(
             id,
@@ -613,6 +630,12 @@ impl Manager {
 
     /// Success path: emit completed + append history.
     fn record(&self, id: &str, success: bool, event: &str, extra: Value) {
+        // Same rationale as the guard in `finish`: a task that raced past a
+        // `cancel()` (already removed + terminal event emitted) must not
+        // emit a second terminal event.
+        if !self.active.lock().unwrap().contains_key(id) {
+            return;
+        }
         self.set_status(id, "completed");
         let (stats, file, path) = {
             let active = self.active.lock().unwrap();

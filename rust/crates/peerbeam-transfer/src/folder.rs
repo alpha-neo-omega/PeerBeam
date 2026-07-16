@@ -276,7 +276,21 @@ pub async fn receive_folder(
             let _ = link.send_frame(folder_frame(&FolderMessage::Cancel)).await;
             break TransferOutcome::Cancelled;
         }
-        match link.recv_frame().await? {
+
+        // Race the next frame against cancellation — see the identical
+        // comment in `stream::receive_file`: without this, a sender that
+        // stalls mid-folder would leave this parked on `recv_frame` forever
+        // even after the caller cancels.
+        let frame = tokio::select! {
+            biased;
+            _ = ctrl.cancelled() => {
+                let _ = link.send_frame(folder_frame(&FolderMessage::Cancel)).await;
+                break TransferOutcome::Cancelled;
+            }
+            frame = link.recv_frame() => frame?,
+        };
+
+        match frame {
             Some(frame) => match frame.kind {
                 FrameKind::Chunk => {
                     if let Some(writer) = current.as_mut() {

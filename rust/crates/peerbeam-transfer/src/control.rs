@@ -67,6 +67,29 @@ impl TransferControl {
             notified.await;
         }
     }
+
+    /// Resolves as soon as cancellation is requested. Intended for a
+    /// `select!` raced against a blocking `recv_frame`, so cancelling a
+    /// receive that is parked waiting on the peer interrupts it promptly
+    /// instead of only being noticed between frames.
+    ///
+    /// Loops around the notify (rather than awaiting it once) because `wake`
+    /// also fires on [`resume`](Self::resume): a resume-triggered wake must
+    /// not be mistaken for cancellation, so we re-check `is_cancelled` and go
+    /// back to waiting if it was actually a resume.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register for wake, then re-check to avoid a lost-notify race.
+            let notified = self.state.wake.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +138,41 @@ mod tests {
         // Give the waiter a moment to park, then resume.
         tokio::task::yield_now().await;
         c.resume();
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_returns_immediately_when_already_cancelled() {
+        let c = TransferControl::new();
+        c.cancel();
+        // Should not hang.
+        c.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_unblocks_on_cancel() {
+        let c = TransferControl::new();
+        let c2 = c.clone();
+        let waiter = tokio::spawn(async move { c2.cancelled().await });
+        // Give the waiter a moment to park, then cancel.
+        tokio::task::yield_now().await;
+        c.cancel();
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_ignores_a_resume_wake() {
+        // `resume()` also calls `notify_waiters`; a waiter on `cancelled()`
+        // must not mistake that wake for cancellation and must keep waiting.
+        let c = TransferControl::new();
+        c.pause();
+        let c2 = c.clone();
+        let waiter = tokio::spawn(async move { c2.cancelled().await });
+        tokio::task::yield_now().await;
+        c.resume(); // wakes the notify, but cancelled() must keep waiting
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "resume must not resolve cancelled()");
+        c.cancel();
         waiter.await.unwrap();
     }
 }

@@ -210,7 +210,22 @@ pub async fn receive_file(
             let _ = link.send_frame(control_frame(&Control::Cancel)).await;
             break TransferOutcome::Cancelled;
         }
-        match link.recv_frame().await? {
+
+        // Race the next frame against cancellation: a plain check at the top
+        // of the loop only fires between frames, so a sender that stalls mid
+        // transfer would otherwise leave this parked on `recv_frame` forever
+        // even after the caller cancels. `cancelled()` re-checks around the
+        // same `Notify` `wait_while_paused` uses, so it wakes promptly.
+        let frame = tokio::select! {
+            biased;
+            _ = ctrl.cancelled() => {
+                let _ = link.send_frame(control_frame(&Control::Cancel)).await;
+                break TransferOutcome::Cancelled;
+            }
+            frame = link.recv_frame() => frame?,
+        };
+
+        match frame {
             Some(frame) => match frame.kind {
                 FrameKind::Chunk => {
                     writer

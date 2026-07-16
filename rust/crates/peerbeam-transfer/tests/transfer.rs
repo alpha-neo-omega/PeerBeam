@@ -13,9 +13,11 @@ use tokio::sync::mpsc;
 
 use peerbeam_domain::entity::{Direction, Progress};
 use peerbeam_domain::error::{DomainError, Result};
-use peerbeam_domain::port::{Frame, Link};
+use peerbeam_domain::port::{Frame, FrameKind, Link};
 use peerbeam_storage_fs::FsStorage;
-use peerbeam_transfer::{receive_file, send_file, SendRequest, TransferControl, TransferOutcome};
+use peerbeam_transfer::{
+    receive_file, send_file, SendRequest, TransferControl, TransferMeta, TransferOutcome,
+};
 
 // ── In-memory link ──────────────────────────────────────────────
 
@@ -179,6 +181,59 @@ async fn cancel_while_paused_stops_both_sides() {
 
     let (rs, rr, _) = tokio::join!(send, recv, canceller);
     assert_eq!(rs.unwrap(), TransferOutcome::Cancelled);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Cancelled);
+}
+
+/// Regression test for the receive side never observing cancellation while
+/// parked on `recv_frame`.
+///
+/// Unlike `cancel_while_paused_stops_both_sides` (where the *sender's*
+/// control is cancelled, which makes the sender itself transmit a `Cancel`
+/// frame the receiver then reads), this cancels the **receiver's own**
+/// control while the peer has gone completely silent after the handshake —
+/// nothing ever arrives for the receive loop to read. Before the fix, the
+/// loop only checked `ctrl.is_cancelled()` between frames and would then
+/// block forever on `recv_frame().await`, so this test would hang (and time
+/// out) without `TransferControl::cancelled()` raced into the loop via
+/// `select!`.
+#[tokio::test]
+async fn cancel_interrupts_parked_receive() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let ctrl_r = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // Hand the receiver its Meta frame directly (bypassing `send_file`
+    // entirely) so nothing else is ever sent on this link — a stand-in for a
+    // sender that stalls right after the handshake.
+    let meta = TransferMeta {
+        transfer_id: "t-cancel-recv".into(),
+        name: "stalled.bin".into(),
+        size: 4096,
+        chunk_size: 1024,
+    };
+    la.send_frame(Frame {
+        kind: FrameKind::Meta,
+        payload: bytes::Bytes::from(serde_json::to_vec(&meta).unwrap()),
+    })
+    .await
+    .unwrap();
+
+    let out_str = out.to_string_lossy().to_string();
+    let recv = receive_file(&mut lb, &storage, &out_str, &ctrl_r, &ptx);
+    let canceller = async {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ctrl_r.cancel();
+    };
+
+    let (rr, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(recv, canceller)
+    })
+    .await
+    .expect("cancel must interrupt a receive parked on recv_frame, not hang");
+
     assert_eq!(rr.unwrap().outcome, TransferOutcome::Cancelled);
 }
 
