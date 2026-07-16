@@ -45,7 +45,9 @@ use crate::control::TransferControl;
 use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
-use crate::stream::{build_progress, read_fill, send_with_retry, signal_pause_edge, TransferOutcome};
+use crate::stream::{
+    build_progress, read_fill, send_with_retry, signal_pause_edge, TransferOutcome,
+};
 
 // ── Wire messages ───────────────────────────────────────────────
 

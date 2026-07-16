@@ -162,8 +162,11 @@ async fn send_folder_skips_unreadable_file_delivers_rest() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("good.txt"), b"fine data").unwrap();
     std::fs::write(root.join("locked.bin"), b"unreadable").unwrap();
-    std::fs::set_permissions(root.join("locked.bin"), std::fs::Permissions::from_mode(0o000))
-        .unwrap();
+    std::fs::set_permissions(
+        root.join("locked.bin"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
 
     if std::fs::read(root.join("locked.bin")).is_ok() {
         // Running as root (or another context where permission bits don't

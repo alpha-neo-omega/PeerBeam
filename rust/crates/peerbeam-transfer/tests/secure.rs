@@ -124,8 +124,8 @@ impl Link for RewriteHelloIdentityLink {
             return Ok(None);
         };
         if !self.rewritten && frame.kind == FrameKind::Handshake {
-            let mut msg: serde_json::Value = serde_json::from_slice(&frame.payload)
-                .expect("handshake frame is valid JSON");
+            let mut msg: serde_json::Value =
+                serde_json::from_slice(&frame.payload).expect("handshake frame is valid JSON");
             if let Some(hello) = msg.get_mut("Hello") {
                 // Leave pubkey/nonce untouched; rebind the presented identity.
                 hello["device_id"] = serde_json::json!("mallory");

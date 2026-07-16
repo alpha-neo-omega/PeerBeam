@@ -154,10 +154,9 @@ async fn sender_pause_stops_receiver_and_resume_completes_byte_exact() {
         "receiver must observe the sender's Control::Pause frame: {progress:?}"
     );
     assert!(
-        !progress
-            .iter()
-            .any(|p| p.direction == Direction::Receiving
-                && p.status == TransferStatus::Transferring),
+        !progress.iter().any(
+            |p| p.direction == Direction::Receiving && p.status == TransferStatus::Transferring
+        ),
         "receiver must not advance while the sender is paused: {progress:?}"
     );
 
@@ -350,10 +349,9 @@ async fn receiver_local_pause_emits_progress_signal_for_the_back_channel() {
         "a local receiver pause must emit Progress{{status: Paused}}: {progress:?}"
     );
     assert!(
-        !progress
-            .iter()
-            .any(|p| p.direction == Direction::Receiving
-                && p.status == TransferStatus::Transferring),
+        !progress.iter().any(
+            |p| p.direction == Direction::Receiving && p.status == TransferStatus::Transferring
+        ),
         "the receive loop must actually still stop, not just report itself paused: {progress:?}"
     );
 

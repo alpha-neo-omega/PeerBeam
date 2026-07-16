@@ -238,7 +238,11 @@ pub unsafe extern "C" fn pb_transfer_accept(json: *const c_char) -> *mut c_char 
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn pb_transfer_accept_trust(json: *const c_char) -> *mut c_char {
-    guard(|| error::envelope((|| runtime::manager()?.accept_trust(&id_of(&read_json(json)?)?))()))
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.accept_trust(&id_of(&read_json(json)?)?)
+        })())
+    })
 }
 
 /// Reject an incoming transfer: `{id}`.

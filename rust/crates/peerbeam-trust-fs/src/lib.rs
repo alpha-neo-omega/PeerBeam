@@ -58,7 +58,11 @@ impl FsTrust {
     /// middle of removing from `cache`: without excluding them, the disk's
     /// (not-yet-updated) copy would immediately resurrect the record this
     /// call is trying to delete.
-    fn merge_from_disk(&self, cache: &mut HashMap<String, TrustRecord>, exclude: &[&str]) -> Result<()> {
+    fn merge_from_disk(
+        &self,
+        cache: &mut HashMap<String, TrustRecord>,
+        exclude: &[&str],
+    ) -> Result<()> {
         let disk = Self::read_records(&self.path)?;
         for (id, disk_rec) in disk {
             if exclude.contains(&id.as_str()) {
@@ -298,7 +302,10 @@ mod tests {
         assert!(!store.is_trusted(&DeviceId::from("dev-r")));
 
         let reopened = FsTrust::open(&path).unwrap();
-        assert!(!reopened.is_trusted(&DeviceId::from("dev-r")), "removal must persist");
+        assert!(
+            !reopened.is_trusted(&DeviceId::from("dev-r")),
+            "removal must persist"
+        );
     }
 
     #[test]

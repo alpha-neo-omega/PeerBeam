@@ -215,7 +215,12 @@ impl StorageProvider for FsStorage {
 /// Unix) makes the existence check and the claim a single atomic syscall, so
 /// two concurrent callers can never both believe they reserved the same name.
 async fn try_reserve(path: &str) -> Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(path).await {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+    {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(DomainError::Storage(format!("reserve {path}: {e}"))),
@@ -413,7 +418,10 @@ mod tests {
         let final1 = r1.unwrap();
         let final2 = r2.unwrap();
 
-        assert_ne!(final1, final2, "racing finalizes must not pick the same name");
+        assert_ne!(
+            final1, final2,
+            "racing finalizes must not pick the same name"
+        );
         let contents: std::collections::HashSet<Vec<u8>> = [
             std::fs::read(&final1).unwrap(),
             std::fs::read(&final2).unwrap(),
@@ -471,10 +479,7 @@ mod tests {
 
         assert_eq!(
             files,
-            vec![
-                ("link.txt".to_string(), 5),
-                ("real.txt".to_string(), 5),
-            ],
+            vec![("link.txt".to_string(), 5), ("real.txt".to_string(), 5),],
             "the symlink must be listed alongside the file it targets"
         );
         let _ = std::fs::remove_dir_all(&dir);

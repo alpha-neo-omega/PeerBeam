@@ -1689,7 +1689,8 @@ mod tests {
 
         // First start: the port is occupied by `sock`, so the spawned
         // `serve()` task fails to bind and exits almost immediately.
-        mgr.start_daemon().expect("start_daemon should accept the request");
+        mgr.start_daemon()
+            .expect("start_daemon should accept the request");
         wait_until(|| !mgr.daemon_running.load(Ordering::SeqCst)).await;
 
         // Before the fix, `daemon_running` would still read `true` here,
@@ -1724,7 +1725,8 @@ mod tests {
         let id = "tx-race-cancel-first";
         mgr.register(id, "sending", "peer", "file.bin", None);
 
-        mgr.cancel(id).expect("cancel finds the freshly-registered transfer");
+        mgr.cancel(id)
+            .expect("cancel finds the freshly-registered transfer");
         assert!(mgr.active.lock().unwrap().get(id).is_none());
 
         // The task's own unwind races in *after* cancel already claimed
@@ -1855,7 +1857,7 @@ mod tests {
         // genuinely paused.
         std::thread::sleep(Duration::from_millis(300));
         fixed.mark_resumed(); // the fix under test: re-anchors last_t/last_bytes
-                               // `unfixed` intentionally does nothing here.
+                              // `unfixed` intentionally does nothing here.
 
         std::thread::sleep(Duration::from_millis(60));
         fixed.update(2_060_000, 10_000_000);
@@ -1883,9 +1885,9 @@ mod tests {
         // prompt): real time passes with nothing transferred yet.
         std::thread::sleep(Duration::from_millis(150));
         s.update(0, 10_000_000); // still nothing moved — average_started stays None
-        // Bytes start moving now: this call sets average_started, but its
-        // own elapsed-since-start is ~0 by construction, so it doesn't yet
-        // show a meaningful rate.
+                                 // Bytes start moving now: this call sets average_started, but its
+                                 // own elapsed-since-start is ~0 by construction, so it doesn't yet
+                                 // show a meaningful rate.
         s.update(1_000_000, 10_000_000);
         std::thread::sleep(Duration::from_millis(60));
         s.update(7_000_000, 10_000_000);

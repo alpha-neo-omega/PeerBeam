@@ -286,8 +286,8 @@ async fn receiver_pause_actually_stops_progress() {
     let src = dir.path().join("src.bin");
     let out = dir.path().join("out");
     let bytes = pattern(4 * 1024 * 1024); // 4 MiB — many chunks, so a fast
-                                           // finish inside the window would
-                                           // signal the pause was ignored.
+                                          // finish inside the window would
+                                          // signal the pause was ignored.
     std::fs::write(&src, &bytes).unwrap();
 
     let storage = FsStorage::new();
