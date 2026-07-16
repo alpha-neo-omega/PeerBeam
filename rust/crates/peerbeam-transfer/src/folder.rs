@@ -45,7 +45,7 @@ use crate::control::TransferControl;
 use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
-use crate::stream::{build_progress, read_fill, send_with_retry, TransferOutcome};
+use crate::stream::{build_progress, read_fill, send_with_retry, signal_pause_edge, TransferOutcome};
 
 // ── Wire messages ───────────────────────────────────────────────
 
@@ -78,6 +78,10 @@ enum FolderMessage {
     },
     Complete,
     Cancel,
+    /// Sender → receiver: cooperative pause — see `protocol::Control::Pause`.
+    Pause,
+    /// Sender → receiver: cooperative resume — see `protocol::Control::Resume`.
+    Resume,
 }
 
 fn folder_frame(msg: &FolderMessage) -> Frame {
@@ -155,6 +159,13 @@ pub async fn send_folder(
     let mut files_completed: u32 = 0;
     let chunk = req.chunk_size.max(1) as usize;
 
+    // Cooperative pause: edge-detect our own pause state and tell the
+    // receiver on the main stream — see `stream::send_file`'s identical
+    // mechanism (shared via `signal_pause_edge`). Tracked once for the whole
+    // folder transfer, since either the per-file or the per-chunk loop below
+    // may be the one blocking when paused.
+    let mut signalled_pause = false;
+
     for (i, (rel, size)) in files.iter().enumerate() {
         let already = have.get(i).copied().unwrap_or(0).min(*size);
 
@@ -178,6 +189,14 @@ pub async fn send_folder(
             continue;
         }
 
+        signal_pause_edge(
+            link,
+            ctrl,
+            &mut signalled_pause,
+            || folder_frame(&FolderMessage::Pause),
+            || folder_frame(&FolderMessage::Resume),
+        )
+        .await;
         if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
             return Ok(outcome);
         }
@@ -210,6 +229,14 @@ pub async fn send_folder(
         done += already;
 
         loop {
+            signal_pause_edge(
+                link,
+                ctrl,
+                &mut signalled_pause,
+                || folder_frame(&FolderMessage::Pause),
+                || folder_frame(&FolderMessage::Resume),
+            )
+            .await;
             if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
                 return Ok(outcome);
             }
@@ -296,10 +323,45 @@ pub async fn receive_folder(
     // counted as completed.
     let mut current_skipped = false;
 
+    // Cooperative pause: edge-detect a *local* pause on our own `ctrl` (this
+    // side's own user pausing the receive — never set by a peer `Pause`
+    // frame; see the `FolderMessage::Pause` arm below for why) and mirror it
+    // to the sender via `Progress{status: Paused}`, exactly like
+    // `stream::receive_file`.
+    let mut signalled_pause = false;
+
     let outcome = loop {
         if ctrl.is_cancelled() {
             let _ = link.send_frame(folder_frame(&FolderMessage::Cancel)).await;
             break TransferOutcome::Cancelled;
+        }
+
+        if ctrl.is_paused() && !signalled_pause {
+            signalled_pause = true;
+            emit(
+                progress,
+                &transfer_id,
+                total,
+                done,
+                &root,
+                files_completed,
+                files_total,
+                Direction::Receiving,
+                TransferStatus::Paused,
+            );
+        } else if !ctrl.is_paused() && signalled_pause {
+            signalled_pause = false;
+            emit(
+                progress,
+                &transfer_id,
+                total,
+                done,
+                &root,
+                files_completed,
+                files_total,
+                Direction::Receiving,
+                TransferStatus::Transferring,
+            );
         }
 
         // Honor a receiver-side pause: stop draining frames (transport
@@ -386,6 +448,42 @@ pub async fn receive_folder(
                     FolderMessage::Cancel => {
                         close_writer(current.take()).await;
                         break TransferOutcome::Cancelled;
+                    }
+                    // Cooperative pause: the sender told us it paused/resumed.
+                    // Deliberately do NOT call `ctrl.pause()`/`ctrl.resume()`
+                    // here — see the identical, more detailed rationale on
+                    // `stream::receive_file`'s `Control::Pause` arm: blocking
+                    // this loop on a peer-initiated pause would leave us
+                    // unable to ever read the sender's matching `Resume`, and
+                    // a compliant sender never sends a `Chunk` between its
+                    // own `Pause` and `Resume` (see `send_folder`'s
+                    // `signal_pause_edge` use), so nothing is lost by just
+                    // mirroring the status.
+                    FolderMessage::Pause => {
+                        emit(
+                            progress,
+                            &transfer_id,
+                            total,
+                            done,
+                            &root,
+                            files_completed,
+                            files_total,
+                            Direction::Receiving,
+                            TransferStatus::Paused,
+                        );
+                    }
+                    FolderMessage::Resume => {
+                        emit(
+                            progress,
+                            &transfer_id,
+                            total,
+                            done,
+                            &root,
+                            files_completed,
+                            files_total,
+                            Direction::Receiving,
+                            TransferStatus::Transferring,
+                        );
                     }
                     // Unexpected mid-stream; ignore.
                     FolderMessage::Manifest { .. } | FolderMessage::ResumeState { .. } => {}
@@ -598,6 +696,8 @@ mod tests {
             FolderMessage::FileEnd { index: 1 },
             FolderMessage::Complete,
             FolderMessage::Cancel,
+            FolderMessage::Pause,
+            FolderMessage::Resume,
         ];
         for m in msgs {
             assert_eq!(parse_folder(&folder_frame(&m)).unwrap(), m);

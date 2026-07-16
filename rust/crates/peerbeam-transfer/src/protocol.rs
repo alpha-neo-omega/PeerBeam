@@ -42,7 +42,28 @@ pub enum Control {
     Verify { ok: bool },
     /// Either side is aborting the transfer.
     Cancel,
+    /// Sender → receiver: cooperative pause — the sender has stopped sending
+    /// chunks; the receiver should stop too so both sides show "paused".
+    /// Sent once per local pause edge (see `stream::send_file`'s
+    /// `signalled_pause` tracking) — never polled or retransmitted, so it
+    /// cannot loop.
+    Pause,
+    /// Sender → receiver: cooperative resume, the counterpart to [`Pause`](Control::Pause).
+    Resume,
 }
+
+/// Sentinel values on the receiver→sender progress back-channel
+/// ([`peerbeam_domain::port::ProgressSink`]/`ProgressSource`), which otherwise
+/// only ever carries real received-byte counts. Reserved from the very top of
+/// the `u64` range: a file would need to be exabytes in size for a real byte
+/// count to collide with either value, which is not a real-world concern.
+///
+/// These mirror [`Control::Pause`]/[`Control::Resume`] in the other
+/// direction — receiver → sender — so a receiver-side pause stops the sender
+/// even though the sender only reads the main stream at the very start and
+/// end of a transfer (see the `peerbeam-ffi` `drive()` back-channel wiring).
+pub const BACK_PAUSE: u64 = u64::MAX;
+pub const BACK_RESUME: u64 = u64::MAX - 1;
 
 /// Build the opening metadata frame.
 pub fn meta_frame(meta: &TransferMeta) -> Frame {
@@ -118,11 +139,23 @@ mod tests {
             },
             Control::Verify { ok: true },
             Control::Cancel,
+            Control::Pause,
+            Control::Resume,
         ] {
             let frame = control_frame(&c);
             assert_eq!(frame.kind, FrameKind::Control);
             assert_eq!(parse_control(&frame).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn back_channel_sentinels_are_distinct_and_never_real_byte_counts() {
+        // Real received-byte counts come from `frame.payload.len()` sums over
+        // an actual transfer; both reserved values sit at the very top of the
+        // `u64` range, far past anything reachable in practice.
+        assert_ne!(BACK_PAUSE, BACK_RESUME);
+        assert_eq!(BACK_PAUSE, u64::MAX);
+        assert_eq!(BACK_RESUME, u64::MAX - 1);
     }
 
     #[test]

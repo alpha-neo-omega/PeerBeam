@@ -26,7 +26,8 @@ use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
     authenticate, receive_file, receive_folder, send_file, send_folder, FolderSendRequest,
-    Identity, PeekLink, SecureLink, SendRequest, TransferControl, TransferOutcome,
+    Identity, PeekLink, SecureLink, SendRequest, TransferControl, TransferOutcome, BACK_PAUSE,
+    BACK_RESUME,
 };
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
@@ -558,6 +559,7 @@ impl Manager {
             id.clone(),
             active.stats.clone(),
             active.file.clone(),
+            active.ctrl.clone(),
             |ptx| async move {
                 let r = send_file(&mut secure, &storage, req, &ctrl, &ptx, 3).await;
                 drop(ptx);
@@ -613,6 +615,7 @@ impl Manager {
             id.clone(),
             active.stats.clone(),
             active.file.clone(),
+            active.ctrl.clone(),
             |ptx| async move {
                 let r = send_folder(&mut secure, &storage, req, &ctrl, &ptx, 3).await;
                 drop(ptx);
@@ -1056,6 +1059,7 @@ impl Manager {
             id.clone(),
             active.stats.clone(),
             active.file.clone(),
+            active.ctrl.clone(),
             |ptx| async move {
                 let mut peek = PeekLink::new(first, &mut secure);
                 let r = if is_folder {
@@ -1112,10 +1116,19 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 /// bytes-sent — so the sender sees the receiver's real progress over a slow
 /// link. If the peer never reports (old build / non-QUIC), we fall back to
 /// bytes-sent after a short grace.
+///
+/// `ctrl` is this transfer's control handle, needed here (independent of
+/// whatever `run` closed over it with) for the sender side of cooperative
+/// pause: a receiver-initiated pause reaches us as a
+/// [`BACK_PAUSE`]/[`BACK_RESUME`] sentinel on the same back-channel that
+/// otherwise only ever carries real byte counts (see `in_task` below), and
+/// pausing/resuming `ctrl` here is what actually stops/resumes the send loop
+/// (which was handed its own clone of the same `TransferControl`).
 async fn drive<F, Fut>(
     id: String,
     stats: Arc<Mutex<Stats>>,
     file: Arc<Mutex<String>>,
+    ctrl: TransferControl,
     run: F,
     progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>>,
     progress_in: Option<Box<dyn peerbeam_domain::port::ProgressSource>>,
@@ -1144,12 +1157,18 @@ where
             while out_rx.recv().await.is_some() {} // drain
             return;
         };
-        let mut last = u64::MAX;
+        // `None` means "nothing sent yet" — kept distinct from any `u64`
+        // value (rather than a magic number like `u64::MAX`) because
+        // `BACK_PAUSE`/`BACK_RESUME` now legitimately use the top of the
+        // `u64` range: a magic-sentinel `last` would make the very first
+        // pause on a fresh channel indistinguishable from "already sent
+        // this" and get silently swallowed.
+        let mut last: Option<u64> = None;
         while let Some(bytes) = out_rx.recv().await {
-            if bytes == last {
+            if last == Some(bytes) {
                 continue;
             }
-            last = bytes;
+            last = Some(bytes);
             if sink.report(bytes).await.is_err() {
                 break; // peer gone / doesn't accept — stop quietly
             }
@@ -1165,21 +1184,37 @@ where
         let Some(mut source) = progress_in else {
             return;
         };
-        // First report has a grace window; if it never comes, leave the bar to
-        // the bytes-sent fallback in the pump.
-        let mut latest = match tokio::time::timeout(PEER_PROGRESS_GRACE, source.recv()).await {
-            Ok(Ok(Some(first))) => {
-                in_driving.store(true, Ordering::SeqCst);
-                emit_peer(&in_id, &in_stats, first);
-                first
+        // First real byte report has a grace window; a pause/resume sentinel
+        // arriving before it is handled immediately (see `handle_back_channel`)
+        // and does not consume the grace, since it isn't the report being
+        // waited for. If no real report ever comes, leave the bar to the
+        // bytes-sent fallback in the pump.
+        let deadline = tokio::time::sleep(PEER_PROGRESS_GRACE);
+        tokio::pin!(deadline);
+        let mut latest: u64;
+        loop {
+            tokio::select! {
+                r = source.recv() => match r {
+                    Ok(Some(value)) => match handle_back_channel(&in_id, &ctrl, value) {
+                        Some(bytes) => {
+                            in_driving.store(true, Ordering::SeqCst);
+                            emit_peer(&in_id, &in_stats, bytes);
+                            latest = bytes;
+                            break;
+                        }
+                        None => continue,
+                    },
+                    _ => {
+                        in_fell_back.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                },
+                _ = &mut deadline => {
+                    in_fell_back.store(true, Ordering::SeqCst);
+                    return;
+                }
             }
-            // No peer report within the grace: let the pump fall back to
-            // bytes-sent from here on.
-            _ => {
-                in_fell_back.store(true, Ordering::SeqCst);
-                return;
-            }
-        };
+        }
         // Emit on each report (up to ~20/s), and at least once a second as a
         // heartbeat so speed/ETA keep ticking and the bar never looks frozen on
         // a slow/stalled link.
@@ -1188,9 +1223,11 @@ where
         loop {
             tokio::select! {
                 r = source.recv() => match r {
-                    Ok(Some(bytes)) => {
-                        latest = bytes;
-                        emit_peer(&in_id, &in_stats, latest);
+                    Ok(Some(value)) => {
+                        if let Some(bytes) = handle_back_channel(&in_id, &ctrl, value) {
+                            latest = bytes;
+                            emit_peer(&in_id, &in_stats, latest);
+                        }
                     }
                     _ => break,
                 },
@@ -1208,10 +1245,40 @@ where
         let mut last = Instant::now()
             .checked_sub(PROGRESS_INTERVAL)
             .unwrap_or_else(Instant::now);
+        // Tracks whether the previous message left us in a paused state, so a
+        // `Progress{status: Paused}` (from a receive loop's own pause edge —
+        // see `stream::receive_file`) only fires the event/back-channel
+        // signal once per pause, and the matching resume fires once too.
+        let mut was_paused = false;
         while let Some(p) = prx.recv().await {
             if let Some(f) = &p.current_file {
                 *file.lock().unwrap() = f.clone();
             }
+
+            // A pause/resume status change is a signal, not a byte update —
+            // relay it immediately (bypassing the throttle below, which
+            // exists only for high-frequency byte progress) to two places:
+            // this side's own UI, via a `transfer_paused`/`transfer_resumed`
+            // event (this is what delivers the event for a receiver paused
+            // by a peer `Control::Pause` frame, which never goes through
+            // `Manager::pause()`), and the peer, via the back-channel
+            // sentinel (the receiver's half of cooperative pause, read by
+            // `in_task` above on the sender's side).
+            if p.status == TransferStatus::Paused {
+                if !was_paused {
+                    was_paused = true;
+                    events::transfer(&pump_id, "transfer_paused", json!({}));
+                    let _ = out_tx.send(BACK_PAUSE);
+                }
+                continue;
+            }
+            if was_paused {
+                was_paused = false;
+                events::transfer(&pump_id, "transfer_resumed", json!({}));
+                let _ = out_tx.send(BACK_RESUME);
+                // Fall through: this message may also carry a real update.
+            }
+
             let is_final = p.total_bytes > 0 && p.transferred_bytes >= p.total_bytes;
             let due = is_final || last.elapsed() >= PROGRESS_INTERVAL;
             // If the peer channel is driving the bar, only keep `total` fresh;
@@ -1258,6 +1325,28 @@ where
     let work = run(ptx);
     let (r, _, _, _) = tokio::join!(work, pump, in_task, out_task);
     r
+}
+
+/// Interpret one raw back-channel value: a [`BACK_PAUSE`]/[`BACK_RESUME`]
+/// sentinel updates `ctrl` and emits the matching event — so a
+/// receiver-initiated pause/resume also stops/resumes this (sender) side's
+/// send loop and shows up in this side's UI — and returns `None` (there is no
+/// byte count to act on). Any other value is a real received-byte count,
+/// returned as `Some` for the caller to use.
+fn handle_back_channel(id: &str, ctrl: &TransferControl, value: u64) -> Option<u64> {
+    match value {
+        BACK_PAUSE => {
+            ctrl.pause();
+            events::transfer(id, "transfer_paused", json!({}));
+            None
+        }
+        BACK_RESUME => {
+            ctrl.resume();
+            events::transfer(id, "transfer_resumed", json!({}));
+            None
+        }
+        bytes => Some(bytes),
+    }
 }
 
 /// Emit a `transfer_progress` event using the peer's confirmed byte count.
@@ -1748,6 +1837,243 @@ mod tests {
             "average_speed {} still looks baselined at registration, not \
              at the first byte",
             s.average_speed
+        );
+    }
+
+    // ── cooperative pause: drive()'s back-channel wiring ─────────────────
+    //
+    // `stream::receive_file`/`folder::receive_folder` only know about
+    // `Progress` (see their module docs on `signal_pause_edge`); the actual
+    // raw-`u64` back-channel sentinel translation happens entirely inside
+    // `drive()`. These tests exercise that translation directly with fake
+    // `ProgressSink`/`ProgressSource` implementations backed by plain mpsc
+    // channels, so no real QUIC link is needed.
+
+    /// Fake `ProgressSink` (receiver side): every reported value is mirrored
+    /// onto a plain channel the test can drain.
+    struct ChanSink {
+        tx: mpsc::UnboundedSender<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl peerbeam_domain::port::ProgressSink for ChanSink {
+        async fn report(&mut self, received: u64) -> DResult<()> {
+            self.tx
+                .send(received)
+                .map_err(|_| peerbeam_domain::error::DomainError::Connection("closed".into()))
+        }
+    }
+
+    /// Fake `ProgressSource` (sender side): yields whatever the test pushes
+    /// onto a plain channel, `None` once it's dropped — mirroring the real
+    /// QUIC uni-stream closing.
+    struct ChanSource {
+        rx: mpsc::UnboundedReceiver<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl peerbeam_domain::port::ProgressSource for ChanSource {
+        async fn recv(&mut self) -> DResult<Option<u64>> {
+            Ok(self.rx.recv().await)
+        }
+    }
+
+    fn test_progress(status: TransferStatus, transferred: u64, total: u64) -> Progress {
+        Progress {
+            transfer: TransferId::from("t-coop-pause"),
+            direction: Direction::Receiving,
+            status,
+            total_bytes: total,
+            transferred_bytes: transferred,
+            speed_bps: 0.0,
+            current_file: Some("f.bin".into()),
+            files_completed: 0,
+            files_total: 1,
+            eta_secs: None,
+        }
+    }
+
+    /// A receive loop's own pause edge (see `stream::receive_file`) reaches
+    /// `drive()` as a `Progress{status: Paused}`/`{status: Transferring}`
+    /// pair on the `ptx` channel `run` is given. The pump must translate
+    /// that into `BACK_PAUSE`/`BACK_RESUME` on the peer-facing sink
+    /// immediately — not throttled like ordinary byte progress — so a
+    /// receiver-initiated pause reaches the sender promptly.
+    #[tokio::test]
+    async fn drive_translates_receiver_pause_progress_into_back_channel_sentinels() {
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<u64>();
+        let ctrl = TransferControl::new();
+        let stats = Arc::new(Mutex::new(Stats::new()));
+        let file = Arc::new(Mutex::new(String::new()));
+        let progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>> =
+            Some(Box::new(ChanSink { tx: sink_tx }));
+
+        let outcome = drive(
+            "t-coop-pause".into(),
+            stats,
+            file,
+            ctrl,
+            |ptx| async move {
+                let _ = ptx.send(test_progress(TransferStatus::Transferring, 10, 100));
+                let _ = ptx.send(test_progress(TransferStatus::Paused, 10, 100));
+                // A little real time so this isn't misread as the same
+                // instant as the surrounding messages.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = ptx.send(test_progress(TransferStatus::Transferring, 10, 100));
+                let _ = ptx.send(test_progress(TransferStatus::Completed, 100, 100));
+                Ok(TransferOutcome::Completed)
+            },
+            progress_out,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
+
+        let mut mirrored = Vec::new();
+        while let Ok(v) = sink_rx.try_recv() {
+            mirrored.push(v);
+        }
+        let pause_at = mirrored.iter().position(|&v| v == BACK_PAUSE);
+        let resume_at = mirrored.iter().position(|&v| v == BACK_RESUME);
+        assert!(
+            pause_at.is_some(),
+            "expected BACK_PAUSE on the back-channel: {mirrored:?}"
+        );
+        assert!(
+            resume_at.is_some(),
+            "expected BACK_RESUME on the back-channel: {mirrored:?}"
+        );
+        assert!(
+            pause_at.unwrap() < resume_at.unwrap(),
+            "pause must precede resume: {mirrored:?}"
+        );
+    }
+
+    /// A redundant `Progress{status: Paused}` (the loop-freedom guarantee:
+    /// the same status repeated) must not re-signal — only the edge does.
+    #[tokio::test]
+    async fn drive_does_not_resignal_a_repeated_paused_status() {
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<u64>();
+        let ctrl = TransferControl::new();
+        let stats = Arc::new(Mutex::new(Stats::new()));
+        let file = Arc::new(Mutex::new(String::new()));
+        let progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>> =
+            Some(Box::new(ChanSink { tx: sink_tx }));
+
+        let outcome = drive(
+            "t-coop-pause-repeat".into(),
+            stats,
+            file,
+            ctrl,
+            |ptx| async move {
+                let _ = ptx.send(test_progress(TransferStatus::Paused, 10, 100));
+                let _ = ptx.send(test_progress(TransferStatus::Paused, 10, 100));
+                let _ = ptx.send(test_progress(TransferStatus::Paused, 10, 100));
+                Ok(TransferOutcome::Completed)
+            },
+            progress_out,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
+
+        let mut mirrored = Vec::new();
+        while let Ok(v) = sink_rx.try_recv() {
+            mirrored.push(v);
+        }
+        assert_eq!(
+            mirrored.iter().filter(|&&v| v == BACK_PAUSE).count(),
+            1,
+            "three repeated Paused statuses must send exactly one BACK_PAUSE, not one per message: {mirrored:?}"
+        );
+    }
+
+    /// The sender's half: a `BACK_PAUSE`/`BACK_RESUME` sentinel arriving on
+    /// the peer-facing source (the receiver's back-channel signal, read by
+    /// `in_task`) must pause/resume `ctrl` — which is what actually stops
+    /// the send loop, since it was handed a clone of this same control.
+    #[tokio::test]
+    async fn drive_pauses_and_resumes_ctrl_from_back_channel_sentinels() {
+        let (src_tx, src_rx) = mpsc::unbounded_channel::<u64>();
+        let ctrl = TransferControl::new();
+        let ctrl_check = ctrl.clone();
+        let stats = Arc::new(Mutex::new(Stats::new()));
+        let file = Arc::new(Mutex::new(String::new()));
+        let progress_in: Option<Box<dyn peerbeam_domain::port::ProgressSource>> =
+            Some(Box::new(ChanSource { rx: src_rx }));
+
+        let handle = tokio::spawn(drive(
+            "t-coop-pause-sender".into(),
+            stats,
+            file,
+            ctrl,
+            |_ptx| async move {
+                // Give the in_task time to process the sentinels below
+                // before the (fake) send "completes".
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(TransferOutcome::Completed)
+            },
+            None,
+            progress_in,
+        ));
+
+        src_tx.send(BACK_PAUSE).unwrap();
+        wait_until(|| ctrl_check.is_paused()).await;
+
+        // A real byte count breaks in_task out of its first-report wait
+        // (mirrors a genuine peer that both pauses and reports progress).
+        src_tx.send(500).unwrap();
+        src_tx.send(BACK_RESUME).unwrap();
+        wait_until(|| !ctrl_check.is_paused()).await;
+
+        drop(src_tx); // let in_task's steady-state loop see the channel close
+        let outcome = handle.await.unwrap();
+        assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
+    }
+
+    /// No infinite frame loop: a bounded pause→resume→pause→resume cycle on
+    /// the receiver's `Progress` stream must produce exactly one sentinel
+    /// per edge (four sentinels for two full cycles), never more.
+    #[tokio::test]
+    async fn drive_bounds_sentinels_to_one_per_edge_across_multiple_cycles() {
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<u64>();
+        let ctrl = TransferControl::new();
+        let stats = Arc::new(Mutex::new(Stats::new()));
+        let file = Arc::new(Mutex::new(String::new()));
+        let progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>> =
+            Some(Box::new(ChanSink { tx: sink_tx }));
+
+        let outcome = drive(
+            "t-coop-pause-bounded".into(),
+            stats,
+            file,
+            ctrl,
+            |ptx| async move {
+                for _ in 0..2 {
+                    let _ = ptx.send(test_progress(TransferStatus::Paused, 10, 100));
+                    let _ = ptx.send(test_progress(TransferStatus::Transferring, 10, 100));
+                }
+                Ok(TransferOutcome::Completed)
+            },
+            progress_out,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
+
+        let mut mirrored = Vec::new();
+        while let Ok(v) = sink_rx.try_recv() {
+            mirrored.push(v);
+        }
+        assert_eq!(
+            mirrored.iter().filter(|&&v| v == BACK_PAUSE).count(),
+            2,
+            "two pause edges must send exactly two BACK_PAUSE sentinels: {mirrored:?}"
+        );
+        assert_eq!(
+            mirrored.iter().filter(|&&v| v == BACK_RESUME).count(),
+            2,
+            "two resume edges must send exactly two BACK_RESUME sentinels: {mirrored:?}"
         );
     }
 }

@@ -30,7 +30,7 @@ pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use peek::PeekLink;
-pub use protocol::{Control, TransferMeta};
+pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};
 pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};

@@ -113,7 +113,23 @@ pub async fn send_file(
     let chunk = req.chunk_size.max(1) as usize;
     let mut sent = offset;
 
+    // Cooperative pause: edge-detect our own pause state and tell the
+    // receiver on the main stream, so a sender-initiated pause stops the
+    // receiver too (rather than only the receiver's transport backpressure
+    // stalling once our chunks stop arriving). Fires exactly once per pause
+    // edge and once per resume edge — never polled or retried — so this
+    // cannot loop.
+    let mut signalled_pause = false;
+
     loop {
+        signal_pause_edge(
+            link,
+            ctrl,
+            &mut signalled_pause,
+            || control_frame(&Control::Pause),
+            || control_frame(&Control::Resume),
+        )
+        .await;
         if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
             return Ok(outcome);
         }
@@ -210,10 +226,41 @@ pub async fn receive_file(
     let mut received = existing;
     let mut integrity_ok = true;
 
+    // Cooperative pause: edge-detect a *local* pause on our own `ctrl` (this
+    // side's own user pausing the receive — never set by a peer `Pause`
+    // frame; see the `Control::Pause` arm below for why) and mirror it to
+    // the sender over the progress back-channel via a `Progress{status:
+    // Paused}` message. `drive()` (in `peerbeam-ffi`) turns that into the
+    // actual back-channel sentinel; this crate only knows about `Progress`,
+    // not the raw channel. Fires exactly once per edge, so it cannot loop.
+    let mut signalled_pause = false;
+
     let outcome = loop {
         if ctrl.is_cancelled() {
             let _ = link.send_frame(control_frame(&Control::Cancel)).await;
             break TransferOutcome::Cancelled;
+        }
+
+        if ctrl.is_paused() && !signalled_pause {
+            signalled_pause = true;
+            let _ = progress.send(make_progress(
+                &meta.transfer_id,
+                Direction::Receiving,
+                TransferStatus::Paused,
+                meta.size.max(received),
+                received,
+                &base,
+            ));
+        } else if !ctrl.is_paused() && signalled_pause {
+            signalled_pause = false;
+            let _ = progress.send(make_progress(
+                &meta.transfer_id,
+                Direction::Receiving,
+                TransferStatus::Transferring,
+                meta.size.max(received),
+                received,
+                &base,
+            ));
         }
 
         // Honor a receiver-side pause: stop draining frames (transport
@@ -266,6 +313,41 @@ pub async fn receive_file(
                         break TransferOutcome::Completed;
                     }
                     Control::Cancel => break TransferOutcome::Cancelled,
+                    // Cooperative pause: the sender told us it paused/resumed.
+                    // Deliberately do NOT call `ctrl.pause()`/`ctrl.resume()`
+                    // here — this loop's *own* pause handling
+                    // (`wait_while_paused` above) fully stops draining
+                    // `recv_frame`, which is right for a *local* pause (it's
+                    // what backpressures an uncooperative/non-QUIC sender),
+                    // but would be wrong here: if we blocked on a
+                    // peer-initiated pause too, we could never read the
+                    // sender's matching `Control::Resume` — a deadlock, since
+                    // that frame arrives on the very stream we'd have stopped
+                    // reading, with nothing local left to wake us. A
+                    // compliant sender (see `send_file`'s `signal_pause_edge`)
+                    // never sends a `Chunk` between its own `Pause` and
+                    // `Resume`, so simply not blocking loses nothing — the
+                    // status just needs mirroring to the UI/back-channel.
+                    Control::Pause => {
+                        let _ = progress.send(make_progress(
+                            &meta.transfer_id,
+                            Direction::Receiving,
+                            TransferStatus::Paused,
+                            meta.size.max(received),
+                            received,
+                            &base,
+                        ));
+                    }
+                    Control::Resume => {
+                        let _ = progress.send(make_progress(
+                            &meta.transfer_id,
+                            Direction::Receiving,
+                            TransferStatus::Transferring,
+                            meta.size.max(received),
+                            received,
+                            &base,
+                        ));
+                    }
                     Control::ResumeAck { .. } | Control::Verify { .. } => {}
                 },
                 _ => {}
@@ -330,6 +412,32 @@ pub async fn receive_file(
         name: final_name,
         bytes: received,
     })
+}
+
+/// Edge-detect a local pause/resume transition on `ctrl` and tell the peer
+/// about it on the main stream, exactly once per edge (tracked in
+/// `signalled`). Generic over the frame builders so both the single-file
+/// protocol (`Control::Pause`/`Resume`) and the folder protocol
+/// (`FolderMessage::Pause`/`Resume`) share this one edge-detector instead of
+/// duplicating the branch logic. Best-effort: a dropped `Pause`/`Resume`
+/// frame only costs the peer a slightly later reaction (it still stops on
+/// its own transport backpressure/cancel checks), so send errors are
+/// ignored here rather than aborting the transfer. Called every loop
+/// iteration but only ever sends on the actual transition, so it cannot loop.
+pub(crate) async fn signal_pause_edge(
+    link: &mut dyn Link,
+    ctrl: &TransferControl,
+    signalled: &mut bool,
+    pause_frame: impl FnOnce() -> Frame,
+    resume_frame: impl FnOnce() -> Frame,
+) {
+    if ctrl.is_paused() && !*signalled {
+        *signalled = true;
+        let _ = link.send_frame(pause_frame()).await;
+    } else if !ctrl.is_paused() && *signalled {
+        *signalled = false;
+        let _ = link.send_frame(resume_frame()).await;
+    }
 }
 
 /// If cancelled, send `Cancel` and return the outcome; if paused, block.
