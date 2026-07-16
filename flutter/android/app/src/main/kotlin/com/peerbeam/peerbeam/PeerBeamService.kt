@@ -6,8 +6,11 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import androidx.core.app.NotificationManagerCompat
 
 /**
  * Foreground service keeping transfers / receive alive across backgrounding.
@@ -16,6 +19,19 @@ import android.os.PowerManager
 class PeerBeamService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Status-bar icon animation. Android doesn't frame-animate a notification
+    // small icon on its own, so while a transfer is active we cycle the icon
+    // through frames by re-posting the notification on a timer (down-arrow
+    // descends for receives, up-arrow rises for sends). Idle = a static icon.
+    private val animHandler = Handler(Looper.getMainLooper())
+    private var animRunnable: Runnable? = null
+    private val dlFrames = intArrayOf(
+        R.drawable.ic_stat_dl0, R.drawable.ic_stat_dl1, R.drawable.ic_stat_dl2,
+    )
+    private val ulFrames = intArrayOf(
+        R.drawable.ic_stat_ul0, R.drawable.ic_stat_ul1, R.drawable.ic_stat_ul2,
+    )
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -41,6 +57,7 @@ class PeerBeamService : Service() {
         val incoming = intent.getBooleanExtra("incoming", false)
 
         Notifications.ensureChannel(this)
+        val frames = if (incoming) dlFrames else ulFrames
         val notification = Notifications.build(
             this,
             title,
@@ -48,6 +65,7 @@ class PeerBeamService : Service() {
             true,
             if (active) -1 else null,
             incoming,
+            if (active) frames[0] else null,
         )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -61,9 +79,43 @@ class PeerBeamService : Service() {
         }
 
         updateLocks(active)
+        if (active) startIconAnimation(title, body, incoming) else stopIconAnimation()
         // Not sticky: don't let the OS resurrect the service without its engine
         // (see the null-intent guard above). The app re-starts it on relaunch.
         return START_NOT_STICKY
+    }
+
+    /// While a transfer is active, cycle the small icon through frames (~2/s) so
+    /// the status-bar icon appears to animate. `startForeground` already posted
+    /// frame 0; this loop advances from frame 1 onward, re-posting the same
+    /// notification id. Stopped when idle / on destroy.
+    private fun startIconAnimation(title: String, body: String, incoming: Boolean) {
+        stopIconAnimation()
+        val frames = if (incoming) dlFrames else ulFrames
+        var i = 1
+        val runnable = object : Runnable {
+            override fun run() {
+                val n = Notifications.build(
+                    this@PeerBeamService, title, body, true, -1, incoming,
+                    frames[i % frames.size],
+                )
+                try {
+                    NotificationManagerCompat.from(this@PeerBeamService)
+                        .notify(Notifications.SERVICE_ID, n)
+                } catch (_: SecurityException) {
+                    // POST_NOTIFICATIONS not granted — skip silently.
+                }
+                i++
+                animHandler.postDelayed(this, 450)
+            }
+        }
+        animRunnable = runnable
+        animHandler.postDelayed(runnable, 450)
+    }
+
+    private fun stopIconAnimation() {
+        animRunnable?.let { animHandler.removeCallbacks(it) }
+        animRunnable = null
     }
 
     /// Wi-Fi lock is held for the whole service lifetime so incoming transfers
@@ -104,6 +156,7 @@ class PeerBeamService : Service() {
     }
 
     override fun onDestroy() {
+        stopIconAnimation()
         releaseLocks()
         super.onDestroy()
     }

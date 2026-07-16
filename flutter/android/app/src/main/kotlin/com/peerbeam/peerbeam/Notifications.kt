@@ -34,6 +34,7 @@ object Notifications {
         ongoing: Boolean,
         progress: Int?,
         incoming: Boolean = false,
+        iconRes: Int? = null,
     ): Notification {
         // Tapping opens the app. One-shots (complete/failed/received) dismiss
         // themselves on tap; the ongoing service note stays put.
@@ -44,7 +45,9 @@ object Notifications {
             context, 0, launch,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val icon = if (incoming) {
+        // iconRes overrides the default (used by the service to cycle animation
+        // frames while a transfer is active); otherwise a static direction icon.
+        val icon = iconRes ?: if (incoming) {
             android.R.drawable.stat_sys_download
         } else {
             android.R.drawable.stat_sys_upload
