@@ -59,6 +59,7 @@ class TransferRepository extends ChangeNotifier {
   void resume(String id) => _api?.resume(id).catchError((_) {});
   void cancel(String id) => _api?.cancel(id).catchError((_) {});
   void accept(String id) => _api?.accept(id).catchError((_) {});
+  void acceptTrust(String id) => _api?.acceptTrust(id).catchError((_) {});
   void reject(String id) => _api?.reject(id).catchError((_) {});
 
   /// Send files to a peer; the engine returns ids and drives events.

@@ -49,6 +49,7 @@ class Bindings {
   final _ArgRetDart _resume;
   final _ArgRetDart _cancel;
   final _ArgRetDart _accept;
+  final _ArgRetDart _acceptTrust;
   final _ArgRetDart _reject;
   final _RetDart _active;
   final _ArgRetDart _get;
@@ -81,6 +82,9 @@ class Bindings {
       _resume = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_resume'),
       _cancel = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_cancel'),
       _accept = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_accept'),
+      _acceptTrust = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_transfer_accept_trust',
+      ),
       _reject = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_reject'),
       _active = lib.lookupFunction<_RetC, _RetDart>('pb_transfers_active'),
       _get = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_get'),
@@ -125,6 +129,7 @@ class Bindings {
   String resume(String json) => _withArg(json, _resume);
   String cancel(String json) => _withArg(json, _cancel);
   String accept(String json) => _withArg(json, _accept);
+  String acceptTrust(String json) => _withArg(json, _acceptTrust);
   String reject(String json) => _withArg(json, _reject);
   String active() => _consume(_active());
   String get(String json) => _withArg(json, _get);

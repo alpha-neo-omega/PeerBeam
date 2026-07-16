@@ -62,6 +62,8 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<void> accept(String id) async => calls.add('accept:$id');
   @override
+  Future<void> acceptTrust(String id) async => calls.add('acceptTrust:$id');
+  @override
   Future<void> reject(String id) async => calls.add('reject:$id');
 
   @override

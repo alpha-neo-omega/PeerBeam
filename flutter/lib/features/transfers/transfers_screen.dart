@@ -174,45 +174,71 @@ class _TransferCard extends StatelessWidget {
                 ),
               ),
               const Gap(AppSpace.xs),
-              Row(
+              // A `Wrap` (not a `Row`) so the action cluster can drop to its
+              // own line on narrow widths instead of overflowing — the
+              // awaitingApproval case has three actions (Decline/Accept/
+              // Trust) where the old two-button row used to just fit.
+              Wrap(
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: AppSpace.xs,
+                runSpacing: AppSpace.xs,
                 children: [
-                  Expanded(
-                    child: Text(
-                      _meta(transfer),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.bodySmall?.copyWith(
-                        color: scheme.onSurfaceVariant,
-                      ),
+                  Text(
+                    _meta(transfer),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
                     ),
                   ),
-                  const Gap(AppSpace.xs),
-                  if (awaitingApproval) ...[
-                    TextButton(
-                      onPressed: () => state.transfer.reject(transfer.id),
-                      child: const Text('Decline'),
-                    ),
-                    const Gap(AppSpace.xs),
-                    FilledButton(
-                      onPressed: () => state.transfer.accept(transfer.id),
-                      child: const Text('Accept'),
-                    ),
-                  ] else ...[
-                    IconButton(
-                      tooltip: paused ? 'Resume' : 'Pause',
-                      onPressed: () => paused
-                          ? state.transfer.resume(transfer.id)
-                          : state.transfer.pause(transfer.id),
-                      icon: Icon(
-                        paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: 'Cancel',
-                      onPressed: () => state.transfer.cancel(transfer.id),
-                      icon: const Icon(Icons.close_rounded),
-                    ),
-                  ],
+                  Wrap(
+                    alignment: WrapAlignment.end,
+                    spacing: AppSpace.xs,
+                    runSpacing: AppSpace.xs,
+                    children: awaitingApproval
+                        ? [
+                            TextButton(
+                              onPressed: () =>
+                                  state.transfer.reject(transfer.id),
+                              child: const Text('Decline'),
+                            ),
+                            FilledButton.tonal(
+                              onPressed: () =>
+                                  state.transfer.accept(transfer.id),
+                              child: const Text('Accept'),
+                            ),
+                            Tooltip(
+                              message:
+                                  'Accept and always trust this device',
+                              child: FilledButton(
+                                onPressed: () => state.transfer.acceptTrust(
+                                  transfer.id,
+                                ),
+                                child: const Text('Trust'),
+                              ),
+                            ),
+                          ]
+                        : [
+                            IconButton(
+                              tooltip: paused ? 'Resume' : 'Pause',
+                              onPressed: () => paused
+                                  ? state.transfer.resume(transfer.id)
+                                  : state.transfer.pause(transfer.id),
+                              icon: Icon(
+                                paused
+                                    ? Icons.play_arrow_rounded
+                                    : Icons.pause_rounded,
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Cancel',
+                              onPressed: () =>
+                                  state.transfer.cancel(transfer.id),
+                              icon: const Icon(Icons.close_rounded),
+                            ),
+                          ],
+                  ),
                 ],
               ),
             ],

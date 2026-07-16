@@ -39,6 +39,11 @@ abstract class PeerBeamApi {
   Future<void> resume(String id);
   Future<void> cancel(String id);
   Future<void> accept(String id);
+
+  /// Accept AND trust the sending device: future transfers from it are
+  /// auto-accepted whenever auto-accept is enabled. A plain [accept] never
+  /// does this — trusting a device is always a separate, explicit choice.
+  Future<void> acceptTrust(String id);
   Future<void> reject(String id);
 
   Future<List<TransferSnapshot>> activeTransfers();
@@ -176,6 +181,9 @@ class PeerBeam implements PeerBeamApi {
   Future<void> cancel(String id) async => _data(_req().cancel(_id(id)));
   @override
   Future<void> accept(String id) async => _data(_req().accept(_id(id)));
+  @override
+  Future<void> acceptTrust(String id) async =>
+      _data(_req().acceptTrust(_id(id)));
   @override
   Future<void> reject(String id) async => _data(_req().reject(_id(id)));
 

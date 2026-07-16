@@ -221,13 +221,24 @@ pub unsafe extern "C" fn pb_transfer_cancel(json: *const c_char) -> *mut c_char 
     guard(|| error::envelope((|| runtime::manager()?.cancel(&id_of(&read_json(json)?)?))()))
 }
 
-/// Accept an incoming transfer: `{id}`.
+/// Accept an incoming transfer: `{id}`. One-time only — does not trust the
+/// sending device.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn pb_transfer_accept(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.accept(&id_of(&read_json(json)?)?))()))
+}
+
+/// Accept an incoming transfer AND trust the sending device: `{id}`. Future
+/// transfers from it are auto-accepted whenever auto-accept is enabled.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_accept_trust(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.accept_trust(&id_of(&read_json(json)?)?))()))
 }
 
 /// Reject an incoming transfer: `{id}`.

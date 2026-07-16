@@ -164,6 +164,18 @@ impl Active {
     }
 }
 
+/// The user's decision on an incoming-transfer prompt. Accepting a transfer
+/// and trusting the sending device are deliberately separate: `AcceptOnce`
+/// lets this one transfer through and nothing else; only `AcceptAndTrust`
+/// approves the device for future auto-accept. Never inferred from a plain
+/// accept — trust is always an explicit, separate choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptDecision {
+    Reject,
+    AcceptOnce,
+    AcceptAndTrust,
+}
+
 // ── manager ─────────────────────────────────────────────────────
 
 pub struct Manager {
@@ -185,7 +197,7 @@ pub struct Manager {
     chunk_size: u32,
     daemon_port: u16,
     active: Mutex<HashMap<String, Arc<Active>>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<AcceptDecision>>>,
     history: Mutex<Vec<Value>>,
     /// Where history persists across restarts (None = in-memory only, tests).
     history_path: Option<std::path::PathBuf>,
@@ -807,7 +819,7 @@ impl Manager {
         // the approval channel and never checks `ctrl`. Fire the pending sender
         // with `false` so it unblocks and cleans up.
         if let Some(tx) = self.pending.lock().unwrap().remove(id) {
-            let _ = tx.send(false);
+            let _ = tx.send(AcceptDecision::Reject);
         }
         // An aborted task won't run finish(); do the cleanup + notify here.
         *a.status.lock().unwrap() = "cancelled".into();
@@ -815,6 +827,9 @@ impl Manager {
         Ok(json!({ "cancelled": true }))
     }
 
+    /// Accept an incoming transfer this one time only. Does not trust the
+    /// sending device — the next incoming transfer from it still needs a
+    /// decision. See [`accept_trust`](Self::accept_trust) to also trust it.
     pub fn accept(&self, id: &str) -> Op {
         match self.pending.lock().unwrap().remove(id) {
             // The receiver may already have timed out (`ACCEPT_TIMEOUT`) and
@@ -822,7 +837,23 @@ impl Manager {
             // removing the entry and sending on it — `send` returning `Err`
             // means the decision landed too late to matter, so report
             // not-found rather than a success the caller already acted past.
-            Some(tx) => match tx.send(true) {
+            Some(tx) => match tx.send(AcceptDecision::AcceptOnce) {
+                Ok(()) => Ok(json!({ "accepted": true })),
+                Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+            },
+            None => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+        }
+    }
+
+    /// Accept an incoming transfer AND trust the sending device: future
+    /// transfers from it are auto-accepted whenever auto-accept is enabled.
+    /// The only path that ever approves a device — a plain [`accept`](Self::accept)
+    /// never does.
+    pub fn accept_trust(&self, id: &str) -> Op {
+        match self.pending.lock().unwrap().remove(id) {
+            // Same rationale as `accept`: a failed send means the timeout
+            // already declined this transfer out from under us.
+            Some(tx) => match tx.send(AcceptDecision::AcceptAndTrust) {
                 Ok(()) => Ok(json!({ "accepted": true })),
                 Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
             },
@@ -834,7 +865,7 @@ impl Manager {
         match self.pending.lock().unwrap().remove(id) {
             // Same rationale as `accept`: a failed send means the timeout
             // already declined this transfer out from under us.
-            Some(tx) => match tx.send(false) {
+            Some(tx) => match tx.send(AcceptDecision::Reject) {
                 Ok(()) => Ok(json!({ "rejected": true })),
                 Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
             },
@@ -942,21 +973,25 @@ impl Manager {
         self.mark_daemon_stopped();
     }
 
-    /// Wait for the user's accept/reject decision on a just-authenticated
-    /// incoming transfer `id`, bounded by [`ACCEPT_TIMEOUT`] so a connection
-    /// drop or an unanswered prompt can't park the caller (and the counted
-    /// `active` slot) forever. The pending entry is removed before returning
-    /// on every path — explicit accept, explicit decline (`reject`, or
-    /// `cancel` firing the sender with `false`), a dropped sender, or a
-    /// timeout — so a stale id can never be acted on by a later
-    /// `accept`/`reject` call. Trust is only recorded on an actual accept.
+    /// Wait for the user's decision on a just-authenticated incoming
+    /// transfer `id`, bounded by [`ACCEPT_TIMEOUT`] so a connection drop or
+    /// an unanswered prompt can't park the caller (and the counted `active`
+    /// slot) forever. The pending entry is removed before returning on every
+    /// path — explicit accept, explicit accept-and-trust, explicit decline
+    /// (`reject`, or `cancel` firing the sender with [`AcceptDecision::Reject`]),
+    /// a dropped sender, or a timeout — so a stale id can never be acted on
+    /// by a later `accept`/`accept_trust`/`reject` call. Trust is recorded
+    /// only for [`AcceptDecision::AcceptAndTrust`] — a plain one-time accept
+    /// never approves the device, so it never gains auto-accept on its own.
     async fn wait_for_accept(&self, id: &str, peer_id: &DeviceId) -> bool {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.to_string(), tx);
         let accepted = match tokio::time::timeout(ACCEPT_TIMEOUT, rx).await {
-            Ok(Ok(true)) => {
-                // Explicit accept: this device is now approved for
-                // auto-accept on future connections. Never set on decline.
+            Ok(Ok(AcceptDecision::AcceptOnce)) => true,
+            Ok(Ok(AcceptDecision::AcceptAndTrust)) => {
+                // Explicit accept-and-trust: this device is now approved for
+                // auto-accept on future connections. Never set on a plain
+                // accept, a decline, a dropped sender, or a timeout.
                 let _ = self.trust.approve(peer_id);
                 true
             }
@@ -1508,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_accept_true_on_explicit_accept_and_approves_trust() {
+    async fn wait_for_accept_true_on_explicit_accept_and_leaves_trust_unapproved() {
         let mgr = Arc::new(test_manager("Device"));
         let peer_id = DeviceId::from("peer-accept");
         pin(&mgr.trust, &peer_id);
@@ -1526,8 +1561,36 @@ mod tests {
             "pending entry must be removed after the decision"
         );
         assert!(
+            !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
+            "a one-time accept must never approve the device for auto-accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_accept_true_on_accept_trust_and_approves_trust() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer_id = DeviceId::from("peer-accept-trust");
+        pin(&mgr.trust, &peer_id);
+        let id = "tx-test-accept-trust".to_string();
+
+        let (mgr2, id2, peer2) = (mgr.clone(), id.clone(), peer_id.clone());
+        let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
+
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
+        mgr.accept_trust(&id)
+            .expect("accept_trust should find the pending id");
+
+        assert!(
+            waiter.await.expect("task join"),
+            "explicit accept-and-trust -> true"
+        );
+        assert!(
+            !mgr.pending.lock().unwrap().contains_key(&id),
+            "pending entry must be removed after the decision"
+        );
+        assert!(
             mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
-            "explicit accept records approval for future auto-accept"
+            "accept-and-trust records approval for future auto-accept"
         );
     }
 
