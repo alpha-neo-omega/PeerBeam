@@ -19,23 +19,29 @@ class ForegroundServiceController {
     required bool receiving,
   }) async {
     final shouldRun = activeTransfers > 0 || receiving;
+    // "Active" = a transfer is actually moving bytes. Idle receive-ready keeps
+    // the service alive (to accept incoming) but holds no CPU wake lock and
+    // shows a static notification — the wake lock + animated notification only
+    // engage during an active transfer (battery-friendly background receive).
+    final active = activeTransfers > 0;
     final note = TransferNotifications.service(
       activeTransfers: activeTransfers,
       receiving: receiving,
     );
 
-    if (shouldRun && !_running) {
-      _running = true;
-      await bridge.startForegroundService(note.title, note.body);
-      // Discovery needs the multicast lock while we're actively running.
-      await bridge.setMulticastLock(true);
-    } else if (!shouldRun && _running) {
+    if (shouldRun) {
+      if (!_running) {
+        _running = true;
+        // Discovery needs the multicast lock while we're running.
+        await bridge.setMulticastLock(true);
+      }
+      // (Re)deliver so the service updates its wake lock + notification for the
+      // current active/idle state. Idempotent + cheap.
+      await bridge.startForegroundService(note.title, note.body, active: active);
+    } else if (_running) {
       _running = false;
       await bridge.setMulticastLock(false);
       await bridge.stopForegroundService();
-    } else if (shouldRun && _running) {
-      // Keep the ongoing notification current.
-      await bridge.showNotification(note);
     }
   }
 }

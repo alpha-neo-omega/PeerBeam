@@ -90,6 +90,7 @@ class MainActivity : FlutterActivity() {
                 val svc = Intent(this, PeerBeamService::class.java)
                     .putExtra("title", call.argument<String>("title"))
                     .putExtra("body", call.argument<String>("body"))
+                    .putExtra("active", call.argument<Boolean>("active") ?: false)
                 ContextCompat.startForegroundService(this, svc)
                 result.success(null)
             }

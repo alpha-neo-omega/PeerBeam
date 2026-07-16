@@ -40,7 +40,13 @@ object Notifications {
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
         if (progress != null) {
-            builder.setProgress(100, progress.coerceIn(0, 100), false)
+            if (progress < 0) {
+                // Indeterminate: an animated, moving progress bar (used while a
+                // transfer is active).
+                builder.setProgress(0, 0, true)
+            } else {
+                builder.setProgress(100, progress.coerceIn(0, 100), false)
+            }
         }
         return builder.build()
     }

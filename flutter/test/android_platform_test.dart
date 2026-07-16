@@ -20,6 +20,7 @@ Future<void> flush() => Future(() {});
 class FakeBridge implements PlatformBridge {
   int startCount = 0;
   int stopCount = 0;
+  bool? lastActive;
   bool multicast = false;
   final List<NotificationContent> shown = [];
   bool exempt = false;
@@ -31,8 +32,14 @@ class FakeBridge implements PlatformBridge {
   @override
   Future<Map<String, dynamic>?> initialIntent() async => null;
   @override
-  Future<void> startForegroundService(String title, String body) async =>
-      startCount++;
+  Future<void> startForegroundService(
+    String title,
+    String body, {
+    bool active = false,
+  }) async {
+    startCount++;
+    lastActive = active;
+  }
   @override
   Future<void> stopForegroundService() async => stopCount++;
   @override
@@ -150,7 +157,7 @@ void main() {
   });
 
   group('ForegroundServiceController', () {
-    test('starts once on work, stops once when idle', () async {
+    test('runs while there is work; wake-lock only while transferring', () async {
       final bridge = FakeBridge();
       final svc = ForegroundServiceController(bridge);
 
@@ -158,20 +165,25 @@ void main() {
       expect(svc.running, isFalse);
       expect(bridge.startCount, 0);
 
+      // A transfer starts → running, active (wake lock), multicast held.
       await svc.sync(activeTransfers: 1, receiving: false);
       expect(svc.running, isTrue);
       expect(bridge.startCount, 1);
+      expect(bridge.lastActive, isTrue);
       expect(bridge.multicast, isTrue);
 
-      // More work while running → refresh notification, no second start.
+      // More work while running → re-delivered, still active, no re-latched
+      // multicast transition.
       await svc.sync(activeTransfers: 2, receiving: false);
-      expect(bridge.startCount, 1);
-      expect(bridge.shown, isNotEmpty);
+      expect(bridge.startCount, 2);
+      expect(bridge.lastActive, isTrue);
 
-      // Receiving keeps it alive even with no transfers.
+      // Transfers done but receiving on → stays running, now IDLE (no wake
+      // lock) rather than stopping.
       await svc.sync(activeTransfers: 0, receiving: true);
       expect(svc.running, isTrue);
       expect(bridge.stopCount, 0);
+      expect(bridge.lastActive, isFalse);
 
       // Fully idle → stop once, multicast released.
       await svc.sync(activeTransfers: 0, receiving: false);

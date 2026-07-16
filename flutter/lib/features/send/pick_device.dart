@@ -13,28 +13,53 @@ class PickedTarget {
 }
 
 /// Bottom-sheet picker over every reachable destination: nearby (discovered,
-/// online) and saved (by-address) devices. Returns null when dismissed or when
-/// nothing is available (a snackbar explains).
+/// online) and saved (by-address) devices. Returns null when dismissed. When
+/// nothing is available it opens with an empty state — shown *in* the sheet so
+/// it's visible above any sheet that opened it (a snackbar would sit behind).
 Future<PickedTarget?> showDevicePicker(BuildContext context) async {
   final scope = AppScope.of(context);
   final online = scope.device.devices.where((d) => d.online).toList();
   final saved = scope.saved.devices;
-
-  if (online.isEmpty && saved.isEmpty) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(const SnackBar(content: Text('No devices to send to')));
-    return null;
-  }
 
   return showModalBottomSheet<PickedTarget>(
     context: context,
     showDragHandle: true,
     builder: (ctx) {
       final scheme = Theme.of(ctx).colorScheme;
-      final label = Theme.of(
-        ctx,
-      ).textTheme.labelLarge?.copyWith(color: scheme.onSurfaceVariant);
+      final text = Theme.of(ctx).textTheme;
+      final label = text.labelLarge?.copyWith(color: scheme.onSurfaceVariant);
+      if (online.isEmpty && saved.isEmpty) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpace.lg,
+              AppSpace.sm,
+              AppSpace.lg,
+              AppSpace.xl,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.devices_other_rounded,
+                  size: AppIcons.lg,
+                  color: scheme.onSurfaceVariant,
+                ),
+                const Gap(AppSpace.sm),
+                Text('No devices to send to', style: text.titleMedium),
+                const Gap(AppSpace.xxs),
+                Text(
+                  'Scan a QR or add a device by address, then try again.',
+                  textAlign: TextAlign.center,
+                  style: text.bodyMedium?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
       return SafeArea(
         child: ListView(
           shrinkWrap: true,

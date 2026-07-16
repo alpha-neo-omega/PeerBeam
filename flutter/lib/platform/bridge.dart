@@ -32,7 +32,14 @@ abstract class PlatformBridge {
   /// Any intent that launched the app cold (share/view), or null.
   Future<Map<String, dynamic>?> initialIntent();
 
-  Future<void> startForegroundService(String title, String body);
+  /// Start/refresh the foreground service. [active] = a transfer is in progress
+  /// (drives the CPU wake lock + an animated notification); false = idle
+  /// receive-ready (no wake lock, static notification).
+  Future<void> startForegroundService(
+    String title,
+    String body, {
+    bool active = false,
+  });
   Future<void> stopForegroundService();
 
   Future<void> showNotification(NotificationContent content);
@@ -81,8 +88,15 @@ class AndroidBridge implements PlatformBridge {
   }
 
   @override
-  Future<void> startForegroundService(String title, String body) =>
-      _invoke('startForegroundService', {'title': title, 'body': body});
+  Future<void> startForegroundService(
+    String title,
+    String body, {
+    bool active = false,
+  }) => _invoke('startForegroundService', {
+    'title': title,
+    'body': body,
+    'active': active,
+  });
 
   @override
   Future<void> stopForegroundService() => _invoke('stopForegroundService');
