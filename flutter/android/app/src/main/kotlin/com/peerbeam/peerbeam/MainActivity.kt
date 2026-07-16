@@ -280,7 +280,7 @@ class MainActivity : FlutterActivity() {
             // copy here would ANR, and this is exactly the byte[]-in-RAM
             // pattern we're replacing, just moved to the wrong thread.
             Thread {
-                val dir = File(cacheDir, "picked").apply { mkdirs() }
+                val dir = preparePickedDir()
                 val out = ArrayList<Map<String, Any?>>()
                 for (uri in uris) {
                     try {
@@ -508,9 +508,14 @@ class MainActivity : FlutterActivity() {
     private fun downloadsUriByNameAt(name: String, relativePath: String): Uri? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        val sel = "${MediaStore.Downloads.RELATIVE_PATH} LIKE ? AND " +
+        // Exact match on the trailing-slash-normalized RELATIVE_PATH (rather
+        // than a `LIKE '%path%'` substring) so nested subdirectories can't
+        // collide with this one, and so `%`/`_` in a folder name are treated
+        // literally instead of as SQL LIKE wildcards.
+        val dir = if (relativePath.endsWith("/")) relativePath else "$relativePath/"
+        val sel = "${MediaStore.Downloads.RELATIVE_PATH} = ? AND " +
             "${MediaStore.Downloads.DISPLAY_NAME} = ?"
-        val args = arrayOf("%$relativePath%", name)
+        val args = arrayOf(dir, name)
         contentResolver.query(collection, arrayOf(MediaStore.Downloads._ID), sel, args, null)
             ?.use { c ->
                 if (c.moveToFirst()) {
@@ -617,7 +622,10 @@ class MainActivity : FlutterActivity() {
     private fun resolveToRealPath(uri: Uri, sharedDir: File, name: String, index: Int): String? {
         if (uri.scheme == "file") return uri.path
         val safeName = sanitizeFileName(name).ifEmpty { "shared_$index" }
-        val dest = File(sharedDir, safeName)
+        // Prefix with the batch index so two shares with the same display
+        // name (e.g. two "photo.jpg" from different folders) don't collide
+        // on disk and silently overwrite one another.
+        val dest = File(sharedDir, "${index}_$safeName")
         return try {
             contentResolver.openInputStream(uri)?.use { input ->
                 dest.outputStream().use { output -> input.copyTo(output) }
@@ -629,11 +637,33 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /// Cache subdirectory that share-in copies are materialized into, cleared
-    /// at the start of every share/view batch so it doesn't grow unbounded
-    /// across repeated shares.
+    /// Cache subdirectory that share-in copies are materialized into. Each
+    /// share/view batch gets its own fresh, uniquely-named subdirectory
+    /// (rather than wiping a single shared dir), so a new share can never
+    /// delete a prior batch's file while it's still mid-transfer. Batches
+    /// older than an hour — well past any plausible transfer duration — are
+    /// pruned here so the cache doesn't grow unbounded across repeated shares.
     private fun prepareSharedDir(): File {
-        val dir = File(cacheDir, "shared")
+        val root = File(cacheDir, "shared")
+        root.mkdirs()
+        val cutoff = System.currentTimeMillis() - 60 * 60 * 1000L
+        root.listFiles()?.forEach { child ->
+            if (child.lastModified() < cutoff) child.deleteRecursively()
+        }
+        val batch = File(root, System.nanoTime().toString())
+        batch.mkdirs()
+        return batch
+    }
+
+    /// Cache subdirectory that the native file picker streams picked files
+    /// into, cleared at the start of every NEW pick batch so it doesn't grow
+    /// unbounded across repeated picks. Safe because a prior pick's files
+    /// were already handed off to the transfer engine before the next pick
+    /// begins — unlike share-in, a picked batch is never still in flight
+    /// when the next pick starts, so a blanket wipe (rather than
+    /// [prepareSharedDir]'s per-batch subdir) is fine here.
+    private fun preparePickedDir(): File {
+        val dir = File(cacheDir, "picked")
         dir.listFiles()?.forEach { it.deleteRecursively() }
         dir.mkdirs()
         return dir
