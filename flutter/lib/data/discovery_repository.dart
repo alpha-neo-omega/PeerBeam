@@ -53,13 +53,16 @@ class DiscoveryRepository extends ChangeNotifier {
 
   /// Start/stop discovery in the engine; UI state flips optimistically.
   void toggleScan() {
+    final previous = _scanning;
     _scanning = !_scanning;
     notifyListeners();
     final fut = _scanning ? _api?.startDiscovery() : _api?.stopDiscovery();
     fut?.catchError((_) {
       if (_disposed) return; // disposed before the toggle resolved
-      // Revert on failure; keep the UI honest.
-      _scanning = !_scanning;
+      // Revert to the state captured before this toggle — restoring by
+      // negating the *current* flag is wrong under rapid toggle+failure,
+      // since a later toggle may have already changed it again.
+      _scanning = previous;
       notifyListeners();
     });
   }

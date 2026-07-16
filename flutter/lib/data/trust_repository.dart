@@ -15,13 +15,19 @@ class TrustRepository extends ChangeNotifier {
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
 
+  /// Note: does NOT refresh in the constructor. Repositories are constructed
+  /// synchronously in `AppState.live` during `initState`, before the engine's
+  /// `initialize()` has been awaited — an early `refresh()` would just hit
+  /// `not_initialised` and be swallowed, leaving trust looking empty until the
+  /// next `trust_changed`/`history_updated` event. Callers must explicitly
+  /// `refresh()` once the engine is initialized (see the boot sequence in
+  /// `main.dart`).
   TrustRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen((e) {
       // New pins land during transfers (TOFU on accept), so a history change
       // is also a trust-refresh signal.
       if (e is TrustChanged || e is HistoryUpdated) refresh();
     });
-    if (_api != null) refresh();
   }
 
   List<TrustedDevice> get items => List.unmodifiable(_items);

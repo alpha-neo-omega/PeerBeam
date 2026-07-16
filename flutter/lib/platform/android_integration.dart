@@ -142,6 +142,7 @@ class AndroidIntegration {
   }
 
   void _notifySendResult(HistoryItem item) {
+    if (!settings.notifications) return;
     final id = TransferNotifications.idFor(item.id);
     final content = item.success
         ? TransferNotifications.complete(

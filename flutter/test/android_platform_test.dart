@@ -153,9 +153,12 @@ void main() {
       final withoutPeer = TransferNotifications.received('f.bin', '');
       expect(withoutPeer.body, '');
 
-      // Same key always yields the same id (stable across calls).
-      expect(withPeer.id, TransferNotifications.idFor('f.bin'));
-      expect(TransferNotifications.idFor('f.bin'), greaterThanOrEqualTo(0));
+      // Two received files sharing a display name must not collide: each
+      // call gets a distinct, positive id (previously derived from the file
+      // name alone, so same-name receives silently replaced one another).
+      expect(withPeer.id, isNot(withoutPeer.id));
+      expect(withPeer.id, greaterThanOrEqualTo(0));
+      expect(withoutPeer.id, greaterThanOrEqualTo(0));
 
       // A received file is always an incoming transfer → download icon.
       expect(withPeer.incoming, isTrue);
@@ -204,6 +207,12 @@ void main() {
       await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
       expect(bridge.startCount, 2);
       expect(bridge.lastActive, isTrue);
+
+      // A repeated sync with unchanged state (same title/body/active/
+      // incoming) must NOT re-deliver — avoids spamming the platform channel
+      // + re-posting the notification on every transfer_progress tick.
+      await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
+      expect(bridge.startCount, 2);
 
       // Transfers done but receiving on → stays running, now IDLE (no wake
       // lock) rather than stopping.
@@ -275,6 +284,14 @@ void main() {
       final fake = FakePeerBeam()
         ..historyEntries = [entry('h0', direction: 'sending', success: true)];
       final bridge = FakeBridge();
+      final history = HistoryRepository(api: fake);
+      // HistoryRepository no longer refreshes in its constructor (it would
+      // run before the engine is initialized in production); mirror the real
+      // boot sequence and load persisted history before starting the
+      // integration, so its notify-baseline is seeded from the *loaded*
+      // history rather than an empty list.
+      await history.refresh();
+      await flush();
       final integration = AndroidIntegration(
         bridge: bridge,
         staging: StagingStore(),
@@ -286,11 +303,11 @@ void main() {
           notifications: true,
           compression: true,
         ),
-        history: HistoryRepository(api: fake),
+        history: history,
       );
 
       await integration.start();
-      await flush(); // let the repo's own initial refresh settle too
+      await flush();
       expect(bridge.notificationPermissionRequests, 1);
       expect(bridge.shown, isEmpty); // cold-start baseline, not a notify
 

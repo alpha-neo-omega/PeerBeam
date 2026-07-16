@@ -66,6 +66,16 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // Persisted settings (device name, save dir, theme, toggles).
         await _state.settings.load(_api);
         _applyPersistedTheme();
+        // Load persisted history + trusted devices now that the engine is
+        // initialized (fetching them any earlier just hits not_initialised
+        // and is swallowed, leaving cold start looking empty).
+        await _state.history.refresh();
+        await _state.trust.refresh();
+        // No-op off Android; routes share/receive intents and drives the
+        // service. Started after history is loaded so the send-notify
+        // baseline is seeded from real history, not an empty list — otherwise
+        // every historical send would look "new" on cold start.
+        await _android.start();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
       } catch (_) {}
@@ -93,9 +103,6 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
 
     // Persist theme choices (the controller itself stays engine-agnostic).
     _state.theme.addListener(_persistTheme);
-
-    // No-op off Android; routes share/receive intents and drives the service.
-    _android.start();
   }
 
   void _applyPersistedTheme() {
@@ -144,11 +151,13 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         if (await Saf.saveTree(f.path)) {
           await Directory(f.path).delete(recursive: true);
         }
-        unawaited(
-          _android.bridge.showNotification(
-            TransferNotifications.received(f.name, f.peer),
-          ),
-        );
+        if (_state.settings.notifications) {
+          unawaited(
+            _android.bridge.showNotification(
+              TransferNotifications.received(f.name, f.peer),
+            ),
+          );
+        }
         return;
       }
       final file = File(f.path);
@@ -158,11 +167,13 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
       if (await Saf.save(f.path, f.name)) {
         await file.delete();
       }
-      unawaited(
-        _android.bridge.showNotification(
-          TransferNotifications.received(f.name, f.peer),
-        ),
-      );
+      if (_state.settings.notifications) {
+        unawaited(
+          _android.bridge.showNotification(
+            TransferNotifications.received(f.name, f.peer),
+          ),
+        );
+      }
     } catch (_) {
       // Leave the item in app storage if the copy fails.
     }

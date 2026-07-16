@@ -70,9 +70,13 @@ class TransferNotifications {
   }
 
   /// A regular (non-clipboard) file finished downloading.
+  ///
+  /// Uses a unique id per call rather than [idFor] on the file name: two
+  /// received files sharing a display name would otherwise collide on the
+  /// same notification id and the second would silently replace the first.
   static NotificationContent received(String fileName, String peer) {
     return NotificationContent(
-      id: idFor(fileName),
+      id: _uniqueReceivedId(),
       title: 'Received $fileName',
       body: peer.isNotEmpty ? 'from $peer' : '',
       incoming: true,
@@ -83,4 +87,14 @@ class TransferNotifications {
   /// (file name or transfer id) — masked to a positive 32-bit value so it
   /// survives the method-channel round trip into a Kotlin `Int`.
   static int idFor(String key) => key.hashCode & 0x7fffffff;
+
+  /// Monotonic counter backing [_uniqueReceivedId], so each received-file
+  /// notification gets a distinct id even when file names repeat.
+  static int _receivedSeq = 0;
+
+  /// A monotonically increasing, positive 31-bit id reserved for received-file
+  /// notifications — distinct from both [idFor]'s hash-based ids and
+  /// [serviceId].
+  static int _uniqueReceivedId() =>
+      0x40000000 + (_receivedSeq++ & 0x3fffffff);
 }

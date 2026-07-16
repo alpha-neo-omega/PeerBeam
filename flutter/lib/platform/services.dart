@@ -10,6 +10,13 @@ class ForegroundServiceController {
   final PlatformBridge bridge;
   bool _running = false;
 
+  /// Signature of the last delivered state (title/body/active/incoming), so a
+  /// [sync] call whose state hasn't meaningfully changed can skip re-posting
+  /// the notification. Without this, `sync` is called on every
+  /// `transfer_progress` tick and would otherwise spam the platform channel +
+  /// re-post the notification many times a second.
+  String? _lastKey;
+
   ForegroundServiceController(this.bridge);
 
   bool get running => _running;
@@ -29,23 +36,34 @@ class ForegroundServiceController {
       activeTransfers: activeTransfers,
       receiving: receiving,
     );
+    final key = '${note.title}|${note.body}|$active|$incoming';
 
     if (shouldRun) {
       if (!_running) {
         _running = true;
         // Discovery needs the multicast lock while we're running.
         await bridge.setMulticastLock(true);
+        await bridge.startForegroundService(
+          note.title,
+          note.body,
+          active: active,
+          incoming: incoming,
+        );
+        _lastKey = key;
+      } else if (key != _lastKey) {
+        // (Re)deliver only when the visible state actually changed — cheap
+        // but no longer unconditional.
+        await bridge.startForegroundService(
+          note.title,
+          note.body,
+          active: active,
+          incoming: incoming,
+        );
+        _lastKey = key;
       }
-      // (Re)deliver so the service updates its wake lock + notification for the
-      // current active/idle state. Idempotent + cheap.
-      await bridge.startForegroundService(
-        note.title,
-        note.body,
-        active: active,
-        incoming: incoming,
-      );
     } else if (_running) {
       _running = false;
+      _lastKey = null;
       await bridge.setMulticastLock(false);
       await bridge.stopForegroundService();
     }

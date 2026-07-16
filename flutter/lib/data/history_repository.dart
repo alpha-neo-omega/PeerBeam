@@ -16,11 +16,16 @@ class HistoryRepository extends ChangeNotifier {
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
 
+  /// Note: does NOT refresh in the constructor. Repositories are constructed
+  /// synchronously in `AppState.live` during `initState`, before the engine's
+  /// `initialize()` has been awaited — an early `refresh()` would just hit
+  /// `not_initialised` and be swallowed, leaving history looking empty until
+  /// the next `history_updated` event. Callers must explicitly `refresh()`
+  /// once the engine is initialized (see the boot sequence in `main.dart`).
   HistoryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen((e) {
       if (e is HistoryUpdated) refresh();
     });
-    if (_api != null) refresh();
   }
 
   List<HistoryItem> get items => List.unmodifiable(_items);

@@ -146,8 +146,10 @@ void main() {
           ),
         ];
       final repo = HistoryRepository(api: fake);
+      // No longer refreshes in the constructor (that runs before the engine
+      // is initialized in production); callers must refresh explicitly.
+      await repo.refresh();
       await flush();
-      // Initial refresh in the constructor.
       expect(repo.items.single.id, 'h1');
 
       fake.historyEntries = [];
