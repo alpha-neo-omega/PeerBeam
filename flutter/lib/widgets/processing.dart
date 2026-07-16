@@ -28,21 +28,19 @@ Future<T> withProcessing<T>(
         return PopScope(
           canPop: false,
           child: AlertDialog(
-            content: Center(
-              heightFactor: 1,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const SizedBox(
-                    width: 22,
-                    height: 22,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
-                  ),
-                  const Gap(AppSpace.md),
-                  Flexible(child: Text(message, textAlign: TextAlign.center)),
-                ],
-              ),
+            // Column with a centered spinner above centered text — unambiguously
+            // centered regardless of dialog width.
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 30,
+                  height: 30,
+                  child: CircularProgressIndicator(strokeWidth: 3),
+                ),
+                const Gap(AppSpace.md),
+                Text(message, textAlign: TextAlign.center),
+              ],
             ),
           ),
         );
