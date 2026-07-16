@@ -28,17 +28,21 @@ Future<T> withProcessing<T>(
         return PopScope(
           canPop: false,
           child: AlertDialog(
-            content: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2.5),
-                ),
-                const Gap(AppSpace.md),
-                Flexible(child: Text(message)),
-              ],
+            content: Center(
+              heightFactor: 1,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2.5),
+                  ),
+                  const Gap(AppSpace.md),
+                  Flexible(child: Text(message, textAlign: TextAlign.center)),
+                ],
+              ),
             ),
           ),
         );
