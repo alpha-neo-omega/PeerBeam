@@ -110,6 +110,74 @@ async fn corrupted_chunk_fails_integrity() {
     );
 }
 
+/// Regression test: a whole-file checksum mismatch must not leave a
+/// poisoned `.part` on disk. Before the fix, the corrupt (now full-size)
+/// `.part` survived the failed integrity check; resume logic then re-hashed
+/// that same bad prefix on every subsequent attempt, so the file could never
+/// be delivered again without a manual `rm`. The fix removes the `.part` as
+/// part of handling the integrity failure, so a clean retry starts fresh.
+#[tokio::test]
+async fn checksum_mismatch_heals_poisoned_part_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("f.bin");
+    let out = dir.path().join("out");
+    let bytes: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (la, mut lb) = MemLink::pair(4);
+    let mut sender = CorruptingLink {
+        inner: la,
+        hit: false,
+    };
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let req = SendRequest {
+        transfer_id: "corrupt-heal-1".into(),
+        name: "f.bin".into(),
+        path: src.to_string_lossy().into(),
+        size: bytes.len() as u64,
+        chunk_size: 64 * 1024,
+    };
+
+    let send = send_file(&mut sender, &storage, req, &cs, &ptx, 3);
+    let recv = receive_file(&mut lb, &storage, &out_str, &cr, &ptx);
+    let (rs, rr) = tokio::join!(send, recv);
+    assert!(matches!(rs, Err(DomainError::Integrity(_))));
+    assert!(matches!(rr, Err(DomainError::Integrity(_))));
+
+    // The poisoned `.part` must be gone, not left around as a full-size but
+    // corrupt file that resume would keep re-hashing forever.
+    let part = out.join("f.bin.part");
+    assert!(
+        !part.exists(),
+        "poisoned .part must be removed after a checksum-mismatch failure, found {}",
+        part.display()
+    );
+
+    // A fresh retry over a clean (non-corrupting) link must now succeed from
+    // scratch instead of being stuck resuming from corrupt bytes.
+    let (mut la2, mut lb2) = MemLink::pair(4);
+    let cs2 = TransferControl::new();
+    let cr2 = TransferControl::new();
+    let req2 = SendRequest {
+        transfer_id: "corrupt-heal-1-retry".into(),
+        name: "f.bin".into(),
+        path: src.to_string_lossy().into(),
+        size: bytes.len() as u64,
+        chunk_size: 64 * 1024,
+    };
+    let send2 = send_file(&mut la2, &storage, req2, &cs2, &ptx, 3);
+    let recv2 = receive_file(&mut lb2, &storage, &out_str, &cr2, &ptx);
+    let (rs2, rr2) = tokio::join!(send2, recv2);
+    rs2.unwrap();
+    rr2.unwrap();
+    assert_eq!(std::fs::read(out.join("f.bin")).unwrap(), bytes);
+}
+
 #[tokio::test]
 async fn clean_transfer_verifies_ok() {
     let dir = tempfile::tempdir().unwrap();

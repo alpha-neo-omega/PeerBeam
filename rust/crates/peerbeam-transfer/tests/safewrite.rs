@@ -1,6 +1,8 @@
 //! Safe file writing: received data lands in `.part` and only becomes the
 //! final file atomically on verified completion; existing files are never
-//! clobbered; a failed transfer leaves no final file.
+//! clobbered; a checksum-mismatch failure leaves no final file and no
+//! poisoned `.part` (removed so a retry starts clean rather than being stuck
+//! resuming from corrupt bytes forever).
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -109,7 +111,7 @@ async fn does_not_overwrite_existing_file() {
 }
 
 #[tokio::test]
-async fn failed_transfer_leaves_part_not_final() {
+async fn failed_transfer_leaves_no_final_file_and_no_poisoned_part() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("f.bin");
     let out = dir.path().join("out");
@@ -131,8 +133,12 @@ async fn failed_transfer_leaves_part_not_final() {
     let recv = receive_file(&mut lb, &storage, &out_str, &cr, &ptx);
     let (_rs, rr) = tokio::join!(send, recv);
 
-    // Integrity failure → no final file, .part remains for a future resume.
+    // Integrity failure → no final file, and the poisoned .part is removed
+    // (not left around to be silently re-hashed and fail forever).
     assert!(matches!(rr, Err(DomainError::Integrity(_))));
     assert!(!out.join("f.bin").exists(), "no final file on failure");
-    assert!(out.join("f.bin.part").exists(), ".part retained for resume");
+    assert!(
+        !out.join("f.bin.part").exists(),
+        "poisoned .part must be removed, not retained"
+    );
 }

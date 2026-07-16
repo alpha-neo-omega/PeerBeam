@@ -1,13 +1,13 @@
-//! Recursive folder transfer with structure preservation and resume.
+//! Recursive folder transfer with structure preservation.
 //!
 //! Builds on the single-file streaming core. A folder transfer is:
 //!
 //! ```text
 //! Manifest(root, [ (rel_path, size) … ])          S→R
-//! ResumeState([ bytes_already_on_disk … ])        R→S
-//! for each not-yet-complete file:
-//!   FileHeader(index, rel_path, size, offset)      S→R
-//!   Chunk … Chunk                                  S→R   (from `offset`)
+//! ResumeState([ 0, 0, … ])                        R→S
+//! for each file:
+//!   FileHeader(index, rel_path, size, offset=0)    S→R
+//!   Chunk … Chunk                                  S→R
 //!   FileEnd(index)                                 S→R
 //! Complete                                         S→R
 //! ```
@@ -16,10 +16,21 @@
 //! root; the receiver recreates the tree under `dest_dir/<root>/…`. Relative
 //! paths are sanitized (no `..`, no absolute) to prevent traversal.
 //!
-//! **Resume** — the receiver reports how many bytes of each file it already
-//! has (from disk); the sender skips complete files and streams the rest of
-//! partial ones from `offset`, while the receiver appends. Nothing is ever
-//! fully loaded into memory.
+//! **No resume (yet)** — folder transfers are not wired to any resume UI/FFI,
+//! so every folder receive is treated as fresh: each file is written with
+//! `open_write` (create/truncate), overwriting anything already at the
+//! destination path rather than blind-appending onto it (blind-appending onto
+//! a same-sized pre-existing file used to silently corrupt it). The wire
+//! messages still carry a `have`/`offset` so a future resume feature can slot
+//! in without a protocol change, but today the receiver always reports `0`
+//! and the sender always streams from the start.
+//!
+//! TODO(transfer): a proper `.part`-staged folder-resume (mirroring
+//! `stream::receive_file`) is a separate future task.
+//!
+//! A single unreadable source file (send side) or a destination path that
+//! collides with an existing directory (receive side) is skipped with a
+//! warning rather than aborting the whole transfer.
 
 use futures::io::AsyncWrite;
 use futures::AsyncWriteExt;
@@ -103,11 +114,12 @@ pub struct FolderReceived {
     pub root: String,
     /// Number of files that ended up complete.
     pub files: usize,
-    /// Total bytes present after the transfer (incl. resumed).
+    /// Total bytes written during this transfer.
     pub bytes: u64,
 }
 
-/// Send a folder recursively over `link`, preserving structure and resuming.
+/// Send a folder recursively over `link`, preserving structure. Skips (with a
+/// warning) any source file that fails to open rather than aborting.
 pub async fn send_folder(
     link: &mut dyn Link,
     storage: &dyn StorageProvider,
@@ -116,6 +128,9 @@ pub async fn send_folder(
     progress: &UnboundedSender<Progress>,
     retries: u32,
 ) -> Result<TransferOutcome> {
+    // TODO(transfer): empty subdirectories are not preserved — `list_files`
+    // only returns files, so a source folder that contains only empty dirs
+    // arrives with no structure at all on the receiver.
     let files = storage.list_files(&req.root_path).await?;
     let root = base_name(&req.root_path);
     let total: u64 = files.iter().map(|(_, s)| *s).sum();
@@ -167,6 +182,20 @@ pub async fn send_folder(
             return Ok(outcome);
         }
 
+        // Open the source file BEFORE announcing it: a file that vanished,
+        // got locked, or lost read permission between the manifest snapshot
+        // above and now must not kill the whole transfer, and the receiver
+        // must never see a `FileHeader` for a file we then fail to stream
+        // (no phantom/partial entry left behind).
+        let src = join(&req.root_path, rel);
+        let mut reader = match storage.open_read(&src, already).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("skipping unreadable file {rel}: {e}");
+                continue;
+            }
+        };
+
         send_with_retry(
             link,
             folder_frame(&FolderMessage::FileHeader {
@@ -180,8 +209,6 @@ pub async fn send_folder(
         .await?;
         done += already;
 
-        let src = join(&req.root_path, rel);
-        let mut reader = storage.open_read(&src, already).await?;
         loop {
             if let Some(outcome) = cancel_or_pause(link, ctrl, retries).await? {
                 return Ok(outcome);
@@ -243,15 +270,15 @@ pub async fn receive_folder(
     let total: u64 = files.iter().map(|f| f.size).sum();
     let files_total = files.len() as u32;
 
-    // Resume: how much of each file do we already have on disk?
-    let mut have = Vec::with_capacity(files.len());
-    for f in &files {
-        let existing = match dest_path(dest_dir, &root, &f.path) {
-            Some(dp) => storage.size(&dp).await?.unwrap_or(0),
-            None => 0,
-        };
-        have.push(existing.min(f.size));
-    }
+    // No resume: folder transfers always start fresh (see module docs), so
+    // every file is reported as having 0 bytes already — regardless of
+    // whatever may already exist at the destination path. Reporting a
+    // pre-existing file's size here would make the sender treat it as an
+    // already-received prefix and skip it (if same size) or the receiver
+    // would blind-append onto it (if smaller), corrupting a file that just
+    // happens to share a destination name. `open_write` below always
+    // creates/truncates instead.
+    let have = vec![0u64; files.len()];
     send_with_retry(
         link,
         folder_frame(&FolderMessage::ResumeState { have: have.clone() }),
@@ -259,17 +286,15 @@ pub async fn receive_folder(
     )
     .await?;
 
-    let mut done: u64 = have.iter().sum();
-    // Zero-byte files are never pre-counted: the sender always re-sends their
-    // header (0 >= 0 must not read as "already have it"), and they complete
-    // via FileEnd like everything else.
-    let mut files_completed: u32 = have
-        .iter()
-        .zip(&files)
-        .filter(|(h, f)| f.size > 0 && **h >= f.size)
-        .count() as u32;
+    let mut done: u64 = 0;
+    let mut files_completed: u32 = 0;
 
     let mut current: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
+    // Set whenever the file announced by the most recent `FileHeader` was
+    // skipped (unsafe path or a create/open failure, e.g. a destination path
+    // that collides with an existing directory) — its `FileEnd` must not be
+    // counted as completed.
+    let mut current_skipped = false;
 
     let outcome = loop {
         if ctrl.is_cancelled() {
@@ -321,13 +346,38 @@ pub async fn receive_folder(
                 FrameKind::Control => match parse_folder(&frame)? {
                     FolderMessage::FileHeader { path, .. } => {
                         close_writer(current.take()).await;
+                        // Traversal/absolute paths are a security violation
+                        // from a peer that should not happen with a
+                        // conforming sender — reject outright rather than
+                        // silently continuing.
                         let dp = dest_path(dest_dir, &root, &path)
                             .ok_or_else(|| DomainError::Transfer(format!("unsafe path: {path}")))?;
-                        current = Some(storage.open_append(&dp).await?);
+                        // Always write fresh (create/truncate): folder
+                        // receives are never resumed (see module docs), so
+                        // anything already at `dp` is overwritten rather than
+                        // blind-appended-to. A create/open failure here — a
+                        // destination path that collides with an existing
+                        // directory, or a filesystem-level type mismatch —
+                        // must not abort the whole folder: skip just this
+                        // entry and keep going.
+                        match storage.open_write(&dp).await {
+                            Ok(w) => {
+                                current = Some(w);
+                                current_skipped = false;
+                            }
+                            Err(e) => {
+                                tracing::warn!("skipping folder entry {path}: {e}");
+                                current = None;
+                                current_skipped = true;
+                            }
+                        }
                     }
                     FolderMessage::FileEnd { .. } => {
                         close_writer(current.take()).await;
-                        files_completed += 1;
+                        if !current_skipped {
+                            files_completed += 1;
+                        }
+                        current_skipped = false;
                     }
                     FolderMessage::Complete => {
                         close_writer(current.take()).await;

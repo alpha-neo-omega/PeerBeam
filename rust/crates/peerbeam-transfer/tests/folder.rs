@@ -1,6 +1,7 @@
 //! End-to-end recursive folder transfer tests over an in-memory link and
-//! real temp directories: structure preservation, resume (skip complete +
-//! append partial), and cancel-then-rerun.
+//! real temp directories: structure preservation, fresh-overwrite of
+//! pre-existing destination files (folder transfers are never resumed), and
+//! cancel-then-rerun.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -129,23 +130,34 @@ async fn transfers_folder_preserving_structure() {
     }
 }
 
+/// Regression test: folder receives must never blind-resume from whatever
+/// happens to already exist at the destination path. Before the fix, a
+/// same-size pre-existing file was treated as "already complete" and left
+/// untouched forever (permanently stale), and a smaller pre-existing file
+/// was blind-appended-to (mixing stale bytes with fresh ones). Every file
+/// must instead be written fresh (`open_write`, create/truncate).
 #[tokio::test]
-async fn resume_skips_complete_and_appends_partial() {
+async fn receive_overwrites_preexisting_destination_files() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
     let root = base.join("myfolder");
-    let f1 = pattern(1, 100 * 1024); // will be pre-delivered in full
-    let f2 = pattern(2, 50 * 1024); // will be 20 KiB partial
+    let f1 = pattern(1, 100 * 1024);
+    let f2 = pattern(2, 50 * 1024);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("f1.bin"), &f1).unwrap();
     std::fs::write(root.join("f2.bin"), &f2).unwrap();
 
-    // Pre-populate the destination: f1 complete, f2 first 20 KiB.
+    // Pre-populate the destination with STALE garbage — not a legitimate
+    // partial transfer. f1's garbage is the same size as the real file (the
+    // old code would treat that as "already complete" and skip it, leaving
+    // the garbage in place forever); f2's garbage is a different size (the
+    // old code would blind-append the real bytes onto it, corrupting it).
     let out = base.join("out");
-    let partial = 20 * 1024usize;
     std::fs::create_dir_all(out.join("myfolder")).unwrap();
-    std::fs::write(out.join("myfolder/f1.bin"), &f1).unwrap();
-    std::fs::write(out.join("myfolder/f2.bin"), &f2[..partial]).unwrap();
+    let stale_f1 = vec![0xAAu8; f1.len()]; // same size, wrong content
+    let stale_f2 = vec![0xBBu8; 12 * 1024]; // different size, wrong content
+    std::fs::write(out.join("myfolder/f1.bin"), &stale_f1).unwrap();
+    std::fs::write(out.join("myfolder/f2.bin"), &stale_f2).unwrap();
     let out_str = out.to_string_lossy().to_string();
 
     let storage = FsStorage::new();
@@ -169,14 +181,16 @@ async fn resume_skips_complete_and_appends_partial() {
     assert_eq!(rs.unwrap(), TransferOutcome::Completed);
     assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
 
-    // Only the missing remainder of f2 crossed the wire.
+    // No per-file resume: every byte of both files crosses the wire
+    // regardless of what pre-existed at the destination.
     assert_eq!(
         sent.load(Ordering::SeqCst),
-        (f2.len() - partial) as u64,
-        "should resend only f2's remainder, skip f1 entirely"
+        (f1.len() + f2.len()) as u64,
+        "folder receives are always fresh — nothing is skipped as already complete"
     );
 
-    // Both files now complete and correct.
+    // Both destination files end up exactly the fresh source content — not
+    // skipped, not appended-to, not left mixed with stale bytes.
     assert_eq!(std::fs::read(out.join("myfolder/f1.bin")).unwrap(), f1);
     assert_eq!(std::fs::read(out.join("myfolder/f2.bin")).unwrap(), f2);
 }

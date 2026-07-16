@@ -1,6 +1,7 @@
 //! Folder-transfer hardening: unicode / long / hidden filenames, deep trees,
-//! empty dirs, and symlink handling. Real send_folder → receive_folder over an
-//! in-memory link.
+//! empty dirs, symlink handling, unreadable source files, and destination
+//! path/type collisions. Real send_folder → receive_folder over an in-memory
+//! link.
 
 mod common;
 
@@ -143,5 +144,143 @@ async fn zero_byte_files_are_created() {
         std::fs::metadata(got.join("sub/also-empty")).unwrap().len(),
         0,
         "nested empty file created"
+    );
+}
+
+/// A source file that becomes unreadable (deleted/locked/permission-denied)
+/// between the manifest snapshot and the send loop must not abort the whole
+/// folder transfer — only that file is skipped (with a warning), and it must
+/// not appear as a phantom/partial entry on the receiver.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_folder_skips_unreadable_file_delivers_rest() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("payload");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("good.txt"), b"fine data").unwrap();
+    std::fs::write(root.join("locked.bin"), b"unreadable").unwrap();
+    std::fs::set_permissions(root.join("locked.bin"), std::fs::Permissions::from_mode(0o000))
+        .unwrap();
+
+    if std::fs::read(root.join("locked.bin")).is_ok() {
+        // Running as root (or another context where permission bits don't
+        // block reads) — this test can't demonstrate the unreadable-file
+        // path here, so skip rather than assert something not being tested.
+        let _ = std::fs::set_permissions(
+            root.join("locked.bin"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+        eprintln!(
+            "skipping send_folder_skips_unreadable_file_delivers_rest: \
+             chmod 000 did not block reads (running as root?)"
+        );
+        return;
+    }
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _p) = mpsc::unbounded_channel();
+    let (ptx2, _p2) = mpsc::unbounded_channel();
+
+    let req = FolderSendRequest {
+        transfer_id: "unreadable".into(),
+        root_path: root.to_string_lossy().into(),
+        chunk_size: 64 * 1024,
+    };
+    let out_str = out.to_string_lossy().to_string();
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let (so, ro) = tokio::join!(send, recv);
+
+    // Restore perms so the tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(
+        root.join("locked.bin"),
+        std::fs::Permissions::from_mode(0o644),
+    );
+
+    assert_eq!(
+        so.unwrap(),
+        TransferOutcome::Completed,
+        "one unreadable file must not abort the whole folder send"
+    );
+    let ro = ro.unwrap();
+    assert_eq!(ro.outcome, TransferOutcome::Completed);
+
+    let got = out.join("payload");
+    assert_eq!(
+        std::fs::read(got.join("good.txt")).unwrap(),
+        b"fine data",
+        "the readable file still arrives"
+    );
+    assert!(
+        !got.join("locked.bin").exists(),
+        "an unreadable source file must not appear as a phantom/partial entry on the receiver"
+    );
+}
+
+/// A destination path that collides with an existing directory (a
+/// file/dir type mismatch) must not abort the whole folder receive — only
+/// that entry is skipped (with a warning), and the rest of the folder still
+/// arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_folder_skips_path_type_collision_delivers_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("payload");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("good.txt"), b"fine data").unwrap();
+    std::fs::write(root.join("collide.bin"), b"should not land").unwrap();
+
+    // Pre-create a DIRECTORY at the destination path where the incoming
+    // file "collide.bin" wants to land — a file/dir type collision.
+    std::fs::create_dir_all(out.join("payload/collide.bin")).unwrap();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _p) = mpsc::unbounded_channel();
+    let (ptx2, _p2) = mpsc::unbounded_channel();
+
+    let req = FolderSendRequest {
+        transfer_id: "collide".into(),
+        root_path: root.to_string_lossy().into(),
+        chunk_size: 64 * 1024,
+    };
+    let out_str = out.to_string_lossy().to_string();
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let (so, ro) = tokio::join!(send, recv);
+
+    assert_eq!(
+        so.unwrap(),
+        TransferOutcome::Completed,
+        "the collision is a receiver-side condition — the sender is unaffected"
+    );
+    let ro = ro.unwrap();
+    assert_eq!(
+        ro.outcome,
+        TransferOutcome::Completed,
+        "a single path collision must not abort the whole folder receive"
+    );
+    assert_eq!(
+        ro.files, 1,
+        "only the non-colliding file counts as completed"
+    );
+
+    let got = out.join("payload");
+    assert_eq!(
+        std::fs::read(got.join("good.txt")).unwrap(),
+        b"fine data",
+        "unaffected file still arrives"
+    );
+    assert!(
+        got.join("collide.bin").is_dir(),
+        "the colliding destination must be left alone, not clobbered or half-written"
     );
 }

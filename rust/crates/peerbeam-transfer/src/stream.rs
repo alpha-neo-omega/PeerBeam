@@ -184,6 +184,11 @@ pub async fn receive_file(
     let dest = format!("{}/{}", dest_dir.trim_end_matches('/'), base);
     // Data is written to a `.part` file; the final name only appears once the
     // whole file is received and verified (safe, atomic, no partial clobber).
+    //
+    // TODO(transfer): the `.part` name is derived from the destination name
+    // alone (no size/hash binding), so two different transfers that resolve
+    // to the same destination could in principle share a `.part`. Out of
+    // scope for this fix.
     let part = format!("{dest}.part");
 
     // Resume from whatever the in-progress `.part` already holds.
@@ -287,6 +292,17 @@ pub async fn receive_file(
     // on disk (resumable) and the final file is never created/clobbered.
     let final_name = if outcome == TransferOutcome::Completed {
         if !integrity_ok {
+            // A poisoned `.part` must not survive a failed integrity check:
+            // resume logic re-hashes whatever prefix is on disk, so leaving
+            // corrupt bytes here would make this file permanently
+            // undeliverable (every retry "resumes" from the bad data and
+            // fails again). The writer above is already flushed and closed,
+            // so removing the file is safe. Best-effort: if this fails, the
+            // Integrity error below still surfaces so the caller can retry
+            // or the user can intervene manually.
+            if let Err(e) = tokio::fs::remove_file(&part).await {
+                tracing::warn!("failed to remove poisoned .part {part}: {e}");
+            }
             return Err(DomainError::Integrity(format!(
                 "checksum mismatch for {base}"
             )));
