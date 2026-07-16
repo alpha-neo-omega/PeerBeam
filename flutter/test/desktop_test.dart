@@ -22,12 +22,15 @@ void main() {
   testWidgets('Send files opens the picker; a cancelled pick is a no-op', (
     tester,
   ) async {
-    // Stub the file_selector channel: behave like a cancelled pick.
+    // The test target platform is Android (flutter_test forces
+    // defaultTargetPlatform to android — see AndroidBridge._enabled), so
+    // pickFilesToStage takes the native peerbeam/android picker branch
+    // rather than file_selector. Stub it to behave like a cancelled pick.
     final calls = <String>[];
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-      const MethodChannel('plugins.flutter.io/file_selector'),
+      const MethodChannel('peerbeam/android'),
       (call) async {
-        calls.add(call.method);
+        if (call.method == 'pickFiles') calls.add(call.method);
         return null; // no files chosen
       },
     );

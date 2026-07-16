@@ -38,6 +38,15 @@ class MainActivity : FlutterActivity() {
     private val reqPickTree = 4210
     private var pendingPick: MethodChannel.Result? = null
 
+    // Native multi-file picker (ACTION_OPEN_DOCUMENT): streams each picked
+    // file into app cache instead of going through file_selector_android,
+    // whose openFile() reads the whole file into a Java byte[] (readFully)
+    // before returning — that OOMs on large files under this app's 256MB
+    // heap cap and kills the app mid-send. The actual streamed copy happens
+    // on a background thread in onActivityResult.
+    private val reqPickFiles = 4212
+    private var pendingFiles: MethodChannel.Result? = null
+
     // Runtime POST_NOTIFICATIONS request (Android 13+). Fire-and-forget: we
     // don't need the grant result, the OS just silently drops notifications
     // (see Notifications.show's SecurityException catch) if denied.
@@ -136,6 +145,7 @@ class MainActivity : FlutterActivity() {
                 setMulticast(call.argument<Boolean>("enabled") ?: false)
                 result.success(null)
             }
+            "pickFiles" -> pickFiles(result)
             "safCurrentFolder" -> result.success(currentFolder())
             "safPickFolder" -> pickTree(result)
             "safSave" -> {
@@ -183,6 +193,29 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // ── Native multi-file picker (streamed to cache; never loaded into RAM) ──
+
+    /// Launch ACTION_OPEN_DOCUMENT to pick one or more files. The result is
+    /// handled in onActivityResult, which streams each picked URI into app
+    /// cache off the main thread and replies with `{path, name, size}` per
+    /// file — never the file's bytes.
+    private fun pickFiles(result: MethodChannel.Result) {
+        pendingFiles?.success(null) // abandon any prior
+        pendingFiles = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivityForResult(intent, reqPickFiles)
+        } catch (e: Exception) {
+            pendingFiles = null
+            result.error("no_picker", e.message, null)
+        }
+    }
+
     // ── Storage Access Framework ─────────────────────────────────────
 
     private fun pickTree(result: MethodChannel.Result) {
@@ -204,28 +237,73 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    @Deprecated("startActivityForResult flow for the folder picker")
+    @Deprecated("startActivityForResult flow for the folder/file pickers")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != reqPickTree) return
-        val reply = pendingPick
-        pendingPick = null
-        val uri = if (resultCode == RESULT_OK) data?.data else null
-        if (uri == null) {
-            reply?.success(null)
+        if (requestCode == reqPickTree) {
+            val reply = pendingPick
+            pendingPick = null
+            val uri = if (resultCode == RESULT_OK) data?.data else null
+            if (uri == null) {
+                reply?.success(null)
+                return
+            }
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+                safPrefs.edit().putString("tree_uri", uri.toString()).apply()
+                val doc = DocumentFile.fromTreeUri(this, uri)
+                reply?.success(mapOf("uri" to uri.toString(), "name" to folderName(doc, uri)))
+            } catch (e: Exception) {
+                reply?.error("persist", e.message, null)
+            }
             return
         }
-        try {
-            contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-            safPrefs.edit().putString("tree_uri", uri.toString()).apply()
-            val doc = DocumentFile.fromTreeUri(this, uri)
-            reply?.success(mapOf("uri" to uri.toString(), "name" to folderName(doc, uri)))
-        } catch (e: Exception) {
-            reply?.error("persist", e.message, null)
+        if (requestCode == reqPickFiles) {
+            val reply = pendingFiles
+            pendingFiles = null
+            if (resultCode != RESULT_OK || data == null) {
+                reply?.success(emptyList<Map<String, Any?>>())
+                return
+            }
+            val uris = ArrayList<Uri>()
+            val clip = data.clipData
+            if (clip != null) {
+                for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+            } else {
+                data.data?.let { uris.add(it) }
+            }
+            // Stream each URI to cache off the main thread — a large-file
+            // copy here would ANR, and this is exactly the byte[]-in-RAM
+            // pattern we're replacing, just moved to the wrong thread.
+            Thread {
+                val dir = File(cacheDir, "picked").apply { mkdirs() }
+                val out = ArrayList<Map<String, Any?>>()
+                for (uri in uris) {
+                    try {
+                        val name = displayName(uri)
+                        val safe = name.replace('/', '_').replace(File.separatorChar, '_')
+                        val dest = File(dir, "${System.currentTimeMillis()}_${out.size}_$safe")
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            dest.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+                        } ?: continue
+                        out.add(
+                            mapOf(
+                                "path" to dest.absolutePath,
+                                "name" to name,
+                                "size" to dest.length(),
+                            ),
+                        )
+                    } catch (e: Exception) {
+                        // skip a file that fails to copy
+                    }
+                }
+                runOnUiThread { reply?.success(out) }
+            }.start()
+            return
         }
     }
 
