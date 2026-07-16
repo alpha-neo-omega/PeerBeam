@@ -42,7 +42,13 @@ struct Stats {
     current_speed: f64,
     average_speed: f64,
     eta_secs: Option<u64>,
-    started: Instant,
+    /// When bytes actually started moving — the first `update()` call with
+    /// `transferred > 0` — used as the baseline for `average_speed` instead
+    /// of registration time. A transfer can sit registered for up to
+    /// `ACCEPT_TIMEOUT` waiting on the peer's accept/reject decision; that
+    /// idle wait must not be counted against the transfer's average speed.
+    /// `None` until that first byte is observed.
+    average_started: Option<Instant>,
     last_t: Instant,
     last_bytes: u64,
 }
@@ -56,10 +62,24 @@ impl Stats {
             current_speed: 0.0,
             average_speed: 0.0,
             eta_secs: None,
-            started: now,
+            average_started: None,
             last_t: now,
             last_bytes: 0,
         }
+    }
+
+    /// Reset the instantaneous-rate baseline after a pause→resume
+    /// transition, so the very next `update()` doesn't compute a bogus
+    /// speed/ETA from a `dt` spanning the entire pause (a near-zero rate
+    /// from a huge elapsed time, and — via the same stale `current_speed` —
+    /// an inflated ETA). Leaves `transferred`/`total` and the
+    /// `average_speed` baseline untouched: only the EMA/instantaneous
+    /// tracking restarts, as if the rate measurement began fresh from here.
+    fn mark_resumed(&mut self) {
+        self.last_t = Instant::now();
+        self.last_bytes = self.transferred;
+        self.current_speed = 0.0;
+        self.eta_secs = None;
     }
 
     fn update(&mut self, transferred: u64, total: u64) {
@@ -78,11 +98,19 @@ impl Stats {
             self.last_bytes = transferred;
         }
         self.transferred = transferred;
-        let elapsed = now.duration_since(self.started).as_secs_f64();
-        self.average_speed = if elapsed > 0.0 {
-            transferred as f64 / elapsed
-        } else {
-            0.0
+        if self.average_started.is_none() && transferred > 0 {
+            self.average_started = Some(now);
+        }
+        self.average_speed = match self.average_started {
+            Some(start) => {
+                let elapsed = now.duration_since(start).as_secs_f64();
+                if elapsed > 0.0 {
+                    transferred as f64 / elapsed
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
         };
         self.eta_secs = if self.current_speed > 1.0 && total >= transferred {
             Some(((total - transferred) as f64 / self.current_speed) as u64)
@@ -270,9 +298,20 @@ impl Manager {
         if let Some(handle) = self.daemon_task.lock().unwrap().take() {
             handle.abort();
         }
-        self.daemon_running.store(false, Ordering::SeqCst);
-        daemon_event("daemon_stopped", self.daemon_port);
+        self.mark_daemon_stopped();
         Ok(json!({ "running": false }))
+    }
+
+    /// Mark the receive daemon as not running and drop its task handle.
+    /// Called both from `stop_daemon()` (explicit stop) and from `serve()`
+    /// itself whenever it exits on its own — a bind failure, or the inbound
+    /// stream ending — so `daemon_status()` never lies about a dead daemon
+    /// still running, and `start_daemon()`'s guard doesn't permanently
+    /// refuse to bring it back up. Idempotent.
+    fn mark_daemon_stopped(&self) {
+        self.daemon_running.store(false, Ordering::SeqCst);
+        *self.daemon_task.lock().unwrap() = None;
+        daemon_event("daemon_stopped", self.daemon_port);
     }
 
     /// Stop then start the receive server.
@@ -587,72 +626,64 @@ impl Manager {
     }
 
     fn finish(&self, id: &str, outcome: DResult<TransferOutcome>) {
-        // `cancel()` may already have removed this id and emitted the
-        // terminal `transfer_cancelled` event synchronously (it doesn't wait
-        // for the task to unwind). Once the receive loop reacts to
-        // cancellation via `TransferControl::cancelled()`, its task also
-        // lands here with `Ok(Cancelled)` — without this guard that would
-        // emit a second terminal event for an id the UI no longer knows
-        // about. `cancel()` removes the entry before the task can observe
-        // cancellation and return, so this check reliably catches it.
-        if !self.active.lock().unwrap().contains_key(id) {
-            return;
-        }
         match outcome {
             Ok(TransferOutcome::Completed) => {
                 self.record(id, true, "transfer_completed", json!({}));
             }
-            Ok(TransferOutcome::Cancelled) => {
-                self.set_status(id, "cancelled");
-                events::transfer(id, "transfer_cancelled", json!({}));
-                self.active.lock().unwrap().remove(id);
-            }
+            Ok(TransferOutcome::Cancelled) => self.finish_cancelled(id),
             Err(e) => self.finish_failed(id, from_domain(e)),
         }
     }
 
-    fn finish_failed(&self, id: &str, (code, msg): (Code, String)) {
-        // Same rationale as the guard in `finish`: a task that raced past a
-        // `cancel()` (already removed + terminal event emitted) must not
-        // emit a second terminal event.
-        if !self.active.lock().unwrap().contains_key(id) {
+    /// The task observed its own cancellation (it noticed `ctrl` between
+    /// chunks) and unwound with `TransferOutcome::Cancelled` — most often
+    /// because `cancel()` already removed the entry and emitted
+    /// `transfer_cancelled` synchronously, racing ahead of the task's own
+    /// unwind. `remove` is the atomic claim: exactly one of {`cancel()`,
+    /// this} ever gets `Some` back for a given id, so exactly one of them
+    /// emits the terminal event. No history entry for a user cancel.
+    fn finish_cancelled(&self, id: &str) {
+        let Some(a) = self.active.lock().unwrap().remove(id) else {
             return;
-        }
-        self.set_status(id, "failed");
+        };
+        *a.status.lock().unwrap() = "cancelled".into();
+        events::transfer(id, "transfer_cancelled", json!({}));
+    }
+
+    fn finish_failed(&self, id: &str, (code, msg): (Code, String)) {
+        // Claim the entry atomically: only whoever successfully removes it
+        // emits the terminal event. A concurrent `cancel()` may have already
+        // claimed (and removed) this id — in which case there is nothing
+        // left to fail here.
+        let Some(a) = self.active.lock().unwrap().remove(id) else {
+            return;
+        };
+        *a.status.lock().unwrap() = "failed".into();
         events::transfer(
             id,
             "transfer_failed",
             json!({ "error": { "code": code.as_str(), "message": msg } }),
         );
-        self.record_history(id, false);
-        self.active.lock().unwrap().remove(id);
+        self.record_history(id, &a, false);
     }
 
     /// Success path: emit completed + append history.
     fn record(&self, id: &str, success: bool, event: &str, extra: Value) {
-        // Same rationale as the guard in `finish`: a task that raced past a
-        // `cancel()` (already removed + terminal event emitted) must not
-        // emit a second terminal event.
-        if !self.active.lock().unwrap().contains_key(id) {
+        // Same atomic-claim rationale as `finish_failed`: a concurrent
+        // `cancel()` may have already removed this id, in which case there
+        // is nothing left to record.
+        let Some(a) = self.active.lock().unwrap().remove(id) else {
             return;
-        }
-        self.set_status(id, "completed");
-        let (stats, file, path) = {
-            let active = self.active.lock().unwrap();
-            match active.get(id) {
-                Some(a) => {
-                    let file = a.file.lock().unwrap().clone();
-                    let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
-                        std::path::Path::new(&self.save_dir())
-                            .join(&file)
-                            .to_string_lossy()
-                            .into_owned()
-                    });
-                    (a.stats.lock().unwrap().dto(), file, path)
-                }
-                None => (json!({}), String::new(), String::new()),
-            }
         };
+        *a.status.lock().unwrap() = "completed".into();
+        let file = a.file.lock().unwrap().clone();
+        let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
+            std::path::Path::new(&self.save_dir())
+                .join(&file)
+                .to_string_lossy()
+                .into_owned()
+        });
+        let stats = a.stats.lock().unwrap().dto();
         let mut payload = json!({ "stats": stats, "file": file, "path": path });
         if let Value::Object(m) = &mut payload {
             if let Value::Object(e) = extra {
@@ -660,14 +691,14 @@ impl Manager {
             }
         }
         events::transfer(id, event, payload);
-        self.record_history(id, success);
-        self.active.lock().unwrap().remove(id);
+        self.record_history(id, &a, success);
     }
 
-    fn record_history(&self, id: &str, success: bool) {
+    /// Append a history entry for an already-claimed (removed from `active`)
+    /// transfer. Takes the `Active` directly rather than looking it up by id
+    /// — by the time this runs the entry is no longer in the map.
+    fn record_history(&self, id: &str, a: &Active, success: bool) {
         let entry = {
-            let active = self.active.lock().unwrap();
-            let Some(a) = active.get(id) else { return };
             let file = a.file.lock().unwrap().clone();
             // Local path of the item: explicit when known (sends, folder
             // receives); otherwise a received file's final location under the
@@ -728,12 +759,6 @@ impl Manager {
         Ok(json!({ "cleared": true }))
     }
 
-    fn set_status(&self, id: &str, status: &str) {
-        if let Some(a) = self.active.lock().unwrap().get(id) {
-            *a.status.lock().unwrap() = status.to_string();
-        }
-    }
-
     // ── control ─────────────────────────────────────────────────
 
     pub fn pause(&self, id: &str) -> Op {
@@ -747,13 +772,28 @@ impl Manager {
     pub fn resume(&self, id: &str) -> Op {
         let a = self.get_active(id)?;
         a.ctrl.resume();
+        // Re-anchor the rate baseline to now: without this the next progress
+        // update measures `dt` across the whole pause, producing a near-zero
+        // instantaneous speed and an inflated ETA (BUG 3).
+        a.stats.lock().unwrap().mark_resumed();
         *a.status.lock().unwrap() = "transferring".into();
         events::transfer(id, "transfer_resumed", json!({}));
         Ok(json!({ "resumed": true }))
     }
 
     pub fn cancel(&self, id: &str) -> Op {
-        let a = self.get_active(id)?;
+        // Atomically claim the entry: `remove` is the same claim mechanic
+        // `finish`/`finish_failed`/`record` use, so cancel() and a task's own
+        // natural completion can never both emit a terminal event for the
+        // same id — whichever removes it first is the sole emitter. Cancel
+        // stays authoritative for the common case (it races well ahead of a
+        // task that has to notice `ctrl` between chunks); the only way this
+        // returns "not found" is a transfer that already reached a terminal
+        // state on its own.
+        let a = match self.active.lock().unwrap().remove(id) {
+            Some(a) => a,
+            None => return Err((Code::InvalidArgument, format!("no active transfer {id}"))),
+        };
         a.ctrl.cancel();
         // Abort the running task so cancel is immediate even if a chunk send is
         // blocked on a slow link (the loop only checks `ctrl` between chunks).
@@ -769,26 +809,32 @@ impl Manager {
         // An aborted task won't run finish(); do the cleanup + notify here.
         *a.status.lock().unwrap() = "cancelled".into();
         events::transfer(id, "transfer_cancelled", json!({}));
-        self.active.lock().unwrap().remove(id);
         Ok(json!({ "cancelled": true }))
     }
 
     pub fn accept(&self, id: &str) -> Op {
         match self.pending.lock().unwrap().remove(id) {
-            Some(tx) => {
-                let _ = tx.send(true);
-                Ok(json!({ "accepted": true }))
-            }
+            // The receiver may already have timed out (`ACCEPT_TIMEOUT`) and
+            // dropped its end of the channel in the moment between us
+            // removing the entry and sending on it — `send` returning `Err`
+            // means the decision landed too late to matter, so report
+            // not-found rather than a success the caller already acted past.
+            Some(tx) => match tx.send(true) {
+                Ok(()) => Ok(json!({ "accepted": true })),
+                Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+            },
             None => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
         }
     }
 
     pub fn reject(&self, id: &str) -> Op {
         match self.pending.lock().unwrap().remove(id) {
-            Some(tx) => {
-                let _ = tx.send(false);
-                Ok(json!({ "rejected": true }))
-            }
+            // Same rationale as `accept`: a failed send means the timeout
+            // already declined this transfer out from under us.
+            Some(tx) => match tx.send(false) {
+                Ok(()) => Ok(json!({ "rejected": true })),
+                Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+            },
             None => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
         }
     }
@@ -861,12 +907,21 @@ impl Manager {
     // ── receiving ───────────────────────────────────────────────
 
     /// Accept inbound connections forever; one task per incoming transfer.
+    ///
+    /// Every return path — a bind failure, or the inbound stream ending
+    /// (transport/endpoint gone) — resets `daemon_running` via
+    /// `mark_daemon_stopped()` before returning. Without that, a dead daemon
+    /// still reports `running: true` from `daemon_status()`, and
+    /// `start_daemon()`'s idempotency guard (`daemon_running.swap`) refuses
+    /// to ever spawn a replacement, permanently wedging the receive side
+    /// until the whole process restarts.
     pub async fn serve(self: Arc<Self>, port: u16) {
         let bind = format!("0.0.0.0:{port}").parse().expect("valid bind");
         let (_local, mut incoming) = match self.quic.serve_addr_on(bind).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "receive server failed to bind");
+                self.mark_daemon_stopped();
                 return;
             }
         };
@@ -879,6 +934,9 @@ impl Manager {
                 Err(e) => tracing::warn!(error = %e, "inbound rejected"),
             }
         }
+        // The incoming stream ended on its own (endpoint/transport gone) —
+        // nothing called `stop_daemon()`, but the daemon is just as dead.
+        self.mark_daemon_stopped();
     }
 
     /// Wait for the user's accept/reject decision on a just-authenticated
@@ -1277,6 +1335,13 @@ mod tests {
     /// identity/name plumbing in isolation (no network I/O beyond binding an
     /// ephemeral local QUIC endpoint, no discovery).
     fn test_manager(name: &str) -> Manager {
+        test_manager_with_port(name, 0)
+    }
+
+    /// Like [`test_manager`], but with an explicit `daemon_port` — needed by
+    /// tests that exercise `start_daemon()`/`serve()` against a port they
+    /// control (e.g. one already occupied, to force a bind failure).
+    fn test_manager_with_port(name: &str, daemon_port: u16) -> Manager {
         let quic = Arc::new(QuicTransport::new().expect("quic transport"));
         let rm = Arc::new(RouteManager::new(quic.clone()));
         let enc = Arc::new(AeadCrypto::new());
@@ -1297,7 +1362,7 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             false,
             1024,
-            0,
+            daemon_port,
             None,
         )
     }
@@ -1433,6 +1498,256 @@ mod tests {
         assert!(
             !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
             "a timeout must never approve the device"
+        );
+    }
+
+    // ── BUG 1: daemon_running must reset when serve() exits on its own ──
+
+    #[tokio::test]
+    async fn serve_resets_daemon_running_on_bind_failure() {
+        let mgr = Arc::new(test_manager("Device"));
+        // Occupy a UDP port so the QUIC endpoint bind inside `serve()` fails.
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind probe socket");
+        let port = sock.local_addr().unwrap().port();
+
+        // Simulate what `start_daemon()` sets before spawning `serve()`, so
+        // this test can call `serve()` directly and observe the reset.
+        mgr.daemon_running.store(true, Ordering::SeqCst);
+        *mgr.daemon_task.lock().unwrap() = None;
+
+        mgr.clone().serve(port).await;
+
+        assert!(
+            !mgr.daemon_running.load(Ordering::SeqCst),
+            "serve() must reset daemon_running when it exits on a bind \
+             failure, or start_daemon() can never restart it"
+        );
+        assert!(
+            mgr.daemon_task.lock().unwrap().is_none(),
+            "the stale task handle must be cleared too"
+        );
+        drop(sock);
+    }
+
+    #[tokio::test]
+    async fn start_daemon_can_restart_after_a_bind_failure_kills_it() {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind probe socket");
+        let port = sock.local_addr().unwrap().port();
+        let mgr = Arc::new(test_manager_with_port("Device", port));
+
+        // First start: the port is occupied by `sock`, so the spawned
+        // `serve()` task fails to bind and exits almost immediately.
+        mgr.start_daemon().expect("start_daemon should accept the request");
+        wait_until(|| !mgr.daemon_running.load(Ordering::SeqCst)).await;
+
+        // Before the fix, `daemon_running` would still read `true` here,
+        // permanently locking `start_daemon()` out of ever retrying.
+        assert!(!mgr.daemon_status()["running"].as_bool().unwrap());
+
+        // Free the port and restart: this must actually spawn a fresh
+        // `serve()`, not be swallowed as an "already running" no-op.
+        drop(sock);
+        let res = mgr.start_daemon().expect("restart should succeed");
+        assert!(
+            res.get("already_running").is_none(),
+            "must be a genuine (re)start, not a dedup no-op: {res}"
+        );
+        wait_until(|| mgr.daemon_running.load(Ordering::SeqCst)).await;
+
+        let _ = mgr.stop_daemon();
+    }
+
+    // ── BUG 2: exactly one terminal event/history entry per transfer ────
+    //
+    // `cancel()` and the terminal paths (`record`/`finish_failed`/
+    // `finish_cancelled`) both claim a transfer by removing it from
+    // `active` — whichever removes it first is the sole emitter. These
+    // tests don't need real concurrency to prove the invariant: calling
+    // both paths in sequence for the same id proves the second one is a
+    // documented no-op regardless of which order they land in.
+
+    #[tokio::test]
+    async fn cancel_then_finish_failed_only_the_remover_acts() {
+        let mgr = test_manager("Device");
+        let id = "tx-race-cancel-first";
+        mgr.register(id, "sending", "peer", "file.bin", None);
+
+        mgr.cancel(id).expect("cancel finds the freshly-registered transfer");
+        assert!(mgr.active.lock().unwrap().get(id).is_none());
+
+        // The task's own unwind races in *after* cancel already claimed
+        // (removed) the entry — this must be a no-op: no second terminal
+        // event/history entry for an id the UI was already told is gone.
+        mgr.finish_failed(id, (Code::Connection, "link dropped".into()));
+
+        assert!(
+            mgr.history.lock().unwrap().is_empty(),
+            "a transfer already claimed by cancel() must not also record a \
+             failure to history"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_failed_then_cancel_only_the_remover_acts() {
+        let mgr = test_manager("Device");
+        let id = "tx-race-finish-first";
+        mgr.register(id, "sending", "peer", "file.bin", None);
+
+        mgr.finish_failed(id, (Code::Connection, "link dropped".into()));
+        assert_eq!(
+            mgr.history.lock().unwrap().len(),
+            1,
+            "the winner records history"
+        );
+
+        // `cancel()` racing in after the entry is already gone must not
+        // succeed, and must not touch history again.
+        let res = mgr.cancel(id);
+        assert!(res.is_err(), "cancel() must find nothing left to cancel");
+        assert_eq!(
+            mgr.history.lock().unwrap().len(),
+            1,
+            "a transfer already claimed by finish_failed() must not be \
+             recorded twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_then_cancel_only_the_remover_acts() {
+        let mgr = test_manager("Device");
+        let id = "tx-race-record-first";
+        mgr.register(id, "sending", "peer", "file.bin", None);
+
+        mgr.record(id, true, "transfer_completed", json!({}));
+        assert_eq!(mgr.history.lock().unwrap().len(), 1);
+
+        let res = mgr.cancel(id);
+        assert!(res.is_err());
+        assert_eq!(
+            mgr.history.lock().unwrap().len(),
+            1,
+            "a transfer already claimed by record() must not be cancelled \
+             (or recorded) again"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_is_not_idempotent_a_second_cancel_errs() {
+        let mgr = test_manager("Device");
+        let id = "tx-double-cancel";
+        mgr.register(id, "sending", "peer", "file.bin", None);
+
+        mgr.cancel(id).expect("first cancel succeeds");
+        let second = mgr.cancel(id);
+        assert!(
+            second.is_err(),
+            "a second cancel on an already-cancelled id must not re-fire \
+             the terminal event"
+        );
+    }
+
+    // ── BUG 3: resume must reset the rate baseline, not progress ─────────
+
+    #[test]
+    fn mark_resumed_resets_rate_baseline_but_not_progress() {
+        let mut s = Stats::new();
+        s.update(1_000_000, 10_000_000);
+        std::thread::sleep(Duration::from_millis(60));
+        s.update(2_000_000, 10_000_000);
+        assert!(s.current_speed > 0.0, "sanity: a rate was established");
+        assert_eq!(s.last_bytes, 2_000_000);
+
+        // A long pause elapses with no update() calls (a paused transfer
+        // stops reading/writing, so nothing calls update() while paused) —
+        // `last_t` goes stale relative to "now".
+        std::thread::sleep(Duration::from_millis(150));
+
+        s.mark_resumed();
+
+        // Progress itself is untouched.
+        assert_eq!(s.transferred, 2_000_000);
+        assert_eq!(s.total, 10_000_000);
+        // The rate baseline is fresh: `last_t` re-anchored to resume time
+        // (not left dated to before the pause), `last_bytes` matches current
+        // progress, and the stale EMA/ETA are cleared rather than leaking a
+        // pre-pause value into the next `dto()`.
+        assert!(
+            s.last_t.elapsed() < Duration::from_millis(50),
+            "last_t must be re-anchored to resume time, not left stale"
+        );
+        assert_eq!(s.last_bytes, 2_000_000);
+        assert_eq!(s.current_speed, 0.0);
+        assert_eq!(s.eta_secs, None);
+    }
+
+    #[test]
+    fn resume_avoids_the_bogus_speed_a_missing_reset_would_produce() {
+        // Two transfers frozen at the same "just paused mid-transfer" state
+        // (2,000,000 / 10,000,000 bytes, no rate established yet — e.g. the
+        // first chunk after a pause) built directly rather than via
+        // `update()`, so the comparison isolates exactly the `last_t`/
+        // `last_bytes` baseline `mark_resumed()` touches, with no EMA
+        // blending against an unrelated pre-pause rate to muddy the result.
+        let paused = || {
+            let mut s = Stats::new();
+            s.transferred = 2_000_000;
+            s.total = 10_000_000;
+            s.last_bytes = 2_000_000;
+            s.last_t = Instant::now();
+            s
+        };
+        let mut fixed = paused();
+        let mut unfixed = paused();
+
+        // A long pause elapses with no update() calls, as happens while
+        // genuinely paused.
+        std::thread::sleep(Duration::from_millis(300));
+        fixed.mark_resumed(); // the fix under test: re-anchors last_t/last_bytes
+                               // `unfixed` intentionally does nothing here.
+
+        std::thread::sleep(Duration::from_millis(60));
+        fixed.update(2_060_000, 10_000_000);
+        unfixed.update(2_060_000, 10_000_000);
+
+        // Same 60,000 bytes moved in the same ~60ms window post-resume, but
+        // `unfixed`'s `dt` spans the full ~360ms pause too, so the same
+        // bytes look like they trickled in ~6x slower — exactly the "bogus
+        // near-zero speed after resume" bug.
+        assert!(
+            fixed.current_speed > unfixed.current_speed * 3.0,
+            "fixed={} unfixed={}: without the resume reset, current_speed \
+             is computed across the pause gap and reads far too low",
+            fixed.current_speed,
+            unfixed.current_speed
+        );
+    }
+
+    // ── BUG 4: average_speed must exclude the pre-transfer approval wait ─
+
+    #[test]
+    fn average_speed_excludes_the_pre_transfer_wait() {
+        let mut s = Stats::new();
+        // Registration-time idle wait (e.g. the up-to-180s accept/reject
+        // prompt): real time passes with nothing transferred yet.
+        std::thread::sleep(Duration::from_millis(150));
+        s.update(0, 10_000_000); // still nothing moved — average_started stays None
+        // Bytes start moving now: this call sets average_started, but its
+        // own elapsed-since-start is ~0 by construction, so it doesn't yet
+        // show a meaningful rate.
+        s.update(1_000_000, 10_000_000);
+        std::thread::sleep(Duration::from_millis(60));
+        s.update(7_000_000, 10_000_000);
+
+        // If average_speed were (wrongly) measured since registration,
+        // elapsed would be ~210ms giving 7,000,000/0.21 ≈ 33 MB/s. Measured
+        // correctly from the first byte (~60ms), it's ≈ 116 MB/s. Assert we
+        // land comfortably above the registration-baselined figure.
+        let wrong_if_from_registration = 7_000_000.0 / 0.21;
+        assert!(
+            s.average_speed > wrong_if_from_registration * 2.0,
+            "average_speed {} still looks baselined at registration, not \
+             at the first byte",
+            s.average_speed
         );
     }
 }
