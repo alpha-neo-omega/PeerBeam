@@ -48,7 +48,10 @@ class SettingsStore extends ChangeNotifier {
     required this.autoAcceptTrusted,
     required this.notifications,
     required this.compression,
-    this.backgroundReceive = false,
+    // Default on so a fresh inbound transfer is shielded from Doze while the
+    // app is backgrounded (zero-config receive). Runs a foreground service with
+    // a persistent notification; users can turn it off in Settings.
+    this.backgroundReceive = true,
     this.theme = 'system',
   });
 
