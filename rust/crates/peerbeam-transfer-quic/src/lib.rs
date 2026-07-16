@@ -153,7 +153,7 @@ impl TransferProvider for QuicTransport {
     }
 
     async fn dial(&self, route: &Route, session: &TransferSession) -> Result<Box<dyn Link>> {
-        let addr = resolve_addr(&route.address, route.port)?;
+        let addr = resolve_addr(&route.address, route.port).await?;
         tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
 
         // Bound the handshake: an unreachable peer must fail fast (the user is
@@ -178,14 +178,22 @@ impl TransferProvider for QuicTransport {
 
 /// Resolve a route target (IPv4/IPv6 literal or hostname) + port to a socket
 /// address. Handles IPv6 bracketing correctly (unlike naive `host:port`).
-fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
+///
+/// IP literals short-circuit synchronously. Hostnames (e.g. a Tailscale
+/// MagicDNS name) are resolved via `tokio::net::lookup_host`, which runs the
+/// blocking `getaddrinfo` call on a blocking-pool thread instead of the async
+/// worker thread, and the whole resolution is bounded by [`CONNECT_TIMEOUT`]
+/// so a slow/unreachable resolver can't stall the dial (or the runtime).
+async fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    use std::net::ToSocketAddrs;
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| DomainError::Connection(format!("resolve {host}: {e}")))?
+    let lookup = tokio::net::lookup_host((host, port));
+    let mut addrs = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
+        .await
+        .map_err(|_| DomainError::Connection(format!("resolve {host}: timed out")))?
+        .map_err(|e| DomainError::Connection(format!("resolve {host}: {e}")))?;
+    addrs
         .next()
         .ok_or_else(|| DomainError::Connection(format!("no address for {host}")))
 }
@@ -206,5 +214,30 @@ pub fn direct_route(address: impl Into<String>, port: u16) -> Route {
         kind: RouteKind::DirectInternet,
         address: address.into(),
         port,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IP literals must short-circuit without touching the resolver.
+    #[tokio::test]
+    async fn resolve_addr_ip_literal_is_immediate() {
+        let addr = resolve_addr("127.0.0.1", 9000).await.unwrap();
+        assert_eq!(addr, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+
+        let addr = resolve_addr("::1", 9000).await.unwrap();
+        assert_eq!(addr, "[::1]:9000".parse::<SocketAddr>().unwrap());
+    }
+
+    /// A hostname is resolved via the async, non-blocking resolver (this must
+    /// not deadlock or block the single-threaded test runtime — the old
+    /// synchronous `to_socket_addrs()` call ran directly on the async task).
+    #[tokio::test]
+    async fn resolve_addr_hostname_resolves_via_async_lookup() {
+        let addr = resolve_addr("localhost", 9000).await.unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 9000);
     }
 }

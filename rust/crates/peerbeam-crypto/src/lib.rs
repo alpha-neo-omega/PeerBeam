@@ -44,9 +44,18 @@ impl EncryptionProvider for AeadCrypto {
     fn key_exchange(&self, ours: &SecretKey, theirs: &PublicKey) -> Result<SessionKeys> {
         let secret = StaticSecret::from(ours.0);
         let our_public = XPublicKey::from(&secret).to_bytes();
-        let shared = secret
-            .diffie_hellman(&XPublicKey::from(theirs.0))
-            .to_bytes();
+        let shared_secret = secret.diffie_hellman(&XPublicKey::from(theirs.0));
+        // A peer presenting a low-order public key (e.g. all-zero) forces the
+        // ECDH result to a publicly-known constant regardless of our private
+        // key, letting anyone who observes the (cleartext) handshake nonces
+        // recompute the session keys. Reject non-contributory results instead
+        // of feeding them to the KDF.
+        if !shared_secret.was_contributory() {
+            return Err(DomainError::Encryption(
+                "key exchange produced a non-contributory (low-order) shared secret".into(),
+            ));
+        }
+        let shared = shared_secret.to_bytes();
 
         let lo = kdf(&shared, b"peerbeam-key-lo");
         let hi = kdf(&shared, b"peerbeam-key-hi");
@@ -125,6 +134,23 @@ mod tests {
         assert_eq!(a_keys.recv, b_keys.send);
         // Directions differ.
         assert_ne!(a_keys.send, a_keys.recv);
+    }
+
+    /// A peer presenting a low-order X25519 public key (the all-zero point is
+    /// the simplest of the small-order points) forces the shared secret to a
+    /// publicly-known constant. `key_exchange` must reject it rather than
+    /// silently deriving session keys anyone could recompute.
+    #[test]
+    fn key_exchange_rejects_low_order_peer_public_key() {
+        let c = AeadCrypto::new();
+        let ours = c.generate_keypair();
+        let low_order_peer = PublicKey([0u8; 32]);
+
+        let result = c.key_exchange(&ours.secret, &low_order_peer);
+        assert!(
+            matches!(result, Err(DomainError::Encryption(_))),
+            "all-zero peer pubkey must be rejected"
+        );
     }
 
     #[test]

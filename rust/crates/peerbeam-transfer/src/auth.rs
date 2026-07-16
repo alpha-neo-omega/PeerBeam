@@ -13,8 +13,14 @@
 //! session keys. The `Confirm` MAC is *key confirmation*: verifying the
 //! peer's MAC (with our receive key) proves the peer derived the same secret,
 //! i.e. it holds the private key matching the public key it presented — this
-//! is the mutual-authentication step. The transcript binds both public keys
-//! and both fresh nonces, so a replayed handshake yields different keys.
+//! is the mutual-authentication step. The transcript binds both public keys,
+//! both fresh nonces, AND both sides' `device_id`/`name` (as presented in the
+//! cleartext Hello), so a replayed handshake yields different keys and an
+//! on-path attacker who rewrites the identity fields in flight (leaving the
+//! pubkey/nonce untouched) breaks key confirmation instead of silently
+//! rebinding an authenticated key to an arbitrary identity. This is a wire
+//! change to the transcript, so both peers must be running a build that
+//! includes it (acceptable pre-1.0).
 //!
 //! **TOFU trust**: the peer's public-key fingerprint is pinned on first
 //! contact via the [`TrustStore`]; on later connections a changed fingerprint
@@ -131,7 +137,20 @@ pub async fn authenticate(
     };
 
     let keys = enc.key_exchange(&identity.keypair.secret, &PublicKey(peer_pub))?;
-    let transcript = transcript(&our_pub, &our_nonce, &peer_pub, &peer_nonce);
+    let transcript = transcript(
+        HandshakeSide {
+            pubkey: &our_pub,
+            nonce: &our_nonce,
+            device_id: &identity.device_id.0,
+            name: &identity.name,
+        },
+        HandshakeSide {
+            pubkey: &peer_pub,
+            nonce: &peer_nonce,
+            device_id: &peer_device,
+            name: &peer_name,
+        },
+    );
 
     // Key confirmation.
     let our_tag = hmac(&keys.send, &transcript);
@@ -192,24 +211,37 @@ pub async fn authenticate(
     })
 }
 
-/// Canonical transcript: order the two (pubkey, nonce) pairs by public key so
-/// both peers hash identical bytes regardless of who spoke first.
-fn transcript(
-    a_pub: &[u8; 32],
-    a_nonce: &[u8; 16],
-    b_pub: &[u8; 32],
-    b_nonce: &[u8; 16],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 * (32 + 16));
-    let (first, first_n, second, second_n) = if a_pub <= b_pub {
-        (a_pub, a_nonce, b_pub, b_nonce)
-    } else {
-        (b_pub, b_nonce, a_pub, a_nonce)
-    };
-    out.extend_from_slice(first);
-    out.extend_from_slice(first_n);
-    out.extend_from_slice(second);
-    out.extend_from_slice(second_n);
+/// One side's presented handshake identity, for [`transcript`].
+struct HandshakeSide<'a> {
+    pubkey: &'a [u8; 32],
+    nonce: &'a [u8; 16],
+    device_id: &'a str,
+    name: &'a str,
+}
+
+/// Canonical transcript: order the two sides' (pubkey, nonce, device_id,
+/// name) tuples by public key so both peers hash identical bytes regardless
+/// of who spoke first.
+///
+/// Binding `device_id`/`name` (as presented in each side's cleartext Hello)
+/// into the transcript that the Confirm HMAC signs means an on-path attacker
+/// who rewrites either field in flight — leaving the pubkey/nonce untouched —
+/// makes the two sides compute different transcripts, so key confirmation
+/// fails and the handshake aborts. Without this, only the public keys and
+/// nonces were authenticated: the attacker could rebind an otherwise-genuine
+/// key to an arbitrary device_id/name on first contact. Variable-length
+/// fields are length-prefixed so `("AB", "")` and `("A", "B")` can't collide.
+fn transcript(a: HandshakeSide, b: HandshakeSide) -> Vec<u8> {
+    let (first, second) = if a.pubkey <= b.pubkey { (a, b) } else { (b, a) };
+    let mut out = Vec::new();
+    for side in [first, second] {
+        out.extend_from_slice(side.pubkey);
+        out.extend_from_slice(side.nonce);
+        out.extend_from_slice(&(side.device_id.len() as u32).to_be_bytes());
+        out.extend_from_slice(side.device_id.as_bytes());
+        out.extend_from_slice(&(side.name.len() as u32).to_be_bytes());
+        out.extend_from_slice(side.name.as_bytes());
+    }
     out
 }
 

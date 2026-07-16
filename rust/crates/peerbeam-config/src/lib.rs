@@ -191,7 +191,12 @@ impl EngineConfig {
             serde_json::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
         // Atomic write: uniquely-named temp + rename, so an interrupted save
         // can't leave a truncated config, and concurrent savers don't rename
-        // the same temp out from under each other.
+        // the same temp out from under each other. The temp file is fsync'd
+        // before the rename so its data is durable first — otherwise a crash
+        // between the rename (metadata-only) landing and the data blocks
+        // actually hitting disk can leave config.json present but empty, and
+        // the parent directory is fsync'd afterwards (best-effort) so the
+        // rename itself survives a crash too.
         let tmp = {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -199,11 +204,23 @@ impl EngineConfig {
             s.push(format!(".{}.{}.tmp", std::process::id(), n));
             std::path::PathBuf::from(s)
         };
-        std::fs::write(&tmp, json).map_err(|e| ConfigError::Io(e.to_string()))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| ConfigError::Io(e.to_string()))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| ConfigError::Io(e.to_string()))?;
+            f.sync_all().map_err(|e| ConfigError::Io(e.to_string()))?;
+        }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             ConfigError::Io(e.to_string())
-        })
+        })?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 

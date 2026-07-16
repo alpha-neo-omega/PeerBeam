@@ -16,6 +16,4 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-
-[dev-dependencies]
 chrono = { workspace = true }

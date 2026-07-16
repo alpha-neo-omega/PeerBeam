@@ -125,3 +125,38 @@ fn unknown_fields_are_ignored_for_forward_compat() {
     let cfg = EngineConfig::load(&path).unwrap();
     assert!(same(&cfg, &EngineConfig::default()));
 }
+
+/// `save` fsyncs the temp file's data before the rename (and best-effort
+/// fsyncs the parent directory afterwards) so a crash can't leave
+/// config.json present-but-empty. This can't simulate a real power cut, but
+/// it pins the surrounding contract: the rename lands, the temp file never
+/// leaks, and the written bytes are immediately readable back in full —
+/// regressions in the fsync-then-rename sequencing would show up as a
+/// leftover `.tmp` file or a truncated/missing config.json.
+#[test]
+fn save_is_durable_and_leaves_no_temp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+
+    let mut cfg = EngineConfig::default();
+    cfg.device.name = "durable-box".into();
+
+    for _ in 0..5 {
+        cfg.save(&path).unwrap();
+    }
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("config.json")],
+        "no .tmp files must be left behind after save"
+    );
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!bytes.is_empty(), "the saved file must not be truncated");
+    let loaded = EngineConfig::load(&path).unwrap();
+    assert!(same(&cfg, &loaded));
+}

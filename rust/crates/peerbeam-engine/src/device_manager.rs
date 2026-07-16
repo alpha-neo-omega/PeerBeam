@@ -29,6 +29,15 @@ use crate::error::EngineError;
 /// Capacity of the device-change broadcast channel.
 const CHANGE_CHANNEL_CAPACITY: usize = 256;
 
+/// How long an offline device is kept around before it's pruned from the
+/// store. Generous enough to survive a brief Wi-Fi drop / provider restart
+/// without losing the entry, short enough that a long-running daemon (a
+/// headless server) doesn't accumulate every device it has ever seen.
+const PRUNE_TTL: chrono::Duration = chrono::Duration::minutes(5);
+
+/// How often the prune sweep runs.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Tracks discovered devices and notifies the UI of changes.
 pub struct DeviceManager {
     providers: Vec<Arc<dyn DiscoveryProvider>>,
@@ -67,10 +76,20 @@ impl DeviceManager {
         let store = self.store.clone();
         let changes = self.changes.clone();
         let handle = tokio::spawn(async move {
-            while let Some((provider, event)) = stream.next().await {
-                let emitted = store.lock().unwrap().observe(&provider, event);
-                for change in emitted {
-                    let _ = changes.send(change);
+            let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        let Some((provider, event)) = item else { break };
+                        let emitted = store.lock().unwrap().observe(&provider, event);
+                        for change in emitted {
+                            let _ = changes.send(change);
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        prune_and_notify(&store, &changes, PRUNE_TTL);
+                    }
                 }
             }
         });
@@ -119,6 +138,14 @@ impl DeviceManager {
         }
     }
 
+    /// Remove offline devices not seen within `ttl`, notifying subscribers.
+    /// Called periodically by the task spawned in [`start`](Self::start) so
+    /// stale entries don't accumulate unbounded on a long-running daemon; also
+    /// exposed for manual/test invocation.
+    pub fn prune(&self, ttl: chrono::Duration) {
+        prune_and_notify(&self.store, &self.changes, ttl);
+    }
+
     /// Combine every provider's event stream into one, tagged with the
     /// provider id so the store can attribute capabilities.
     fn tagged_stream(&self) -> BoxStream<'static, (ProviderId, DiscoveryEvent)> {
@@ -131,5 +158,124 @@ impl DeviceManager {
             })
             .collect();
         stream::select_all(tagged).boxed()
+    }
+}
+
+/// Prune stale offline devices from `store` and broadcast the resulting
+/// `Removed` changes on `changes`. Shared by the periodic sweep in
+/// [`DeviceManager::start`] and the manual [`DeviceManager::prune`].
+fn prune_and_notify(
+    store: &Mutex<DeviceStore>,
+    changes: &broadcast::Sender<DeviceChange>,
+    ttl: chrono::Duration,
+) {
+    let emitted = store.lock().unwrap().prune(chrono::Utc::now(), ttl);
+    for change in emitted {
+        let _ = changes.send(change);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    use async_trait::async_trait;
+    use tokio::time::timeout;
+
+    use peerbeam_domain::entity::{DeviceType, Platform};
+    use peerbeam_domain::port::DiscoveryCaps;
+
+    /// Provider that replays a fixed script and never advertises/scans again.
+    struct Scripted {
+        id: ProviderId,
+        script: Vec<DiscoveryEvent>,
+    }
+
+    #[async_trait]
+    impl DiscoveryProvider for Scripted {
+        fn id(&self) -> ProviderId {
+            self.id.clone()
+        }
+        fn capabilities(&self) -> DiscoveryCaps {
+            DiscoveryCaps {
+                can_advertise: true,
+                can_scan: true,
+                crosses_subnet: false,
+                requires_tailscale: false,
+            }
+        }
+        async fn advertise(&self, _me: &Device) -> peerbeam_domain::Result<()> {
+            Ok(())
+        }
+        async fn scan(&self) -> peerbeam_domain::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> peerbeam_domain::Result<()> {
+            Ok(())
+        }
+        fn events(&self) -> BoxStream<'static, DiscoveryEvent> {
+            futures::stream::iter(self.script.clone()).boxed()
+        }
+    }
+
+    fn device(id: &str) -> Device {
+        Device {
+            id: DeviceId::from(id),
+            name: id.to_string(),
+            device_type: DeviceType::Desktop,
+            platform: Platform::Linux,
+            addresses: vec!["10.0.0.1".to_string()],
+            port: 9000,
+            last_seen: chrono::Utc::now(),
+        }
+    }
+
+    /// `prune` (the manual/testable entry point that the periodic sweep in
+    /// `start` also drives) removes an offline device once it is older than
+    /// the TTL, and broadcasts the `Removed` change — closing the "offline
+    /// devices accumulate unbounded" gap.
+    #[tokio::test]
+    async fn prune_removes_stale_offline_device_and_notifies() {
+        let provider = Arc::new(Scripted {
+            id: ProviderId::from("udp"),
+            script: vec![
+                DiscoveryEvent::Found(device("a")),
+                DiscoveryEvent::Lost(DeviceId::from("a")),
+            ],
+        });
+        let manager = DeviceManager::new(vec![provider]);
+        let mut changes = manager.changes();
+        manager.start(device("me")).await.expect("starts");
+
+        // Drain Added + offline StatusChanged emitted by the scripted events.
+        let _added = timeout(StdDuration::from_millis(500), changes.recv())
+            .await
+            .expect("added change")
+            .unwrap();
+        let offline = timeout(StdDuration::from_millis(500), changes.recv())
+            .await
+            .expect("status change")
+            .unwrap();
+        assert!(matches!(
+            offline,
+            DeviceChange::StatusChanged { online: false, .. }
+        ));
+        assert_eq!(manager.snapshot().len(), 1, "still tracked while offline");
+
+        // Not yet stale under a generous TTL.
+        manager.prune(chrono::Duration::hours(1));
+        assert_eq!(manager.snapshot().len(), 1, "not stale, kept");
+
+        // A zero TTL makes the offline device immediately stale.
+        manager.prune(chrono::Duration::zero());
+        let removed = timeout(StdDuration::from_millis(500), changes.recv())
+            .await
+            .expect("removed change")
+            .unwrap();
+        assert_eq!(removed, DeviceChange::Removed(DeviceId::from("a")));
+        assert!(manager.snapshot().is_empty(), "pruned");
+
+        manager.stop().await.expect("stops");
     }
 }
