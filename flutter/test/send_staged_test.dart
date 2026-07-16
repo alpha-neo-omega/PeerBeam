@@ -63,4 +63,62 @@ void main() {
     // not trip the pending-timer check at teardown.
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'sendStaged removes only the items enqueued before a mid-batch folder failure',
+    (tester) async {
+      final fake = FakePeerBeam()..failFolder = true;
+      final state = AppState.live(fake);
+      state.staging.add([
+        StagedFile(path: '/x/a.bin', name: 'a.bin', size: 10),
+        StagedFile(path: '/x/dir', name: 'dir', size: 0, isDirectory: true),
+      ]);
+      final textItem = state.staging.addText('hello world');
+
+      late BuildContext ctx;
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (c) {
+                  ctx = c;
+                  return const SizedBox();
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // sendFolder throws for the staged folder, but only after the file +
+      // text batch has already been enqueued — a partial-failure scenario.
+      await tester.runAsync(() async {
+        await sendStaged(
+          ctx,
+          PeerTarget(name: 'Laptop', addresses: const ['host'], port: 49600),
+          'Laptop',
+        );
+      });
+
+      // The batch (file + materialized text) went out before the folder
+      // failed.
+      final sendCall = fake.calls.firstWhere(
+        (c) => c.startsWith('send:'),
+        orElse: () => '',
+      );
+      expect(sendCall, contains('/x/a.bin'));
+      expect(sendCall, contains('peerbeam-clipboard-'));
+
+      // File + text were enqueued → removed from the store.
+      expect(state.staging.items.any((i) => i.path == '/x/a.bin'), isFalse);
+      expect(state.staging.items.any((i) => i.id == textItem.id), isFalse);
+      // The folder that threw was never enqueued → stays staged so a retry
+      // can't duplicate the file/text that already went out.
+      expect(state.staging.items.any((i) => i.path == '/x/dir'), isTrue);
+
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 }

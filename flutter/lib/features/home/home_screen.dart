@@ -92,18 +92,30 @@ class HomeScreen extends StatelessWidget {
     final scope = AppScope.of(context);
     final target = await _promptForAddress(context);
     if (target == null || !context.mounted) return;
-    void snack(String m) => ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(m)));
     if (scope.staging.isNotEmpty) {
       await sendStaged(context, target, target.name);
       return;
     }
+    await _pickFilesAndSend(context, target, target.name);
+  }
+
+  /// Pick files with the native picker and send them straight to [target] (no
+  /// staging). Shared tail of `_sendTo`, `_sendToSaved`, and `_sendToAddress`
+  /// once each has confirmed the staging stack is empty.
+  Future<void> _pickFilesAndSend(
+    BuildContext context,
+    PeerTarget target,
+    String name,
+  ) async {
+    final scope = AppScope.of(context);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
     final picked = await pickFilesToStage();
     if (picked.isEmpty || !context.mounted) return;
     try {
       await scope.transfer.send(target, picked.map((f) => f.path).toList());
-      if (context.mounted) snack('Sending ${picked.length} to ${target.name}');
+      if (context.mounted) snack('Sending ${picked.length} to $name');
     } catch (e) {
       if (context.mounted) snack(friendlyError(e));
     }
@@ -269,22 +281,12 @@ class HomeScreen extends StatelessWidget {
   /// Send to a saved device. Content-first (send the stack if non-empty).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
-    void snack(String m) => ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(m)));
     final target = PeerTarget(name: d.name, addresses: [d.host], port: d.port);
     if (scope.staging.isNotEmpty) {
       await sendStaged(context, target, d.name);
       return;
     }
-    final picked = await pickFilesToStage();
-    if (picked.isEmpty || !context.mounted) return;
-    try {
-      await scope.transfer.send(target, picked.map((f) => f.path).toList());
-      if (context.mounted) snack('Sending ${picked.length} to ${d.name}');
-    } catch (e) {
-      if (context.mounted) snack(friendlyError(e));
-    }
+    await _pickFilesAndSend(context, target, d.name);
   }
 
   /// Send to a discovered device. Content-first: if the stack has items, send
@@ -303,14 +305,7 @@ class HomeScreen extends StatelessWidget {
       await sendStaged(context, target, device.name);
       return;
     }
-    final picked = await pickFilesToStage();
-    if (picked.isEmpty || !context.mounted) return;
-    try {
-      await scope.transfer.send(target, picked.map((f) => f.path).toList());
-      if (context.mounted) snack('Sending ${picked.length} to ${device.name}');
-    } catch (e) {
-      if (context.mounted) snack(friendlyError(e));
-    }
+    await _pickFilesAndSend(context, target, device.name);
   }
 
   /// Pick a device from the persistent bar and send the current stack.

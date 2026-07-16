@@ -11,6 +11,10 @@ class FakePeerBeam implements PeerBeamApi {
   final List<String> calls = [];
   List<HistoryEntry> historyEntries = [];
 
+  /// When true, [sendFolder] throws instead of succeeding — used to simulate
+  /// a mid-batch failure in tests.
+  bool failFolder = false;
+
   void emit(BridgeEvent e) => _ctrl.add(e);
 
   @override
@@ -41,6 +45,10 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<String> sendFolder(PeerTarget peer, String path) async {
+    if (failFolder) {
+      calls.add('sendFolder-fail:$path');
+      throw Exception('sendFolder failed');
+    }
     calls.add('sendFolder:$path');
     return 'tx-1';
   }
