@@ -42,6 +42,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   StreamSubscription<({String path, String peer})>? _clipSub;
   StreamSubscription<({String path, String name, String peer})>? _fileSub;
   StreamSubscription<void>? _shareSub;
+  bool _sheetOpen = false;
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
     staging: _state.staging,
@@ -120,9 +121,14 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   /// cold-start share waits for the first build).
   void _openStagedSheet() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_sheetOpen) return; // coalesce re-shares into the open sheet
       final context = rootNavigatorKey.currentContext;
       if (context == null) return;
-      showStagedFilesSheet(context, _state.staging);
+      _sheetOpen = true;
+      showStagedFilesSheet(
+        context,
+        _state.staging,
+      ).whenComplete(() => _sheetOpen = false);
     });
   }
 

@@ -33,6 +33,7 @@ class TransfersScreen extends StatelessWidget {
                 padding: const EdgeInsets.all(AppSpace.md),
                 itemCount: items.length,
                 itemBuilder: (context, i) => Appear(
+                  key: ValueKey(items[i].id),
                   index: i,
                   child: Padding(
                     padding: const EdgeInsets.only(bottom: AppSpace.sm),

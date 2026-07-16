@@ -18,7 +18,9 @@ class PickedTarget {
 /// it's visible above any sheet that opened it (a snackbar would sit behind).
 Future<PickedTarget?> showDevicePicker(BuildContext context) async {
   final scope = AppScope.of(context);
-  final online = scope.device.devices.where((d) => d.online).toList();
+  final online = scope.device.devices
+      .where((d) => d.online && scope.device.peerTarget(d.id) != null)
+      .toList();
   final saved = scope.saved.devices;
 
   return showModalBottomSheet<PickedTarget>(

@@ -27,31 +27,37 @@ Future<String> writeTextPayload(String text) async {
 }
 
 /// The compose-message dialog. Returns the entered text, or null if cancelled.
-Future<String?> composeText(BuildContext context, {String prefill = ''}) {
+Future<String?> composeText(BuildContext context, {String prefill = ''}) async {
   final controller = TextEditingController(text: prefill);
-  return showDialog<String>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      title: const Text('Send text'),
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        minLines: 3,
-        maxLines: 8,
-        decoration: const InputDecoration(hintText: 'Type or paste a message'),
+  try {
+    return await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Send text'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 3,
+          maxLines: 8,
+          decoration: const InputDecoration(
+            hintText: 'Type or paste a message',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('Add'),
+          ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(ctx, controller.text),
-          child: const Text('Add'),
-        ),
-      ],
-    ),
-  );
+    );
+  } finally {
+    controller.dispose();
+  }
 }
 
 /// Compose a message (prefilled from the clipboard) and add it to the stack,
@@ -66,14 +72,26 @@ Future<void> addTextToStack(BuildContext context) async {
   showStagedFilesSheet(context, staging);
 }
 
-/// Add the current clipboard text to the stack (no dialog). Snackbars if empty.
+/// Add the current clipboard text to the stack (no dialog). Shows a dialog
+/// if empty — a SnackBar would render behind the modal staged sheet this is
+/// always called from and never be seen.
 Future<void> addClipboardToStack(BuildContext context) async {
   final clip = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
   if (!context.mounted) return;
   if (clip.trim().isEmpty) {
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(const SnackBar(content: Text('Clipboard is empty')));
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clipboard is empty'),
+        content: const Text('There is no text on the clipboard to add.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
     return;
   }
   AppScope.of(context).staging.addText(clip);

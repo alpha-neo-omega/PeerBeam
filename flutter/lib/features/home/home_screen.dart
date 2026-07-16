@@ -134,54 +134,74 @@ class HomeScreen extends StatelessWidget {
   }
 
   /// Dialog to collect a host/IP (or MagicDNS name) and port → [PeerTarget].
-  Future<PeerTarget?> _promptForAddress(BuildContext context) {
+  Future<PeerTarget?> _promptForAddress(BuildContext context) async {
     final host = TextEditingController();
     final port = TextEditingController(text: '49600');
-    return showDialog<PeerTarget>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Send to address'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: host,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Host / IP or MagicDNS name',
+    String? error;
+    try {
+      return await showDialog<PeerTarget>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: const Text('Send to address'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: host,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Host / IP or MagicDNS name',
+                  ),
+                ),
+                const Gap(AppSpace.sm),
+                TextField(
+                  controller: port,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Port'),
+                ),
+                if (error != null) ...[
+                  const Gap(AppSpace.sm),
+                  Text(
+                    error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
               ),
-            ),
-            const Gap(AppSpace.sm),
-            TextField(
-              controller: port,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Port'),
-            ),
-          ],
+              FilledButton(
+                onPressed: () {
+                  final h = host.text.trim();
+                  final p = int.tryParse(port.text.trim()) ?? 0;
+                  if (h.isEmpty || p <= 0 || p > 65535) {
+                    setState(
+                      () => error =
+                          'Enter a host and a port between 1 and 65535',
+                    );
+                    return;
+                  }
+                  Navigator.pop(
+                    context,
+                    PeerTarget(name: h, addresses: [h], port: p),
+                  );
+                },
+                child: const Text('Next'),
+              ),
+            ],
+          ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final h = host.text.trim();
-              final p = int.tryParse(port.text.trim()) ?? 0;
-              if (h.isEmpty || p <= 0 || p > 65535) {
-                Navigator.pop(context); // invalid → cancel
-                return;
-              }
-              Navigator.pop(
-                context,
-                PeerTarget(name: h, addresses: [h], port: p),
-              );
-            },
-            child: const Text('Next'),
-          ),
-        ],
-      ),
-    );
+      );
+    } finally {
+      host.dispose();
+      port.dispose();
+    }
   }
 
   /// Save a device (name + host/IP or MagicDNS + port) to the persistent book.
@@ -191,70 +211,79 @@ class HomeScreen extends StatelessWidget {
     final host = TextEditingController();
     final port = TextEditingController(text: '49600');
     String? error;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setState) => AlertDialog(
-          title: const Text('Add device'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: name,
-                autofocus: true,
-                decoration: const InputDecoration(labelText: 'Name'),
-              ),
-              const Gap(AppSpace.sm),
-              TextField(
-                controller: host,
-                decoration: const InputDecoration(
-                  labelText: 'Host / IP or MagicDNS name',
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: const Text('Add device'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: name,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Name'),
                 ),
-              ),
-              const Gap(AppSpace.sm),
-              TextField(
-                controller: port,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'Port'),
-              ),
-              if (error != null) ...[
                 const Gap(AppSpace.sm),
-                Text(
-                  error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                TextField(
+                  controller: host,
+                  decoration: const InputDecoration(
+                    labelText: 'Host / IP or MagicDNS name',
+                  ),
                 ),
+                const Gap(AppSpace.sm),
+                TextField(
+                  controller: port,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Port'),
+                ),
+                if (error != null) ...[
+                  const Gap(AppSpace.sm),
+                  Text(
+                    error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
               ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final h = host.text.trim();
+                  final p = int.tryParse(port.text.trim()) ?? 0;
+                  if (h.isEmpty || p <= 0 || p > 65535) {
+                    setState(
+                      () => error =
+                          'Enter a host and a port between 1 and 65535',
+                    );
+                    return;
+                  }
+                  Navigator.pop(context, true);
+                },
+                child: const Text('Save'),
+              ),
             ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final h = host.text.trim();
-                final p = int.tryParse(port.text.trim()) ?? 0;
-                if (h.isEmpty || p <= 0 || p > 65535) {
-                  setState(
-                    () => error = 'Enter a host and a port between 1 and 65535',
-                  );
-                  return;
-                }
-                Navigator.pop(context, true);
-              },
-              child: const Text('Save'),
-            ),
-          ],
         ),
-      ),
-    );
-    if (ok != true) return;
-    final h = host.text.trim();
-    final p = int.tryParse(port.text.trim()) ?? 0;
-    final n = name.text.trim().isEmpty ? h : name.text.trim();
-    if (h.isEmpty || p <= 0 || p > 65535) return;
-    await scope.saved.add(name: n, host: h, port: p);
+      );
+      if (ok != true) return;
+      final h = host.text.trim();
+      final p = int.tryParse(port.text.trim()) ?? 0;
+      final n = name.text.trim().isEmpty ? h : name.text.trim();
+      if (h.isEmpty || p <= 0 || p > 65535) return;
+      await scope.saved.add(name: n, host: h, port: p);
+    } finally {
+      name.dispose();
+      host.dispose();
+      port.dispose();
+    }
   }
 
   /// Edit a saved device's name/address in place.
@@ -264,70 +293,79 @@ class HomeScreen extends StatelessWidget {
     final host = TextEditingController(text: d.host);
     final port = TextEditingController(text: '${d.port}');
     String? error;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setState) => AlertDialog(
-          title: const Text('Edit device'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: name,
-                autofocus: true,
-                decoration: const InputDecoration(labelText: 'Name'),
-              ),
-              const Gap(AppSpace.sm),
-              TextField(
-                controller: host,
-                decoration: const InputDecoration(
-                  labelText: 'Host / IP or MagicDNS name',
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: const Text('Edit device'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: name,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Name'),
                 ),
-              ),
-              const Gap(AppSpace.sm),
-              TextField(
-                controller: port,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'Port'),
-              ),
-              if (error != null) ...[
                 const Gap(AppSpace.sm),
-                Text(
-                  error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                TextField(
+                  controller: host,
+                  decoration: const InputDecoration(
+                    labelText: 'Host / IP or MagicDNS name',
+                  ),
                 ),
+                const Gap(AppSpace.sm),
+                TextField(
+                  controller: port,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Port'),
+                ),
+                if (error != null) ...[
+                  const Gap(AppSpace.sm),
+                  Text(
+                    error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
               ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final h = host.text.trim();
+                  final p = int.tryParse(port.text.trim()) ?? 0;
+                  if (h.isEmpty || p <= 0 || p > 65535) {
+                    setState(
+                      () => error =
+                          'Enter a host and a port between 1 and 65535',
+                    );
+                    return;
+                  }
+                  Navigator.pop(context, true);
+                },
+                child: const Text('Save'),
+              ),
             ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final h = host.text.trim();
-                final p = int.tryParse(port.text.trim()) ?? 0;
-                if (h.isEmpty || p <= 0 || p > 65535) {
-                  setState(
-                    () => error = 'Enter a host and a port between 1 and 65535',
-                  );
-                  return;
-                }
-                Navigator.pop(context, true);
-              },
-              child: const Text('Save'),
-            ),
-          ],
         ),
-      ),
-    );
-    if (ok != true) return;
-    final h = host.text.trim();
-    final p = int.tryParse(port.text.trim()) ?? 0;
-    final n = name.text.trim().isEmpty ? h : name.text.trim();
-    if (h.isEmpty || p <= 0 || p > 65535) return;
-    await scope.saved.update(d.id, name: n, host: h, port: p);
+      );
+      if (ok != true) return;
+      final h = host.text.trim();
+      final p = int.tryParse(port.text.trim()) ?? 0;
+      final n = name.text.trim().isEmpty ? h : name.text.trim();
+      if (h.isEmpty || p <= 0 || p > 65535) return;
+      await scope.saved.update(d.id, name: n, host: h, port: p);
+    } finally {
+      name.dispose();
+      host.dispose();
+      port.dispose();
+    }
   }
 
   /// Send to a saved device. Content-first (send the stack if non-empty).

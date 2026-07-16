@@ -126,9 +126,15 @@ class AppShell extends StatelessWidget {
       bindings[SingleActivator(keys[i], control: true)] = () => _go(i);
       bindings[SingleActivator(keys[i], meta: true)] = () => _go(i);
     }
-    return CallbackShortcuts(
-      bindings: bindings,
-      child: Focus(autofocus: true, child: child),
+    return PopScope(
+      canPop: navigationShell.currentIndex == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _go(0); // return to the Home branch before allowing exit
+      },
+      child: CallbackShortcuts(
+        bindings: bindings,
+        child: Focus(autofocus: true, child: child),
+      ),
     );
   }
 }

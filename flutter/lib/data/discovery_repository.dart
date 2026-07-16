@@ -82,10 +82,36 @@ class DiscoveryRepository extends ChangeNotifier {
       case DeviceLatencyChanged(:final id, :final latencyMs):
         final d = _byId[id];
         if (d != null) _byId[id] = _withLatency(d, latencyMs);
+      case DeviceResync():
+        unawaited(_resync());
+        return;
       default:
         return;
     }
     notifyListeners();
+  }
+
+  /// Re-pull the authoritative device list after a [DeviceResync] hint (the
+  /// native event stream lagged and silently dropped device transitions).
+  /// Rebuilds `_byId`/`_raw` from scratch so ghost devices are dropped and
+  /// any missed additions reappear.
+  Future<void> _resync() async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      final list = await api.devices();
+      if (_disposed) return;
+      final freshIds = list.map((d) => d.id).toSet();
+      _byId.removeWhere((id, _) => !freshIds.contains(id));
+      _raw.removeWhere((id, _) => !freshIds.contains(id));
+      for (final d in list) {
+        _raw[d.id] = d;
+        _byId[d.id] = _map(d);
+      }
+      notifyListeners();
+    } catch (_) {
+      // Best-effort recovery; the next event or resync will retry.
+    }
   }
 
   @override

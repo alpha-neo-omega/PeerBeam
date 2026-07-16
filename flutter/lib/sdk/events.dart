@@ -47,6 +47,8 @@ sealed class BridgeEvent {
         return const HistoryUpdated();
       case 'trust_changed':
         return const TrustChanged();
+      case 'device_resync':
+        return const DeviceResync();
       default:
         return null;
     }
@@ -133,4 +135,10 @@ class HistoryUpdated extends BridgeEvent {
 
 class TrustChanged extends BridgeEvent {
   const TrustChanged();
+}
+
+/// Hint that the device-change stream lagged and dropped transitions; the
+/// consumer must re-pull the authoritative device list via `devices()`.
+class DeviceResync extends BridgeEvent {
+  const DeviceResync();
 }

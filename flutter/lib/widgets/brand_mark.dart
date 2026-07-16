@@ -40,7 +40,9 @@ class BrandLockup extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        const PeerBeamMark(),
+        showWordmark
+            ? const ExcludeSemantics(child: PeerBeamMark())
+            : const PeerBeamMark(),
         if (showWordmark) ...[
           const Gap(AppSpace.xs),
           Text(

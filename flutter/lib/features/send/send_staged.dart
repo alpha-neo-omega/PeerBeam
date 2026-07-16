@@ -41,6 +41,7 @@ Future<void> sendStaged(
   }
 
   final sentIds = <String>[];
+  Object? failure;
   try {
     final batchPaths = [for (final f in fileItems) f.path];
     for (final t in textItems) {
@@ -57,13 +58,22 @@ Future<void> sendStaged(
       sentIds.add(folder.id);
     }
   } catch (e) {
-    if (context.mounted) snack(friendlyError(e));
+    failure = e;
   } finally {
     for (final id in sentIds) {
       staging.remove(id);
     }
-    if (sentIds.isNotEmpty && context.mounted) {
-      snack('Sending ${sentIds.length} to $targetName');
+    if (context.mounted) {
+      if (failure != null && sentIds.isNotEmpty) {
+        snack(
+          'Sent ${sentIds.length} to $targetName — some items failed: '
+          '${friendlyError(failure)}',
+        );
+      } else if (failure != null) {
+        snack(friendlyError(failure));
+      } else if (sentIds.isNotEmpty) {
+        snack('Sending ${sentIds.length} to $targetName');
+      }
     }
   }
 }

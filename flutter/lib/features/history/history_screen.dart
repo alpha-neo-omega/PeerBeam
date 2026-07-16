@@ -184,7 +184,7 @@ class _HistoryRow extends StatelessWidget {
                       Text(
                         message
                             ? '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-                                  '${_ago(item.at)} · tap to copy'
+                                  '${_ago(item.at)} · tap to view'
                                   '${item.success ? '' : ' · Failed'}'
                             : '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
                                   '${formatBytes(item.bytes)} · ${_ago(item.at)}'
