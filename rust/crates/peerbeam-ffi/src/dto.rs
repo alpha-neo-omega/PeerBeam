@@ -71,3 +71,12 @@ pub fn device_event(change: &DeviceChange) -> Value {
         DeviceChange::Removed(id) => json!({ "type": "device_removed", "id": id.0 }),
     }
 }
+
+/// A lightweight hint that the device-change broadcast stream dropped events
+/// (the receiver lagged behind the sender). There is no way to recover the
+/// specific missed transitions, so this simply tells Dart to re-pull the
+/// authoritative list via `devices()` instead of trusting its incremental
+/// view.
+pub fn device_resync_event() -> Value {
+    json!({ "type": "device_resync" })
+}

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::broadcast::{self, error::RecvError};
 
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
@@ -15,6 +16,7 @@ use peerbeam_discovery_mdns::MdnsDiscovery;
 use peerbeam_discovery_tailscale::{Config as TsConfig, TailscaleDiscovery};
 use peerbeam_discovery_udp::UdpDiscovery;
 use peerbeam_domain::entity::{Device, DeviceType};
+use peerbeam_domain::event::DeviceChange;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::EncryptionProvider;
 use peerbeam_engine::{Engine, EngineBuilder, RouteManager};
@@ -157,8 +159,48 @@ fn me(config: &EngineConfig) -> Device {
     }
 }
 
+/// Forward device-change broadcasts to `emit` until the channel closes.
+///
+/// `broadcast::Receiver::recv()` can return `Err(Lagged(n))` — a RECOVERABLE
+/// error meaning the sender outran this receiver's buffer and `n`
+/// intermediate changes were dropped — whenever a burst (e.g. a large network
+/// coming online, or an `offline_all()` storm on stop/rename-restart) emits
+/// more than the channel capacity while the consumer is briefly behind. That
+/// is distinct from `Err(Closed)`, which means every sender was dropped and
+/// the stream is truly finished. Treating `Lagged` as terminal would silently
+/// end device-list updates for the rest of the process; only `Closed` ends
+/// the loop. On `Lagged` we also emit a resync hint so the consumer can
+/// re-pull the authoritative list and recover the dropped transitions.
+async fn forward_device_changes(
+    mut changes: broadcast::Receiver<DeviceChange>,
+    emit: impl Fn(&Value),
+) {
+    loop {
+        match changes.recv().await {
+            Ok(change) => emit(&dto::device_event(&change)),
+            Err(RecvError::Lagged(_)) => {
+                emit(&dto::device_resync_event());
+                continue;
+            }
+            Err(RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Initialise the runtime + engine and start the event forwarder.
+///
+/// Idempotent: a second call without an intervening [`shutdown`] (e.g. a
+/// Flutter hot-restart re-entering `pb_init`) tears down the previous
+/// engine/daemon first. Without this, the old daemon task — which holds its
+/// own `Arc<Manager>` — keeps running and keeps the QUIC transfer port bound,
+/// so the new daemon's bind would fail (silently, since `start_daemon`'s
+/// result used to be discarded) while the statics were overwritten to point
+/// at the new, half-working instance.
 pub fn init(config_json: &str) -> OpResult {
+    if lock(&ENGINE).is_some() {
+        shutdown();
+    }
+
     let mut config: EngineConfig = if config_json.trim().is_empty() {
         EngineConfig::default()
     } else {
@@ -190,12 +232,8 @@ pub fn init(config_json: &str) -> OpResult {
     let engine = Arc::new(builder.build().map_err(crate::error::from_engine)?);
 
     // Forward device-list changes to Dart as events (no polling).
-    let mut changes = engine.device_changes();
-    rt().spawn(async move {
-        while let Ok(change) = changes.recv().await {
-            events::emit(&dto::device_event(&change));
-        }
-    });
+    let changes = engine.device_changes();
+    rt().spawn(forward_device_changes(changes, events::emit));
 
     // Transfer manager: its own QUIC transport (dial + serve) + identity.
     let quic = Arc::new(QuicTransport::new().map_err(crate::error::from_domain)?);
@@ -223,8 +261,10 @@ pub fn init(config_json: &str) -> OpResult {
     ));
 
     // Start the receive server (the "daemon") so accept/reject have incoming
-    // transfers; controllable via pb_daemon_*.
-    let _ = manager.start_daemon();
+    // transfers; controllable via pb_daemon_*. Propagate failure instead of
+    // discarding it — otherwise init() would report `{"initialised": true}`
+    // while incoming transfers silently have no listener.
+    manager.start_daemon()?;
 
     *lock(&ME) = Some(me(&config));
     *lock(&ENGINE) = Some(engine);
@@ -249,7 +289,21 @@ pub fn status() -> OpResult {
 /// Stop work and release the engine.
 pub fn shutdown() {
     if let Ok(engine) = engine() {
-        let _ = rt().block_on(engine.stop_discovery());
+        match tokio::runtime::Handle::try_current() {
+            // The calling thread already has a tokio context entered (e.g.
+            // `init`'s idempotent teardown re-entering `shutdown` from a test
+            // harness that drives `pb_init`/`pb_shutdown` from inside an
+            // `async fn`; real Dart callers never have one). `rt().block_on`
+            // would panic ("cannot start a runtime from within a runtime"),
+            // so drive the future on the already-current handle instead —
+            // `block_in_place` makes it legal to block this worker thread.
+            Ok(handle) => {
+                let _ = tokio::task::block_in_place(|| handle.block_on(engine.stop_discovery()));
+            }
+            Err(_) => {
+                let _ = rt().block_on(engine.stop_discovery());
+            }
+        }
     }
     DISCOVERING.store(false, Ordering::SeqCst);
     // Stop the daemon task explicitly: it holds its own `Arc<Manager>`, so
@@ -261,6 +315,11 @@ pub fn shutdown() {
     *lock(&ENGINE) = None;
     *lock(&ME) = None;
     *lock(&MANAGER) = None;
+    // Drain any in-flight emit() before returning: set_callback(None) takes
+    // an exclusive lock that blocks until every emitter's shared (read) guard
+    // has released, so once this returns no emitter can still be holding the
+    // callback pointer Dart is about to free.
+    crate::events::set_callback(None);
 }
 
 pub fn discovery_start() -> OpResult {
@@ -286,4 +345,56 @@ pub fn devices() -> OpResult {
     let engine = engine()?;
     let list: Vec<DeviceDto> = engine.devices().iter().map(DeviceDto::from).collect();
     Ok(json!({ "devices": list }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// A burst larger than the broadcast channel's capacity must not kill the
+    /// forwarder: `recv()` returns `Err(Lagged(_))` once the receiver falls
+    /// behind, and the loop must emit a resync hint and keep going rather
+    /// than treating it as terminal (the bug being fixed: the old `while let
+    /// Ok` loop exited on the very first `Lagged` and never recovered).
+    #[tokio::test]
+    async fn forward_device_changes_continues_past_lagged_and_stops_on_closed() {
+        // Capacity 2: sending 6 changes before anyone consumes guarantees the
+        // receiver has lagged by the time it starts polling.
+        let (tx, rx) = broadcast::channel(2);
+        let received: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = received.clone();
+
+        let id = DeviceId::from("dev-1");
+        for _ in 0..5 {
+            let _ = tx.send(DeviceChange::StatusChanged {
+                id: id.clone(),
+                online: true,
+            });
+        }
+        // A uniquely identifiable change sent last, so we can confirm it was
+        // still delivered *after* the lag.
+        let _ = tx.send(DeviceChange::Removed(DeviceId::from("sentinel")));
+        // Dropping every sender closes the channel once buffered items drain,
+        // which is what lets the forwarder loop terminate below instead of
+        // awaiting forever.
+        drop(tx);
+
+        forward_device_changes(rx, move |v: &Value| {
+            sink.lock().unwrap().push(v.clone());
+        })
+        .await;
+
+        let events = received.lock().unwrap();
+        assert!(
+            events.iter().any(|v| v["type"] == "device_resync"),
+            "expected a resync hint after the Lagged burst, got: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|v| v["type"] == "device_removed" && v["id"] == "sentinel"),
+            "expected the forwarder to keep delivering changes after Lagged, got: {events:?}"
+        );
+    }
 }
