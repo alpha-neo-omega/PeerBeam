@@ -364,12 +364,15 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
     };
 
     let (rs, rr, _) = tokio::join!(send, recv, pump);
+    // Clean up the multi-hundred-MiB sample dir unconditionally, before the
+    // `?`s below can return early on error — otherwise a failed benchmark
+    // leaks it permanently.
+    let _ = std::fs::remove_dir_all(&dir);
     rs.map_err(CliError::from)?;
     rr.map_err(CliError::from)?;
     let secs = start.elapsed().as_secs_f64();
     let mbs = size_mib as f64 / secs;
 
-    let _ = std::fs::remove_dir_all(&dir);
     if ctx.json {
         ctx.json_line(&json!({"mib": size_mib, "seconds": secs, "mib_s": mbs}));
     } else {
@@ -473,13 +476,16 @@ async fn bench_quic(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
     };
 
     let (rs, rr, _) = tokio::join!(send, recv, pump);
+    // Clean up the multi-hundred-MiB sample dir unconditionally, before the
+    // `?`s below can return early on error — otherwise a failed benchmark
+    // leaks it permanently.
+    let _ = std::fs::remove_dir_all(&dir);
     rs.map_err(CliError::from)?;
     rr.map_err(CliError::from)?;
     let secs = start.elapsed().as_secs_f64();
     let mbs = size_mib as f64 / secs;
     let connect_ms = connect_rx.await.unwrap_or(0.0);
 
-    let _ = std::fs::remove_dir_all(&dir);
     if ctx.json {
         ctx.json_line(&json!({
             "mib": size_mib, "seconds": secs, "mib_s": mbs, "connect_ms": connect_ms
@@ -584,8 +590,26 @@ fn emit_change(ctx: &Ctx, change: &peerbeam_engine::DeviceChange) {
             C::Removed(id) => json!({"change":"removed","id":id.to_string()}),
         };
         ctx.json_line(&v);
-    } else if let C::Added(m) = change {
-        ctx.line(&format!("{} {}", ctx.green("+"), m.device.name));
+    } else {
+        match change {
+            C::Added(m) => ctx.line(&format!("{} {}", ctx.green("+"), m.device.name)),
+            C::Updated(m) => ctx.line(&ctx.dim(&format!("* {}", m.device.name))),
+            C::StatusChanged { id, online } => {
+                let marker = if *online {
+                    ctx.green("online")
+                } else {
+                    ctx.dim("offline")
+                };
+                ctx.line(&format!("{marker} {id}"));
+            }
+            C::LatencyChanged { id, latency_ms } => {
+                let ms = latency_ms
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "?".into());
+                ctx.line(&ctx.dim(&format!("~ {id} {ms}ms")));
+            }
+            C::Removed(id) => ctx.line(&format!("{} {}", ctx.red("-"), id)),
+        }
     }
 }
 
@@ -705,6 +729,17 @@ fn completions(shell: clap_complete::Shell) -> CliResult {
     Ok(())
 }
 
+/// Clamp a configured chunk size (stored as `u64`) into the `u32` range the
+/// transfer engine expects. A plain `.max(1) as u32` cast is unsound: `.max(1)`
+/// runs BEFORE the truncating cast, so any value that is an exact multiple of
+/// 2^32 (e.g. 4 GiB) survives the guard unchanged and then truncates to 0,
+/// handing the transfer engine a zero chunk size. Clamping into range first
+/// and applying the minimum after the value is already a valid `u32` closes
+/// that gap.
+fn clamp_chunk_size(chunk_size: u64) -> u32 {
+    chunk_size.clamp(1, u32::MAX as u64) as u32
+}
+
 async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResult {
     // Validate every path up front so a bad entry fails the whole call
     // before anything is sent.
@@ -757,7 +792,7 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
     // peer. The CLI never picks or sees a route.
     let routes = RouteManager::new(Arc::new(QuicTransport::new().map_err(CliError::from)?));
     let storage = FsStorage::new();
-    let chunk = config.transfer.chunk_size.max(1) as u32;
+    let chunk = clamp_chunk_size(config.transfer.chunk_size);
 
     let hist = history::path_for(&config.storage.data_directory);
     for p in &args.paths {
@@ -923,16 +958,26 @@ async fn receive(ctx: &Ctx, args: ReceiveArgs, path_override: Option<&str>) -> C
 /// Background daemon: serve transfers until interrupted.
 async fn daemon(ctx: &Ctx, args: DaemonArgs, path_override: Option<&str>) -> CliResult {
     match args.action {
-        DaemonAction::Start { foreground: _ } => {
+        DaemonAction::Start { foreground } => {
             let config = load_config(path_override)?;
             let port = config.transfer.port;
             let dir = config.storage.save_directory.clone();
             std::fs::create_dir_all(&dir)?;
-            ctx.line(&ctx.dim("daemon: serving transfers (Ctrl-C to stop)"));
+            // Backgrounding is not implemented yet: the daemon always runs in
+            // the foreground. Say so honestly rather than silently ignoring
+            // `--foreground` (previously a no-op) or claiming a detach mode
+            // that doesn't exist.
+            if !foreground {
+                ctx.line(&ctx.dim(
+                    "daemon: background mode is not implemented yet; running in the foreground (Ctrl-C to stop)",
+                ));
+            } else {
+                ctx.line(&ctx.dim("daemon: serving transfers (Ctrl-C to stop)"));
+            }
             serve_loop(ctx, &config, port, &dir, false).await
         }
         DaemonAction::Stop | DaemonAction::Status => Err(CliError::Unavailable(
-            "daemon IPC (stop/status) is not implemented; run `daemon start --foreground`".into(),
+            "daemon IPC (stop/status) is not implemented; run `daemon start` (it always runs in the foreground)".into(),
         )),
     }
 }
@@ -1607,5 +1652,42 @@ mod resolve_addr_tests {
     fn bare_ipv6_asks_for_brackets() {
         let err = resolve_addr("fe80::1").unwrap_err().to_string();
         assert!(err.contains("bracketed"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod clamp_chunk_size_tests {
+    use super::clamp_chunk_size;
+
+    #[test]
+    fn passes_through_ordinary_values() {
+        assert_eq!(clamp_chunk_size(1_048_576), 1_048_576);
+    }
+
+    #[test]
+    fn zero_clamps_up_to_one_not_zero() {
+        // `.max(1)` alone is correct here — regression guard for the trivial case.
+        assert_eq!(clamp_chunk_size(0), 1);
+    }
+
+    #[test]
+    fn exact_multiple_of_2_pow_32_does_not_truncate_to_zero() {
+        // This is the bug: `(4_294_967_296u64.max(1)) as u32 == 0` because
+        // `.max(1)` ran BEFORE the truncating cast, so the guard never saw
+        // the post-cast value. Clamping into u32 range first must yield the
+        // maximum representable chunk size, never 0.
+        let two_pow_32: u64 = 1u64 << 32;
+        assert_eq!(clamp_chunk_size(two_pow_32), u32::MAX);
+        assert_ne!(clamp_chunk_size(two_pow_32), 0);
+    }
+
+    #[test]
+    fn values_above_u32_max_clamp_to_u32_max() {
+        assert_eq!(clamp_chunk_size(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn u32_max_itself_is_unchanged() {
+        assert_eq!(clamp_chunk_size(u32::MAX as u64), u32::MAX);
     }
 }
