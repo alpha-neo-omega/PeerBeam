@@ -20,13 +20,25 @@ class PeerBeamService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val title = intent?.getStringExtra("title") ?: "PeerBeam"
-        val body = intent?.getStringExtra("body") ?: "Active"
+        // A null intent means the OS restarted the service after killing the
+        // process. The receive engine lives in the (now-gone) Flutter process,
+        // so a resurrected service can't actually receive anything — it would
+        // just hold a Wi-Fi lock + a stale "Active" notification with no way to
+        // stop it. Bail out instead of running as a zombie; the app re-creates
+        // the service properly on next launch.
+        if (intent == null) {
+            releaseLocks()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val title = intent.getStringExtra("title") ?: "PeerBeam"
+        val body = intent.getStringExtra("body") ?: "Active"
         // Active = a transfer is moving bytes: animate the notification (an
         // indeterminate bar) and hold the CPU awake. Idle receive-ready shows a
         // static notification and holds no CPU wake lock (battery-friendly).
-        val active = intent?.getBooleanExtra("active", false) ?: false
-        val incoming = intent?.getBooleanExtra("incoming", false) ?: false
+        val active = intent.getBooleanExtra("active", false)
+        val incoming = intent.getBooleanExtra("incoming", false)
 
         Notifications.ensureChannel(this)
         val notification = Notifications.build(
@@ -49,7 +61,9 @@ class PeerBeamService : Service() {
         }
 
         updateLocks(active)
-        return START_STICKY
+        // Not sticky: don't let the OS resurrect the service without its engine
+        // (see the null-intent guard above). The app re-starts it on relaunch.
+        return START_NOT_STICKY
     }
 
     /// Wi-Fi lock is held for the whole service lifetime so incoming transfers
