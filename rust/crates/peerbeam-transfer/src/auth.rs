@@ -164,11 +164,15 @@ pub async fn authenticate(
         }
         Some(_) => false,
         None => {
+            // Pin the key now (MITM protection). This is *not* approval for
+            // auto-accept — that only happens if the user explicitly accepts
+            // the transfer that follows (see `FsTrust::approve`).
             trust.record(TrustRecord {
                 device: peer_id.clone(),
                 fingerprint,
                 name: peer_name,
                 trusted_at: Utc::now(),
+                approved: false,
             })?;
             true
         }

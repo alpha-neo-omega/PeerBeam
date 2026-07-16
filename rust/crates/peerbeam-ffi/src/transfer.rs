@@ -21,7 +21,7 @@ use peerbeam_domain::entity::{
 };
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{FrameKind, Link};
+use peerbeam_domain::port::{FrameKind, Link, TrustStore};
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
@@ -868,15 +868,31 @@ impl Manager {
             json!({ "peer": peer, "incoming": true }),
         );
 
-        // Approval: auto-accept already-trusted peers when configured, else wait.
+        // Approval: auto-accept only peers explicitly approved by the user on
+        // a prior transfer, else wait for a decision. A pinned key alone
+        // (TOFU trust, MITM protection) is not consent to auto-accept — that
+        // requires the user to have accepted at least once before.
         // Read the flag fresh so a live toggle applies without a restart.
         let auto = self.auto_accept.load(Ordering::SeqCst);
-        let accepted = if auto && !sess.newly_trusted {
+        let approved = self
+            .trust
+            .lookup(&sess.peer_id)
+            .ok()
+            .flatten()
+            .map(|r| r.approved)
+            .unwrap_or(false);
+        let accepted = if auto && approved {
             true
         } else {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().unwrap().insert(id.clone(), tx);
-            rx.await.unwrap_or(false)
+            let accepted = rx.await.unwrap_or(false);
+            if accepted {
+                // Explicit accept: this device is now approved for
+                // auto-accept on future connections. Never set on decline.
+                let _ = self.trust.approve(&sess.peer_id);
+            }
+            accepted
         };
         if !accepted {
             events::transfer(&id, "transfer_cancelled", json!({ "reason": "rejected" }));

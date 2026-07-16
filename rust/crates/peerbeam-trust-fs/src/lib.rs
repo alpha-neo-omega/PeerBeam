@@ -84,6 +84,21 @@ impl FsTrust {
         }
         Ok(existed)
     }
+
+    /// Mark a pinned device as approved for auto-accept. Called only after
+    /// the user explicitly accepts an incoming transfer from it — a declined
+    /// transfer must never call this. A no-op (returning `Ok`) if the device
+    /// isn't pinned; a device is always pinned before it can be approved.
+    pub fn approve(&self, device: &DeviceId) -> Result<()> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(record) = cache.get_mut(&device.0) {
+            if !record.approved {
+                record.approved = true;
+                self.persist(&cache)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A temp path next to `path`, unique per process and per call, so concurrent
@@ -123,6 +138,7 @@ mod tests {
             fingerprint: fp.to_string(),
             name: "Peer".to_string(),
             trusted_at: Utc::now(),
+            approved: false,
         }
     }
 
@@ -218,5 +234,56 @@ mod tests {
         let reopened = FsTrust::open(&path).unwrap();
         assert!(!reopened.is_trusted(&DeviceId::from("dev-a")));
         assert!(reopened.is_trusted(&DeviceId::from("dev-b")));
+    }
+
+    #[test]
+    fn approve_marks_pinned_device_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-approve");
+
+        store.record(record("dev-approve", "fp")).unwrap();
+        assert!(!store.lookup(&id).unwrap().unwrap().approved);
+
+        store.approve(&id).unwrap();
+        assert!(store.lookup(&id).unwrap().unwrap().approved);
+
+        // Persisted across reopen.
+        let reopened = FsTrust::open(&path).unwrap();
+        assert!(reopened.lookup(&id).unwrap().unwrap().approved);
+    }
+
+    #[test]
+    fn approve_unknown_device_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        assert!(store.approve(&DeviceId::from("ghost")).is_ok());
+        assert!(store.lookup(&DeviceId::from("ghost")).unwrap().is_none());
+    }
+
+    #[test]
+    fn records_without_approved_field_deserialize_as_not_approved() {
+        // Simulates a trust.json written before `approved` existed: old
+        // records must still load, defaulting to `approved: false` (a
+        // pinned-but-unapproved device requires one more explicit accept
+        // after upgrading, rather than silently becoming auto-acceptable).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let legacy = serde_json::json!([{
+            "device": "dev-legacy",
+            "fingerprint": "fp-legacy",
+            "name": "Old Peer",
+            "trusted_at": Utc::now().to_rfc3339(),
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = FsTrust::open(&path).unwrap();
+        let rec = store
+            .lookup(&DeviceId::from("dev-legacy"))
+            .unwrap()
+            .unwrap();
+        assert!(!rec.approved);
+        assert_eq!(rec.fingerprint, "fp-legacy");
     }
 }
