@@ -40,3 +40,6 @@ chrono = { workspace = true }
 libloading = "0.8"
 serial_test = "3"
 tempfile = { workspace = true }
+# test-util enables tokio::time::pause/advance so tests can fast-forward
+# through ACCEPT_TIMEOUT instead of actually sleeping 180s.
+tokio = { workspace = true, features = ["test-util"] }

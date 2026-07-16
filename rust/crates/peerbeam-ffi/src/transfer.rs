@@ -858,6 +858,30 @@ impl Manager {
         }
     }
 
+    /// Wait for the user's accept/reject decision on a just-authenticated
+    /// incoming transfer `id`, bounded by [`ACCEPT_TIMEOUT`] so a connection
+    /// drop or an unanswered prompt can't park the caller (and the counted
+    /// `active` slot) forever. The pending entry is removed before returning
+    /// on every path — explicit accept, explicit decline (`reject`, or
+    /// `cancel` firing the sender with `false`), a dropped sender, or a
+    /// timeout — so a stale id can never be acted on by a later
+    /// `accept`/`reject` call. Trust is only recorded on an actual accept.
+    async fn wait_for_accept(&self, id: &str, peer_id: &DeviceId) -> bool {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id.to_string(), tx);
+        let accepted = match tokio::time::timeout(ACCEPT_TIMEOUT, rx).await {
+            Ok(Ok(true)) => {
+                // Explicit accept: this device is now approved for
+                // auto-accept on future connections. Never set on decline.
+                let _ = self.trust.approve(peer_id);
+                true
+            }
+            _ => false,
+        };
+        self.pending.lock().unwrap().remove(id);
+        accepted
+    }
+
     async fn handle_incoming(self: Arc<Self>, mut link: Box<dyn Link>) {
         let sess = match authenticate(
             &mut *link,
@@ -907,15 +931,7 @@ impl Manager {
         let accepted = if auto && approved {
             true
         } else {
-            let (tx, rx) = oneshot::channel();
-            self.pending.lock().unwrap().insert(id.clone(), tx);
-            let accepted = rx.await.unwrap_or(false);
-            if accepted {
-                // Explicit accept: this device is now approved for
-                // auto-accept on future connections. Never set on decline.
-                let _ = self.trust.approve(&sess.peer_id);
-            }
-            accepted
+            self.wait_for_accept(&id, &sess.peer_id).await
         };
         if !accepted {
             events::transfer(&id, "transfer_cancelled", json!({ "reason": "rejected" }));
@@ -989,6 +1005,14 @@ impl Manager {
         self.finish(&id, outcome);
     }
 }
+
+/// How long an incoming transfer waits for the user to accept/reject before
+/// it's treated as abandoned. Without this bound, a connection that dies (or
+/// a prompt nobody answers) parks the handler on the approval channel
+/// forever: the transfer stays in `active` — counted by the UI/notification —
+/// with no terminal event ever emitted. Long enough that a human answering a
+/// prompt is never rushed; short enough that ghosts don't accumulate.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long to wait for the peer's first progress report before assuming the
 /// peer doesn't support the back-channel and falling back to bytes-sent.
@@ -1268,5 +1292,124 @@ mod tests {
         assert_eq!(after.name, "Renamed Device");
         assert_eq!(after.device_id, before.device_id);
         assert_eq!(after.keypair.public.0, before.keypair.public.0);
+    }
+
+    // ── wait_for_accept: the ghost-transfer leak fix ─────────────
+    //
+    // `handle_incoming` registers the transfer (counted in `active`) *before*
+    // the user decides. These tests exercise `wait_for_accept` directly —
+    // the extracted decision-wait — without a real QUIC handshake, proving
+    // the pending entry never outlives the decision on every exit path:
+    // explicit accept, explicit reject, and (the actual bug) an unanswered
+    // prompt timing out.
+
+    /// Pin a device the way `authenticate()`'s TOFU step would, so
+    /// `trust.approve` (called only on accept) has a pinned record to flip.
+    fn pin(trust: &FsTrust, device: &DeviceId) {
+        trust
+            .record(peerbeam_domain::entity::TrustRecord {
+                device: device.clone(),
+                fingerprint: "test-fingerprint".into(),
+                name: "peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: false,
+            })
+            .expect("pin device");
+    }
+
+    /// Poll `pred` until it's true, yielding between attempts so other tasks
+    /// on the current-thread test runtime get to run. Bounded so a broken
+    /// precondition fails fast instead of hanging the test.
+    async fn wait_until(mut pred: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if pred() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition not met in time");
+    }
+
+    #[tokio::test]
+    async fn wait_for_accept_true_on_explicit_accept_and_approves_trust() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer_id = DeviceId::from("peer-accept");
+        pin(&mgr.trust, &peer_id);
+        let id = "tx-test-accept".to_string();
+
+        let (mgr2, id2, peer2) = (mgr.clone(), id.clone(), peer_id.clone());
+        let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
+
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
+        mgr.accept(&id).expect("accept should find the pending id");
+
+        assert!(waiter.await.expect("task join"), "explicit accept -> true");
+        assert!(
+            !mgr.pending.lock().unwrap().contains_key(&id),
+            "pending entry must be removed after the decision"
+        );
+        assert!(
+            mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
+            "explicit accept records approval for future auto-accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_accept_false_on_explicit_reject_and_leaves_trust_unapproved() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer_id = DeviceId::from("peer-reject");
+        pin(&mgr.trust, &peer_id);
+        let id = "tx-test-reject".to_string();
+
+        let (mgr2, id2, peer2) = (mgr.clone(), id.clone(), peer_id.clone());
+        let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
+
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
+        mgr.reject(&id).expect("reject should find the pending id");
+
+        assert!(
+            !waiter.await.expect("task join"),
+            "explicit reject -> false"
+        );
+        assert!(!mgr.pending.lock().unwrap().contains_key(&id));
+        assert!(
+            !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
+            "a decline must never approve the device"
+        );
+    }
+
+    /// The bug this whole fix is for: nobody ever answers (dead connection,
+    /// ignored prompt). Without the timeout this hangs forever with the
+    /// entry still in `pending` and the transfer still counted as active —
+    /// this test uses a paused virtual clock so it doesn't actually sleep
+    /// 180s to prove that no longer happens.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_accept_times_out_when_unanswered_and_cleans_up() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer_id = DeviceId::from("peer-timeout");
+        pin(&mgr.trust, &peer_id);
+        let id = "tx-test-timeout".to_string();
+
+        let (mgr2, id2, peer2) = (mgr.clone(), id.clone(), peer_id.clone());
+        let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
+
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
+
+        // Nobody calls accept()/reject(); fast-forward the virtual clock
+        // past the bound instead of actually waiting.
+        tokio::time::advance(ACCEPT_TIMEOUT + Duration::from_millis(1)).await;
+
+        assert!(
+            !waiter.await.expect("task join"),
+            "an unanswered prompt must resolve to false, not hang forever"
+        );
+        assert!(
+            !mgr.pending.lock().unwrap().contains_key(&id),
+            "the pending entry must not linger after a timeout"
+        );
+        assert!(
+            !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
+            "a timeout must never approve the device"
+        );
     }
 }
