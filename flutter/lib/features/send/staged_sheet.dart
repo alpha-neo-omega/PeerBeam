@@ -5,6 +5,7 @@ import '../../platform/desktop_files.dart';
 import '../../state/models.dart' show formatBytes;
 import '../../state/staging.dart';
 import '../../widgets/appear.dart';
+import '../../widgets/processing.dart';
 import 'pick_device.dart';
 import 'send_staged.dart';
 import 'send_text.dart';
@@ -30,7 +31,11 @@ Future<void> _pickAndSend(BuildContext context, StagingStore staging) async {
 }
 
 Future<void> _addFiles(BuildContext context, StagingStore staging) async {
-  final picked = await pickFilesToStage();
+  final picked = await withProcessing(
+    context,
+    'Preparing files…',
+    pickFilesToStage,
+  );
   if (picked.isNotEmpty) staging.add(picked);
 }
 

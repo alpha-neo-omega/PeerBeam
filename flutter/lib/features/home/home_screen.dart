@@ -11,6 +11,7 @@ import '../../state/staging.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/brand_mark.dart';
 import '../../widgets/common.dart';
+import '../../widgets/processing.dart';
 import '../../widgets/device_tile.dart';
 import '../qr/qr.dart';
 import '../send/pick_device.dart';
@@ -78,7 +79,11 @@ class HomeScreen extends StatelessWidget {
   /// desktop and Android (file_selector copies picks to app storage there).
   Future<void> _pickFiles(BuildContext context) async {
     final staging = AppScope.of(context).staging;
-    final picked = await pickFilesToStage();
+    final picked = await withProcessing(
+      context,
+      'Preparing files…',
+      pickFilesToStage,
+    );
     if (picked.isEmpty || !context.mounted) return;
     final added = staging.add(picked);
     if (added > 0 && context.mounted) {
@@ -111,7 +116,11 @@ class HomeScreen extends StatelessWidget {
     void snack(String m) => ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(m)));
-    final picked = await pickFilesToStage();
+    final picked = await withProcessing(
+      context,
+      'Preparing files…',
+      pickFilesToStage,
+    );
     if (picked.isEmpty || !context.mounted) return;
     try {
       await scope.transfer.send(target, picked.map((f) => f.path).toList());
