@@ -1,8 +1,20 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:peerbeam/data/history_repository.dart';
+import 'package:peerbeam/data/transfer_repository.dart';
+import 'package:peerbeam/platform/android_integration.dart';
 import 'package:peerbeam/platform/bridge.dart';
 import 'package:peerbeam/platform/notifications.dart';
 import 'package:peerbeam/platform/services.dart';
 import 'package:peerbeam/platform/shared_item.dart';
+import 'package:peerbeam/sdk/events.dart';
+import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/state/staging.dart';
+import 'package:peerbeam/state/stores.dart';
+
+import 'sdk/fake_peerbeam.dart';
+
+/// Flush pending microtasks so stream listeners run.
+Future<void> flush() => Future(() {});
 
 /// Records bridge interactions for assertions.
 class FakeBridge implements PlatformBridge {
@@ -12,6 +24,7 @@ class FakeBridge implements PlatformBridge {
   final List<NotificationContent> shown = [];
   bool exempt = false;
   int exemptionRequests = 0;
+  int notificationPermissionRequests = 0;
 
   @override
   Stream<Map<String, dynamic>> events() => const Stream.empty();
@@ -33,6 +46,9 @@ class FakeBridge implements PlatformBridge {
   Future<void> requestIgnoreBatteryOptimizations() async => exemptionRequests++;
   @override
   Future<void> setMulticastLock(bool enabled) async => multicast = enabled;
+  @override
+  Future<void> requestNotificationPermission() async =>
+      notificationPermissionRequests++;
 }
 
 void main() {
@@ -118,6 +134,19 @@ void main() {
         'Transfer failed',
       );
     });
+
+    test('received includes the peer when known, omits it otherwise', () {
+      final withPeer = TransferNotifications.received('f.bin', 'Bob');
+      expect(withPeer.title, 'Received f.bin');
+      expect(withPeer.body, 'from Bob');
+
+      final withoutPeer = TransferNotifications.received('f.bin', '');
+      expect(withoutPeer.body, '');
+
+      // Same key always yields the same id (stable across calls).
+      expect(withPeer.id, TransferNotifications.idFor('f.bin'));
+      expect(TransferNotifications.idFor('f.bin'), greaterThanOrEqualTo(0));
+    });
   });
 
   group('ForegroundServiceController', () {
@@ -159,6 +188,95 @@ void main() {
       expect(await battery.isExempt(), isTrue);
       await battery.requestExemption();
       expect(bridge.exemptionRequests, 1);
+    });
+  });
+
+  group('requestNotificationPermission', () {
+    test('is invoked through the bridge', () async {
+      final bridge = FakeBridge();
+      await bridge.requestNotificationPermission();
+      expect(bridge.notificationPermissionRequests, 1);
+    });
+  });
+
+  group('AndroidIntegration send notifications', () {
+    HistoryEntry entry(
+      String id, {
+      required String direction,
+      required bool success,
+      String file = 'f.bin',
+    }) => HistoryEntry(
+      id: id,
+      direction: direction,
+      peer: 'Bob',
+      file: file,
+      path: '',
+      bytes: 10,
+      success: success,
+      at: '2026-01-01T00:00:00Z',
+    );
+
+    test('notifies for newly-settled sends only, skipping pre-existing '
+        'history and receives', () async {
+      // Pre-existing history entry from a *previous* app run.
+      final fake = FakePeerBeam()
+        ..historyEntries = [entry('h0', direction: 'sending', success: true)];
+      final bridge = FakeBridge();
+      final integration = AndroidIntegration(
+        bridge: bridge,
+        staging: StagingStore(),
+        transfer: TransferRepository(api: fake),
+        settings: SettingsStore(
+          deviceName: 'd',
+          saveDirectory: '/x',
+          autoAcceptTrusted: false,
+          notifications: true,
+          compression: true,
+        ),
+        history: HistoryRepository(api: fake),
+      );
+
+      await integration.start();
+      await flush(); // let the repo's own initial refresh settle too
+      expect(bridge.notificationPermissionRequests, 1);
+      expect(bridge.shown, isEmpty); // cold-start baseline, not a notify
+
+      // A new send completes successfully.
+      fake.historyEntries = [
+        ...fake.historyEntries,
+        entry('h1', direction: 'sending', success: true, file: 'a.bin'),
+      ];
+      fake.emit(const HistoryUpdated());
+      await flush();
+      expect(bridge.shown.where((n) => n.title == 'Sent'), hasLength(1));
+
+      // A new send fails.
+      fake.historyEntries = [
+        ...fake.historyEntries,
+        entry('h2', direction: 'sending', success: false, file: 'b.bin'),
+      ];
+      fake.emit(const HistoryUpdated());
+      await flush();
+      expect(
+        bridge.shown.where((n) => n.title == 'Transfer failed'),
+        hasLength(1),
+      );
+
+      // A receive completes — handled elsewhere (main.dart); must not
+      // double-notify here.
+      fake.historyEntries = [
+        ...fake.historyEntries,
+        entry('h3', direction: 'receiving', success: true, file: 'c.bin'),
+      ];
+      fake.emit(const HistoryUpdated());
+      await flush();
+      expect(bridge.shown.where((n) => n.title == 'Sent'), hasLength(1));
+      expect(
+        bridge.shown.where((n) => n.title == 'Transfer failed'),
+        hasLength(1),
+      );
+
+      integration.dispose();
     });
   });
 }

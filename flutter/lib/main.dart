@@ -10,6 +10,7 @@ import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
 import 'platform/engine_config.dart';
+import 'platform/notifications.dart';
 import 'platform/saf.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
@@ -39,13 +40,14 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   final _messengerKey = GlobalKey<ScaffoldMessengerState>();
   StreamSubscription<String>? _errSub;
   StreamSubscription<({String path, String peer})>? _clipSub;
-  StreamSubscription<({String path, String name})>? _fileSub;
+  StreamSubscription<({String path, String name, String peer})>? _fileSub;
   StreamSubscription<void>? _shareSub;
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
     staging: _state.staging,
     transfer: _state.transfer,
     settings: _state.settings,
+    history: _state.history,
   );
 
   @override
@@ -128,10 +130,13 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   }
 
   /// On Android, copy a freshly received file into the user's chosen SAF folder
-  /// (so it's visible in Files/Gallery) and drop the engine's private copy.
+  /// (so it's visible in Files/Gallery), drop the engine's private copy, and
+  /// surface a "Received `name`" notification.
   /// No-op off Android, for directories (folder transfers), or when no folder is
   /// chosen yet — the file then stays in app storage.
-  Future<void> _publishReceivedFile(({String path, String name}) f) async {
+  Future<void> _publishReceivedFile(
+    ({String path, String name, String peer}) f,
+  ) async {
     if (!Saf.isSupported) return;
     try {
       final file = File(f.path);
@@ -141,6 +146,11 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
       if (await Saf.save(f.path, f.name)) {
         await file.delete();
       }
+      unawaited(
+        _android.bridge.showNotification(
+          TransferNotifications.received(f.name, f.peer),
+        ),
+      );
     } catch (_) {
       // Leave the file in app storage if the copy fails.
     }

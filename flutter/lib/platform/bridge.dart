@@ -43,6 +43,10 @@ abstract class PlatformBridge {
 
   /// Acquire/release a Wi-Fi multicast lock so mDNS/UDP discovery can receive.
   Future<void> setMulticastLock(bool enabled);
+
+  /// Ask for the POST_NOTIFICATIONS runtime permission (Android 13+; a no-op
+  /// on older Android, where it's granted implicitly, and off Android).
+  Future<void> requestNotificationPermission();
 }
 
 /// Real Android implementation over method/event channels. Every call is a
@@ -108,4 +112,8 @@ class AndroidBridge implements PlatformBridge {
   @override
   Future<void> setMulticastLock(bool enabled) =>
       _invoke('setMulticastLock', {'enabled': enabled});
+
+  @override
+  Future<void> requestNotificationPermission() =>
+      _invoke('requestNotificationPermission');
 }

@@ -1,9 +1,11 @@
 package com.peerbeam.peerbeam
 
+import android.Manifest
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -12,6 +14,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.webkit.MimeTypeMap
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
@@ -34,6 +37,11 @@ class MainActivity : FlutterActivity() {
     // via std::fs to app storage, which the OS hides — SAF makes files visible).
     private val reqPickTree = 4210
     private var pendingPick: MethodChannel.Result? = null
+
+    // Runtime POST_NOTIFICATIONS request (Android 13+). Fire-and-forget: we
+    // don't need the grant result, the OS just silently drops notifications
+    // (see Notifications.show's SecurityException catch) if denied.
+    private val reqPostNotifications = 4211
     private val safPrefs
         get() = getSharedPreferences("peerbeam_saf", Context.MODE_PRIVATE)
 
@@ -117,6 +125,10 @@ class MainActivity : FlutterActivity() {
                 startActivity(request)
                 result.success(null)
             }
+            "requestNotificationPermission" -> {
+                requestNotificationPermission()
+                result.success(null)
+            }
             "setMulticastLock" -> {
                 setMulticast(call.argument<Boolean>("enabled") ?: false)
                 result.success(null)
@@ -138,6 +150,25 @@ class MainActivity : FlutterActivity() {
                 result.success(openInTree(name) || openInDownloads(name))
             }
             else -> result.notImplemented()
+        }
+    }
+
+    /// Ask for POST_NOTIFICATIONS (Android 13+ only; older versions grant it
+    /// implicitly). It's declared in the manifest but the OS still requires an
+    /// explicit runtime request on API 33+, otherwise it defaults to denied and
+    /// every notification silently no-ops.
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                reqPostNotifications,
+            )
         }
     }
 

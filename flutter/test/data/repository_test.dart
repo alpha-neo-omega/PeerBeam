@@ -96,6 +96,29 @@ void main() {
       expect(repo.transfers, isEmpty); // moves out of active
     });
 
+    test('fileReceived carries the path, name, and sending peer', () async {
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+      final received = <({String path, String name, String peer})>[];
+      repo.fileReceived.listen(received.add);
+
+      fake.emit(
+        ev('transfer_queued', 't2', {
+          'peer': 'Alice',
+          'file': 'movie.mkv',
+          'incoming': true,
+        }),
+      );
+      await flush();
+      fake.emit(ev('transfer_completed', 't2', {'path': '/data/movie.mkv'}));
+      await flush();
+
+      expect(received, hasLength(1));
+      expect(received.single.path, '/data/movie.mkv');
+      expect(received.single.name, 'movie.mkv');
+      expect(received.single.peer, 'Alice');
+    });
+
     test('commands delegate to the engine', () async {
       final fake = FakePeerBeam();
       final repo = TransferRepository(api: fake);

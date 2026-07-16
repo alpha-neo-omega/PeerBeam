@@ -67,4 +67,18 @@ class TransferNotifications {
       body: fileName,
     );
   }
+
+  /// A regular (non-clipboard) file finished downloading.
+  static NotificationContent received(String fileName, String peer) {
+    return NotificationContent(
+      id: idFor(fileName),
+      title: 'Received $fileName',
+      body: peer.isNotEmpty ? 'from $peer' : '',
+    );
+  }
+
+  /// Derive a stable-ish, platform-safe notification id from a string key
+  /// (file name or transfer id) — masked to a positive 32-bit value so it
+  /// survives the method-channel round trip into a Kotlin `Int`.
+  static int idFor(String key) => key.hashCode & 0x7fffffff;
 }

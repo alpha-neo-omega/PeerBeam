@@ -34,11 +34,13 @@ class TransferRepository extends ChangeNotifier {
   final StreamController<({String path, String peer})> _clipboards =
       StreamController.broadcast();
 
-  /// A regular file finished downloading: its saved path and file name. Used to
-  /// copy it into the user's chosen folder on platforms (Android) where the
-  /// engine's write location isn't user-visible.
-  Stream<({String path, String name})> get fileReceived => _files.stream;
-  final StreamController<({String path, String name})> _files =
+  /// A regular file finished downloading: its saved path, file name, and the
+  /// sending peer. Used to copy it into the user's chosen folder on platforms
+  /// (Android) where the engine's write location isn't user-visible, and to
+  /// surface a "Received `name`" notification.
+  Stream<({String path, String name, String peer})> get fileReceived =>
+      _files.stream;
+  final StreamController<({String path, String name, String peer})> _files =
       StreamController.broadcast();
 
   /// Matches the wire-name convention the sender uses for clipboard sends.
@@ -112,7 +114,11 @@ class TransferRepository extends ChangeNotifier {
             _clipboards.add((path: e.path!, peer: done.peerName));
           } else {
             // A real received file — offer it for copy into the user's folder.
-            _files.add((path: e.path!, name: done.fileName));
+            _files.add((
+              path: e.path!,
+              name: done.fileName,
+              peer: done.peerName,
+            ));
           }
         }
         _update(id, state: TransferState.completed);
