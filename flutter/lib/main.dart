@@ -129,18 +129,30 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     _openStagedSheet();
   }
 
-  /// On Android, copy a freshly received file into the user's chosen SAF folder
-  /// (so it's visible in Files/Gallery), drop the engine's private copy, and
-  /// surface a "Received `name`" notification.
-  /// No-op off Android, for directories (folder transfers), or when no folder is
-  /// chosen yet — the file then stays in app storage.
+  /// On Android, copy a freshly received file or folder into the user's chosen
+  /// SAF folder (so it's visible in Files/Gallery), drop the engine's private
+  /// copy, and surface a "Received `name`" notification.
+  /// No-op off Android, or when no folder is chosen yet — the item then stays
+  /// in app storage.
   Future<void> _publishReceivedFile(
     ({String path, String name, String peer}) f,
   ) async {
     if (!Saf.isSupported) return;
     try {
+      if (FileSystemEntity.isDirectorySync(f.path)) {
+        // A received folder: publish the whole tree, then drop the local copy.
+        if (await Saf.saveTree(f.path)) {
+          await Directory(f.path).delete(recursive: true);
+        }
+        unawaited(
+          _android.bridge.showNotification(
+            TransferNotifications.received(f.name, f.peer),
+          ),
+        );
+        return;
+      }
       final file = File(f.path);
-      if (FileSystemEntity.isDirectorySync(f.path) || !await file.exists()) {
+      if (!await file.exists()) {
         return;
       }
       if (await Saf.save(f.path, f.name)) {
@@ -152,7 +164,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         ),
       );
     } catch (_) {
-      // Leave the file in app storage if the copy fails.
+      // Leave the item in app storage if the copy fails.
     }
   }
 

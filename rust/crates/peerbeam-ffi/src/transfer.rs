@@ -940,14 +940,21 @@ impl Manager {
             Err(e) => return self.finish_failed(&id, from_domain(e)),
         };
         let is_folder = first.kind == FrameKind::Control;
-        if is_folder {
-            // A folder lands as many files; point history at the save dir.
-            *active.path.lock().unwrap() = Some(self.save_dir());
-        }
         let save_dir = self.save_dir();
+        if is_folder {
+            // A folder lands as many files; default to the save dir until the
+            // real root is known (set below once the receive completes).
+            *active.path.lock().unwrap() = Some(save_dir.clone());
+        }
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
+        // Filled in by the folder branch with the sanitized root name
+        // `receive_folder` actually wrote under `save_dir`, so history/"open"
+        // can point at the folder itself instead of its parent.
+        let folder_root = Arc::new(std::sync::Mutex::new(None::<String>));
 
+        let dest_dir = save_dir.clone();
+        let folder_root_cell = folder_root.clone();
         let outcome = drive(
             id.clone(),
             active.stats.clone(),
@@ -955,11 +962,14 @@ impl Manager {
             |ptx| async move {
                 let mut peek = PeekLink::new(first, &mut secure);
                 let r = if is_folder {
-                    receive_folder(&mut peek, &storage, &save_dir, &ctrl, &ptx)
+                    receive_folder(&mut peek, &storage, &dest_dir, &ctrl, &ptx)
                         .await
-                        .map(|r| r.outcome)
+                        .map(|r| {
+                            *folder_root_cell.lock().unwrap() = Some(r.root);
+                            r.outcome
+                        })
                 } else {
-                    receive_file(&mut peek, &storage, &save_dir, &ctrl, &ptx)
+                    receive_file(&mut peek, &storage, &dest_dir, &ctrl, &ptx)
                         .await
                         .map(|r| r.outcome)
                 };
@@ -970,6 +980,12 @@ impl Manager {
             None,
         )
         .await;
+        if is_folder && matches!(outcome, Ok(TransferOutcome::Completed)) {
+            if let Some(root) = folder_root.lock().unwrap().clone() {
+                *active.path.lock().unwrap() =
+                    Some(format!("{}/{}", save_dir.trim_end_matches('/'), root));
+            }
+        }
         self.finish(&id, outcome);
     }
 }

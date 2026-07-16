@@ -145,6 +145,14 @@ class MainActivity : FlutterActivity() {
                     result.success(saveToTree(path, name) ?: saveToDownloads(path, name))
                 }
             }
+            "safSaveTree" -> {
+                val path = call.argument<String>("path")
+                if (path == null) {
+                    result.error("args", "path required", null)
+                } else {
+                    result.success(saveTree(path))
+                }
+            }
             "safOpen" -> {
                 val name = call.argument<String>("name") ?: ""
                 result.success(openInTree(name) || openInDownloads(name))
@@ -256,8 +264,16 @@ class MainActivity : FlutterActivity() {
         val tree = DocumentFile.fromTreeUri(this, uri) ?: return null
         val src = File(path)
         if (!src.exists()) return null
-        tree.findFile(name)?.delete() // overwrite semantics
-        val doc = tree.createFile(mimeOf(name), name) ?: return null
+        return copyFileIntoDir(tree, name, src)?.uri?.toString()
+    }
+
+    /// Copy local file [src] into SAF directory [dir] as [name] (overwriting a
+    /// same-name file already there). Returns the new document, or null if the
+    /// source is missing or the copy failed.
+    private fun copyFileIntoDir(dir: DocumentFile, name: String, src: File): DocumentFile? {
+        if (!src.exists()) return null
+        dir.findFile(name)?.delete() // overwrite semantics
+        val doc = dir.createFile(mimeOf(name), name) ?: return null
         return try {
             contentResolver.openOutputStream(doc.uri)?.use { out ->
                 src.inputStream().use { it.copyTo(out) }
@@ -265,11 +281,65 @@ class MainActivity : FlutterActivity() {
                 doc.delete()
                 return null
             }
-            doc.uri.toString()
+            doc
         } catch (e: Exception) {
             doc.delete()
             null
         }
+    }
+
+    // ── Recursive folder publish (received folders) ──────────────────
+
+    /// Publish every regular file under local folder [path] into the user's
+    /// destination — the chosen SAF tree if one is set, else public
+    /// Downloads/PeerBeam (API 29+) — preserving the folder's own name and its
+    /// subdirectory structure. Returns true only if every file was published;
+    /// false if nothing is set up (no SAF tree and API < 29) or any file failed
+    /// (best-effort: as many files as possible are still published).
+    private fun saveTree(path: String): Boolean {
+        val root = File(path)
+        if (!root.isDirectory) return false
+        val files = root.walkTopDown().filter { it.isFile }.toList()
+        val treeUri = persistedTree()
+        return when {
+            treeUri != null -> saveTreeToTree(treeUri, root, files)
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> saveTreeToDownloads(root, files)
+            else -> false
+        }
+    }
+
+    /// Publish [files] (all under [root]) into the SAF tree at [treeUri],
+    /// recreating `<root.name>/<subdirs>` beneath it.
+    private fun saveTreeToTree(treeUri: Uri, root: File, files: List<File>): Boolean {
+        val tree = DocumentFile.fromTreeUri(this, treeUri) ?: return false
+        var ok = true
+        for (f in files) {
+            val segments = relativeSegments(root, f)
+            val dir = findOrCreateDirs(tree, listOf(root.name) + segments.dropLast(1))
+            if (dir == null || copyFileIntoDir(dir, segments.last(), f) == null) ok = false
+        }
+        return ok
+    }
+
+    /// [f]'s path components relative to [root] (e.g. `sub/a.txt` under `root`
+    /// yields `["sub", "a.txt"]`; a direct child yields `["a.txt"]`).
+    private fun relativeSegments(root: File, f: File): List<String> =
+        f.relativeTo(root).path.split(File.separatorChar).filter { it.isNotEmpty() }
+
+    /// Find-or-create each directory in [segments] under [start] in order,
+    /// returning the innermost directory, or null if a segment collides with a
+    /// same-name file or can't be created.
+    private fun findOrCreateDirs(start: DocumentFile, segments: List<String>): DocumentFile? {
+        var dir = start
+        for (seg in segments) {
+            val existing = dir.findFile(seg)
+            dir = when {
+                existing != null && existing.isDirectory -> existing
+                existing != null -> return null // a same-name file blocks the dir
+                else -> dir.createDirectory(seg) ?: return null
+            }
+        }
+        return dir
     }
 
     /// Open a previously-saved file from the tree by [name] with a view intent.
@@ -297,15 +367,36 @@ class MainActivity : FlutterActivity() {
     /// Copy [path] into public Downloads/PeerBeam via MediaStore (no runtime
     /// permission), overwriting a same-name entry. Returns the URI, or null when
     /// unsupported (API < 29) / the copy failed.
-    private fun saveToDownloads(path: String, name: String): String? {
+    private fun saveToDownloads(path: String, name: String): String? =
+        saveToDownloadsAt(path, name, "Download/PeerBeam")
+
+    /// Publish [files] (all under [root]) into public Downloads via MediaStore,
+    /// under `Download/PeerBeam/<root.name>/<subdirs>` per file (API 29+ only —
+    /// callers must gate on that).
+    private fun saveTreeToDownloads(root: File, files: List<File>): Boolean {
+        var ok = true
+        for (f in files) {
+            val segments = relativeSegments(root, f)
+            val subdir = (listOf(root.name) + segments.dropLast(1)).joinToString("/")
+            val relativePath = "Download/PeerBeam/$subdir"
+            if (saveToDownloadsAt(f.path, segments.last(), relativePath) == null) ok = false
+        }
+        return ok
+    }
+
+    /// Copy [path] into Downloads at an explicit [relativePath] under
+    /// `Download/…` (e.g. `Download/PeerBeam/myfolder/sub` for a file inside a
+    /// received folder), overwriting a same-name entry already there. Returns
+    /// the URI, or null when unsupported (API < 29) / the copy failed.
+    private fun saveToDownloadsAt(path: String, name: String, relativePath: String): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val src = File(path)
         if (!src.exists()) return null
-        deleteFromDownloads(name) // overwrite semantics
+        deleteFromDownloadsAt(name, relativePath) // overwrite semantics
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.RELATIVE_PATH, "Download/PeerBeam")
+            put(MediaStore.Downloads.RELATIVE_PATH, relativePath)
             put(MediaStore.Downloads.MIME_TYPE, mimeOf(name))
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
@@ -330,12 +421,15 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun downloadsUriByName(name: String): Uri? {
+    private fun downloadsUriByName(name: String): Uri? =
+        downloadsUriByNameAt(name, "Download/PeerBeam")
+
+    private fun downloadsUriByNameAt(name: String, relativePath: String): Uri? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val sel = "${MediaStore.Downloads.RELATIVE_PATH} LIKE ? AND " +
             "${MediaStore.Downloads.DISPLAY_NAME} = ?"
-        val args = arrayOf("%Download/PeerBeam%", name)
+        val args = arrayOf("%$relativePath%", name)
         contentResolver.query(collection, arrayOf(MediaStore.Downloads._ID), sel, args, null)
             ?.use { c ->
                 if (c.moveToFirst()) {
@@ -346,8 +440,10 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
-    private fun deleteFromDownloads(name: String) {
-        downloadsUriByName(name)?.let { contentResolver.delete(it, null, null) }
+    private fun deleteFromDownloads(name: String) = deleteFromDownloadsAt(name, "Download/PeerBeam")
+
+    private fun deleteFromDownloadsAt(name: String, relativePath: String) {
+        downloadsUriByNameAt(name, relativePath)?.let { contentResolver.delete(it, null, null) }
     }
 
     private fun openInDownloads(name: String): Boolean {

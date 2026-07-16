@@ -83,6 +83,20 @@ class Saf {
     }
   }
 
+  /// Recursively copy every file under local folder [path] into the chosen
+  /// destination (SAF tree if set, else public Downloads/PeerBeam),
+  /// preserving the folder's own name and its subdirectory structure. Returns
+  /// true only if every file was published.
+  static Future<bool> saveTree(String path) async {
+    if (!isSupported) return false;
+    try {
+      return (await _ch.invokeMethod<bool>('safSaveTree', {'path': path})) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Open a previously-saved file from the chosen folder by [name]. Returns true
   /// if it was found and an opener was launched.
   static Future<bool> open(String name) async {
