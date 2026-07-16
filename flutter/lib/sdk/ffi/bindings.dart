@@ -165,9 +165,19 @@ class Bindings {
 DynamicLibrary _openLibrary(String? overridePath) {
   if (overridePath != null) return DynamicLibrary.open(overridePath);
   if (Platform.isIOS) return DynamicLibrary.process();
-  final name = Platform.isWindows
-      ? 'peerbeam_ffi.dll'
-      : (Platform.isMacOS ? 'libpeerbeam_ffi.dylib' : 'libpeerbeam_ffi.so');
+  if (Platform.isMacOS) {
+    // macOS `dlopen` of a bare leaf name does NOT search the app bundle's
+    // Frameworks dir (unlike Linux, whose loader searches the executable's
+    // RUNPATH), so resolve the embedded engine explicitly relative to the app
+    // binary: peerbeam.app/Contents/MacOS/peerbeam ->
+    // ../Frameworks/libpeerbeam_ffi.dylib. Fall back to the bare name for
+    // `flutter test`/dev where the dylib sits on the default search path.
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final bundled = '$exeDir/../Frameworks/libpeerbeam_ffi.dylib';
+    if (File(bundled).existsSync()) return DynamicLibrary.open(bundled);
+    return DynamicLibrary.open('libpeerbeam_ffi.dylib');
+  }
+  final name = Platform.isWindows ? 'peerbeam_ffi.dll' : 'libpeerbeam_ffi.so';
   return DynamicLibrary.open(name);
 }
 

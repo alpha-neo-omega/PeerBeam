@@ -133,9 +133,10 @@ jobs:
         with: { name: cli-windows, path: out/* }
 
   # Publish the GitHub Release. Requires the no-secret builds (Linux GUI +
-  # Android + the three CLI jobs); the signed GUI jobs (macOS/Windows DMG/MSIX)
-  # are intentionally NOT attached until their signing secrets exist. Uses the
-  # built-in GITHUB_TOKEN.
+  # Android + the three CLI jobs). Unsigned GUI artifacts (Linux tar/deb, Windows
+  # portable zip, macOS universal DMG) ARE attached; the signed variants
+  # (notarized DMG / signed MSIX) await their signing secrets. Uses the built-in
+  # GITHUB_TOKEN.
   release:
     needs: [linux, windows, android, cli-linux, cli-macos, cli-windows]
     runs-on: ubuntu-latest
@@ -175,6 +176,10 @@ jobs:
           # search at any depth; the basename is unique.
           mapfile -t -O "${#files[@]}" files < <(find artifacts/windows \
             -type f -name '*.zip' 2>/dev/null)
+          # macOS GUI ships as the unsigned/un-notarized universal DMG (runs on
+          # Intel + Apple Silicon); the notarized DMG awaits signing secrets.
+          mapfile -t -O "${#files[@]}" files < <(find artifacts/macos \
+            -maxdepth 1 -type f -name '*.dmg' 2>/dev/null)
           printf 'upload: %s\n' "${files[@]}"
           if ! gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \

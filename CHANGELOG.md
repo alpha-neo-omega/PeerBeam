@@ -6,6 +6,19 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-16 — Beta
+
+See [Release Notes](docs/RELEASE_NOTES_v0.2.4.md).
+
+### Fixed
+- **macOS GUI now launches** — the app loaded the engine
+  (`libpeerbeam_ffi.dylib`) by bare name, which macOS `dlopen` never resolves
+  from an app bundle, and nothing built or embedded the dylib in the `.app`.
+  The engine is now built universal (x86_64 + arm64), embedded in
+  `Contents/Frameworks` with an `@rpath` install id, and loaded by an
+  executable-relative path. One DMG runs on Intel and Apple Silicon. The DMG is
+  attached to the release (unsigned/un-notarized until signing secrets exist).
+
 ## [0.2.3] - 2026-07-16 — Beta
 
 See [Release Notes](docs/RELEASE_NOTES_v0.2.3.md). The stability release: two
