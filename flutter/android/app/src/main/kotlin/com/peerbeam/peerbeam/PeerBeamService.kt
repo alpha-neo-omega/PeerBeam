@@ -65,7 +65,10 @@ class PeerBeamService : Service() {
             true,
             if (active) -1 else null,
             incoming,
-            if (active) frames[0] else null,
+            // Active → first animation frame (the loop cycles the rest). Idle →
+            // a static neutral brand glyph, not a direction arrow (which reads
+            // as activity when nothing is transferring).
+            if (active) frames[0] else R.drawable.ic_stat_peerbeam,
         )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
