@@ -6,6 +6,25 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-16 — Beta
+
+See [Release Notes](docs/RELEASE_NOTES_v0.2.3.md). The stability release: two
+adversarial audits (42 confirmed bugs fixed), an Android storage overhaul,
+cooperative pause, and stacking selection.
+
+### Added
+- **Stacking selection** (LocalSend-style): build one selection from files,
+  folders, text, and clipboard, review/edit it, then send the whole batch to a
+  device in one go. Tapping a device now sends the current selection (empty
+  selection → pick files, as before). A persistent bar on Home shows the count
+  + total with a one-tap Send.
+- **Cooperative pause**: either side pauses and both stop and show paused, with
+  correct speed/ETA after resume.
+- **Explicit Trust button** — accepting a transfer no longer auto-trusts the
+  sender; auto-accept requires explicit approval, not just a pinned key.
+- **Android notifications** for received files and send complete/failed, with an
+  animated-while-transferring status-bar icon and a static idle brand glyph.
+
 ### Fixed
 - **Received transfers show the sender's name, not a raw id** — the auth
   handshake dropped the peer's human name, so History/Transfers read
@@ -21,15 +40,28 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   captured at startup, so a new folder (and the auto-accept toggle) only applied
   after a restart, and History reported a path the file wasn't at. Both now apply
   live to the running engine.
+- **Large files no longer crash the app** — picked and shared files are streamed
+  to cache instead of loaded into memory.
+- **Transfer correctness**: cancel interrupts a parked receive and fires exactly
+  one terminal event; abandoned incoming transfers are time-bounded (no stuck
+  "1 transfer in progress"); a corrupt `.part` heals on checksum failure; folder
+  receive overwrites instead of blind-appending; folder send skips unreadable
+  files; receiver-side pause actually pauses (file + folder) with no lost wakeups.
+- **The device list no longer freezes** under a broadcast-lag burst — the engine
+  emits a resync hint and the app re-pulls the authoritative device list. Offline
+  devices are pruned, DNS is non-blocking, the trust store merges instead of
+  clobbering, config loads missing fields as defaults, init is idempotent, and
+  Tailscale peers are dialable (transfer port stamped on discovery).
+- **CLI**: `chunk_size` clamped (no u32 truncation), `watch` shows all device
+  events, honest daemon hints, `benchmark` cleans up temp files on error.
+- **UI**: stable keys on transfer rows (no backward-animating progress bars),
+  inline validation on the address dialog, leaked text controllers disposed,
+  partial-batch sends report what failed, the Nearby picker only lists reachable
+  devices, Android back returns to the Home tab before exiting, re-shares
+  coalesce into the open sheet, and the brand mark is announced once by screen
+  readers.
 - **Removed the non-functional "Compression" toggle** — it was never wired to the
   transfer path, so it did nothing even after a restart.
-
-### Added
-- **Stacking selection** (LocalSend-style): build one selection from files,
-  folders, text, and clipboard, review/edit it, then send the whole batch to a
-  device in one go. Tapping a device now sends the current selection (empty
-  selection → pick files, as before). A persistent bar on Home shows the count
-  + total with a one-tap Send.
 
 ### Changed
 - In-app logo is a monochrome brand glyph tinted to the app's primary colour at
@@ -40,6 +72,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 - Removed the duplicate "PeerBeam" heading on Home — the nav rail (or, on
   phones, the app bar) carries the brand once. Dropped the example
   name/IP placeholders in the add-device and send-to-address dialogs.
+- Android `versionCode` is now monotonic (time-based), so any build installs
+  over any previous one without a downgrade block.
 
 ## [0.2.2] - 2026-07-15 — Beta
 

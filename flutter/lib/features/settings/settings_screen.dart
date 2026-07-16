@@ -230,7 +230,7 @@ class SettingsScreen extends StatelessWidget {
                   leading: Icon(Icons.info_outline_rounded),
                   title: Text('PeerBeam'),
                   // Keep in sync with pubspec.yaml / workspace version.
-                  subtitle: Text('Version 0.2.2 · AGPL-3.0'),
+                  subtitle: Text('Version 0.2.3 · AGPL-3.0'),
                 ),
               ),
             ],
