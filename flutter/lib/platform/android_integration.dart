@@ -104,6 +104,18 @@ class AndroidIntegration {
   Future<void> _syncService() => service.sync(
     activeTransfers: transfer.activeCount,
     receiving: settings.backgroundReceive,
+    incoming: _hasActiveReceive(),
+  );
+
+  /// Whether any transfer currently occupying the foreground-service
+  /// notification is a receive — selects the download icon over the upload
+  /// one while the service is showing an active-transfer notification.
+  bool _hasActiveReceive() => transfer.transfers.any(
+    (t) =>
+        t.direction == TransferDirection.receiving &&
+        (t.state == TransferState.transferring ||
+            t.state == TransferState.pending ||
+            t.state == TransferState.paused),
   );
 
   /// A backgrounded *sender* gets no other feedback once the transfers screen

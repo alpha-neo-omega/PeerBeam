@@ -3,7 +3,9 @@ package com.peerbeam.peerbeam
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -31,14 +33,31 @@ object Notifications {
         body: String,
         ongoing: Boolean,
         progress: Int?,
+        incoming: Boolean = false,
     ): Notification {
+        // Tapping opens the app. One-shots (complete/failed/received) dismiss
+        // themselves on tap; the ongoing service note stays put.
+        val launch = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val pi = PendingIntent.getActivity(
+            context, 0, launch,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val icon = if (incoming) {
+            android.R.drawable.stat_sys_download
+        } else {
+            android.R.drawable.stat_sys_upload
+        }
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(icon)
             .setContentTitle(title)
             .setContentText(body)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(pi)
+            .setAutoCancel(!ongoing)
         if (progress != null) {
             if (progress < 0) {
                 // Indeterminate: an animated, moving progress bar (used while a

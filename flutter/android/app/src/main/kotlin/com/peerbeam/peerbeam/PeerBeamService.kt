@@ -26,6 +26,7 @@ class PeerBeamService : Service() {
         // indeterminate bar) and hold the CPU awake. Idle receive-ready shows a
         // static notification and holds no CPU wake lock (battery-friendly).
         val active = intent?.getBooleanExtra("active", false) ?: false
+        val incoming = intent?.getBooleanExtra("incoming", false) ?: false
 
         Notifications.ensureChannel(this)
         val notification = Notifications.build(
@@ -34,6 +35,7 @@ class PeerBeamService : Service() {
             body,
             true,
             if (active) -1 else null,
+            incoming,
         )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

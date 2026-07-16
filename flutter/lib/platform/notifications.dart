@@ -42,6 +42,7 @@ class TransferNotifications {
       body: '$percent%',
       ongoing: true,
       progress: percent.clamp(0, 100),
+      incoming: !sending,
     );
   }
 
@@ -74,6 +75,7 @@ class TransferNotifications {
       id: idFor(fileName),
       title: 'Received $fileName',
       body: peer.isNotEmpty ? 'from $peer' : '',
+      incoming: true,
     );
   }
 

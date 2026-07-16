@@ -21,6 +21,7 @@ class FakeBridge implements PlatformBridge {
   int startCount = 0;
   int stopCount = 0;
   bool? lastActive;
+  bool? lastIncoming;
   bool multicast = false;
   final List<NotificationContent> shown = [];
   bool exempt = false;
@@ -36,9 +37,11 @@ class FakeBridge implements PlatformBridge {
     String title,
     String body, {
     bool active = false,
+    bool incoming = false,
   }) async {
     startCount++;
     lastActive = active;
+    lastIncoming = incoming;
   }
   @override
   Future<void> stopForegroundService() async => stopCount++;
@@ -153,6 +156,30 @@ void main() {
       // Same key always yields the same id (stable across calls).
       expect(withPeer.id, TransferNotifications.idFor('f.bin'));
       expect(TransferNotifications.idFor('f.bin'), greaterThanOrEqualTo(0));
+
+      // A received file is always an incoming transfer → download icon.
+      expect(withPeer.incoming, isTrue);
+    });
+
+    test('progress is direction-aware for the small icon', () {
+      expect(
+        TransferNotifications.progress(
+          notificationId: 5,
+          fileName: 'f.bin',
+          percent: 10,
+          sending: true,
+        ).incoming,
+        isFalse,
+      );
+      expect(
+        TransferNotifications.progress(
+          notificationId: 5,
+          fileName: 'f.bin',
+          percent: 10,
+          sending: false,
+        ).incoming,
+        isTrue,
+      );
     });
   });
 
@@ -161,12 +188,12 @@ void main() {
       final bridge = FakeBridge();
       final svc = ForegroundServiceController(bridge);
 
-      await svc.sync(activeTransfers: 0, receiving: false);
+      await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
       expect(svc.running, isFalse);
       expect(bridge.startCount, 0);
 
       // A transfer starts → running, active (wake lock), multicast held.
-      await svc.sync(activeTransfers: 1, receiving: false);
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
       expect(svc.running, isTrue);
       expect(bridge.startCount, 1);
       expect(bridge.lastActive, isTrue);
@@ -174,22 +201,36 @@ void main() {
 
       // More work while running → re-delivered, still active, no re-latched
       // multicast transition.
-      await svc.sync(activeTransfers: 2, receiving: false);
+      await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
       expect(bridge.startCount, 2);
       expect(bridge.lastActive, isTrue);
 
       // Transfers done but receiving on → stays running, now IDLE (no wake
       // lock) rather than stopping.
-      await svc.sync(activeTransfers: 0, receiving: true);
+      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
       expect(svc.running, isTrue);
       expect(bridge.stopCount, 0);
       expect(bridge.lastActive, isFalse);
 
       // Fully idle → stop once, multicast released.
-      await svc.sync(activeTransfers: 0, receiving: false);
+      await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
       expect(svc.running, isFalse);
       expect(bridge.stopCount, 1);
       expect(bridge.multicast, isFalse);
+    });
+
+    test('threads incoming through to the bridge for the direction-aware '
+        'small icon', () async {
+      final bridge = FakeBridge();
+      final svc = ForegroundServiceController(bridge);
+
+      // An active receive → incoming=true reaches the bridge.
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: true);
+      expect(bridge.lastIncoming, isTrue);
+
+      // An active send → incoming=false.
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+      expect(bridge.lastIncoming, isFalse);
     });
   });
 

@@ -91,6 +91,7 @@ class MainActivity : FlutterActivity() {
                     .putExtra("title", call.argument<String>("title"))
                     .putExtra("body", call.argument<String>("body"))
                     .putExtra("active", call.argument<Boolean>("active") ?: false)
+                    .putExtra("incoming", call.argument<Boolean>("incoming") ?: false)
                 ContextCompat.startForegroundService(this, svc)
                 result.success(null)
             }
@@ -106,6 +107,7 @@ class MainActivity : FlutterActivity() {
                     call.argument<String>("body") ?: "",
                     call.argument<Boolean>("ongoing") ?: false,
                     call.argument<Int>("progress"),
+                    call.argument<Boolean>("incoming") ?: false,
                 )
                 Notifications.show(this, call.argument<Int>("id") ?: 0, n)
                 result.success(null)

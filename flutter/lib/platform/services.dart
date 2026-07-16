@@ -17,6 +17,7 @@ class ForegroundServiceController {
   Future<void> sync({
     required int activeTransfers,
     required bool receiving,
+    required bool incoming,
   }) async {
     final shouldRun = activeTransfers > 0 || receiving;
     // "Active" = a transfer is actually moving bytes. Idle receive-ready keeps
@@ -37,7 +38,12 @@ class ForegroundServiceController {
       }
       // (Re)deliver so the service updates its wake lock + notification for the
       // current active/idle state. Idempotent + cheap.
-      await bridge.startForegroundService(note.title, note.body, active: active);
+      await bridge.startForegroundService(
+        note.title,
+        note.body,
+        active: active,
+        incoming: incoming,
+      );
     } else if (_running) {
       _running = false;
       await bridge.setMulticastLock(false);

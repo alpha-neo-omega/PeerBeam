@@ -14,12 +14,17 @@ class NotificationContent {
   /// 0..100 for a determinate progress bar, or null for none.
   final int? progress;
 
+  /// True when this notification concerns an incoming (receive) transfer —
+  /// selects the download small-icon instead of the upload one.
+  final bool incoming;
+
   const NotificationContent({
     required this.id,
     required this.title,
     required this.body,
     this.ongoing = false,
     this.progress,
+    this.incoming = false,
   });
 }
 
@@ -34,11 +39,13 @@ abstract class PlatformBridge {
 
   /// Start/refresh the foreground service. [active] = a transfer is in progress
   /// (drives the CPU wake lock + an animated notification); false = idle
-  /// receive-ready (no wake lock, static notification).
+  /// receive-ready (no wake lock, static notification). [incoming] = at least
+  /// one active transfer is a receive (selects the download small-icon).
   Future<void> startForegroundService(
     String title,
     String body, {
     bool active = false,
+    bool incoming = false,
   });
   Future<void> stopForegroundService();
 
@@ -92,10 +99,12 @@ class AndroidBridge implements PlatformBridge {
     String title,
     String body, {
     bool active = false,
+    bool incoming = false,
   }) => _invoke('startForegroundService', {
     'title': title,
     'body': body,
     'active': active,
+    'incoming': incoming,
   });
 
   @override
@@ -109,6 +118,7 @@ class AndroidBridge implements PlatformBridge {
         'body': c.body,
         'ongoing': c.ongoing,
         'progress': c.progress,
+        'incoming': c.incoming,
       });
 
   @override
