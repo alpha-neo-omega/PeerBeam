@@ -41,6 +41,10 @@ class PeerBeamService : Service() {
     }
 
     private fun acquireLocks() {
+        // onStartCommand (and thus acquireLocks) can fire repeatedly while the
+        // service is already running — release first so locks never stack.
+        releaseLocks()
+
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "peerbeam:wifi")
             .apply {
@@ -50,7 +54,10 @@ class PeerBeamService : Service() {
 
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "peerbeam:transfer")
-            .apply { acquire(6 * 60 * 60 * 1000L) } // safety cap: 6h
+            // Indefinite: lifetime-bounded by the service instead of a fixed
+            // cap — released in releaseLocks()/onDestroy, so a >6h transfer on
+            // a sleeping device no longer stalls when the old 6h cap expired.
+            .apply { acquire() }
     }
 
     private fun releaseLocks() {

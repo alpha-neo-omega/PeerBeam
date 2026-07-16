@@ -506,15 +506,62 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /// Builds the Dart-facing share/view event, resolving every incoming URI to
+    /// a real filesystem path first — the Rust engine opens paths via
+    /// `tokio::fs`, which can't read a `content://` URI directly.
     private fun fileEvent(event: String, uris: List<Uri>): Map<String, Any?> {
         val paths = ArrayList<String>()
         val names = ArrayList<String>()
-        for (uri in uris) {
-            paths.add(uri.toString())
-            names.add(displayName(uri))
+        val sharedDir = prepareSharedDir()
+        uris.forEachIndexed { index, uri ->
+            val name = displayName(uri)
+            val path = resolveToRealPath(uri, sharedDir, name, index)
+            if (path != null) {
+                paths.add(path)
+                names.add(name)
+            }
+            // else: unreadable URI (stream open failed) — skip it rather than
+            // hand Dart a path that doesn't exist.
         }
         return mapOf("event" to event, "paths" to paths, "names" to names)
     }
+
+    /// Resolves [uri] to a path the Rust engine can open with `std`/`tokio::fs`.
+    /// `file://` URIs already are one and are returned as-is (no copy). Every
+    /// other scheme (`content://` from Photos/Files/WhatsApp/Downloads under
+    /// scoped storage, etc.) is materialized into [sharedDir] first — a
+    /// synchronous copy on the UI thread, same as LocalSend does for share-in;
+    /// large shared files will visibly block until the copy completes. Returns
+    /// null if the URI can't be opened at all, so the caller can skip it.
+    private fun resolveToRealPath(uri: Uri, sharedDir: File, name: String, index: Int): String? {
+        if (uri.scheme == "file") return uri.path
+        val safeName = sanitizeFileName(name).ifEmpty { "shared_$index" }
+        val dest = File(sharedDir, safeName)
+        return try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            } ?: return null
+            dest.absolutePath
+        } catch (e: Exception) {
+            dest.delete()
+            null
+        }
+    }
+
+    /// Cache subdirectory that share-in copies are materialized into, cleared
+    /// at the start of every share/view batch so it doesn't grow unbounded
+    /// across repeated shares.
+    private fun prepareSharedDir(): File {
+        val dir = File(cacheDir, "shared")
+        dir.listFiles()?.forEach { it.deleteRecursively() }
+        dir.mkdirs()
+        return dir
+    }
+
+    /// Strips path separators from a display name so it can't escape
+    /// [prepareSharedDir]'s directory or collide with it structurally.
+    private fun sanitizeFileName(name: String): String =
+        name.replace('/', '_').replace('\\', '_').trim()
 
     private fun displayName(uri: Uri): String {
         var name = uri.lastPathSegment ?: "file"
