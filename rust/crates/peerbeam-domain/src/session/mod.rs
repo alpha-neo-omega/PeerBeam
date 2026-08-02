@@ -1,0 +1,24 @@
+//! PeerSession domain foundation.
+//!
+//! The value types, the [`MessageHandler`] port, and the pure negotiation and
+//! state-machine logic for PeerBeam's single peer-communication abstraction
+//! (`Peer → PeerSession → Typed Message → Handler → Engine`). This module is
+//! IO-free and runtime-free per the architectural invariants; the session
+//! *runtime* (driving a `Link`, the registries, keepalive) lives in the transfer
+//! layer, built on these types.
+//!
+//! See `docs/PEERSESSION_SPEC.md` and `docs/MESSAGE_REGISTRY.md`.
+
+mod error;
+mod frame;
+mod handler;
+mod ids;
+mod negotiation;
+mod state;
+
+pub use error::SessionError;
+pub use frame::{MessageFlags, SessionFrame};
+pub use handler::MessageHandler;
+pub use ids::{ChannelId, ChannelType, MessageType, SessionId};
+pub use negotiation::{negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation};
+pub use state::SessionState;

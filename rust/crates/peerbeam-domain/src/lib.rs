@@ -16,5 +16,6 @@ pub mod error;
 pub mod event;
 pub mod id;
 pub mod port;
+pub mod session;
 
 pub use error::{DomainError, Result};

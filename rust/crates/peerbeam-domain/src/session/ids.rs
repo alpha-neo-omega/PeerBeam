@@ -1,0 +1,187 @@
+//! Identifier newtypes for the PeerSession layer.
+//!
+//! These are pure value types with no IO. Random [`SessionId`] generation lives
+//! in the session layer (which owns entropy); the domain stays IO-free per the
+//! architectural invariants.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// A logical session between two trusted devices.
+///
+/// A 128-bit value minted by the session initiator and echoed by the responder.
+/// It is stable across reconnects within one session's lifetime, so a dropped
+/// connection can re-attach rather than starting over (see the session spec).
+/// Generation from entropy is performed by the session layer; the domain only
+/// carries and compares the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionId([u8; 16]);
+
+impl SessionId {
+    /// The all-zero id. Useful as a placeholder and in tests; never a valid
+    /// negotiated session id.
+    pub const NIL: SessionId = SessionId([0u8; 16]);
+
+    /// Construct from raw bytes (e.g. from entropy produced by the session
+    /// layer, or decoded from the wire).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        SessionId(bytes)
+    }
+
+    /// Construct from a `u128` (convenient for deterministic tests).
+    #[must_use]
+    pub const fn from_u128(value: u128) -> Self {
+        SessionId(value.to_be_bytes())
+    }
+
+    /// The raw 16 bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Whether this is the [`NIL`](SessionId::NIL) id.
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0 == [0u8; 16]
+    }
+}
+
+impl fmt::Display for SessionId {
+    /// Lower-case hex, no separators.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A channel within a session. Maps to a transport stream id at the transport
+/// layer; `0` is reserved for the control channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChannelId(u64);
+
+impl ChannelId {
+    /// The reserved control channel that carries session-level messages
+    /// (negotiation, keepalive, shutdown).
+    pub const CONTROL: ChannelId = ChannelId(0);
+
+    /// Construct from a raw stream id.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        ChannelId(id)
+    }
+
+    /// The raw id.
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is the control channel.
+    #[must_use]
+    pub fn is_control(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// The capability a channel carries (registry id). See the message registry for
+/// the range assignments; only [`CONTROL`](ChannelType::CONTROL) and
+/// [`TRANSFER`](ChannelType::TRANSFER) are near-term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChannelType(u16);
+
+impl ChannelType {
+    /// Session's own control protocol.
+    pub const CONTROL: ChannelType = ChannelType(0x0000);
+    /// File/folder transfer (today's transfer, reframed as a channel).
+    pub const TRANSFER: ChannelType = ChannelType(0x0100);
+
+    /// Construct from a raw registry id.
+    #[must_use]
+    pub const fn new(id: u16) -> Self {
+        ChannelType(id)
+    }
+
+    /// The raw registry id.
+    #[must_use]
+    pub const fn get(&self) -> u16 {
+        self.0
+    }
+
+    /// Whether this is the control channel type.
+    #[must_use]
+    pub fn is_control(&self) -> bool {
+        self.0 == 0x0000
+    }
+
+    /// Whether this id is in the first-party capability range (`0x0100..=0x0FFF`).
+    #[must_use]
+    pub fn is_first_party(&self) -> bool {
+        (0x0100..=0x0FFF).contains(&self.0)
+    }
+
+    /// Whether this id is in the plugin range (`0x8000..=0xBFFF`).
+    #[must_use]
+    pub fn is_plugin(&self) -> bool {
+        (0x8000..=0xBFFF).contains(&self.0)
+    }
+}
+
+/// A message kind within a channel's own namespace. Each [`ChannelType`] owns a
+/// separate `MessageType` space starting at `1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MessageType(u16);
+
+impl MessageType {
+    /// Construct from a raw id.
+    #[must_use]
+    pub const fn new(id: u16) -> Self {
+        MessageType(id)
+    }
+
+    /// The raw id.
+    #[must_use]
+    pub const fn get(&self) -> u16 {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_id_hex_display_is_32_chars() {
+        let id = SessionId::from_u128(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        let s = id.to_string();
+        assert_eq!(s.len(), 32);
+        assert_eq!(s, "0123456789abcdef0011223344556677");
+    }
+
+    #[test]
+    fn session_id_nil_roundtrip() {
+        assert!(SessionId::NIL.is_nil());
+        assert!(!SessionId::from_u128(1).is_nil());
+        assert_eq!(SessionId::from_bytes([0u8; 16]), SessionId::NIL);
+    }
+
+    #[test]
+    fn channel_id_control_is_zero() {
+        assert!(ChannelId::CONTROL.is_control());
+        assert_eq!(ChannelId::CONTROL.get(), 0);
+        assert!(!ChannelId::new(1).is_control());
+    }
+
+    #[test]
+    fn channel_type_range_classification() {
+        assert!(ChannelType::CONTROL.is_control());
+        assert!(ChannelType::TRANSFER.is_first_party());
+        assert!(!ChannelType::TRANSFER.is_control());
+        assert!(ChannelType::new(0x8001).is_plugin());
+        assert!(!ChannelType::new(0x0100).is_plugin());
+    }
+}

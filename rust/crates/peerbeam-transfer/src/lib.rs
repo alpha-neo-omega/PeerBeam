@@ -23,6 +23,7 @@ mod peek;
 mod protocol;
 mod recover;
 mod secure;
+mod session;
 mod stream;
 
 pub use auth::{authenticate, Identity, Session};
@@ -33,4 +34,9 @@ pub use peek::PeekLink;
 pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};
 pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
+pub use session::{
+    CloseReason, ControlMessage, DispatchOutcome, Flow, HandlerRegistry, Keepalive,
+    KeepaliveAction, KeepaliveConfig, MessageDispatcher, PeerSession, SessionConfig, SessionEvent,
+    SessionHello, SessionInfo, SessionRegistry, SessionRole,
+};
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};
