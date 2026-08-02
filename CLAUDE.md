@@ -1,3 +1,35 @@
+\# Constitutional Governance
+
+The following documents are **constitutional** — the highest authority in this
+repository:
+
+- `ROADMAP.md`
+- `docs/VISION.md`
+- `docs/FUTURE_ARCHITECTURE.md`
+- `docs/ARCHITECTURAL_INVARIANTS.md`
+
+Derived documents (`docs/FEATURE_CATALOG.md`, `docs/FEATURE_PRIORITIES.md`) may
+evolve freely but must conform to the constitutional set.
+
+Before implementing any feature, milestone, refactor, protocol change, or
+architectural change:
+
+1. Verify compliance with all constitutional documents.
+2. If a conflict exists:
+   - Stop.
+   - Identify the conflicting clause.
+   - Explain the conflict.
+   - Request an explicit constitutional amendment.
+3. Never silently evolve the architecture.
+
+The central architectural abstraction is `Peer → PeerSession → Typed Message →
+Handler → Engine`. No feature may bypass PeerSession. Decision rules
+(Constitutional Preservation, Simplicity First, Verification Over Assumption) and
+the twelve architectural invariants are defined in
+`docs/ARCHITECTURAL_INVARIANTS.md`.
+
+
+
 \# ROLE
 
 

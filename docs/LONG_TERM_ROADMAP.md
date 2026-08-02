@@ -1,5 +1,11 @@
 # Long-Term Roadmap
 
+> **HISTORICAL — superseded by [ROADMAP.md](../ROADMAP.md).** Preserved for
+> context; nothing here is removed. The canonical roadmap and the constitutional
+> documents ([VISION](VISION.md) · [FUTURE_ARCHITECTURE](FUTURE_ARCHITECTURE.md) ·
+> [ARCHITECTURAL_INVARIANTS](ARCHITECTURAL_INVARIANTS.md)) govern; where this file
+> conflicts with them, they win.
+
 Where PeerBeam goes after the 1.0 line, evaluated as if it were a major public
 open-source project. Priorities are ordered by leverage: unblock the Stable
 claim first, then durability, then reach.

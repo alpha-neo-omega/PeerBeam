@@ -1,5 +1,11 @@
 # PeerBeam — Feature Roadmap
 
+> **HISTORICAL — superseded by [ROADMAP.md](../ROADMAP.md).** Preserved for
+> context; nothing here is removed. The canonical roadmap and the constitutional
+> documents ([VISION](VISION.md) · [FUTURE_ARCHITECTURE](FUTURE_ARCHITECTURE.md) ·
+> [ARCHITECTURAL_INVARIANTS](ARCHITECTURAL_INVARIANTS.md)) govern; where this file
+> conflicts with them, they win.
+
 Future work, ranked by value × fit-with-mission. Grounded in the current
 codebase (QUIC transport, LAN + mDNS + Tailscale discovery, TOFU trust,
 file/folder/clipboard transfer, resume infra in
