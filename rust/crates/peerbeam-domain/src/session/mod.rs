@@ -9,6 +9,7 @@
 //!
 //! See `docs/PEERSESSION_SPEC.md` and `docs/MESSAGE_REGISTRY.md`.
 
+mod channel_state;
 mod error;
 mod frame;
 mod handler;
@@ -16,6 +17,7 @@ mod ids;
 mod negotiation;
 mod state;
 
+pub use channel_state::ChannelState;
 pub use error::SessionError;
 pub use frame::{MessageFlags, SessionFrame};
 pub use handler::MessageHandler;

@@ -21,9 +21,11 @@
 //! # Ok(()) }
 //! ```
 
+mod channels;
 mod link;
 mod tls;
 
+pub use channels::QuicChannels;
 pub use link::QuicLink;
 
 use std::net::{IpAddr, SocketAddr};
@@ -117,10 +119,7 @@ impl QuicTransport {
         &self,
         addr: SocketAddr,
     ) -> Result<(SocketAddr, BoxStream<'static, Result<Box<dyn Link>>>)> {
-        let mut server_config = tls::server_config()?;
-        server_config.transport = transport_config();
-        let endpoint = quinn::Endpoint::server(server_config, addr).map_err(conn_err)?;
-        let local = endpoint.local_addr().map_err(conn_err)?;
+        let (endpoint, local) = server_endpoint(addr)?;
         tracing::info!(%local, "quic serving");
 
         let stream = futures::stream::unfold(endpoint, |ep| async move {
@@ -140,6 +139,62 @@ impl QuicTransport {
         });
         Ok((local, Box::pin(stream)))
     }
+
+    /// Connect to `route`, returning the raw QUIC connection (bounded handshake).
+    async fn connect(&self, route: &Route, session: &TransferSession) -> Result<quinn::Connection> {
+        let addr = resolve_addr(&route.address, route.port).await?;
+        tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
+        let connecting = self.client.connect(addr, SERVER_NAME).map_err(conn_err)?;
+        tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| conn_err("connect timed out — peer unreachable"))?
+            .map_err(conn_err)
+    }
+
+    /// Dial `route` and present the connection as a multi-channel transport
+    /// (each channel is a QUIC bidirectional stream).
+    pub async fn dial_channels(
+        &self,
+        route: &Route,
+        session: &TransferSession,
+    ) -> Result<QuicChannels> {
+        Ok(QuicChannels::new(self.connect(route, session).await?))
+    }
+
+    /// Serve on `addr`, yielding each inbound connection as a multi-channel
+    /// transport, plus the bound local address.
+    pub async fn serve_channels_on(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(SocketAddr, BoxStream<'static, Result<QuicChannels>>)> {
+        let (endpoint, local) = server_endpoint(addr)?;
+        tracing::info!(%local, "quic serving (channels)");
+
+        let stream = futures::stream::unfold(endpoint, |ep| async move {
+            loop {
+                match ep.accept().await {
+                    Some(incoming) => match incoming.await {
+                        Ok(conn) => return Some((Ok(QuicChannels::new(conn)), ep)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "quic inbound connection rejected");
+                            continue;
+                        }
+                    },
+                    None => return None,
+                }
+            }
+        });
+        Ok((local, Box::pin(stream)))
+    }
+}
+
+/// Build a server endpoint bound to `addr`, returning it and its local address.
+fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, SocketAddr)> {
+    let mut server_config = tls::server_config()?;
+    server_config.transport = transport_config();
+    let endpoint = quinn::Endpoint::server(server_config, addr).map_err(conn_err)?;
+    let local = endpoint.local_addr().map_err(conn_err)?;
+    Ok((endpoint, local))
 }
 
 #[async_trait]
@@ -153,20 +208,13 @@ impl TransferProvider for QuicTransport {
     }
 
     async fn dial(&self, route: &Route, session: &TransferSession) -> Result<Box<dyn Link>> {
-        let addr = resolve_addr(&route.address, route.port).await?;
-        tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
-
         // Bound the handshake: an unreachable peer must fail fast (the user is
         // watching), not after the 30s idle timeout.
-        let connecting = self.client.connect(addr, SERVER_NAME).map_err(conn_err)?;
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-            .await
-            .map_err(|_| conn_err("connect timed out — peer unreachable"))?
-            .map_err(conn_err)?;
+        let conn = self.connect(route, session).await?;
         // Client opens the bidirectional stream; it materialises on the server
         // once the first frame (transfer Meta) is written by the engine.
         let (send, recv) = conn.open_bi().await.map_err(conn_err)?;
-        tracing::debug!(%addr, "quic link established (outbound)");
+        tracing::debug!(remote = %conn.remote_address(), "quic link established (outbound)");
         Ok(Box::new(QuicLink::new(conn, send, recv)))
     }
 

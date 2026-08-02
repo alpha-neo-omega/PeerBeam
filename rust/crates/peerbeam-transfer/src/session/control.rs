@@ -9,22 +9,37 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use peerbeam_domain::session::{
-    CapabilitySet, ChannelId, MessageFlags, MessageType, SessionError, SessionFrame, SessionId,
-    Version,
+    CapabilitySet, ChannelId, ChannelType, MessageFlags, MessageType, SessionError, SessionFrame,
+    SessionId, Version,
 };
 
-/// Control message type ids (within the control channel's namespace).
+/// Control message type ids (within the control channel's namespace). Ids follow
+/// the message registry; unassigned numbers are reserved.
 pub mod id {
     /// Version + capability announcement.
     pub const HELLO: u16 = 1;
+    /// Request to open a data channel `{channel, channel_type}`.
+    pub const CHANNEL_OPEN: u16 = 2;
+    /// Accept a channel open `{channel}`.
+    pub const CHANNEL_ACCEPT: u16 = 3;
+    /// Reject a channel open `{channel, reason}`.
+    pub const CHANNEL_REJECT: u16 = 4;
+    /// Request to close a channel `{channel}`.
+    pub const CHANNEL_CLOSE: u16 = 5;
     /// Keepalive request.
     pub const PING: u16 = 6;
     /// Keepalive reply.
     pub const PONG: u16 = 7;
-    /// Graceful teardown.
+    /// Graceful whole-session teardown.
     pub const SHUTDOWN: u16 = 8;
     /// "I do not understand message type N."
     pub const UNSUPPORTED: u16 = 11;
+    /// Acknowledge a channel close `{channel}`.
+    pub const CHANNEL_CLOSED: u16 = 13;
+    /// A session-level protocol violation `{detail}`.
+    pub const PROTOCOL_ERROR: u16 = 14;
+    /// A channel-scoped error `{channel, detail}`.
+    pub const CHANNEL_ERROR: u16 = 15;
 }
 
 /// The body of a [`ControlMessage::Hello`].
@@ -51,6 +66,44 @@ pub enum ControlMessage {
     Shutdown(String),
     /// Notice that a received message type was not understood.
     Unsupported(u16),
+    /// Peer requests opening a data channel of the given type.
+    ChannelOpen {
+        /// The channel id (allocated by the opener).
+        channel: ChannelId,
+        /// The capability the channel will carry.
+        channel_type: ChannelType,
+    },
+    /// Peer accepted a channel open.
+    ChannelAccept {
+        /// The accepted channel id.
+        channel: ChannelId,
+    },
+    /// Peer refused a channel open.
+    ChannelReject {
+        /// The refused channel id.
+        channel: ChannelId,
+        /// Why it was refused.
+        reason: String,
+    },
+    /// Peer requests closing a channel.
+    ChannelClose {
+        /// The channel to close.
+        channel: ChannelId,
+    },
+    /// Peer confirms a channel is closed.
+    ChannelClosed {
+        /// The closed channel.
+        channel: ChannelId,
+    },
+    /// A session-level protocol violation (fatal for the session).
+    ProtocolError(String),
+    /// A channel-scoped error (fatal only for that channel).
+    ChannelError {
+        /// The affected channel.
+        channel: ChannelId,
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 impl ControlMessage {
@@ -63,6 +116,13 @@ impl ControlMessage {
             ControlMessage::Pong(_) => id::PONG,
             ControlMessage::Shutdown(_) => id::SHUTDOWN,
             ControlMessage::Unsupported(_) => id::UNSUPPORTED,
+            ControlMessage::ChannelOpen { .. } => id::CHANNEL_OPEN,
+            ControlMessage::ChannelAccept { .. } => id::CHANNEL_ACCEPT,
+            ControlMessage::ChannelReject { .. } => id::CHANNEL_REJECT,
+            ControlMessage::ChannelClose { .. } => id::CHANNEL_CLOSE,
+            ControlMessage::ChannelClosed { .. } => id::CHANNEL_CLOSED,
+            ControlMessage::ProtocolError(_) => id::PROTOCOL_ERROR,
+            ControlMessage::ChannelError { .. } => id::CHANNEL_ERROR,
         })
     }
 
@@ -73,6 +133,16 @@ impl ControlMessage {
             ControlMessage::Ping(nonce) | ControlMessage::Pong(nonce) => encode(nonce)?,
             ControlMessage::Shutdown(reason) => encode(reason)?,
             ControlMessage::Unsupported(mt) => encode(mt)?,
+            ControlMessage::ChannelOpen {
+                channel,
+                channel_type,
+            } => encode(&(channel, channel_type))?,
+            ControlMessage::ChannelAccept { channel }
+            | ControlMessage::ChannelClose { channel }
+            | ControlMessage::ChannelClosed { channel } => encode(channel)?,
+            ControlMessage::ChannelReject { channel, reason } => encode(&(channel, reason))?,
+            ControlMessage::ProtocolError(detail) => encode(detail)?,
+            ControlMessage::ChannelError { channel, detail } => encode(&(channel, detail))?,
         };
         Ok(SessionFrame::new(
             ChannelId::CONTROL,
@@ -92,6 +162,31 @@ impl ControlMessage {
             id::PONG => Ok(ControlMessage::Pong(decode(&frame.payload)?)),
             id::SHUTDOWN => Ok(ControlMessage::Shutdown(decode(&frame.payload)?)),
             id::UNSUPPORTED => Ok(ControlMessage::Unsupported(decode(&frame.payload)?)),
+            id::CHANNEL_OPEN => {
+                let (channel, channel_type) = decode(&frame.payload)?;
+                Ok(ControlMessage::ChannelOpen {
+                    channel,
+                    channel_type,
+                })
+            }
+            id::CHANNEL_ACCEPT => Ok(ControlMessage::ChannelAccept {
+                channel: decode(&frame.payload)?,
+            }),
+            id::CHANNEL_REJECT => {
+                let (channel, reason) = decode(&frame.payload)?;
+                Ok(ControlMessage::ChannelReject { channel, reason })
+            }
+            id::CHANNEL_CLOSE => Ok(ControlMessage::ChannelClose {
+                channel: decode(&frame.payload)?,
+            }),
+            id::CHANNEL_CLOSED => Ok(ControlMessage::ChannelClosed {
+                channel: decode(&frame.payload)?,
+            }),
+            id::PROTOCOL_ERROR => Ok(ControlMessage::ProtocolError(decode(&frame.payload)?)),
+            id::CHANNEL_ERROR => {
+                let (channel, detail) = decode(&frame.payload)?;
+                Ok(ControlMessage::ChannelError { channel, detail })
+            }
             other => Err(SessionError::FrameDecode(format!(
                 "unknown control message type {other}"
             ))),

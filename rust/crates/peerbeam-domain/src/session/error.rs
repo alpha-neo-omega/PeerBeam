@@ -57,6 +57,11 @@ pub enum SessionError {
     /// A control payload could not be (de)serialized.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// A channel-layer error (capability not negotiated, channel limit reached,
+    /// unknown channel, …).
+    #[error("channel error: {0}")]
+    Channel(String),
 }
 
 impl From<DomainError> for SessionError {

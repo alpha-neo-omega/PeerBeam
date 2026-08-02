@@ -5,6 +5,7 @@
 //! a concrete implementation. This is the seam that makes the engine
 //! plugin-driven and testable with mocks.
 
+mod channel;
 mod clipboard;
 mod compression;
 mod discovery;
@@ -16,6 +17,7 @@ mod storage;
 mod transfer;
 mod trust;
 
+pub use channel::ChannelTransport;
 pub use clipboard::ClipboardProvider;
 pub use compression::CompressionProvider;
 pub use discovery::{DiscoveryCaps, DiscoveryEvent, DiscoveryProvider};

@@ -59,3 +59,48 @@ pub fn drain(rx: &mut mpsc::UnboundedReceiver<Progress>) -> Vec<Progress> {
     }
     out
 }
+
+/// An in-memory `ChannelTransport`: opening a stream hands the peer a connected
+/// [`MemLink`] end and returns the local end; accepting yields the streams the
+/// peer opened, in order (FIFO).
+pub struct MemTransport {
+    peer_accept: mpsc::UnboundedSender<Box<dyn Link>>,
+    my_accept: tokio::sync::Mutex<mpsc::UnboundedReceiver<Box<dyn Link>>>,
+}
+
+impl MemTransport {
+    /// A connected pair of transports.
+    pub fn pair() -> (std::sync::Arc<MemTransport>, std::sync::Arc<MemTransport>) {
+        let (a_to_b, b_recv) = mpsc::unbounded_channel();
+        let (b_to_a, a_recv) = mpsc::unbounded_channel();
+        let a = std::sync::Arc::new(MemTransport {
+            peer_accept: a_to_b,
+            my_accept: tokio::sync::Mutex::new(a_recv),
+        });
+        let b = std::sync::Arc::new(MemTransport {
+            peer_accept: b_to_a,
+            my_accept: tokio::sync::Mutex::new(b_recv),
+        });
+        (a, b)
+    }
+}
+
+#[async_trait]
+impl peerbeam_domain::port::ChannelTransport for MemTransport {
+    async fn open_stream(&self) -> Result<Box<dyn Link>> {
+        let (mine, theirs) = MemLink::pair(32);
+        self.peer_accept
+            .send(Box::new(theirs))
+            .map_err(|_| DomainError::Connection("peer transport closed".into()))?;
+        Ok(Box::new(mine))
+    }
+
+    async fn accept_stream(&self) -> Result<Option<Box<dyn Link>>> {
+        let mut rx = self.my_accept.lock().await;
+        Ok(rx.recv().await)
+    }
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+}

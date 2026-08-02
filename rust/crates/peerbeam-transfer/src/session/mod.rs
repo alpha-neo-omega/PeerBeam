@@ -1,52 +1,60 @@
-//! PeerSession runtime: the session skeleton built on the domain session types.
+//! PeerSession runtime: an authenticated session multiplexing N channels.
 //!
-//! A [`PeerSession`] drives a single authenticated, secured [`Link`] as the
-//! control channel: it exchanges [`SessionHello`], negotiates version and
-//! capabilities, tracks lifecycle state, dispatches inbound frames, and closes
-//! cleanly. Multiplexed data channels, per-channel keys, reconnect, and resume
-//! are later milestones and are intentionally absent here.
+//! A [`PeerSession`] owns one authenticated, secured connection
+//! ([`ChannelTransport`]) and drives it: it takes the first stream as the
+//! **control channel**, exchanges [`SessionHello`], negotiates version and
+//! capabilities, then runs a single pump that routes control messages, accepts
+//! inbound data streams, and coordinates the [`ChannelManager`]. Each data
+//! channel is an independent stream with its own actor, ordering, flow control,
+//! and lifecycle — one channel's failure never touches another.
 //!
-//! PeerSession assumes the [`Link`] it is given is already authenticated and
-//! sealed (see [`crate::authenticate`] and [`crate::SecureLink`]); it does not
-//! re-implement the handshake — one responsibility per component.
+//! Per-channel encryption keys, transfer migration, reconnect, and resume are
+//! later milestones and are intentionally absent. PeerSession assumes the
+//! transport's streams are already authenticated and sealed (see
+//! [`crate::authenticate`] and [`crate::SecureLink`]).
 
+mod channel;
+mod channel_manager;
 mod control;
 mod event;
 mod registry;
 
+pub use channel::{ChannelEvent, ChannelInfo, ChannelStats};
+pub use channel_manager::ChannelManager;
 pub use control::{ControlMessage, SessionHello};
 pub use event::{
     CloseReason, Keepalive, KeepaliveAction, KeepaliveConfig, SessionEvent, SessionRole,
 };
-pub use registry::{
-    DispatchOutcome, HandlerRegistry, MessageDispatcher, SessionInfo, SessionRegistry,
-};
+pub use registry::{HandlerRegistry, SessionInfo, SessionRegistry};
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::port::{Frame, FrameKind, Link};
+use peerbeam_domain::port::{ChannelTransport, Frame, FrameKind, Link};
 use peerbeam_domain::session::{
-    negotiate_version, Capability, CapabilitySet, ChannelType, MessageHandler, SessionError,
-    SessionFrame, SessionId, SessionState, Version, VersionNegotiation,
+    negotiate_version, Capability, CapabilitySet, ChannelId, ChannelType, MessageFlags,
+    MessageType, SessionError, SessionFrame, SessionId, SessionState, Version, VersionNegotiation,
 };
 
-/// Whether the dispatch loop should continue or the session has closed.
+use channel::ActorEvent;
+
+/// Whether the pump should continue or the session has closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flow {
-    /// Keep processing frames.
+enum Flow {
     Continue,
-    /// The session is closed; stop.
     Closed,
 }
 
 /// Parameters for opening a session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionConfig {
     /// The protocol version this side speaks.
     pub version: Version,
@@ -54,11 +62,16 @@ pub struct SessionConfig {
     pub capabilities: CapabilitySet,
     /// Keepalive / idle-timeout tuning.
     pub keepalive: KeepaliveConfig,
+    /// Handlers for data-channel capabilities.
+    pub handlers: HandlerRegistry,
+    /// Maximum concurrently-open data channels.
+    pub channel_limit: usize,
 }
 
 impl SessionConfig {
     /// A config advertising `capabilities` at the current protocol version with
-    /// default keepalive tuning. The control capability is always included.
+    /// default keepalive and no handlers. The control capability is always
+    /// included.
     #[must_use]
     pub fn new(capabilities: CapabilitySet) -> Self {
         let mut caps = capabilities;
@@ -67,17 +80,127 @@ impl SessionConfig {
             version: Version::CURRENT,
             capabilities: caps,
             keepalive: KeepaliveConfig::default(),
+            handlers: HandlerRegistry::new(),
+            channel_limit: channel_manager::DEFAULT_CHANNEL_LIMIT,
         }
     }
-}
 
-impl Default for SessionConfig {
-    fn default() -> Self {
-        SessionConfig::new(CapabilitySet::new())
+    /// Set the data-channel handlers.
+    #[must_use]
+    pub fn with_handlers(mut self, handlers: HandlerRegistry) -> Self {
+        self.handlers = handlers;
+        self
+    }
+
+    /// Set the maximum number of concurrently-open data channels.
+    #[must_use]
+    pub fn with_channel_limit(mut self, limit: usize) -> Self {
+        self.channel_limit = limit;
+        self
     }
 }
 
-/// A live session with one trusted peer over the control channel.
+/// A command sent to a running session's pump via its [`SessionHandle`].
+enum SessionCommand {
+    OpenChannel {
+        channel_type: ChannelType,
+        reply: oneshot::Sender<Result<ChannelId, SessionError>>,
+    },
+    SendOnChannel {
+        channel: ChannelId,
+        message_type: MessageType,
+        flags: MessageFlags,
+        payload: Bytes,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    CloseChannel {
+        channel: ChannelId,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Vec<ChannelInfo>>,
+    },
+    Ping,
+    Close,
+}
+
+/// A cloneable handle for controlling a session while its [`run`](PeerSession::run)
+/// pump owns the session object.
+#[derive(Clone)]
+pub struct SessionHandle {
+    commands: UnboundedSender<SessionCommand>,
+}
+
+impl SessionHandle {
+    /// Open a data channel of `channel_type`; resolves to its id once the peer
+    /// accepts the open request has been sent (the channel becomes `Open` on the
+    /// peer's accept, observable via [`ChannelEvent::Opened`]).
+    pub async fn open_channel(&self, channel_type: ChannelType) -> Result<ChannelId, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::OpenChannel {
+                channel_type,
+                reply,
+            })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    /// Send an application frame on an open channel.
+    pub async fn send_on_channel(
+        &self,
+        channel: ChannelId,
+        message_type: MessageType,
+        flags: MessageFlags,
+        payload: Bytes,
+    ) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SendOnChannel {
+                channel,
+                message_type,
+                flags,
+                payload,
+                reply,
+            })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    /// Close a channel (best-effort).
+    pub fn close_channel(&self, channel: ChannelId) {
+        let _ = self.commands.send(SessionCommand::CloseChannel { channel });
+    }
+
+    /// Send a keepalive ping; the peer replies with a pong (best-effort).
+    pub fn ping(&self) {
+        let _ = self.commands.send(SessionCommand::Ping);
+    }
+
+    /// A snapshot of every live channel's metadata and statistics.
+    pub async fn channels(&self) -> Result<Vec<ChannelInfo>, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::Snapshot { reply })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Close the whole session (best-effort).
+    pub fn close(&self) {
+        let _ = self.commands.send(SessionCommand::Close);
+    }
+}
+
+/// Owned value produced by one pump wake-up, so the `select!` borrows end before
+/// the session is mutated.
+enum Wake {
+    Control(Result<Option<SessionFrame>, SessionError>),
+    Accept(Result<Option<Box<dyn Link>>, SessionError>),
+    Actor(Option<ActorEvent>),
+    Command(Option<SessionCommand>),
+}
+
+/// A live multiplexed session with one trusted peer.
 pub struct PeerSession {
     id: SessionId,
     role: SessionRole,
@@ -85,30 +208,45 @@ pub struct PeerSession {
     state: SessionState,
     version: Version,
     capabilities: CapabilitySet,
-    link: Box<dyn Link>,
-    dispatcher: MessageDispatcher,
+    control: Box<dyn Link>,
+    manager: ChannelManager,
     events: UnboundedSender<SessionEvent>,
     keepalive: Keepalive,
     registry: Option<SessionRegistry>,
+    control_out: VecDeque<ControlMessage>,
+    commands_tx: UnboundedSender<SessionCommand>,
+    commands_rx: UnboundedReceiver<SessionCommand>,
+    actor_events_rx: UnboundedReceiver<ActorEvent>,
+    accepting: bool,
     ping_nonce: u64,
 }
 
 impl PeerSession {
-    /// Open a session over an already-authenticated, secured `link`.
+    /// Open a session over an authenticated, secured `transport`.
     ///
-    /// The initiator mints the [`SessionId`]; the responder adopts it. Both sides
-    /// exchange [`SessionHello`], then version and capabilities are negotiated.
-    /// Returns an `Active` session, or an error if the versions are incompatible
-    /// or the peer misbehaves during negotiation.
+    /// Takes the first stream as the control channel, exchanges [`SessionHello`]
+    /// (initiator mints the id, responder adopts it), then negotiates version and
+    /// capabilities. `channel_events` receives per-channel lifecycle events.
     pub async fn open(
-        mut link: Box<dyn Link>,
+        transport: Arc<dyn ChannelTransport>,
         role: SessionRole,
         peer: DeviceId,
         config: SessionConfig,
         events: UnboundedSender<SessionEvent>,
+        channel_events: UnboundedSender<ChannelEvent>,
         registry: Option<SessionRegistry>,
     ) -> Result<PeerSession, SessionError> {
         let now = Instant::now();
+
+        // The control channel is the first stream: the initiator opens it, the
+        // responder accepts it (before any data streams).
+        let mut control: Box<dyn Link> = match role {
+            SessionRole::Initiator => transport.open_stream().await?,
+            SessionRole::Responder => transport.accept_stream().await?.ok_or_else(|| {
+                SessionError::Link("transport closed before control stream".into())
+            })?,
+        };
+
         let our_hello = |session_id| {
             ControlMessage::Hello(SessionHello {
                 version: config.version,
@@ -116,26 +254,20 @@ impl PeerSession {
                 session_id,
             })
         };
-
-        // Exchange Hellos. The initiator speaks first (mints the id); the
-        // responder listens first (adopts it), so a duplex link never deadlocks.
         let (session_id, peer_hello) = match role {
             SessionRole::Initiator => {
                 let id = random_session_id();
-                send_control(link.as_mut(), &our_hello(id)).await?;
-                let peer_hello = recv_hello(link.as_mut()).await?;
-                (id, peer_hello)
+                send_control(control.as_mut(), &our_hello(id)).await?;
+                (id, recv_hello(control.as_mut()).await?)
             }
             SessionRole::Responder => {
-                let peer_hello = recv_hello(link.as_mut()).await?;
+                let peer_hello = recv_hello(control.as_mut()).await?;
                 let id = peer_hello.session_id;
-                send_control(link.as_mut(), &our_hello(id)).await?;
+                send_control(control.as_mut(), &our_hello(id)).await?;
                 (id, peer_hello)
             }
         };
 
-        // Negotiate version (fatal if the majors differ) and intersect
-        // capabilities (behaviour is chosen by what both advertise).
         let version = match negotiate_version(config.version, peer_hello.version) {
             VersionNegotiation::Agreed(v) => v,
             VersionNegotiation::Incompatible { local, peer } => {
@@ -144,6 +276,18 @@ impl PeerSession {
         };
         let capabilities = config.capabilities.intersect(&peer_hello.capabilities);
 
+        let (actor_events_tx, actor_events_rx) = unbounded_channel();
+        let (commands_tx, commands_rx) = unbounded_channel();
+        let manager = ChannelManager::new(
+            transport,
+            role,
+            config.handlers,
+            capabilities.clone(),
+            config.channel_limit,
+            channel_events,
+            actor_events_tx,
+        );
+
         let session = PeerSession {
             id: session_id,
             role,
@@ -151,11 +295,16 @@ impl PeerSession {
             state: SessionState::Active,
             version,
             capabilities: capabilities.clone(),
-            link,
-            dispatcher: MessageDispatcher::new(),
+            control,
+            manager,
             events,
             keepalive: Keepalive::new(config.keepalive, now),
             registry,
+            control_out: VecDeque::new(),
+            commands_tx,
+            commands_rx,
+            actor_events_rx,
+            accepting: true,
             ping_nonce: 0,
         };
 
@@ -175,6 +324,15 @@ impl PeerSession {
             capabilities,
         });
         Ok(session)
+    }
+
+    /// A cloneable handle to control this session while [`run`](PeerSession::run)
+    /// owns it.
+    #[must_use]
+    pub fn handle(&self) -> SessionHandle {
+        SessionHandle {
+            commands: self.commands_tx.clone(),
+        }
     }
 
     /// The session id.
@@ -207,151 +365,228 @@ impl PeerSession {
         self.version
     }
 
-    /// The negotiated capabilities (the intersection of both sides').
+    /// The negotiated capabilities.
     #[must_use]
     pub fn capabilities(&self) -> &CapabilitySet {
         &self.capabilities
     }
 
-    /// Register a capability handler for a data channel type. Data channels are
-    /// opened in a later milestone; this is the registration seam.
-    pub fn register_handler(&mut self, handler: Arc<dyn MessageHandler>) {
-        self.dispatcher.register(handler);
+    /// Number of live data channels.
+    #[must_use]
+    pub fn channel_count(&self) -> usize {
+        self.manager.channel_count()
     }
 
-    /// Ask the keepalive scheduler what is due at `now` (read-only). The owner's
-    /// event loop calls this on a timer and acts on the result via
-    /// [`send_ping`](PeerSession::send_ping) / [`close`](PeerSession::close).
+    /// The keepalive action due at `now` (read-only).
     #[must_use]
     pub fn poll_keepalive(&self, now: Instant) -> KeepaliveAction {
         self.keepalive.due(now)
     }
 
-    /// Send a keepalive `Ping` and record it with the scheduler.
-    pub async fn send_ping(&mut self) -> Result<(), SessionError> {
-        self.ping_nonce = self.ping_nonce.wrapping_add(1);
-        let nonce = self.ping_nonce;
-        self.send(&ControlMessage::Ping(nonce)).await?;
-        self.keepalive.on_ping_sent(Instant::now());
-        Ok(())
-    }
-
-    /// Receive one frame and act on it. Returns whether to continue or that the
-    /// session has closed.
-    pub async fn recv_and_dispatch(&mut self) -> Result<Flow, SessionError> {
-        let frame = match recv_session_frame(self.link.as_mut()).await? {
-            Some(frame) => frame,
-            None => {
-                self.mark_closed(CloseReason::Peer("link closed".into()));
-                return Ok(Flow::Closed);
-            }
-        };
-        self.keepalive.on_activity(Instant::now());
-
-        if frame.channel.is_control() {
-            self.handle_control(&frame).await
-        } else {
-            match self.dispatcher.dispatch(frame.clone()).await? {
-                DispatchOutcome::Handled => Ok(Flow::Continue),
-                DispatchOutcome::Unbound | DispatchOutcome::NoHandler => {
-                    // Unknown/unroutable data frame: ignore if optional, else tell
-                    // the peer we could not handle it. Never tears down the session.
-                    if !frame.flags.is_optional() {
-                        self.send(&ControlMessage::Unsupported(frame.message_type.get()))
-                            .await?;
-                    }
-                    Ok(Flow::Continue)
+    /// Run the session pump until it closes.
+    pub async fn run(&mut self) -> Result<(), SessionError> {
+        loop {
+            while let Some(msg) = self.control_out.pop_front() {
+                if send_control(self.control.as_mut(), &msg).await.is_err() {
+                    self.mark_closed(CloseReason::Error("control write failed".into()));
+                    return Ok(());
                 }
             }
+            if self.state.is_terminal() {
+                return Ok(());
+            }
+
+            let transport = self.manager.transport();
+            let accepting = self.accepting;
+            let wake = {
+                let Self {
+                    control,
+                    actor_events_rx,
+                    commands_rx,
+                    ..
+                } = &mut *self;
+                tokio::select! {
+                    r = recv_session_frame(control.as_mut()) => Wake::Control(r),
+                    a = transport.accept_stream(), if accepting => Wake::Accept(a.map_err(SessionError::from)),
+                    e = actor_events_rx.recv() => Wake::Actor(e),
+                    c = commands_rx.recv() => Wake::Command(c),
+                }
+            };
+
+            match wake {
+                Wake::Control(Err(_)) => {
+                    self.mark_closed(CloseReason::Error("control link error".into()));
+                    return Ok(());
+                }
+                Wake::Control(Ok(None)) => {
+                    self.mark_closed(CloseReason::Peer("link closed".into()));
+                    return Ok(());
+                }
+                Wake::Control(Ok(Some(frame))) => {
+                    self.keepalive.on_activity(Instant::now());
+                    if self.route_control(&frame) == Flow::Closed {
+                        return Ok(());
+                    }
+                }
+                Wake::Accept(Ok(Some(link))) => {
+                    let out = self.manager.on_stream_accepted(link);
+                    self.control_out.extend(out);
+                }
+                Wake::Accept(_) => self.accepting = false,
+                Wake::Actor(Some(event)) => {
+                    let out = self.manager.on_actor_event(event);
+                    self.control_out.extend(out);
+                }
+                Wake::Actor(None) => {}
+                Wake::Command(Some(cmd)) => {
+                    if self.handle_command(cmd).await == Flow::Closed {
+                        return Ok(());
+                    }
+                }
+                Wake::Command(None) => {}
+            }
         }
     }
 
-    /// Run the receive loop until the session closes.
-    pub async fn run(&mut self) -> Result<(), SessionError> {
-        while self.recv_and_dispatch().await? == Flow::Continue {}
-        Ok(())
-    }
-
-    /// Close the session gracefully, notifying the peer.
-    pub async fn close(&mut self) -> Result<(), SessionError> {
-        self.close_gracefully("local close").await
-    }
-
-    /// Close the session gracefully with a specific reason sent to the peer.
-    pub async fn shutdown(&mut self, reason: impl Into<String>) -> Result<(), SessionError> {
-        self.close_gracefully(&reason.into()).await
-    }
-
-    async fn close_gracefully(&mut self, reason: &str) -> Result<(), SessionError> {
-        if self.state.is_terminal() {
-            return Ok(());
-        }
-        if self.state.is_active() {
-            self.state = SessionState::ShuttingDown;
-        }
-        // Best-effort: notify the peer and close the transport even if either
-        // step fails (we are tearing down regardless).
-        let _ = self
-            .send(&ControlMessage::Shutdown(reason.to_string()))
-            .await;
-        let _ = self.link.close().await;
-        self.state = SessionState::Closed;
-        self.finish_close(CloseReason::Local);
-        Ok(())
-    }
-
-    async fn handle_control(&mut self, frame: &SessionFrame) -> Result<Flow, SessionError> {
+    fn route_control(&mut self, frame: &SessionFrame) -> Flow {
         let msg = match ControlMessage::from_frame(frame) {
             Ok(msg) => msg,
             Err(_) => {
-                // Unknown/corrupt control message: reply Unsupported unless the
-                // sender marked it ignorable. The session survives.
                 if !frame.flags.is_optional() {
-                    self.send(&ControlMessage::Unsupported(frame.message_type.get()))
-                        .await?;
+                    self.control_out
+                        .push_back(ControlMessage::Unsupported(frame.message_type.get()));
                 }
-                return Ok(Flow::Continue);
+                return Flow::Continue;
             }
         };
         match msg {
-            ControlMessage::Hello(_) => {
-                // A stray Hello after establishment is a protocol nicety we
-                // ignore rather than fault the session over.
-                tracing::debug!(session = %self.id, "ignoring unexpected Hello after establishment");
-                Ok(Flow::Continue)
+            ControlMessage::Hello(_) | ControlMessage::Pong(_) | ControlMessage::Unsupported(_) => {
             }
             ControlMessage::Ping(nonce) => {
                 self.emit(SessionEvent::PingReceived {
                     session_id: self.id,
                 });
-                self.send(&ControlMessage::Pong(nonce)).await?;
-                Ok(Flow::Continue)
+                self.control_out.push_back(ControlMessage::Pong(nonce));
             }
-            ControlMessage::Pong(_) => Ok(Flow::Continue),
             ControlMessage::Shutdown(reason) => {
                 self.mark_closed(CloseReason::Peer(reason));
-                Ok(Flow::Closed)
+                return Flow::Closed;
             }
-            ControlMessage::Unsupported(_) => Ok(Flow::Continue),
+            ControlMessage::ProtocolError(detail) => {
+                self.mark_closed(CloseReason::Error(detail));
+                return Flow::Closed;
+            }
+            ControlMessage::ChannelOpen {
+                channel,
+                channel_type,
+            } => {
+                let out = self.manager.handle_channel_open(channel, channel_type);
+                self.control_out.extend(out);
+            }
+            ControlMessage::ChannelAccept { channel } => {
+                self.manager.handle_channel_accept(channel)
+            }
+            ControlMessage::ChannelReject { channel, reason } => {
+                self.manager.handle_channel_reject(channel, reason);
+            }
+            ControlMessage::ChannelClose { channel } => {
+                let out = self.manager.handle_channel_close(channel);
+                self.control_out.extend(out);
+            }
+            ControlMessage::ChannelClosed { channel } => {
+                self.manager.handle_channel_closed(channel);
+            }
+            ControlMessage::ChannelError { channel, detail } => {
+                self.manager.handle_channel_error(channel, detail);
+            }
+        }
+        Flow::Continue
+    }
+
+    async fn handle_command(&mut self, cmd: SessionCommand) -> Flow {
+        match cmd {
+            SessionCommand::OpenChannel {
+                channel_type,
+                reply,
+            } => {
+                match self.manager.open_channel(channel_type).await {
+                    Ok((id, msg)) => {
+                        self.control_out.push_back(msg);
+                        let _ = reply.send(Ok(id));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+                Flow::Continue
+            }
+            SessionCommand::SendOnChannel {
+                channel,
+                message_type,
+                flags,
+                payload,
+                reply,
+            } => {
+                let _ =
+                    reply.send(
+                        self.manager
+                            .send_on_channel(channel, message_type, flags, payload),
+                    );
+                Flow::Continue
+            }
+            SessionCommand::CloseChannel { channel } => {
+                if let Some(msg) = self.manager.close_channel(channel) {
+                    self.control_out.push_back(msg);
+                }
+                Flow::Continue
+            }
+            SessionCommand::Snapshot { reply } => {
+                let _ = reply.send(self.manager.snapshot());
+                Flow::Continue
+            }
+            SessionCommand::Ping => {
+                self.ping_nonce = self.ping_nonce.wrapping_add(1);
+                self.control_out
+                    .push_back(ControlMessage::Ping(self.ping_nonce));
+                Flow::Continue
+            }
+            SessionCommand::Close => {
+                self.close_gracefully().await;
+                Flow::Closed
+            }
         }
     }
 
-    async fn send(&mut self, msg: &ControlMessage) -> Result<(), SessionError> {
-        send_control(self.link.as_mut(), msg).await
+    async fn close_gracefully(&mut self) {
+        if self.state.is_terminal() {
+            return;
+        }
+        if self.state.is_active() {
+            self.state = SessionState::ShuttingDown;
+        }
+        let _ = send_control(
+            self.control.as_mut(),
+            &ControlMessage::Shutdown("local close".into()),
+        )
+        .await;
+        self.manager.shutdown_all();
+        let _ = self.manager.transport().close().await;
+        let _ = self.control.close().await;
+        self.state = SessionState::Closed;
+        self.finish_close(CloseReason::Local);
     }
 
-    /// Mark a peer/timeout-initiated close. `Closed` is a legal transition from
-    /// any non-terminal state, so this always succeeds without a forced override.
     fn mark_closed(&mut self, reason: CloseReason) {
         if self.state.is_terminal() {
             return;
         }
-        debug_assert!(self.state.can_transition_to(SessionState::Closed));
         self.state = SessionState::Closed;
+        self.manager.shutdown_all();
         self.finish_close(reason);
     }
 
     fn finish_close(&mut self, reason: CloseReason) {
+        self.accepting = false;
         if let Some(reg) = &self.registry {
             reg.remove(self.id);
         }
@@ -362,12 +597,11 @@ impl PeerSession {
     }
 
     fn emit(&self, event: SessionEvent) {
-        // Best-effort: a dropped receiver just means no one is listening.
         let _ = self.events.send(event);
     }
 }
 
-/// Wrap a session frame in a transport frame and send it.
+/// Wrap a control message in a transport frame and send it on `link`.
 async fn send_control(link: &mut dyn Link, msg: &ControlMessage) -> Result<(), SessionError> {
     let session_frame = msg.to_frame()?;
     let frame = Frame {

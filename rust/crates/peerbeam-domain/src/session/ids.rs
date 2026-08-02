@@ -61,7 +61,7 @@ impl fmt::Display for SessionId {
 
 /// A channel within a session. Maps to a transport stream id at the transport
 /// layer; `0` is reserved for the control channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChannelId(u64);
 
 impl ChannelId {

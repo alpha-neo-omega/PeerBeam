@@ -1,214 +1,421 @@
-//! Integration tests for the PeerSession skeleton (M2): two endpoints over an
-//! in-memory link, exercising establishment, negotiation, keepalive, and close.
+//! Integration tests for the multiplexed PeerSession (M3): two endpoints over an
+//! in-memory `ChannelTransport`, exercising establishment/negotiation (M1–M2
+//! regression) plus channel open/accept/reject/close, independent ordering,
+//! isolation, cleanup, and concurrency.
 
 mod common;
 
-use common::MemLink;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+use common::MemTransport;
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, SessionError, Version};
+use peerbeam_domain::session::{
+    Capability, CapabilitySet, ChannelId, ChannelState, ChannelType, MessageFlags, MessageHandler,
+    MessageType, SessionError, SessionFrame, Version,
+};
 use peerbeam_transfer::{
-    CloseReason, Flow, PeerSession, SessionConfig, SessionEvent, SessionRegistry, SessionRole,
+    ChannelEvent, HandlerRegistry, PeerSession, SessionConfig, SessionEvent, SessionHandle,
+    SessionRole,
 };
 
-/// Open both ends concurrently with the given capability sets and per-side
-/// registries.
-async fn open_pair(
-    cfg_a: SessionConfig,
-    cfg_b: SessionConfig,
-) -> (
-    Result<PeerSession, SessionError>,
-    Result<PeerSession, SessionError>,
-    UnboundedReceiver<SessionEvent>,
-    UnboundedReceiver<SessionEvent>,
-    SessionRegistry,
-    SessionRegistry,
-) {
-    let (la, lb) = MemLink::pair(8);
-    let (tx_a, rx_a) = mpsc::unbounded_channel();
-    let (tx_b, rx_b) = mpsc::unbounded_channel();
-    let reg_a = SessionRegistry::new();
-    let reg_b = SessionRegistry::new();
+const T1: ChannelType = ChannelType::TRANSFER; // 0x0100
+fn t2() -> ChannelType {
+    ChannelType::new(0x0101)
+}
+
+/// Records every frame a channel delivers, keyed by channel id, for ordering
+/// assertions.
+type Log = Arc<Mutex<Vec<(ChannelId, Vec<u8>)>>>;
+
+struct Recorder {
+    channel_type: ChannelType,
+    log: Log,
+}
+
+#[async_trait]
+impl MessageHandler for Recorder {
+    fn channel_type(&self) -> ChannelType {
+        self.channel_type
+    }
+    async fn handle(&self, frame: SessionFrame) -> Result<(), SessionError> {
+        self.log
+            .lock()
+            .expect("log")
+            .push((frame.channel, frame.payload.to_vec()));
+        Ok(())
+    }
+}
+
+fn caps() -> CapabilitySet {
+    CapabilitySet::new()
+        .with(Capability::new(T1))
+        .with(Capability::new(t2()))
+}
+
+fn recording_handlers(log: &Log) -> HandlerRegistry {
+    HandlerRegistry::new()
+        .with(Arc::new(Recorder {
+            channel_type: T1,
+            log: log.clone(),
+        }))
+        .with(Arc::new(Recorder {
+            channel_type: t2(),
+            log: log.clone(),
+        }))
+}
+
+/// A running, negotiated session pair with handles and event receivers.
+struct Pair {
+    a: SessionHandle,
+    b: SessionHandle,
+    a_events: UnboundedReceiver<SessionEvent>,
+    b_events: UnboundedReceiver<SessionEvent>,
+    a_channels: UnboundedReceiver<ChannelEvent>,
+    b_channels: UnboundedReceiver<ChannelEvent>,
+}
+
+async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev_tx, a_events) = unbounded_channel();
+    let (b_ev_tx, b_events) = unbounded_channel();
+    let (a_ch_tx, a_channels) = unbounded_channel();
+    let (b_ch_tx, b_channels) = unbounded_channel();
+
     let fa = PeerSession::open(
-        Box::new(la),
+        ta,
         SessionRole::Initiator,
         DeviceId::from("device-b"),
-        cfg_a,
-        tx_a,
-        Some(reg_a.clone()),
+        a_cfg,
+        a_ev_tx,
+        a_ch_tx,
+        None,
     );
     let fb = PeerSession::open(
-        Box::new(lb),
+        tb,
         SessionRole::Responder,
         DeviceId::from("device-a"),
-        cfg_b,
-        tx_b,
-        Some(reg_b.clone()),
+        b_cfg,
+        b_ev_tx,
+        b_ch_tx,
+        None,
     );
     let (ra, rb) = tokio::join!(fa, fb);
-    (ra, rb, rx_a, rx_b, reg_a, reg_b)
-}
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+    let b_handle = b.handle();
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
 
-fn caps(extra: ChannelType) -> CapabilitySet {
-    CapabilitySet::new().with(Capability::new(extra))
-}
-
-fn drain(rx: &mut UnboundedReceiver<SessionEvent>) -> Vec<SessionEvent> {
-    let mut out = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        out.push(ev);
+    Pair {
+        a: a_handle,
+        b: b_handle,
+        a_events,
+        b_events,
+        a_channels,
+        b_channels,
     }
-    out
 }
 
-#[tokio::test]
-async fn two_endpoints_establish_and_agree() {
-    let (ra, rb, mut rx_a, mut rx_b, reg_a, reg_b) = open_pair(
-        SessionConfig::new(caps(ChannelType::TRANSFER)),
-        SessionConfig::new(caps(ChannelType::TRANSFER)),
-    )
-    .await;
-    let a = ra.expect("initiator opens");
-    let b = rb.expect("responder opens");
-
-    assert!(a.state().is_active());
-    assert!(b.state().is_active());
-    // The responder adopts the initiator's minted id.
-    assert_eq!(a.id(), b.id());
-    assert!(!a.id().is_nil());
-    assert_eq!(a.version(), Version::CURRENT);
-
-    // Both advertised TRANSFER + the implicit CONTROL, so both are agreed.
-    assert!(a.capabilities().supports(ChannelType::CONTROL));
-    assert!(a.capabilities().supports(ChannelType::TRANSFER));
-
-    // Each side emitted Established and registered itself.
-    assert!(matches!(
-        drain(&mut rx_a).first(),
-        Some(SessionEvent::Established { .. })
-    ));
-    assert!(matches!(
-        drain(&mut rx_b).first(),
-        Some(SessionEvent::Established { .. })
-    ));
-    assert_eq!(reg_a.len(), 1);
-    assert_eq!(reg_b.len(), 1);
-    assert!(reg_a.get(a.id()).is_some());
-}
-
-#[tokio::test]
-async fn close_ends_both_sides() {
-    let (ra, rb, _rx_a, mut rx_b, reg_a, _reg_b) = open_pair(
-        SessionConfig::new(CapabilitySet::new()),
-        SessionConfig::new(CapabilitySet::new()),
-    )
-    .await;
-    let mut a = ra.expect("initiator");
-    let b = rb.expect("responder");
-    let a_id = a.id();
-
-    // Run the responder until the initiator's shutdown reaches it.
-    let b_task = tokio::spawn(async move {
-        let mut b = b;
-        b.run().await.map(|()| b)
-    });
-
-    a.close().await.expect("close");
-    let b = b_task.await.expect("join").expect("run");
-
-    assert!(a.state().is_terminal());
-    assert!(b.state().is_terminal());
-    assert!(
-        reg_a.remove(a_id).is_none(),
-        "closing deregisters the session"
-    );
-
-    // The responder saw the peer-initiated close.
-    assert!(drain(&mut rx_b).iter().any(|e| matches!(
-        e,
-        SessionEvent::Closed {
-            reason: CloseReason::Peer(_),
-            ..
+async fn next_channel_event(
+    rx: &mut UnboundedReceiver<ChannelEvent>,
+    pred: impl Fn(&ChannelEvent) -> bool,
+) -> ChannelEvent {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(ev)) if pred(&ev) => return ev,
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("channel event stream ended"),
+            Err(_) => panic!("timed out waiting for a channel event"),
         }
-    )));
+    }
+}
+
+async fn wait_until(mut pred: impl FnMut() -> bool) {
+    for _ in 0..300 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached in time");
+}
+
+async fn wait_channels_len(handle: &SessionHandle, expected: usize) {
+    for _ in 0..300 {
+        if let Ok(channels) = handle.channels().await {
+            if channels.len() == expected {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("channel count did not reach {expected}");
+}
+
+#[tokio::test]
+async fn regression_establish_and_negotiate() {
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, mut a_rx) = unbounded_channel();
+    let (b_ev, _b_rx) = unbounded_channel();
+    let (a_ch, _a_chr) = unbounded_channel();
+    let (b_ch, _b_chr) = unbounded_channel();
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        DeviceId::from("b"),
+        SessionConfig::new(caps()),
+        a_ev,
+        a_ch,
+        None,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        DeviceId::from("a"),
+        SessionConfig::new(caps()),
+        b_ev,
+        b_ch,
+        None,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let a = ra.expect("a");
+    let b = rb.expect("b");
+    assert!(a.state().is_active() && b.state().is_active());
+    assert_eq!(a.id(), b.id());
+    assert!(a.capabilities().supports(ChannelType::CONTROL));
+    assert!(a.capabilities().supports(T1) && a.capabilities().supports(t2()));
+    assert!(matches!(
+        a_rx.try_recv(),
+        Ok(SessionEvent::Established { .. })
+    ));
 }
 
 #[tokio::test]
 async fn incompatible_major_versions_are_rejected() {
-    let mut cfg_a = SessionConfig::new(CapabilitySet::new());
-    cfg_a.version = Version::new(2, 0);
-    let cfg_b = SessionConfig::new(CapabilitySet::new()); // 1.0
-
-    let (ra, rb, _rx_a, _rx_b, _reg_a, _reg_b) = open_pair(cfg_a, cfg_b).await;
-
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _) = unbounded_channel();
+    let (b_ev, _) = unbounded_channel();
+    let (a_ch, _) = unbounded_channel();
+    let (b_ch, _) = unbounded_channel();
+    let mut a_cfg = SessionConfig::new(caps());
+    a_cfg.version = Version::new(2, 0);
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        DeviceId::from("b"),
+        a_cfg,
+        a_ev,
+        a_ch,
+        None,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        DeviceId::from("a"),
+        SessionConfig::new(caps()),
+        b_ev,
+        b_ch,
+        None,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
     assert!(matches!(ra, Err(SessionError::VersionIncompatible { .. })));
     assert!(matches!(rb, Err(SessionError::VersionIncompatible { .. })));
 }
 
 #[tokio::test]
-async fn capabilities_are_intersected_and_unknown_ones_dropped() {
-    // A supports TRANSFER; B supports chat (0x0101). Only the implicit CONTROL is
-    // common; each side's unique capability is dropped.
-    let (ra, rb, _rx_a, _rx_b, _reg_a, _reg_b) = open_pair(
-        SessionConfig::new(caps(ChannelType::TRANSFER)),
-        SessionConfig::new(caps(ChannelType::new(0x0101))),
+async fn opens_multiple_independent_channels() {
+    let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;
+    let c1 = p.a.open_channel(T1).await.expect("open t1");
+    let c2 = p.a.open_channel(t2()).await.expect("open t2");
+    assert_ne!(c1, c2);
+
+    // Both endpoints observe both channels open.
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
     )
     .await;
-    let a = ra.expect("a");
-    let b = rb.expect("b");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c2),
+    )
+    .await;
+    next_channel_event(&mut p.b_channels, |e| {
+        matches!(e, ChannelEvent::Opened { .. })
+    })
+    .await;
 
-    for session in [&a, &b] {
-        assert!(session.capabilities().supports(ChannelType::CONTROL));
-        assert!(!session.capabilities().supports(ChannelType::TRANSFER));
-        assert!(!session.capabilities().supports(ChannelType::new(0x0101)));
-        assert_eq!(session.capabilities().len(), 1);
+    let a_snapshot = p.a.channels().await.expect("snapshot");
+    assert_eq!(a_snapshot.len(), 2);
+    assert!(a_snapshot.iter().all(|c| c.state == ChannelState::Open));
+    wait_channels_len(&p.b, 2).await;
+}
+
+#[tokio::test]
+async fn frames_are_ordered_per_channel_and_isolated() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let mut p = open(
+        SessionConfig::new(caps()),
+        SessionConfig::new(caps()).with_handlers(recording_handlers(&log)),
+    )
+    .await;
+    let c1 = p.a.open_channel(T1).await.expect("t1");
+    let c2 = p.a.open_channel(t2()).await.expect("t2");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
+    )
+    .await;
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c2),
+    )
+    .await;
+
+    for i in 0..5u8 {
+        p.a.send_on_channel(
+            c1,
+            MessageType::new(1),
+            MessageFlags::NONE,
+            Bytes::from(vec![i]),
+        )
+        .await
+        .expect("send c1");
+        p.a.send_on_channel(
+            c2,
+            MessageType::new(1),
+            MessageFlags::NONE,
+            Bytes::from(vec![100 + i]),
+        )
+        .await
+        .expect("send c2");
+    }
+
+    wait_until({
+        let log = log.clone();
+        move || log.lock().expect("log").len() == 10
+    })
+    .await;
+
+    let recorded = log.lock().expect("log").clone();
+    let c1_bytes: Vec<u8> = recorded
+        .iter()
+        .filter(|(ch, _)| *ch == c1)
+        .flat_map(|(_, p)| p.clone())
+        .collect();
+    let c2_bytes: Vec<u8> = recorded
+        .iter()
+        .filter(|(ch, _)| *ch == c2)
+        .flat_map(|(_, p)| p.clone())
+        .collect();
+    assert_eq!(c1_bytes, vec![0, 1, 2, 3, 4], "channel 1 preserves order");
+    assert_eq!(
+        c2_bytes,
+        vec![100, 101, 102, 103, 104],
+        "channel 2 preserves order, isolated from channel 1"
+    );
+}
+
+#[tokio::test]
+async fn closing_one_channel_leaves_others_open() {
+    let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;
+    let c1 = p.a.open_channel(T1).await.expect("t1");
+    let c2 = p.a.open_channel(t2()).await.expect("t2");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c2),
+    )
+    .await;
+
+    p.a.close_channel(c1);
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Closed { channel } if *channel == c1),
+    )
+    .await;
+
+    wait_channels_len(&p.a, 1).await;
+    let snap = p.a.channels().await.expect("snap");
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].id, c2, "the other channel stays open");
+}
+
+#[tokio::test]
+async fn channel_beyond_limit_is_rejected() {
+    // The responder allows only one channel; the initiator's second open is
+    // rejected by the peer.
+    let mut p = open(
+        SessionConfig::new(caps()),
+        SessionConfig::new(caps()).with_channel_limit(1),
+    )
+    .await;
+    let c1 = p.a.open_channel(T1).await.expect("first");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
+    )
+    .await;
+
+    let c2 = p.a.open_channel(t2()).await.expect("second requested");
+    let ev = next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Rejected { channel, .. } if *channel == c2),
+    )
+    .await;
+    assert!(matches!(ev, ChannelEvent::Rejected { .. }));
+}
+
+#[tokio::test]
+async fn ping_is_answered_and_reported() {
+    let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;
+    p.a.ping();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), p.b_events.recv()).await {
+            Ok(Some(SessionEvent::PingReceived { .. })) => break,
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("event stream ended"),
+            Err(_) => panic!("timed out waiting for PingReceived"),
+        }
     }
 }
 
 #[tokio::test]
-async fn ping_is_answered_with_pong() {
-    let (ra, rb, _rx_a, mut rx_b, _reg_a, _reg_b) = open_pair(
-        SessionConfig::new(CapabilitySet::new()),
-        SessionConfig::new(CapabilitySet::new()),
-    )
-    .await;
-    let mut a = ra.expect("a");
-    let b = rb.expect("b");
+async fn stress_many_channels_open_and_clean_up() {
+    let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;
+    let mut ids = Vec::new();
+    for _ in 0..24 {
+        ids.push(p.a.open_channel(T1).await.expect("open"));
+    }
+    // Wait for all to be acknowledged open on the initiator.
+    let mut opened = 0;
+    while opened < ids.len() {
+        next_channel_event(&mut p.a_channels, |e| {
+            matches!(e, ChannelEvent::Opened { .. })
+        })
+        .await;
+        opened += 1;
+    }
+    let snap = p.a.channels().await.expect("snap");
+    assert_eq!(snap.len(), 24);
 
-    let b_task = tokio::spawn(async move {
-        let mut b = b;
-        b.run().await.map(|()| b)
-    });
-
-    a.send_ping().await.expect("send ping");
-    // The responder replies with Pong; the initiator receives it and stays open.
-    assert_eq!(
-        a.recv_and_dispatch().await.expect("recv pong"),
-        Flow::Continue
+    // Closing the session tears everything down.
+    p.a.close();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), p.a_events.recv()).await {
+            Ok(Some(SessionEvent::Closed { .. })) => break,
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => panic!("timed out waiting for session close"),
+        }
+    }
+    // After close the handle can no longer query channels.
+    assert!(
+        p.a.channels().await.is_err() || p.a.channels().await.map(|c| c.is_empty()).unwrap_or(true)
     );
-
-    a.close().await.expect("close");
-    let _b = b_task.await.expect("join").expect("run");
-
-    assert!(drain(&mut rx_b)
-        .iter()
-        .any(|e| matches!(e, SessionEvent::PingReceived { .. })));
-}
-
-#[tokio::test]
-async fn peer_hangup_closes_the_session() {
-    let (ra, rb, _rx_a, _rx_b, _reg_a, _reg_b) = open_pair(
-        SessionConfig::new(CapabilitySet::new()),
-        SessionConfig::new(CapabilitySet::new()),
-    )
-    .await;
-    let mut a = ra.expect("a");
-    let b = rb.expect("b");
-
-    // Drop the responder: its link end closes, so the initiator's next receive
-    // observes a clean hangup and closes.
-    drop(b);
-    assert_eq!(a.recv_and_dispatch().await.expect("recv"), Flow::Closed);
-    assert!(a.state().is_terminal());
 }

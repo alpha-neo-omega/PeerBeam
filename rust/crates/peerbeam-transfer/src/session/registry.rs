@@ -1,12 +1,15 @@
-//! Registries: active sessions, capability handlers, and the message dispatcher.
+//! Registries: active sessions and capability handlers.
+//!
+//! Channel routing itself lives in [`ChannelManager`](super::ChannelManager),
+//! which owns the channels and dispatches each channel's frames to the handler
+//! registered here — one routing path, no duplication.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{
-    CapabilitySet, ChannelId, ChannelType, MessageHandler, SessionError, SessionFrame, SessionId,
-    SessionState, Version,
+    CapabilitySet, ChannelType, MessageHandler, SessionId, SessionState, Version,
 };
 
 /// A snapshot of an active session, held by the [`SessionRegistry`] so the owner
@@ -91,7 +94,9 @@ impl SessionRegistry {
     }
 }
 
-/// Maps a [`ChannelType`] to the handler that serves it.
+/// Maps a [`ChannelType`] to the handler that serves it. A session's
+/// [`ChannelManager`](super::ChannelManager) consults this when a channel opens,
+/// binding the channel's actor to the matching handler.
 #[derive(Clone, Default)]
 pub struct HandlerRegistry {
     map: HashMap<ChannelType, Arc<dyn MessageHandler>>,
@@ -109,6 +114,13 @@ impl HandlerRegistry {
     /// Register a handler under its own [`MessageHandler::channel_type`].
     pub fn register(&mut self, handler: Arc<dyn MessageHandler>) {
         self.map.insert(handler.channel_type(), handler);
+    }
+
+    /// Builder-style [`register`](HandlerRegistry::register).
+    #[must_use]
+    pub fn with(mut self, handler: Arc<dyn MessageHandler>) -> Self {
+        self.register(handler);
+        self
     }
 
     /// The handler for `channel_type`, if any.
@@ -136,79 +148,9 @@ impl HandlerRegistry {
     }
 }
 
-/// The result of dispatching one data-channel frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchOutcome {
-    /// A handler processed the frame.
-    Handled,
-    /// The channel is bound to a type, but no handler is registered for it.
-    NoHandler,
-    /// The channel id is not bound to any type (no channel was opened for it).
-    Unbound,
-}
-
-/// Routes inbound data-channel frames to the handler registered for the channel's
-/// type. Control-channel frames are handled by the session itself, not here —
-/// this dispatcher owns *capability* routing only (one responsibility).
-///
-/// In this milestone no data channels are opened, so a session's dispatcher stays
-/// empty and every non-control frame resolves to [`DispatchOutcome::Unbound`]; the
-/// binding/handler paths are exercised directly by the dispatcher's tests and are
-/// the extension seam later milestones populate.
-#[derive(Clone, Default)]
-pub struct MessageDispatcher {
-    handlers: HandlerRegistry,
-    channels: HashMap<ChannelId, ChannelType>,
-}
-
-impl MessageDispatcher {
-    /// An empty dispatcher.
-    #[must_use]
-    pub fn new() -> Self {
-        MessageDispatcher {
-            handlers: HandlerRegistry::new(),
-            channels: HashMap::new(),
-        }
-    }
-
-    /// Register a capability handler.
-    pub fn register(&mut self, handler: Arc<dyn MessageHandler>) {
-        self.handlers.register(handler);
-    }
-
-    /// Bind a channel id to a channel type (done when a channel is opened).
-    pub fn bind(&mut self, channel: ChannelId, channel_type: ChannelType) {
-        self.channels.insert(channel, channel_type);
-    }
-
-    /// Whether a handler is registered for `channel_type`.
-    #[must_use]
-    pub fn has_handler(&self, channel_type: ChannelType) -> bool {
-        self.handlers.contains(channel_type)
-    }
-
-    /// Route one frame to its handler.
-    pub async fn dispatch(&self, frame: SessionFrame) -> Result<DispatchOutcome, SessionError> {
-        let Some(channel_type) = self.channels.get(&frame.channel).copied() else {
-            return Ok(DispatchOutcome::Unbound);
-        };
-        match self.handlers.get(channel_type) {
-            Some(handler) => {
-                handler.handle(frame).await?;
-                Ok(DispatchOutcome::Handled)
-            }
-            None => Ok(DispatchOutcome::NoHandler),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use peerbeam_domain::session::{MessageFlags, MessageType};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn info(id: u128) -> SessionInfo {
         SessionInfo {
@@ -253,62 +195,11 @@ mod tests {
         assert_eq!(reg.len(), 16);
     }
 
-    struct CountingHandler {
-        channel: ChannelType,
-        count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl MessageHandler for CountingHandler {
-        fn channel_type(&self) -> ChannelType {
-            self.channel
-        }
-        async fn handle(&self, _frame: SessionFrame) -> Result<(), SessionError> {
-            self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    fn data_frame(channel: ChannelId) -> SessionFrame {
-        SessionFrame::new(
-            channel,
-            MessageType::new(1),
-            MessageFlags::NONE,
-            Bytes::from_static(b"x"),
-        )
-    }
-
-    #[tokio::test]
-    async fn dispatch_routes_to_registered_handler() {
-        let count = Arc::new(AtomicUsize::new(0));
-        let mut d = MessageDispatcher::new();
-        d.register(Arc::new(CountingHandler {
-            channel: ChannelType::TRANSFER,
-            count: count.clone(),
-        }));
-        d.bind(ChannelId::new(4), ChannelType::TRANSFER);
-
-        assert_eq!(
-            d.dispatch(data_frame(ChannelId::new(4))).await.unwrap(),
-            DispatchOutcome::Handled
-        );
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert!(d.has_handler(ChannelType::TRANSFER));
-    }
-
-    #[tokio::test]
-    async fn dispatch_reports_unbound_and_no_handler() {
-        let mut d = MessageDispatcher::new();
-        // Unbound: no channel bound to id 9.
-        assert_eq!(
-            d.dispatch(data_frame(ChannelId::new(9))).await.unwrap(),
-            DispatchOutcome::Unbound
-        );
-        // Bound but no handler registered for the type.
-        d.bind(ChannelId::new(9), ChannelType::TRANSFER);
-        assert_eq!(
-            d.dispatch(data_frame(ChannelId::new(9))).await.unwrap(),
-            DispatchOutcome::NoHandler
-        );
+    #[test]
+    fn handler_registry_len_and_contains() {
+        let reg = HandlerRegistry::new();
+        assert!(reg.is_empty());
+        assert!(!reg.contains(ChannelType::TRANSFER));
+        assert_eq!(reg.len(), 0);
     }
 }
