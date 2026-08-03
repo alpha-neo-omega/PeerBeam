@@ -102,3 +102,40 @@ The per-channel derivation and sealing provide cryptographic isolation between
 channels while reusing the audited AEAD + sealing scheme. Every M4 requirement
 (independent keys, counters, replay, overflow-fail-closed, zeroization) is
 implemented and tested. No invariant is violated.
+
+## M5 addendum — transfer as the first sealed capability
+
+M5 puts file transfer on a PeerSession channel, so the per-channel sealing is now
+exercised end-to-end by a real capability (previously only by unit tests and the
+control channel).
+
+- **Owned sealed stream.** A transfer channel's stream is handed to the caller as
+  an owned `SealedLink` (`session::sealed_link`) — the same `ChannelCrypto` seal /
+  open scheme and the same frame codec as `SecureLink`, reused verbatim (one
+  implementation of the sealing scheme; `secure::{encode_frame, decode_frame}` are
+  shared, not duplicated). The unmodified transfer engine (`send_file` /
+  `receive_file`) runs over it exactly as over a directly-dialed `SecureLink`.
+- **Fresh per-channel counter, no probe.** Stream channels do **not** send the M3
+  probe frame. Both peers start the channel's send/recv counters at 0 and the
+  sender's first real frame (the transfer `Meta`) materialises the stream, so the
+  counters cannot desync. Keys are derived per channel via HKDF exactly as for
+  message channels (M4), so two concurrent transfers use independent keys and
+  counters — a nonce is never reused across channels.
+- **Failure isolation.** The transfer runs entirely caller-side; the session pump
+  is never in its data path. A transfer that errors, is cancelled, or panics
+  therefore closes only its own channel — the pump keeps servicing control and
+  sibling channels. Verified by `cancelled_transfer_does_not_terminate_session`
+  and `concurrent_transfers_use_independent_channels`.
+- **Opt-in, legacy untouched.** Session transfer is enabled only by advertising
+  `ChannelType::TRANSFER` as a stream capability
+  (`SessionConfig::with_stream_channel_type`); the default config carries no stream
+  types, so the legacy transfer path is byte-for-byte unchanged and remains the
+  default.
+
+### Residual risk update
+The M4 "not yet exercised on the wire by a real capability" item is partially
+closed: the sealed per-channel path is now exercised end-to-end by the transfer
+capability over the in-memory `ChannelTransport` with the **real** authenticated
+handshake and **real** per-channel crypto (only the socket is simulated). A
+dedicated real-QUIC sealed-transfer test remains a recommended follow-up (the
+QUIC transport itself is already covered for multiplexing at M3).

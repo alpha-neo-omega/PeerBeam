@@ -14,15 +14,18 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use common::MemTransport;
 use peerbeam_crypto::AeadCrypto;
+use peerbeam_domain::entity::Progress;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelId, ChannelState, ChannelType, MessageFlags, MessageHandler,
     MessageType, SessionError, SessionFrame, Version,
 };
+use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    ChannelEvent, HandlerRegistry, Identity, PeerSession, SessionConfig, SessionEvent,
-    SessionHandle, SessionRole,
+    receive_file_on_channel, send_file_on_session, ChannelEvent, HandlerRegistry, Identity,
+    IncomingStreamChannel, PeerSession, SendRequest, SessionConfig, SessionEvent, SessionHandle,
+    SessionRole, TransferControl, TransferOutcome,
 };
 use peerbeam_trust_fs::FsTrust;
 
@@ -98,6 +101,8 @@ struct Pair {
     b_events: UnboundedReceiver<SessionEvent>,
     a_channels: UnboundedReceiver<ChannelEvent>,
     b_channels: UnboundedReceiver<ChannelEvent>,
+    a_incoming: UnboundedReceiver<IncomingStreamChannel>,
+    b_incoming: UnboundedReceiver<IncomingStreamChannel>,
 }
 
 async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
@@ -106,6 +111,8 @@ async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
     let (b_ev_tx, b_events) = unbounded_channel();
     let (a_ch_tx, a_channels) = unbounded_channel();
     let (b_ch_tx, b_channels) = unbounded_channel();
+    let (a_in_tx, a_incoming) = unbounded_channel();
+    let (b_in_tx, b_incoming) = unbounded_channel();
 
     let (id_a, enc_a, trust_a) = security("device-a");
     let (id_b, enc_b, trust_b) = security("device-b");
@@ -115,6 +122,7 @@ async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
         a_cfg,
         a_ev_tx,
         a_ch_tx,
+        a_in_tx,
         None,
         id_a,
         enc_a,
@@ -126,6 +134,7 @@ async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
         b_cfg,
         b_ev_tx,
         b_ch_tx,
+        b_in_tx,
         None,
         id_b,
         enc_b,
@@ -146,6 +155,8 @@ async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
         b_events,
         a_channels,
         b_channels,
+        a_incoming,
+        b_incoming,
     }
 }
 
@@ -192,6 +203,8 @@ async fn regression_establish_and_negotiate() {
     let (b_ev, _b_rx) = unbounded_channel();
     let (a_ch, _a_chr) = unbounded_channel();
     let (b_ch, _b_chr) = unbounded_channel();
+    let (a_in, _a_inr) = unbounded_channel();
+    let (b_in, _b_inr) = unbounded_channel();
     let (id_a, enc_a, trust_a) = security("device-a");
     let (id_b, enc_b, trust_b) = security("device-b");
     let fa = PeerSession::open(
@@ -200,6 +213,7 @@ async fn regression_establish_and_negotiate() {
         SessionConfig::new(caps()),
         a_ev,
         a_ch,
+        a_in,
         None,
         id_a,
         enc_a,
@@ -211,6 +225,7 @@ async fn regression_establish_and_negotiate() {
         SessionConfig::new(caps()),
         b_ev,
         b_ch,
+        b_in,
         None,
         id_b,
         enc_b,
@@ -236,6 +251,8 @@ async fn incompatible_major_versions_are_rejected() {
     let (b_ev, _) = unbounded_channel();
     let (a_ch, _) = unbounded_channel();
     let (b_ch, _) = unbounded_channel();
+    let (a_in, _) = unbounded_channel();
+    let (b_in, _) = unbounded_channel();
     let mut a_cfg = SessionConfig::new(caps());
     a_cfg.version = Version::new(2, 0);
     let (id_a, enc_a, trust_a) = security("device-a");
@@ -246,6 +263,7 @@ async fn incompatible_major_versions_are_rejected() {
         a_cfg,
         a_ev,
         a_ch,
+        a_in,
         None,
         id_a,
         enc_a,
@@ -257,6 +275,7 @@ async fn incompatible_major_versions_are_rejected() {
         SessionConfig::new(caps()),
         b_ev,
         b_ch,
+        b_in,
         None,
         id_b,
         enc_b,
@@ -457,4 +476,211 @@ async fn stress_many_channels_open_and_clean_up() {
     assert!(
         p.a.channels().await.is_err() || p.a.channels().await.map(|c| c.is_empty()).unwrap_or(true)
     );
+}
+
+// ── M5: file transfer as a PeerSession channel ──────────────────────────────
+//
+// These exercise the full PeerSession stack — real authenticated handshake
+// (AeadCrypto + FsTrust), real per-channel key derivation, and the real,
+// unmodified transfer engine (`send_file`/`receive_file`) — over an in-memory
+// `ChannelTransport`. Only the socket is simulated; the crypto and transfer
+// logic are the production code paths.
+
+/// A config that advertises TRANSFER as a stream capability (opt-in to
+/// session transfer) plus the message caps used elsewhere in this file.
+fn transfer_cfg() -> SessionConfig {
+    SessionConfig::new(caps()).with_stream_channel_type(T1)
+}
+
+/// Write `data` to a fresh file under `dir` and return its absolute path.
+fn write_src(dir: &std::path::Path, name: &str, data: &[u8]) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, data).expect("write source");
+    path.to_string_lossy().into_owned()
+}
+
+fn send_req(id: &str, name: &str, path: String, size: u64, chunk: u32) -> SendRequest {
+    SendRequest {
+        transfer_id: id.to_string(),
+        name: name.to_string(),
+        path,
+        size,
+        chunk_size: chunk,
+    }
+}
+
+/// One file sent over its own transfer channel arrives byte-for-byte.
+#[tokio::test]
+async fn transfer_over_session_single_file_is_byte_for_byte() {
+    let mut p = open(transfer_cfg(), transfer_cfg()).await;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..250_000u32).map(|i| (i % 251) as u8).collect();
+    let path = write_src(src.path(), "movie.bin", &data);
+
+    let storage_s = FsStorage::new();
+    let storage_r = FsStorage::new();
+    let ctrl_s = TransferControl::new();
+    let ctrl_r = TransferControl::new();
+    let (ptx, _prx) = unbounded_channel::<Progress>();
+    let (ptx2, _prx2) = unbounded_channel::<Progress>();
+
+    let dst_dir = dst.path().to_string_lossy().into_owned();
+    let ha = &p.a;
+    let hb = &p.b;
+    let bin = &mut p.b_incoming;
+
+    let send_fut = send_file_on_session(
+        ha,
+        &storage_s,
+        send_req("t1", "movie.bin", path, data.len() as u64, 8192),
+        &ctrl_s,
+        &ptx,
+        0,
+    );
+    let recv_fut = async {
+        let inc = bin.recv().await.expect("incoming transfer channel");
+        assert_eq!(inc.channel_type, T1);
+        receive_file_on_channel(inc, hb, &storage_r, &dst_dir, &ctrl_r, &ptx2).await
+    };
+    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+
+    assert_eq!(send_res.expect("send ok"), TransferOutcome::Completed);
+    let received = recv_res.expect("receive ok");
+    assert_eq!(received.outcome, TransferOutcome::Completed);
+    assert_eq!(received.bytes, data.len() as u64);
+    let got = std::fs::read(dst.path().join("movie.bin")).unwrap();
+    assert_eq!(got, data, "received bytes differ from source");
+
+    // The opener never receives an incoming-stream notification for a channel
+    // it opened itself — that path is the accepter's only.
+    assert!(p.a_incoming.try_recv().is_err());
+}
+
+/// Two transfers run concurrently on independent channels; both complete and
+/// each arrives byte-for-byte — the channels do not cross-contaminate.
+#[tokio::test]
+async fn concurrent_transfers_use_independent_channels() {
+    let mut p = open(transfer_cfg(), transfer_cfg()).await;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let data_a: Vec<u8> = (0..180_000u32).map(|i| (i % 97) as u8).collect();
+    let data_b: Vec<u8> = (0..90_000u32).map(|i| (i % 131 + 3) as u8).collect();
+    let path_a = write_src(src.path(), "a.bin", &data_a);
+    let path_b = write_src(src.path(), "b.bin", &data_b);
+
+    let ss = FsStorage::new();
+    let sr = FsStorage::new();
+    let (cs1, cs2, cr1, cr2) = (
+        TransferControl::new(),
+        TransferControl::new(),
+        TransferControl::new(),
+        TransferControl::new(),
+    );
+    let (pt, _pr) = unbounded_channel::<Progress>();
+    let dst_dir = dst.path().to_string_lossy().into_owned();
+    let ha = &p.a;
+    let hb = &p.b;
+    let bin = &mut p.b_incoming;
+
+    let senders = async {
+        tokio::join!(
+            send_file_on_session(
+                ha,
+                &ss,
+                send_req("ta", "a.bin", path_a, data_a.len() as u64, 4096),
+                &cs1,
+                &pt,
+                0,
+            ),
+            send_file_on_session(
+                ha,
+                &ss,
+                send_req("tb", "b.bin", path_b, data_b.len() as u64, 4096),
+                &cs2,
+                &pt,
+                0,
+            ),
+        )
+    };
+    let receivers = async {
+        // Both channels pair before either transfer body runs.
+        let i1 = bin.recv().await.expect("incoming 1");
+        let i2 = bin.recv().await.expect("incoming 2");
+        tokio::join!(
+            receive_file_on_channel(i1, hb, &sr, &dst_dir, &cr1, &pt),
+            receive_file_on_channel(i2, hb, &sr, &dst_dir, &cr2, &pt),
+        )
+    };
+    let (send_res, recv_res) = tokio::join!(senders, receivers);
+
+    assert_eq!(send_res.0.expect("send a"), TransferOutcome::Completed);
+    assert_eq!(send_res.1.expect("send b"), TransferOutcome::Completed);
+    assert_eq!(
+        recv_res.0.expect("recv 1").outcome,
+        TransferOutcome::Completed
+    );
+    assert_eq!(
+        recv_res.1.expect("recv 2").outcome,
+        TransferOutcome::Completed
+    );
+    assert_eq!(std::fs::read(dst.path().join("a.bin")).unwrap(), data_a);
+    assert_eq!(std::fs::read(dst.path().join("b.bin")).unwrap(), data_b);
+}
+
+/// Cancelling a transfer ends it as `Cancelled` and leaves the PeerSession
+/// fully usable — a transfer failure is isolated to its own channel.
+#[tokio::test]
+async fn cancelled_transfer_does_not_terminate_session() {
+    let mut p = open(transfer_cfg(), transfer_cfg()).await;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let data = vec![9u8; 2_000_000];
+    let path = write_src(src.path(), "big.bin", &data);
+
+    let ss = FsStorage::new();
+    let sr = FsStorage::new();
+    let ctrl_s = TransferControl::new();
+    let ctrl_r = TransferControl::new();
+    let (pt, _pr) = unbounded_channel::<Progress>();
+    let dst_dir = dst.path().to_string_lossy().into_owned();
+    let ha = &p.a;
+    let hb = &p.b;
+    let bin = &mut p.b_incoming;
+
+    let send_fut = send_file_on_session(
+        ha,
+        &ss,
+        send_req("tc", "big.bin", path, data.len() as u64, 4096),
+        &ctrl_s,
+        &pt,
+        0,
+    );
+    let recv_fut = async {
+        let inc = bin.recv().await.expect("incoming channel");
+        // Cancel before the receiver acks, so the transfer aborts early.
+        ctrl_s.cancel();
+        receive_file_on_channel(inc, hb, &sr, &dst_dir, &ctrl_r, &pt).await
+    };
+    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+
+    assert_eq!(send_res.expect("send resolves"), TransferOutcome::Cancelled);
+    assert_eq!(
+        recv_res.expect("receive resolves").outcome,
+        TransferOutcome::Cancelled
+    );
+
+    // The session survived the cancelled transfer: control still works and a
+    // brand-new channel can be opened.
+    p.a.ping();
+    let _ = p.a.channels().await.expect("session still serves control");
+    let c = p.a.open_channel(t2()).await.expect("session still usable");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c),
+    )
+    .await;
 }

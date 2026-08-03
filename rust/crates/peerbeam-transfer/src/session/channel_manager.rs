@@ -9,7 +9,7 @@
 //! send, and the session pump writes them. Failure of one channel is isolated to
 //! that channel — no method here tears down the session or unrelated channels.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -22,12 +22,14 @@ use peerbeam_domain::session::{
 };
 
 use super::channel::{
-    spawn_channel, ActorEvent, Channel, ChannelEvent, ChannelInfo, PROBE_MESSAGE_TYPE,
+    spawn_channel, ActorEvent, Channel, ChannelEvent, ChannelInfo, IncomingStreamChannel,
+    PROBE_MESSAGE_TYPE,
 };
 use super::control::ControlMessage;
 use super::crypto::SessionCrypto;
 use super::event::SessionRole;
 use super::registry::HandlerRegistry;
+use super::sealed_link::SealedLink;
 
 /// Default cap on concurrently-open channels per session (prevents a peer from
 /// exhausting resources by opening unboundedly).
@@ -45,6 +47,10 @@ pub struct ChannelManager {
     limit: usize,
     events: UnboundedSender<ChannelEvent>,
     actor_events_tx: UnboundedSender<ActorEvent>,
+    // Channel types whose stream is owned by the caller (e.g. transfer) rather
+    // than dispatched to a message handler.
+    stream_types: HashSet<ChannelType>,
+    incoming_stream_tx: UnboundedSender<IncomingStreamChannel>,
     // Responder-side FIFO pairing of received ChannelOpens with accepted streams.
     pending_opens: VecDeque<(ChannelId, ChannelType)>,
     pending_streams: VecDeque<Box<dyn Link>>,
@@ -64,8 +70,10 @@ impl ChannelManager {
         handlers: HandlerRegistry,
         negotiated: CapabilitySet,
         limit: usize,
+        stream_types: HashSet<ChannelType>,
         events: UnboundedSender<ChannelEvent>,
         actor_events_tx: UnboundedSender<ActorEvent>,
+        incoming_stream_tx: UnboundedSender<IncomingStreamChannel>,
     ) -> Self {
         // Parity split: the initiator uses odd ids, the responder even, so
         // concurrently-opened channels never collide on an id. 0 is control.
@@ -84,6 +92,8 @@ impl ChannelManager {
             limit,
             events,
             actor_events_tx,
+            stream_types,
+            incoming_stream_tx,
             pending_opens: VecDeque::new(),
             pending_streams: VecDeque::new(),
         }
@@ -182,6 +192,35 @@ impl ChannelManager {
         ))
     }
 
+    /// Open a **stream** channel: the caller owns the sealed stream and runs its
+    /// own protocol (e.g. `send_file`) over it. Returns the id, the sealed stream,
+    /// and the `ChannelOpen` to send. No dispatch actor and no probe — the
+    /// caller's first write materialises the stream on the peer.
+    pub async fn open_stream_channel(
+        &mut self,
+        channel_type: ChannelType,
+    ) -> Result<(ChannelId, Box<dyn Link>, ControlMessage), SessionError> {
+        self.permit(channel_type).map_err(SessionError::Channel)?;
+        let id = self.allocate_id();
+        let crypto = self.crypto.derive(id, self.version)?;
+        let link = self.transport.open_stream().await?;
+        let sealed: Box<dyn Link> = Box::new(SealedLink::new(link, crypto, self.crypto.enc()));
+        self.channels
+            .insert(id, Channel::new_stream(id, channel_type));
+        self.emit(ChannelEvent::Opened {
+            channel: id,
+            channel_type,
+        });
+        Ok((
+            id,
+            sealed,
+            ControlMessage::ChannelOpen {
+                channel: id,
+                channel_type,
+            },
+        ))
+    }
+
     /// Handle a peer `ChannelOpen` (responder side): permission-check, then queue
     /// for FIFO pairing with an accepted stream. Returns control messages to send
     /// (a `ChannelReject`, or `ChannelAccept`s for any channels that paired).
@@ -241,6 +280,41 @@ impl ChannelManager {
                     continue;
                 }
             };
+            if self.stream_types.contains(&channel_type) {
+                // Stream capability (e.g. transfer): the caller owns the sealed
+                // stream and runs its own protocol over it. No dispatch actor.
+                let sealed: Box<dyn Link> =
+                    Box::new(SealedLink::new(link, crypto, self.crypto.enc()));
+                if self
+                    .incoming_stream_tx
+                    .send(IncomingStreamChannel {
+                        channel: id,
+                        channel_type,
+                        link: sealed,
+                    })
+                    .is_err()
+                {
+                    // Nobody is receiving incoming streams: reject, isolated.
+                    let reason = "no stream receiver".to_string();
+                    self.emit(ChannelEvent::Rejected {
+                        channel: id,
+                        reason: reason.clone(),
+                    });
+                    out.push(ControlMessage::ChannelReject {
+                        channel: id,
+                        reason,
+                    });
+                    continue;
+                }
+                self.channels
+                    .insert(id, Channel::new_stream(id, channel_type));
+                self.emit(ChannelEvent::Opened {
+                    channel: id,
+                    channel_type,
+                });
+                out.push(ControlMessage::ChannelAccept { channel: id });
+                continue;
+            }
             let handler = self.handlers.get(channel_type);
             let channel = spawn_channel(
                 id,

@@ -19,8 +19,10 @@ mod control;
 mod crypto;
 mod event;
 mod registry;
+mod sealed_link;
+mod transfer;
 
-pub use channel::{ChannelEvent, ChannelInfo, ChannelStats};
+pub use channel::{ChannelEvent, ChannelInfo, ChannelStats, IncomingStreamChannel};
 pub use channel_manager::ChannelManager;
 pub use control::{ControlMessage, SessionHello};
 pub(crate) use crypto::{ChannelCrypto, SessionCrypto};
@@ -28,8 +30,9 @@ pub use event::{
     CloseReason, Keepalive, KeepaliveAction, KeepaliveConfig, SessionEvent, SessionRole,
 };
 pub use registry::{HandlerRegistry, SessionInfo, SessionRegistry};
+pub use transfer::{receive_file_on_channel, send_file_on_session};
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,6 +75,13 @@ pub struct SessionConfig {
     pub handlers: HandlerRegistry,
     /// Maximum concurrently-open data channels.
     pub channel_limit: usize,
+    /// Capabilities whose channels are **stream** channels: the caller owns the
+    /// sealed stream and runs its own protocol over it (e.g. transfer), instead
+    /// of the frame being dispatched to a [`MessageHandler`]. Empty by default —
+    /// every channel is a message channel unless opted in here.
+    ///
+    /// [`MessageHandler`]: peerbeam_domain::session::MessageHandler
+    pub stream_channel_types: HashSet<ChannelType>,
 }
 
 impl SessionConfig {
@@ -88,6 +98,7 @@ impl SessionConfig {
             keepalive: KeepaliveConfig::default(),
             handlers: HandlerRegistry::new(),
             channel_limit: channel_manager::DEFAULT_CHANNEL_LIMIT,
+            stream_channel_types: HashSet::new(),
         }
     }
 
@@ -95,6 +106,16 @@ impl SessionConfig {
     #[must_use]
     pub fn with_handlers(mut self, handlers: HandlerRegistry) -> Self {
         self.handlers = handlers;
+        self
+    }
+
+    /// Mark `channel_type` as a stream capability: its channels deliver the
+    /// sealed stream to the caller (opener via
+    /// [`SessionHandle::open_stream_channel`], accepter via the session's
+    /// incoming-streams receiver) instead of dispatching to a handler.
+    #[must_use]
+    pub fn with_stream_channel_type(mut self, channel_type: ChannelType) -> Self {
+        self.stream_channel_types.insert(channel_type);
         self
     }
 
@@ -106,11 +127,19 @@ impl SessionConfig {
     }
 }
 
+/// Reply to an [`SessionCommand::OpenStreamChannel`]: the new channel's id and
+/// the sealed stream the caller owns.
+type OpenStreamReply = Result<(ChannelId, Box<dyn Link>), SessionError>;
+
 /// A command sent to a running session's pump via its [`SessionHandle`].
 enum SessionCommand {
     OpenChannel {
         channel_type: ChannelType,
         reply: oneshot::Sender<Result<ChannelId, SessionError>>,
+    },
+    OpenStreamChannel {
+        channel_type: ChannelType,
+        reply: oneshot::Sender<OpenStreamReply>,
     },
     SendOnChannel {
         channel: ChannelId,
@@ -144,6 +173,26 @@ impl SessionHandle {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(SessionCommand::OpenChannel {
+                channel_type,
+                reply,
+            })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    /// Open a **stream** channel of `channel_type` (must be configured as a
+    /// stream capability via [`SessionConfig::with_stream_channel_type`]).
+    /// Resolves to the channel id and the sealed stream, which the caller owns
+    /// and runs its own protocol over (e.g. `send_file`). The peer's accepter
+    /// receives the matching [`IncomingStreamChannel`] on the session's
+    /// incoming-streams receiver.
+    pub async fn open_stream_channel(
+        &self,
+        channel_type: ChannelType,
+    ) -> Result<(ChannelId, Box<dyn Link>), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::OpenStreamChannel {
                 channel_type,
                 reply,
             })
@@ -242,6 +291,7 @@ impl PeerSession {
         config: SessionConfig,
         events: UnboundedSender<SessionEvent>,
         channel_events: UnboundedSender<ChannelEvent>,
+        incoming_streams: UnboundedSender<IncomingStreamChannel>,
         registry: Option<SessionRegistry>,
         identity: Identity,
         enc: Arc<dyn EncryptionProvider>,
@@ -314,8 +364,10 @@ impl PeerSession {
             config.handlers,
             capabilities.clone(),
             config.channel_limit,
+            config.stream_channel_types,
             channel_events,
             actor_events_tx,
+            incoming_streams,
         );
 
         let session = PeerSession {
@@ -555,6 +607,21 @@ impl PeerSession {
                     Ok((id, msg)) => {
                         self.control_out.push_back(msg);
                         let _ = reply.send(Ok(id));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+                Flow::Continue
+            }
+            SessionCommand::OpenStreamChannel {
+                channel_type,
+                reply,
+            } => {
+                match self.manager.open_stream_channel(channel_type).await {
+                    Ok((id, link, msg)) => {
+                        self.control_out.push_back(msg);
+                        let _ = reply.send(Ok((id, link)));
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));

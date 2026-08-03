@@ -91,15 +91,17 @@ impl Link for SecureLink<'_> {
     }
 }
 
-/// Serialize a frame as `[kind tag byte] || payload`.
-fn encode_frame(frame: &Frame) -> Vec<u8> {
+/// Serialize a frame as `[kind tag byte] || payload`. Shared with the session
+/// layer's owned [`SealedLink`](crate::session::SealedLink) so there is one
+/// frame codec for the sealing scheme.
+pub(crate) fn encode_frame(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + frame.payload.len());
     out.push(kind_tag(frame.kind));
     out.extend_from_slice(&frame.payload);
     out
 }
 
-fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Frame> {
     let (tag, payload) = bytes
         .split_first()
         .ok_or_else(|| DomainError::Integrity("empty secure frame".into()))?;

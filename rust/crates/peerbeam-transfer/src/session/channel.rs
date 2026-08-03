@@ -97,14 +97,42 @@ pub(crate) enum ActorEvent {
     Errored { channel: ChannelId, detail: String },
 }
 
-/// A live channel handle held in the manager's registry: metadata plus the
-/// actor's command sender. The actor owns the stream.
+/// An established channel whose sealed stream is owned by the caller (a stream
+/// capability such as transfer), not by a dispatch actor. Delivered once, by
+/// value, over the session's incoming-stream channel.
+pub struct IncomingStreamChannel {
+    /// The channel id.
+    pub channel: ChannelId,
+    /// The capability the channel carries.
+    pub channel_type: ChannelType,
+    /// The established, sealed stream; run the capability (e.g. `receive_file`)
+    /// over it directly.
+    pub link: Box<dyn Link>,
+}
+
+/// A live channel handle held in the manager's registry: metadata plus, for a
+/// message channel, the actor's command sender. Stream channels (the caller owns
+/// the stream) carry no command sender.
 pub struct Channel {
     id: ChannelId,
     channel_type: ChannelType,
     state: ChannelState,
     stats: Arc<Mutex<ChannelStats>>,
-    commands: UnboundedSender<ActorCommand>,
+    commands: Option<UnboundedSender<ActorCommand>>,
+}
+
+impl Channel {
+    /// A registry entry for a stream channel (the caller owns the stream; the
+    /// manager only tracks it for lifecycle/snapshot).
+    pub(crate) fn new_stream(id: ChannelId, channel_type: ChannelType) -> Self {
+        Channel {
+            id,
+            channel_type,
+            state: ChannelState::Open,
+            stats: Arc::new(Mutex::new(ChannelStats::default())),
+            commands: None,
+        }
+    }
 }
 
 impl Channel {
@@ -137,15 +165,21 @@ impl Channel {
         self.state = state;
     }
 
-    /// Queue a frame to send on this channel. An error means the actor has
-    /// stopped (channel gone).
+    /// Queue a frame to send on this channel. `false` if the actor has stopped
+    /// (channel gone) or this is a stream channel (no dispatch actor).
     pub(crate) fn send(&self, frame: SessionFrame) -> bool {
-        self.commands.send(ActorCommand::Send(frame)).is_ok()
+        match &self.commands {
+            Some(tx) => tx.send(ActorCommand::Send(frame)).is_ok(),
+            None => false,
+        }
     }
 
-    /// Signal the actor to close the stream (best-effort).
+    /// Signal the actor to close the stream (best-effort). No-op for a stream
+    /// channel, whose stream is owned by the caller.
     pub(crate) fn signal_close(&self) {
-        let _ = self.commands.send(ActorCommand::Close);
+        if let Some(tx) = &self.commands {
+            let _ = tx.send(ActorCommand::Close);
+        }
     }
 }
 
@@ -259,6 +293,6 @@ pub(crate) fn spawn_channel(
         channel_type,
         state,
         stats,
-        commands,
+        commands: Some(commands),
     }
 }
