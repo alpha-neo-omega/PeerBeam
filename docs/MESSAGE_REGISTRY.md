@@ -61,9 +61,22 @@ The session's own protocol. MessageTypes here are stable and additive-only.
 | `6` | `Ping` | both | keepalive `{nonce, ts}` |
 | `7` | `Pong` | both | keepalive reply `{nonce, ts}` |
 | `8` | `Shutdown` | both | graceful teardown `{reason}` |
-| `9` | `ResumeRequest` | initiator | reconnect `{session_id, token}` |
-| `10` | `ResumeAck` | responder | `{accepted: bool}` |
+| `9` | `ResumeRequest` | redialler | reconnect `{token}` — a single-use, master-keyed resume token (§below); sent **plaintext** on the fresh control stream (it is self-authenticating) |
+| `10` | `ResumeAck` | accepter | `{accepted: bool, reason}` — **sealed** under the epoch control key when accepted (proves master possession); plaintext on refusal |
 | `11` | `Unsupported` | both | generic "I don't understand type X" |
+
+**Resume token (M6).** The `ResumeRequest` token is an HMAC-SHA256 over an immutable
+binding — `{session_id, device-id pair (unordered), protocol version, epoch,
+created_at, expires_at}` — keyed by a **resume key** derived from the session master
+secret (never transmitted). It is single-use: each token authorises one strictly
+increasing `epoch`, and the accepter rejects any epoch it has already consumed
+(replay). Verification is fail-closed: a tampered, wrong-pair, wrong-version,
+expired, or replayed token is refused (`ResumeAck{accepted:false}`) and the session
+falls back to a fresh handshake. On acceptance both peers re-derive **all** channel
+keys at the new epoch (M4 derivation mixes the epoch), so counters restart under
+fresh keys with no nonce reuse. Resume never repeats the authenticated handshake
+(I5/I6 are met by the master-keyed token + sealed ack). See
+[STATE_MACHINES.md §7](STATE_MACHINES.md#7-reconnect-and-resume).
 
 ## 4. Per-channel MessageType namespaces
 

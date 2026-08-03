@@ -43,6 +43,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Domain-separation label for channel key derivation (versioned).
 const DOMAIN_LABEL: &[u8] = b"peerbeam-channel-keys-v1";
+/// Domain-separation label for the session **resume key** (M6). Independent of
+/// the channel-key label so the resume key can never collide with a channel key.
+const RESUME_LABEL: &[u8] = b"peerbeam-resume-key-v1";
 /// Derivation purpose: an encryption key.
 const PURPOSE_KEY: u8 = 1;
 /// Derivation purpose: a nonce prefix.
@@ -84,15 +87,20 @@ fn hkdf_expand(prk: &[u8], info: &[u8], out_len: usize) -> Result<Vec<u8>, Sessi
     Ok(out)
 }
 
-/// Build the HKDF `info`: domain label ‖ purpose ‖ channel ‖ version ‖ direction.
-fn info(purpose: u8, channel: ChannelId, version: Version, dir: Direction) -> Vec<u8> {
-    let mut v = Vec::with_capacity(DOMAIN_LABEL.len() + 1 + 8 + 4 + 1);
+/// Build the HKDF `info`: domain label ‖ purpose ‖ channel ‖ version ‖ direction
+/// ‖ epoch. The **epoch** (M6) is the reconnect generation: bumping it on every
+/// resume yields entirely fresh keys, so a resumed channel starts its counters at
+/// zero under a *different* key — no `(key, nonce)` pair is ever reused across
+/// reconnects, and a counter reset is never a rollback within one key.
+fn info(purpose: u8, channel: ChannelId, version: Version, dir: Direction, epoch: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(DOMAIN_LABEL.len() + 1 + 8 + 4 + 1 + 8);
     v.extend_from_slice(DOMAIN_LABEL);
     v.push(purpose);
     v.extend_from_slice(&channel.get().to_be_bytes());
     v.extend_from_slice(&version.major.to_be_bytes());
     v.extend_from_slice(&version.minor.to_be_bytes());
     v.push(dir as u8);
+    v.extend_from_slice(&epoch.to_be_bytes());
     v
 }
 
@@ -101,8 +109,9 @@ fn derive_key(
     channel: ChannelId,
     version: Version,
     dir: Direction,
+    epoch: u64,
 ) -> Result<[u8; 32], SessionError> {
-    let bytes = hkdf_expand(master, &info(PURPOSE_KEY, channel, version, dir), 32)?;
+    let bytes = hkdf_expand(master, &info(PURPOSE_KEY, channel, version, dir, epoch), 32)?;
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
     Ok(key)
@@ -113,8 +122,13 @@ fn derive_prefix(
     channel: ChannelId,
     version: Version,
     dir: Direction,
+    epoch: u64,
 ) -> Result<[u8; 4], SessionError> {
-    let bytes = hkdf_expand(master, &info(PURPOSE_NONCE, channel, version, dir), 4)?;
+    let bytes = hkdf_expand(
+        master,
+        &info(PURPOSE_NONCE, channel, version, dir, epoch),
+        4,
+    )?;
     let mut prefix = [0u8; 4];
     prefix.copy_from_slice(&bytes);
     Ok(prefix)
@@ -228,11 +242,14 @@ pub(crate) struct SessionCrypto {
     master_send: [u8; 32],
     master_recv: [u8; 32],
     role: SessionRole,
+    /// Reconnect generation (M6). Starts at 0; every successful resume bumps it,
+    /// re-deriving all channel keys so nonces are never reused across reconnects.
+    epoch: u64,
     enc: Arc<dyn EncryptionProvider>,
 }
 
 impl SessionCrypto {
-    /// Capture the master secret from an authenticated [`Session`].
+    /// Capture the master secret from an authenticated [`Session`] at epoch 0.
     pub(crate) fn from_session(
         session: &Session,
         role: SessionRole,
@@ -242,6 +259,7 @@ impl SessionCrypto {
             master_send: session.send_key,
             master_recv: session.recv_key,
             role,
+            epoch: 0,
             enc,
         }
     }
@@ -249,6 +267,49 @@ impl SessionCrypto {
     /// The encryption provider, shared with channel actors.
     pub(crate) fn enc(&self) -> Arc<dyn EncryptionProvider> {
         self.enc.clone()
+    }
+
+    /// The current reconnect generation.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// A copy of this crypto context rebound to `epoch` — same master secret and
+    /// role, fresh key generation. Used on resume so the recovered session's
+    /// channels derive brand-new keys (no nonce reuse). The old context is dropped
+    /// (and zeroized) by the caller.
+    pub(crate) fn with_epoch(&self, epoch: u64) -> Self {
+        SessionCrypto {
+            master_send: self.master_send,
+            master_recv: self.master_recv,
+            role: self.role,
+            epoch,
+            enc: self.enc.clone(),
+        }
+    }
+
+    /// The **resume key**: a symmetric, role-independent key derived from the
+    /// session master secret, used to MAC resume tokens. Both peers derive an
+    /// identical value (the two directional masters are ordered canonically before
+    /// derivation, so initiator and responder agree regardless of role), and it is
+    /// domain-separated from every channel key. It is *never* sent on the wire —
+    /// only its MAC over a token is.
+    pub(crate) fn resume_key(&self) -> Result<[u8; 32], SessionError> {
+        // Canonical order so both roles derive the same key: initiator's
+        // master_send == responder's master_recv and vice-versa.
+        let (lo, hi) = if self.master_send <= self.master_recv {
+            (self.master_send, self.master_recv)
+        } else {
+            (self.master_recv, self.master_send)
+        };
+        let mut prk = [0u8; 64];
+        prk[..32].copy_from_slice(&lo);
+        prk[32..].copy_from_slice(&hi);
+        let bytes = hkdf_expand(&prk, RESUME_LABEL, 32)?;
+        prk.zeroize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(key)
     }
 
     fn send_dir(&self) -> Direction {
@@ -265,17 +326,19 @@ impl SessionCrypto {
         }
     }
 
-    /// Derive the crypto context for `channel` at protocol `version`.
+    /// Derive the crypto context for `channel` at protocol `version` (at the
+    /// current epoch).
     pub(crate) fn derive(
         &self,
         channel: ChannelId,
         version: Version,
     ) -> Result<ChannelCrypto, SessionError> {
+        let e = self.epoch;
         Ok(ChannelCrypto::from_keys(
-            derive_key(&self.master_send, channel, version, self.send_dir())?,
-            derive_key(&self.master_recv, channel, version, self.recv_dir())?,
-            derive_prefix(&self.master_send, channel, version, self.send_dir())?,
-            derive_prefix(&self.master_recv, channel, version, self.recv_dir())?,
+            derive_key(&self.master_send, channel, version, self.send_dir(), e)?,
+            derive_key(&self.master_recv, channel, version, self.recv_dir(), e)?,
+            derive_prefix(&self.master_send, channel, version, self.send_dir(), e)?,
+            derive_prefix(&self.master_recv, channel, version, self.recv_dir(), e)?,
         ))
     }
 
@@ -449,5 +512,46 @@ mod tests {
         let c_v10 = init.derive(ChannelId::new(1), Version::new(1, 0)).unwrap();
         let c_v11 = init.derive(ChannelId::new(1), Version::new(1, 1)).unwrap();
         assert_ne!(c_v10.send_key, c_v11.send_key);
+    }
+
+    #[test]
+    fn epoch_bump_yields_fresh_keys_no_nonce_reuse() {
+        let (init, _r) = master_pair();
+        assert_eq!(init.epoch(), 0);
+        let e0 = init.derive(ChannelId::new(1), v()).unwrap();
+        let resumed = init.with_epoch(1);
+        assert_eq!(resumed.epoch(), 1);
+        let e1 = resumed.derive(ChannelId::new(1), v()).unwrap();
+        // Same channel + version, next epoch → entirely different key material,
+        // so counters restarting at 0 never reuse an (epoch-0) nonce.
+        assert_ne!(e0.send_key, e1.send_key);
+        assert_ne!(e0.recv_key, e1.recv_key);
+        assert_ne!(e0.send_prefix, e1.send_prefix);
+        // Control channel also re-keys per epoch.
+        let ctl0 = init.control().unwrap();
+        let ctl1 = resumed.control().unwrap();
+        assert_ne!(ctl0.send_key, ctl1.send_key);
+    }
+
+    #[test]
+    fn both_peers_derive_same_epoch_keys() {
+        let (init, resp) = master_pair();
+        let mut a = init.with_epoch(3).derive(ChannelId::new(2), v()).unwrap();
+        let mut b = resp.with_epoch(3).derive(ChannelId::new(2), v()).unwrap();
+        let enc = AeadCrypto::new();
+        let sealed = a.seal(&enc, b"resumed").unwrap();
+        a.advance_send().unwrap();
+        assert_eq!(b.open(&enc, &sealed).unwrap(), b"resumed");
+    }
+
+    #[test]
+    fn resume_key_is_symmetric_across_roles() {
+        // Initiator and responder hold mirrored directional masters; the resume
+        // key must come out identical so either can MAC/validate a token.
+        let (init, resp) = master_pair();
+        assert_eq!(init.resume_key().unwrap(), resp.resume_key().unwrap());
+        // It is domain-separated from any channel key.
+        let ch = init.derive(ChannelId::new(1), v()).unwrap();
+        assert_ne!(init.resume_key().unwrap(), ch.send_key);
     }
 }

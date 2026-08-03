@@ -111,6 +111,79 @@ impl ChannelManager {
         self.channels.len()
     }
 
+    /// The current crypto epoch (reconnect generation, M6).
+    #[must_use]
+    pub fn crypto_epoch(&self) -> u64 {
+        self.crypto.epoch()
+    }
+
+    /// A copy of the session crypto at the current epoch, for preserving the
+    /// master secret across a reconnect.
+    #[must_use]
+    pub fn crypto_clone(&self) -> SessionCrypto {
+        self.crypto.with_epoch(self.crypto.epoch())
+    }
+
+    /// The open **message** channels (id + type) eligible for automatic
+    /// re-attachment on resume. Stream channels are excluded — their capability
+    /// (e.g. transfer) re-opens them and resumes their payload itself.
+    #[must_use]
+    pub fn reattachable_channels(&self) -> Vec<(ChannelId, ChannelType)> {
+        self.channels
+            .values()
+            .filter(|ch| {
+                ch.state() == ChannelState::Open && !self.stream_types.contains(&ch.channel_type())
+            })
+            .map(|ch| (ch.id(), ch.channel_type()))
+            .collect()
+    }
+
+    /// Re-open a preserved channel with its **original** id (resume re-attach).
+    /// Like [`open_channel`](ChannelManager::open_channel) but the id is fixed, not
+    /// freshly allocated; future allocations are bumped past it to avoid collision.
+    pub async fn reopen_channel(
+        &mut self,
+        id: ChannelId,
+        channel_type: ChannelType,
+    ) -> Result<ControlMessage, SessionError> {
+        self.permit(channel_type).map_err(SessionError::Channel)?;
+        let crypto = self.crypto.derive(id, self.version)?;
+        let link = self.transport.open_stream().await?;
+        let handler = self.handlers.get(channel_type);
+        let channel = spawn_channel(
+            id,
+            channel_type,
+            ChannelState::Opening,
+            link,
+            handler,
+            self.actor_events_tx.clone(),
+            crypto,
+            self.crypto.enc(),
+        );
+        self.channels.insert(id, channel);
+        self.bump_next_id_past(id);
+        if let Some(ch) = self.channels.get(&id) {
+            ch.send(SessionFrame::new(
+                id,
+                MessageType::new(PROBE_MESSAGE_TYPE),
+                MessageFlags::OPTIONAL,
+                Bytes::new(),
+            ));
+        }
+        Ok(ControlMessage::ChannelOpen {
+            channel: id,
+            channel_type,
+        })
+    }
+
+    /// Keep the id allocator from ever handing out a re-attached id, preserving
+    /// role parity (the allocator steps by 2).
+    fn bump_next_id_past(&mut self, id: ChannelId) {
+        while self.next_id <= id.get() {
+            self.next_id = self.next_id.wrapping_add(2);
+        }
+    }
+
     /// A snapshot of every live channel's metadata and statistics.
     #[must_use]
     pub fn snapshot(&self) -> Vec<ChannelInfo> {

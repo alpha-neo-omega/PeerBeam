@@ -62,6 +62,28 @@ pub enum SessionError {
     /// unknown channel, …).
     #[error("channel error: {0}")]
     Channel(String),
+
+    /// A resume token failed validation (bad MAC, wrong peer, wrong version, or a
+    /// binding mismatch). The resume is refused and the caller falls back to a
+    /// fresh session (fail-closed, I11).
+    #[error("resume rejected: {0}")]
+    ResumeRejected(String),
+
+    /// A resume token has expired (its short-lived window elapsed).
+    #[error("resume token expired")]
+    ResumeExpired,
+
+    /// A resume token was replayed (its single-use epoch was already consumed).
+    #[error("resume token replayed")]
+    ResumeReplayed,
+
+    /// Reconnect attempts were exhausted without a successful resume; the session
+    /// terminates cleanly.
+    #[error("recovery attempts exhausted after {attempts}")]
+    RecoveryExhausted {
+        /// How many reconnect attempts were made.
+        attempts: u32,
+    },
 }
 
 impl From<DomainError> for SessionError {

@@ -1,8 +1,10 @@
 //! Session lifecycle states and the legal transitions between them.
 //!
-//! The state set and edges are pure data; the session layer drives them. Reconnect
-//! and resume states are intentionally absent here — they arrive in a later
-//! milestone and would be dead variants today.
+//! The state set and edges are pure data; the session layer drives them.
+//! [`Recovering`](SessionState::Recovering) covers reconnect + resume (M6): an
+//! `Active` session whose transport was lost re-establishes a new transport,
+//! resumes via a single-use token, and returns to `Active` — or, if attempts are
+//! exhausted, closes.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +19,11 @@ pub enum SessionState {
     Negotiating,
     /// Established; channels may be used.
     Active,
+    /// The transport was lost; re-establishing it and resuming the session
+    /// (reconnect + resume, M6). Returns to [`Active`](SessionState::Active) on a
+    /// successful resume, or to [`Closed`](SessionState::Closed) when recovery
+    /// attempts are exhausted.
+    Recovering,
     /// Draining: no new channels, existing ones finishing.
     ShuttingDown,
     /// Fully closed (terminal).
@@ -45,7 +52,8 @@ impl SessionState {
     #[must_use]
     pub fn can_transition_to(&self, next: SessionState) -> bool {
         use SessionState::{
-            Active, Authenticating, Closed, Connecting, Failed, Negotiating, ShuttingDown,
+            Active, Authenticating, Closed, Connecting, Failed, Negotiating, Recovering,
+            ShuttingDown,
         };
         matches!(
             (self, next),
@@ -61,6 +69,10 @@ impl SessionState {
                 | (Active, ShuttingDown)
                 | (Active, Closed)
                 | (Active, Failed)
+                | (Active, Recovering)
+                | (Recovering, Active)
+                | (Recovering, Closed)
+                | (Recovering, Failed)
                 | (ShuttingDown, Closed)
                 | (Failed, Closed)
         )
@@ -70,7 +82,7 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::SessionState::{
-        Active, Authenticating, Closed, Connecting, Failed, Negotiating, ShuttingDown,
+        Active, Authenticating, Closed, Connecting, Failed, Negotiating, Recovering, ShuttingDown,
     };
 
     #[test]
@@ -95,6 +107,20 @@ mod tests {
         assert!(!Active.can_transition_to(Negotiating)); // no going back
         assert!(!Closed.can_transition_to(Active)); // terminal
         assert!(!ShuttingDown.can_transition_to(Active));
+    }
+
+    #[test]
+    fn recovery_transitions() {
+        // Active loses its transport → Recovering → Active on resume.
+        assert!(Active.can_transition_to(Recovering));
+        assert!(Recovering.can_transition_to(Active));
+        // Recovery can give up (attempts exhausted) or hit a fatal error.
+        assert!(Recovering.can_transition_to(Closed));
+        assert!(Recovering.can_transition_to(Failed));
+        // But you cannot enter recovery from a half-open or terminal state.
+        assert!(!Negotiating.can_transition_to(Recovering));
+        assert!(!Closed.can_transition_to(Recovering));
+        assert!(!ShuttingDown.can_transition_to(Recovering));
     }
 
     #[test]

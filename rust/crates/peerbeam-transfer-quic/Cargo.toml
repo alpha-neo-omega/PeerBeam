@@ -21,6 +21,8 @@ rcgen = { workspace = true }
 peerbeam-transfer = { path = "../peerbeam-transfer" }
 peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 peerbeam-reliability-fs = { path = "../peerbeam-reliability-fs" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

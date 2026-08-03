@@ -48,6 +48,28 @@ pub enum SessionEvent {
         /// The session it arrived on.
         session_id: SessionId,
     },
+    /// The transport was lost; a reconnect attempt is starting (M6).
+    Recovering {
+        /// The session being recovered (identity preserved across the reconnect).
+        session_id: SessionId,
+        /// Which attempt this is (1-based).
+        attempt: u32,
+    },
+    /// A reconnect succeeded: the session resumed at a new crypto epoch (M6).
+    Recovered {
+        /// The recovered session (same id as before the loss).
+        session_id: SessionId,
+        /// The new reconnect generation now in force.
+        epoch: u64,
+    },
+    /// Recovery gave up (attempts exhausted or a fatal resume rejection); the
+    /// session terminates cleanly (M6).
+    RecoveryFailed {
+        /// The session that could not be recovered.
+        session_id: SessionId,
+        /// Why recovery failed.
+        reason: String,
+    },
     /// The session closed.
     Closed {
         /// The session that closed.

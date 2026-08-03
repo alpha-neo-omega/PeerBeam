@@ -13,6 +13,8 @@ use peerbeam_domain::session::{
     SessionId, Version,
 };
 
+use super::resume::ResumeToken;
+
 /// Control message type ids (within the control channel's namespace). Ids follow
 /// the message registry; unassigned numbers are reserved.
 pub mod id {
@@ -32,6 +34,10 @@ pub mod id {
     pub const PONG: u16 = 7;
     /// Graceful whole-session teardown.
     pub const SHUTDOWN: u16 = 8;
+    /// Reconnect: re-attach to an existing session with a resume token.
+    pub const RESUME_REQUEST: u16 = 9;
+    /// Reconnect reply: accept or reject a resume.
+    pub const RESUME_ACK: u16 = 10;
     /// "I do not understand message type N."
     pub const UNSUPPORTED: u16 = 11;
     /// Acknowledge a channel close `{channel}`.
@@ -64,6 +70,16 @@ pub enum ControlMessage {
     Pong(u64),
     /// Graceful teardown with a human-readable reason.
     Shutdown(String),
+    /// Reconnect: re-attach to the session named by the token, without repeating
+    /// the handshake. Sent first on a freshly-dialled control stream (M6).
+    ResumeRequest(ResumeToken),
+    /// Reconnect reply: whether the resume was accepted, with a reason on refusal.
+    ResumeAck {
+        /// Whether the peer accepted the resume.
+        accepted: bool,
+        /// Human-readable reason (empty when accepted).
+        reason: String,
+    },
     /// Notice that a received message type was not understood.
     Unsupported(u16),
     /// Peer requests opening a data channel of the given type.
@@ -115,6 +131,8 @@ impl ControlMessage {
             ControlMessage::Ping(_) => id::PING,
             ControlMessage::Pong(_) => id::PONG,
             ControlMessage::Shutdown(_) => id::SHUTDOWN,
+            ControlMessage::ResumeRequest(_) => id::RESUME_REQUEST,
+            ControlMessage::ResumeAck { .. } => id::RESUME_ACK,
             ControlMessage::Unsupported(_) => id::UNSUPPORTED,
             ControlMessage::ChannelOpen { .. } => id::CHANNEL_OPEN,
             ControlMessage::ChannelAccept { .. } => id::CHANNEL_ACCEPT,
@@ -132,6 +150,8 @@ impl ControlMessage {
             ControlMessage::Hello(hello) => encode(hello)?,
             ControlMessage::Ping(nonce) | ControlMessage::Pong(nonce) => encode(nonce)?,
             ControlMessage::Shutdown(reason) => encode(reason)?,
+            ControlMessage::ResumeRequest(token) => encode(token)?,
+            ControlMessage::ResumeAck { accepted, reason } => encode(&(accepted, reason))?,
             ControlMessage::Unsupported(mt) => encode(mt)?,
             ControlMessage::ChannelOpen {
                 channel,
@@ -161,6 +181,11 @@ impl ControlMessage {
             id::PING => Ok(ControlMessage::Ping(decode(&frame.payload)?)),
             id::PONG => Ok(ControlMessage::Pong(decode(&frame.payload)?)),
             id::SHUTDOWN => Ok(ControlMessage::Shutdown(decode(&frame.payload)?)),
+            id::RESUME_REQUEST => Ok(ControlMessage::ResumeRequest(decode(&frame.payload)?)),
+            id::RESUME_ACK => {
+                let (accepted, reason) = decode(&frame.payload)?;
+                Ok(ControlMessage::ResumeAck { accepted, reason })
+            }
             id::UNSUPPORTED => Ok(ControlMessage::Unsupported(decode(&frame.payload)?)),
             id::CHANNEL_OPEN => {
                 let (channel, channel_type) = decode(&frame.payload)?;
@@ -219,6 +244,23 @@ mod tests {
         })
     }
 
+    fn resume_token() -> ResumeToken {
+        use super::super::resume::ResumeBinding;
+        ResumeToken::mint(
+            &[3u8; 32],
+            &ResumeBinding {
+                session_id: SessionId::from_u128(7),
+                local: peerbeam_domain::id::DeviceId::from("me"),
+                peer: peerbeam_domain::id::DeviceId::from("peer"),
+                version: Version::CURRENT,
+            },
+            1,
+            1_000,
+            30_000,
+        )
+        .expect("mint")
+    }
+
     #[test]
     fn control_messages_roundtrip_through_frames() {
         for msg in [
@@ -226,6 +268,15 @@ mod tests {
             ControlMessage::Ping(42),
             ControlMessage::Pong(42),
             ControlMessage::Shutdown("bye".into()),
+            ControlMessage::ResumeRequest(resume_token()),
+            ControlMessage::ResumeAck {
+                accepted: true,
+                reason: String::new(),
+            },
+            ControlMessage::ResumeAck {
+                accepted: false,
+                reason: "token expired".into(),
+            },
             ControlMessage::Unsupported(99),
         ] {
             let frame = msg.to_frame().expect("encode");

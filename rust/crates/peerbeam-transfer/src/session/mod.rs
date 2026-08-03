@@ -8,8 +8,11 @@
 //! channel is an independent stream with its own actor, ordering, flow control,
 //! and lifecycle — one channel's failure never touches another.
 //!
-//! Per-channel encryption keys, transfer migration, reconnect, and resume are
-//! later milestones and are intentionally absent. PeerSession assumes the
+//! Per-channel encryption keys (M4), transfer as a channel (M5), and reconnect +
+//! resume (M6) are built on this runtime. Reconnect/resume live in
+//! [`recovery`]: a lost `Active` session is captured as a [`PreservedSession`] and
+//! re-established over a fresh transport with a single-use [`ResumeToken`], at a
+//! bumped crypto epoch so no nonce is ever reused. PeerSession assumes the
 //! transport's streams are already authenticated and sealed (see
 //! [`crate::authenticate`] and [`crate::SecureLink`]).
 
@@ -18,7 +21,9 @@ mod channel_manager;
 mod control;
 mod crypto;
 mod event;
+mod recovery;
 mod registry;
+mod resume;
 mod sealed_link;
 mod transfer;
 
@@ -29,7 +34,12 @@ pub(crate) use crypto::{ChannelCrypto, SessionCrypto};
 pub use event::{
     CloseReason, Keepalive, KeepaliveAction, KeepaliveConfig, SessionEvent, SessionRole,
 };
+pub use recovery::{
+    PreservedSession, RecoveryConfig, RecoveryManager, RecoveryStats, RunExit, SessionWiring,
+    TransportFactory,
+};
 pub use registry::{HandlerRegistry, SessionInfo, SessionRegistry};
+pub use resume::{ResumeBinding, ResumeToken};
 pub use transfer::{receive_file_on_channel, send_file_on_session};
 
 use std::collections::{HashSet, VecDeque};
@@ -259,6 +269,8 @@ enum Wake {
 pub struct PeerSession {
     id: SessionId,
     role: SessionRole,
+    /// This endpoint's own device id (for the resume-token identity pair).
+    local: DeviceId,
     peer: DeviceId,
     state: SessionState,
     version: Version,
@@ -276,6 +288,9 @@ pub struct PeerSession {
     actor_events_rx: UnboundedReceiver<ActorEvent>,
     accepting: bool,
     ping_nonce: u64,
+    /// Highest resume epoch this endpoint has consumed (accepter's single-use
+    /// replay guard); preserved across reconnects. 0 for a freshly-opened session.
+    consumed_epoch: u64,
 }
 
 impl PeerSession {
@@ -308,6 +323,7 @@ impl PeerSession {
             })?,
         };
 
+        let local = identity.device_id.clone();
         // The authenticated handshake runs exactly once per session, over the raw
         // control stream. Its master secret keys every channel (control included).
         let auth_session = authenticate(control.as_mut(), &identity, &*enc, &*trust).await?;
@@ -354,6 +370,54 @@ impl PeerSession {
         };
         let capabilities = config.capabilities.intersect(&peer_hello.capabilities);
 
+        let wiring = SessionWiring {
+            events,
+            channel_events,
+            incoming_streams,
+            registry,
+        };
+        Ok(Self::assemble(
+            transport,
+            role,
+            session_id,
+            local,
+            peer,
+            version,
+            capabilities,
+            session_crypto,
+            control,
+            control_crypto,
+            enc,
+            &config,
+            wiring,
+            0,
+            now,
+        ))
+    }
+
+    /// Build a live `PeerSession` from already-established, already-keyed parts.
+    /// Shared by [`open`](PeerSession::open) (fresh handshake) and
+    /// [`resume`](PeerSession::resume)/[`accept_resume`](PeerSession::accept_resume)
+    /// (reconnect), so the assembly, registry registration, and `Established`
+    /// event are defined exactly once.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        transport: Arc<dyn ChannelTransport>,
+        role: SessionRole,
+        session_id: SessionId,
+        local: DeviceId,
+        peer: DeviceId,
+        version: Version,
+        capabilities: CapabilitySet,
+        session_crypto: SessionCrypto,
+        control: Box<dyn Link>,
+        control_crypto: ChannelCrypto,
+        enc: Arc<dyn EncryptionProvider>,
+        config: &SessionConfig,
+        wiring: SessionWiring,
+        consumed_epoch: u64,
+        now: Instant,
+    ) -> PeerSession {
         let (actor_events_tx, actor_events_rx) = unbounded_channel();
         let (commands_tx, commands_rx) = unbounded_channel();
         let manager = ChannelManager::new(
@@ -361,18 +425,19 @@ impl PeerSession {
             session_crypto,
             version,
             role,
-            config.handlers,
+            config.handlers.clone(),
             capabilities.clone(),
             config.channel_limit,
-            config.stream_channel_types,
-            channel_events,
+            config.stream_channel_types.clone(),
+            wiring.channel_events,
             actor_events_tx,
-            incoming_streams,
+            wiring.incoming_streams,
         );
 
         let session = PeerSession {
             id: session_id,
             role,
+            local,
             peer: peer.clone(),
             state: SessionState::Active,
             version,
@@ -381,15 +446,16 @@ impl PeerSession {
             control_crypto,
             enc,
             manager,
-            events,
+            events: wiring.events,
             keepalive: Keepalive::new(config.keepalive, now),
-            registry,
+            registry: wiring.registry,
             control_out: VecDeque::new(),
             commands_tx,
             commands_rx,
             actor_events_rx,
             accepting: true,
             ping_nonce: 0,
+            consumed_epoch,
         };
 
         if let Some(reg) = &session.registry {
@@ -407,7 +473,7 @@ impl PeerSession {
             version,
             capabilities,
         });
-        Ok(session)
+        session
     }
 
     /// A cloneable handle to control this session while [`run`](PeerSession::run)
@@ -467,8 +533,213 @@ impl PeerSession {
         self.keepalive.due(now)
     }
 
-    /// Run the session pump until it closes.
-    pub async fn run(&mut self) -> Result<(), SessionError> {
+    /// The current crypto epoch (reconnect generation, M6).
+    #[must_use]
+    pub fn crypto_epoch(&self) -> u64 {
+        self.manager.crypto_epoch()
+    }
+
+    /// Snapshot the state needed to resume this session after a transport loss:
+    /// the master secret (for the resume key + re-keying), identity, negotiated
+    /// version + capabilities, and the open message channels to re-attach.
+    fn preserve(&self) -> PreservedSession {
+        let crypto = self.manager.crypto_clone();
+        let epoch = crypto.epoch();
+        PreservedSession {
+            session_id: self.id,
+            local: self.local.clone(),
+            peer: self.peer.clone(),
+            role: self.role,
+            version: self.version,
+            capabilities: self.capabilities.clone(),
+            crypto,
+            consumed_epoch: self.consumed_epoch,
+            channels: self.manager.reattachable_channels(),
+            stats: RecoveryStats {
+                attempts: 0,
+                resumes: 0,
+                epoch,
+            },
+        }
+    }
+
+    /// Capture the lost session for recovery: snapshot its state, tear down the
+    /// now-dead channel actors (their streams died with the transport), and mark
+    /// the session `Recovering`.
+    fn capture_loss(&mut self) -> RunExit {
+        let preserved = self.preserve();
+        self.manager.shutdown_all();
+        if self.state.can_transition_to(SessionState::Recovering) {
+            self.state = SessionState::Recovering;
+        }
+        RunExit::Lost(Box::new(preserved))
+    }
+
+    /// Resume a lost session over a fresh `transport` (the redialling side).
+    ///
+    /// Mints a single-use [`ResumeToken`] for `epoch`, runs the resume handshake
+    /// on a new control stream, re-keys every channel to `epoch` (fresh keys, no
+    /// nonce reuse), and re-attaches the preserved message channels — all without
+    /// repeating the authenticated handshake. The authenticated identity, session
+    /// id, and negotiated version are preserved from `preserved`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume(
+        transport: Arc<dyn ChannelTransport>,
+        preserved: &PreservedSession,
+        epoch: u64,
+        config: &SessionConfig,
+        token_ttl_ms: u64,
+        wiring: SessionWiring,
+    ) -> Result<PeerSession, SessionError> {
+        let now = Instant::now();
+        let enc = preserved.crypto.enc();
+        let mut control = transport.open_stream().await?;
+
+        // Rebind crypto to the new epoch: fresh keys for every channel.
+        let session_crypto = preserved.crypto.with_epoch(epoch);
+        let mut control_crypto = session_crypto.control()?;
+
+        // Mint + send the resume token (plaintext — the token is self-authenticating
+        // via its MAC; the QUIC/TLS transport still encrypts it in transit).
+        let resume_key = session_crypto.resume_key()?;
+        let binding = ResumeBinding {
+            session_id: preserved.session_id,
+            local: preserved.local.clone(),
+            peer: preserved.peer.clone(),
+            version: preserved.version,
+        };
+        let token = ResumeToken::mint(&resume_key, &binding, epoch, now_ms(), token_ttl_ms)?;
+        send_control_plain(control.as_mut(), &ControlMessage::ResumeRequest(token)).await?;
+
+        // Await the reply: accepted → sealed under the epoch control key (proves
+        // the peer holds the master); rejected → plaintext with a reason.
+        match recv_resume_reply(control.as_mut(), &mut control_crypto, &*enc).await? {
+            ResumeReply::Accepted => {}
+            ResumeReply::Rejected(reason) => return Err(SessionError::ResumeRejected(reason)),
+        }
+
+        let mut session = Self::assemble(
+            transport,
+            preserved.role,
+            preserved.session_id,
+            preserved.local.clone(),
+            preserved.peer.clone(),
+            preserved.version,
+            preserved.capabilities.clone(),
+            session_crypto,
+            control,
+            control_crypto,
+            enc,
+            config,
+            wiring,
+            preserved.consumed_epoch,
+            now,
+        );
+        session.reattach_channels(&preserved.channels).await?;
+        Ok(session)
+    }
+
+    /// Accept a peer's resume over a fresh `transport` (the accepting side).
+    ///
+    /// Validates the resume token against the preserved binding and the single-use
+    /// replay guard, re-keys to the token's epoch, and confirms with a sealed
+    /// `ResumeAck`. Returns the resumed session and the epoch now consumed (so the
+    /// caller updates its replay guard). A rejected token yields a typed error and
+    /// a plaintext refusal to the peer (fail-closed, I11).
+    pub async fn accept_resume(
+        transport: Arc<dyn ChannelTransport>,
+        preserved: &PreservedSession,
+        config: &SessionConfig,
+        wiring: SessionWiring,
+    ) -> Result<(PeerSession, u64), SessionError> {
+        let now = Instant::now();
+        let enc = preserved.crypto.enc();
+        let mut control = transport.accept_stream().await?.ok_or_else(|| {
+            SessionError::Link("transport closed before resume control stream".into())
+        })?;
+
+        let token = match recv_control_plain(control.as_mut()).await? {
+            ControlMessage::ResumeRequest(token) => token,
+            other => {
+                return Err(SessionError::UnexpectedMessage {
+                    state: SessionState::Recovering,
+                    detail: format!("expected ResumeRequest, got {other:?}"),
+                })
+            }
+        };
+
+        let resume_key = preserved.crypto.resume_key()?;
+        let binding = ResumeBinding {
+            session_id: preserved.session_id,
+            local: preserved.local.clone(),
+            peer: preserved.peer.clone(),
+            version: preserved.version,
+        };
+        if let Err(e) = token.verify(&resume_key, &binding, now_ms(), preserved.consumed_epoch) {
+            let _ = send_control_plain(
+                control.as_mut(),
+                &ControlMessage::ResumeAck {
+                    accepted: false,
+                    reason: e.to_string(),
+                },
+            )
+            .await;
+            return Err(e);
+        }
+        let epoch = token.epoch;
+
+        let session_crypto = preserved.crypto.with_epoch(epoch);
+        let mut control_crypto = session_crypto.control()?;
+        // Sealed accept: only a holder of the master can produce this frame.
+        send_control(
+            control.as_mut(),
+            &mut control_crypto,
+            &*enc,
+            &ControlMessage::ResumeAck {
+                accepted: true,
+                reason: String::new(),
+            },
+        )
+        .await?;
+
+        let session = Self::assemble(
+            transport,
+            preserved.role,
+            preserved.session_id,
+            preserved.local.clone(),
+            preserved.peer.clone(),
+            preserved.version,
+            preserved.capabilities.clone(),
+            session_crypto,
+            control,
+            control_crypto,
+            enc,
+            config,
+            wiring,
+            epoch,
+            now,
+        );
+        // Re-opened channels arrive as ordinary ChannelOpens on the pump.
+        Ok((session, epoch))
+    }
+
+    /// Re-open preserved message channels with their original ids under the new
+    /// epoch keys, queueing each `ChannelOpen` for the pump to flush.
+    async fn reattach_channels(
+        &mut self,
+        channels: &[(ChannelId, ChannelType)],
+    ) -> Result<(), SessionError> {
+        for &(id, channel_type) in channels {
+            let msg = self.manager.reopen_channel(id, channel_type).await?;
+            self.control_out.push_back(msg);
+        }
+        Ok(())
+    }
+
+    /// Run the session pump until it closes or its transport is lost. Returns
+    /// [`RunExit::Closed`] on a graceful/fatal close, or [`RunExit::Lost`] with the
+    /// state to resume from when the transport drops while `Active`.
+    pub async fn run(&mut self) -> Result<RunExit, SessionError> {
         loop {
             while let Some(msg) = self.control_out.pop_front() {
                 if send_control(
@@ -480,12 +751,12 @@ impl PeerSession {
                 .await
                 .is_err()
                 {
-                    self.mark_closed(CloseReason::Error("control write failed".into()));
-                    return Ok(());
+                    // Control write failed → the transport is gone. Recoverable.
+                    return Ok(self.capture_loss());
                 }
             }
             if self.state.is_terminal() {
-                return Ok(());
+                return Ok(RunExit::Closed);
             }
 
             let transport = self.manager.transport();
@@ -508,18 +779,16 @@ impl PeerSession {
             };
 
             match wake {
-                Wake::Control(Err(_)) => {
-                    self.mark_closed(CloseReason::Error("control link error".into()));
-                    return Ok(());
-                }
-                Wake::Control(Ok(None)) => {
-                    self.mark_closed(CloseReason::Peer("link closed".into()));
-                    return Ok(());
+                // A control-link failure or clean EOF from the peer's transport is
+                // a recoverable loss, not a session close: hand back the state to
+                // resume from.
+                Wake::Control(Err(_)) | Wake::Control(Ok(None)) => {
+                    return Ok(self.capture_loss());
                 }
                 Wake::Control(Ok(Some(frame))) => {
                     self.keepalive.on_activity(Instant::now());
                     if self.route_control(&frame) == Flow::Closed {
-                        return Ok(());
+                        return Ok(RunExit::Closed);
                     }
                 }
                 Wake::Accept(Ok(Some(link))) => {
@@ -534,7 +803,7 @@ impl PeerSession {
                 Wake::Actor(None) => {}
                 Wake::Command(Some(cmd)) => {
                     if self.handle_command(cmd).await == Flow::Closed {
-                        return Ok(());
+                        return Ok(RunExit::Closed);
                     }
                 }
                 Wake::Command(None) => {}
@@ -554,8 +823,14 @@ impl PeerSession {
             }
         };
         match msg {
-            ControlMessage::Hello(_) | ControlMessage::Pong(_) | ControlMessage::Unsupported(_) => {
-            }
+            // Resume messages are exchanged out-of-band on a freshly-dialled
+            // control stream during recovery (see `resume`/`accept_resume`), never
+            // on the live pump — ignore a stray one rather than tear down.
+            ControlMessage::Hello(_)
+            | ControlMessage::Pong(_)
+            | ControlMessage::Unsupported(_)
+            | ControlMessage::ResumeRequest(_)
+            | ControlMessage::ResumeAck { .. } => {}
             ControlMessage::Ping(nonce) => {
                 self.emit(SessionEvent::PingReceived {
                     session_id: self.id,
@@ -709,6 +984,92 @@ impl PeerSession {
 
     fn emit(&self, event: SessionEvent) {
         let _ = self.events.send(event);
+    }
+}
+
+/// The outcome of the resume handshake as seen by the redialling side.
+enum ResumeReply {
+    /// The peer accepted (and proved it holds the master via a sealed ack).
+    Accepted,
+    /// The peer refused, with a reason.
+    Rejected(String),
+}
+
+/// Current unix time in milliseconds (for resume-token freshness — not a nonce,
+/// so wall-clock is appropriate here).
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Send an **unsealed** control message on a freshly-dialled stream (used only for
+/// the resume request/refusal, before the epoch keys are in force on both sides).
+async fn send_control_plain(link: &mut dyn Link, msg: &ControlMessage) -> Result<(), SessionError> {
+    let frame = msg.to_frame()?;
+    link.send_frame(Frame {
+        kind: FrameKind::Control,
+        payload: frame.encode(),
+    })
+    .await?;
+    Ok(())
+}
+
+/// Receive one **unsealed** control message (the resume request).
+async fn recv_control_plain(link: &mut dyn Link) -> Result<ControlMessage, SessionError> {
+    let frame = link
+        .recv_frame()
+        .await?
+        .ok_or_else(|| SessionError::Link("link closed during resume".into()))?;
+    let session_frame = SessionFrame::decode(&frame.payload)?;
+    ControlMessage::from_frame(&session_frame)
+}
+
+/// Receive the resume reply: an accepted `ResumeAck` is sealed under the epoch
+/// control key (so opening it proves the peer holds the master); a refusal is
+/// plaintext. Try sealed first, then fall back to plaintext.
+async fn recv_resume_reply(
+    link: &mut dyn Link,
+    crypto: &mut ChannelCrypto,
+    enc: &dyn EncryptionProvider,
+) -> Result<ResumeReply, SessionError> {
+    let frame = link
+        .recv_frame()
+        .await?
+        .ok_or_else(|| SessionError::Link("link closed awaiting resume ack".into()))?;
+
+    // Accepted path: sealed under the epoch control key.
+    if let Ok(plain) = crypto.open(enc, &frame.payload) {
+        if let Ok(sf) = SessionFrame::decode(&plain) {
+            if let Ok(ControlMessage::ResumeAck { accepted, reason }) =
+                ControlMessage::from_frame(&sf)
+            {
+                return Ok(reply_from(accepted, reason));
+            }
+        }
+        return Err(SessionError::ResumeRejected(
+            "malformed sealed resume ack".into(),
+        ));
+    }
+
+    // Refusal path: plaintext.
+    let sf = SessionFrame::decode(&frame.payload)?;
+    match ControlMessage::from_frame(&sf)? {
+        ControlMessage::ResumeAck { accepted, reason } => Ok(reply_from(accepted, reason)),
+        other => Err(SessionError::UnexpectedMessage {
+            state: SessionState::Recovering,
+            detail: format!("expected ResumeAck, got {other:?}"),
+        }),
+    }
+}
+
+fn reply_from(accepted: bool, reason: String) -> ResumeReply {
+    if accepted {
+        ResumeReply::Accepted
+    } else {
+        ResumeReply::Rejected(reason)
     }
 }
 

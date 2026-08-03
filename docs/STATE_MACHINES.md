@@ -166,43 +166,54 @@ retained for a short window in case the peer reconnects (§7).
 
 ## 7. Reconnect and Resume
 
-Reconnect re-establishes the *transport + session*; Resume re-attaches the *logical
-session and its channels*.
+Reconnect re-establishes the *transport*; Resume re-attaches the *logical session
+and its channels* over it. As implemented in M6, resume **does not repeat the
+authenticated handshake** — the session master secret already proves the identity,
+so a single-use, master-keyed [resume token](MESSAGE_REGISTRY.md#3-control-channel-0x0000-message-set)
+re-binds the existing `SessionId` instead. The authenticated identity, negotiated
+version, and capabilities are all preserved; every channel (control included)
+re-derives its keys at a **bumped crypto epoch**, so no nonce is ever reused across
+a reconnect (M4 derivation mixes the epoch).
 
 ```mermaid
 stateDiagram-v2
     [*] --> LOST
     LOST --> BACKOFF: schedule attempt
     BACKOFF --> REDIAL: delay elapsed
-    REDIAL --> REAUTH: transport up (maybe new route)
-    REDIAL --> BACKOFF: dial failed [attempts left]
+    REDIAL --> RESUMING: transport up (maybe new route) + token exchanged
+    REDIAL --> BACKOFF: dial failed / timed out [attempts left]
     REDIAL --> GIVE_UP: attempts exhausted
-    REAUTH --> RENEGOTIATE: auth ok
-    RENEGOTIATE --> RESUMING: same SessionId + valid token
-    RENEGOTIATE --> FRESH: token invalid/expired
-    RESUMING --> ACTIVE: channels re-opened + resumed
-    FRESH --> ACTIVE: new session (channels restart)
+    RESUMING --> ACTIVE: token valid → re-key (epoch+1) + channels re-attached
+    RESUMING --> GIVE_UP: token invalid/expired/replayed (fail closed)
     GIVE_UP --> [*]
 ```
 
 | State | Event | Next | Action / guard |
 |---|---|---|---|
-| LOST | — | BACKOFF | preserve SessionId + resume token |
-| BACKOFF | delay elapsed | REDIAL | RouteManager re-selects best route |
-| REDIAL | up | REAUTH | may be a **different** route than before |
-| REDIAL | fail `[attempts left]` | BACKOFF | linear/exponential backoff |
-| REDIAL | exhausted | GIVE_UP | CLOSED + typed error |
-| REAUTH | ok | RENEGOTIATE | fresh keys (new handshake) |
-| RENEGOTIATE | `[token valid]` | RESUMING | rebind SessionId |
-| RENEGOTIATE | `[token invalid/expired]` | FRESH | new SessionId; channels restart |
-| RESUMING | channels resumed | ACTIVE | per-channel resume (Transfer: offset; Chat: last-ack) |
-| FRESH | — | ACTIVE | capabilities re-open from scratch |
+| LOST | — | BACKOFF | preserve SessionId + master + channel registry (no re-auth) |
+| BACKOFF | delay elapsed | REDIAL | RouteManager / `TransportFactory` re-selects best route |
+| REDIAL | up | RESUMING | send `ResumeRequest{token}`; may be a **different** route |
+| REDIAL | fail / timeout `[attempts left]` | BACKOFF | linear backoff, bounded `attempt_timeout` |
+| REDIAL | exhausted | GIVE_UP | CLOSED + `RecoveryExhausted` |
+| RESUMING | `[token valid]` | ACTIVE | rebind SessionId; re-key at epoch+1; re-open channels; per-channel payload resumes from its own checkpoint |
+| RESUMING | `[token invalid/expired/replayed]` | GIVE_UP | `ResumeAck{accepted:false}`; fail closed (no incorrect resume) |
 
-**Resume guarantees:** a resume token is single-use, integrity-protected, bound to
-SessionId + peer identity, and short-lived — so a reconnect continues in-flight work
-(a Transfer resumes from its on-disk offset via the `ReliabilityStore`) without
-restarting, and a stale/forged token safely degrades to a fresh session rather than
-resuming incorrectly (fail-closed, I11).
+**Resume guarantees:** a resume token is single-use (each authorises exactly one
+strictly-increasing epoch), integrity-protected (HMAC keyed by the master-derived
+resume key), bound to SessionId + peer-identity pair + protocol version, and
+short-lived. A reconnect continues in-flight work (a Transfer resumes from its
+on-disk offset via the `ReliabilityStore`) without restarting; a stale, forged, or
+replayed token is refused and the session terminates cleanly rather than resuming
+incorrectly (fail-closed, I11). Because the master secret is retained (not
+re-derived), recovery **never** repeats authentication, yet remains mutually
+authenticated: only a holder of the master can MAC a valid token or open the sealed
+`ResumeAck`.
+
+> **Note (M6 vs. earlier draft).** An earlier draft of this diagram re-ran the full
+> handshake (`REAUTH`/`RENEGOTIATE`) on every reconnect. M6 supersedes that: the
+> handshake runs **exactly once per session** (I5/I6 satisfied via the master-keyed
+> token), which is both simpler (DR2) and preserves in-flight channel crypto. This
+> is a derived-document evolution; no constitutional invariant changed.
 
 ---
 

@@ -139,3 +139,66 @@ capability over the in-memory `ChannelTransport` with the **real** authenticated
 handshake and **real** per-channel crypto (only the socket is simulated). A
 dedicated real-QUIC sealed-transfer test remains a recommended follow-up (the
 QUIC transport itself is already covered for multiplexing at M3).
+
+## M6 addendum — reconnect + resume security
+
+M6 lets an authenticated session survive transport loss and resume over a fresh
+connection **without repeating the handshake**. Security rests on the same master
+secret M4 already established.
+
+### Resume token
+- **Binding.** An HMAC-SHA256 over `{session_id, unordered device-id pair,
+  protocol version, epoch, created_at, expires_at}`, keyed by a **resume key** =
+  `HKDF(canonically-ordered master halves, "peerbeam-resume-key-v1")`. The resume
+  key is domain-separated from every channel key and is **never** sent — only a MAC
+  over public binding fields is. Both peers derive an identical resume key
+  regardless of role (`crypto.rs::resume_key`), and identical bindings (device-id
+  pair is sorted), so either can mint/validate.
+- **Single-use.** Each token authorises exactly one strictly-increasing `epoch`;
+  the accepter tracks the highest consumed epoch and rejects `epoch ≤ consumed`
+  (`resume.rs::verify`, guard `ResumeReplayed`). The redialler bumps the epoch per
+  attempt, so a partially-used epoch is never re-presented.
+- **Fail-closed verification** (order: MAC → binding → freshness → single-use):
+  tampered/forged → `ResumeRejected` (constant-time `verify_slice`); wrong device
+  pair or version → `ResumeRejected`; expired → `ResumeExpired`; replayed →
+  `ResumeReplayed`. Any failure refuses the resume (`ResumeAck{accepted:false}`)
+  and the manager gives up rather than resuming incorrectly (I11). Unit-tested in
+  `resume.rs` (tamper, wrong key, wrong peer, wrong version, wrong session, expiry,
+  replay, mirrored-view).
+
+### No nonce reuse across reconnects
+The reconnect **epoch** is mixed into the M4 HKDF `info` (`crypto.rs::info`). On
+resume both peers rebuild every channel context (control included) at `epoch+1`, so
+keys are entirely fresh and counters legitimately restart at 0 under a *different*
+key — no `(key, nonce)` pair repeats, and a counter reset is never a rollback within
+one key. Verified by `epoch_bump_yields_fresh_keys_no_nonce_reuse` and
+`both_peers_derive_same_epoch_keys`.
+
+### Identity preserved, no re-auth, still mutually authenticated
+The master secret is retained across the loss (`PreservedSession.crypto`), so the
+authenticated handshake runs **exactly once per session**. Resume is still mutually
+authenticated: only a holder of the master can MAC a valid token (proves the
+redialler) or produce/open the **sealed** `ResumeAck` under the epoch control key
+(proves the accepter). This satisfies I5 (E2E, mutually authenticated) and I6
+(identity cryptographically proven, never inferred from "connected once") without a
+second ECDH.
+
+### Failure isolation
+Recovery is capability-agnostic infrastructure. A failed resume closes the session
+cleanly (`RecoveryExhausted`) and never resumes a wrong session. In-flight transfer
+payloads resume from their own on-disk checkpoint (`ReliabilityStore` /
+`recover.rs`), which M6 reuses rather than duplicates.
+
+### Residual risks / notes
+- **Plaintext `ResumeRequest`.** The token is self-authenticating (MAC) and carries
+  no secret; it is sent unsealed on the fresh stream because the epoch keys are not
+  yet in force on both sides. QUIC's own TLS still encrypts it in transit, and a
+  captured token cannot be replayed (single-use epoch) nor used without the master
+  (an attacker cannot complete the sealed `ResumeAck` step). A passive observer
+  learns only `session_id` + device ids, which are not secret-critical.
+- **Wall-clock for freshness.** Token expiry uses `SystemTime` (not a nonce), so a
+  grossly-wrong clock could widen/narrow the window; the single-use epoch guard is
+  the primary anti-replay control, with expiry as defence in depth.
+- **Real-QUIC verified.** `peerbeam-transfer-quic/tests/reconnect.rs` drives the
+  full path over two real QUIC endpoints: establish → close the connection →
+  redial → resume (epoch 1) → channel re-attached → session usable.
