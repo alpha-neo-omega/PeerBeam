@@ -45,8 +45,7 @@ async fn multiplexes_independent_channels_over_real_quic() {
     // The server accepts only while its stream is polled, so dial and accept
     // must run concurrently.
     let sess = session();
-    let (dialed, accepted) =
-        tokio::join!(client.dial_channels(&route, &sess), incoming.next());
+    let (dialed, accepted) = tokio::join!(client.dial_channels(&route, &sess), incoming.next());
     let ct_client = dialed.unwrap();
     let ct_server = accepted.expect("a connection").unwrap();
 

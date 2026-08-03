@@ -18,13 +18,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use peerbeam_domain::port::{ChannelTransport, Link};
 use peerbeam_domain::session::{
     CapabilitySet, ChannelId, ChannelState, ChannelType, MessageFlags, MessageType, SessionError,
-    SessionFrame,
+    SessionFrame, Version,
 };
 
 use super::channel::{
     spawn_channel, ActorEvent, Channel, ChannelEvent, ChannelInfo, PROBE_MESSAGE_TYPE,
 };
 use super::control::ControlMessage;
+use super::crypto::SessionCrypto;
 use super::event::SessionRole;
 use super::registry::HandlerRegistry;
 
@@ -35,6 +36,8 @@ pub const DEFAULT_CHANNEL_LIMIT: usize = 256;
 /// Owns and coordinates one session's data channels.
 pub struct ChannelManager {
     transport: Arc<dyn ChannelTransport>,
+    crypto: SessionCrypto,
+    version: Version,
     channels: HashMap<ChannelId, Channel>,
     handlers: HandlerRegistry,
     negotiated: CapabilitySet,
@@ -55,6 +58,8 @@ impl ChannelManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport: Arc<dyn ChannelTransport>,
+        crypto: SessionCrypto,
+        version: Version,
         role: SessionRole,
         handlers: HandlerRegistry,
         negotiated: CapabilitySet,
@@ -70,6 +75,8 @@ impl ChannelManager {
         };
         ChannelManager {
             transport,
+            crypto,
+            version,
             channels: HashMap::new(),
             handlers,
             negotiated,
@@ -141,6 +148,7 @@ impl ChannelManager {
     ) -> Result<(ChannelId, ControlMessage), SessionError> {
         self.permit(channel_type).map_err(SessionError::Channel)?;
         let id = self.allocate_id();
+        let crypto = self.crypto.derive(id, self.version)?;
         let link = self.transport.open_stream().await?;
         let handler = self.handlers.get(channel_type);
         let channel = spawn_channel(
@@ -150,6 +158,8 @@ impl ChannelManager {
             link,
             handler,
             self.actor_events_tx.clone(),
+            crypto,
+            self.crypto.enc(),
         );
         self.channels.insert(id, channel);
         // Probe frame: materialises the stream on lazy transports (e.g. QUIC
@@ -214,6 +224,23 @@ impl ChannelManager {
             let Some(link) = self.pending_streams.pop_front() else {
                 break;
             };
+            let crypto = match self.crypto.derive(id, self.version) {
+                Ok(crypto) => crypto,
+                Err(e) => {
+                    // Key derivation failure (should be impossible): reject the
+                    // channel and drop the accepted stream. Isolated.
+                    self.emit(ChannelEvent::Error {
+                        channel: id,
+                        detail: e.to_string(),
+                    });
+                    drop(link);
+                    out.push(ControlMessage::ChannelReject {
+                        channel: id,
+                        reason: "key derivation failed".into(),
+                    });
+                    continue;
+                }
+            };
             let handler = self.handlers.get(channel_type);
             let channel = spawn_channel(
                 id,
@@ -222,6 +249,8 @@ impl ChannelManager {
                 link,
                 handler,
                 self.actor_events_tx.clone(),
+                crypto,
+                self.crypto.enc(),
             );
             self.channels.insert(id, channel);
             self.emit(ChannelEvent::Opened {

@@ -13,15 +13,36 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use common::MemTransport;
+use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::id::DeviceId;
+use peerbeam_domain::port::{EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelId, ChannelState, ChannelType, MessageFlags, MessageHandler,
     MessageType, SessionError, SessionFrame, Version,
 };
 use peerbeam_transfer::{
-    ChannelEvent, HandlerRegistry, PeerSession, SessionConfig, SessionEvent, SessionHandle,
-    SessionRole,
+    ChannelEvent, HandlerRegistry, Identity, PeerSession, SessionConfig, SessionEvent,
+    SessionHandle, SessionRole,
 };
+use peerbeam_trust_fs::FsTrust;
+
+/// Fresh identity, encryption provider, and (leaked-temp-dir) trust store for a
+/// test endpoint. Each side authenticates with its own keypair + empty trust
+/// store (TOFU pins the peer on first contact).
+fn security(name: &str) -> (Identity, Arc<dyn EncryptionProvider>, Arc<dyn TrustStore>) {
+    let enc = AeadCrypto::new();
+    let keypair = enc.generate_keypair();
+    let identity = Identity {
+        device_id: DeviceId::from(name),
+        name: name.to_string(),
+        keypair,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let trust = FsTrust::open(dir.path().join("trust.json")).expect("trust store");
+    // Keep the temp dir alive for the whole test; leaking is fine in tests.
+    std::mem::forget(dir);
+    (identity, Arc::new(enc), Arc::new(trust))
+}
 
 const T1: ChannelType = ChannelType::TRANSFER; // 0x0100
 fn t2() -> ChannelType {
@@ -86,23 +107,29 @@ async fn open(a_cfg: SessionConfig, b_cfg: SessionConfig) -> Pair {
     let (a_ch_tx, a_channels) = unbounded_channel();
     let (b_ch_tx, b_channels) = unbounded_channel();
 
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
     let fa = PeerSession::open(
         ta,
         SessionRole::Initiator,
-        DeviceId::from("device-b"),
         a_cfg,
         a_ev_tx,
         a_ch_tx,
         None,
+        id_a,
+        enc_a,
+        trust_a,
     );
     let fb = PeerSession::open(
         tb,
         SessionRole::Responder,
-        DeviceId::from("device-a"),
         b_cfg,
         b_ev_tx,
         b_ch_tx,
         None,
+        id_b,
+        enc_b,
+        trust_b,
     );
     let (ra, rb) = tokio::join!(fa, fb);
     let mut a = ra.expect("initiator opens");
@@ -165,23 +192,29 @@ async fn regression_establish_and_negotiate() {
     let (b_ev, _b_rx) = unbounded_channel();
     let (a_ch, _a_chr) = unbounded_channel();
     let (b_ch, _b_chr) = unbounded_channel();
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
     let fa = PeerSession::open(
         ta,
         SessionRole::Initiator,
-        DeviceId::from("b"),
         SessionConfig::new(caps()),
         a_ev,
         a_ch,
         None,
+        id_a,
+        enc_a,
+        trust_a,
     );
     let fb = PeerSession::open(
         tb,
         SessionRole::Responder,
-        DeviceId::from("a"),
         SessionConfig::new(caps()),
         b_ev,
         b_ch,
         None,
+        id_b,
+        enc_b,
+        trust_b,
     );
     let (ra, rb) = tokio::join!(fa, fb);
     let a = ra.expect("a");
@@ -205,23 +238,29 @@ async fn incompatible_major_versions_are_rejected() {
     let (b_ch, _) = unbounded_channel();
     let mut a_cfg = SessionConfig::new(caps());
     a_cfg.version = Version::new(2, 0);
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
     let fa = PeerSession::open(
         ta,
         SessionRole::Initiator,
-        DeviceId::from("b"),
         a_cfg,
         a_ev,
         a_ch,
         None,
+        id_a,
+        enc_a,
+        trust_a,
     );
     let fb = PeerSession::open(
         tb,
         SessionRole::Responder,
-        DeviceId::from("a"),
         SessionConfig::new(caps()),
         b_ev,
         b_ch,
         None,
+        id_b,
+        enc_b,
+        trust_b,
     );
     let (ra, rb) = tokio::join!(fa, fb);
     assert!(matches!(ra, Err(SessionError::VersionIncompatible { .. })));

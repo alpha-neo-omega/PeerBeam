@@ -7,12 +7,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use peerbeam_domain::port::{Frame, FrameKind, Link};
+use peerbeam_domain::port::{EncryptionProvider, Frame, FrameKind, Link};
 use peerbeam_domain::session::{
     ChannelId, ChannelState, ChannelType, MessageHandler, SessionFrame,
 };
+
+use super::crypto::ChannelCrypto;
 
 /// Reserved message type (0) for a probe frame sent when a channel opens, purely
 /// to materialise the underlying stream on a lazy transport (e.g. QUIC opens a
@@ -154,6 +157,7 @@ fn lock(stats: &Arc<Mutex<ChannelStats>>) -> std::sync::MutexGuard<'_, ChannelSt
 /// Create a channel by spawning its actor over `link`. The actor reads inbound
 /// frames (dispatching to `handler` if present) and writes queued outbound
 /// frames, reporting lifecycle changes via `actor_events`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_channel(
     id: ChannelId,
     channel_type: ChannelType,
@@ -161,6 +165,8 @@ pub(crate) fn spawn_channel(
     mut link: Box<dyn Link>,
     handler: Option<Arc<dyn MessageHandler>>,
     actor_events: UnboundedSender<ActorEvent>,
+    mut crypto: ChannelCrypto,
+    enc: Arc<dyn EncryptionProvider>,
 ) -> Channel {
     let (commands, mut command_rx) = unbounded_channel::<ActorCommand>();
     let stats = Arc::new(Mutex::new(ChannelStats::default()));
@@ -172,12 +178,22 @@ pub(crate) fn spawn_channel(
                 cmd = command_rx.recv() => match cmd {
                     Some(ActorCommand::Send(sf)) => {
                         let bytes = sf.payload.len() as u64;
-                        let frame = Frame { kind: FrameKind::Control, payload: sf.encode() };
+                        // Seal with this channel's key; advance the counter only
+                        // after a successful send (retry-safe).
+                        let sealed = match crypto.seal(&*enc, &sf.encode()) {
+                            Ok(sealed) => sealed,
+                            Err(e) => {
+                                let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
+                                break;
+                            }
+                        };
+                        let frame = Frame { kind: FrameKind::Control, payload: Bytes::from(sealed) };
                         if link.send_frame(frame).await.is_err() {
-                            let _ = actor_events.send(ActorEvent::Errored {
-                                channel: id,
-                                detail: "send failed".into(),
-                            });
+                            let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: "send failed".into() });
+                            break;
+                        }
+                        if let Err(e) = crypto.advance_send() {
+                            let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
                             break;
                         }
                         let mut s = lock(&actor_stats);
@@ -190,44 +206,47 @@ pub(crate) fn spawn_channel(
                     Some(ActorCommand::Close) | None => break,
                 },
                 inbound = link.recv_frame() => match inbound {
-                    Ok(Some(frame)) => match SessionFrame::decode(&frame.payload) {
-                        Ok(sf) => {
-                            {
-                                let mut s = lock(&actor_stats);
-                                s.frames_recv += 1;
-                                s.bytes_recv += sf.payload.len() as u64;
+                    Ok(Some(frame)) => {
+                        // Open with this channel's key; any failure (tamper,
+                        // replay, wrong key) is channel-scoped — it closes only
+                        // this channel, never the session or its neighbours.
+                        let plain = match crypto.open(&*enc, &frame.payload) {
+                            Ok(plain) => plain,
+                            Err(e) => {
+                                let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
+                                break;
                             }
-                            // The probe frame (message type 0) exists only to
-                            // materialise the stream on the peer; never dispatch it.
-                            if sf.message_type.get() != PROBE_MESSAGE_TYPE {
-                            if let Some(h) = &handler {
-                                if let Err(e) = h.handle(sf).await {
-                                    let _ = actor_events.send(ActorEvent::Errored {
-                                        channel: id,
-                                        detail: e.to_string(),
-                                    });
-                                    break;
+                        };
+                        match SessionFrame::decode(&plain) {
+                            Ok(sf) => {
+                                {
+                                    let mut s = lock(&actor_stats);
+                                    s.frames_recv += 1;
+                                    s.bytes_recv += sf.payload.len() as u64;
+                                }
+                                // The probe frame (message type 0) only
+                                // materialises the stream; never dispatch it.
+                                if sf.message_type.get() != PROBE_MESSAGE_TYPE {
+                                    if let Some(h) = &handler {
+                                        if let Err(e) = h.handle(sf).await {
+                                            let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
+                                break;
                             }
                         }
-                        Err(e) => {
-                            let _ = actor_events.send(ActorEvent::Errored {
-                                channel: id,
-                                detail: e.to_string(),
-                            });
-                            break;
-                        }
-                    },
+                    }
                     Ok(None) => {
                         let _ = actor_events.send(ActorEvent::Closed { channel: id });
                         break;
                     }
                     Err(e) => {
-                        let _ = actor_events.send(ActorEvent::Errored {
-                            channel: id,
-                            detail: e.to_string(),
-                        });
+                        let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
                         break;
                     }
                 },

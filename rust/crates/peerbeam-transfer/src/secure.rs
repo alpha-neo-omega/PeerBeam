@@ -18,17 +18,21 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use peerbeam_domain::error::{DomainError, Result};
-use peerbeam_domain::port::{EncryptionProvider, Frame, FrameKind, Link, Nonce};
+use peerbeam_domain::port::{EncryptionProvider, Frame, FrameKind, Link};
+use peerbeam_domain::session::SessionError;
 
 use crate::auth::Session;
+use crate::session::ChannelCrypto;
 
 /// A [`Link`] that seals/opens frames using an authenticated [`Session`].
+///
+/// The per-frame sealing (AES-256-GCM, counter-nonce, strict replay) lives in
+/// [`ChannelCrypto`], shared with the multiplexed session layer so there is one
+/// implementation of the sealing scheme.
 pub struct SecureLink<'a> {
     inner: &'a mut dyn Link,
     enc: &'a dyn EncryptionProvider,
-    session: Session,
-    send_ctr: u64,
-    recv_ctr: u64,
+    crypto: ChannelCrypto,
 }
 
 impl<'a> SecureLink<'a> {
@@ -37,39 +41,37 @@ impl<'a> SecureLink<'a> {
         Self {
             inner,
             enc,
-            session,
-            send_ctr: 0,
-            recv_ctr: 0,
+            crypto: ChannelCrypto::from_keys(
+                session.send_key,
+                session.recv_key,
+                session.send_prefix,
+                session.recv_prefix,
+            ),
         }
     }
+}
 
-    fn nonce(prefix: [u8; 4], ctr: u64) -> Nonce {
-        let mut n = [0u8; 12];
-        n[..4].copy_from_slice(&prefix);
-        n[4..].copy_from_slice(&ctr.to_be_bytes());
-        Nonce(n)
-    }
+fn sess_to_dom(e: SessionError) -> DomainError {
+    DomainError::Integrity(e.to_string())
 }
 
 #[async_trait]
 impl Link for SecureLink<'_> {
     async fn send_frame(&mut self, frame: Frame) -> Result<()> {
-        // Seal with the *current* counter; only advance it once the inner send
-        // succeeds. A failed send (retried on the same link via
-        // `send_with_retry`) must re-seal with the same nonce/counter — the
-        // receiver never advanced, so a bumped counter would desync and every
-        // subsequent frame would be rejected as "reordered".
-        let nonce = Self::nonce(self.session.send_prefix, self.send_ctr);
+        // Seal with the current counter; advance only after the inner send
+        // succeeds so a retried send re-seals with the same nonce (the receiver
+        // never advanced) rather than desyncing.
         let sealed = self
-            .enc
-            .seal(&self.session.send_key, &nonce, &encode_frame(&frame))?;
+            .crypto
+            .seal(self.enc, &encode_frame(&frame))
+            .map_err(sess_to_dom)?;
         self.inner
             .send_frame(Frame {
                 kind: FrameKind::Control,
                 payload: Bytes::from(sealed),
             })
             .await?;
-        self.send_ctr += 1;
+        self.crypto.advance_send().map_err(sess_to_dom)?;
         Ok(())
     }
 
@@ -77,23 +79,10 @@ impl Link for SecureLink<'_> {
         let Some(outer) = self.inner.recv_frame().await? else {
             return Ok(None);
         };
-        let payload = &outer.payload;
-        if payload.len() < 12 {
-            return Err(DomainError::Integrity("secure frame too short".into()));
-        }
-
-        // The nonce (prefix + counter) is prepended by `seal`. Reject any
-        // frame that isn't the next expected one before spending a decrypt.
-        let got_prefix = &payload[..4];
-        let got_ctr = u64::from_be_bytes(payload[4..12].try_into().expect("8 bytes"));
-        if got_prefix != self.session.recv_prefix || got_ctr != self.recv_ctr {
-            return Err(DomainError::Integrity(
-                "replayed, reordered, or forged frame".into(),
-            ));
-        }
-
-        let plain = self.enc.open(&self.session.recv_key, payload)?;
-        self.recv_ctr += 1;
+        let plain = self
+            .crypto
+            .open(self.enc, &outer.payload)
+            .map_err(sess_to_dom)?;
         Ok(Some(decode_frame(&plain)?))
     }
 

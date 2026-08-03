@@ -16,12 +16,14 @@
 mod channel;
 mod channel_manager;
 mod control;
+mod crypto;
 mod event;
 mod registry;
 
 pub use channel::{ChannelEvent, ChannelInfo, ChannelStats};
 pub use channel_manager::ChannelManager;
 pub use control::{ControlMessage, SessionHello};
+pub(crate) use crypto::{ChannelCrypto, SessionCrypto};
 pub use event::{
     CloseReason, Keepalive, KeepaliveAction, KeepaliveConfig, SessionEvent, SessionRole,
 };
@@ -38,11 +40,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::port::{ChannelTransport, Frame, FrameKind, Link};
+use peerbeam_domain::port::{
+    ChannelTransport, EncryptionProvider, Frame, FrameKind, Link, TrustStore,
+};
 use peerbeam_domain::session::{
     negotiate_version, Capability, CapabilitySet, ChannelId, ChannelType, MessageFlags,
     MessageType, SessionError, SessionFrame, SessionId, SessionState, Version, VersionNegotiation,
 };
+
+use crate::auth::{authenticate, Identity};
 
 use channel::ActorEvent;
 
@@ -209,6 +215,8 @@ pub struct PeerSession {
     version: Version,
     capabilities: CapabilitySet,
     control: Box<dyn Link>,
+    control_crypto: ChannelCrypto,
+    enc: Arc<dyn EncryptionProvider>,
     manager: ChannelManager,
     events: UnboundedSender<SessionEvent>,
     keepalive: Keepalive,
@@ -227,14 +235,17 @@ impl PeerSession {
     /// Takes the first stream as the control channel, exchanges [`SessionHello`]
     /// (initiator mints the id, responder adopts it), then negotiates version and
     /// capabilities. `channel_events` receives per-channel lifecycle events.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         transport: Arc<dyn ChannelTransport>,
         role: SessionRole,
-        peer: DeviceId,
         config: SessionConfig,
         events: UnboundedSender<SessionEvent>,
         channel_events: UnboundedSender<ChannelEvent>,
         registry: Option<SessionRegistry>,
+        identity: Identity,
+        enc: Arc<dyn EncryptionProvider>,
+        trust: Arc<dyn TrustStore>,
     ) -> Result<PeerSession, SessionError> {
         let now = Instant::now();
 
@@ -247,6 +258,14 @@ impl PeerSession {
             })?,
         };
 
+        // The authenticated handshake runs exactly once per session, over the raw
+        // control stream. Its master secret keys every channel (control included).
+        let auth_session = authenticate(control.as_mut(), &identity, &*enc, &*trust).await?;
+        let peer = auth_session.peer_id.clone();
+        let session_crypto = SessionCrypto::from_session(&auth_session, role, enc.clone());
+        let mut control_crypto = session_crypto.control()?;
+
+        // From here the control channel is sealed with its own derived key.
         let our_hello = |session_id| {
             ControlMessage::Hello(SessionHello {
                 version: config.version,
@@ -257,21 +276,30 @@ impl PeerSession {
         let (session_id, peer_hello) = match role {
             SessionRole::Initiator => {
                 let id = random_session_id();
-                send_control(control.as_mut(), &our_hello(id)).await?;
-                (id, recv_hello(control.as_mut()).await?)
+                send_control(control.as_mut(), &mut control_crypto, &*enc, &our_hello(id)).await?;
+                (
+                    id,
+                    recv_hello(control.as_mut(), &mut control_crypto, &*enc).await?,
+                )
             }
             SessionRole::Responder => {
-                let peer_hello = recv_hello(control.as_mut()).await?;
+                let peer_hello = recv_hello(control.as_mut(), &mut control_crypto, &*enc).await?;
                 let id = peer_hello.session_id;
-                send_control(control.as_mut(), &our_hello(id)).await?;
+                send_control(control.as_mut(), &mut control_crypto, &*enc, &our_hello(id)).await?;
                 (id, peer_hello)
             }
         };
 
         let version = match negotiate_version(config.version, peer_hello.version) {
             VersionNegotiation::Agreed(v) => v,
-            VersionNegotiation::Incompatible { local, peer } => {
-                return Err(SessionError::VersionIncompatible { local, peer })
+            VersionNegotiation::Incompatible {
+                local,
+                peer: peer_version,
+            } => {
+                return Err(SessionError::VersionIncompatible {
+                    local,
+                    peer: peer_version,
+                })
             }
         };
         let capabilities = config.capabilities.intersect(&peer_hello.capabilities);
@@ -280,6 +308,8 @@ impl PeerSession {
         let (commands_tx, commands_rx) = unbounded_channel();
         let manager = ChannelManager::new(
             transport,
+            session_crypto,
+            version,
             role,
             config.handlers,
             capabilities.clone(),
@@ -296,6 +326,8 @@ impl PeerSession {
             version,
             capabilities: capabilities.clone(),
             control,
+            control_crypto,
+            enc,
             manager,
             events,
             keepalive: Keepalive::new(config.keepalive, now),
@@ -387,7 +419,15 @@ impl PeerSession {
     pub async fn run(&mut self) -> Result<(), SessionError> {
         loop {
             while let Some(msg) = self.control_out.pop_front() {
-                if send_control(self.control.as_mut(), &msg).await.is_err() {
+                if send_control(
+                    self.control.as_mut(),
+                    &mut self.control_crypto,
+                    &*self.enc,
+                    &msg,
+                )
+                .await
+                .is_err()
+                {
                     self.mark_closed(CloseReason::Error("control write failed".into()));
                     return Ok(());
                 }
@@ -398,15 +438,17 @@ impl PeerSession {
 
             let transport = self.manager.transport();
             let accepting = self.accepting;
+            let enc = self.enc.clone();
             let wake = {
                 let Self {
                     control,
+                    control_crypto,
                     actor_events_rx,
                     commands_rx,
                     ..
                 } = &mut *self;
                 tokio::select! {
-                    r = recv_session_frame(control.as_mut()) => Wake::Control(r),
+                    r = recv_session_frame(control.as_mut(), control_crypto, &*enc) => Wake::Control(r),
                     a = transport.accept_stream(), if accepting => Wake::Accept(a.map_err(SessionError::from)),
                     e = actor_events_rx.recv() => Wake::Actor(e),
                     c = commands_rx.recv() => Wake::Command(c),
@@ -566,6 +608,8 @@ impl PeerSession {
         }
         let _ = send_control(
             self.control.as_mut(),
+            &mut self.control_crypto,
+            &*self.enc,
             &ControlMessage::Shutdown("local close".into()),
         )
         .await;
@@ -601,28 +645,47 @@ impl PeerSession {
     }
 }
 
-/// Wrap a control message in a transport frame and send it on `link`.
-async fn send_control(link: &mut dyn Link, msg: &ControlMessage) -> Result<(), SessionError> {
+/// Seal a control message with the control channel's key and send it.
+async fn send_control(
+    link: &mut dyn Link,
+    crypto: &mut ChannelCrypto,
+    enc: &dyn EncryptionProvider,
+    msg: &ControlMessage,
+) -> Result<(), SessionError> {
     let session_frame = msg.to_frame()?;
-    let frame = Frame {
+    let sealed = crypto.seal(enc, &session_frame.encode())?;
+    link.send_frame(Frame {
         kind: FrameKind::Control,
-        payload: session_frame.encode(),
-    };
-    link.send_frame(frame).await?;
+        payload: Bytes::from(sealed),
+    })
+    .await?;
+    crypto.advance_send()?;
     Ok(())
 }
 
-/// Receive one transport frame and decode the session frame it carries.
-async fn recv_session_frame(link: &mut dyn Link) -> Result<Option<SessionFrame>, SessionError> {
+/// Receive one transport frame, open it with the control key, and decode the
+/// session frame it carries.
+async fn recv_session_frame(
+    link: &mut dyn Link,
+    crypto: &mut ChannelCrypto,
+    enc: &dyn EncryptionProvider,
+) -> Result<Option<SessionFrame>, SessionError> {
     match link.recv_frame().await? {
-        Some(frame) => Ok(Some(SessionFrame::decode(&frame.payload)?)),
+        Some(frame) => {
+            let plain = crypto.open(enc, &frame.payload)?;
+            Ok(Some(SessionFrame::decode(&plain)?))
+        }
         None => Ok(None),
     }
 }
 
 /// Receive the peer's opening [`SessionHello`], rejecting anything else.
-async fn recv_hello(link: &mut dyn Link) -> Result<SessionHello, SessionError> {
-    match recv_session_frame(link).await? {
+async fn recv_hello(
+    link: &mut dyn Link,
+    crypto: &mut ChannelCrypto,
+    enc: &dyn EncryptionProvider,
+) -> Result<SessionHello, SessionError> {
+    match recv_session_frame(link, crypto, enc).await? {
         Some(frame) => match ControlMessage::from_frame(&frame)? {
             ControlMessage::Hello(hello) => Ok(hello),
             other => Err(SessionError::UnexpectedMessage {
