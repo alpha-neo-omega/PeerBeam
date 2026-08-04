@@ -40,7 +40,10 @@ pub use recovery::{
 };
 pub use registry::{HandlerRegistry, SessionInfo, SessionRegistry};
 pub use resume::{ResumeBinding, ResumeToken};
-pub use transfer::{receive_file_on_channel, send_file_on_session};
+pub use transfer::{
+    receive_file_on_channel, receive_folder_on_channel, send_file_on_session,
+    send_folder_on_session,
+};
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;

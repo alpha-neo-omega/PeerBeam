@@ -34,6 +34,7 @@ use peerbeam_domain::session::{ChannelType, SessionError};
 use super::channel::IncomingStreamChannel;
 use super::SessionHandle;
 use crate::control::TransferControl;
+use crate::folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 use crate::stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};
 
 fn sess_to_dom(e: SessionError) -> DomainError {
@@ -81,6 +82,44 @@ pub async fn receive_file_on_channel(
         channel, mut link, ..
     } = incoming;
     let received = receive_file(link.as_mut(), storage, dest_dir, ctrl, progress).await;
+    session.close_channel(channel);
+    received
+}
+
+/// Open a dedicated transfer channel on `session` and send a **folder** over it,
+/// reusing the folder transfer engine unchanged (same channel mechanism as
+/// [`send_file_on_session`]).
+pub async fn send_folder_on_session(
+    session: &SessionHandle,
+    storage: &dyn StorageProvider,
+    req: FolderSendRequest,
+    ctrl: &TransferControl,
+    progress: &UnboundedSender<Progress>,
+    retries: u32,
+) -> Result<TransferOutcome> {
+    let (channel, mut link) = session
+        .open_stream_channel(ChannelType::TRANSFER)
+        .await
+        .map_err(sess_to_dom)?;
+    let outcome = send_folder(link.as_mut(), storage, req, ctrl, progress, retries).await;
+    session.close_channel(channel);
+    outcome
+}
+
+/// Receive a **folder** over an accepted incoming transfer channel, reusing the
+/// folder transfer engine unchanged.
+pub async fn receive_folder_on_channel(
+    incoming: IncomingStreamChannel,
+    session: &SessionHandle,
+    storage: &dyn StorageProvider,
+    dest_dir: &str,
+    ctrl: &TransferControl,
+    progress: &UnboundedSender<Progress>,
+) -> Result<FolderReceived> {
+    let IncomingStreamChannel {
+        channel, mut link, ..
+    } = incoming;
+    let received = receive_folder(link.as_mut(), storage, dest_dir, ctrl, progress).await;
     session.close_channel(channel);
     received
 }

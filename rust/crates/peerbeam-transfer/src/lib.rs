@@ -18,6 +18,7 @@
 mod auth;
 mod clipboard;
 mod control;
+mod cutover;
 mod folder;
 mod peek;
 mod protocol;
@@ -29,17 +30,22 @@ mod stream;
 pub use auth::{authenticate, Identity, Session};
 pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
+pub use cutover::{
+    receive_file_selected, receive_folder_selected, send_file_selected, send_folder_selected,
+    transfer_capability, CompatMode, FallbackReason, LegacyPath, MigrationMetrics,
+    MigrationSnapshot, SessionOpen, SessionReceivePath, SessionSendPath, TransferPath,
+};
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use peek::PeekLink;
 pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};
 pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
 pub use session::{
-    receive_file_on_channel, send_file_on_session, ChannelEvent, ChannelInfo, ChannelStats,
-    CloseReason, ControlMessage, HandlerRegistry, IncomingStreamChannel, Keepalive,
-    KeepaliveAction, KeepaliveConfig, PeerSession, PreservedSession, RecoveryConfig,
-    RecoveryManager, RecoveryStats, ResumeBinding, ResumeToken, RunExit, SessionConfig,
-    SessionEvent, SessionHandle, SessionHello, SessionInfo, SessionRegistry, SessionRole,
-    SessionWiring, TransportFactory,
+    receive_file_on_channel, receive_folder_on_channel, send_file_on_session,
+    send_folder_on_session, ChannelEvent, ChannelInfo, ChannelStats, CloseReason, ControlMessage,
+    HandlerRegistry, IncomingStreamChannel, Keepalive, KeepaliveAction, KeepaliveConfig,
+    PeerSession, PreservedSession, RecoveryConfig, RecoveryManager, RecoveryStats, ResumeBinding,
+    ResumeToken, RunExit, SessionConfig, SessionEvent, SessionHandle, SessionHello, SessionInfo,
+    SessionRegistry, SessionRole, SessionWiring, TransportFactory,
 };
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};
