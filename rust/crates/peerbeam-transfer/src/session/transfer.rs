@@ -28,13 +28,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use peerbeam_domain::entity::Progress;
 use peerbeam_domain::error::{DomainError, Result};
-use peerbeam_domain::port::StorageProvider;
+use peerbeam_domain::port::{FrameKind, StorageProvider};
 use peerbeam_domain::session::{ChannelType, SessionError};
 
 use super::channel::IncomingStreamChannel;
 use super::SessionHandle;
 use crate::control::TransferControl;
 use crate::folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
+use crate::peek::PeekLink;
 use crate::stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};
 
 fn sess_to_dom(e: SessionError) -> DomainError {
@@ -122,4 +123,51 @@ pub async fn receive_folder_on_channel(
     let received = receive_folder(link.as_mut(), storage, dest_dir, ctrl, progress).await;
     session.close_channel(channel);
     received
+}
+
+/// What a channel receive produced — a single file or a folder.
+#[derive(Debug)]
+pub enum ChannelReceived {
+    /// A single file arrived.
+    File(Received),
+    /// A folder arrived.
+    Folder(FolderReceived),
+}
+
+/// Receive a file **or** a folder over an accepted incoming transfer channel,
+/// dispatching by peeking the first frame (a folder opens with a `Control`
+/// manifest frame; a file opens with a `Meta` frame) — the same discriminator the
+/// legacy receive path uses, now over a per-channel sealed stream. Reuses
+/// [`receive_file`] / [`receive_folder`] unchanged.
+pub async fn receive_on_channel(
+    incoming: IncomingStreamChannel,
+    session: &SessionHandle,
+    storage: &dyn StorageProvider,
+    dest_dir: &str,
+    ctrl: &TransferControl,
+    progress: &UnboundedSender<Progress>,
+) -> Result<ChannelReceived> {
+    let IncomingStreamChannel {
+        channel, mut link, ..
+    } = incoming;
+    let result = async {
+        let first = link
+            .recv_frame()
+            .await?
+            .ok_or_else(|| DomainError::Connection("channel closed before data".into()))?;
+        let is_folder = first.kind == FrameKind::Control;
+        let mut peek = PeekLink::new(first, link.as_mut());
+        if is_folder {
+            receive_folder(&mut peek, storage, dest_dir, ctrl, progress)
+                .await
+                .map(ChannelReceived::Folder)
+        } else {
+            receive_file(&mut peek, storage, dest_dir, ctrl, progress)
+                .await
+                .map(ChannelReceived::File)
+        }
+    }
+    .await;
+    session.close_channel(channel);
+    result
 }
