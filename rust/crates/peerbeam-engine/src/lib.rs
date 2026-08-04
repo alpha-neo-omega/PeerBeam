@@ -11,6 +11,7 @@
 
 mod builder;
 mod device_manager;
+mod diagnostics;
 mod engine;
 mod error;
 mod route_classifier;
@@ -18,6 +19,7 @@ mod route_manager;
 
 pub use builder::EngineBuilder;
 pub use device_manager::DeviceManager;
+pub use diagnostics::SessionDiagnostics;
 pub use engine::Engine;
 pub use error::EngineError;
 pub use route_classifier::{AddressClassifier, RouteClassifier};

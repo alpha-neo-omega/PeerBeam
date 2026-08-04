@@ -69,11 +69,54 @@ pub enum Command {
     Benchmark(BenchmarkArgs),
     /// Show overall status.
     Status,
+    /// Inspect PeerSessions (list / show / watch / stats).
+    Session(SessionArgs),
+    /// Inspect PeerSession channels.
+    Channels(ChannelsArgs),
+    /// Show active transfers and their transport (PeerSession / legacy).
+    Transfers,
+    /// Show migration (cutover) statistics.
+    Migration,
+    /// Show reconnect / resume (recovery) state.
+    Recovery,
+    /// Aggregate PeerSession diagnostics (sessions + migration + recovery).
+    Diagnostics,
     /// Generate a shell completion script.
     Completions {
         /// Target shell.
         shell: Shell,
     },
+}
+
+#[derive(Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub action: SessionAction,
+}
+
+#[derive(Subcommand)]
+pub enum SessionAction {
+    /// List active sessions.
+    List,
+    /// Show one session by id.
+    Show {
+        /// Session id (hex, as shown by `session list`).
+        id: String,
+    },
+    /// Stream session lifecycle changes (snapshot when no daemon is attached).
+    Watch,
+    /// Session + migration summary counters.
+    Stats,
+}
+
+#[derive(Args)]
+pub struct ChannelsArgs {
+    /// Session id to inspect; omit for all tracked sessions.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Stream channel changes (snapshot when no daemon is attached).
+    #[arg(long)]
+    pub watch: bool,
 }
 
 #[derive(Args)]

@@ -41,7 +41,81 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Clipboard(a) => clipboard(ctx, a, cfg_override.as_deref()).await,
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
+        Command::Session(a) => session_cmd(ctx, a).await,
+        Command::Channels(a) => channels_cmd(ctx, a).await,
+        Command::Transfers => transfers_cmd(ctx),
+        Command::Migration => migration_cmd(ctx),
+        Command::Recovery => recovery_cmd(ctx),
+        Command::Diagnostics => diagnostics_cmd(ctx),
     }
+}
+
+// ── PeerSession diagnostics (M8, presentation only) ─────────────────────────
+//
+// The CLI is a stateless presentation layer over the engine's
+// `SessionDiagnostics` (the single source of truth). A one-shot invocation holds
+// no live sessions of its own — so a standalone `peerbeam session list` reports
+// an empty set — while a long-running `daemon` (or an in-process transfer) shows
+// its live sessions. No engine state is duplicated here.
+
+/// Print a diagnostics value as JSON (always machine-readable, pretty in a TTY).
+fn present(ctx: &Ctx, value: &serde_json::Value) -> CliResult {
+    if ctx.json {
+        ctx.json_line(value);
+    } else {
+        let pretty = serde_json::to_string_pretty(value)
+            .map_err(|e| CliError::Other(format!("format: {e}")))?;
+        ctx.line(&pretty);
+    }
+    Ok(())
+}
+
+async fn session_cmd(ctx: &Ctx, args: SessionArgs) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    let value = match args.action {
+        SessionAction::List | SessionAction::Watch => diag.sessions_json(),
+        SessionAction::Show { id } => diag.session_json(&id),
+        SessionAction::Stats => json!({
+            "sessions": diag.sessions_json()["count"].clone(),
+            "migration": diag.migration_json(),
+        }),
+    };
+    present(ctx, &value)
+}
+
+async fn channels_cmd(ctx: &Ctx, args: ChannelsArgs) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    let value = match args.session {
+        Some(id) => diag.channels_json(&id).await,
+        None => diag.all_channels_json().await,
+    };
+    present(ctx, &value)
+}
+
+fn transfers_cmd(ctx: &Ctx) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    // Transfers ride PeerSessions (M7 default) or the legacy transport; present
+    // both the live sessions and the transport breakdown.
+    let value = json!({
+        "sessions": diag.sessions_json(),
+        "migration": diag.migration_json(),
+    });
+    present(ctx, &value)
+}
+
+fn migration_cmd(ctx: &Ctx) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    present(ctx, &diag.migration_json())
+}
+
+fn recovery_cmd(ctx: &Ctx) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    present(ctx, &diag.recovery_json())
+}
+
+fn diagnostics_cmd(ctx: &Ctx) -> CliResult {
+    let diag = peerbeam_engine::SessionDiagnostics::new();
+    present(ctx, &diag.diagnostics_json())
 }
 
 fn load_config(override_path: Option<&str>) -> Result<EngineConfig, CliError> {
@@ -921,6 +995,8 @@ async fn secure_send_folder(
             "outcome": format!("{outcome:?}"),
             "peer": peer_id,
             "newly_trusted": newly_trusted,
+            // M8 additive: the transport this transfer used on the wire.
+            "transport": "legacy",
         }));
     } else {
         ctx.line(&ctx.green(&format!("sent folder {name}")));
@@ -1081,6 +1157,8 @@ async fn secure_send_file(
             "bytes": size,
             "peer": peer_id,
             "newly_trusted": newly_trusted,
+            // M8 additive: the transport this transfer used on the wire.
+            "transport": "legacy",
         }));
     } else {
         ctx.line(&ctx.green(&format!("sent {name}")));
@@ -1259,6 +1337,7 @@ async fn serve_loop(
                         "bytes": rcv.bytes,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
+                        "transport": "legacy",
                     }));
                 } else {
                     ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
@@ -1280,6 +1359,7 @@ async fn serve_loop(
                         "files": fr.files,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
+                        "transport": "legacy",
                     }));
                 } else {
                     ctx.line(
@@ -1620,6 +1700,85 @@ mod config_key_tests {
         assert_eq!(render_scalar(&json!("hi")), "hi");
         assert_eq!(render_scalar(&json!(7)), "7");
         assert_eq!(render_scalar(&json!(true)), "true");
+    }
+}
+
+// ── M8: additive PeerSession CLI commands ───────────────────────────────────
+#[cfg(test)]
+mod session_cli_tests {
+    use super::dispatch;
+    use crate::cli::{ChannelsArgs, Cli, Command, SessionAction, SessionArgs};
+    use crate::output::Ctx;
+
+    fn quiet_ctx() -> Ctx {
+        // json=true so output is machine-readable; no colour, non-interactive.
+        Ctx::new(true, true, 0, true, true)
+    }
+
+    #[tokio::test]
+    async fn diagnostic_commands_dispatch_ok() {
+        let ctx = quiet_ctx();
+        // Each new command presents an (empty, standalone) diagnostics snapshot
+        // without error — proving the presentation wiring over the engine's
+        // SessionDiagnostics.
+        for cmd in [
+            Command::Session(SessionArgs {
+                action: SessionAction::List,
+            }),
+            Command::Session(SessionArgs {
+                action: SessionAction::Show {
+                    id: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+                },
+            }),
+            Command::Session(SessionArgs {
+                action: SessionAction::Stats,
+            }),
+            Command::Session(SessionArgs {
+                action: SessionAction::Watch,
+            }),
+            Command::Channels(ChannelsArgs {
+                session: None,
+                watch: false,
+            }),
+            Command::Channels(ChannelsArgs {
+                session: Some("deadbeefdeadbeefdeadbeefdeadbeef".into()),
+                watch: false,
+            }),
+            Command::Transfers,
+            Command::Migration,
+            Command::Recovery,
+            Command::Diagnostics,
+        ] {
+            assert!(dispatch(cmd, &ctx, None).await.is_ok());
+        }
+    }
+
+    #[test]
+    fn cli_parses_new_and_existing_subcommands() {
+        use clap::Parser;
+        // New additive subcommands parse.
+        for args in [
+            vec!["peerbeam", "session", "list"],
+            vec!["peerbeam", "session", "show", "abc"],
+            vec!["peerbeam", "session", "watch"],
+            vec!["peerbeam", "session", "stats"],
+            vec!["peerbeam", "channels", "--session", "abc", "--watch"],
+            vec!["peerbeam", "transfers"],
+            vec!["peerbeam", "migration"],
+            vec!["peerbeam", "recovery"],
+            vec!["peerbeam", "diagnostics"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "should parse: {args:?}");
+        }
+        // Existing commands still parse unchanged (backward compatibility).
+        for args in [
+            vec!["peerbeam", "status"],
+            vec!["peerbeam", "send", "file.txt", "--to", "box"],
+            vec!["peerbeam", "receive", "--once"],
+            vec!["peerbeam", "history", "--limit", "5"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "regression: {args:?}");
+        }
     }
 }
 

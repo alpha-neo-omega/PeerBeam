@@ -62,3 +62,54 @@ pub fn transfer(id: &str, ty: &str, payload: Value) {
         "payload": payload,
     }));
 }
+
+/// Additive PeerSession event vocabulary (M8). New `type` strings only — existing
+/// consumers ignore unknown types, so this never breaks the callback contract.
+///
+/// The transport-selection path emits these once a frontend routes its transfers
+/// through the M7 selector; the vocabulary is published now so consumers (Dart)
+/// can subscribe additively. Marked `allow(dead_code)` until that wiring lands.
+#[allow(dead_code)]
+pub mod kind {
+    /// A PeerSession was established.
+    pub const SESSION_CREATED: &str = "session_created";
+    /// A PeerSession closed.
+    pub const SESSION_CLOSED: &str = "session_closed";
+    /// A PeerSession lost its transport and is reconnecting.
+    pub const SESSION_RECOVERING: &str = "session_recovering";
+    /// A PeerSession resumed after a reconnect.
+    pub const SESSION_RESUMED: &str = "session_resumed";
+    /// Recovery gave up; the session terminated.
+    pub const RECOVERY_FAILED: &str = "recovery_failed";
+    /// A channel opened on a session.
+    pub const CHANNEL_OPENED: &str = "channel_opened";
+    /// A channel closed.
+    pub const CHANNEL_CLOSED: &str = "channel_closed";
+    /// Version + capability negotiation completed.
+    pub const CAPABILITY_NEGOTIATED: &str = "capability_negotiated";
+    /// A transfer fell back from PeerSession to the legacy transport.
+    pub const FALLBACK_TRIGGERED: &str = "fallback_triggered";
+    /// The migration (cutover) counters changed.
+    pub const MIGRATION_STATS_UPDATED: &str = "migration_stats_updated";
+}
+
+/// Emit a session-scoped event: `type`, `session_id`, `timestamp`, `payload`.
+#[allow(dead_code)]
+pub fn session(session_id: &str, ty: &str, payload: Value) {
+    emit(&json!({
+        "type": ty,
+        "session_id": session_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": payload,
+    }));
+}
+
+/// Emit a `migration_stats_updated` event carrying the current counters.
+#[allow(dead_code)]
+pub fn migration(snapshot: Value) {
+    emit(&json!({
+        "type": kind::MIGRATION_STATS_UPDATED,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": snapshot,
+    }));
+}

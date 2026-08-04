@@ -17,3 +17,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
+tempfile = { workspace = true }
+bytes = { workspace = true }

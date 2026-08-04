@@ -19,7 +19,7 @@ use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::event::DeviceChange;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::EncryptionProvider;
-use peerbeam_engine::{Engine, EngineBuilder, RouteManager};
+use peerbeam_engine::{Engine, EngineBuilder, RouteManager, SessionDiagnostics};
 use peerbeam_transfer::Identity;
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
@@ -33,6 +33,11 @@ static RT: OnceLock<Runtime> = OnceLock::new();
 static ENGINE: Mutex<Option<Arc<Engine>>> = Mutex::new(None);
 static ME: Mutex<Option<Device>> = Mutex::new(None);
 static MANAGER: Mutex<Option<Arc<Manager>>> = Mutex::new(None);
+/// PeerSession diagnostics (M8): the single, shared source of truth for live
+/// session/channel/migration/recovery state that the additive `pb_session_*` /
+/// `pb_migration_*` / `pb_diagnostics` calls read. Reuses the engine's
+/// `SessionDiagnostics` — no duplicated state.
+static DIAGNOSTICS: Mutex<Option<Arc<SessionDiagnostics>>> = Mutex::new(None);
 /// Tracks whether discovery is currently running, so a live rename knows
 /// whether to re-announce (no equivalent query exists on `Engine` itself).
 static DISCOVERING: AtomicBool = AtomicBool::new(false);
@@ -65,6 +70,16 @@ where
     rt().spawn(future)
 }
 
+/// Block on `fut` on the shared runtime, whether or not a tokio context is
+/// already entered (mirrors [`shutdown`]'s re-entrancy handling). Used by the
+/// synchronous diagnostics FFI to read an async channel snapshot.
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => rt().block_on(fut),
+    }
+}
+
 /// Recover a poisoned lock instead of panicking. These statics hold only an
 /// `Option<Arc<…>>`; a panic in some unrelated call while the lock was held must
 /// not brick every subsequent FFI call by poisoning the mutex forever.
@@ -81,6 +96,13 @@ pub fn manager() -> Result<Arc<Manager>, (Code, String)> {
 
 fn engine() -> Result<Arc<Engine>, (Code, String)> {
     lock(&ENGINE)
+        .clone()
+        .ok_or((Code::NotInitialised, "engine not initialised".into()))
+}
+
+/// The PeerSession diagnostics, if initialised (M8).
+pub fn diagnostics() -> Result<Arc<SessionDiagnostics>, (Code, String)> {
+    lock(&DIAGNOSTICS)
         .clone()
         .ok_or((Code::NotInitialised, "engine not initialised".into()))
 }
@@ -266,9 +288,14 @@ pub fn init(config_json: &str) -> OpResult {
     // while incoming transfers silently have no listener.
     manager.start_daemon()?;
 
+    // The engine's single source of truth for live PeerSession status. Empty
+    // until sessions run; the additive diagnostics FFI reads it (M8).
+    let diagnostics = Arc::new(SessionDiagnostics::new());
+
     *lock(&ME) = Some(me(&config));
     *lock(&ENGINE) = Some(engine);
     *lock(&MANAGER) = Some(manager);
+    *lock(&DIAGNOSTICS) = Some(diagnostics);
     Ok(json!({ "initialised": true }))
 }
 
@@ -315,6 +342,7 @@ pub fn shutdown() {
     *lock(&ENGINE) = None;
     *lock(&ME) = None;
     *lock(&MANAGER) = None;
+    *lock(&DIAGNOSTICS) = None;
     // Drain any in-flight emit() before returning: set_callback(None) takes
     // an exclusive lock that blocks until every emitter's shared (read) guard
     // has released, so once this returns no emitter can still be holding the

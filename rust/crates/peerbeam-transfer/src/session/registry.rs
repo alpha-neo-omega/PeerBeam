@@ -92,6 +92,12 @@ impl SessionRegistry {
     pub fn active_ids(&self) -> Vec<SessionId> {
         self.guard().keys().copied().collect()
     }
+
+    /// A snapshot of every active session, for diagnostics/enumeration.
+    #[must_use]
+    pub fn list(&self) -> Vec<SessionInfo> {
+        self.guard().values().cloned().collect()
+    }
 }
 
 /// Maps a [`ChannelType`] to the handler that serves it. A session's

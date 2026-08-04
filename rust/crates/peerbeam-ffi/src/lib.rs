@@ -16,6 +16,7 @@ mod error;
 mod events;
 mod logs;
 mod runtime;
+mod session;
 mod settings;
 mod status;
 mod transfer;
@@ -79,11 +80,19 @@ pub extern "C" fn pb_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// `{ "abi": <u32>, "semver": "<crate version>" }` (a bare object, not an
-/// envelope — this call cannot fail).
+/// `{ "abi": <u32>, "semver": "<crate version>", "features": [...] }` (a bare
+/// object, not an envelope — this call cannot fail).
+///
+/// `abi` stays `1`: M8 is **purely additive** (new `pb_*` functions and event
+/// types), so no existing signature or DTO changed. New capability is advertised
+/// through the additive `features` array, which old frontends ignore.
 #[no_mangle]
 pub extern "C" fn pb_version_json() -> *mut c_char {
-    to_cstring(json!({ "abi": ABI_VERSION, "semver": env!("CARGO_PKG_VERSION") }))
+    to_cstring(json!({
+        "abi": ABI_VERSION,
+        "semver": env!("CARGO_PKG_VERSION"),
+        "features": ["peersession_diagnostics", "migration_metrics", "session_events"],
+    }))
 }
 
 /// Initialise the engine. `config_json` may be empty for defaults.
@@ -374,6 +383,51 @@ pub extern "C" fn pb_status() -> *mut c_char {
     guard(|| error::envelope(runtime::status()))
 }
 
+// ── PeerSession diagnostics (M8, additive) ──────────────────────
+
+/// All active PeerSessions: `{ sessions:[{id,peer,state,version,capabilities}], count }`.
+#[no_mangle]
+pub extern "C" fn pb_sessions_json() -> *mut c_char {
+    guard(|| error::envelope(session::sessions()))
+}
+
+/// One session by id: `{id}` → `{ session: {...}|null }`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_session_get(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| session::session_get(&read_json(json)?))()))
+}
+
+/// Live channel snapshot: `{id}` for one session, or `{}`/null for all tracked
+/// sessions → `{ channels:[...] }` / `{ sessions:[...] }`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_channels_json(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope(session::channels(&read_json_or_empty(json))))
+}
+
+/// Migration (cutover) counters: session vs legacy transfers + fallback reasons.
+#[no_mangle]
+pub extern "C" fn pb_migration_json() -> *mut c_char {
+    guard(|| error::envelope(session::migration()))
+}
+
+/// Recovery state: sessions currently reconnecting/resuming.
+#[no_mangle]
+pub extern "C" fn pb_recovery_json() -> *mut c_char {
+    guard(|| error::envelope(session::recovery()))
+}
+
+/// Aggregate PeerSession diagnostics (`sessions` + `migration` + `recovery`).
+#[no_mangle]
+pub extern "C" fn pb_diagnostics_json() -> *mut c_char {
+    guard(|| error::envelope(session::diagnostics()))
+}
+
 // ── logs ────────────────────────────────────────────────────────
 
 /// Recent structured logs: `{limit?}` → `{logs:[…]}`.
@@ -420,6 +474,141 @@ mod tests {
         let v = take(pb_version_json());
         assert_eq!(v["abi"], ABI_VERSION);
         assert!(v["semver"].is_string());
+    }
+
+    /// ABI compatibility: M8 stays ABI v1 and only *adds* a `features` array.
+    #[test]
+    fn abi_unchanged_features_additive() {
+        assert_eq!(pb_abi_version(), 1);
+        let v = take(pb_version_json());
+        assert_eq!(v["abi"], 1);
+        let features = v["features"].as_array().expect("features array");
+        assert!(features.iter().any(|f| f == "peersession_diagnostics"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn diagnostics_before_init_error_cleanly() {
+        pb_shutdown();
+        let v = take(pb_sessions_json());
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "not_initialised");
+        let v = take(pb_migration_json());
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn diagnostics_snapshots_are_well_formed_after_init() {
+        let v = take(unsafe { pb_init(std::ptr::null()) });
+        assert_eq!(v["ok"], true, "init: {v}");
+
+        let s = take(pb_sessions_json());
+        assert_eq!(s["ok"], true);
+        assert_eq!(s["data"]["count"], 0);
+        assert!(s["data"]["sessions"].is_array());
+
+        let m = take(pb_migration_json());
+        assert_eq!(m["ok"], true);
+        assert_eq!(m["data"]["session_transfers"], 0);
+        assert_eq!(m["data"]["legacy_transfers"], 0);
+        assert!(m["data"]["fallback_reasons"].is_object());
+
+        let r = take(pb_recovery_json());
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["data"]["recovering"], 0);
+
+        let d = take(pb_diagnostics_json());
+        assert_eq!(d["ok"], true);
+        assert!(d["data"]["sessions"].is_object());
+        assert!(d["data"]["migration"].is_object());
+
+        // Channel snapshot for all (no sessions) is a well-formed empty list.
+        let c = take(unsafe { pb_channels_json(std::ptr::null()) });
+        assert_eq!(c["ok"], true);
+        assert!(c["data"]["sessions"].is_array());
+
+        // Unknown session id → null session, still ok.
+        let g = take(unsafe {
+            let arg = CString::new("{\"id\":\"deadbeefdeadbeefdeadbeefdeadbeef\"}").unwrap();
+            pb_session_get(arg.as_ptr())
+        });
+        assert_eq!(g["ok"], true);
+        assert_eq!(g["data"]["session"], serde_json::Value::Null);
+
+        pb_shutdown();
+    }
+
+    /// The additive event vocabulary is stable (documents every new `type`).
+    #[test]
+    fn session_event_type_names_are_stable() {
+        use events::kind;
+        assert_eq!(kind::SESSION_CREATED, "session_created");
+        assert_eq!(kind::SESSION_CLOSED, "session_closed");
+        assert_eq!(kind::SESSION_RECOVERING, "session_recovering");
+        assert_eq!(kind::SESSION_RESUMED, "session_resumed");
+        assert_eq!(kind::RECOVERY_FAILED, "recovery_failed");
+        assert_eq!(kind::CHANNEL_OPENED, "channel_opened");
+        assert_eq!(kind::CHANNEL_CLOSED, "channel_closed");
+        assert_eq!(kind::CAPABILITY_NEGOTIATED, "capability_negotiated");
+        assert_eq!(kind::FALLBACK_TRIGGERED, "fallback_triggered");
+        assert_eq!(kind::MIGRATION_STATS_UPDATED, "migration_stats_updated");
+    }
+
+    // Collects events for the callback-ordering test.
+    static COLLECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    extern "C" fn collect(ptr: *const c_char) {
+        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
+        unsafe { pb_free_string(ptr as *mut c_char) };
+        COLLECTED.lock().unwrap().push(s);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_events_route_in_order_through_the_callback() {
+        COLLECTED.lock().unwrap().clear();
+        pb_set_event_callback(Some(collect));
+
+        // Emit the additive session/migration vocabulary in a fixed order.
+        events::session("abc", events::kind::SESSION_CREATED, json!({ "peer": "p" }));
+        events::session(
+            "abc",
+            events::kind::CAPABILITY_NEGOTIATED,
+            json!({ "version": "1.0" }),
+        );
+        events::session("abc", events::kind::CHANNEL_OPENED, json!({ "channel": 1 }));
+        events::transfer(
+            "t1",
+            events::kind::FALLBACK_TRIGGERED,
+            json!({ "reason": "older_peer" }),
+        );
+        events::migration(json!({ "session_transfers": 0, "legacy_transfers": 1 }));
+        events::session("abc", events::kind::SESSION_CLOSED, json!({}));
+
+        pb_set_event_callback(None);
+
+        let got: Vec<Value> = COLLECTED
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let types: Vec<&str> = got.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        // Order matches emit order exactly (emit invokes the callback synchronously).
+        assert_eq!(
+            types,
+            vec![
+                "session_created",
+                "capability_negotiated",
+                "channel_opened",
+                "fallback_triggered",
+                "migration_stats_updated",
+                "session_closed",
+            ]
+        );
+        // Envelope shape: session events carry session_id; migration carries payload.
+        assert_eq!(got[0]["session_id"], "abc");
+        assert_eq!(got[4]["payload"]["legacy_transfers"], 1);
     }
 
     #[test]
