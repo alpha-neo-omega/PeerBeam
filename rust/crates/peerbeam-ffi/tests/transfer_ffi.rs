@@ -6,7 +6,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -16,15 +16,22 @@ use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{EncryptionProvider, TransferProvider};
+use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
+use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType};
 use peerbeam_ffi::*;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    authenticate, receive_file, send_file, Identity, SecureLink, SendRequest, TransferControl,
-    TransferOutcome,
+    receive_on_channel, send_file_on_session, ChannelReceived, Identity, PeerSession, SendRequest,
+    SessionConfig, SessionRole, TransferControl, TransferOutcome,
 };
 use peerbeam_transfer_quic::{direct_route, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
+
+/// The transfer session config used by the test peers (matches the FFI engine).
+fn peer_cfg() -> SessionConfig {
+    SessionConfig::new(CapabilitySet::new().with(Capability::new(ChannelType::TRANSFER)))
+        .with_stream_channel_type(ChannelType::TRANSFER)
+}
 
 // ── event capture ───────────────────────────────────────────────
 
@@ -141,13 +148,34 @@ async fn receive_into_ffi_with_accept() {
     let quic = QuicTransport::new().unwrap();
     let route = direct_route("127.0.0.1", port);
 
-    // Sender parks after Meta until the FFI side accepts.
+    // Sender parks after Meta until the FFI side accepts. Runs over PeerSession
+    // (a transfer channel), matching the FFI engine's transport.
     let send_fut = async {
-        let mut link = quic.dial(&route, &session()).await.unwrap();
-        let sess = authenticate(&mut *link, &identity, &enc, &trust)
-            .await
-            .unwrap();
-        let mut secure = SecureLink::new(&mut *link, &enc, sess);
+        let qc = quic.dial_channels(&route, &session()).await.unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            peer_cfg(),
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
         let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
         let ctrl = TransferControl::new();
         let req = SendRequest {
@@ -157,7 +185,7 @@ async fn receive_into_ffi_with_accept() {
             size: payload.len() as u64,
             chunk_size: 64 * 1024,
         };
-        send_file(&mut secure, &FsStorage::new(), req, &ctrl, &ptx, 3).await
+        send_file_on_session(&handle, &FsStorage::new(), req, &ctrl, &ptx, 3).await
     };
 
     // Driver: wait for the incoming queued event, then accept it.
@@ -223,7 +251,7 @@ async fn send_from_ffi_events_and_stats() {
     let (enc, trust, identity) = peer_identity(dir.path(), "receiver");
     let recv_quic = QuicTransport::new().unwrap();
     let (addr, mut incoming) = recv_quic
-        .serve_addr_on("127.0.0.1:0".parse().unwrap())
+        .serve_channels_on("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let peer_port = addr.port();
@@ -235,19 +263,51 @@ async fn send_from_ffi_events_and_stats() {
     let src = dir.path().join("out.bin");
     std::fs::write(&src, &payload).unwrap();
 
-    // Receiver side (auto-accepts by just running receive_file).
+    // Receiver side over PeerSession (accepts the incoming transfer channel).
     let recv_fut = async move {
         use futures::StreamExt;
-        let mut link = incoming.next().await.unwrap().unwrap();
-        let sess = authenticate(&mut *link, &identity, &enc, &trust)
-            .await
-            .unwrap();
-        let mut secure = SecureLink::new(&mut *link, &enc, sess);
+        let qc = incoming.next().await.unwrap().unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, mut inc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Responder,
+            peer_cfg(),
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+        let incoming_ch = inc_rx.recv().await.unwrap();
         let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
         let ctrl = TransferControl::new();
-        receive_file(&mut secure, &FsStorage::new(), &recv_dir_s, &ctrl, &ptx)
-            .await
-            .unwrap()
+        match receive_on_channel(
+            incoming_ch,
+            &handle,
+            &FsStorage::new(),
+            &recv_dir_s,
+            &ctrl,
+            &ptx,
+        )
+        .await
+        .unwrap()
+        {
+            ChannelReceived::File(f) => f,
+            ChannelReceived::Folder(_) => panic!("expected a file"),
+        }
     };
 
     // Kick off the FFI send.

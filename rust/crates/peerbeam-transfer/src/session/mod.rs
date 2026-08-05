@@ -297,6 +297,9 @@ pub struct PeerSession {
     /// Whether the peer was newly TOFU-pinned during this session's handshake
     /// (surfaced to the UI/CLI). Always false for a resumed session (no handshake).
     newly_trusted: bool,
+    /// The peer's presented human name from the handshake (empty for a resumed
+    /// session — the name is not re-exchanged).
+    peer_name: String,
 }
 
 impl PeerSession {
@@ -335,6 +338,7 @@ impl PeerSession {
         let auth_session = authenticate(control.as_mut(), &identity, &*enc, &*trust).await?;
         let peer = auth_session.peer_id.clone();
         let newly_trusted = auth_session.newly_trusted;
+        let peer_name = auth_session.peer_name.clone();
         let session_crypto = SessionCrypto::from_session(&auth_session, role, enc.clone());
         let mut control_crypto = session_crypto.control()?;
 
@@ -401,6 +405,7 @@ impl PeerSession {
             now,
         );
         session.newly_trusted = newly_trusted;
+        session.peer_name = peer_name;
         Ok(session)
     }
 
@@ -466,6 +471,7 @@ impl PeerSession {
             ping_nonce: 0,
             consumed_epoch,
             newly_trusted: false,
+            peer_name: String::new(),
         };
 
         if let Some(reg) = &session.registry {
@@ -517,6 +523,12 @@ impl PeerSession {
     #[must_use]
     pub fn newly_trusted(&self) -> bool {
         self.newly_trusted
+    }
+
+    /// The peer's presented human name from the handshake (may be empty).
+    #[must_use]
+    pub fn peer_name(&self) -> &str {
+        &self.peer_name
     }
 
     /// The current lifecycle state.

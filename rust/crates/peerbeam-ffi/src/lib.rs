@@ -17,6 +17,7 @@ mod events;
 mod logs;
 mod runtime;
 mod session;
+mod session_exec;
 mod settings;
 mod status;
 mod transfer;

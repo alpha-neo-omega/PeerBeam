@@ -21,15 +21,15 @@ use peerbeam_domain::entity::{
 };
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{FrameKind, Link, TrustStore};
+use peerbeam_domain::port::TrustStore;
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    authenticate, receive_file, receive_folder, send_file, send_folder, FolderSendRequest,
-    Identity, PeekLink, SecureLink, SendRequest, TransferControl, TransferOutcome, BACK_PAUSE,
+    receive_on_channel, send_file_on_session, send_folder_on_session, ChannelReceived,
+    FolderSendRequest, Identity, SendRequest, TransferControl, TransferOutcome, BACK_PAUSE,
     BACK_RESUME,
 };
-use peerbeam_transfer_quic::QuicTransport;
+use peerbeam_transfer_quic::{QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 
 use crate::error::{from_domain, Code};
@@ -478,26 +478,35 @@ impl Manager {
         active
     }
 
-    /// Connect to the peer, retrying transient connection failures with a
-    /// short backoff (Wi-Fi blips, a receiver mid-restart). Emits
-    /// `transfer_retrying` per attempt; cancellation stops the retries.
-    async fn connect_with_retry(
+    /// Establish an initiator PeerSession, retrying transient connection
+    /// failures with a short backoff (Wi-Fi blips, a receiver mid-restart).
+    /// Emits `transfer_retrying` per attempt; cancellation stops the retries.
+    async fn open_send_retry(
         &self,
         id: &str,
         active: &Active,
         device: &Device,
-        session: &TransferSession,
-    ) -> Result<Box<dyn Link>, (Code, String)> {
+        meta: &TransferSession,
+    ) -> Result<crate::session_exec::Session, (Code, String)> {
         const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
         let mut attempt = 0;
         loop {
-            match self.rm.connect(device, session).await {
-                Ok(link) => return Ok(link),
+            match crate::session_exec::dial(
+                &self.quic,
+                &self.rm,
+                device,
+                meta,
+                self.identity(),
+                self.enc.clone(),
+                self.trust.clone(),
+            )
+            .await
+            {
+                Ok(s) => return Ok(s),
                 Err(e) => {
-                    let mapped = from_domain(e);
-                    let transient = matches!(mapped.0, Code::Connection);
+                    let transient = matches!(e.0, Code::Connection);
                     if !transient || attempt >= BACKOFF.len() || active.ctrl.is_cancelled() {
-                        return Err(mapped);
+                        return Err(e);
                     }
                     let delay = BACKOFF[attempt];
                     attempt += 1;
@@ -509,7 +518,7 @@ impl Manager {
                     );
                     tokio::time::sleep(delay).await;
                     if active.ctrl.is_cancelled() {
-                        return Err(mapped);
+                        return Err(e);
                     }
                     *active.status.lock().unwrap() = "connecting".into();
                 }
@@ -527,25 +536,11 @@ impl Manager {
         size: u64,
     ) {
         *active.status.lock().unwrap() = "connecting".into();
-        let session = self.session(&id, device.id.clone(), size);
+        let meta = self.session(&id, device.id.clone(), size);
 
-        let mut link = match self
-            .connect_with_retry(&id, &active, &device, &session)
-            .await
-        {
-            Ok(l) => l,
-            Err(e) => return self.finish_failed(&id, e),
-        };
-        let sess = match authenticate(
-            &mut *link,
-            &self.identity(),
-            self.enc.as_ref(),
-            self.trust.as_ref(),
-        )
-        .await
-        {
+        let session = match self.open_send_retry(&id, &active, &device, &meta).await {
             Ok(s) => s,
-            Err(e) => return self.finish_failed(&id, from_domain(e)),
+            Err(e) => return self.finish_failed(&id, e),
         };
         events::transfer(
             &id,
@@ -554,10 +549,7 @@ impl Manager {
         );
         *active.status.lock().unwrap() = "transferring".into();
 
-        // Read the peer's live progress back-channel (receiver-confirmed bytes)
-        // so the bar reflects the receiver, not just bytes handed to transport.
-        let peer_progress = link.progress_source();
-        let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
+        let handle = session.handle.clone();
         let req = SendRequest {
             transfer_id: id.clone(),
             name,
@@ -573,14 +565,15 @@ impl Manager {
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let r = send_file(&mut secure, &storage, req, &ctrl, &ptx, 3).await;
+                let r = send_file_on_session(&handle, &storage, req, &ctrl, &ptx, 3).await;
                 drop(ptx);
                 r
             },
             None,
-            peer_progress,
+            None,
         )
         .await;
+        session.close().await;
         self.finish(&id, outcome);
     }
 
@@ -592,30 +585,15 @@ impl Manager {
         path: String,
     ) {
         *active.status.lock().unwrap() = "connecting".into();
-        let session = self.session(&id, device.id.clone(), 0);
-        let mut link = match self
-            .connect_with_retry(&id, &active, &device, &session)
-            .await
-        {
-            Ok(l) => l,
-            Err(e) => return self.finish_failed(&id, e),
-        };
-        let sess = match authenticate(
-            &mut *link,
-            &self.identity(),
-            self.enc.as_ref(),
-            self.trust.as_ref(),
-        )
-        .await
-        {
+        let meta = self.session(&id, device.id.clone(), 0);
+        let session = match self.open_send_retry(&id, &active, &device, &meta).await {
             Ok(s) => s,
-            Err(e) => return self.finish_failed(&id, from_domain(e)),
+            Err(e) => return self.finish_failed(&id, e),
         };
         events::transfer(&id, "transfer_started", json!({ "peer": device.name }));
         *active.status.lock().unwrap() = "transferring".into();
 
-        let peer_progress = link.progress_source();
-        let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
+        let handle = session.handle.clone();
         let req = FolderSendRequest {
             transfer_id: id.clone(),
             root_path: path,
@@ -629,14 +607,15 @@ impl Manager {
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let r = send_folder(&mut secure, &storage, req, &ctrl, &ptx, 3).await;
+                let r = send_folder_on_session(&handle, &storage, req, &ctrl, &ptx, 3).await;
                 drop(ptx);
                 r
             },
             None,
-            peer_progress,
+            None,
         )
         .await;
+        session.close().await;
         self.finish(&id, outcome);
     }
 
@@ -951,7 +930,7 @@ impl Manager {
     /// until the whole process restarts.
     pub async fn serve(self: Arc<Self>, port: u16) {
         let bind = format!("0.0.0.0:{port}").parse().expect("valid bind");
-        let (_local, mut incoming) = match self.quic.serve_addr_on(bind).await {
+        let (_local, mut incoming) = match self.quic.serve_channels_on(bind).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "receive server failed to bind");
@@ -961,9 +940,9 @@ impl Manager {
         };
         while let Some(item) = incoming.next().await {
             match item {
-                Ok(link) => {
+                Ok(qc) => {
                     let mgr = self.clone();
-                    crate::runtime::spawn(async move { mgr.handle_incoming(link).await });
+                    crate::runtime::spawn(async move { mgr.handle_incoming(qc).await });
                 }
                 Err(e) => tracing::warn!(error = %e, "inbound rejected"),
             }
@@ -1001,18 +980,19 @@ impl Manager {
         accepted
     }
 
-    async fn handle_incoming(self: Arc<Self>, mut link: Box<dyn Link>) {
-        let sess = match authenticate(
-            &mut *link,
-            &self.identity(),
-            self.enc.as_ref(),
-            self.trust.as_ref(),
+    async fn handle_incoming(self: Arc<Self>, qc: QuicChannels) {
+        // Establish the responder PeerSession (runs the handshake internally).
+        let mut session = match crate::session_exec::accept(
+            qc,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
         )
         .await
         {
             Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "incoming auth failed");
+            Err((_, msg)) => {
+                tracing::warn!(error = %msg, "incoming session failed");
                 return;
             }
         };
@@ -1020,9 +1000,9 @@ impl Manager {
         // Prefer the peer's human name from the handshake; fall back to the raw
         // device id only when the peer presented no name.
         let peer = {
-            let n = sess.peer_name.trim();
+            let n = session.peer_name.trim();
             if n.is_empty() {
-                sess.peer_id.0.clone()
+                session.peer_id.clone()
             } else {
                 n.to_string()
             }
@@ -1042,7 +1022,7 @@ impl Manager {
         let auto = self.auto_accept.load(Ordering::SeqCst);
         let approved = self
             .trust
-            .lookup(&sess.peer_id)
+            .lookup(&session.peer_device)
             .ok()
             .flatten()
             .map(|r| r.approved)
@@ -1050,78 +1030,67 @@ impl Manager {
         let accepted = if auto && approved {
             true
         } else {
-            self.wait_for_accept(&id, &sess.peer_id).await
+            self.wait_for_accept(&id, &session.peer_device).await
         };
         if !accepted {
             events::transfer(&id, "transfer_cancelled", json!({ "reason": "rejected" }));
             self.active.lock().unwrap().remove(&id);
-            let _ = link.close().await;
+            session.close().await;
             return;
         }
 
         events::transfer(&id, "transfer_started", json!({ "peer": peer }));
         *active.status.lock().unwrap() = "transferring".into();
-        // Report our received-byte progress back to the sender (best-effort).
-        let peer_progress = link.progress_sink();
-        let mut secure = SecureLink::new(&mut *link, self.enc.as_ref(), sess);
 
-        // Peek the first frame to dispatch file vs folder receive (no engine
-        // change — a PeekLink replays the frame the real receiver expects).
-        let first = match secure.recv_frame().await {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                return self.finish_failed(&id, (Code::Connection, "closed before data".into()))
+        // Await the peer's transfer channel.
+        let incoming_ch = match session.next_incoming().await {
+            Some(c) => c,
+            None => {
+                self.finish_failed(&id, (Code::Connection, "closed before data".into()));
+                session.close().await;
+                return;
             }
-            Err(e) => return self.finish_failed(&id, from_domain(e)),
         };
-        let is_folder = first.kind == FrameKind::Control;
+
         let save_dir = self.save_dir();
-        if is_folder {
-            // A folder lands as many files; default to the save dir until the
-            // real root is known (set below once the receive completes).
-            *active.path.lock().unwrap() = Some(save_dir.clone());
-        }
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
         // Filled in by the folder branch with the sanitized root name
         // `receive_folder` actually wrote under `save_dir`, so history/"open"
         // can point at the folder itself instead of its parent.
         let folder_root = Arc::new(std::sync::Mutex::new(None::<String>));
-
         let dest_dir = save_dir.clone();
         let folder_root_cell = folder_root.clone();
+        let handle = session.handle.clone();
         let outcome = drive(
             id.clone(),
             active.stats.clone(),
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let mut peek = PeekLink::new(first, &mut secure);
-                let r = if is_folder {
-                    receive_folder(&mut peek, &storage, &dest_dir, &ctrl, &ptx)
-                        .await
-                        .map(|r| {
-                            *folder_root_cell.lock().unwrap() = Some(r.root);
-                            r.outcome
-                        })
-                } else {
-                    receive_file(&mut peek, &storage, &dest_dir, &ctrl, &ptx)
-                        .await
-                        .map(|r| r.outcome)
-                };
+                let r = receive_on_channel(incoming_ch, &handle, &storage, &dest_dir, &ctrl, &ptx)
+                    .await
+                    .map(|received| match received {
+                        ChannelReceived::File(f) => f.outcome,
+                        ChannelReceived::Folder(fr) => {
+                            *folder_root_cell.lock().unwrap() = Some(fr.root);
+                            fr.outcome
+                        }
+                    });
                 drop(ptx);
                 r
             },
-            peer_progress,
+            None,
             None,
         )
         .await;
-        if is_folder && matches!(outcome, Ok(TransferOutcome::Completed)) {
+        if matches!(outcome, Ok(TransferOutcome::Completed)) {
             if let Some(root) = folder_root.lock().unwrap().clone() {
                 *active.path.lock().unwrap() =
                     Some(format!("{}/{}", save_dir.trim_end_matches('/'), root));
             }
         }
+        session.close().await;
         self.finish(&id, outcome);
     }
 }
