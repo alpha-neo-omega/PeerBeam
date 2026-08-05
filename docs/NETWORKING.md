@@ -104,8 +104,8 @@ The **QUIC transport is implemented** (`peerbeam-transfer-quic`, built on
 - **Disconnects** surface as `DomainError::Connection`; the engine's recovery
   driver (`send_file_recover`/`LinkFactory`) can redial and resume from the
   receiver's offset.
-- Verified by **two-real-endpoint** integration tests (localhost, not mocks)
-  and measured by `peerbeam benchmark quic` — see [Benchmarks](BENCHMARKS.md).
+- Verified by **two-real-endpoint** integration tests (localhost, not mocks) —
+  see the CLI `transfer_e2e` tests and [Benchmarks](BENCHMARKS.md).
 
 The CLI now uses this transport end to end: `receive`/`daemon` serve QUIC and
 advertise via discovery; `send --to <name>` resolves a peer's address+port from

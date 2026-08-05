@@ -111,26 +111,23 @@ moves off the CPU). No further micro-optimization is worthwhile here.
 
 ## QUIC transport (real network, loopback)
 
-The QUIC `TransferProvider` (`peerbeam-transfer-quic`) measured over two real
-endpoints on `127.0.0.1` via `peerbeam benchmark quic`:
+QUIC transfer over two real endpoints on `127.0.0.1`. The dedicated
+`benchmark quic` micro-benchmark (a direct `TransferProvider` link) was retired
+when the legacy direct-transport path was removed; real-QUIC transfer is now
+exercised end to end by the two-process CLI tests
+(`peerbeam-cli/tests/transfer_e2e.rs`, sender + receiver over a PeerSession
+channel). The last recorded direct-link figure, for reference:
 
-| Metric | Command | Value |
-|---|---|---|
-| Throughput | `benchmark quic --size 512 --chunk 1024` | **~430 MiB/s** (i5-1135G7) |
-| Connect latency | (handshake, same run) | **~0.7 ms** |
+| Metric | Value |
+|---|---|
+| Throughput (512 MiB, 1024 KiB chunks) | **~430 MiB/s** (i5-1135G7) |
+| Connect latency (handshake) | **~0.7 ms** |
 
-This is a full real transfer: QUIC (TLS 1.3 + UDP) + the transfer engine's
-dual SHA-256. It lands at ~85% of the transport-free in-process loopback
-(~500 MiB/s), the difference being TLS record crypto + UDP/framing + the QUIC
-stack. Loopback (127.0.0.1) has no propagation delay, MTU limits, or loss —
-real-LAN/WAN numbers will differ and are the next thing to measure once QUIC is
-wired into `send`/`receive`.
-
-Reproduce:
-
-```
-target/release/peerbeam benchmark quic --size 512 --chunk 1024
-```
+This was a full real transfer: QUIC (TLS 1.3 + UDP) + the transfer engine's
+dual SHA-256, at ~85% of the transport-free in-process loopback (~500 MiB/s) —
+the difference being TLS record crypto + UDP/framing + the QUIC stack. Loopback
+(127.0.0.1) has no propagation delay, MTU limits, or loss; real-LAN/WAN numbers
+will differ.
 
 ## Real-network integration (QUIC)
 

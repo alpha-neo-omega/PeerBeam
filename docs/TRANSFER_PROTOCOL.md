@@ -152,4 +152,5 @@ for 1.0 in [Known Issues](KNOWN_ISSUES.md).
 - [Transfer](TRANSFER.md) — engine behaviour, chunking, resume, retry.
 - [Security](SECURITY.md) — crypto choices and the trust model.
 - [Networking](NETWORKING.md) — how a link is chosen and established.
-- A runnable end-to-end example: `rust/bins/peerbeam-cli/examples/quic_transfer.rs`.
+- A runnable end-to-end test (two live processes over QUIC):
+  `rust/bins/peerbeam-cli/tests/transfer_e2e.rs`.

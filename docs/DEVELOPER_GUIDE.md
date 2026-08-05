@@ -91,16 +91,16 @@ fresh checkout.
 
 ### Run the end-to-end example
 
-A complete file transfer over the real QUIC transport in one process —
-handshake → SecureLink → stream:
+A complete file transfer over the real QUIC transport, driven by two live
+`peerbeam` processes (sender + receiver) over a PeerSession channel:
 
 ```bash
 cd rust
-cargo run --example quic_transfer -p peerbeam-cli
+cargo test -p peerbeam-cli --test transfer_e2e
 ```
 
-Source: `rust/bins/peerbeam-cli/examples/quic_transfer.rs`. Good first stop for
-understanding the transfer API end to end.
+Source: `rust/bins/peerbeam-cli/tests/transfer_e2e.rs`. Good first stop for
+understanding the transfer path end to end.
 
 ## Test & lint (the merge gate)
 
