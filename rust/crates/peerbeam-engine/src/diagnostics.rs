@@ -1,12 +1,11 @@
 //! PeerSession diagnostics — the single, engine-level source of truth for live
-//! session, channel, migration, and recovery status (M8).
+//! session, channel, transport, and recovery status.
 //!
 //! This is the seam frontends (FFI, CLI, daemon) read to *present* PeerSession
 //! state without owning any of it and without duplicating engine state. It holds
-//! the very same [`SessionRegistry`] a running [`PeerSession`] registers into
-//! (M2) and the same [`MigrationMetrics`] the transport selector records into
-//! (M7) — nothing is copied or recomputed. Channel snapshots are read live from a
-//! session's own handle.
+//! the very same [`SessionRegistry`] a running [`PeerSession`] registers into,
+//! plus its live control handles — nothing is copied or recomputed. Channel
+//! snapshots are read live from a session's own handle.
 //!
 //! [`PeerSession`]: peerbeam_transfer::PeerSession
 
@@ -16,9 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use peerbeam_domain::session::{SessionId, SessionState};
-use peerbeam_transfer::{
-    ChannelInfo, MigrationMetrics, SessionHandle, SessionInfo, SessionRegistry,
-};
+use peerbeam_transfer::{ChannelInfo, SessionHandle, SessionInfo, SessionRegistry};
 
 /// A stable snake_case label for a session state (for JSON output).
 fn state_label(state: SessionState) -> &'static str {
@@ -48,11 +45,10 @@ fn parse_session_id(hex: &str) -> Option<SessionId> {
 }
 
 /// Read-only diagnostics over the live PeerSession state. Cheaply cloneable
-/// (shares the underlying registry, metrics, and handle map).
+/// (shares the underlying registry and handle map).
 #[derive(Clone)]
 pub struct SessionDiagnostics {
     sessions: SessionRegistry,
-    migration: Arc<MigrationMetrics>,
     handles: Arc<Mutex<HashMap<SessionId, SessionHandle>>>,
 }
 
@@ -63,12 +59,11 @@ impl Default for SessionDiagnostics {
 }
 
 impl SessionDiagnostics {
-    /// A fresh diagnostics view with an empty registry and zeroed metrics.
+    /// A fresh diagnostics view with an empty registry.
     #[must_use]
     pub fn new() -> Self {
         SessionDiagnostics {
             sessions: SessionRegistry::new(),
-            migration: Arc::new(MigrationMetrics::new()),
             handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -78,13 +73,6 @@ impl SessionDiagnostics {
     #[must_use]
     pub fn registry(&self) -> SessionRegistry {
         self.sessions.clone()
-    }
-
-    /// The migration metrics to pass into the M7 transport selector so transfers
-    /// record their transport choice here.
-    #[must_use]
-    pub fn migration(&self) -> Arc<MigrationMetrics> {
-        self.migration.clone()
     }
 
     /// Track a live session's control handle so its channels can be snapshotted.
@@ -172,24 +160,29 @@ impl SessionDiagnostics {
         })
     }
 
-    /// `{ session_transfers, legacy_transfers, fallbacks, fallback_reasons }` — the
-    /// migration (cutover) counters.
+    /// `{ transport, active_sessions, recovering }` — a live transport summary.
+    ///
+    /// PeerSession is the sole transport, so this reports the permanent runtime:
+    /// the transport name and live session counts, sourced from the registry.
+    #[must_use]
+    pub fn transport_json(&self) -> Value {
+        let list = self.sessions.list();
+        let recovering = list
+            .iter()
+            .filter(|i| i.state == SessionState::Recovering)
+            .count();
+        json!({
+            "transport": "peersession",
+            "active_sessions": list.len(),
+            "recovering": recovering,
+        })
+    }
+
+    /// Alias for [`transport_json`](Self::transport_json), kept so the FFI/CLI
+    /// diagnostics endpoints named "migration" stay ABI/command-stable.
     #[must_use]
     pub fn migration_json(&self) -> Value {
-        let s = self.migration.snapshot();
-        json!({
-            "session_transfers": s.session_transfers,
-            "legacy_transfers": s.legacy_transfers,
-            "fallbacks": s.fallbacks,
-            "fallback_reasons": {
-                "older_peer": s.older_peer,
-                "version_mismatch": s.version_mismatch,
-                "capability_mismatch": s.capability_mismatch,
-                "negotiation_failed": s.negotiation_failed,
-                "resume_incompatible": s.resume_incompatible,
-                "explicit_compat": s.explicit_compat,
-            },
-        })
+        self.transport_json()
     }
 
     /// `{ recovering, sessions_recovering: [...] }` — sessions currently in the
@@ -211,7 +204,7 @@ impl SessionDiagnostics {
     pub fn diagnostics_json(&self) -> Value {
         json!({
             "sessions": self.sessions_json(),
-            "migration": self.migration_json(),
+            "transport": self.transport_json(),
             "recovery": self.recovery_json(),
         })
     }
@@ -239,7 +232,8 @@ mod tests {
         let d = SessionDiagnostics::new();
         assert_eq!(d.sessions_json()["count"], 0);
         assert!(d.sessions_json()["sessions"].as_array().unwrap().is_empty());
-        assert_eq!(d.migration_json()["session_transfers"], 0);
+        assert_eq!(d.transport_json()["transport"], "peersession");
+        assert_eq!(d.transport_json()["active_sessions"], 0);
         assert_eq!(d.recovery_json()["recovering"], 0);
         assert_eq!(d.session_json("deadbeef")["session"], Value::Null);
         assert!(d.diagnostics_json()["sessions"].is_object());
@@ -263,16 +257,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_snapshot_reflects_metrics() {
+    fn transport_snapshot_reflects_registry() {
         let d = SessionDiagnostics::new();
-        // Record via the shared metrics handle (what the selector receives).
-        let m = d.migration();
-        // Use the public snapshot after simulating a couple of transfers is not
-        // possible without the selector; assert the zeroed shape here and rely on
-        // the selector integration test for populated values.
-        let s = m.snapshot();
-        assert_eq!(s.session_transfers, 0);
-        assert_eq!(d.migration_json()["fallbacks"], 0);
+        d.registry().register(info(1, SessionState::Active));
+        d.registry().register(info(2, SessionState::Recovering));
+        let t = d.transport_json();
+        assert_eq!(t["transport"], "peersession");
+        assert_eq!(t["active_sessions"], 2);
+        assert_eq!(t["recovering"], 1);
+        // The retained `migration_json` alias returns the same runtime summary.
+        assert_eq!(d.migration_json(), t);
     }
 
     #[test]

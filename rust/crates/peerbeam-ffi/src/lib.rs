@@ -92,7 +92,7 @@ pub extern "C" fn pb_version_json() -> *mut c_char {
     to_cstring(json!({
         "abi": ABI_VERSION,
         "semver": env!("CARGO_PKG_VERSION"),
-        "features": ["peersession_diagnostics", "migration_metrics", "session_events"],
+        "features": ["peersession_diagnostics", "transport_diagnostics", "session_events"],
     }))
 }
 
@@ -411,7 +411,8 @@ pub unsafe extern "C" fn pb_channels_json(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope(session::channels(&read_json_or_empty(json))))
 }
 
-/// Migration (cutover) counters: session vs legacy transfers + fallback reasons.
+/// Transport summary: the active transport (always PeerSession) + live session
+/// counts. (Endpoint name retained for ABI stability.)
 #[no_mangle]
 pub extern "C" fn pb_migration_json() -> *mut c_char {
     guard(|| error::envelope(session::migration()))
@@ -423,7 +424,7 @@ pub extern "C" fn pb_recovery_json() -> *mut c_char {
     guard(|| error::envelope(session::recovery()))
 }
 
-/// Aggregate PeerSession diagnostics (`sessions` + `migration` + `recovery`).
+/// Aggregate PeerSession diagnostics (`sessions` + `transport` + `recovery`).
 #[no_mangle]
 pub extern "C" fn pb_diagnostics_json() -> *mut c_char {
     guard(|| error::envelope(session::diagnostics()))
@@ -511,9 +512,9 @@ mod tests {
 
         let m = take(pb_migration_json());
         assert_eq!(m["ok"], true);
-        assert_eq!(m["data"]["session_transfers"], 0);
-        assert_eq!(m["data"]["legacy_transfers"], 0);
-        assert!(m["data"]["fallback_reasons"].is_object());
+        assert_eq!(m["data"]["transport"], "peersession");
+        assert_eq!(m["data"]["active_sessions"], 0);
+        assert_eq!(m["data"]["recovering"], 0);
 
         let r = take(pb_recovery_json());
         assert_eq!(r["ok"], true);
@@ -522,7 +523,7 @@ mod tests {
         let d = take(pb_diagnostics_json());
         assert_eq!(d["ok"], true);
         assert!(d["data"]["sessions"].is_object());
-        assert!(d["data"]["migration"].is_object());
+        assert!(d["data"]["transport"].is_object());
 
         // Channel snapshot for all (no sessions) is a well-formed empty list.
         let c = take(unsafe { pb_channels_json(std::ptr::null()) });
@@ -552,8 +553,6 @@ mod tests {
         assert_eq!(kind::CHANNEL_OPENED, "channel_opened");
         assert_eq!(kind::CHANNEL_CLOSED, "channel_closed");
         assert_eq!(kind::CAPABILITY_NEGOTIATED, "capability_negotiated");
-        assert_eq!(kind::FALLBACK_TRIGGERED, "fallback_triggered");
-        assert_eq!(kind::MIGRATION_STATS_UPDATED, "migration_stats_updated");
     }
 
     // Collects events for the callback-ordering test.
@@ -570,7 +569,7 @@ mod tests {
         COLLECTED.lock().unwrap().clear();
         pb_set_event_callback(Some(collect));
 
-        // Emit the additive session/migration vocabulary in a fixed order.
+        // Emit the additive session-lifecycle vocabulary in a fixed order.
         events::session("abc", events::kind::SESSION_CREATED, json!({ "peer": "p" }));
         events::session(
             "abc",
@@ -578,12 +577,6 @@ mod tests {
             json!({ "version": "1.0" }),
         );
         events::session("abc", events::kind::CHANNEL_OPENED, json!({ "channel": 1 }));
-        events::transfer(
-            "t1",
-            events::kind::FALLBACK_TRIGGERED,
-            json!({ "reason": "older_peer" }),
-        );
-        events::migration(json!({ "session_transfers": 0, "legacy_transfers": 1 }));
         events::session("abc", events::kind::SESSION_CLOSED, json!({}));
 
         pb_set_event_callback(None);
@@ -602,14 +595,11 @@ mod tests {
                 "session_created",
                 "capability_negotiated",
                 "channel_opened",
-                "fallback_triggered",
-                "migration_stats_updated",
                 "session_closed",
             ]
         );
-        // Envelope shape: session events carry session_id; migration carries payload.
+        // Envelope shape: session events carry session_id.
         assert_eq!(got[0]["session_id"], "abc");
-        assert_eq!(got[4]["payload"]["legacy_transfers"], 1);
     }
 
     #[test]

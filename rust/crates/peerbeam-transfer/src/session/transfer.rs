@@ -1,11 +1,10 @@
-//! File transfer as a PeerSession channel (M5).
+//! File transfer as a PeerSession channel — the transfer transport.
 //!
-//! This is the first real capability carried over [`PeerSession`]: each transfer
-//! runs on its **own** transfer-type stream channel, cryptographically isolated
-//! from control and from every other channel (its own derived key, see
-//! [`super::crypto`]). The transfer itself reuses the existing engine unchanged —
-//! [`send_file`]/[`receive_file`] run over the channel's sealed stream exactly as
-//! they run over a [`crate::SecureLink`].
+//! Every transfer runs on its **own** transfer-type stream channel,
+//! cryptographically isolated from control and from every other channel (its own
+//! derived key, see [`super::crypto`]). The transfer itself reuses the transfer
+//! engine unchanged — [`send_file`]/[`receive_file`] run over the channel's
+//! sealed stream, sealed by the same scheme as [`crate::SecureLink`].
 //!
 //! It runs entirely **caller-side**: the session pump hands over the sealed
 //! stream (opener via [`SessionHandle::open_stream_channel`], accepter via the
@@ -14,11 +13,9 @@
 //! or tear down the session or any sibling channel — the pump keeps servicing
 //! control traffic throughout.
 //!
-//! Legacy transfer ([`send_file`]/[`receive_file`] over a directly-dialed
-//! [`crate::SecureLink`]) is untouched and remains the default; a caller opts
-//! into session transfer by advertising [`ChannelType::TRANSFER`] as a stream
-//! capability ([`SessionConfig::with_stream_channel_type`]) and using the
-//! helpers here.
+//! A caller enables transfer channels by advertising [`ChannelType::TRANSFER`]
+//! as a stream capability ([`SessionConfig::with_stream_channel_type`]) and using
+//! the helpers here.
 //!
 //! [`PeerSession`]: super::PeerSession
 //! [`SessionHandle::open_stream_channel`]: super::SessionHandle::open_stream_channel
@@ -137,7 +134,7 @@ pub enum ChannelReceived {
 /// Receive a file **or** a folder over an accepted incoming transfer channel,
 /// dispatching by peeking the first frame (a folder opens with a `Control`
 /// manifest frame; a file opens with a `Meta` frame) — the same discriminator the
-/// legacy receive path uses, now over a per-channel sealed stream. Reuses
+/// direct receive path used, now over a per-channel sealed stream. Reuses
 /// [`receive_file`] / [`receive_folder`] unchanged.
 pub async fn receive_on_channel(
     incoming: IncomingStreamChannel,

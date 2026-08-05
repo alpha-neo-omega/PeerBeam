@@ -81,7 +81,7 @@ only ciphertext (I5). The primitive is unchanged; M4 reuses `EncryptionProvider`
 - Malformed/short frames are rejected before any decrypt attempt
   (`malformed_frame_is_rejected`).
 - The plaintext handshake window is the pre-existing `authenticate()` step
-  (unchanged by M4); its security is the same as the legacy transfer path.
+  (unchanged by M4); its security is the same as the `SecureLink` transfer path.
 - HKDF-Expand uses the existing HMAC-SHA256; masters are already high-entropy
   (ECDH + hash), so no Extract step is required.
 
@@ -126,11 +126,12 @@ control channel).
   therefore closes only its own channel — the pump keeps servicing control and
   sibling channels. Verified by `cancelled_transfer_does_not_terminate_session`
   and `concurrent_transfers_use_independent_channels`.
-- **Opt-in, legacy untouched.** Session transfer is enabled only by advertising
+- **Capability-gated.** Session transfer is enabled by advertising
   `ChannelType::TRANSFER` as a stream capability
-  (`SessionConfig::with_stream_channel_type`); the default config carries no stream
-  types, so the legacy transfer path is byte-for-byte unchanged and remains the
-  default.
+  (`SessionConfig::with_stream_channel_type`); a config carrying no stream types
+  opens no transfer channel. Every production frontend advertises it — session
+  transfer is the sole transport (the earlier direct-`SecureLink` path has since
+  been retired; see M9).
 
 ### Residual risk update
 The M4 "not yet exercised on the wire by a real capability" item is partially

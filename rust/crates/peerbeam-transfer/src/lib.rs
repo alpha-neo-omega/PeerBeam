@@ -18,7 +18,6 @@
 mod auth;
 mod clipboard;
 mod control;
-mod cutover;
 mod folder;
 mod peek;
 mod protocol;
@@ -30,11 +29,6 @@ mod stream;
 pub use auth::{authenticate, Identity, Session};
 pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
-pub use cutover::{
-    receive_file_selected, receive_folder_selected, send_file_selected, send_folder_selected,
-    transfer_capability, CompatMode, FallbackReason, LegacyPath, MigrationMetrics,
-    MigrationSnapshot, SessionOpen, SessionReceivePath, SessionSendPath, TransferPath,
-};
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use peek::PeekLink;
 pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};

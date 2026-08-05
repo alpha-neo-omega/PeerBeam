@@ -73,13 +73,13 @@ pub enum Command {
     Session(SessionArgs),
     /// Inspect PeerSession channels.
     Channels(ChannelsArgs),
-    /// Show active transfers and their transport (PeerSession / legacy).
+    /// Show active transfers and their transport (PeerSession).
     Transfers,
-    /// Show migration (cutover) statistics.
+    /// Show the transport summary (PeerSession runtime).
     Migration,
     /// Show reconnect / resume (recovery) state.
     Recovery,
-    /// Aggregate PeerSession diagnostics (sessions + migration + recovery).
+    /// Aggregate PeerSession diagnostics (sessions + transport + recovery).
     Diagnostics,
     /// Generate a shell completion script.
     Completions {
@@ -105,7 +105,7 @@ pub enum SessionAction {
     },
     /// Stream session lifecycle changes (snapshot when no daemon is attached).
     Watch,
-    /// Session + migration summary counters.
+    /// Session + transport summary.
     Stats,
 }
 

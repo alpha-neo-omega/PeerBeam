@@ -33,10 +33,11 @@ static RT: OnceLock<Runtime> = OnceLock::new();
 static ENGINE: Mutex<Option<Arc<Engine>>> = Mutex::new(None);
 static ME: Mutex<Option<Device>> = Mutex::new(None);
 static MANAGER: Mutex<Option<Arc<Manager>>> = Mutex::new(None);
-/// PeerSession diagnostics (M8): the single, shared source of truth for live
-/// session/channel/migration/recovery state that the additive `pb_session_*` /
-/// `pb_migration_*` / `pb_diagnostics` calls read. Reuses the engine's
-/// `SessionDiagnostics` — no duplicated state.
+/// PeerSession diagnostics: the single, shared source of truth for live
+/// session/channel/transport/recovery state that the `pb_session_*` /
+/// `pb_channels_json` / `pb_migration_json` / `pb_recovery_json` /
+/// `pb_diagnostics_json` calls read. Reuses the engine's `SessionDiagnostics` —
+/// no duplicated state.
 static DIAGNOSTICS: Mutex<Option<Arc<SessionDiagnostics>>> = Mutex::new(None);
 /// Tracks whether discovery is currently running, so a live rename knows
 /// whether to re-announce (no equivalent query exists on `Engine` itself).

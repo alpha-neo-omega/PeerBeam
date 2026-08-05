@@ -1,4 +1,4 @@
-//! Production transfer execution over PeerSession (CLI cutover).
+//! Production transfer execution over PeerSession.
 //!
 //! Every CLI file/folder transfer runs as a PeerSession transfer channel — the
 //! sender dials a multiplexed connection and opens a channel

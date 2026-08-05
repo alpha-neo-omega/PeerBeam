@@ -2,7 +2,7 @@
 //!
 //! Thin, read-only wrappers over the engine's [`SessionDiagnostics`] (the single
 //! source of truth). No state lives here — every call reads the shared registry /
-//! metrics the running sessions and the transport selector already populate.
+//! state the running sessions already populate.
 //!
 //! [`SessionDiagnostics`]: peerbeam_engine::SessionDiagnostics
 
@@ -45,7 +45,7 @@ pub fn channels(v: &Value) -> Result<Value, (Code, String)> {
     }
 }
 
-/// `{ session_transfers, legacy_transfers, fallbacks, fallback_reasons }`.
+/// `{ transport, active_sessions, recovering }` — the live transport summary.
 pub fn migration() -> Result<Value, (Code, String)> {
     Ok(runtime::diagnostics()?.migration_json())
 }
@@ -55,7 +55,7 @@ pub fn recovery() -> Result<Value, (Code, String)> {
     Ok(runtime::diagnostics()?.recovery_json())
 }
 
-/// Aggregate `{ sessions, migration, recovery }` diagnostics.
+/// Aggregate `{ sessions, transport, recovery }` diagnostics.
 pub fn diagnostics() -> Result<Value, (Code, String)> {
     Ok(runtime::diagnostics()?.diagnostics_json())
 }

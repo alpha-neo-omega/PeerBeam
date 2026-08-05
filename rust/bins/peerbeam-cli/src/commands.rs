@@ -77,7 +77,7 @@ async fn session_cmd(ctx: &Ctx, args: SessionArgs) -> CliResult {
         SessionAction::Show { id } => diag.session_json(&id),
         SessionAction::Stats => json!({
             "sessions": diag.sessions_json()["count"].clone(),
-            "migration": diag.migration_json(),
+            "transport": diag.transport_json(),
         }),
     };
     present(ctx, &value)
@@ -94,11 +94,11 @@ async fn channels_cmd(ctx: &Ctx, args: ChannelsArgs) -> CliResult {
 
 fn transfers_cmd(ctx: &Ctx) -> CliResult {
     let diag = peerbeam_engine::SessionDiagnostics::new();
-    // Transfers ride PeerSessions (M7 default) or the legacy transport; present
-    // both the live sessions and the transport breakdown.
+    // Transfers ride PeerSession channels; present the live sessions and the
+    // transport summary.
     let value = json!({
         "sessions": diag.sessions_json(),
-        "migration": diag.migration_json(),
+        "transport": diag.transport_json(),
     });
     present(ctx, &value)
 }
