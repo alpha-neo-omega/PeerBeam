@@ -294,6 +294,9 @@ pub struct PeerSession {
     /// Highest resume epoch this endpoint has consumed (accepter's single-use
     /// replay guard); preserved across reconnects. 0 for a freshly-opened session.
     consumed_epoch: u64,
+    /// Whether the peer was newly TOFU-pinned during this session's handshake
+    /// (surfaced to the UI/CLI). Always false for a resumed session (no handshake).
+    newly_trusted: bool,
 }
 
 impl PeerSession {
@@ -331,6 +334,7 @@ impl PeerSession {
         // control stream. Its master secret keys every channel (control included).
         let auth_session = authenticate(control.as_mut(), &identity, &*enc, &*trust).await?;
         let peer = auth_session.peer_id.clone();
+        let newly_trusted = auth_session.newly_trusted;
         let session_crypto = SessionCrypto::from_session(&auth_session, role, enc.clone());
         let mut control_crypto = session_crypto.control()?;
 
@@ -379,7 +383,7 @@ impl PeerSession {
             incoming_streams,
             registry,
         };
-        Ok(Self::assemble(
+        let mut session = Self::assemble(
             transport,
             role,
             session_id,
@@ -395,7 +399,9 @@ impl PeerSession {
             wiring,
             0,
             now,
-        ))
+        );
+        session.newly_trusted = newly_trusted;
+        Ok(session)
     }
 
     /// Build a live `PeerSession` from already-established, already-keyed parts.
@@ -459,6 +465,7 @@ impl PeerSession {
             accepting: true,
             ping_nonce: 0,
             consumed_epoch,
+            newly_trusted: false,
         };
 
         if let Some(reg) = &session.registry {
@@ -504,6 +511,12 @@ impl PeerSession {
     #[must_use]
     pub fn peer(&self) -> &DeviceId {
         &self.peer
+    }
+
+    /// Whether the peer was newly TOFU-pinned during this session's handshake.
+    #[must_use]
+    pub fn newly_trusted(&self) -> bool {
+        self.newly_trusted
     }
 
     /// The current lifecycle state.

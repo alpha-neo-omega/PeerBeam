@@ -183,6 +183,91 @@ fn json_output_is_machine_readable() {
 }
 
 #[test]
+fn sends_a_folder_between_two_processes_over_quic() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let recv_dir = dir.path().join("recv");
+    let folder = dir.path().join("payload");
+
+    let mut cfg = EngineConfig::default();
+    cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
+    cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
+    cfg.save(&cfg_path).unwrap();
+
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"alpha").unwrap();
+    let big: Vec<u8> = (0..(200 * 1024)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(folder.join("b.bin"), &big).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    let mut receiver = Command::new(BIN)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--no-color",
+            "receive",
+            "--once",
+            "--port",
+            "0",
+            "--dir",
+            recv_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn receiver");
+
+    let stdout = receiver.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(port) = parse_listen_port(&line) {
+                let _ = tx.send(port);
+            }
+        }
+    });
+    let port = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("receiver should announce a listening port");
+
+    let send = Command::new(BIN)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--no-color",
+            "-y",
+            "send",
+            folder.to_str().unwrap(),
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("run sender");
+    assert!(
+        send.status.success(),
+        "folder send failed: {}\n{}",
+        String::from_utf8_lossy(&send.stdout),
+        String::from_utf8_lossy(&send.stderr),
+    );
+
+    let status = wait_with_timeout(&mut receiver, Duration::from_secs(15));
+    assert!(
+        status.map(|s| s.success()).unwrap_or(false),
+        "receiver exit"
+    );
+
+    // The whole folder arrived under recv_dir/payload/ byte-for-byte.
+    assert_eq!(
+        std::fs::read(recv_dir.join("payload").join("a.txt")).expect("a.txt"),
+        b"alpha"
+    );
+    assert_eq!(
+        std::fs::read(recv_dir.join("payload").join("b.bin")).expect("b.bin"),
+        big
+    );
+}
+
+#[test]
 fn status_json_reports_real_fields() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.json");

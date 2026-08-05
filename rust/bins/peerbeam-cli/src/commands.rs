@@ -15,8 +15,8 @@ use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::{ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    authenticate, receive_file, receive_folder, send_file, send_folder, FolderSendRequest,
-    Identity, PeekLink, SecureLink, SendRequest, TransferControl,
+    receive_file, receive_on_channel, send_file, send_file_on_session, send_folder_on_session,
+    ChannelReceived, FolderSendRequest, Identity, SendRequest, TransferControl,
 };
 use peerbeam_transfer_quic::{direct_route, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
@@ -862,9 +862,10 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
     }
 
     let sc = SecureCtx::build(&config)?;
-    // Everything flows through the RouteManager — the one API for reaching a
-    // peer. The CLI never picks or sees a route.
-    let routes = RouteManager::new(Arc::new(QuicTransport::new().map_err(CliError::from)?));
+    // Transfers run over PeerSession: the QUIC transport dials a multiplexed
+    // channel connection; the RouteManager still ranks/selects the route.
+    let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
+    let routes = RouteManager::new(quic.clone());
     let storage = FsStorage::new();
     let chunk = clamp_chunk_size(config.transfer.chunk_size);
 
@@ -876,7 +877,9 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file.bin".into());
         if path.is_dir() {
-            let r = secure_send_folder(ctx, &routes, &target, &sc, &storage, p, &name, chunk).await;
+            let r =
+                secure_send_folder(ctx, &quic, &routes, &target, &sc, &storage, p, &name, chunk)
+                    .await;
             history::record(
                 &hist,
                 history::entry(
@@ -891,8 +894,10 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             r?;
         } else {
             let size = std::fs::metadata(path)?.len();
-            let r =
-                secure_send_file(ctx, &routes, &target, &sc, &storage, p, &name, size, chunk).await;
+            let r = secure_send_file(
+                ctx, &quic, &routes, &target, &sc, &storage, p, &name, size, chunk,
+            )
+            .await;
             history::record(
                 &hist,
                 history::entry("sending", &target.name, &name, p, size, r.is_ok()),
@@ -903,10 +908,12 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
     Ok(())
 }
 
-/// Dial, authenticate, and stream a whole folder; returns total bytes sent.
+/// Establish a PeerSession and stream a whole folder over a transfer channel;
+/// returns total bytes sent.
 #[allow(clippy::too_many_arguments)]
 async fn secure_send_folder(
     ctx: &Ctx,
+    quic: &Arc<QuicTransport>,
     routes: &RouteManager,
     device: &peerbeam_domain::entity::Device,
     sc: &SecureCtx,
@@ -915,36 +922,15 @@ async fn secure_send_folder(
     name: &str,
     chunk: u32,
 ) -> Result<u64, CliError> {
-    use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
-    use peerbeam_domain::id::TransferId;
-
-    let session = TransferSession {
-        id: TransferId::from(name),
-        peer: device.id.clone(),
-        direction: Direction::Sending,
-        status: TransferStatus::Transferring,
-        files: Vec::new(),
-        total_bytes: 0,
-        transferred_bytes: 0,
-        started_at: chrono::Utc::now(),
-        completed_at: None,
-        is_resume: false,
-    };
-
-    let mut link = routes
-        .connect(device, &session)
-        .await
-        .map_err(CliError::from)?;
-    let sess = authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust)
-        .await
-        .map_err(CliError::from)?;
-    let newly_trusted = sess.newly_trusted;
-    let peer_id = sess.peer_id.0.clone();
+    let session =
+        crate::session_transfer::dial(quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust)
+            .await?;
+    let newly_trusted = session.newly_trusted;
+    let peer_id = session.peer_id.clone();
     if newly_trusted && !ctx.json {
         ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
     }
 
-    let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
     let (ptx, mut prx) = mpsc::unbounded_channel();
     let ctrl = TransferControl::new();
     let req = FolderSendRequest {
@@ -953,8 +939,9 @@ async fn secure_send_folder(
         chunk_size: chunk,
     };
 
+    let handle = &session.handle;
     let send = async move {
-        let r = send_folder(&mut secure, storage, req, &ctrl, &ptx, 3).await;
+        let r = send_folder_on_session(handle, storage, req, &ctrl, &ptx, 3).await;
         drop(ptx);
         r
     };
@@ -987,6 +974,7 @@ async fn secure_send_folder(
     };
     let (r, bytes) = tokio::join!(send, pump);
     let outcome = r.map_err(CliError::from)?;
+    session.close().await;
 
     if ctx.json {
         ctx.json_line(&json!({
@@ -995,8 +983,7 @@ async fn secure_send_folder(
             "outcome": format!("{outcome:?}"),
             "peer": peer_id,
             "newly_trusted": newly_trusted,
-            // M8 additive: the transport this transfer used on the wire.
-            "transport": "legacy",
+            "transport": "peersession",
         }));
     } else {
         ctx.line(&ctx.green(&format!("sent folder {name}")));
@@ -1058,11 +1045,13 @@ async fn daemon(ctx: &Ctx, args: DaemonArgs, path_override: Option<&str>) -> Cli
     }
 }
 
-/// This device's authentication material (crypto + trust + identity).
-struct SecureCtx {
-    enc: AeadCrypto,
-    trust: FsTrust,
-    ident: Identity,
+/// This device's authentication material (crypto + trust + identity). Held as
+/// `Arc`s so they can be shared into `PeerSession::open` (which takes owned
+/// trait-object handles).
+pub struct SecureCtx {
+    pub enc: Arc<AeadCrypto>,
+    pub trust: Arc<FsTrust>,
+    pub ident: Identity,
 }
 
 impl SecureCtx {
@@ -1076,7 +1065,11 @@ impl SecureCtx {
         };
         let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
         let trust = FsTrust::open(trust_path).map_err(CliError::from)?;
-        Ok(Self { enc, trust, ident })
+        Ok(Self {
+            enc: Arc::new(enc),
+            trust: Arc::new(trust),
+            ident,
+        })
     }
 }
 
@@ -1086,6 +1079,7 @@ impl SecureCtx {
 #[allow(clippy::too_many_arguments)]
 async fn secure_send_file(
     ctx: &Ctx,
+    quic: &Arc<QuicTransport>,
     routes: &RouteManager,
     device: &peerbeam_domain::entity::Device,
     sc: &SecureCtx,
@@ -1095,36 +1089,15 @@ async fn secure_send_file(
     size: u64,
     chunk: u32,
 ) -> CliResult {
-    use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
-    use peerbeam_domain::id::TransferId;
-
-    let session = TransferSession {
-        id: TransferId::from(name),
-        peer: device.id.clone(),
-        direction: Direction::Sending,
-        status: TransferStatus::Transferring,
-        files: Vec::new(),
-        total_bytes: size,
-        transferred_bytes: 0,
-        started_at: chrono::Utc::now(),
-        completed_at: None,
-        is_resume: false,
-    };
-
-    let mut link = routes
-        .connect(device, &session)
-        .await
-        .map_err(CliError::from)?;
-    let sess = authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust)
-        .await
-        .map_err(CliError::from)?;
-    let newly_trusted = sess.newly_trusted;
-    let peer_id = sess.peer_id.0.clone();
+    let session =
+        crate::session_transfer::dial(quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust)
+            .await?;
+    let newly_trusted = session.newly_trusted;
+    let peer_id = session.peer_id.clone();
     if newly_trusted && !ctx.json {
         ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
     }
 
-    let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
     let (ptx, mut prx) = mpsc::unbounded_channel();
     let bar = ctx.bar(size, name);
     let ctrl = TransferControl::new();
@@ -1136,8 +1109,9 @@ async fn secure_send_file(
         chunk_size: chunk,
     };
 
+    let handle = &session.handle;
     let send = async move {
-        let r = send_file(&mut secure, storage, req, &ctrl, &ptx, 3).await;
+        let r = send_file_on_session(handle, storage, req, &ctrl, &ptx, 3).await;
         drop(ptx);
         r
     };
@@ -1149,6 +1123,7 @@ async fn secure_send_file(
     };
     let (r, _) = tokio::join!(send, pump);
     r.map_err(CliError::from)?;
+    session.close().await;
 
     if ctx.json {
         ctx.json_line(&json!({
@@ -1157,8 +1132,7 @@ async fn secure_send_file(
             "bytes": size,
             "peer": peer_id,
             "newly_trusted": newly_trusted,
-            // M8 additive: the transport this transfer used on the wire.
-            "transport": "legacy",
+            "transport": "peersession",
         }));
     } else {
         ctx.line(&ctx.green(&format!("sent {name}")));
@@ -1166,14 +1140,9 @@ async fn secure_send_file(
     Ok(())
 }
 
-/// Serve inbound QUIC connections, authenticate each, and receive one file per
-/// connection into `dir`. Advertises presence via discovery so senders find us.
-/// What one inbound transfer produced.
-enum ReceivedKind {
-    File(peerbeam_transfer::Received),
-    Folder(peerbeam_transfer::FolderReceived),
-}
-
+/// Serve inbound QUIC connections as PeerSessions, accept each peer's transfer
+/// channel, and receive one file or folder per connection into `dir`. Advertises
+/// presence via discovery so senders find us.
 async fn serve_loop(
     ctx: &Ctx,
     config: &EngineConfig,
@@ -1182,15 +1151,12 @@ async fn serve_loop(
     once: bool,
 ) -> CliResult {
     use futures::StreamExt;
-    use peerbeam_domain::port::Bind;
 
     let sc = SecureCtx::build(config)?;
-    let quic = QuicTransport::new().map_err(CliError::from)?;
+    let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
     let storage = FsStorage::new();
-    let (local, mut incoming) = quic
-        .serve_addr(Bind { port })
-        .await
-        .map_err(CliError::from)?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+    let (local, mut incoming) = quic.serve_channels_on(addr).await.map_err(CliError::from)?;
     if ctx.json {
         ctx.json_line(&json!({
             "event": "listening",
@@ -1211,8 +1177,8 @@ async fn serve_loop(
     let _ = engine.start_discovery(me(config)).await;
 
     loop {
-        let mut link = match incoming.next().await {
-            Some(Ok(l)) => l,
+        let qc = match incoming.next().await {
+            Some(Ok(c)) => c,
             Some(Err(e)) => {
                 if !ctx.json {
                     ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
@@ -1221,107 +1187,70 @@ async fn serve_loop(
             }
             None => break,
         };
-        let sess = match authenticate(&mut *link, &sc.ident, &sc.enc, &sc.trust).await {
-            Ok(s) => s,
-            Err(e) => {
-                if ctx.json {
-                    ctx.json_line(
-                        &json!({"event": "error", "message": format!("auth failed: {e}")}),
-                    );
-                } else {
-                    ctx.line(&ctx.dim(&format!("auth failed: {e}")));
+        // Establish the PeerSession (runs the handshake internally).
+        let mut session =
+            match crate::session_transfer::accept(qc, &sc.ident, &sc.enc, &sc.trust).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if ctx.json {
+                        ctx.json_line(
+                            &json!({"event": "error", "message": format!("session failed: {e}")}),
+                        );
+                    } else {
+                        ctx.line(&ctx.dim(&format!("session failed: {e}")));
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
-        let newly_trusted = sess.newly_trusted;
-        let peer_id = sess.peer_id.0.clone();
+            };
+        let newly_trusted = session.newly_trusted;
+        let peer_id = session.peer_id.clone();
         if newly_trusted && !ctx.json {
             ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
         }
 
+        // Await the peer's transfer channel.
+        let incoming_ch = match session.next_incoming().await {
+            Some(c) => c,
+            None => {
+                if ctx.json {
+                    ctx.json_line(&json!({"event": "error", "message": "closed before data"}));
+                } else {
+                    ctx.line(&ctx.red("transfer failed: closed before data"));
+                }
+                session.close().await;
+                if once {
+                    break;
+                }
+                continue;
+            }
+        };
+
         let storage_ref = &storage;
+        let handle = &session.handle;
         let (ptx, mut prx) = mpsc::unbounded_channel();
         let ctrl = TransferControl::new();
-        // Report our received-byte progress back to the sender so its bar shows
-        // our real progress (over a slow link it otherwise sits at 100%).
-        let progress_sink = link.progress_sink();
-        let mut secure = SecureLink::new(&mut *link, &sc.enc, sess);
         let recv = async move {
-            // Peek the first frame to dispatch file vs folder receive.
-            let first = match secure.recv_frame().await {
-                Ok(Some(f)) => f,
-                Ok(None) => {
-                    drop(ptx);
-                    return Err(peerbeam_domain::error::DomainError::Connection(
-                        "closed before data".into(),
-                    ));
-                }
-                Err(e) => {
-                    drop(ptx);
-                    return Err(e);
-                }
-            };
-            let is_folder = first.kind == peerbeam_domain::port::FrameKind::Control;
-            let mut peek = PeekLink::new(first, &mut secure);
-            let r = if is_folder {
-                receive_folder(&mut peek, storage_ref, dir, &ctrl, &ptx)
-                    .await
-                    .map(ReceivedKind::Folder)
-            } else {
-                receive_file(&mut peek, storage_ref, dir, &ctrl, &ptx)
-                    .await
-                    .map(ReceivedKind::File)
-            };
+            let r = receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx).await;
             drop(ptx);
             r
         };
-        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel::<u64>();
-        let report = async move {
-            let Some(mut sink) = progress_sink else {
-                while rep_rx.recv().await.is_some() {} // drain
-                return;
-            };
-            let mut last = u64::MAX;
-            while let Some(b) = rep_rx.recv().await {
-                if b == last {
-                    continue;
-                }
-                last = b;
-                if sink.report(b).await.is_err() {
-                    break; // sender gone / doesn't accept — stop quietly
-                }
-            }
-        };
         // Human progress bar (created lazily once the total size is known).
-        // Throttle the back-channel report to ~20/s (always send the final) so
-        // small chunks don't spam the sender.
         let pump = async move {
-            use std::time::{Duration, Instant};
             let mut bar: Option<crate::output::Bar> = None;
-            let mut last = Instant::now()
-                .checked_sub(Duration::from_millis(100))
-                .unwrap_or_else(Instant::now);
             while let Some(p) = prx.recv().await {
-                let is_final = p.total_bytes > 0 && p.transferred_bytes >= p.total_bytes;
-                if is_final || last.elapsed() >= Duration::from_millis(50) {
-                    last = Instant::now();
-                    let _ = rep_tx.send(p.transferred_bytes);
-                }
                 if !ctx.json {
                     let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
                     b.update(p.transferred_bytes);
                 }
             }
-            drop(rep_tx);
             if let Some(b) = bar {
                 b.finish();
             }
         };
-        let (r, _, _) = tokio::join!(recv, pump, report);
+        let (r, _) = tokio::join!(recv, pump);
         let hist = history::path_for(&config.storage.data_directory);
         match r {
-            Ok(ReceivedKind::File(rcv)) => {
+            Ok(ChannelReceived::File(rcv)) => {
                 let saved = std::path::Path::new(dir)
                     .join(&rcv.name)
                     .to_string_lossy()
@@ -1337,13 +1266,13 @@ async fn serve_loop(
                         "bytes": rcv.bytes,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
-                        "transport": "legacy",
+                        "transport": "peersession",
                     }));
                 } else {
                     ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
                 }
             }
-            Ok(ReceivedKind::Folder(fr)) => {
+            Ok(ChannelReceived::Folder(fr)) => {
                 let saved = std::path::Path::new(dir)
                     .join(&fr.root)
                     .to_string_lossy()
@@ -1359,7 +1288,7 @@ async fn serve_loop(
                         "files": fr.files,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
-                        "transport": "legacy",
+                        "transport": "peersession",
                     }));
                 } else {
                     ctx.line(
@@ -1379,6 +1308,7 @@ async fn serve_loop(
                 }
             }
         }
+        session.close().await;
         if once {
             break;
         }

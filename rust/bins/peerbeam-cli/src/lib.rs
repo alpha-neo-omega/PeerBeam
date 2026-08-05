@@ -9,3 +9,4 @@ pub mod history;
 pub mod output;
 pub mod prompt;
 pub mod resolve;
+pub mod session_transfer;
