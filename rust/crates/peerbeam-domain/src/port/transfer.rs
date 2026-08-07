@@ -85,6 +85,15 @@ pub trait Link: Send + Sync {
     /// Close the connection.
     async fn close(&mut self) -> Result<()>;
 
+    /// Gracefully close: flush any buffered outbound data and wait (bounded) for
+    /// the peer to acknowledge it before tearing the connection down, so a final
+    /// frame (e.g. a `Shutdown` control message) is actually delivered rather
+    /// than dropped by an abrupt close. Defaults to [`close`](Link::close) for
+    /// transports where close already delivers buffered data.
+    async fn graceful_close(&mut self) -> Result<()> {
+        self.close().await
+    }
+
     /// Receiver side: open the progress back-channel to report received bytes.
     /// `None` if the transport doesn't support it (falls back to bytes-sent).
     /// Owned so it can be driven concurrently with frame I/O.

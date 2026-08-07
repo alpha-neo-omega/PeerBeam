@@ -13,6 +13,8 @@
 //! materialise more than one frame; the transfer engine above bounds frame
 //! size to its chunk size.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
@@ -208,6 +210,21 @@ impl Link for QuicLink {
     async fn close(&mut self) -> Result<()> {
         // Best-effort: finish our send side, then close the connection.
         let _ = self.send.finish();
+        self.conn.close(CLOSE_OK.into(), b"bye");
+        Ok(())
+    }
+
+    async fn graceful_close(&mut self) -> Result<()> {
+        // Deliver buffered data before closing: quinn's Connection::close sends
+        // CONNECTION_CLOSE immediately and drops un-transmitted stream data, so a
+        // final frame written just before it (e.g. a Shutdown control message)
+        // would be lost and the peer would misread a clean close as a transport
+        // loss. Finish the send side, then wait (bounded) for the peer to
+        // acknowledge all data + FIN (`stopped()` resolves once acknowledged),
+        // and only then close the connection. A gone/unresponsive peer just hits
+        // the timeout, after which we close anyway.
+        let _ = self.send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.send.stopped()).await;
         self.conn.close(CLOSE_OK.into(), b"bye");
         Ok(())
     }

@@ -993,8 +993,12 @@ impl PeerSession {
         )
         .await;
         self.manager.shutdown_all();
-        let _ = self.manager.transport().close().await;
-        let _ = self.control.close().await;
+        // Gracefully close the control stream — which shares the one QUIC
+        // connection — so the Shutdown frame above is delivered before the
+        // connection tears down. An abrupt transport close here would drop the
+        // buffered Shutdown, making the peer misread this clean close as a
+        // recoverable transport loss (and burn its whole reconnect budget).
+        let _ = self.control.graceful_close().await;
         self.state = SessionState::Closed;
         self.finish_close(CloseReason::Local);
     }
