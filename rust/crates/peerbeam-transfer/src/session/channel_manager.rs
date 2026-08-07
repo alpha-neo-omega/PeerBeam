@@ -336,6 +336,20 @@ impl ChannelManager {
         channel: ChannelId,
         channel_type: ChannelType,
     ) -> Vec<ControlMessage> {
+        // Reserved id 0 is the control channel — it lives outside `channels`, so
+        // the duplicate-id guard below would not catch it. Accepting a peer open
+        // on id 0 would derive crypto identical to the live control channel (same
+        // id/version/epoch → same HKDF key + nonce prefix) with counters reset to
+        // 0, reusing an AEAD (key, nonce) pair the control channel already
+        // consumed — a two-time-pad break enabling control-channel forgery.
+        // Refuse it before any crypto derivation.
+        if channel.is_control() {
+            self.pending_opens.push_back(PendingOpen::Reject(
+                channel,
+                "reserved control channel id".to_string(),
+            ));
+            return self.try_pair();
+        }
         // Even a rejected open is queued (as a Reject marker): the peer opened a
         // stream for it, and only by consuming that stream in FIFO order does the
         // reject avoid orphaning a stream and desyncing every later pairing.
