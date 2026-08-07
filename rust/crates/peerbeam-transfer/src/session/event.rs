@@ -140,6 +140,14 @@ impl Keepalive {
         self.last_ping = Some(now);
     }
 
+    /// The polling cadence: how often the pump should consult [`due`](Self::due)
+    /// while idle. Ticking at the ping interval sends pings on time and detects
+    /// the idle timeout within one interval of its deadline.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.config.interval
+    }
+
     /// Decide what to do at `now`.
     #[must_use]
     pub fn due(&self, now: Instant) -> KeepaliveAction {

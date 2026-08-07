@@ -266,6 +266,8 @@ enum Wake {
     Accept(Result<Option<Box<dyn Link>>, SessionError>),
     Actor(Option<ActorEvent>),
     Command(Option<SessionCommand>),
+    /// The idle keepalive timer elapsed — consult the scheduler.
+    Tick,
 }
 
 /// A live multiplexed session with one trusted peer.
@@ -796,6 +798,12 @@ impl PeerSession {
             let transport = self.manager.transport();
             let accepting = self.accepting;
             let enc = self.enc.clone();
+            // Idle keepalive timer: a fresh sleep each iteration, so it only
+            // elapses when no other branch has fired for a whole interval (i.e.
+            // the pump is genuinely idle). Any real activity resets it — and also
+            // resets the scheduler via on_activity — so this drives pings/idle
+            // timeout only when the peer has gone quiet.
+            let tick = self.keepalive.interval();
             let wake = {
                 let Self {
                     control,
@@ -809,6 +817,7 @@ impl PeerSession {
                     a = transport.accept_stream(), if accepting => Wake::Accept(a.map_err(SessionError::from)),
                     e = actor_events_rx.recv() => Wake::Actor(e),
                     c = commands_rx.recv() => Wake::Command(c),
+                    _ = tokio::time::sleep(tick) => Wake::Tick,
                 }
             };
 
@@ -841,6 +850,23 @@ impl PeerSession {
                     }
                 }
                 Wake::Command(None) => {}
+                Wake::Tick => match self.keepalive.due(Instant::now()) {
+                    KeepaliveAction::Idle => {}
+                    KeepaliveAction::SendPing => {
+                        self.ping_nonce = self.ping_nonce.wrapping_add(1);
+                        self.control_out
+                            .push_back(ControlMessage::Ping(self.ping_nonce));
+                        self.keepalive.on_ping_sent(Instant::now());
+                    }
+                    // The idle window elapsed with no peer response — the peer is
+                    // unresponsive even though the transport may still look alive
+                    // (e.g. its app pump stalled while QUIC keep-alive holds the
+                    // connection up). Close cleanly with Timeout rather than hang.
+                    KeepaliveAction::Timeout => {
+                        self.mark_closed(CloseReason::Timeout);
+                        return Ok(RunExit::Closed);
+                    }
+                },
             }
         }
     }

@@ -104,9 +104,33 @@ impl Capability {
 ///
 /// Stored as a vector (not a map) so it serializes to a JSON array with valid
 /// keys, and so ordering is canonical for reproducible negotiation.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CapabilitySet {
     caps: Vec<Capability>,
+}
+
+impl<'de> Deserialize<'de> for CapabilitySet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Normalize on decode: `supports`/`features`/`intersect` binary-search the
+        // vector, which is only valid when it is sorted and unique. A peer from a
+        // different/older/re-implemented build may serialize capabilities in any
+        // order, so rebuild through `insert` to re-establish the invariant rather
+        // than trusting the wire order. Mirror the derived `Serialize` shape
+        // (`{ "caps": [...] }`) so the wire format is unchanged.
+        #[derive(Deserialize)]
+        struct Raw {
+            caps: Vec<Capability>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut set = CapabilitySet::new();
+        for cap in raw.caps {
+            set.insert(cap);
+        }
+        Ok(set)
+    }
 }
 
 impl CapabilitySet {
@@ -220,6 +244,30 @@ mod tests {
         assert_eq!(channels, vec![0x0000, 0x0100]);
         assert_eq!(set.features(ChannelType::CONTROL), Some(0b10));
         assert!(set.supports(ChannelType::TRANSFER));
+    }
+
+    #[test]
+    fn deserialize_normalizes_unsorted_wire_order() {
+        // A peer that serializes capabilities in non-ascending channel order must
+        // still negotiate correctly: deserialize re-sorts so binary_search works.
+        let json = r#"{"caps":[{"channel":256,"features":0},{"channel":0,"features":3}]}"#;
+        let set: CapabilitySet = serde_json::from_str(json).expect("deserialize");
+        let channels: Vec<u16> = set.iter().map(|c| c.channel.get()).collect();
+        assert_eq!(channels, vec![0x0000, 0x0100], "re-sorted ascending");
+        assert!(
+            set.supports(ChannelType::TRANSFER),
+            "0x0100 found after re-sort"
+        );
+        assert_eq!(set.features(ChannelType::CONTROL), Some(3));
+
+        // Round-trip: the custom Deserialize must accept exactly what Serialize
+        // emits (the wire shape used by SessionHello), or handshakes break.
+        let original = CapabilitySet::new()
+            .with(Capability::with_features(ChannelType::CONTROL, 3))
+            .with(Capability::new(ChannelType::TRANSFER));
+        let wire = serde_json::to_string(&original).expect("serialize");
+        let back: CapabilitySet = serde_json::from_str(&wire).expect("round-trip deserialize");
+        assert_eq!(back, original);
     }
 
     #[test]

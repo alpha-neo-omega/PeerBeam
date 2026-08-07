@@ -24,8 +24,8 @@ use peerbeam_domain::session::{
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
     receive_file_on_channel, send_file_on_session, ChannelEvent, HandlerRegistry, Identity,
-    IncomingStreamChannel, PeerSession, SendRequest, SessionConfig, SessionEvent, SessionHandle,
-    SessionRole, TransferControl, TransferOutcome,
+    IncomingStreamChannel, KeepaliveConfig, PeerSession, SendRequest, SessionConfig, SessionEvent,
+    SessionHandle, SessionRole, TransferControl, TransferOutcome,
 };
 use peerbeam_trust_fs::FsTrust;
 
@@ -480,6 +480,30 @@ async fn reject_does_not_desync_later_channel_pairing() {
         "c3 must open cleanly, not inherit the rejected channel's stream: {ev:?}"
     );
     wait_channels_len(&p.a, 1).await;
+}
+
+#[tokio::test]
+async fn idle_session_sends_automatic_keepalive_pings() {
+    // The pump drives the keepalive scheduler: after `interval` of no activity it
+    // auto-sends a Ping (previously the scheduler was never consulted, so the
+    // idle-timeout/keepalive config was inert and a stalled peer hung forever).
+    let mut fast = SessionConfig::new(caps());
+    fast.keepalive = KeepaliveConfig {
+        interval: Duration::from_millis(50),
+        idle_timeout: Duration::from_secs(30),
+    };
+    let mut p = open(fast, SessionConfig::new(caps())).await;
+
+    // With A idle, its pump auto-pings within a few intervals; B reports it.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), p.b_events.recv()).await {
+            Ok(Some(SessionEvent::PingReceived { .. })) => break,
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("event stream ended before a keepalive ping"),
+            Err(_) => panic!("no automatic keepalive ping arrived within the timeout"),
+        }
+    }
+    p.a.close();
 }
 
 #[tokio::test]
