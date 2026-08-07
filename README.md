@@ -21,7 +21,7 @@ two frontends over the same core.
 
 > **Status: 🟢 Release Candidate.** Engine, discovery, security, QUIC transport,
 > RouteManager, full FFI, Dart SDK, and the Flutter app are implemented and
-> tested (204 Rust + 35 Flutter tests, clippy/fmt clean). Networked
+> tested (377 Rust + 35 Flutter tests, clippy/fmt clean). Networked
 > `send`/`receive` work end to end over QUIC with mutual authentication —
 > **verified live on real hardware** (Android → Linux, byte-exact). Linux + CLI
 > are build- and run-verified; Android runs the full engine on-device.
