@@ -6,6 +6,48 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-08 — Beta
+
+The **PeerSession** release. The transfer stack was rebuilt on a single
+multiplexed, authenticated session abstraction
+(`Peer → PeerSession → Typed Message → Handler → Engine`). Every transfer now
+runs as a cryptographically isolated channel over one QUIC session, with
+reconnect/resume built in. The old direct-link transport and its
+migration/compatibility layer are gone — PeerSession is the only transport.
+
+### Added
+- **PeerSession foundation** — a multiplexed session over QUIC: N independent
+  channels per session, each a typed control or stream channel (M1–M3).
+- **Per-channel encryption** — every channel derives its own key via HKDF, with
+  independent counters and replay protection, so concurrent transfers never
+  share a nonce (M4).
+- **Transfer as a channel** — file and folder transfers run on a dedicated
+  sealed transfer channel, reusing the transfer engine unchanged; a failed or
+  cancelled transfer can no longer stall the session or its siblings (M5).
+- **Reconnect + resume** — a session survives a dropped connection: it
+  reconnects, bumps its epoch, and reattaches its channels with message
+  continuity (M6).
+- **PeerSession diagnostics** — live session/channel/transport/recovery
+  snapshots exposed over the FFI and the CLI (`session`, `channels`,
+  `transfers`, `recovery`, `diagnostics`) (M8–M9).
+
+### Changed
+- **CLI and FFI transfers execute over PeerSession** — both frontends dial /
+  accept a PeerSession and run transfers as channels; the Flutter app follows
+  via the FFI (M7–M9).
+- **Diagnostics report the permanent runtime** — the former migration metrics
+  endpoint now reports the live transport summary
+  (`transport`/`active_sessions`/`recovering`); the API surface (FFI symbol +
+  CLI command) is unchanged.
+- **Unified monochrome brand mark** across launcher icons, packaging, README
+  banner, and GitHub social preview.
+
+### Removed
+- **Migration / cutover / compatibility layer** — the dual-path selector,
+  `CompatMode`, fallback machinery, and migration-only metrics were deleted.
+  PeerSession is the sole send/receive/recovery path (M9).
+- FFI migration event kinds (`FALLBACK_TRIGGERED`, `MIGRATION_STATS_UPDATED`).
+
 ## [0.2.4] - 2026-07-16 — Beta
 
 See [Release Notes](docs/RELEASE_NOTES_v0.2.4.md).
