@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use peerbeam_domain::port::{EncryptionProvider, Nonce};
 use peerbeam_domain::session::{ChannelId, SessionError, Version};
@@ -67,9 +67,16 @@ enum Direction {
 
 /// HKDF-Expand (RFC 5869) with HMAC-SHA256. The master keys are already
 /// high-entropy (ECDH + hash), so no Extract step is needed — they are the PRK.
-fn hkdf_expand(prk: &[u8], info: &[u8], out_len: usize) -> Result<Vec<u8>, SessionError> {
-    let mut out = Vec::with_capacity(out_len);
-    let mut block: Vec<u8> = Vec::new();
+fn hkdf_expand(
+    prk: &[u8],
+    info: &[u8],
+    out_len: usize,
+) -> Result<Zeroizing<Vec<u8>>, SessionError> {
+    // `out` and `block` both hold derived key material; wrap/scrub them so no
+    // plaintext key survives in freed heap after this returns (the callers copy
+    // into fixed arrays whose owners zeroize on Drop).
+    let mut out = Zeroizing::new(Vec::with_capacity(out_len));
+    let mut block: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     let mut counter: u8 = 1;
     while out.len() < out_len {
         let mut mac = HmacSha256::new_from_slice(prk)
@@ -77,7 +84,7 @@ fn hkdf_expand(prk: &[u8], info: &[u8], out_len: usize) -> Result<Vec<u8>, Sessi
         mac.update(&block);
         mac.update(info);
         mac.update(&[counter]);
-        block = mac.finalize().into_bytes().to_vec();
+        block = Zeroizing::new(mac.finalize().into_bytes().to_vec());
         out.extend_from_slice(&block);
         counter = counter
             .checked_add(1)

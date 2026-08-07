@@ -49,7 +49,8 @@ impl Session {
         self.incoming.recv().await
     }
 
-    /// Close the session and wait for its pump to finish.
+    /// Close the session and wait for its pump to finish. The pump task removes
+    /// this session from the diagnostics registry when `run` returns.
     pub async fn close(self) {
         self.handle.close();
         let _ = self.run.await;
@@ -66,6 +67,11 @@ async fn establish(
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
     let (inc, incoming) = unbounded_channel();
+    // Register into the shared diagnostics registry so pb_session_* / transport /
+    // recovery report this live session (the registry is the seam the engine's
+    // SessionDiagnostics reads). Absent only if the runtime is not initialised.
+    let diag = crate::runtime::diagnostics().ok();
+    let registry = diag.as_ref().map(|d| d.registry());
     let mut ps = PeerSession::open(
         transport,
         role,
@@ -73,19 +79,33 @@ async fn establish(
         ev,
         ch,
         inc,
-        None,
+        registry,
         ident,
         enc,
         trust,
     )
     .await
     .map_err(|e| (Code::Connection, format!("session establish failed: {e}")))?;
+    let id = ps.id();
     let peer_device = ps.peer().clone();
     let peer_id = peer_device.0.clone();
     let peer_name = ps.peer_name().to_string();
     let handle = ps.handle();
+    if let Some(d) = &diag {
+        d.register_handle(id, handle.clone());
+    }
     let run = crate::runtime::spawn_handle(async move {
         let _ = ps.run().await;
+        // The session has ended — a clean close, or a transport loss that the
+        // FFI does not recover (it runs the pump directly, with no
+        // RecoveryManager, and discards RunExit::Lost). capture_loss marked the
+        // registry entry `Recovering`; with nothing to finish it, remove the
+        // entry + handle here so diagnostics don't leak a permanently-recovering
+        // session (and the recovering count stays accurate).
+        if let Some(d) = diag {
+            d.registry().remove(id);
+            d.unregister_handle(id);
+        }
     });
     Ok(Session {
         handle,

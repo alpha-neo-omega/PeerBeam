@@ -599,6 +599,12 @@ impl PeerSession {
         self.manager.shutdown_all();
         if self.state.can_transition_to(SessionState::Recovering) {
             self.state = SessionState::Recovering;
+            // Reflect the recovering state in the registry so diagnostics
+            // (recovery_json / transport_json) observe it; assemble() re-registers
+            // Active on a successful resume, and finish_close() removes on give-up.
+            if let Some(reg) = &self.registry {
+                reg.set_state(self.id, SessionState::Recovering);
+            }
         }
         RunExit::Lost(Box::new(preserved))
     }
@@ -975,6 +981,9 @@ impl PeerSession {
         }
         if self.state.is_active() {
             self.state = SessionState::ShuttingDown;
+            if let Some(reg) = &self.registry {
+                reg.set_state(self.id, SessionState::ShuttingDown);
+            }
         }
         let _ = send_control(
             self.control.as_mut(),

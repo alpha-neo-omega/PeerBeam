@@ -254,7 +254,6 @@ impl RecoveryManager {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            self.stats.attempts += 1;
             if attempt > self.config.max_attempts {
                 let _ = self.handle_tx.send(None);
                 let _ = self.wiring.events.send(SessionEvent::RecoveryFailed {
@@ -265,6 +264,9 @@ impl RecoveryManager {
                     attempts: attempt - 1,
                 });
             }
+            // Count only real attempts (past the bound check), so the public
+            // stat agrees with the `RecoveryExhausted { attempts }` value.
+            self.stats.attempts += 1;
             let _ = self.wiring.events.send(SessionEvent::Recovering {
                 session_id,
                 attempt,
@@ -277,34 +279,45 @@ impl RecoveryManager {
                 Ok(Err(_)) | Err(_) => continue, // dial failed or timed out → retry
             };
 
-            let outcome = match preserved.role {
-                SessionRole::Initiator => {
-                    // Bump the epoch per attempt so a partially-consumed epoch is
-                    // never re-presented (the accepter rejects replays).
-                    let epoch = preserved.crypto.epoch() + attempt as u64;
-                    PeerSession::resume(
+            // The resume handshake must also be bounded by attempt_timeout: a peer
+            // that never sends ResumeAck (asymmetric loss / half-open link) would
+            // otherwise block recv_frame forever, so recover() never returns and
+            // the I11 fail-closed guarantee is never reached. On timeout treat the
+            // attempt as failed and retry within the budget.
+            let handshake = async {
+                match preserved.role {
+                    SessionRole::Initiator => {
+                        // Bump the epoch per attempt so a partially-consumed epoch
+                        // is never re-presented (the accepter rejects replays).
+                        let epoch = preserved.crypto.epoch() + attempt as u64;
+                        PeerSession::resume(
+                            transport,
+                            &preserved,
+                            epoch,
+                            &self.session_config,
+                            self.config.token_ttl_ms,
+                            self.wiring.clone(),
+                        )
+                        .await
+                        .map(|s| (s, epoch))
+                    }
+                    SessionRole::Responder => PeerSession::accept_resume(
                         transport,
                         &preserved,
-                        epoch,
                         &self.session_config,
-                        self.config.token_ttl_ms,
                         self.wiring.clone(),
                     )
                     .await
-                    .map(|s| (s, epoch))
+                    .map(|(s, consumed)| {
+                        preserved.consumed_epoch = consumed;
+                        let e = s.crypto_epoch();
+                        (s, e)
+                    }),
                 }
-                SessionRole::Responder => PeerSession::accept_resume(
-                    transport,
-                    &preserved,
-                    &self.session_config,
-                    self.wiring.clone(),
-                )
-                .await
-                .map(|(s, consumed)| {
-                    preserved.consumed_epoch = consumed;
-                    let e = s.crypto_epoch();
-                    (s, e)
-                }),
+            };
+            let outcome = match tokio::time::timeout(self.config.attempt_timeout, handshake).await {
+                Ok(o) => o,
+                Err(_) => continue, // handshake timed out → retry within budget
             };
 
             match outcome {
@@ -319,21 +332,31 @@ impl RecoveryManager {
                     self.session = Some(session);
                     return Ok(());
                 }
-                // Fatal: the peer refused the token (forged/expired/replayed). Do
-                // not keep retrying a credential that will keep failing — fail
-                // closed so the caller can start a fresh session.
+                // A refused resume token — forged, expired, or replayed.
                 Err(
                     e @ (SessionError::ResumeRejected(_)
                     | SessionError::ResumeExpired
                     | SessionError::ResumeReplayed),
-                ) => {
-                    let _ = self.handle_tx.send(None);
-                    let _ = self.wiring.events.send(SessionEvent::RecoveryFailed {
-                        session_id,
-                        reason: e.to_string(),
-                    });
-                    return Err(e);
-                }
+                ) => match preserved.role {
+                    // Initiator: *we* minted the refused credential, so it will
+                    // keep failing — fail closed for a fresh session.
+                    SessionRole::Initiator => {
+                        let _ = self.handle_tx.send(None);
+                        let _ = self.wiring.events.send(SessionEvent::RecoveryFailed {
+                            session_id,
+                            reason: e.to_string(),
+                        });
+                        return Err(e);
+                    }
+                    // Responder: the refused token came from an *inbound*
+                    // connection — a stray, stale, or forged peer, not our own
+                    // failure. Count it as one attempt and keep accepting the
+                    // next inbound within the budget, so the legitimate peer can
+                    // still resume. (Otherwise an unauthenticated remote could
+                    // force a recoverable session closed by racing a bad
+                    // ResumeRequest into the recovery window.)
+                    SessionRole::Responder => continue,
+                },
                 // Transient (dial/link glitch): retry within the attempt budget.
                 Err(_) => continue,
             }

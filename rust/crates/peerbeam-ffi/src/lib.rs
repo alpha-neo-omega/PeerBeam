@@ -581,11 +581,16 @@ mod tests {
 
         pb_set_event_callback(None);
 
+        // Filter to this test's own session ("abc"): the global callback is a
+        // process-wide sink, and unrelated async lifecycle events (e.g. a prior
+        // test's daemon serve task emitting `daemon_stopped`) can interleave. We
+        // assert routing + ordering for *our* session, not the absence of others.
         let got: Vec<Value> = COLLECTED
             .lock()
             .unwrap()
             .iter()
             .map(|s| serde_json::from_str(s).unwrap())
+            .filter(|v: &Value| v["session_id"] == "abc")
             .collect();
         let types: Vec<&str> = got.iter().map(|v| v["type"].as_str().unwrap()).collect();
         // Order matches emit order exactly (emit invokes the callback synchronously).

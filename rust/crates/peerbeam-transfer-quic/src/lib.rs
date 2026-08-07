@@ -60,6 +60,12 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
     // Allow the progress back-channel's dedicated uni-stream (receiver→sender).
     tc.max_concurrent_uni_streams(4u8.into());
+    // Every PeerSession channel is one bidi stream (control + up to
+    // DEFAULT_CHANNEL_LIMIT=256 data channels). quinn defaults to 100, which is
+    // below the app-level channel limit and would make the pump block on
+    // `open_bi` back-pressure once ~100 channels are open. Advertise headroom
+    // above 256 so the application guard stays authoritative, not the transport.
+    tc.max_concurrent_bidi_streams(512u32.into());
     tc.max_idle_timeout(Some(
         Duration::from_secs(30)
             .try_into()
@@ -121,23 +127,8 @@ impl QuicTransport {
     ) -> Result<(SocketAddr, BoxStream<'static, Result<Box<dyn Link>>>)> {
         let (endpoint, local) = server_endpoint(addr)?;
         tracing::info!(%local, "quic serving");
-
-        let stream = futures::stream::unfold(endpoint, |ep| async move {
-            loop {
-                match ep.accept().await {
-                    Some(incoming) => match accept_link(incoming).await {
-                        Ok(link) => return Some((Ok(link), ep)),
-                        Err(e) => {
-                            // A single bad connection must not stop the server.
-                            tracing::warn!(error = %e, "quic inbound connection rejected");
-                            continue;
-                        }
-                    },
-                    None => return None, // endpoint closed
-                }
-            }
-        });
-        Ok((local, Box::pin(stream)))
+        let stream = accept_loop(endpoint, accept_link);
+        Ok((local, stream))
     }
 
     /// Connect to `route`, returning the raw QUIC connection (bounded handshake).
@@ -169,22 +160,10 @@ impl QuicTransport {
     ) -> Result<(SocketAddr, BoxStream<'static, Result<QuicChannels>>)> {
         let (endpoint, local) = server_endpoint(addr)?;
         tracing::info!(%local, "quic serving (channels)");
-
-        let stream = futures::stream::unfold(endpoint, |ep| async move {
-            loop {
-                match ep.accept().await {
-                    Some(incoming) => match incoming.await {
-                        Ok(conn) => return Some((Ok(QuicChannels::new(conn)), ep)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "quic inbound connection rejected");
-                            continue;
-                        }
-                    },
-                    None => return None,
-                }
-            }
+        let stream = accept_loop(endpoint, |incoming| async move {
+            Ok(QuicChannels::new(incoming.await.map_err(conn_err)?))
         });
-        Ok((local, Box::pin(stream)))
+        Ok((local, stream))
     }
 }
 
@@ -195,6 +174,51 @@ fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, SocketAddr)> {
     let endpoint = quinn::Endpoint::server(server_config, addr).map_err(conn_err)?;
     let local = endpoint.local_addr().map_err(conn_err)?;
     Ok((endpoint, local))
+}
+
+/// Drive an accept loop that runs each inbound `handshake` on its **own** task,
+/// yielding the results as a stream.
+///
+/// `quinn::Endpoint::accept()` only dequeues a connection; the handshake happens
+/// in the `handshake` future. Awaiting that inline (as a plain `unfold` did)
+/// serialises acceptance — one slow or deliberately-stalled peer would block
+/// accepting every other connection (head-of-line DoS). Spawning per connection
+/// keeps acceptance flowing. The driver stops when the endpoint closes or when
+/// the consumer drops the returned stream (`tx.closed()`), which drops the
+/// endpoint. A failed handshake is logged and skipped, never fatal to the server.
+fn accept_loop<T, F, Fut>(endpoint: quinn::Endpoint, handshake: F) -> BoxStream<'static, Result<T>>
+where
+    T: Send + 'static,
+    F: Fn(quinn::Incoming) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<T>>(64);
+    let handshake = Arc::new(handshake);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break, // consumer dropped the stream
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else { break }; // endpoint closed
+                    let tx = tx.clone();
+                    let handshake = handshake.clone();
+                    tokio::spawn(async move {
+                        match handshake(incoming).await {
+                            Ok(item) => {
+                                let _ = tx.send(Ok(item)).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "quic inbound connection rejected");
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
 }
 
 #[async_trait]

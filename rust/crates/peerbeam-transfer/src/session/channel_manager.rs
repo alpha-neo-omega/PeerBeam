@@ -35,6 +35,18 @@ use super::sealed_link::SealedLink;
 /// exhausting resources by opening unboundedly).
 pub const DEFAULT_CHANNEL_LIMIT: usize = 256;
 
+/// A queued peer `ChannelOpen` awaiting its stream. Every peer open — accepted
+/// **or** rejected — opened exactly one stream on the peer's side, so both are
+/// queued: `try_pair` consumes one stream per entry, keeping the FIFO
+/// open↔stream pairing aligned even when an open is rejected.
+enum PendingOpen {
+    /// A permitted open, to be paired with its stream and spawned.
+    Accept(ChannelId, ChannelType),
+    /// A rejected open; its stream is consumed (dropped) on pairing and the
+    /// `ChannelReject` emitted, so the reject never desyncs later pairings.
+    Reject(ChannelId, String),
+}
+
 /// Owns and coordinates one session's data channels.
 pub struct ChannelManager {
     transport: Arc<dyn ChannelTransport>,
@@ -52,7 +64,7 @@ pub struct ChannelManager {
     stream_types: HashSet<ChannelType>,
     incoming_stream_tx: UnboundedSender<IncomingStreamChannel>,
     // Responder-side FIFO pairing of received ChannelOpens with accepted streams.
-    pending_opens: VecDeque<(ChannelId, ChannelType)>,
+    pending_opens: VecDeque<PendingOpen>,
     pending_streams: VecDeque<Box<dyn Link>>,
 }
 
@@ -199,10 +211,25 @@ impl ChannelManager {
     }
 
     fn allocate_id(&mut self) -> ChannelId {
-        let id = self.next_id;
-        // Step by 2 to preserve the role parity; never yields 0 (control).
-        self.next_id = self.next_id.wrapping_add(2);
-        ChannelId::new(id)
+        // Step by 2 to preserve the role parity; never yields 0 (control). Skip
+        // any id already live or pending: on resume the initiator re-attaches the
+        // responder's own (even-parity) channels, so this side's fresh allocator
+        // (reset to its parity start) would otherwise re-hand-out an occupied id —
+        // clobbering the live channel and reusing its (key, nonce). Skipping keeps
+        // every live channel's id unique. `permit` guarantees a free id exists.
+        loop {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(2);
+            let cid = ChannelId::new(id);
+            let taken = self.channels.contains_key(&cid)
+                || self
+                    .pending_opens
+                    .iter()
+                    .any(|p| matches!(p, PendingOpen::Accept(pid, _) if *pid == cid));
+            if id != 0 && !taken {
+                return cid;
+            }
+        }
     }
 
     fn emit(&self, event: ChannelEvent) {
@@ -216,7 +243,14 @@ impl ChannelManager {
                 channel_type.get()
             ));
         }
-        if self.channels.len() + self.pending_opens.len() >= self.limit {
+        // Count only pending *accepts* toward the limit — reject markers never
+        // become channels.
+        let pending_accepts = self
+            .pending_opens
+            .iter()
+            .filter(|p| matches!(p, PendingOpen::Accept(..)))
+            .count();
+        if self.channels.len() + pending_accepts >= self.limit {
             return Err("channel limit reached".into());
         }
         Ok(())
@@ -302,20 +336,28 @@ impl ChannelManager {
         channel: ChannelId,
         channel_type: ChannelType,
     ) -> Vec<ControlMessage> {
+        // Even a rejected open is queued (as a Reject marker): the peer opened a
+        // stream for it, and only by consuming that stream in FIFO order does the
+        // reject avoid orphaning a stream and desyncing every later pairing.
         if let Err(reason) = self.permit(channel_type) {
-            self.emit(ChannelEvent::Rejected {
-                channel,
-                reason: reason.clone(),
-            });
-            return vec![ControlMessage::ChannelReject { channel, reason }];
+            self.pending_opens
+                .push_back(PendingOpen::Reject(channel, reason));
+            return self.try_pair();
         }
         if self.channels.contains_key(&channel)
-            || self.pending_opens.iter().any(|(id, _)| *id == channel)
+            || self
+                .pending_opens
+                .iter()
+                .any(|p| matches!(p, PendingOpen::Accept(id, _) if *id == channel))
         {
-            let reason = "duplicate channel id".to_string();
-            return vec![ControlMessage::ChannelReject { channel, reason }];
+            self.pending_opens.push_back(PendingOpen::Reject(
+                channel,
+                "duplicate channel id".to_string(),
+            ));
+            return self.try_pair();
         }
-        self.pending_opens.push_back((channel, channel_type));
+        self.pending_opens
+            .push_back(PendingOpen::Accept(channel, channel_type));
         self.try_pair()
     }
 
@@ -330,11 +372,28 @@ impl ChannelManager {
     fn try_pair(&mut self) -> Vec<ControlMessage> {
         let mut out = Vec::new();
         while !self.pending_opens.is_empty() && !self.pending_streams.is_empty() {
-            let Some((id, channel_type)) = self.pending_opens.pop_front() else {
+            let Some(pending) = self.pending_opens.pop_front() else {
                 break;
             };
             let Some(link) = self.pending_streams.pop_front() else {
                 break;
+            };
+            let (id, channel_type) = match pending {
+                PendingOpen::Reject(id, reason) => {
+                    // Consume (drop) the stream the peer opened for this rejected
+                    // channel so the next open still lines up with its own stream.
+                    drop(link);
+                    self.emit(ChannelEvent::Rejected {
+                        channel: id,
+                        reason: reason.clone(),
+                    });
+                    out.push(ControlMessage::ChannelReject {
+                        channel: id,
+                        reason,
+                    });
+                    continue;
+                }
+                PendingOpen::Accept(id, channel_type) => (id, channel_type),
             };
             let crypto = match self.crypto.derive(id, self.version) {
                 Ok(crypto) => crypto,
@@ -424,6 +483,12 @@ impl ChannelManager {
     }
 
     /// Handle a peer `ChannelReject`: drop the pending channel.
+    ///
+    /// The `Rejected` event is emitted unconditionally: rejecting a channel
+    /// closes its stream, which can make the local actor emit `Closed`/`Error`
+    /// and remove the channel *before* this `ChannelReject` arrives — gating the
+    /// emit on presence would then swallow the reject a caller is waiting for. A
+    /// benign duplicate lifecycle event is preferable to a lost one.
     pub fn handle_channel_reject(&mut self, channel: ChannelId, reason: String) {
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();
@@ -449,7 +514,10 @@ impl ChannelManager {
         }
     }
 
-    /// Handle a peer `ChannelError`: close the channel (isolated).
+    /// Handle a peer `ChannelError`: close the channel (isolated). Emits
+    /// unconditionally for the same reason as [`handle_channel_reject`] — a peer
+    /// error can arrive after the local actor already closed the channel, and a
+    /// waiter must still observe it.
     pub fn handle_channel_error(&mut self, channel: ChannelId, detail: String) {
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();

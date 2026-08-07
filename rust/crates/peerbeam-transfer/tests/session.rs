@@ -430,6 +430,59 @@ async fn channel_beyond_limit_is_rejected() {
 }
 
 #[tokio::test]
+async fn reject_does_not_desync_later_channel_pairing() {
+    // RM4 (#6/#7): a rejected ChannelOpen must still consume the stream the peer
+    // opened for it. Otherwise the orphaned stream desyncs FIFO open<->stream
+    // pairing and a later channel binds to the wrong stream (wrong per-channel
+    // key → spurious error), corrupting an unrelated channel.
+    let mut p = open(
+        SessionConfig::new(caps()),
+        SessionConfig::new(caps()).with_channel_limit(1),
+    )
+    .await;
+
+    // c1 opens and fills the responder's single slot.
+    let c1 = p.a.open_channel(T1).await.expect("c1");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
+    )
+    .await;
+
+    // c2 is rejected on the limit; the peer already opened a stream for it — the
+    // orphan that (pre-fix) would offset every later pairing.
+    let c2 = p.a.open_channel(t2()).await.expect("c2 requested");
+    next_channel_event(
+        &mut p.a_channels,
+        |e| matches!(e, ChannelEvent::Rejected { channel, .. } if *channel == c2),
+    )
+    .await;
+
+    // Free the slot (control stream is ordered: the close is processed before the
+    // next open), then open c3. With the fix c3 pairs with its own stream and
+    // opens; without it, c3 inherits c2's orphan stream and errors.
+    p.a.close_channel(c1);
+    wait_channels_len(&p.a, 0).await;
+
+    let c3 = p.a.open_channel(T1).await.expect("c3 requested");
+    let ev = next_channel_event(&mut p.a_channels, |e| {
+        matches!(
+            e,
+            ChannelEvent::Opened { channel, .. }
+                | ChannelEvent::Rejected { channel, .. }
+                | ChannelEvent::Error { channel, .. }
+            if *channel == c3
+        )
+    })
+    .await;
+    assert!(
+        matches!(ev, ChannelEvent::Opened { .. }),
+        "c3 must open cleanly, not inherit the rejected channel's stream: {ev:?}"
+    );
+    wait_channels_len(&p.a, 1).await;
+}
+
+#[tokio::test]
 async fn ping_is_answered_and_reported() {
     let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;
     p.a.ping();

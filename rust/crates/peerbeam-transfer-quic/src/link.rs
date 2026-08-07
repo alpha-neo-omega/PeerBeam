@@ -27,17 +27,40 @@ const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// Reason code sent when closing the connection cleanly.
 const CLOSE_OK: u32 = 0;
 
+/// Resumable state of an in-progress frame read, held in [`QuicLink`] so that a
+/// [`QuicLink::recv_frame`] future dropped mid-frame (e.g. a `tokio::select!`
+/// branch losing the race) loses no bytes: the next call continues from here.
+/// This makes `recv_frame` **cancellation-safe**, which `read_exact` is not.
+enum RecvState {
+    /// Between frames — nothing read yet.
+    Idle,
+    /// Reading the 5-byte length-delimited header.
+    Header { buf: [u8; 5], filled: usize },
+    /// Header parsed; reading the `payload` (`filled` of `buf.len()` bytes read).
+    Payload {
+        kind: FrameKind,
+        buf: Vec<u8>,
+        filled: usize,
+    },
+}
+
 /// One live QUIC connection presented as a framed [`Link`].
 pub struct QuicLink {
     conn: Connection,
     send: SendStream,
     recv: RecvStream,
+    recv_state: RecvState,
 }
 
 impl QuicLink {
     /// Wrap an opened/accepted bidirectional stream on `conn`.
     pub(crate) fn new(conn: Connection, send: SendStream, recv: RecvStream) -> Self {
-        Self { conn, send, recv }
+        Self {
+            conn,
+            send,
+            recv,
+            recv_state: RecvState::Idle,
+        }
     }
 
     /// The peer's remote address (for logging).
@@ -71,6 +94,29 @@ fn conn_err(e: impl std::fmt::Display) -> DomainError {
     DomainError::Connection(format!("quic: {e}"))
 }
 
+/// Outcome of [`fill`].
+enum FillOutcome {
+    /// `buf` was filled to `buf.len()`.
+    Filled,
+    /// The stream finished before `buf` was full (peer closed its send side).
+    Eof,
+}
+
+/// Read from `recv` into `buf[*filled..]` until `buf` is full or the stream ends,
+/// advancing `*filled` as bytes arrive. Cancellation-safe: `RecvStream::read`
+/// suspends only when *no* bytes are available (so a dropped-while-pending future
+/// consumes nothing), and every byte it returns is recorded in `*filled` before
+/// the next await — so re-calling with the same `buf`/`filled` resumes cleanly.
+async fn fill(recv: &mut RecvStream, buf: &mut [u8], filled: &mut usize) -> Result<FillOutcome> {
+    while *filled < buf.len() {
+        match recv.read(&mut buf[*filled..]).await.map_err(conn_err)? {
+            Some(0) | None => return Ok(FillOutcome::Eof),
+            Some(n) => *filled += n,
+        }
+    }
+    Ok(FillOutcome::Filled)
+}
+
 #[async_trait]
 impl Link for QuicLink {
     async fn send_frame(&mut self, frame: Frame) -> Result<()> {
@@ -94,25 +140,69 @@ impl Link for QuicLink {
     }
 
     async fn recv_frame(&mut self) -> Result<Option<Frame>> {
-        let mut header = [0u8; 5];
-        match self.recv.read_exact(&mut header).await {
-            Ok(()) => {}
-            // Peer finished the stream at a frame boundary — clean close.
-            Err(quinn::ReadExactError::FinishedEarly { .. }) => return Ok(None),
-            Err(e) => return Err(conn_err(e)),
+        // Cancellation-safe, resumable read: all partial progress lives in
+        // `self.recv_state`, so a future dropped mid-frame (a losing select!
+        // branch) resumes here on the next call instead of desyncing the stream.
+        loop {
+            if matches!(self.recv_state, RecvState::Idle) {
+                self.recv_state = RecvState::Header {
+                    buf: [0u8; 5],
+                    filled: 0,
+                };
+            }
+            match &mut self.recv_state {
+                RecvState::Idle => unreachable!("set to Header above"),
+                RecvState::Header { buf, filled } => {
+                    match fill(&mut self.recv, &mut buf[..], filled).await? {
+                        // EOF at a frame boundary (nothing read) is a clean close;
+                        // a partially-read header is a truncation error.
+                        FillOutcome::Eof if *filled == 0 => {
+                            self.recv_state = RecvState::Idle;
+                            return Ok(None);
+                        }
+                        FillOutcome::Eof => {
+                            self.recv_state = RecvState::Idle;
+                            return Err(conn_err("stream ended mid-header"));
+                        }
+                        FillOutcome::Filled => {
+                            let kind = u8_to_kind(buf[0])?;
+                            let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                            if len > MAX_FRAME {
+                                self.recv_state = RecvState::Idle;
+                                return Err(DomainError::Transfer(
+                                    "frame exceeds MAX_FRAME".into(),
+                                ));
+                            }
+                            self.recv_state = RecvState::Payload {
+                                kind,
+                                buf: vec![0u8; len as usize],
+                                filled: 0,
+                            };
+                        }
+                    }
+                }
+                RecvState::Payload { buf, filled, .. } => {
+                    match fill(&mut self.recv, &mut buf[..], filled).await? {
+                        // A truncated payload after a header is a hard error.
+                        FillOutcome::Eof => {
+                            self.recv_state = RecvState::Idle;
+                            return Err(conn_err("stream ended mid-payload"));
+                        }
+                        FillOutcome::Filled => {
+                            let RecvState::Payload { kind, buf, .. } =
+                                std::mem::replace(&mut self.recv_state, RecvState::Idle)
+                            else {
+                                unreachable!("matched Payload above")
+                            };
+                            return Ok(Some(Frame {
+                                kind,
+                                payload: Bytes::from(buf),
+                            }));
+                        }
+                    }
+                }
+            }
         }
-        let kind = u8_to_kind(header[0])?;
-        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        if len > MAX_FRAME {
-            return Err(DomainError::Transfer("frame exceeds MAX_FRAME".into()));
-        }
-        let mut payload = vec![0u8; len as usize];
-        // A truncated payload after a header is a hard error, not a clean EOF.
-        self.recv.read_exact(&mut payload).await.map_err(conn_err)?;
-        Ok(Some(Frame {
-            kind,
-            payload: Bytes::from(payload),
-        }))
     }
 
     async fn close(&mut self) -> Result<()> {
