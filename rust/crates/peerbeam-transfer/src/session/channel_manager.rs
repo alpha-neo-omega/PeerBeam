@@ -196,6 +196,20 @@ impl ChannelManager {
         }
     }
 
+    /// After accepting a peer-opened channel, advance our allocator past its id
+    /// if it shares our parity, so we never re-issue that id within this epoch —
+    /// **even after the channel closes**. On resume the initiator re-attaches our
+    /// own (same-parity) channels into our freshly-reset allocator; without this
+    /// high-water mark, a re-attached id that later closes would be handed out
+    /// again at the same `(id, epoch)`, reusing its AEAD `(key, nonce)`. Only
+    /// same-parity ids can collide with our allocations; opposite-parity ids are
+    /// the peer's space and are left alone (bumping past them would waste ours).
+    fn reserve_incoming_id(&mut self, id: ChannelId) {
+        if id.get() % 2 == self.next_id % 2 {
+            self.bump_next_id_past(id);
+        }
+    }
+
     /// A snapshot of every live channel's metadata and statistics.
     #[must_use]
     pub fn snapshot(&self) -> Vec<ChannelInfo> {
@@ -409,6 +423,9 @@ impl ChannelManager {
                 }
                 PendingOpen::Accept(id, channel_type) => (id, channel_type),
             };
+            // Reserve this id in our allocator so we never re-issue it this epoch
+            // (closes the resume nonce-reuse case for re-attached same-parity ids).
+            self.reserve_incoming_id(id);
             let crypto = match self.crypto.derive(id, self.version) {
                 Ok(crypto) => crypto,
                 Err(e) => {
