@@ -190,9 +190,15 @@ impl ChannelManager {
 
     /// Keep the id allocator from ever handing out a re-attached id, preserving
     /// role parity (the allocator steps by 2).
+    ///
+    /// Computed directly, never in a loop: callers only pass ids sharing our
+    /// allocation parity (so `id + 2` stays in-parity), and `id` may be
+    /// peer-supplied — a `while next_id <= id` loop would spin (forever for
+    /// `u64::MAX`) on a hostile value. `saturating_add` caps at `u64::MAX`.
     fn bump_next_id_past(&mut self, id: ChannelId) {
-        while self.next_id <= id.get() {
-            self.next_id = self.next_id.wrapping_add(2);
+        let next = id.get().saturating_add(2);
+        if next > self.next_id {
+            self.next_id = next;
         }
     }
 
@@ -235,11 +241,14 @@ impl ChannelManager {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(2);
             let cid = ChannelId::new(id);
+            // Exclude ids that are live OR pending as *either* an Accept or a
+            // Reject: a queued Reject for an our-parity id (a peer opened it with
+            // a bad/unnegotiated capability) must not be reissued, or `try_pair`
+            // would later reject the channel we just opened under that id.
             let taken = self.channels.contains_key(&cid)
-                || self
-                    .pending_opens
-                    .iter()
-                    .any(|p| matches!(p, PendingOpen::Accept(pid, _) if *pid == cid));
+                || self.pending_opens.iter().any(|p| match p {
+                    PendingOpen::Accept(pid, _) | PendingOpen::Reject(pid, _) => *pid == cid,
+                });
             if id != 0 && !taken {
                 return cid;
             }
