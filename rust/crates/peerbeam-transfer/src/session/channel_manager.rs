@@ -47,6 +47,73 @@ enum PendingOpen {
     Reject(ChannelId, String),
 }
 
+/// Allocates this side's channel ids, upholding two invariants the rest of the
+/// session depends on:
+///
+/// 1. **Parity split.** The initiator allocates odd ids, the responder even, so
+///    both sides can open channels concurrently without ever choosing the same
+///    id. The parity is fixed for the session's lifetime.
+/// 2. **No `(id, epoch)` reuse.** A channel's AEAD keys derive from
+///    `(id, epoch)`, so handing out one id twice *within an epoch* would reuse a
+///    `(key, nonce)` pair. Allocation is monotonic within an epoch; a resume
+///    bumps the epoch, so an id may safely recur afterwards under fresh keys.
+///
+/// A small, pure unit so these invariants can be unit-tested in isolation — the
+/// scattered allocator logic this replaces could not be, and drifted repeatedly.
+#[derive(Debug)]
+struct ChannelIdAllocator {
+    /// Next candidate id; always this side's parity.
+    next: u64,
+    /// This side's parity (`0` even/responder, `1` odd/initiator). Fixed.
+    parity: u64,
+}
+
+impl ChannelIdAllocator {
+    fn new(role: SessionRole) -> Self {
+        let next = match role {
+            SessionRole::Initiator => 1,
+            SessionRole::Responder => 2,
+        };
+        ChannelIdAllocator {
+            next,
+            parity: next % 2,
+        }
+    }
+
+    /// Hand out the next own-parity id for which `is_taken` returns false.
+    /// Monotonic — each result is strictly greater than the last — so no id
+    /// recurs within the epoch. `None` only on id-space exhaustion (≈2^63 opens,
+    /// unreachable in practice).
+    fn allocate(&mut self, is_taken: impl Fn(ChannelId) -> bool) -> Option<ChannelId> {
+        loop {
+            let id = self.next;
+            self.next = self.next.checked_add(2)?;
+            let cid = ChannelId::new(id);
+            if id != 0 && !is_taken(cid) {
+                return Some(cid);
+            }
+        }
+    }
+
+    /// Reserve an id this side did **not** allocate (a peer-accepted channel, or
+    /// a preserved channel re-attached on resume) so it is never handed out this
+    /// epoch. Only same-parity ids can collide with our allocations; an
+    /// opposite-parity id is the peer's space and is left alone (advancing past
+    /// it would flip our parity and break the split). A hostile same-parity id
+    /// near `u64::MAX` cannot advance the counter (checked_add) — so it can
+    /// neither hang the allocator nor force a later collision.
+    fn reserve(&mut self, id: ChannelId) {
+        let id = id.get();
+        if id % 2 == self.parity {
+            if let Some(next) = id.checked_add(2) {
+                if next > self.next {
+                    self.next = next;
+                }
+            }
+        }
+    }
+}
+
 /// Owns and coordinates one session's data channels.
 pub struct ChannelManager {
     transport: Arc<dyn ChannelTransport>,
@@ -55,7 +122,7 @@ pub struct ChannelManager {
     channels: HashMap<ChannelId, Channel>,
     handlers: HandlerRegistry,
     negotiated: CapabilitySet,
-    next_id: u64,
+    ids: ChannelIdAllocator,
     limit: usize,
     events: UnboundedSender<ChannelEvent>,
     actor_events_tx: UnboundedSender<ActorEvent>,
@@ -87,12 +154,6 @@ impl ChannelManager {
         actor_events_tx: UnboundedSender<ActorEvent>,
         incoming_stream_tx: UnboundedSender<IncomingStreamChannel>,
     ) -> Self {
-        // Parity split: the initiator uses odd ids, the responder even, so
-        // concurrently-opened channels never collide on an id. 0 is control.
-        let next_id = match role {
-            SessionRole::Initiator => 1,
-            SessionRole::Responder => 2,
-        };
         ChannelManager {
             transport,
             crypto,
@@ -100,7 +161,7 @@ impl ChannelManager {
             channels: HashMap::new(),
             handlers,
             negotiated,
-            next_id,
+            ids: ChannelIdAllocator::new(role),
             limit,
             events,
             actor_events_tx,
@@ -177,7 +238,7 @@ impl ChannelManager {
         // channel may be the peer's (opposite-parity) id — re-attaching it must
         // not advance (and flip the parity of) our own allocator, or both sides
         // would start allocating the same ids after resume.
-        self.reserve_incoming_id(id);
+        self.ids.reserve(id);
         if let Some(ch) = self.channels.get(&id) {
             ch.send(SessionFrame::new(
                 id,
@@ -190,34 +251,6 @@ impl ChannelManager {
             channel: id,
             channel_type,
         })
-    }
-
-    /// Keep the id allocator from ever handing out a re-attached id, preserving
-    /// role parity (the allocator steps by 2).
-    ///
-    /// Computed directly, never in a loop: callers only pass ids sharing our
-    /// allocation parity (so `id + 2` stays in-parity), and `id` may be
-    /// peer-supplied — a `while next_id <= id` loop would spin (forever for
-    /// `u64::MAX`) on a hostile value. `saturating_add` caps at `u64::MAX`.
-    fn bump_next_id_past(&mut self, id: ChannelId) {
-        let next = id.get().saturating_add(2);
-        if next > self.next_id {
-            self.next_id = next;
-        }
-    }
-
-    /// Reserve an id we did not allocate ourselves (a peer-accepted channel, or a
-    /// preserved channel being re-attached on resume): advance our allocator past
-    /// it **only if it shares our parity**, so we never re-issue that id within
-    /// this epoch — even after the channel closes. Without this high-water mark, a
-    /// re-attached same-parity id that later closes would be handed out again at
-    /// the same `(id, epoch)`, reusing its AEAD `(key, nonce)`. Opposite-parity
-    /// ids are the peer's space: they cannot collide with our allocations, and
-    /// bumping past one would flip our allocator's parity and break the split.
-    fn reserve_incoming_id(&mut self, id: ChannelId) {
-        if id.get() % 2 == self.next_id % 2 {
-            self.bump_next_id_past(id);
-        }
     }
 
     /// A snapshot of every live channel's metadata and statistics.
@@ -234,29 +267,21 @@ impl ChannelManager {
             .collect()
     }
 
-    fn allocate_id(&mut self) -> ChannelId {
-        // Step by 2 to preserve the role parity; never yields 0 (control). Skip
-        // any id already live or pending: on resume the initiator re-attaches the
-        // responder's own (even-parity) channels, so this side's fresh allocator
-        // (reset to its parity start) would otherwise re-hand-out an occupied id —
-        // clobbering the live channel and reusing its (key, nonce). Skipping keeps
-        // every live channel's id unique. `permit` guarantees a free id exists.
-        loop {
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(2);
-            let cid = ChannelId::new(id);
-            // Exclude ids that are live OR pending as *either* an Accept or a
-            // Reject: a queued Reject for an our-parity id (a peer opened it with
-            // a bad/unnegotiated capability) must not be reissued, or `try_pair`
-            // would later reject the channel we just opened under that id.
-            let taken = self.channels.contains_key(&cid)
-                || self.pending_opens.iter().any(|p| match p {
-                    PendingOpen::Accept(pid, _) | PendingOpen::Reject(pid, _) => *pid == cid,
-                });
-            if id != 0 && !taken {
-                return cid;
-            }
-        }
+    /// Allocate the next own-parity id for a locally-opened channel, skipping any
+    /// id that is currently live or pending (as an Accept **or** a Reject — a
+    /// queued Reject for an our-parity id must not be reissued, or `try_pair`
+    /// would later reject the channel we just opened under it).
+    fn allocate_id(&mut self) -> Result<ChannelId, SessionError> {
+        let channels = &self.channels;
+        let pending = &self.pending_opens;
+        self.ids
+            .allocate(|cid| {
+                channels.contains_key(&cid)
+                    || pending.iter().any(|p| match p {
+                        PendingOpen::Accept(pid, _) | PendingOpen::Reject(pid, _) => *pid == cid,
+                    })
+            })
+            .ok_or_else(|| SessionError::Channel("channel id space exhausted".into()))
     }
 
     fn emit(&self, event: ChannelEvent) {
@@ -291,7 +316,7 @@ impl ChannelManager {
         channel_type: ChannelType,
     ) -> Result<(ChannelId, ControlMessage), SessionError> {
         self.permit(channel_type).map_err(SessionError::Channel)?;
-        let id = self.allocate_id();
+        let id = self.allocate_id()?;
         let crypto = self.crypto.derive(id, self.version)?;
         let link = self.transport.open_stream().await?;
         let handler = self.handlers.get(channel_type);
@@ -335,7 +360,7 @@ impl ChannelManager {
         channel_type: ChannelType,
     ) -> Result<(ChannelId, Box<dyn Link>, ControlMessage), SessionError> {
         self.permit(channel_type).map_err(SessionError::Channel)?;
-        let id = self.allocate_id();
+        let id = self.allocate_id()?;
         let crypto = self.crypto.derive(id, self.version)?;
         let link = self.transport.open_stream().await?;
         let sealed: Box<dyn Link> = Box::new(SealedLink::new(link, crypto, self.crypto.enc()));
@@ -438,7 +463,7 @@ impl ChannelManager {
             };
             // Reserve this id in our allocator so we never re-issue it this epoch
             // (closes the resume nonce-reuse case for re-attached same-parity ids).
-            self.reserve_incoming_id(id);
+            self.ids.reserve(id);
             let crypto = match self.crypto.derive(id, self.version) {
                 Ok(crypto) => crypto,
                 Err(e) => {
@@ -631,5 +656,88 @@ impl ChannelManager {
         }
         self.pending_opens.clear();
         self.pending_streams.clear();
+    }
+}
+
+#[cfg(test)]
+mod id_allocator_tests {
+    use super::{ChannelIdAllocator, SessionRole};
+    use peerbeam_domain::session::ChannelId;
+    use std::collections::HashSet;
+
+    fn free(_: ChannelId) -> bool {
+        false
+    }
+
+    #[test]
+    fn allocates_role_parity_and_steps_by_two() {
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        let a = init.allocate(free).unwrap().get();
+        let b = init.allocate(free).unwrap().get();
+        let c = init.allocate(free).unwrap().get();
+        assert_eq!((a, b, c), (1, 3, 5), "initiator: odd, ascending");
+
+        let mut resp = ChannelIdAllocator::new(SessionRole::Responder);
+        let a = resp.allocate(free).unwrap().get();
+        let b = resp.allocate(free).unwrap().get();
+        assert_eq!((a, b), (2, 4), "responder: even, ascending");
+    }
+
+    #[test]
+    fn allocate_skips_taken_and_never_yields_zero() {
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        let taken: HashSet<u64> = [1, 3].into_iter().collect();
+        let id = init.allocate(|c| taken.contains(&c.get())).unwrap().get();
+        assert_eq!(id, 5, "skips live 1 and 3");
+    }
+
+    #[test]
+    fn allocation_is_monotonic_so_no_reissue_within_epoch_even_after_close() {
+        // Allocate 1,3,5; then "close" 3 (no longer live). The monotonic counter
+        // must not hand 3 back out this epoch — that would reuse its (id, epoch)
+        // AEAD key. This is the invariant rounds 4/8 kept violating.
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        let mut live: HashSet<u64> = HashSet::new();
+        for _ in 0..3 {
+            live.insert(init.allocate(|c| live.contains(&c.get())).unwrap().get());
+        }
+        assert_eq!(live, [1, 3, 5].into_iter().collect());
+        live.remove(&3); // channel 3 closes
+        let next = init.allocate(|c| live.contains(&c.get())).unwrap().get();
+        assert_eq!(next, 7, "must not reissue the closed id 3");
+    }
+
+    #[test]
+    fn reserve_same_parity_prevents_reissue() {
+        // Simulates resume re-attaching our own (same-parity) id 5 into a fresh
+        // allocator: reserving it must push the counter past it.
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        init.reserve(ChannelId::new(5));
+        assert_eq!(init.allocate(free).unwrap().get(), 7, "past reserved 5");
+    }
+
+    #[test]
+    fn reserve_opposite_parity_is_ignored_preserving_parity() {
+        // An initiator re-attaching the peer's even id 2 must NOT flip its
+        // allocator to even (the round-8 parity-flip regression).
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        init.reserve(ChannelId::new(2));
+        let id = init.allocate(free).unwrap().get();
+        assert_eq!(id, 1, "still odd; opposite-parity reserve ignored");
+    }
+
+    #[test]
+    fn reserve_hostile_max_id_neither_hangs_nor_forces_collision() {
+        // A peer sending a same-parity id near u64::MAX must not advance the
+        // counter to an overflow point (the round-7 infinite-loop / collision).
+        let mut init = ChannelIdAllocator::new(SessionRole::Initiator);
+        init.reserve(ChannelId::new(u64::MAX)); // MAX is odd = initiator parity
+                                                // Still hands out small odd ids, promptly, with no hang.
+        assert_eq!(init.allocate(free).unwrap().get(), 1);
+        assert_eq!(init.allocate(free).unwrap().get(), 3);
+
+        let mut resp = ChannelIdAllocator::new(SessionRole::Responder);
+        resp.reserve(ChannelId::new(u64::MAX - 1)); // even = responder parity
+        assert_eq!(resp.allocate(free).unwrap().get(), 2);
     }
 }
