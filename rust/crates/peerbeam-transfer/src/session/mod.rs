@@ -776,6 +776,14 @@ impl PeerSession {
     /// [`RunExit::Closed`] on a graceful/fatal close, or [`RunExit::Lost`] with the
     /// state to resume from when the transport drops while `Active`.
     pub async fn run(&mut self) -> Result<RunExit, SessionError> {
+        // Fixed-cadence keepalive timer, created ONCE so other pump wakes never
+        // reset it. A fresh per-iteration sleep would be starved by any
+        // sub-interval local command/actor traffic, so a peer that goes silent
+        // while this side stays busy would never be pinged or timed out. The
+        // scheduler's on_activity (peer frames only) still decides whether a given
+        // tick actually pings/closes; the interval only guarantees it is consulted.
+        let mut keepalive_tick = tokio::time::interval(self.keepalive.interval());
+        keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             while let Some(msg) = self.control_out.pop_front() {
                 if send_control(
@@ -798,12 +806,6 @@ impl PeerSession {
             let transport = self.manager.transport();
             let accepting = self.accepting;
             let enc = self.enc.clone();
-            // Idle keepalive timer: a fresh sleep each iteration, so it only
-            // elapses when no other branch has fired for a whole interval (i.e.
-            // the pump is genuinely idle). Any real activity resets it — and also
-            // resets the scheduler via on_activity — so this drives pings/idle
-            // timeout only when the peer has gone quiet.
-            let tick = self.keepalive.interval();
             let wake = {
                 let Self {
                     control,
@@ -817,7 +819,7 @@ impl PeerSession {
                     a = transport.accept_stream(), if accepting => Wake::Accept(a.map_err(SessionError::from)),
                     e = actor_events_rx.recv() => Wake::Actor(e),
                     c = commands_rx.recv() => Wake::Command(c),
-                    _ = tokio::time::sleep(tick) => Wake::Tick,
+                    _ = keepalive_tick.tick() => Wake::Tick,
                 }
             };
 
