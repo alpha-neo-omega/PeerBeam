@@ -173,7 +173,11 @@ impl ChannelManager {
             self.crypto.enc(),
         );
         self.channels.insert(id, channel);
-        self.bump_next_id_past(id);
+        // Reserve with the parity guard, NOT an unconditional bump: a preserved
+        // channel may be the peer's (opposite-parity) id — re-attaching it must
+        // not advance (and flip the parity of) our own allocator, or both sides
+        // would start allocating the same ids after resume.
+        self.reserve_incoming_id(id);
         if let Some(ch) = self.channels.get(&id) {
             ch.send(SessionFrame::new(
                 id,
@@ -202,14 +206,14 @@ impl ChannelManager {
         }
     }
 
-    /// After accepting a peer-opened channel, advance our allocator past its id
-    /// if it shares our parity, so we never re-issue that id within this epoch —
-    /// **even after the channel closes**. On resume the initiator re-attaches our
-    /// own (same-parity) channels into our freshly-reset allocator; without this
-    /// high-water mark, a re-attached id that later closes would be handed out
-    /// again at the same `(id, epoch)`, reusing its AEAD `(key, nonce)`. Only
-    /// same-parity ids can collide with our allocations; opposite-parity ids are
-    /// the peer's space and are left alone (bumping past them would waste ours).
+    /// Reserve an id we did not allocate ourselves (a peer-accepted channel, or a
+    /// preserved channel being re-attached on resume): advance our allocator past
+    /// it **only if it shares our parity**, so we never re-issue that id within
+    /// this epoch — even after the channel closes. Without this high-water mark, a
+    /// re-attached same-parity id that later closes would be handed out again at
+    /// the same `(id, epoch)`, reusing its AEAD `(key, nonce)`. Opposite-parity
+    /// ids are the peer's space: they cannot collide with our allocations, and
+    /// bumping past one would flip our allocator's parity and break the split.
     fn reserve_incoming_id(&mut self, id: ChannelId) {
         if id.get() % 2 == self.next_id % 2 {
             self.bump_next_id_past(id);
