@@ -278,7 +278,11 @@ pub fn init(config_json: &str) -> OpResult {
         identity,
         config.storage.save_directory.clone(),
         config.device.auto_accept_trusted,
-        config.transfer.chunk_size as u32,
+        // Clamp BEFORE the u32 cast: a configured chunk_size >= 2^32 would
+        // otherwise truncate (e.g. 2^32 -> 0), and Manager::new's max(1) guard
+        // runs after the cast, yielding a 1-byte chunk size. Mirrors the CLI's
+        // clamp_chunk_size so both frontends behave identically.
+        config.transfer.chunk_size.clamp(1, u32::MAX as u64) as u32,
         config.transfer.port,
         Some(std::path::Path::new(&config.storage.data_directory).join("history.json")),
     ));

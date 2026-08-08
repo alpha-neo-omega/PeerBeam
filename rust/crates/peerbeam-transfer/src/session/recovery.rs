@@ -260,6 +260,12 @@ impl RecoveryManager {
                     session_id,
                     reason: format!("attempts exhausted after {}", attempt - 1),
                 });
+                // Recovery is giving up: drop the entry capture_loss() marked
+                // Recovering, or it leaks forever (there is no PeerSession Drop and
+                // finish_close is unreachable on this path).
+                if let Some(reg) = &self.wiring.registry {
+                    reg.remove(session_id);
+                }
                 return Err(SessionError::RecoveryExhausted {
                     attempts: attempt - 1,
                 });
@@ -346,6 +352,9 @@ impl RecoveryManager {
                             session_id,
                             reason: e.to_string(),
                         });
+                        if let Some(reg) = &self.wiring.registry {
+                            reg.remove(session_id);
+                        }
                         return Err(e);
                     }
                     // Responder: the refused token came from an *inbound*
