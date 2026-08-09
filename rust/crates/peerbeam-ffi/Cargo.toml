@@ -25,6 +25,7 @@ peerbeam-transfer = { path = "../peerbeam-transfer" }
 peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
 peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+peerbeam-identity-fs = { path = "../peerbeam-identity-fs" }
 peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 tokio = { workspace = true }
 futures = { workspace = true }

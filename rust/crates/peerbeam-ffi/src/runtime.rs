@@ -18,9 +18,7 @@ use peerbeam_discovery_udp::UdpDiscovery;
 use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::event::DeviceChange;
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::port::EncryptionProvider;
 use peerbeam_engine::{Engine, EngineBuilder, RouteManager, SessionDiagnostics};
-use peerbeam_transfer::Identity;
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
 
@@ -166,13 +164,9 @@ fn apply_live_device_name(m: &Arc<Manager>, name: &str) {
     }
 }
 
-fn device_id() -> DeviceId {
-    DeviceId::from(format!("app-{}", std::process::id()))
-}
-
-fn me(config: &EngineConfig) -> Device {
+fn me(config: &EngineConfig, device_id: &DeviceId) -> Device {
     Device {
-        id: device_id(),
+        id: device_id.clone(),
         name: config.device.name.clone(),
         device_type: DeviceType::Desktop,
         platform: peerbeam_platform::current(),
@@ -242,10 +236,23 @@ pub fn init(config_json: &str) -> OpResult {
     crate::settings::configure(&config.storage.data_directory);
     crate::settings::overlay(&mut config);
 
-    let id = device_id();
-    let mut builder =
-        EngineBuilder::new(config.clone()).with_discovery(Arc::new(UdpDiscovery::new(id.clone())));
-    if let Ok(mdns) = MdnsDiscovery::new(id.clone()) {
+    // Load the device's persistent identity once, up front: the same
+    // `device_id`/keypair drive discovery (below), `me()`, and the transfer
+    // manager's mutual-auth handshake — there must be exactly one source of
+    // truth, not an ephemeral `app-<pid>` id plus a throwaway keypair.
+    let enc = Arc::new(AeadCrypto::new());
+    let identity_path = std::path::Path::new(&config.storage.data_directory).join("identity.json");
+    let identity = peerbeam_transfer::load_or_generate(
+        &peerbeam_identity_fs::FsIdentity::open(identity_path),
+        enc.as_ref(),
+        config.device.name.clone(),
+    )
+    .map_err(crate::error::from_domain)?;
+    let device_id = identity.device_id.clone();
+
+    let mut builder = EngineBuilder::new(config.clone())
+        .with_discovery(Arc::new(UdpDiscovery::new(device_id.clone())));
+    if let Ok(mdns) = MdnsDiscovery::new(device_id.clone()) {
         builder = builder.with_discovery(Arc::new(mdns));
     }
     builder = builder.with_discovery(Arc::new(TailscaleDiscovery::new(TsConfig {
@@ -261,13 +268,6 @@ pub fn init(config_json: &str) -> OpResult {
     // Transfer manager: its own QUIC transport (dial + serve) + identity.
     let quic = Arc::new(QuicTransport::new().map_err(crate::error::from_domain)?);
     let route_manager = Arc::new(RouteManager::new(quic.clone()));
-    let enc = Arc::new(AeadCrypto::new());
-    let keypair = enc.generate_keypair();
-    let identity = Identity {
-        device_id: id.clone(),
-        name: config.device.name.clone(),
-        keypair,
-    };
     let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
     let trust = Arc::new(FsTrust::open(trust_path).map_err(crate::error::from_domain)?);
     let manager = Arc::new(Manager::new(
@@ -297,7 +297,7 @@ pub fn init(config_json: &str) -> OpResult {
     // until sessions run; the additive diagnostics FFI reads it (M8).
     let diagnostics = Arc::new(SessionDiagnostics::new());
 
-    *lock(&ME) = Some(me(&config));
+    *lock(&ME) = Some(me(&config, &device_id));
     *lock(&ENGINE) = Some(engine);
     *lock(&MANAGER) = Some(manager);
     *lock(&DIAGNOSTICS) = Some(diagnostics);
