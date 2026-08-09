@@ -5,6 +5,7 @@
 //! a concrete implementation. This is the seam that makes the engine
 //! plugin-driven and testable with mocks.
 
+mod appstore;
 mod channel;
 mod clipboard;
 mod compression;
@@ -18,6 +19,7 @@ mod storage;
 mod transfer;
 mod trust;
 
+pub use appstore::AppStore;
 pub use channel::ChannelTransport;
 pub use clipboard::ClipboardProvider;
 pub use compression::CompressionProvider;
