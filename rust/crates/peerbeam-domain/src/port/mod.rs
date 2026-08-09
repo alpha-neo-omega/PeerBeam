@@ -10,6 +10,7 @@ mod clipboard;
 mod compression;
 mod discovery;
 mod encryption;
+mod identity;
 mod notification;
 mod reliability;
 mod route;
@@ -24,6 +25,7 @@ pub use discovery::{DiscoveryCaps, DiscoveryEvent, DiscoveryProvider};
 pub use encryption::{
     EncryptionProvider, Fingerprint, KeyPair, Nonce, PublicKey, SecretKey, SessionKeys,
 };
+pub use identity::IdentityStore;
 pub use notification::{Notice, NotificationSink};
 pub use reliability::ReliabilityStore;
 pub use route::RouteProvider;

@@ -5,6 +5,7 @@
 
 mod clipboard;
 mod device;
+mod identity;
 mod managed_device;
 mod route;
 mod transfer;
@@ -12,6 +13,7 @@ mod trust;
 
 pub use clipboard::{classify, ClipboardData, ClipboardItem, ClipboardKind};
 pub use device::{Device, DeviceType, Platform};
+pub use identity::{device_id_from_fingerprint, StoredIdentity};
 pub use managed_device::{DeviceCapabilities, ManagedDevice};
 pub use route::{Route, RouteHealth, RouteKind};
 pub use transfer::{Direction, FileEntry, Progress, TransferSession, TransferStatus};
