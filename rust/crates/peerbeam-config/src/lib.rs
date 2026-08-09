@@ -48,6 +48,10 @@ pub struct DeviceConfig {
     pub name: String,
     /// Automatically accept transfers from already-trusted devices.
     pub auto_accept_trusted: bool,
+    /// Require an explicit first-contact pairing-code confirmation before
+    /// accepting a transfer from a newly pinned peer (optional MITM check).
+    /// Off by default so zero-config first contact stays frictionless.
+    pub require_pairing_confirmation: bool,
 }
 
 /// Discovery configuration.
@@ -111,6 +115,7 @@ impl Default for DeviceConfig {
         Self {
             name: peerbeam_platform::hostname(),
             auto_accept_trusted: false,
+            require_pairing_confirmation: false,
         }
     }
 }
@@ -239,5 +244,21 @@ mod compat_tests {
         assert_eq!(cfg.transfer.port, 50000);
         assert_eq!(cfg.transfer.chunk_size, 64 * 1024, "missing -> default");
         assert!(cfg.encryption.required, "missing section -> default");
+    }
+
+    #[test]
+    fn require_pairing_confirmation_defaults_off_and_round_trips() {
+        // Default is off (zero-config stays frictionless).
+        assert!(!DeviceConfig::default().require_pairing_confirmation);
+
+        // Absent in JSON -> false via serde(default).
+        let cfg: EngineConfig = serde_json::from_str(r#"{"device":{"name":"x"}}"#).unwrap();
+        assert!(!cfg.device.require_pairing_confirmation);
+
+        // Present -> honored.
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"device":{"name":"x","require_pairing_confirmation":true}}"#)
+                .unwrap();
+        assert!(cfg.device.require_pairing_confirmation);
     }
 }
