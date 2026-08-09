@@ -74,7 +74,7 @@ networking, trust, or crypto (I5/I6/I9).
   auto-accept requires real approval (I6).
 - **Storage:** trust records (exists).
 - **Offline:** yes.
-- **CLI:** yes — trust list/approve/revoke.
+- **CLI:** receiver prints the pairing code and, with `require_pairing_confirmation`, prompts to confirm it before accepting (mismatch/decline un-pins the peer). No standalone trust-management subcommand yet.
 
 ---
 

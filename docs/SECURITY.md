@@ -134,7 +134,7 @@ When enabled, the receiver must confirm the codes match before accepting a
 transfer from a newly pinned peer; a mismatch (or a decline) **un-pins** the
 peer (treated as a suspected MITM) and aborts. The code is stable across
 sessions, so it can be re-verified later. Revoking trust later is available in
-the app (Trusted Devices) and CLI.
+the app (Trusted Devices).
 
 ## Settings & trust over FFI
 
