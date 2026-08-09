@@ -98,6 +98,31 @@ impl EncryptionProvider for AeadCrypto {
         hasher.update(public.0);
         Fingerprint(to_hex(&hasher.finalize()))
     }
+
+    fn pairing_code(&self, a: &PublicKey, b: &PublicKey) -> String {
+        // Canonical order so both peers hash identical bytes regardless of who
+        // is "a" or "b".
+        let (lo, hi) = if a.0 <= b.0 {
+            (&a.0, &b.0)
+        } else {
+            (&b.0, &a.0)
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"peerbeam-pairing-v1");
+        hasher.update(lo);
+        hasher.update(hi);
+        let digest = hasher.finalize();
+        // 128 bits -> uppercase hex -> eight groups of four.
+        let hex = to_hex_upper(&digest[..16]);
+        let mut out = String::with_capacity(39);
+        for (i, ch) in hex.chars().enumerate() {
+            if i != 0 && i % 4 == 0 {
+                out.push(' ');
+            }
+            out.push(ch);
+        }
+        out
+    }
 }
 
 fn kdf(shared: &[u8], label: &[u8]) -> [u8; 32] {
@@ -122,6 +147,15 @@ fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn to_hex_upper(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02X}");
     }
     s
 }
@@ -225,5 +259,64 @@ mod tests {
             derive_subkey(&ikm_a, b"peerbeam-appstore-v1"),
             derive_subkey(&ikm_a, b"peerbeam-other-v1"),
         );
+    }
+
+    #[test]
+    fn pairing_code_is_stable_order_independent_and_distinct() {
+        let c = AeadCrypto::new();
+        let a = c.generate_keypair();
+        let b = c.generate_keypair();
+
+        // Stable: same pair -> same code.
+        assert_eq!(
+            c.pairing_code(&a.public, &b.public),
+            c.pairing_code(&a.public, &b.public),
+        );
+        // Order-independent: canonical ordering means swap yields the same code.
+        assert_eq!(
+            c.pairing_code(&a.public, &b.public),
+            c.pairing_code(&b.public, &a.public),
+        );
+        // Distinct: a different second key yields a different code.
+        let d = c.generate_keypair();
+        assert_ne!(
+            c.pairing_code(&a.public, &b.public),
+            c.pairing_code(&a.public, &d.public),
+        );
+    }
+
+    #[test]
+    fn pairing_code_format_is_eight_groups_of_four_uppercase_hex() {
+        let c = AeadCrypto::new();
+        let a = c.generate_keypair();
+        let b = c.generate_keypair();
+        let code = c.pairing_code(&a.public, &b.public);
+
+        assert_eq!(code.len(), 39, "32 hex + 7 spaces");
+        let groups: Vec<&str> = code.split(' ').collect();
+        assert_eq!(groups.len(), 8);
+        for g in groups {
+            assert_eq!(g.len(), 4);
+            assert!(
+                g.chars()
+                    .all(|ch| ch.is_ascii_digit() || ('A'..='F').contains(&ch)),
+                "uppercase hex only, got {g}"
+            );
+        }
+    }
+
+    /// The check must actually detect a substituted key: a MITM sits between A
+    /// and B with its own key M, so A sees (A,M) and B sees (M,B). Those codes
+    /// must differ, or the two users would see matching codes and be fooled.
+    #[test]
+    fn pairing_code_detects_a_mitm_substitution() {
+        let c = AeadCrypto::new();
+        let a = c.generate_keypair();
+        let b = c.generate_keypair();
+        let m = c.generate_keypair();
+
+        let a_sees = c.pairing_code(&a.public, &m.public);
+        let b_sees = c.pairing_code(&m.public, &b.public);
+        assert_ne!(a_sees, b_sees);
     }
 }

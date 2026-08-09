@@ -56,4 +56,12 @@ pub trait EncryptionProvider: Send + Sync {
 
     /// Compute a user-verifiable fingerprint of a public key.
     fn fingerprint(&self, public: &PublicKey) -> Fingerprint;
+
+    /// A stable, human-comparable "safety number" over two device public keys,
+    /// for optional first-contact verification. Identical for both peers of an
+    /// honest handshake (order-independent) and divergent under a
+    /// man-in-the-middle. Rendered as eight space-separated groups of four
+    /// uppercase hex digits (39 chars total). Unlike a short PIN, its 128-bit
+    /// output resists an offline birthday-collision grind (~2^64).
+    fn pairing_code(&self, a: &PublicKey, b: &PublicKey) -> String;
 }
