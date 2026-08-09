@@ -79,7 +79,11 @@ Working now:
 - `receive [--dir DIR] [--port N] [--once]` — serve QUIC, authenticate each
   peer, stream incoming files to `DIR` (default: config `save_directory`).
   Advertises presence via discovery so `send --to` can find it. `--once` exits
-  after one transfer; `--port 0` picks an OS port (printed on start).
+  after one transfer; `--port 0` picks an OS port (printed on start). On first
+  contact from a new peer, the CLI prints the peer's pairing code (a 128-bit
+  safety number); if `device.require_pairing_confirmation` is enabled, the user
+  is prompted to confirm the code matches the sender's (a decline un-pins the
+  peer and aborts the transfer).
 - `daemon start [--foreground]` — run the receive loop until interrupted.
   (`daemon stop|status` need the IPC layer — not built yet, exit code 8.)
 - `clipboard send [--to NAME | --addr IP:PORT] [TEXT]` — send text using the

@@ -116,6 +116,26 @@ absolute paths).
   tampered frames; safe write refuses to overwrite and leaves `.part` on
   integrity failure.
 
+## Pairing code (optional first-contact verification)
+
+On first contact PeerBeam pins a peer's public-key fingerprint (trust on first
+use). To let a user confirm that pin is the intended peer and not a
+man-in-the-middle, each device can display a **pairing code**: a 128-bit
+"safety number" derived from both devices' public keys
+(`SHA-256("peerbeam-pairing-v1" ‖ lo ‖ hi)`, first 16 bytes, shown as eight
+groups of four uppercase hex digits). Both honest peers compute the **same**
+code; under a man-in-the-middle each side computes a **different** code.
+
+The 128-bit width resists an offline grind (a short 6-digit code would not —
+an attacker could grind substituted keys until the two sides' codes collide).
+
+It is **optional and off by default** (`device.require_pairing_confirmation`).
+When enabled, the receiver must confirm the codes match before accepting a
+transfer from a newly pinned peer; a mismatch (or a decline) **un-pins** the
+peer (treated as a suspected MITM) and aborts. The code is stable across
+sessions, so it can be re-verified later. Revoking trust later is available in
+the app (Trusted Devices) and CLI.
+
 ## Settings & trust over FFI
 
 The FFI `pb_settings_get` exposes the TOFU trusted-devices list (read from the

@@ -62,9 +62,12 @@ networking, trust, or crypto (I5/I6/I9).
 - **Offline:** yes (local-first).
 - **CLI:** yes — inspect/clear via subcommands.
 
-### Trust hardening + optional PIN pairing — Phase A · S–M
+### Trust hardening + optional pairing-code verification — Phase A · S–M
 - **Why:** fix the sharp edge where a peer is pinned during handshake even if the
-  transfer is declined; add optional 6-digit first-contact PIN.
+  transfer is declined; add optional first-contact **pairing-code (safety-number) comparison**: a
+  128-bit code derived from both device keys, compared out of band to detect a
+  man-in-the-middle; off by default. (A short 6-digit code was considered but
+  is grindable; the compared code is full-width.)
 - **Reuses:** `peerbeam-transfer` auth, `peerbeam-trust-fs`.
 - **Dependencies:** none.
 - **Security:** separates "key-pinned (anti-MITM)" from "approved (authorized)";
