@@ -60,6 +60,9 @@ pub struct Session {
     pub peer_id: String,
     /// Whether the peer was newly TOFU-pinned during this handshake.
     pub newly_trusted: bool,
+    /// The first-contact pairing code from this session's handshake (empty
+    /// for a resumed session — there is no handshake to derive it from).
+    pub pairing_code: String,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
 }
@@ -106,6 +109,7 @@ async fn establish(
     .map_err(|e| CliError::Other(format!("session establish failed: {e}")))?;
     let peer_id = ps.peer().0.clone();
     let newly_trusted = ps.newly_trusted();
+    let pairing_code = ps.pairing_code().to_string();
     let handle = ps.handle();
     let run = tokio::spawn(async move {
         let _ = ps.run().await;
@@ -114,6 +118,7 @@ async fn establish(
         handle,
         peer_id,
         newly_trusted,
+        pairing_code,
         incoming,
         run,
     })

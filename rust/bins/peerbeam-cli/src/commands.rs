@@ -829,8 +829,13 @@ async fn secure_send_folder(
             .await?;
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
+    // Captured now (rather than read off `session` down by the JSON output)
+    // because `session.close()` below takes `self` by value — after that
+    // point `session` is moved and no longer accessible.
+    let pairing_code = session.pairing_code.clone();
     if newly_trusted && !ctx.json {
         ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
+        ctx.line(&format!("  pairing code: {}", ctx.bold(&pairing_code)));
     }
 
     let (ptx, mut prx) = mpsc::unbounded_channel();
@@ -885,12 +890,55 @@ async fn secure_send_folder(
             "outcome": format!("{outcome:?}"),
             "peer": peer_id,
             "newly_trusted": newly_trusted,
+            "pairing_code": pairing_code,
             "transport": "peersession",
         }));
     } else {
         ctx.line(&ctx.green(&format!("sent folder {name}")));
     }
     Ok(bytes)
+}
+
+/// Outcome of the optional first-contact pairing check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingGate {
+    /// Not first contact, or the toggle is off — proceed without blocking.
+    Proceed,
+    /// First contact + toggle on + the user confirmed the codes match.
+    Confirmed,
+    /// First contact + toggle on + declined or no answer — revoke and abort.
+    Revoke,
+}
+
+/// Decide what to do at first contact. `answer` is `Some(true/false)` for an
+/// explicit yes/no, or `None` when no confirmation could be obtained (JSON /
+/// non-interactive / EOF), which is treated as a decline (safe default).
+pub(crate) fn pairing_gate(
+    newly_trusted: bool,
+    require: bool,
+    answer: Option<bool>,
+) -> PairingGate {
+    if !newly_trusted || !require {
+        return PairingGate::Proceed;
+    }
+    match answer {
+        Some(true) => PairingGate::Confirmed,
+        _ => PairingGate::Revoke,
+    }
+}
+
+/// Read a yes/no answer from `reader`. `None` on EOF/error (no answer); an
+/// empty line counts as "no" (the prompt's default is No).
+pub(crate) fn read_confirm(reader: &mut impl std::io::BufRead) -> Option<bool> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        )),
+        Err(_) => None,
+    }
 }
 
 /// A minimal `Device` for a `--addr` target (a single explicit route).
@@ -997,8 +1045,13 @@ async fn secure_send_file(
             .await?;
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
+    // Captured now (rather than read off `session` down by the JSON output)
+    // because `session.close()` below takes `self` by value — after that
+    // point `session` is moved and no longer accessible.
+    let pairing_code = session.pairing_code.clone();
     if newly_trusted && !ctx.json {
         ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
+        ctx.line(&format!("  pairing code: {}", ctx.bold(&pairing_code)));
     }
 
     let (ptx, mut prx) = mpsc::unbounded_channel();
@@ -1035,6 +1088,7 @@ async fn secure_send_file(
             "bytes": size,
             "peer": peer_id,
             "newly_trusted": newly_trusted,
+            "pairing_code": pairing_code,
             "transport": "peersession",
         }));
     } else {
@@ -1115,6 +1169,55 @@ async fn serve_loop(
         let peer_id = session.peer_id.clone();
         if newly_trusted && !ctx.json {
             ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
+            ctx.line(&format!(
+                "  pairing code: {}",
+                ctx.bold(&session.pairing_code)
+            ));
+        }
+
+        // Optional first-contact pairing check: when the toggle is on and this
+        // peer was just pinned, require the operator to confirm the pairing
+        // code matches before accepting the transfer. Declining (or having no
+        // way to prompt — JSON/non-interactive mode) un-pins the peer and
+        // aborts this connection; discovery/serving continues.
+        let answer = if config.device.require_pairing_confirmation && newly_trusted {
+            if ctx.json {
+                None // cannot prompt in JSON/non-interactive mode
+            } else {
+                ctx.line("Does the pairing code match the other device? [y/N]");
+                let mut stdin = std::io::stdin().lock();
+                read_confirm(&mut stdin)
+            }
+        } else {
+            None
+        };
+        match pairing_gate(
+            newly_trusted,
+            config.device.require_pairing_confirmation,
+            answer,
+        ) {
+            PairingGate::Proceed | PairingGate::Confirmed => {}
+            PairingGate::Revoke => {
+                // `peer_id` here is the plain-string form the CLI's `Session`
+                // wrapper surfaces (see `session_transfer::Session::peer_id`);
+                // `FsTrust::remove` takes the newtyped `DeviceId`.
+                let _ = sc
+                    .trust
+                    .remove(&peerbeam_domain::id::DeviceId::from(peer_id.clone()));
+                if ctx.json {
+                    ctx.json_line(&json!({
+                        "event": "error",
+                        "message": "pairing code not confirmed; peer un-pinned",
+                        "peer": peer_id,
+                    }));
+                } else {
+                    ctx.line(&ctx.red(
+                        "pairing code not confirmed — un-pinned peer (possible MITM); transfer aborted",
+                    ));
+                }
+                session.close().await;
+                continue; // move on to the next inbound connection
+            }
         }
 
         // Await the peer's transfer channel.
@@ -1175,6 +1278,7 @@ async fn serve_loop(
                         "bytes": rcv.bytes,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
+                        "pairing_code": session.pairing_code.clone(),
                         "transport": "peersession",
                     }));
                 } else {
@@ -1197,6 +1301,7 @@ async fn serve_loop(
                         "files": fr.files,
                         "peer": peer_id,
                         "newly_trusted": newly_trusted,
+                        "pairing_code": session.pairing_code.clone(),
                         "transport": "peersession",
                     }));
                 } else {
@@ -1652,6 +1757,50 @@ mod resolve_addr_tests {
     fn bare_ipv6_asks_for_brackets() {
         let err = resolve_addr("fe80::1").unwrap_err().to_string();
         assert!(err.contains("bracketed"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::{pairing_gate, read_confirm, PairingGate};
+    use std::io::Cursor;
+
+    #[test]
+    fn gate_proceeds_when_not_first_contact_or_toggle_off() {
+        assert!(matches!(
+            pairing_gate(false, true, None),
+            PairingGate::Proceed
+        ));
+        assert!(matches!(
+            pairing_gate(true, false, None),
+            PairingGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn gate_confirms_on_yes_and_revokes_on_no_or_no_answer() {
+        assert!(matches!(
+            pairing_gate(true, true, Some(true)),
+            PairingGate::Confirmed
+        ));
+        assert!(matches!(
+            pairing_gate(true, true, Some(false)),
+            PairingGate::Revoke
+        ));
+        // No answer available (non-interactive / EOF) -> safe default: revoke.
+        assert!(matches!(
+            pairing_gate(true, true, None),
+            PairingGate::Revoke
+        ));
+    }
+
+    #[test]
+    fn read_confirm_parses_yes_no_and_eof() {
+        assert_eq!(read_confirm(&mut Cursor::new(b"y\n")), Some(true));
+        assert_eq!(read_confirm(&mut Cursor::new(b"Yes\n")), Some(true));
+        assert_eq!(read_confirm(&mut Cursor::new(b"n\n")), Some(false));
+        assert_eq!(read_confirm(&mut Cursor::new(b"\n")), Some(false));
+        assert_eq!(read_confirm(&mut Cursor::new(b"")), None);
     }
 }
 

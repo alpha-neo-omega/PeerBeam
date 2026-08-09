@@ -302,6 +302,9 @@ pub struct PeerSession {
     /// The peer's presented human name from the handshake (empty for a resumed
     /// session — the name is not re-exchanged).
     peer_name: String,
+    /// The first-contact pairing code from this session's handshake (empty for
+    /// a resumed session — there is no handshake to derive it from).
+    pairing_code: String,
 }
 
 impl PeerSession {
@@ -341,6 +344,7 @@ impl PeerSession {
         let peer = auth_session.peer_id.clone();
         let newly_trusted = auth_session.newly_trusted;
         let peer_name = auth_session.peer_name.clone();
+        let pairing_code = auth_session.pairing_code.clone();
         let session_crypto = SessionCrypto::from_session(&auth_session, role, enc.clone());
         let mut control_crypto = session_crypto.control()?;
 
@@ -408,6 +412,7 @@ impl PeerSession {
         );
         session.newly_trusted = newly_trusted;
         session.peer_name = peer_name;
+        session.pairing_code = pairing_code;
         Ok(session)
     }
 
@@ -474,6 +479,7 @@ impl PeerSession {
             consumed_epoch,
             newly_trusted: false,
             peer_name: String::new(),
+            pairing_code: String::new(),
         };
 
         if let Some(reg) = &session.registry {
@@ -531,6 +537,13 @@ impl PeerSession {
     #[must_use]
     pub fn peer_name(&self) -> &str {
         &self.peer_name
+    }
+
+    /// The first-contact pairing code from this session's handshake (empty for
+    /// a resumed session, which has no handshake).
+    #[must_use]
+    pub fn pairing_code(&self) -> &str {
+        &self.pairing_code
     }
 
     /// The current lifecycle state.
