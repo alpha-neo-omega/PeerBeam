@@ -1254,6 +1254,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-identity-fs"
+version = "0.3.0"
+dependencies = [
+ "peerbeam-domain",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "peerbeam-platform"
 version = "0.3.0"
 dependencies = [

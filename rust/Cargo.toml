@@ -18,6 +18,7 @@ members = [
     "crates/peerbeam-reliability-fs",
     "crates/peerbeam-crypto",
     "crates/peerbeam-trust-fs",
+    "crates/peerbeam-identity-fs",
     "bins/peerbeam-cli",
 ]
 

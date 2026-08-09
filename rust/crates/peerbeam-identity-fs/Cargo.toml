@@ -1,0 +1,14 @@
+[package]
+name = "peerbeam-identity-fs"
+description = "Filesystem IdentityStore: the device's long-term keypair + id, persisted as a 0600 JSON file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
