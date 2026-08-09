@@ -48,6 +48,17 @@ pin it via TOFU, so **deleting this file resets the device's identity** (peers
 will see a new, untrusted device and must trust it again). It never leaves the
 device.
 
+## Application data (AppStore)
+
+Capability data (chat log, clipboard history, notes) is stored under
+`<data_directory>/appstore/<namespace>/`, one file per record. Each record's
+**value** is encrypted at rest with AES-256-GCM under a key derived from the
+device identity's secret (`peerbeam-appstore-v1`); files are `0600` on Unix.
+Namespace and record-key names are stored in the clear (the directory is
+`0600`-protected). Because the key derives from the device identity, **deleting
+`identity.json` makes existing AppStore data unreadable**. Clearing a namespace
+deletes its records.
+
 ## Integrity, confidentiality, replay protection
 
 `SecureLink` wraps the authenticated session. Every frame is sealed with

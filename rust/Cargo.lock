@@ -1078,6 +1078,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-appstore-fs"
+version = "0.3.0"
+dependencies = [
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "rand 0.8.7",
+ "tempfile",
+]
+
+[[package]]
 name = "peerbeam-cli"
 version = "0.3.0"
 dependencies = [

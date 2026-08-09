@@ -19,6 +19,7 @@ members = [
     "crates/peerbeam-crypto",
     "crates/peerbeam-trust-fs",
     "crates/peerbeam-identity-fs",
+    "crates/peerbeam-appstore-fs",
     "bins/peerbeam-cli",
 ]
 
