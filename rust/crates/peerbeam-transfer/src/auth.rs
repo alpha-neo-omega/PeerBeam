@@ -67,6 +67,10 @@ pub struct Session {
     pub peer_name: String,
     /// Whether the peer was newly pinned (true) or already trusted (false).
     pub newly_trusted: bool,
+    /// A stable, human-comparable code over both devices' public keys, for
+    /// optional first-contact MITM verification. Empty for resumed/relayed
+    /// sessions (which are never first contact).
+    pub pairing_code: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -208,6 +212,7 @@ pub async fn authenticate(
         peer_id,
         peer_name: peer_name_display,
         newly_trusted,
+        pairing_code: enc.pairing_code(&PublicKey(our_pub), &PublicKey(peer_pub)),
     })
 }
 

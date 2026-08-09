@@ -194,6 +194,7 @@ mod tests {
             peer_id: DeviceId::from("peer"),
             peer_name: "peer".into(),
             newly_trusted: false,
+            pairing_code: String::new(),
         };
         let recv = Session {
             send_key: k2,
@@ -203,6 +204,7 @@ mod tests {
             peer_id: DeviceId::from("me"),
             peer_name: "me".into(),
             newly_trusted: false,
+            pairing_code: String::new(),
         };
         (send, recv)
     }

@@ -381,6 +381,7 @@ mod tests {
             peer_id: DeviceId::from("r"),
             peer_name: "r".into(),
             newly_trusted: false,
+            pairing_code: String::new(),
         };
         let resp = Session {
             send_key: k_rev,
@@ -390,6 +391,7 @@ mod tests {
             peer_id: DeviceId::from("i"),
             peer_name: "i".into(),
             newly_trusted: false,
+            pairing_code: String::new(),
         };
         let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
         (

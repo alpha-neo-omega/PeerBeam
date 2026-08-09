@@ -363,6 +363,16 @@ async fn secure_link_rejects_replayed_frame() {
 }
 
 #[tokio::test]
+async fn handshake_produces_matching_pairing_codes() {
+    let enc = AeadCrypto::new();
+    let (sa, sb, _la, _lb) = established(&enc).await;
+    assert_eq!(sa.pairing_code.len(), 39);
+    assert!(!sa.pairing_code.is_empty());
+    // Both honest peers derive the same code.
+    assert_eq!(sa.pairing_code, sb.pairing_code);
+}
+
+#[tokio::test]
 async fn secure_link_rejects_tampered_frame() {
     let enc = AeadCrypto::new();
     let (sa, sb, mut la, lb) = established(&enc).await;
