@@ -42,22 +42,37 @@ impl IdentityStore for FsIdentity {
         let json = serde_json::to_vec_pretty(identity)
             .map_err(|e| DomainError::Storage(format!("serialize identity: {e}")))?;
         // Atomic: write a uniquely-named temp next to the target (private
-        // from the moment it's created — see `write_private`), then rename
-        // over it — a crash mid-write leaves the old file intact.
+        // from the moment it's created, and fsync'd before the rename so its
+        // data is durable first — see `write_private` — otherwise a crash
+        // between the rename (metadata-only) landing and the data blocks
+        // actually hitting disk can leave identity.json present but empty),
+        // then rename over it — a crash mid-write leaves the old file intact.
         let tmp = unique_tmp(&self.path);
         write_private(&tmp, &json)?;
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             DomainError::Storage(format!("commit identity: {e}"))
-        })
+        })?;
+        // Best-effort: fsync the parent directory too, so the rename itself
+        // (the directory entry pointing at the new inode) survives a crash.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 
-/// Create `path` and write `bytes` to it. On Unix the file is created with
-/// mode `0600` atomically (via `open(..., O_CREAT|O_EXCL, 0600)`), so there is
-/// no window — not even an instant — where the secret key sits at the
-/// process's default (typically group/world-readable) umask before a
-/// separate chmod call catches up. Elsewhere, permissions are unmanaged.
+/// Create `path` and write `bytes` to it, durably. On Unix the file is
+/// created with mode `0600` atomically (via `open(..., O_CREAT|O_EXCL,
+/// 0600)`), so there is no window — not even an instant — where the secret
+/// key sits at the process's default (typically group/world-readable) umask
+/// before a separate chmod call catches up. On every platform the bytes are
+/// `fsync`'d before this returns, so the caller's subsequent rename is
+/// renaming a fully-flushed file — this is the device's long-term identity;
+/// losing it to an unflushed inode on a hard stop would silently break every
+/// peer's TOFU pin. Elsewhere (non-Unix), permissions are unmanaged.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -73,12 +88,28 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(path);
         return Err(DomainError::Storage(format!("write identity: {e}")));
     }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(path);
+        return Err(DomainError::Storage(format!("sync identity: {e}")));
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).map_err(|e| DomainError::Storage(format!("write identity: {e}")))
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| DomainError::Storage(format!("create identity: {e}")))?;
+    if let Err(e) = file.write_all(bytes) {
+        let _ = std::fs::remove_file(path);
+        return Err(DomainError::Storage(format!("write identity: {e}")));
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(path);
+        return Err(DomainError::Storage(format!("sync identity: {e}")));
+    }
+    Ok(())
 }
 
 /// A temp path next to `path`, unique per process and per call.
