@@ -1315,6 +1315,7 @@ dependencies = [
  "hmac",
  "peerbeam-crypto",
  "peerbeam-domain",
+ "peerbeam-identity-fs",
  "peerbeam-reliability-fs",
  "peerbeam-storage-fs",
  "peerbeam-trust-fs",

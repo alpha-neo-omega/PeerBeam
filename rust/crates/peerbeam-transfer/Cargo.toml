@@ -26,5 +26,6 @@ peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 peerbeam-reliability-fs = { path = "../peerbeam-reliability-fs" }
 peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+peerbeam-identity-fs = { path = "../peerbeam-identity-fs" }
 tokio = { workspace = true }
 tempfile = { workspace = true }
