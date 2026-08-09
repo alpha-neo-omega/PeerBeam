@@ -69,7 +69,7 @@ fn to_hex(bytes: &[u8; 32]) -> String {
 }
 
 fn from_hex(s: &str) -> Result<[u8; 32], String> {
-    if s.len() != 64 {
+    if s.len() != 64 || !s.is_ascii() {
         return Err(format!("expected 64 hex chars, got {}", s.len()));
     }
     let mut out = [0u8; 32];
@@ -127,5 +127,32 @@ mod tests {
     fn bad_hex_is_rejected_not_silently_accepted() {
         let json = r#"{"device_id":"pb-x","public":"zz","secret":"00"}"#;
         assert!(serde_json::from_str::<StoredIdentity>(json).is_err());
+    }
+
+    #[test]
+    fn sixty_four_byte_multi_byte_utf8_is_rejected_not_panicking() {
+        // `public` here is exactly 64 *bytes* (the old guard's unit) but only
+        // 63 *chars*, because it contains one 2-byte UTF-8 character ('é')
+        // positioned right after the first byte. `from_hex` slices in fixed
+        // 2-byte chunks (`s[0..2]`, `s[2..4]`, ...); chunk `s[0..2]` here cuts
+        // through the middle of 'é' (its bytes occupy offsets 1..3), which is
+        // not a char boundary. Slicing a `&str` at a non-char-boundary
+        // panics, so a byte-length-only guard is not enough — the guard must
+        // also reject non-ASCII input before any slicing happens.
+        let public = format!("a\u{e9}{}", "a".repeat(61));
+        assert_eq!(public.len(), 64, "fixture must stay exactly 64 bytes");
+        assert_ne!(
+            public.chars().count(),
+            64,
+            "fixture must be non-ASCII (fewer chars than bytes)"
+        );
+        let json = format!(
+            r#"{{"device_id":"pb-x","public":"{public}","secret":"{}"}}"#,
+            "0".repeat(64)
+        );
+        assert!(
+            serde_json::from_str::<StoredIdentity>(&json).is_err(),
+            "must decode-error, not panic, on multi-byte UTF-8 padded to 64 bytes"
+        );
     }
 }
