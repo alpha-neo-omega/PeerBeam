@@ -39,6 +39,11 @@ pub struct Session {
     pub peer_name: String,
     /// The authenticated peer's device id, typed (for trust lookups).
     pub peer_device: peerbeam_domain::id::DeviceId,
+    /// Whether the peer was newly TOFU-pinned during this session's handshake.
+    pub newly_trusted: bool,
+    /// The first-contact pairing code from this session's handshake (empty for
+    /// a resumed session, which has no handshake).
+    pub pairing_code: String,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
 }
@@ -90,6 +95,8 @@ async fn establish(
     let peer_device = ps.peer().clone();
     let peer_id = peer_device.0.clone();
     let peer_name = ps.peer_name().to_string();
+    let newly_trusted = ps.newly_trusted();
+    let pairing_code = ps.pairing_code().to_string();
     let handle = ps.handle();
     if let Some(d) = &diag {
         d.register_handle(id, handle.clone());
@@ -112,6 +119,8 @@ async fn establish(
         peer_id,
         peer_name,
         peer_device,
+        newly_trusted,
+        pairing_code,
         incoming,
         run,
     })

@@ -198,6 +198,19 @@ async fn receive_into_ffi_with_accept() {
         .await
         .unwrap()
         .expect("incoming queued event");
+        // The incoming-transfer event exposes the first-contact pairing code
+        // for out-of-band MITM verification, plus whether the peer was newly
+        // TOFU-pinned during this handshake.
+        let payload = &queued["payload"];
+        assert_eq!(
+            payload["pairing_code"].as_str().map(str::len),
+            Some(39),
+            "pairing_code: {payload}"
+        );
+        assert!(
+            payload["newly_trusted"].as_bool().is_some(),
+            "newly_trusted: {payload}"
+        );
         let id = queued["transfer_id"].as_str().unwrap().to_string();
         let v = call_json(pb_transfer_accept, &json!({ "id": id }));
         assert_eq!(v["ok"], true, "accept: {v}");

@@ -1011,7 +1011,12 @@ impl Manager {
         events::transfer(
             &id,
             "transfer_queued",
-            json!({ "peer": peer, "incoming": true }),
+            json!({
+                "peer": peer,
+                "incoming": true,
+                "newly_trusted": session.newly_trusted,
+                "pairing_code": session.pairing_code.clone(),
+            }),
         );
 
         // Approval: auto-accept only peers explicitly approved by the user on
