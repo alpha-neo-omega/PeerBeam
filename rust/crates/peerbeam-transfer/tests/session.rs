@@ -244,6 +244,59 @@ async fn regression_establish_and_negotiate() {
     ));
 }
 
+/// Regression guard for the CLI-facing plumbing: `pairing_code` is computed
+/// one layer below (`auth::authenticate`) and copied onto `PeerSession` by
+/// hand in two places — `open()`'s post-`assemble` assignment here, and the
+/// CLI's `session_transfer::Session` construction (`bins/peerbeam-cli/src/
+/// session_transfer.rs`). Neither copy is enforced by the type system, so a
+/// future edit dropping either one would compile clean and silently regress to
+/// an always-empty code reaching the CLI. Exercises a real `PeerSession::open`
+/// dial/accept round trip (mirrors `regression_establish_and_negotiate` above)
+/// one layer above the existing `handshake_produces_matching_pairing_codes`
+/// test in `tests/secure.rs` (which only covers `authenticate()` directly).
+#[tokio::test]
+async fn pairing_code_survives_peer_session_handshake() {
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _) = unbounded_channel();
+    let (b_ev, _) = unbounded_channel();
+    let (a_ch, _) = unbounded_channel();
+    let (b_ch, _) = unbounded_channel();
+    let (a_in, _) = unbounded_channel();
+    let (b_in, _) = unbounded_channel();
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        SessionConfig::new(caps()),
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        SessionConfig::new(caps()),
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let a = ra.expect("a");
+    let b = rb.expect("b");
+    assert_eq!(a.pairing_code().len(), 39);
+    assert!(!a.pairing_code().is_empty());
+    assert_eq!(a.pairing_code(), b.pairing_code());
+}
+
 #[tokio::test]
 async fn incompatible_major_versions_are_rejected() {
     let (ta, tb) = MemTransport::pair();

@@ -1200,22 +1200,51 @@ async fn serve_loop(
             PairingGate::Revoke => {
                 // `peer_id` here is the plain-string form the CLI's `Session`
                 // wrapper surfaces (see `session_transfer::Session::peer_id`);
-                // `FsTrust::remove` takes the newtyped `DeviceId`.
-                let _ = sc
+                // `FsTrust::remove` takes the newtyped `DeviceId`. This is a
+                // security-relevant un-pin: swallowing an `Err` here would
+                // leave the peer trusted on disk while claiming otherwise —
+                // the next connection would then find it already trusted,
+                // skip the gate entirely (no `newly_trusted`), and silently
+                // defeat the whole check. So the result is checked, and a
+                // failed un-pin still fails the connection closed (it must
+                // never fall through to receiving data either way).
+                match sc
                     .trust
-                    .remove(&peerbeam_domain::id::DeviceId::from(peer_id.clone()));
-                if ctx.json {
-                    ctx.json_line(&json!({
-                        "event": "error",
-                        "message": "pairing code not confirmed; peer un-pinned",
-                        "peer": peer_id,
-                    }));
-                } else {
-                    ctx.line(&ctx.red(
-                        "pairing code not confirmed — un-pinned peer (possible MITM); transfer aborted",
-                    ));
+                    .remove(&peerbeam_domain::id::DeviceId::from(peer_id.clone()))
+                {
+                    Ok(_) => {
+                        if ctx.json {
+                            ctx.json_line(&json!({
+                                "event": "error",
+                                "message": "pairing code not confirmed; peer un-pinned",
+                                "peer": peer_id,
+                            }));
+                        } else {
+                            ctx.line(&ctx.red(
+                                "pairing code not confirmed — un-pinned peer (possible MITM); transfer aborted",
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if ctx.json {
+                            ctx.json_line(&json!({
+                                "event": "error",
+                                "message": format!(
+                                    "pairing code not confirmed; FAILED to un-pin peer: {e}"
+                                ),
+                                "peer": peer_id,
+                            }));
+                        } else {
+                            ctx.line(&ctx.red(&format!(
+                                "pairing code not confirmed — FAILED to un-pin peer ({e}); transfer aborted regardless",
+                            )));
+                        }
+                    }
                 }
                 session.close().await;
+                if once {
+                    break;
+                }
                 continue; // move on to the next inbound connection
             }
         }
