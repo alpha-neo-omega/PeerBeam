@@ -107,6 +107,16 @@ fn kdf(shared: &[u8], label: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Derive a 32-byte subkey from high-entropy input key material `ikm` and a
+/// domain-separation `label`. Used to derive an at-rest data key (e.g. the
+/// AppStore key) from the device identity's X25519 secret. The secret is already
+/// 32 bytes of high-entropy material, so `SHA-256(ikm ‖ label)` is sufficient;
+/// `label` domain-separates it from any other use of the same secret.
+#[must_use]
+pub fn derive_subkey(ikm: &[u8], label: &[u8]) -> [u8; 32] {
+    kdf(ikm, label)
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -194,5 +204,26 @@ mod tests {
         assert_eq!(c.fingerprint(&a.public), c.fingerprint(&a.public));
         assert_ne!(c.fingerprint(&a.public), c.fingerprint(&b.public));
         assert_eq!(c.fingerprint(&a.public).0.len(), 64);
+    }
+
+    #[test]
+    fn derive_subkey_is_stable_distinct_and_domain_separated() {
+        let ikm_a = [7u8; 32];
+        let ikm_b = [8u8; 32];
+        // Stable: same inputs -> same key.
+        assert_eq!(
+            derive_subkey(&ikm_a, b"peerbeam-appstore-v1"),
+            derive_subkey(&ikm_a, b"peerbeam-appstore-v1"),
+        );
+        // Distinct ikm -> distinct key.
+        assert_ne!(
+            derive_subkey(&ikm_a, b"peerbeam-appstore-v1"),
+            derive_subkey(&ikm_b, b"peerbeam-appstore-v1"),
+        );
+        // Domain separation: same ikm, different label -> distinct key.
+        assert_ne!(
+            derive_subkey(&ikm_a, b"peerbeam-appstore-v1"),
+            derive_subkey(&ikm_a, b"peerbeam-other-v1"),
+        );
     }
 }
