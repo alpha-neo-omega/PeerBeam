@@ -39,6 +39,15 @@ On later connections a changed fingerprint (a new device reusing an id, or a
 man-in-the-middle) is rejected. Fingerprints are meant to be compared
 out-of-band for stronger assurance.
 
+## Device identity
+
+Each device has a long-term X25519 identity keypair, generated on first run and
+stored at `<data_directory>/identity.json` with owner-only permissions (`0600`
+on Unix). The `device_id` is derived from the key's fingerprint (`pb-…`). Peers
+pin it via TOFU, so **deleting this file resets the device's identity** (peers
+will see a new, untrusted device and must trust it again). It never leaves the
+device.
+
 ## Integrity, confidentiality, replay protection
 
 `SecureLink` wraps the authenticated session. Every frame is sealed with

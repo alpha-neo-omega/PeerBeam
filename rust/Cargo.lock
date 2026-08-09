@@ -1096,6 +1096,7 @@ dependencies = [
  "peerbeam-discovery-udp",
  "peerbeam-domain",
  "peerbeam-engine",
+ "peerbeam-identity-fs",
  "peerbeam-platform",
  "peerbeam-storage-fs",
  "peerbeam-transfer",

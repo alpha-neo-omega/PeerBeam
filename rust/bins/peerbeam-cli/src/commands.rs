@@ -235,8 +235,16 @@ fn doctor(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
         Err(e) => checks.push(("UDP sockets".into(), "fail", e.to_string())),
     }
 
+    // Persistent identity (the same file `SecureCtx::build` authenticates
+    // with, and the id discovery announces us as).
+    let device_id = crate::engine::device_id(&cfg);
+    match &device_id {
+        Ok(id) => checks.push(("Identity".into(), "pass", id.to_string())),
+        Err(e) => checks.push(("Identity".into(), "fail", e.to_string())),
+    }
+
     // mDNS daemon.
-    match peerbeam_discovery_mdns::MdnsDiscovery::new(crate::engine::device_id()) {
+    match device_id.and_then(peerbeam_discovery_mdns::MdnsDiscovery::new) {
         Ok(_) => checks.push(("mDNS".into(), "pass", "daemon available".into())),
         Err(e) => checks.push(("mDNS".into(), "warn", format!("unavailable: {e}"))),
     }
@@ -462,8 +470,13 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
 // ── discovery-backed ────────────────────────────────────────────
 
 async fn snapshot(config: EngineConfig, secs: u64) -> Vec<ManagedDevice> {
-    let engine = build_engine(config.clone());
-    if engine.start_discovery(me(&config)).await.is_err() {
+    let Ok(engine) = build_engine(config.clone()) else {
+        return Vec::new();
+    };
+    let Ok(self_device) = me(&config) else {
+        return Vec::new();
+    };
+    if engine.start_discovery(self_device).await.is_err() {
         return Vec::new();
     }
     tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -504,9 +517,9 @@ fn device_rows(devices: &[ManagedDevice]) -> Vec<Vec<String>> {
 async fn discover(ctx: &Ctx, args: DiscoverArgs, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
     if args.watch {
-        let engine = build_engine(config.clone());
+        let engine = build_engine(config.clone())?;
         let mut changes = engine.device_changes();
-        engine.start_discovery(me(&config)).await?;
+        engine.start_discovery(me(&config)?).await?;
         if !ctx.json {
             ctx.line(&ctx.dim("watching for devices (Ctrl-C to stop)…"));
         }
@@ -612,9 +625,13 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
     let port = config.transfer.port;
 
+    // This device's persistent id — the same one discovery announces us as
+    // and the transfer handshake authenticates with (see `SecureCtx::build`).
+    let device_id = crate::engine::device_id(&config)?;
+
     // Real provider availability (mirrors `doctor`, concise).
     let udp_ok = std::net::UdpSocket::bind("0.0.0.0:0").is_ok();
-    let mdns_ok = peerbeam_discovery_mdns::MdnsDiscovery::new(crate::engine::device_id()).is_ok();
+    let mdns_ok = peerbeam_discovery_mdns::MdnsDiscovery::new(device_id.clone()).is_ok();
     let tailscale_ok = std::process::Command::new("tailscale")
         .arg("version")
         .output()
@@ -637,6 +654,7 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
 
     if ctx.json {
         ctx.json_line(&json!({
+            "device_id": device_id.to_string(),
             "device_name": config.device.name,
             "platform": peerbeam_platform::current().as_str(),
             "transfer_port": port,
@@ -646,6 +664,7 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
             "listening": listening,
         }));
     } else {
+        ctx.line(&format!("{}     {}", ctx.bold("Device ID:"), device_id));
         ctx.line(&format!("{}   {}", ctx.bold("Device:"), config.device.name));
         ctx.line(&format!(
             "{} {}",
@@ -940,12 +959,13 @@ pub struct SecureCtx {
 impl SecureCtx {
     fn build(config: &EngineConfig) -> Result<Self, CliError> {
         let enc = AeadCrypto::new();
-        let keypair = enc.generate_keypair();
-        let ident = Identity {
-            device_id: crate::engine::device_id(),
-            name: config.device.name.clone(),
-            keypair,
-        };
+        let identity_path =
+            std::path::Path::new(&config.storage.data_directory).join("identity.json");
+        let ident = peerbeam_transfer::load_or_generate(
+            &peerbeam_identity_fs::FsIdentity::open(identity_path),
+            &enc,
+            config.device.name.clone(),
+        )?;
         let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
         let trust = FsTrust::open(trust_path).map_err(CliError::from)?;
         Ok(Self {
@@ -1055,9 +1075,15 @@ async fn serve_loop(
         ));
     }
 
-    // Best-effort discoverability (so `send --to <name>` can find us).
-    let engine = build_engine(config.clone());
-    let _ = engine.start_discovery(me(config)).await;
+    // Best-effort discoverability (so `send --to <name>` can find us). Identity
+    // load failure here shouldn't abort an otherwise-working receive/daemon —
+    // `SecureCtx::build` above already proved the identity file is usable, but
+    // this stays defensive rather than assuming that. `engine` is carried past
+    // the loop below so discovery can be stopped on the way out.
+    let engine = build_engine(config.clone()).ok();
+    if let (Some(engine), Ok(self_device)) = (&engine, me(config)) {
+        let _ = engine.start_discovery(self_device).await;
+    }
 
     loop {
         let qc = match incoming.next().await {
@@ -1197,7 +1223,9 @@ async fn serve_loop(
         }
     }
 
-    let _ = engine.stop_discovery().await;
+    if let Some(engine) = &engine {
+        let _ = engine.stop_discovery().await;
+    }
     Ok(())
 }
 

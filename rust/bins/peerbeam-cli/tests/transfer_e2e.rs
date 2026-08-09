@@ -25,6 +25,21 @@ fn sends_a_file_between_two_processes_over_quic() {
     cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
     cfg.save(&cfg_path).unwrap();
 
+    // The sender gets its own `data_directory` (own identity + trust store),
+    // exactly as a second, distinct real device would. Sharing `cfg_path`
+    // between the two processes would give them the *same* persistent
+    // identity, collapsing the handshake's directional keys onto each other
+    // (both sides otherwise-`<`-compare their own public key against an
+    // identical peer key) and failing key confirmation.
+    let sender_cfg_path = dir.path().join("sender-config.json");
+    let mut sender_cfg = cfg.clone();
+    sender_cfg.storage.data_directory = dir
+        .path()
+        .join("data-sender")
+        .to_string_lossy()
+        .into_owned();
+    sender_cfg.save(&sender_cfg_path).unwrap();
+
     // A payload with content worth verifying byte-for-byte.
     let payload: Vec<u8> = (0..(512 * 1024)).map(|i| (i % 251) as u8).collect();
     std::fs::write(&src, &payload).unwrap();
@@ -66,7 +81,7 @@ fn sends_a_file_between_two_processes_over_quic() {
     let send = Command::new(BIN)
         .args([
             "--config",
-            cfg_path.to_str().unwrap(),
+            sender_cfg_path.to_str().unwrap(),
             "--no-color",
             "-y",
             "send",
@@ -105,6 +120,18 @@ fn json_output_is_machine_readable() {
     cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
     cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
     cfg.save(&cfg_path).unwrap();
+
+    // A distinct `data_directory` for the sender — see the comment in
+    // `sends_a_file_between_two_processes_over_quic` for why sharing one
+    // identity between the two ends breaks the handshake.
+    let sender_cfg_path = dir.path().join("sender-config.json");
+    let mut sender_cfg = cfg.clone();
+    sender_cfg.storage.data_directory = dir
+        .path()
+        .join("data-sender")
+        .to_string_lossy()
+        .into_owned();
+    sender_cfg.save(&sender_cfg_path).unwrap();
 
     let payload: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 251) as u8).collect();
     std::fs::write(&src, &payload).unwrap();
@@ -149,7 +176,7 @@ fn json_output_is_machine_readable() {
     let send = Command::new(BIN)
         .args([
             "--config",
-            cfg_path.to_str().unwrap(),
+            sender_cfg_path.to_str().unwrap(),
             "--json",
             "send",
             src.to_str().unwrap(),
@@ -194,6 +221,18 @@ fn sends_a_folder_between_two_processes_over_quic() {
     cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
     cfg.save(&cfg_path).unwrap();
 
+    // A distinct `data_directory` for the sender — see the comment in
+    // `sends_a_file_between_two_processes_over_quic` for why sharing one
+    // identity between the two ends breaks the handshake.
+    let sender_cfg_path = dir.path().join("sender-config.json");
+    let mut sender_cfg = cfg.clone();
+    sender_cfg.storage.data_directory = dir
+        .path()
+        .join("data-sender")
+        .to_string_lossy()
+        .into_owned();
+    sender_cfg.save(&sender_cfg_path).unwrap();
+
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("a.txt"), b"alpha").unwrap();
     let big: Vec<u8> = (0..(200 * 1024)).map(|i| (i % 251) as u8).collect();
@@ -233,7 +272,7 @@ fn sends_a_folder_between_two_processes_over_quic() {
     let send = Command::new(BIN)
         .args([
             "--config",
-            cfg_path.to_str().unwrap(),
+            sender_cfg_path.to_str().unwrap(),
             "--no-color",
             "-y",
             "send",
@@ -271,7 +310,14 @@ fn sends_a_folder_between_two_processes_over_quic() {
 fn status_json_reports_real_fields() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.json");
-    EngineConfig::default().save(&cfg_path).unwrap();
+    // `data_directory` must be isolated under the tempdir: `status` now loads
+    // (and, on first run, generates + persists) the device's identity file at
+    // `<data_directory>/identity.json`. Leaving `EngineConfig::default()`'s
+    // real platform data dir in place would make this test read/write the
+    // host's actual `identity.json` as a side effect of `cargo test`.
+    let mut cfg = EngineConfig::default();
+    cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
+    cfg.save(&cfg_path).unwrap();
 
     let out = Command::new(BIN)
         .args(["--config", cfg_path.to_str().unwrap(), "--json", "status"])
@@ -283,6 +329,56 @@ fn status_json_reports_real_fields() {
     assert_eq!(v["transfer_port"].as_u64(), Some(49600));
     assert!(v["providers"].is_array());
     assert!(v["listening"].is_boolean());
+    assert!(
+        v["device_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("pb-")),
+        "device_id must be the persistent pb-<fingerprint> id: {:?}",
+        v["device_id"]
+    );
+}
+
+/// The id `status` reports (the same id discovery announces us as, and the
+/// transfer handshake authenticates with — see `crate::engine::device_id`)
+/// must be the persistent identity, not a fresh id each run: same value
+/// across two invocations, and identical to what's on disk.
+#[test]
+fn device_id_is_stable_across_invocations_and_matches_identity_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let data_dir = dir.path().join("data");
+
+    let mut cfg = EngineConfig::default();
+    cfg.storage.data_directory = data_dir.to_string_lossy().into_owned();
+    cfg.save(&cfg_path).unwrap();
+
+    let run_status = || -> String {
+        let out = Command::new(BIN)
+            .args(["--config", cfg_path.to_str().unwrap(), "--json", "status"])
+            .output()
+            .expect("run status");
+        assert!(out.status.success());
+        let v: Value = serde_json::from_slice(&out.stdout).expect("valid json");
+        v["device_id"]
+            .as_str()
+            .expect("device_id present")
+            .to_string()
+    };
+
+    let id1 = run_status();
+    let id2 = run_status();
+    assert_eq!(id1, id2, "advertised device id must be stable across runs");
+    assert!(id1.starts_with("pb-"));
+
+    // Same source of truth as the file `SecureCtx::build` authenticates with.
+    let stored: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("identity.json")).unwrap())
+            .expect("identity.json is valid json");
+    assert_eq!(
+        stored["device_id"].as_str(),
+        Some(id1.as_str()),
+        "status-advertised id must match the persisted identity file"
+    );
 }
 
 /// Parse the port from a line like `listening on 0.0.0.0:49731 — saving to ...`.
