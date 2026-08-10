@@ -4,6 +4,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/chat_repository.dart';
 import 'package:peerbeam/data/discovery_repository.dart';
 import 'package:peerbeam/data/history_repository.dart';
 import 'package:peerbeam/data/transfer_repository.dart';
@@ -257,6 +258,89 @@ void main() {
       fake.emit(const HistoryUpdated());
       await flush();
       expect(repo.items, isEmpty);
+    });
+  });
+
+  group('ChatRepository', () {
+    test('refresh pulls the conversation from the engine', () async {
+      final fake = FakePeerBeam();
+      fake.chatHistories['bob'] = [
+        ChatMessage(
+          id: 'm1',
+          peerId: 'bob',
+          direction: 'in',
+          body: 'hi',
+          at: DateTime.now(),
+          status: 'received',
+        ),
+      ];
+      final repo = ChatRepository(api: fake);
+      // No refresh in the constructor (same reasoning as the other
+      // repositories); callers refresh explicitly once a conversation opens.
+      expect(repo.messagesFor('bob'), isEmpty);
+
+      await repo.refresh('bob');
+      expect(repo.messagesFor('bob').single.body, 'hi');
+    });
+
+    test('a chat_received event appends to that peer\'s conversation', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'm2',
+            peerId: 'alice',
+            direction: 'in',
+            body: 'yo',
+            at: DateTime.now(),
+            status: 'received',
+          ),
+        ),
+      );
+      await flush();
+
+      expect(repo.messagesFor('alice').single.body, 'yo');
+      // Untouched conversations stay empty.
+      expect(repo.messagesFor('bob'), isEmpty);
+    });
+
+    test(
+      'send shows the message immediately, then reconciles with the engine',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
+        const target = PeerTarget(
+          name: 'carol',
+          addresses: ['127.0.0.1'],
+          port: 49600,
+        );
+
+        // Not awaited on purpose: the optimistic append happens synchronously
+        // before chatSend's own await, exactly like the fire-and-forget call
+        // the chat screen makes from a button handler.
+        final pending = repo.send('carol', target, '  hello  ');
+        expect(repo.messagesFor('carol').single.body, 'hello');
+        expect(repo.messagesFor('carol').single.status, 'pending');
+
+        await pending;
+        expect(fake.calls, contains('chatSend:hello'));
+        // Reconciled from chatHistory: the fake's persisted record replaces
+        // the optimistic placeholder.
+        expect(repo.messagesFor('carol').single.status, 'sent');
+      },
+    );
+
+    test('send ignores blank text', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(name: 'dave', addresses: [], port: 0);
+
+      await repo.send('dave', target, '   ');
+
+      expect(repo.messagesFor('dave'), isEmpty);
+      expect(fake.calls, isEmpty);
     });
   });
 }

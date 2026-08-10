@@ -15,6 +15,7 @@ import '../../widgets/brand_mark.dart';
 import '../../widgets/common.dart';
 import '../../widgets/processing.dart';
 import '../../widgets/device_tile.dart';
+import '../chat/chat_screen.dart';
 import '../qr/qr.dart';
 import '../send/pick_device.dart';
 import '../send/send_staged.dart';
@@ -405,6 +406,25 @@ class HomeScreen extends StatelessWidget {
     await sendStaged(context, picked.target, picked.name);
   }
 
+  /// Open a chat with a discovered device (pushed, not a nav tab — see
+  /// task-9 brief for the M1 rationale).
+  void _chatWith(BuildContext context, Device device) {
+    final target = AppScope.of(context).device.peerTarget(device.id);
+    if (target == null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text('${device.name} is not reachable right now')),
+        );
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(peerId: device.id, peer: target),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
@@ -689,6 +709,7 @@ class HomeScreen extends StatelessWidget {
                                 child: DeviceTile(
                                   device: devices[i],
                                   onSend: () => _sendTo(context, devices[i]),
+                                  onChat: () => _chatWith(context, devices[i]),
                                 ),
                               ),
                             );

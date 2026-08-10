@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../data/chat_repository.dart';
 import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
 import '../data/saved_devices_repository.dart';
@@ -133,6 +134,7 @@ class AppState {
   final HistoryRepository history;
   final SavedDevicesRepository saved;
   final TrustRepository trust;
+  final ChatRepository chat;
   final SettingsStore settings;
   final StagingStore staging;
 
@@ -143,6 +145,7 @@ class AppState {
     required this.history,
     required this.saved,
     required this.trust,
+    required this.chat,
     required this.settings,
     required this.staging,
   });
@@ -156,6 +159,7 @@ class AppState {
       history: HistoryRepository(api: api),
       saved: SavedDevicesRepository()..load(),
       trust: TrustRepository(api: api),
+      chat: ChatRepository(api: api),
       settings: SettingsStore(
         deviceName: 'This Device',
         saveDirectory: '~/Downloads/PeerBeam',
@@ -171,6 +175,7 @@ class AppState {
     theme.dispose();
     device.dispose();
     trust.dispose();
+    chat.dispose();
     transfer.dispose();
     history.dispose();
     saved.dispose();

@@ -9,7 +9,13 @@ import 'status_dot.dart';
 class DeviceTile extends StatelessWidget {
   final Device device;
   final VoidCallback? onSend;
-  const DeviceTile({super.key, required this.device, this.onSend});
+  final VoidCallback? onChat;
+  const DeviceTile({
+    super.key,
+    required this.device,
+    this.onSend,
+    this.onChat,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -72,6 +78,17 @@ class DeviceTile extends StatelessWidget {
                         ],
                       ),
                     ),
+                    if (onChat != null) ...[
+                      const Gap(AppSpace.xxs),
+                      IconButton(
+                        onPressed: device.online ? onChat : null,
+                        icon: const Icon(
+                          Icons.chat_bubble_outline_rounded,
+                          size: AppIcons.sm,
+                        ),
+                        tooltip: 'Chat with ${device.name}',
+                      ),
+                    ],
                     const Gap(AppSpace.xs),
                     IconButton.filledTonal(
                       onPressed: device.online ? onSend : null,
