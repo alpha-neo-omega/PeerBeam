@@ -76,7 +76,7 @@ mod tests {
     use peerbeam_appstore_fs::FsAppStore;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
     use peerbeam_domain::port::EncryptionProvider;
-    use peerbeam_domain::session::ChannelId;
+    use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType};
     use std::sync::Mutex;
 
     fn store(seed: u8) -> (ChatStore, tempfile::TempDir) {
@@ -144,5 +144,24 @@ mod tests {
         assert_eq!(received.lock().unwrap().len(), 1, "sink fires once");
         let hist = cs.history(&peer).unwrap();
         assert_eq!(hist.len(), 1, "store holds one record");
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_malformed_frame_without_panicking() {
+        let (cs, _dir) = store(4);
+        let sink: ReceivedSink = Arc::new(|_rec| {});
+        let (handler, peer_slot) = ChatHandler::new(cs, sink);
+        let _ = peer_slot.set(DeviceId::from("pb-sender"));
+
+        // Peer is bound, but the frame is neither the right message type nor
+        // valid JSON — `handle` must return an error, not panic.
+        let bad = SessionFrame::new(
+            ChannelId::new(1),
+            MessageType::new(999),
+            MessageFlags::END_OF_MESSAGE,
+            Bytes::from_static(b"not json"),
+        );
+        let err = handler.handle(bad).await.unwrap_err();
+        assert!(matches!(err, SessionError::FrameDecode(_)));
     }
 }

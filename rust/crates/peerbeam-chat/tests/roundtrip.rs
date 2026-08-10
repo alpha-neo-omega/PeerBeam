@@ -181,3 +181,109 @@ async fn handler_dedups_same_message_id_without_a_second_network_send() {
     assert_eq!(hist.len(), 1, "exactly one record persisted");
     assert_eq!(hist[0].body, "dup me");
 }
+
+/// Regression: `send_message` must not race the local `open_channel` return
+/// (channel merely `Opening`) against the peer's `ChannelAccept`.
+///
+/// `SessionHandle::open_channel` resolves as soon as *we* have allocated the
+/// channel and queued the open request on the wire — it does not wait for the
+/// peer's accept (the channel becomes `Open` only once that arrives). On the
+/// in-memory transport used elsewhere in this file that round trip is
+/// effectively instantaneous, which hid the bug. Here B's run loop — the side
+/// that would send back `ChannelAccept` — is deliberately delayed by 50ms
+/// before it starts processing anything, reproducing the nonzero round trip
+/// any real transport (QUIC over LAN/WiFi/Tailscale/Internet) has. Against the
+/// pre-fix code (`open_channel` → immediately `send_on_channel`) this fails
+/// with `SendError::Session("... channel not open")`; the fix must wait for
+/// the channel to actually reach `Open` first.
+#[tokio::test]
+async fn send_message_waits_for_channel_open_when_receiver_run_loop_is_delayed() {
+    let store_b = chat_store(6);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+
+    let _ = peer_slot_b.set(a_id.clone());
+
+    // A's run loop starts immediately so it can observe the ChannelAccept once
+    // B (eventually) sends it.
+    tokio::spawn(async move { a.run().await });
+    // B's run loop is delayed: the ChannelOpen A sends sits unprocessed on the
+    // transport for 50ms first, simulating real-transport latency before the
+    // peer's accept comes back — the exact scenario that exposed the race.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b.run().await
+    });
+
+    let store_a = chat_store(7);
+    let rec = send_message(&a_handle, &store_a, &b_id, "delayed hello")
+        .await
+        .expect("send_message must wait for the channel to open, not race it");
+    assert_eq!(rec.body, "delayed hello");
+    // Only-persist-after-success (Finding 2): the send succeeded, so our own
+    // history must show it as Sent.
+    let sender_hist = store_a.history(&b_id).expect("store_a history readable");
+    assert_eq!(sender_hist.len(), 1);
+    assert_eq!(sender_hist[0].status, peerbeam_chat::Status::Sent);
+
+    let mut got: Option<ChatRecord> = None;
+    for _ in 0..300 {
+        let snapshot = received.lock().unwrap().clone();
+        if let Some(first) = snapshot.into_iter().next() {
+            got = Some(first);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let received_rec = got.expect("B did not receive the delayed message in time");
+    assert_eq!(received_rec.body, "delayed hello");
+    let hist = store_b.history(&a_id).expect("store_b history readable");
+    assert_eq!(hist.len(), 1, "store_b persisted exactly one record");
+}

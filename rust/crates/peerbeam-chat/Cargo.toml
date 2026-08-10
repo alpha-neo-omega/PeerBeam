@@ -16,6 +16,7 @@ chrono = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 peerbeam-crypto = { path = "../peerbeam-crypto" }
@@ -23,4 +24,3 @@ peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
 peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 tempfile = { workspace = true }
-tokio = { workspace = true }
