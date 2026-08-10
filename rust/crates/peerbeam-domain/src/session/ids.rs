@@ -99,6 +99,8 @@ impl ChannelType {
     pub const CONTROL: ChannelType = ChannelType(0x0000);
     /// File/folder transfer (today's transfer, reframed as a channel).
     pub const TRANSFER: ChannelType = ChannelType(0x0100);
+    /// Text/markdown chat messages (Phase B). See MESSAGE_REGISTRY.md §2.
+    pub const CHAT: ChannelType = ChannelType(0x0101);
 
     /// Construct from a raw registry id.
     #[must_use]
@@ -183,5 +185,12 @@ mod tests {
         assert!(!ChannelType::TRANSFER.is_control());
         assert!(ChannelType::new(0x8001).is_plugin());
         assert!(!ChannelType::new(0x0100).is_plugin());
+    }
+
+    #[test]
+    fn chat_channel_type_is_0x0101_and_first_party() {
+        assert_eq!(ChannelType::CHAT.get(), 0x0101);
+        assert!(ChannelType::CHAT.is_first_party());
+        assert!(!ChannelType::CHAT.is_control());
     }
 }
