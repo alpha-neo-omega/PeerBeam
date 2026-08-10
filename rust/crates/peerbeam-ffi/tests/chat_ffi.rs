@@ -18,13 +18,13 @@ use serde_json::{json, Value};
 use peerbeam_chat::{ChatHandler, ChatRecord, ChatStore, ReceivedSink};
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
-use peerbeam_domain::entity::{Direction, TransferSession, TransferStatus};
+use peerbeam_domain::entity::{Direction, Route, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
 use peerbeam_ffi::*;
 use peerbeam_transfer::{HandlerRegistry, Identity, PeerSession, SessionConfig, SessionRole};
-use peerbeam_transfer_quic::{direct_route, QuicTransport};
+use peerbeam_transfer_quic::{direct_route, QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 
 /// The session config a manual chat-only peer advertises: just CHAT (plus the
@@ -146,6 +146,34 @@ fn session_meta() -> TransferSession {
     }
 }
 
+/// Dial the FFI daemon's QUIC listener with a bounded retry/backoff instead
+/// of a fixed sleep: `pb_init` returns as soon as `start_daemon()` has
+/// *spawned* the task that binds the listener (`Manager::serve` ->
+/// `serve_channels_on`), not once it has actually finished binding — a single
+/// unretried dial right after `pb_init` can flake if that bind hasn't landed
+/// yet. Retries in short steps for up to `budget` (test-only: panics if the
+/// listener never comes up in time, mirroring `send_message`'s own
+/// fail-after-budget convention).
+async fn dial_channels_retrying(
+    quic: &QuicTransport,
+    route: &Route,
+    meta: &TransferSession,
+    budget: Duration,
+) -> QuicChannels {
+    let deadline = Instant::now() + budget;
+    loop {
+        match quic.dial_channels(route, meta).await {
+            Ok(qc) => return qc,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("dial_channels did not succeed within {budget:?}: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────
 
 /// FFI engine SENDS via `pb_chat_send` to a manually-built real peer.
@@ -252,7 +280,6 @@ async fn chat_received_into_ffi_and_history_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let port = 49901;
     init_ffi(port, dir.path());
-    tokio::time::sleep(Duration::from_millis(300)).await; // let the server bind
 
     let (enc, trust, identity) = peer_identity(dir.path(), "sender");
     let sender_store = peer_chat_store(dir.path(), "sender", 7);
@@ -260,7 +287,11 @@ async fn chat_received_into_ffi_and_history_round_trip() {
     let route = direct_route("127.0.0.1", port);
 
     let send_fut = async move {
-        let qc = quic.dial_channels(&route, &session_meta()).await.unwrap();
+        // Bounded retry instead of a fixed sleep: the daemon's listener bind
+        // races this dial, and a single unretried attempt right after
+        // `pb_init` can flake if the bind hasn't landed yet.
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);

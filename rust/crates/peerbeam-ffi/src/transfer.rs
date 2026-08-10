@@ -960,11 +960,19 @@ impl Manager {
             let session =
                 crate::session_exec::dial(&quic, &rm, &device, &meta, ident, enc, trust, None)
                     .await?;
-            let rec = peerbeam_chat::send_message(&session.handle, &chat, &peer_id, &text)
-                .await
-                .map_err(|e| (Code::Connection, e.to_string()))?;
+            // Capture the outcome WITHOUT short-circuiting: the session must be
+            // closed on every path once it exists, or a post-dial failure (peer
+            // rejects the Chat channel, send times out) leaks the QUIC
+            // connection, its run-loop task, and its diagnostics-registry entry
+            // forever (`Session` has no `Drop` that closes it). Mirrors
+            // `run_send`/`run_send_folder`, which always call `session.close()`
+            // regardless of outcome.
+            let result: Result<_, (Code, String)> =
+                peerbeam_chat::send_message(&session.handle, &chat, &peer_id, &text)
+                    .await
+                    .map_err(|e| (Code::Connection, e.to_string()));
             session.close().await;
-            Ok::<_, (Code, String)>(rec)
+            result
         })?;
         Ok(json!({ "id": rec.id }))
     }
