@@ -10,10 +10,11 @@ import '../sdk/peerbeam.dart';
 /// Per-peer chat conversations, refetched from the engine on demand and
 /// appended-to live as `chat_received` events arrive.
 ///
-/// Conversations are keyed by the peer's device id (not by [PeerTarget],
-/// which carries no stable id of its own — only `name`/`addresses`/`port`,
-/// the shape the engine needs to dial). Callers (the chat screen) hold both:
-/// the device id for the map key, and a [PeerTarget] to actually send with.
+/// Conversations are keyed by the peer's real device id, passed explicitly
+/// as `peerId` alongside the [PeerTarget] used to actually send. [PeerTarget]
+/// does carry its own `id` field now, but it's optional — a manually-entered
+/// host:port target has none — so callers (the chat screen) still thread the
+/// device id through separately rather than reading it off [PeerTarget].
 class ChatRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
   final Map<String, List<ChatMessage>> _byPeer = {};

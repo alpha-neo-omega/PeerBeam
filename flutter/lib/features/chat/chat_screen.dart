@@ -6,9 +6,10 @@ import '../../state/app_scope.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 
-/// A one-to-one chat with [peer]. [peerId] is the discovered device's id —
-/// the conversation key — since [PeerTarget] itself carries no stable id
-/// (only the name/addresses/port the engine needs to dial).
+/// A one-to-one chat with [peer]. [peerId] is the discovered device's real
+/// id — the conversation key. [PeerTarget] does carry its own `id` field
+/// now, but it's optional (a manually-entered host:port target has none), so
+/// the id is threaded through separately here rather than read off [peer].
 class ChatScreen extends StatefulWidget {
   final String peerId;
   final PeerTarget peer;

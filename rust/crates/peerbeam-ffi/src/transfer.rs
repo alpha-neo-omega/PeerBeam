@@ -967,8 +967,16 @@ impl Manager {
             // forever (`Session` has no `Drop` that closes it). Mirrors
             // `run_send`/`run_send_folder`, which always call `session.close()`
             // regardless of outcome.
+            // The record's peer must be the session's *authenticated* peer id,
+            // not the pre-dial (possibly discovered/advertised) `device.id` —
+            // chat history is namespaced by device id, so using the pre-dial
+            // id would let it diverge from the authenticated identity the
+            // receiving side records under, splitting the conversation across
+            // two namespaces. Mirrors the CLI's `chat send` (`bins/peerbeam-
+            // cli/src/chat.rs`), which uses `session.peer_id` for the same
+            // reason.
             let result: Result<_, (Code, String)> =
-                peerbeam_chat::send_message(&session.handle, &chat, &peer_id, &text)
+                peerbeam_chat::send_message(&session.handle, &chat, &session.peer_device, &text)
                     .await
                     .map_err(|e| (Code::Connection, e.to_string()));
             session.close().await;
