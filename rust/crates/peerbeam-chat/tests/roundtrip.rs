@@ -287,3 +287,106 @@ async fn send_message_waits_for_channel_open_when_receiver_run_loop_is_delayed()
     let hist = store_b.history(&a_id).expect("store_b history readable");
     assert_eq!(hist.len(), 1, "store_b persisted exactly one record");
 }
+
+/// Regression for the review's follow-up finding: when the peer rejects our
+/// channel open, `send_message` must fail *fast* (well under the full poll
+/// budget), not spin out the whole timeout.
+///
+/// B is configured with `.with_channel_limit(0)` — it still negotiates the
+/// CHAT capability (so A's local `open_channel` succeeds and registers the
+/// channel as `Opening`), but its `ChannelManager::permit` rejects every data
+/// channel open outright, so it queues and sends back a `ChannelReject`. On
+/// A's side that removes the channel from its own registry (`handle_channel_
+/// reject` in `channel_manager.rs`) — the exact "present, then gone" signal
+/// `wait_for_channel_open`'s fail-fast path is built to detect.
+///
+/// B's run loop is delayed 30ms before it starts (same technique as the
+/// delayed-open test above). This is load-bearing, not incidental: on the
+/// undelayed in-memory transport the entire open→reject round trip completes
+/// faster than `wait_for_channel_open`'s very first poll, so the channel is
+/// already gone before we ever observe it present — indistinguishable, from
+/// inside `send_message`, from registration lag (see `decide`'s `None,
+/// seen_before: false` arm), so it would (correctly, per that arm's contract)
+/// wait out the full budget instead of failing fast. Confirmed by manual
+/// tracing: with no delay, `a_handle.channels()` immediately after
+/// `open_channel` already returns `[]`. The delay gives us a window where the
+/// channel is genuinely observed `Opening` (so `seen` becomes `true`) before
+/// B processes the open and rejects it — reproducing the real-transport case
+/// where local registration is visible well before a network round trip
+/// completes.
+#[tokio::test]
+async fn send_message_fails_fast_when_the_peer_rejects_the_channel() {
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let b_id = id_b.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    // Negotiates CHAT fine, but accepts zero concurrent data channels: any
+    // open A requests is rejected.
+    let b_cfg = SessionConfig::new(caps()).with_channel_limit(0);
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        b.run().await
+    });
+
+    let store_a = chat_store(8);
+    let started = std::time::Instant::now();
+    let result = send_message(&a_handle, &store_a, &b_id, "should be rejected").await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "send_message must fail when the peer rejects the channel"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "must fail fast on rejection (well under the 5s budget), took {elapsed:?}"
+    );
+    // No false Sent record: the send never actually happened.
+    assert!(
+        store_a
+            .history(&b_id)
+            .expect("store_a history readable")
+            .is_empty(),
+        "a rejected send must not persist a Sent record"
+    );
+}
