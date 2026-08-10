@@ -151,8 +151,15 @@ class _ChatBubble extends StatelessWidget {
     );
   }
 
-  String _time(DateTime t) =>
-      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+  // The engine persists timestamps as UTC (RFC3339); the optimistic message
+  // is created with a local `DateTime.now()`. Normalize both through
+  // `toLocal()` so a non-UTC user doesn't see the displayed time shift when
+  // the optimistic message is replaced by the parsed (UTC) record.
+  String _time(DateTime t) {
+    final local = t.toLocal();
+    return '${local.hour.toString().padLeft(2, '0')}:'
+        '${local.minute.toString().padLeft(2, '0')}';
+  }
 }
 
 /// The bottom compose bar: a text field plus a send button.

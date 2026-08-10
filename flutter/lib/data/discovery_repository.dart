@@ -32,7 +32,12 @@ class DiscoveryRepository extends ChangeNotifier {
   PeerTarget? peerTarget(String id) {
     final d = _raw[id];
     if (d == null || d.addresses.isEmpty || d.port == 0) return null;
-    return PeerTarget(name: d.name, addresses: d.addresses, port: d.port);
+    return PeerTarget(
+      id: d.id,
+      name: d.name,
+      addresses: d.addresses,
+      port: d.port,
+    );
   }
 
   /// Start discovery and reflect it in [scanning] (used at boot, so the

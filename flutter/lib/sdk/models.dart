@@ -162,22 +162,35 @@ class HistoryEntry {
 }
 
 /// A peer target for a send (matches the FFI `peer` JSON).
+///
+/// [id] is the discovered/saved device's stable id, when known. It is
+/// nullable because one construction site (the manual host/port "Send to
+/// address" dialog) has no device id to offer — the engine's `device_from`
+/// falls back to a placeholder id in that case. Whenever a real id is
+/// available it must be threaded through, since the engine keys
+/// conversation/session state (e.g. chat history) by this id, not by name.
 @immutable
 class PeerTarget {
   final String name;
   final List<String> addresses;
   final int port;
+  final String? id;
   const PeerTarget({
     required this.name,
     required this.addresses,
     required this.port,
+    this.id,
   });
 
-  Map<String, dynamic> toJson() => {
-    'name': name,
-    'addresses': addresses,
-    'port': port,
-  };
+  Map<String, dynamic> toJson() {
+    final m = <String, dynamic>{
+      'name': name,
+      'addresses': addresses,
+      'port': port,
+    };
+    if (id != null) m['id'] = id;
+    return m;
+  }
 }
 
 /// A pinned (trusted) peer, as recorded by the engine's TOFU store.

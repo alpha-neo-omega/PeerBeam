@@ -108,7 +108,10 @@ class FakePeerBeam implements PeerBeamApi {
   Future<String> chatSend(PeerTarget peer, String text) async {
     calls.add('chatSend:$text');
     final id = 'chat-${++_chatSeq}';
-    final peerId = peer.name;
+    // Mirrors the real engine's `device_from`: key by the peer's real id when
+    // present, falling back to name only when it isn't (matching the one
+    // construction site with no device id — the manual host/port dialog).
+    final peerId = peer.id ?? peer.name;
     final msg = ChatMessage(
       id: id,
       peerId: peerId,

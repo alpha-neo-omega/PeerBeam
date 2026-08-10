@@ -372,7 +372,12 @@ class HomeScreen extends StatelessWidget {
   /// Send to a saved device. Content-first (send the stack if non-empty).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
-    final target = PeerTarget(name: d.name, addresses: [d.host], port: d.port);
+    final target = PeerTarget(
+      id: d.id,
+      name: d.name,
+      addresses: [d.host],
+      port: d.port,
+    );
     if (scope.staging.isNotEmpty) {
       await sendStaged(context, target, d.name);
       return;

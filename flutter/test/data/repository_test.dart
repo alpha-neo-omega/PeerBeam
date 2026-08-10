@@ -307,11 +307,19 @@ void main() {
     });
 
     test(
-      'send shows the message immediately, then reconciles with the engine',
+      'send shows the message immediately, then reconciles with the engine '
+      '— keyed by the peer\'s real id, not its display name',
       () async {
+        // Regression guard for the PeerTarget-carries-no-id bug: `id` and
+        // `name` deliberately differ here. If `PeerTarget.id` weren't wired
+        // through (or the fake/engine keyed by name again instead of id),
+        // `chatSend` would persist under 'carol' while this test's `refresh`
+        // reads 'pb-carol' — the reconcile step would find nothing and the
+        // status would stay 'pending' forever, failing the last expectation.
         final fake = FakePeerBeam();
         final repo = ChatRepository(api: fake);
         const target = PeerTarget(
+          id: 'pb-carol',
           name: 'carol',
           addresses: ['127.0.0.1'],
           port: 49600,
@@ -320,15 +328,17 @@ void main() {
         // Not awaited on purpose: the optimistic append happens synchronously
         // before chatSend's own await, exactly like the fire-and-forget call
         // the chat screen makes from a button handler.
-        final pending = repo.send('carol', target, '  hello  ');
-        expect(repo.messagesFor('carol').single.body, 'hello');
-        expect(repo.messagesFor('carol').single.status, 'pending');
+        final pending = repo.send('pb-carol', target, '  hello  ');
+        expect(repo.messagesFor('pb-carol').single.body, 'hello');
+        expect(repo.messagesFor('pb-carol').single.status, 'pending');
 
         await pending;
         expect(fake.calls, contains('chatSend:hello'));
-        // Reconciled from chatHistory: the fake's persisted record replaces
-        // the optimistic placeholder.
-        expect(repo.messagesFor('carol').single.status, 'sent');
+        // Reconciled from chatHistory('pb-carol'): the fake's persisted
+        // record (keyed by peer.id) replaces the optimistic placeholder.
+        expect(repo.messagesFor('pb-carol').single.status, 'sent');
+        // The name is never used as a conversation key.
+        expect(repo.messagesFor('carol'), isEmpty);
       },
     );
 

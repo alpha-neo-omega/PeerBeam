@@ -110,6 +110,7 @@ Future<PickedTarget?> showDevicePicker(BuildContext context) async {
                     ctx,
                     PickedTarget(
                       PeerTarget(
+                        id: d.id,
                         name: d.name,
                         addresses: [d.host],
                         port: d.port,
