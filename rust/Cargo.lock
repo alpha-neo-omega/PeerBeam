@@ -1264,6 +1264,8 @@ dependencies = [
  "libc",
  "libloading",
  "peerbeam-app",
+ "peerbeam-appstore-fs",
+ "peerbeam-chat",
  "peerbeam-config",
  "peerbeam-crypto",
  "peerbeam-discovery-mdns",

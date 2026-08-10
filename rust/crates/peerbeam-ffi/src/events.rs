@@ -63,6 +63,24 @@ pub fn transfer(id: &str, ty: &str, payload: Value) {
     }));
 }
 
+/// Emit a `chat_received` event carrying one persisted record. The handler
+/// that decoded and persisted the record calls this only to notify — it does
+/// not re-persist (the `ChatStore` write already happened in `ChatHandler`).
+pub fn chat(rec: &peerbeam_chat::ChatRecord) {
+    emit(&json!({
+        "type": "chat_received",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message": {
+            "id": rec.id,
+            "peer_id": rec.peer_id,
+            "direction": rec.direction,
+            "timestamp": rec.timestamp,
+            "body": rec.body,
+            "status": rec.status,
+        },
+    }));
+}
+
 /// Additive PeerSession lifecycle event vocabulary. New `type` strings only —
 /// existing consumers ignore unknown types, so this never breaks the callback
 /// contract. Published so consumers (Dart) can subscribe additively; marked
@@ -96,4 +114,60 @@ pub fn session(session_id: &str, ty: &str, payload: Value) {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "payload": payload,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerbeam_chat::{ChatRecord, Direction, Status};
+    use std::ffi::CStr;
+    use std::sync::Mutex;
+
+    // Collects the raw JSON strings the callback receives, for this test only
+    // (guarded by `#[serial_test::serial]` — `CALLBACK` is process-global, same
+    // pattern as `lib.rs`'s `session_events_route_in_order_through_the_callback`).
+    static COLLECTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    extern "C" fn collect(ptr: *const c_char) {
+        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
+        // Free exactly as `pb_free_string` does (the callback owns the string).
+        unsafe { drop(CString::from_raw(ptr as *mut c_char)) };
+        COLLECTED.lock().unwrap().push(s);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_emits_chat_received_with_expected_shape() {
+        COLLECTED.lock().unwrap().clear();
+        set_callback(Some(collect));
+
+        let rec = ChatRecord {
+            id: "m1".to_string(),
+            peer_id: "pb-bob".to_string(),
+            direction: Direction::In,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            body: "hello".to_string(),
+            status: Status::Received,
+        };
+        chat(&rec);
+
+        set_callback(None);
+
+        let got: Vec<Value> = COLLECTED
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(got.len(), 1);
+        let v = &got[0];
+        assert_eq!(v["type"], "chat_received");
+        assert!(v["timestamp"].is_string(), "envelope carries a timestamp");
+        assert_eq!(v["message"]["id"], "m1");
+        assert_eq!(v["message"]["peer_id"], "pb-bob");
+        assert_eq!(v["message"]["direction"], "in");
+        assert_eq!(v["message"]["timestamp"], "2024-01-01T00:00:00Z");
+        assert_eq!(v["message"]["body"], "hello");
+        assert_eq!(v["message"]["status"], "received");
+    }
 }

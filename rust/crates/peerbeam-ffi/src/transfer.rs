@@ -15,6 +15,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use peerbeam_chat::ChatStore;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
     Device, DeviceType, Direction, Progress, TransferSession, TransferStatus,
@@ -183,6 +184,11 @@ pub struct Manager {
     quic: Arc<QuicTransport>,
     enc: Arc<AeadCrypto>,
     trust: Arc<FsTrust>,
+    /// Encrypted local store for chat history, one namespace per peer. Shared
+    /// (`Clone`) with `handle_incoming`'s per-connection chat wiring — the
+    /// accept path registers a `ChatHandler` against a clone of this store, so
+    /// every accepted session persists into the same on-disk conversation log.
+    chat: ChatStore,
     identity: Identity,
     /// The presented name, split out from `identity` so a live rename
     /// (`set_identity_name`) reaches in-flight/future handshakes without a
@@ -215,6 +221,7 @@ impl Manager {
         quic: Arc<QuicTransport>,
         enc: Arc<AeadCrypto>,
         trust: Arc<FsTrust>,
+        chat: ChatStore,
         identity: Identity,
         save_dir: String,
         auto_accept: bool,
@@ -233,6 +240,7 @@ impl Manager {
             quic,
             enc,
             trust,
+            chat,
             identity,
             identity_name,
             save_dir: RwLock::new(save_dir),
@@ -499,6 +507,10 @@ impl Manager {
                 self.identity(),
                 self.enc.clone(),
                 self.trust.clone(),
+                // The sender advertises the Chat capability (see
+                // `session_exec::session_cfg`) but registers no handler here —
+                // chat *sending* is wired in a later task.
+                None,
             )
             .await
             {
@@ -981,12 +993,20 @@ impl Manager {
     }
 
     async fn handle_incoming(self: Arc<Self>, qc: QuicChannels) {
+        // Chat wiring for the accept side: the handler persists each inbound
+        // record via `self.chat` itself, then calls this sink purely to
+        // notify — the sink must not re-persist.
+        let wiring = crate::session_exec::ChatWiring {
+            store: self.chat.clone(),
+            sink: Arc::new(|rec| crate::events::chat(&rec)),
+        };
         // Establish the responder PeerSession (runs the handshake internally).
         let mut session = match crate::session_exec::accept(
             qc,
             self.identity(),
             self.enc.clone(),
             self.trust.clone(),
+            Some(wiring),
         )
         .await
         {
@@ -1451,11 +1471,21 @@ mod tests {
             name: name.to_string(),
             keypair,
         };
+        let chat_key =
+            peerbeam_crypto::derive_subkey(&identity.keypair.secret.0, b"peerbeam-appstore-v1");
+        let appstore: Arc<dyn peerbeam_domain::port::AppStore> =
+            Arc::new(peerbeam_appstore_fs::FsAppStore::open(
+                dir.path().join("appstore"),
+                chat_key,
+                enc.clone(),
+            ));
+        let chat = ChatStore::new(appstore);
         Manager::new(
             rm,
             quic,
             enc,
             trust,
+            chat,
             identity,
             dir.path().to_string_lossy().into_owned(),
             false,

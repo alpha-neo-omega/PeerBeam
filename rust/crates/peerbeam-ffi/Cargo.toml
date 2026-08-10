@@ -27,6 +27,8 @@ peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 peerbeam-identity-fs = { path = "../peerbeam-identity-fs" }
 peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
+peerbeam-chat = { path = "../peerbeam-chat" }
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

@@ -270,11 +270,25 @@ pub fn init(config_json: &str) -> OpResult {
     let route_manager = Arc::new(RouteManager::new(quic.clone()));
     let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
     let trust = Arc::new(FsTrust::open(trust_path).map_err(crate::error::from_domain)?);
+
+    // Encrypted local AppStore for capability data (chat history first; future
+    // capabilities share the same store under their own namespace). The data
+    // key is derived from the device identity secret, not reused as-is, so a
+    // leaked appstore key can never be turned back into the identity secret.
+    let appstore_root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let chat_key =
+        peerbeam_crypto::derive_subkey(&identity.keypair.secret.0, b"peerbeam-appstore-v1");
+    let appstore: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(appstore_root, chat_key, enc.clone()),
+    );
+    let chat = peerbeam_chat::ChatStore::new(appstore);
+
     let manager = Arc::new(Manager::new(
         route_manager,
         quic,
         enc,
         trust,
+        chat,
         identity,
         config.storage.save_directory.clone(),
         config.device.auto_accept_trusted,

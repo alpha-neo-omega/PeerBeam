@@ -6,26 +6,54 @@
 //! session's transfer channel via the existing engine helpers — no transfer
 //! logic lives here.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
 use peerbeam_domain::entity::{Device, TransferSession};
+use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
-use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType};
+use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
 use peerbeam_engine::RouteManager;
 use peerbeam_transfer::{
-    Identity, IncomingStreamChannel, PeerSession, SessionConfig, SessionHandle, SessionRole,
+    HandlerRegistry, Identity, IncomingStreamChannel, PeerSession, SessionConfig, SessionHandle,
+    SessionRole,
 };
 use peerbeam_transfer_quic::{QuicChannels, QuicTransport};
 
 use crate::error::{from_domain, Code};
 
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
+const CHAT: ChannelType = ChannelType::CHAT;
 
-fn transfer_cfg() -> SessionConfig {
-    SessionConfig::new(CapabilitySet::new().with(Capability::new(TRANSFER)))
-        .with_stream_channel_type(TRANSFER)
+/// Chat wiring for a session: the store + a received-sink. Present on the
+/// receiving (accept) side so inbound chat is persisted + surfaced; the
+/// sending side advertises the Chat capability but registers no handler here
+/// (sending chat is Task 6).
+///
+/// `Clone` (both fields are: `ChatStore` derives it, `ReceivedSink` is an
+/// `Arc`) so `dial`'s retry loop can hand each connection attempt its own
+/// copy without giving up the multi-route retry behavior.
+#[derive(Clone)]
+pub struct ChatWiring {
+    pub store: ChatStore,
+    pub sink: ReceivedSink,
+}
+
+/// A session config advertising both the TRANSFER (stream) and CHAT (message)
+/// capabilities. `chat_handler`, when present, is registered to serve the Chat
+/// channel; absent, CHAT is still advertised but no handler serves it (the
+/// dial/sender side, until Task 6 wires chat sending).
+fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
+    let caps = CapabilitySet::new()
+        .with(Capability::new(TRANSFER))
+        .with(Capability::new(CHAT));
+    let mut cfg = SessionConfig::new(caps).with_stream_channel_type(TRANSFER);
+    if let Some(h) = chat_handler {
+        cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
+    }
+    cfg
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
@@ -38,7 +66,7 @@ pub struct Session {
     /// The peer's presented human name (may be empty).
     pub peer_name: String,
     /// The authenticated peer's device id, typed (for trust lookups).
-    pub peer_device: peerbeam_domain::id::DeviceId,
+    pub peer_device: DeviceId,
     /// Whether the peer was newly TOFU-pinned during this session's handshake.
     pub newly_trusted: bool,
     /// The first-contact pairing code from this session's handshake (empty for
@@ -68,7 +96,18 @@ async fn establish(
     ident: Identity,
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
+    chat: Option<ChatWiring>,
 ) -> Result<Session, (Code, String)> {
+    // Build the optional chat handler + its peer slot. The slot is bound to
+    // the authenticated peer right after `PeerSession::open` returns, before
+    // the run loop is spawned, so no Chat frame can be dispatched to an
+    // unbound handler.
+    let mut peer_slot: Option<Arc<OnceLock<DeviceId>>> = None;
+    let chat_handler: Option<Arc<dyn MessageHandler>> = chat.map(|w| {
+        let (h, slot) = ChatHandler::new(w.store, w.sink);
+        peer_slot = Some(slot);
+        h as Arc<dyn MessageHandler>
+    });
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
     let (inc, incoming) = unbounded_channel();
@@ -80,7 +119,7 @@ async fn establish(
     let mut ps = PeerSession::open(
         transport,
         role,
-        transfer_cfg(),
+        session_cfg(chat_handler),
         ev,
         ch,
         inc,
@@ -91,6 +130,10 @@ async fn establish(
     )
     .await
     .map_err(|e| (Code::Connection, format!("session establish failed: {e}")))?;
+    // Bind the chat peer before the run loop dispatches any frame.
+    if let Some(slot) = peer_slot {
+        let _ = slot.set(ps.peer().clone());
+    }
     let id = ps.id();
     let peer_device = ps.peer().clone();
     let peer_id = peer_device.0.clone();
@@ -128,6 +171,7 @@ async fn establish(
 
 /// Dial `device` and establish an initiator PeerSession over the RouteManager's
 /// best available route (one attempt across ranked candidates).
+#[allow(clippy::too_many_arguments)]
 pub async fn dial(
     quic: &Arc<QuicTransport>,
     routes: &RouteManager,
@@ -136,6 +180,7 @@ pub async fn dial(
     ident: Identity,
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
+    chat: Option<ChatWiring>,
 ) -> Result<Session, (Code, String)> {
     let candidates = routes.candidates(device);
     if candidates.is_empty() {
@@ -152,6 +197,7 @@ pub async fn dial(
                     ident.clone(),
                     enc.clone(),
                     trust.clone(),
+                    chat.clone(),
                 )
                 .await
                 {
@@ -174,7 +220,8 @@ pub async fn accept(
     ident: Identity,
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
+    chat: Option<ChatWiring>,
 ) -> Result<Session, (Code, String)> {
     let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
-    establish(transport, SessionRole::Responder, ident, enc, trust).await
+    establish(transport, SessionRole::Responder, ident, enc, trust, chat).await
 }
