@@ -1,0 +1,25 @@
+[package]
+name = "peerbeam-chat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
+peerbeam-transfer = { path = "../peerbeam-transfer" }
+peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
