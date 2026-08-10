@@ -9,10 +9,12 @@
 //! Every session also advertises the Chat capability (`CHAT`) alongside
 //! Transfer, so a `chat send` from either side is accepted regardless of what
 //! the session was originally established for. When the caller passes a
-//! `(ChatStore, ReceivedSink)` pair (the receiving/serving side — `chat watch`
-//! and `receive`/`daemon`), a `ChatHandler` is registered to persist + surface
-//! inbound Chat frames; the sending side (`chat send`, `send`) advertises CHAT
-//! but registers no handler, since it never receives one.
+//! `(ChatStore, ReceivedSink)` pair, a `ChatHandler` is registered to persist +
+//! surface inbound Chat frames. Today only `chat watch` does this; `send`,
+//! `chat send`, and `receive`/`daemon` (`serve_loop`) all pass `None` — CHAT is
+//! still advertised on every session (so a peer's `chat send` is accepted
+//! regardless), but nothing handles it on those paths, since none of them
+//! currently surface inbound chat.
 //!
 //! This module only *establishes* the session and hands back its handle; the
 //! transfer itself reuses the engine (`send_file`/`receive_file` via the channel
