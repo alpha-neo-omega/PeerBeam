@@ -1099,6 +1099,7 @@ dependencies = [
  "peerbeam-domain",
  "peerbeam-transfer",
  "peerbeam-transfer-quic",
+ "peerbeam-trust-fs",
  "rand 0.8.7",
  "serde",
  "serde_json",
