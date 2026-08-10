@@ -59,6 +59,8 @@ class Bindings {
   final _RetDart _historyClear;
   final _RetDart _settingsGet;
   final _ArgRetDart _settingsSet;
+  final _ArgRetDart _chatSend;
+  final _ArgRetDart _chatHistory;
 
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
@@ -97,6 +99,10 @@ class Bindings {
       _settingsGet = lib.lookupFunction<_RetC, _RetDart>('pb_settings_get'),
       _settingsSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_settings_set',
+      ),
+      _chatSend = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_send'),
+      _chatHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_history',
       );
 
   /// Load the native library. `overridePath` forces a specific file (tests).
@@ -139,6 +145,8 @@ class Bindings {
   String historyClear() => _consume(_historyClear());
   String settingsGet() => _consume(_settingsGet());
   String settingsSet(String json) => _withArg(json, _settingsSet);
+  String chatSend(String json) => _withArg(json, _chatSend);
+  String chatHistory(String json) => _withArg(json, _chatHistory);
 
   /// Read a Rust-owned string and free it (ownership contract).
   String _consume(Pointer<Utf8> ptr) {

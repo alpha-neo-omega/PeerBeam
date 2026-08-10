@@ -100,4 +100,30 @@ class FakePeerBeam implements PeerBeamApi {
     calls.add('history');
     return historyEntries;
   }
+
+  final Map<String, List<ChatMessage>> chatHistories = {};
+  int _chatSeq = 0;
+
+  @override
+  Future<String> chatSend(PeerTarget peer, String text) async {
+    calls.add('chatSend:$text');
+    final id = 'chat-${++_chatSeq}';
+    final peerId = peer.name;
+    final msg = ChatMessage(
+      id: id,
+      peerId: peerId,
+      direction: 'out',
+      body: text,
+      at: DateTime.now(),
+      status: 'sent',
+    );
+    chatHistories.putIfAbsent(peerId, () => []).add(msg);
+    return id;
+  }
+
+  @override
+  Future<List<ChatMessage>> chatHistory(String peerId) async {
+    calls.add('chatHistory:$peerId');
+    return chatHistories[peerId] ?? const [];
+  }
 }

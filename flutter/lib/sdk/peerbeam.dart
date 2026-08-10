@@ -63,6 +63,12 @@ abstract class PeerBeamApi {
 
   /// Revoke a pinned device. Returns whether it was pinned.
   Future<bool> trustRemove(String id);
+
+  /// Send a chat text message to a peer. Returns the new message id.
+  Future<String> chatSend(PeerTarget peer, String text);
+
+  /// Chat history with a given peer, oldest first.
+  Future<List<ChatMessage>> chatHistory(String peerId);
 }
 
 /// Real, FFI-backed implementation.
@@ -221,6 +227,22 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<void> historyClear() async => _data(_req().historyClear());
+
+  @override
+  Future<String> chatSend(PeerTarget peer, String text) async {
+    final data = _data(
+      _req().chatSend(jsonEncode({'peer': peer.toJson(), 'text': text})),
+    );
+    return data['id'] as String;
+  }
+
+  @override
+  Future<List<ChatMessage>> chatHistory(String peerId) async {
+    final data = _data(
+      _req().chatHistory(jsonEncode({'peer_id': peerId})),
+    );
+    return _list(data['messages']).map(ChatMessage.fromJson).toList();
+  }
 
   // ── envelope handling ─────────────────────────────────────────
 

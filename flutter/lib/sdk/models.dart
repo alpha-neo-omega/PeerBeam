@@ -202,3 +202,34 @@ class TrustedDevice {
         DateTime.tryParse(j['trusted_at'] as String? ?? '') ?? DateTime.now(),
   );
 }
+
+/// A single chat message, sent or received via a [PeerTarget].
+@immutable
+class ChatMessage {
+  final String id;
+  final String peerId;
+  final String direction; // 'out' | 'in'
+  final String body;
+  final DateTime at;
+  final String status; // 'pending' | 'sent' | 'received'
+
+  const ChatMessage({
+    required this.id,
+    required this.peerId,
+    required this.direction,
+    required this.body,
+    required this.at,
+    required this.status,
+  });
+
+  bool get isMine => direction == 'out';
+
+  factory ChatMessage.fromJson(Map<String, dynamic> j) => ChatMessage(
+    id: j['id'] as String? ?? '',
+    peerId: j['peer_id'] as String? ?? '',
+    direction: j['direction'] as String? ?? 'in',
+    body: j['body'] as String? ?? '',
+    at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
+    status: j['status'] as String? ?? 'received',
+  );
+}

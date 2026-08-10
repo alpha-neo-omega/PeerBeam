@@ -49,6 +49,8 @@ sealed class BridgeEvent {
         return const TrustChanged();
       case 'device_resync':
         return const DeviceResync();
+      case 'chat_received':
+        return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
       default:
         return null;
     }
@@ -141,4 +143,10 @@ class TrustChanged extends BridgeEvent {
 /// consumer must re-pull the authoritative device list via `devices()`.
 class DeviceResync extends BridgeEvent {
   const DeviceResync();
+}
+
+/// A chat message received from a peer.
+class ChatReceived extends BridgeEvent {
+  final ChatMessage message;
+  const ChatReceived(this.message);
 }
