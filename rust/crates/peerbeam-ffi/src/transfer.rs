@@ -929,6 +929,73 @@ impl Manager {
         Ok(json!({ "removed": removed }))
     }
 
+    // ── chat ────────────────────────────────────────────────────
+
+    /// Send a chat message to a peer: dial (advertising the Chat capability
+    /// but registering no handler on this side — see
+    /// `session_exec::session_cfg`; the receiver's `handle_incoming` is what
+    /// registers the `ChatHandler`), open a Chat channel, send one Message
+    /// frame, and persist the Sent record. Blocks the calling thread on the
+    /// FFI runtime for the duration of the dial + send (bounded by `dial`'s
+    /// per-route attempt and `send_message`'s channel-open budget) so the
+    /// caller gets the persisted record's id synchronously.
+    pub fn chat_send(&self, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let text = req
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "text required".into()))?
+            .to_string();
+        let peer_id = device.id.clone();
+        let meta = self.session(&format!("chat-{}", peer_id.0), peer_id.clone(), 0);
+        let (quic, rm, ident, enc, trust, chat) = (
+            self.quic.clone(),
+            self.rm.clone(),
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            self.chat.clone(),
+        );
+        let rec = crate::runtime::block_on(async move {
+            let session =
+                crate::session_exec::dial(&quic, &rm, &device, &meta, ident, enc, trust, None)
+                    .await?;
+            let rec = peerbeam_chat::send_message(&session.handle, &chat, &peer_id, &text)
+                .await
+                .map_err(|e| (Code::Connection, e.to_string()))?;
+            session.close().await;
+            Ok::<_, (Code, String)>(rec)
+        })?;
+        Ok(json!({ "id": rec.id }))
+    }
+
+    /// Conversation history with one peer, chronological (oldest first).
+    pub fn chat_history(&self, req: &Value) -> Op {
+        let peer_id = req
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "peer_id required".into()))?;
+        let peer = DeviceId::from(peer_id.to_string());
+        let hist = self
+            .chat
+            .history(&peer)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let messages: Vec<Value> = hist
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "peer_id": r.peer_id,
+                    "direction": r.direction,
+                    "timestamp": r.timestamp,
+                    "body": r.body,
+                    "status": r.status,
+                })
+            })
+            .collect();
+        Ok(json!({ "messages": messages }))
+    }
+
     // ── receiving ───────────────────────────────────────────────
 
     /// Accept inbound connections forever; one task per incoming transfer.

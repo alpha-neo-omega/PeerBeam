@@ -308,6 +308,26 @@ pub unsafe extern "C" fn pb_trust_remove(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.trust_remove(&read_json(json)?))()))
 }
 
+// ── chat ────────────────────────────────────────────────────────
+
+/// Send a chat message: `{peer:{name,addresses[],port},text}` → `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_send(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_send(&read_json(json)?))()))
+}
+
+/// Conversation history: `{peer_id}` → `{messages:[...]}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_history(&read_json(json)?))()))
+}
+
 // ── clipboard ───────────────────────────────────────────────────
 
 /// Current clipboard item, or `{item:null}`.
