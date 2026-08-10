@@ -39,6 +39,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Send(a) => send(ctx, a, cfg_override.as_deref()).await,
         Command::Receive(a) => receive(ctx, a, cfg_override.as_deref()).await,
         Command::Clipboard(a) => clipboard(ctx, a, cfg_override.as_deref()).await,
+        Command::Chat(a) => crate::chat::chat(ctx, a.action, cfg_override.as_deref()).await,
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
@@ -118,7 +119,7 @@ fn diagnostics_cmd(ctx: &Ctx) -> CliResult {
     present(ctx, &diag.diagnostics_json())
 }
 
-fn load_config(override_path: Option<&str>) -> Result<EngineConfig, CliError> {
+pub(crate) fn load_config(override_path: Option<&str>) -> Result<EngineConfig, CliError> {
     EngineConfig::load_or_default(&config_path(override_path))
         .map_err(|e| CliError::Other(format!("config: {e}")))
 }
@@ -469,7 +470,7 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
 
 // ── discovery-backed ────────────────────────────────────────────
 
-async fn snapshot(config: EngineConfig, secs: u64) -> Vec<ManagedDevice> {
+pub(crate) async fn snapshot(config: EngineConfig, secs: u64) -> Vec<ManagedDevice> {
     let Ok(engine) = build_engine(config.clone()) else {
         return Vec::new();
     };
@@ -824,9 +825,10 @@ async fn secure_send_folder(
     name: &str,
     chunk: u32,
 ) -> Result<u64, CliError> {
-    let session =
-        crate::session_transfer::dial(quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust)
-            .await?;
+    let session = crate::session_transfer::dial(
+        quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust, None,
+    )
+    .await?;
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
     // Captured now (rather than read off `session` down by the JSON output)
@@ -942,7 +944,11 @@ pub(crate) fn read_confirm(reader: &mut impl std::io::BufRead) -> Option<bool> {
 }
 
 /// A minimal `Device` for a `--addr` target (a single explicit route).
-fn target_device(name: String, address: String, port: u16) -> peerbeam_domain::entity::Device {
+pub(crate) fn target_device(
+    name: String,
+    address: String,
+    port: u16,
+) -> peerbeam_domain::entity::Device {
     use peerbeam_domain::entity::{Device, DeviceType};
     use peerbeam_domain::id::DeviceId;
     Device {
@@ -1005,7 +1011,7 @@ pub struct SecureCtx {
 }
 
 impl SecureCtx {
-    fn build(config: &EngineConfig) -> Result<Self, CliError> {
+    pub(crate) fn build(config: &EngineConfig) -> Result<Self, CliError> {
         let enc = AeadCrypto::new();
         let identity_path =
             std::path::Path::new(&config.storage.data_directory).join("identity.json");
@@ -1024,6 +1030,24 @@ impl SecureCtx {
     }
 }
 
+/// Build the CLI's chat store: an encrypted [`peerbeam_appstore_fs::FsAppStore`]
+/// rooted at `<data_directory>/appstore`, keyed by a domain-separated subkey of
+/// the device identity secret — the same construction the FFI runtime uses, so
+/// chat history persists across `chat send`/`chat history`/`chat watch`
+/// invocations and stays isolated from the transfer identity key.
+pub(crate) fn chat_store(
+    config: &EngineConfig,
+    enc: &Arc<AeadCrypto>,
+    ident: &Identity,
+) -> peerbeam_chat::ChatStore {
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let store: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, enc.clone()),
+    );
+    peerbeam_chat::ChatStore::new(store)
+}
+
 /// Select a route (via the RouteManager), authenticate, wrap in `SecureLink`,
 /// and stream one file with progress. The route chosen is the manager's
 /// concern — this function never sees it.
@@ -1040,9 +1064,10 @@ async fn secure_send_file(
     size: u64,
     chunk: u32,
 ) -> CliResult {
-    let session =
-        crate::session_transfer::dial(quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust)
-            .await?;
+    let session = crate::session_transfer::dial(
+        quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust, None,
+    )
+    .await?;
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
     // Captured now (rather than read off `session` down by the JSON output)
@@ -1152,7 +1177,7 @@ async fn serve_loop(
         };
         // Establish the PeerSession (runs the handshake internally).
         let mut session =
-            match crate::session_transfer::accept(qc, &sc.ident, &sc.enc, &sc.trust).await {
+            match crate::session_transfer::accept(qc, &sc.ident, &sc.enc, &sc.trust, None).await {
                 Ok(s) => s,
                 Err(e) => {
                     if ctx.json {
@@ -1367,7 +1392,7 @@ async fn serve_loop(
 /// as-is first (so every address the resolver accepts still works); only on
 /// failure do we craft a clearer hint for the two common footguns — a missing
 /// port and an unbracketed IPv6 host.
-fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
+pub(crate) fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
     use std::net::ToSocketAddrs;
     if let Ok(mut addrs) = s.to_socket_addrs() {
         return addrs
@@ -1396,7 +1421,7 @@ fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, CliError> {
 }
 
 /// Resolve a `--to` query (or interactive pick) to a device index.
-fn resolve_peer(
+pub(crate) fn resolve_peer(
     ctx: &Ctx,
     candidates: &[(String, String)],
     to: &Option<String>,

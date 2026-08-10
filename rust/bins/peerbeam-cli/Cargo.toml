@@ -29,6 +29,8 @@ peerbeam-identity-fs = { path = "../../crates/peerbeam-identity-fs" }
 peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
 peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }
 peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
+peerbeam-appstore-fs = { path = "../../crates/peerbeam-appstore-fs" }
+peerbeam-chat = { path = "../../crates/peerbeam-chat" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

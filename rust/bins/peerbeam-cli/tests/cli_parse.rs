@@ -1,7 +1,7 @@
 //! Argument-parsing tests for the CLI surface.
 
 use clap::{CommandFactory, Parser};
-use peerbeam_cli::cli::{BenchTarget, Cli, Command, ConfigAction};
+use peerbeam_cli::cli::{BenchTarget, ChatAction, Cli, Command, ConfigAction};
 
 #[test]
 fn command_definition_is_valid() {
@@ -110,6 +110,55 @@ fn benchmark_loopback_size() {
             _ => panic!("expected loopback"),
         },
         _ => panic!("expected benchmark"),
+    }
+}
+
+#[test]
+fn chat_send_addr_conflicts_with_to() {
+    assert!(Cli::try_parse_from([
+        "peerbeam",
+        "chat",
+        "send",
+        "--to",
+        "phone",
+        "--addr",
+        "1.2.3.4:9",
+        "hi",
+    ])
+    .is_err());
+    let cli =
+        Cli::try_parse_from(["peerbeam", "chat", "send", "--addr", "1.2.3.4:49600", "hi"]).unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::Send { to, addr, text } => {
+                assert!(to.is_none());
+                assert_eq!(addr.as_deref(), Some("1.2.3.4:49600"));
+                assert_eq!(text, "hi");
+            }
+            _ => panic!("expected send"),
+        },
+        _ => panic!("expected chat"),
+    }
+}
+
+#[test]
+fn chat_history_and_watch_parse() {
+    let cli = Cli::try_parse_from(["peerbeam", "chat", "history", "pb-abc123"]).unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::History { peer } => assert_eq!(peer, "pb-abc123"),
+            _ => panic!("expected history"),
+        },
+        _ => panic!("expected chat"),
+    }
+
+    let cli = Cli::try_parse_from(["peerbeam", "chat", "watch", "--port", "50100"]).unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::Watch { port } => assert_eq!(port, Some(50100)),
+            _ => panic!("expected watch"),
+        },
+        _ => panic!("expected chat"),
     }
 }
 

@@ -57,6 +57,8 @@ pub enum Command {
     Receive(ReceiveArgs),
     /// Share or read clipboard content.
     Clipboard(ClipboardArgs),
+    /// Chat with a peer.
+    Chat(ChatArgs),
     /// Show transfer history.
     History(HistoryArgs),
     /// Run the background daemon.
@@ -183,6 +185,38 @@ pub enum ClipboardAction {
     },
     /// Print the last received clipboard content.
     Get,
+}
+
+#[derive(Args)]
+pub struct ChatArgs {
+    #[command(subcommand)]
+    pub action: ChatAction,
+}
+
+#[derive(Subcommand)]
+pub enum ChatAction {
+    /// Send a message to a peer.
+    Send {
+        /// Target device (id, name, or name prefix).
+        #[arg(long)]
+        to: Option<String>,
+        /// Dial a peer directly at `IP:PORT`, skipping discovery.
+        #[arg(long, value_name = "IP:PORT", conflicts_with = "to")]
+        addr: Option<String>,
+        /// Message text.
+        text: String,
+    },
+    /// Print a conversation's history.
+    History {
+        /// Peer device id.
+        peer: String,
+    },
+    /// Listen for and print incoming chat messages.
+    Watch {
+        /// Port to listen on (overrides `transfer.port` from config).
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Args)]
