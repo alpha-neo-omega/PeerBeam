@@ -86,7 +86,7 @@ detail belongs to each capability's future spec):
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
   `Cancel`, `Pause`, `Resume` — i.e. today's [transfer
   protocol](TRANSFER_PROTOCOL.md), unchanged, now scoped to this channel.
-- **Chat (0x0101):** `Message`, `Receipt`, `Reaction`, `Edit`.
+- **Chat (0x0101):** `Message = 1` (implemented, 1a); `Receipt`, `Reaction`, `Edit` reserved (not implemented).
 - **Presence (0x0103):** `Heartbeat`, `Subscribe`, `Unsubscribe`.
 
 A capability may add MessageTypes to its own namespace at will; that is a
