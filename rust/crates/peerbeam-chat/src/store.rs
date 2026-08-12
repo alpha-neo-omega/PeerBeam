@@ -452,7 +452,10 @@ mod tests {
     }
 
     /// 1b's record_sent rebuilt a record from OutboxEntry's own fields, which would
-    /// silently drop the additive kind/file. The round trip must preserve them.
+    /// silently drop the additive kind/file for a Text record too. `enqueue` only
+    /// ever produces Text entries, so this alone cannot catch a File-dropping bug
+    /// (see `outbox_round_trip_preserves_a_file_records_additive_fields` for that) —
+    /// it exists to keep the plain Text round trip covered.
     #[test]
     fn outbox_round_trip_preserves_additive_record_fields() {
         let (cs, _dir) = store();
@@ -466,5 +469,61 @@ mod tests {
         assert_eq!(hist[0].status, Status::Sent);
         assert_eq!(hist[0].kind, Kind::Text);
         assert!(hist[0].file.is_none());
+    }
+
+    /// Discriminating regression guard for `record_sent`: `ChatStore::enqueue` only
+    /// accepts a `ChatMessage`, so nothing that goes through the real outbox
+    /// pipeline can ever be `Kind::File` — a test that only exercises `enqueue` +
+    /// `outbox_for` + `record_sent` (as the Text test above does) would pass
+    /// identically whether `record_sent` preserves additive fields or blindly
+    /// reconstructs a Text record from `OutboxEntry`'s four fields, because both
+    /// produce a Text/None result either way.
+    ///
+    /// So this test bypasses `enqueue`: it persists a `Kind::File` conversation
+    /// record directly, then hand-builds an `OutboxEntry` that points at that same
+    /// record (same peer, same id) and feeds it to `record_sent` — reproducing the
+    /// real shape a future file-transfer flush would have, without waiting for that
+    /// feature to exist. Only the read-existing-record fix can pass this; the
+    /// reconstruct-always version provably cannot (verified by hand: temporarily
+    /// reverting `record_sent` to always rebuild `ChatRecord { .. kind: Kind::Text,
+    /// file: None }` makes this test fail on the `kind`/`file` assertions below).
+    #[test]
+    fn outbox_round_trip_preserves_a_file_records_additive_fields() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some("/tmp/report.pdf".into()),
+        };
+        cs.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
+            .unwrap();
+
+        // Hand-built outbox entry pointing at that same File record — `enqueue`
+        // cannot produce this shape today, since it only takes a `ChatMessage`.
+        let entry = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: r.id.clone(),
+            body: String::new(),
+            timestamp: r.timestamp.clone(),
+        };
+        cs.record_sent(&entry).unwrap();
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1, "upsert, not a second row");
+        assert_eq!(hist[0].id, r.id);
+        assert_eq!(hist[0].status, Status::Sent);
+        assert_eq!(hist[0].kind, Kind::File, "kind must survive record_sent");
+        let file = hist[0]
+            .file
+            .clone()
+            .expect("file meta must survive record_sent");
+        assert_eq!(
+            file.name, "report.pdf",
+            "a defaulted FileMeta could not pass this"
+        );
+        assert_eq!(file.size, 4096);
+        assert_eq!(file.local_path.as_deref(), Some("/tmp/report.pdf"));
     }
 }
