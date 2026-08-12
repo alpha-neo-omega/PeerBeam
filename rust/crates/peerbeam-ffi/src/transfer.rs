@@ -15,9 +15,11 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use peerbeam_chat::{
-    ChatStore, Direction as ChatDirection, FileRef, Kind as ChatKind, Status as ChatStatus,
-};
+use peerbeam_chat::{ChatStore, Direction as ChatDirection, FileRef, Status as ChatStatus};
+// Only referenced by the guard test's assertions below; the guard's own
+// kind check now lives solely in `ChatRecord::is_settleable_file_row`.
+#[cfg(test)]
+use peerbeam_chat::Kind as ChatKind;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
     Device, DeviceType, Direction, Progress, TransferSession, TransferStatus,
@@ -929,12 +931,11 @@ impl Manager {
         } else {
             ChatDirection::In
         };
-        rec.kind == ChatKind::File
-            && rec.direction == expected
-            && matches!(
-                rec.status,
-                ChatStatus::Transferring | ChatStatus::PendingApproval
-            )
+        // The predicate itself — kind/direction/in-flight-status — lives once,
+        // in `ChatRecord::is_settleable_file_row`, shared with the CLI's
+        // `settle_received_chat_file`. This helper's own job is just the fetch
+        // and the direction mapping around it.
+        rec.is_settleable_file_row(expected)
     }
 
     /// Mirror a transfer's terminal outcome onto its chat row, when that row is
