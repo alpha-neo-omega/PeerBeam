@@ -17,7 +17,9 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use common::MemTransport;
 use peerbeam_appstore_fs::FsAppStore;
-use peerbeam_chat::{send_message, ChatHandler, ChatMessage, ChatRecord, ChatStore, ReceivedSink};
+use peerbeam_chat::{
+    send_message, ChatHandler, ChatMessage, ChatRecord, ChatStore, FileRef, ReceivedSink,
+};
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{EncryptionProvider, TrustStore};
@@ -753,6 +755,10 @@ async fn flush_pushes_from_the_accept_side_to_a_handler_equipped_dialer() {
 /// returned `Err` for any non-TEXT type and the channel actor treats any handler
 /// error as fatal — so the unknown frame tore the chat channel down and the text
 /// message that followed it on that same channel never arrived.
+///
+/// Uses `MessageType::new(999)` — a deliberately unassigned id — rather than
+/// `2`, since increment 2a gave `MSG_FILE_REF` (2) its own known-type dispatch
+/// arm; using it here would no longer exercise the unknown-type fallback.
 #[tokio::test]
 async fn unknown_optional_message_does_not_kill_the_chat_channel() {
     let store_b = chat_store(2);
@@ -829,9 +835,9 @@ async fn unknown_optional_message_does_not_kill_the_chat_channel() {
     a_handle
         .send_on_channel(
             channel,
-            MessageType::new(2),
+            MessageType::new(999),
             MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
-            Bytes::from_static(b"{\"file\":\"report.pdf\"}"),
+            Bytes::from_static(b"{\"whatever\":true}"),
         )
         .await
         .expect("send unknown optional frame");
@@ -866,4 +872,112 @@ async fn unknown_optional_message_does_not_kill_the_chat_channel() {
         1,
         "exactly one record: the unknown frame persisted nothing"
     );
+}
+
+/// Increment 2a: a real two-session `FileRef` delivery. A opens a CHAT
+/// channel, waits for it to be accepted, then sends a `FileRef` frame (not a
+/// text message) directly on it. B's `ChatHandler` must dispatch `MSG_FILE_REF`
+/// as a known type — the increment-0 unknown-OPTIONAL fallback would
+/// otherwise silently swallow it, since `FileRef::to_frame` always sets
+/// OPTIONAL — and persist an `In`/`File`/`PendingApproval` row keyed by the
+/// FileRef's own id (which doubles as the transfer id).
+#[tokio::test]
+async fn b_persists_a_file_ref_pushed_over_a_real_session() {
+    let store_b = chat_store(30);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+    let _ = peer_slot_b.set(a_id.clone());
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // Open ONE chat channel and wait for the peer to accept it.
+    let channel = a_handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .expect("open chat channel");
+    let mut opened = false;
+    for _ in 0..500 {
+        let chans = a_handle.channels().await.expect("channels");
+        if chans.iter().any(|c| c.id == channel && c.state.is_open()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(opened, "chat channel never opened");
+
+    // Send a FileRef (not a text message) on the open channel.
+    let r = FileRef::new("report.pdf", 4096).unwrap();
+    let frame = r.to_frame(channel).unwrap();
+    a_handle
+        .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
+        .await
+        .expect("send file ref");
+
+    // B persists it as a PendingApproval File row, keyed by the id that will
+    // also be the transfer id.
+    let mut hist = Vec::new();
+    for _ in 0..200 {
+        hist = store_b.history(&a_id).expect("store_b history readable");
+        if !hist.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hist.len(), 1, "B persisted exactly one record");
+    assert_eq!(hist[0].kind, peerbeam_chat::Kind::File);
+    assert_eq!(hist[0].status, peerbeam_chat::Status::PendingApproval);
+    assert_eq!(hist[0].id, r.id, "the record key IS the transfer id");
+    let meta = hist[0].file.clone().expect("file meta present");
+    assert_eq!(meta.name, "report.pdf");
+    assert_eq!(meta.size, 4096);
+    assert!(meta.local_path.is_none());
+
+    assert_eq!(received.lock().unwrap().len(), 1, "sink fired once");
 }

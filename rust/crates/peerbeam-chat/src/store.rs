@@ -153,8 +153,23 @@ impl ChatStore {
     }
 
     /// Upsert the conversation record for a delivered entry to `Sent`.
+    ///
+    /// Reads the existing record and flips only its status, so additive fields
+    /// (`kind`, `file`) survive; rebuilding from `OutboxEntry`'s four fields
+    /// would silently drop them.
     pub fn record_sent(&self, entry: &OutboxEntry) -> Result<(), ChatError> {
-        let rec = ChatRecord {
+        let peer = DeviceId::from(entry.peer_id.clone());
+        let ns = namespace(&peer);
+        if let Some(bytes) = self
+            .store
+            .get(&ns, &entry.message_id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            let mut rec = ChatRecord::decode(&bytes)?;
+            rec.status = Status::Sent;
+            return self.append(&rec);
+        }
+        self.append(&ChatRecord {
             id: entry.message_id.clone(),
             peer_id: entry.peer_id.clone(),
             direction: Direction::Out,
@@ -163,15 +178,46 @@ impl ChatStore {
             status: Status::Sent,
             kind: Kind::Text,
             file: None,
+        })
+    }
+
+    /// Replace a record's status in place (upsert at the same key). A missing
+    /// record is a no-op, not an error — a status event can outlive its row.
+    pub fn set_status(&self, peer: &DeviceId, id: &str, status: Status) -> Result<(), ChatError> {
+        let ns = namespace(peer);
+        let Some(bytes) = self
+            .store
+            .get(&ns, id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        else {
+            return Ok(());
         };
+        let mut rec = ChatRecord::decode(&bytes)?;
+        rec.status = status;
         self.append(&rec)
+    }
+
+    /// Settle records left mid-flight by a crash or restart. Transfer ids are
+    /// process-scoped and no event replays, so a record still `Transferring` or
+    /// `PendingApproval` at startup would spin forever. Returns how many were
+    /// changed.
+    pub fn reconcile_peer(&self, peer: &DeviceId) -> Result<usize, ChatError> {
+        let mut changed = 0;
+        for rec in self.history(peer)? {
+            if matches!(rec.status, Status::Transferring | Status::PendingApproval) {
+                self.set_status(peer, &rec.id, Status::Interrupted)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{ChatRecord, Direction, Status};
+    use crate::message::FileRef;
+    use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status};
     use crate::ChatMessage;
     use peerbeam_appstore_fs::FsAppStore;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
@@ -352,5 +398,73 @@ mod tests {
         assert_eq!(hist[0].id, m.id);
         assert_eq!(hist[0].status, Status::Sent);
         assert!(cs.outbox_for(&peer).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_status_updates_in_place() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("a.bin", 3).unwrap();
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        };
+        cs.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
+            .unwrap();
+        cs.set_status(&peer, &r.id, Status::Sent).unwrap();
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1, "upsert, not a second row");
+        assert_eq!(hist[0].status, Status::Sent);
+        assert_eq!(hist[0].kind, Kind::File, "kind survives a status change");
+        // Absent id is a no-op, not an error.
+        assert!(cs.set_status(&peer, "nope", Status::Failed).is_ok());
+    }
+
+    #[test]
+    fn reconcile_marks_mid_flight_records_interrupted() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let a = FileRef::new("a.bin", 1).unwrap();
+        let b = FileRef::new("b.bin", 1).unwrap();
+        let m = |r: &FileRef| FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        };
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &a,
+            m(&a),
+            Status::Transferring,
+        ))
+        .unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &b)).unwrap(); // PendingApproval
+        let text = ChatMessage::new("hi").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &text)).unwrap();
+
+        assert_eq!(cs.reconcile_peer(&peer).unwrap(), 2);
+        let hist = cs.history(&peer).unwrap();
+        let by_id = |id: &str| hist.iter().find(|r| r.id == id).unwrap().status;
+        assert_eq!(by_id(&a.id), Status::Interrupted);
+        assert_eq!(by_id(&b.id), Status::Interrupted);
+        assert_eq!(by_id(&text.id), Status::Sent, "settled records untouched");
+    }
+
+    /// 1b's record_sent rebuilt a record from OutboxEntry's own fields, which would
+    /// silently drop the additive kind/file. The round trip must preserve them.
+    #[test]
+    fn outbox_round_trip_preserves_additive_record_fields() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::new("queued").unwrap();
+        cs.enqueue(&peer, &msg).unwrap();
+        let entry = cs.outbox_for(&peer).unwrap().remove(0);
+        cs.record_sent(&entry).unwrap();
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].status, Status::Sent);
+        assert_eq!(hist[0].kind, Kind::Text);
+        assert!(hist[0].file.is_none());
     }
 }
