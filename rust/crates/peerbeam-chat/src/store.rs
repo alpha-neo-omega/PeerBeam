@@ -245,6 +245,61 @@ impl ChatStore {
         self.append(&rec)
     }
 
+    /// Guarded terminal-status write for a transfer's own chat row: settles
+    /// `(peer, id)` to `status` only when the stored record passes
+    /// [`ChatRecord::is_settleable_file_row`] for `expected_direction` — see
+    /// its doc for why a bare key match at a peer-supplied transfer id is not
+    /// authorization to write. Shared by every surface that bridges a
+    /// transfer's terminal outcome onto a chat row (both the FFI's and the
+    /// CLI's receive/send paths), so this authorization decision has exactly
+    /// one implementation.
+    ///
+    /// A missing record, the wrong kind/direction, or an already-settled row
+    /// is a silent no-op — no write. Returns whether a write happened, so a
+    /// caller that also wants to record a local path can order it correctly:
+    /// see [`set_file_row_path`](Self::set_file_row_path), which **must**
+    /// run before this — both read the same in-flight leg of the guard, so
+    /// once the row reads a terminal status this closes it to further writes.
+    pub fn settle_file_row(
+        &self,
+        peer: &DeviceId,
+        id: &str,
+        expected_direction: Direction,
+        status: Status,
+    ) -> Result<bool, ChatError> {
+        let Some(rec) = self.get(peer, id)? else {
+            return Ok(false);
+        };
+        if !rec.is_settleable_file_row(expected_direction) {
+            return Ok(false);
+        }
+        self.set_status(peer, id, status)?;
+        Ok(true)
+    }
+
+    /// Guarded local-path write for a received chat file — the same
+    /// authorization guard as [`settle_file_row`](Self::settle_file_row).
+    /// **Must be called before** `settle_file_row`, not after: see that
+    /// method's doc for why the ordering is load-bearing, not a style choice.
+    /// A missing record, the wrong kind/direction, or an already-settled row
+    /// is a silent no-op. Returns whether a write happened.
+    pub fn set_file_row_path(
+        &self,
+        peer: &DeviceId,
+        id: &str,
+        expected_direction: Direction,
+        local_path: &str,
+    ) -> Result<bool, ChatError> {
+        let Some(rec) = self.get(peer, id)? else {
+            return Ok(false);
+        };
+        if !rec.is_settleable_file_row(expected_direction) {
+            return Ok(false);
+        }
+        self.set_file_path(peer, id, local_path)?;
+        Ok(true)
+    }
+
     /// Settle records left mid-flight by a crash or restart. Transfer ids are
     /// process-scoped and no event replays, so a record still `Transferring` or
     /// `PendingApproval` at startup would spin forever. Returns how many were
@@ -627,5 +682,200 @@ mod tests {
         );
         assert_eq!(file.size, 4096);
         assert_eq!(file.local_path.as_deref(), Some("/tmp/report.pdf"));
+    }
+
+    // ── settle_file_row / set_file_row_path — the receive-side chat bridge's
+    // authorization guard, shared by every surface (FFI + CLI) that mirrors a
+    // transfer's terminal outcome onto a chat row. ─────────────────────────
+
+    /// The positive case a legitimate receive must still hit: a chat file
+    /// offer (`In`/`File`/`PendingApproval`) settles to `Received` and picks
+    /// up where it landed — proving the guard cannot pass merely by refusing
+    /// everything.
+    #[test]
+    fn settle_file_row_settles_a_genuine_receive_and_records_its_path() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap(); // In/File/PendingApproval
+
+        // Ordering matters: path before status, mirroring the real caller.
+        let path_written = cs
+            .set_file_row_path(&peer, &r.id, Direction::In, "/home/me/Downloads/report.pdf")
+            .unwrap();
+        assert!(path_written);
+        let settled = cs
+            .settle_file_row(&peer, &r.id, Direction::In, Status::Received)
+            .unwrap();
+        assert!(settled);
+
+        let rec = cs.get(&peer, &r.id).unwrap().expect("row");
+        assert_eq!(rec.status, Status::Received);
+        assert_eq!(
+            rec.file.unwrap().local_path.as_deref(),
+            Some("/home/me/Downloads/report.pdf")
+        );
+    }
+
+    /// The equally-legitimate send-side case: `Out`/`File`/`Transferring`
+    /// settles to `Sent` (no path — the sender's path was already set at
+    /// `prepare_file_send` time).
+    #[test]
+    fn settle_file_row_settles_a_genuine_send_completion() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some("/tmp/report.pdf".into()),
+        };
+        cs.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
+            .unwrap();
+
+        let settled = cs
+            .settle_file_row(&peer, &r.id, Direction::Out, Status::Sent)
+            .unwrap();
+        assert!(settled);
+        assert_eq!(cs.get(&peer, &r.id).unwrap().unwrap().status, Status::Sent);
+    }
+
+    /// The ordinary case, by far the most common: a ".receive completes" a
+    /// plain (non-chat) transfer whose id has no row at all. Must be a
+    /// silent no-op — no row is ever invented.
+    #[test]
+    fn settle_file_row_is_silent_when_no_row_exists() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = cs
+            .settle_file_row(
+                &peer,
+                "tx-plain-transfer-id",
+                Direction::In,
+                Status::Received,
+            )
+            .unwrap();
+        assert!(!settled);
+        assert!(cs.get(&peer, "tx-plain-transfer-id").unwrap().is_none());
+    }
+
+    /// The hostile case (a): an already-paired peer opens an ordinary
+    /// transfer whose peer-supplied `transfer_id` collides with the id of our
+    /// own OUTBOUND TEXT message in that thread. Without the guard this would
+    /// stamp our own "sent" text as `Received`. Must be a complete no-op.
+    #[test]
+    fn settle_file_row_is_silent_for_a_hostile_collision_with_a_text_row() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::new("hello there").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &msg)).unwrap(); // Out/Text/Sent
+
+        let settled = cs
+            .settle_file_row(&peer, &msg.id, Direction::In, Status::Received)
+            .unwrap();
+        assert!(!settled, "a text row must never be settled as a file row");
+
+        let rec = cs.get(&peer, &msg.id).unwrap().expect("row still present");
+        assert_eq!(rec.kind, Kind::Text, "kind must be untouched");
+        assert_eq!(rec.status, Status::Sent, "status must be untouched");
+        assert_eq!(rec.body, "hello there", "body must be untouched");
+    }
+
+    /// The hostile case (b): a peer-supplied `transfer_id` collides with the
+    /// id of a FILE row we already settled (e.g. one we `Declined`). Without
+    /// the guard this would flip a declined file back to `Received` while
+    /// keeping its old metadata. Must be a complete no-op.
+    #[test]
+    fn settle_file_row_is_silent_for_a_hostile_collision_with_an_already_settled_file_row() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("suspicious.exe", 4096).unwrap();
+        let mut declined = ChatRecord::file_in(&peer, &r);
+        declined.status = Status::Declined;
+        cs.append(&declined).unwrap();
+
+        let settled = cs
+            .settle_file_row(&peer, &r.id, Direction::In, Status::Received)
+            .unwrap();
+        assert!(!settled, "an already-settled row must never be re-settled");
+
+        let rec = cs.get(&peer, &r.id).unwrap().expect("row still present");
+        assert_eq!(
+            rec.status,
+            Status::Declined,
+            "a declined file must not flip to Received"
+        );
+    }
+
+    /// A direction mismatch is exactly as hostile as a kind mismatch: our own
+    /// OUTBOUND file share must not be settleable as if it were a receive.
+    #[test]
+    fn settle_file_row_is_silent_for_a_direction_mismatch() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some("/tmp/report.pdf".into()),
+        };
+        cs.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
+            .unwrap();
+
+        let settled = cs
+            .settle_file_row(&peer, &r.id, Direction::In, Status::Received)
+            .unwrap();
+        assert!(!settled);
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Transferring,
+            "an outbound row must not be settled by a wrong-direction (receive) call"
+        );
+    }
+
+    /// `set_file_row_path` shares the identical guard: a text row (no `file`
+    /// to set a path on, and the wrong `kind` regardless) must not gain one.
+    #[test]
+    fn set_file_row_path_is_silent_for_a_text_row() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::new("hi").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &msg)).unwrap();
+
+        let written = cs
+            .set_file_row_path(&peer, &msg.id, Direction::In, "/tmp/x")
+            .unwrap();
+        assert!(!written);
+        assert!(cs.get(&peer, &msg.id).unwrap().unwrap().file.is_none());
+    }
+
+    /// The ordering requirement, proven directly: once a row is already
+    /// settled (`Received`), `set_file_row_path` must refuse to touch it —
+    /// it shares the same in-flight leg of the guard as `settle_file_row`, so
+    /// calling it AFTER settling (the wrong order) silently does nothing
+    /// instead of overwriting an already-final row.
+    #[test]
+    fn set_file_row_path_is_silent_once_the_row_is_already_settled() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+        cs.settle_file_row(&peer, &r.id, Direction::In, Status::Received)
+            .unwrap();
+
+        let written = cs
+            .set_file_row_path(&peer, &r.id, Direction::In, "/late/path")
+            .unwrap();
+        assert!(!written);
+        assert!(
+            cs.get(&peer, &r.id)
+                .unwrap()
+                .unwrap()
+                .file
+                .unwrap()
+                .local_path
+                .is_none(),
+            "a path written after settling must not land"
+        );
     }
 }

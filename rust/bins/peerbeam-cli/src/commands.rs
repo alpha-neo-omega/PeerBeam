@@ -17,8 +17,9 @@ use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::{ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    receive_file, receive_on_channel, send_file, send_file_on_session, send_folder_on_session,
-    ChannelReceived, FolderSendRequest, Identity, SendRequest, TransferControl,
+    peek_incoming_meta, receive_file, receive_on_channel, send_file, send_file_on_session,
+    send_folder_on_session, ChannelReceived, FolderSendRequest, Identity, SendRequest,
+    TransferControl, TransferOutcome,
 };
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
@@ -1167,6 +1168,50 @@ async fn secure_send_file(
     Ok(())
 }
 
+/// Mirror a receive's outcome onto the chat row it might be completing — the
+/// CLI-side counterpart of the FFI's `Manager::chat_settle`/
+/// `chat_set_local_path`. `chat` file shares mint the wire transfer id off
+/// the same id as the `FileRef`'s chat row (`peerbeam_chat::prepare_file_send`),
+/// so a receive whose peer-supplied `transfer_id` names a row in *our* store
+/// is how that row ever leaves `PendingApproval` — without this bridge, a
+/// file shared via chat and received here would save correctly but its
+/// conversation row would stay `PendingApproval` forever.
+///
+/// Delegates the entire authorization decision to `ChatStore::settle_file_row`/
+/// `set_file_row_path` (guarded by `ChatRecord::is_settleable_file_row`):
+/// `transfer_id` is the peer's own first-frame field on receive (peer-
+/// supplied, not further validated) and a chat message id is a wire field the
+/// peer has already seen, so a bare id match is not proof this row belongs to
+/// this transfer — see that guard's doc for the full rationale (an
+/// already-paired peer sending an ordinary file whose `transfer_id` happens
+/// to equal an existing message id in the thread must never be able to flip
+/// an unrelated `Text`/already-settled row). A missing row, wrong kind/
+/// direction, or an already-settled row is therefore a silent no-op here —
+/// exactly the ordinary-transfer case, which is the overwhelming majority of
+/// receives.
+///
+/// `local_path`, when given, is written **before** `status` — both share the
+/// in-flight leg of the guard, so once the row reads a terminal status it is
+/// deliberately closed to further writes (mirrors the FFI's own ordering
+/// note on `chat_set_local_path`). Silently does nothing when `transfer_id`
+/// is empty (nothing could be peeked — see `peek_incoming_meta`'s doc).
+fn settle_received_chat_file(
+    chat: &peerbeam_chat::ChatStore,
+    peer_id: &str,
+    transfer_id: &str,
+    status: peerbeam_chat::Status,
+    local_path: Option<&str>,
+) {
+    if transfer_id.is_empty() {
+        return;
+    }
+    let peer = DeviceId::from(peer_id.to_string());
+    if let Some(path) = local_path {
+        let _ = chat.set_file_row_path(&peer, transfer_id, peerbeam_chat::Direction::In, path);
+    }
+    let _ = chat.settle_file_row(&peer, transfer_id, peerbeam_chat::Direction::In, status);
+}
+
 /// Serve inbound QUIC connections as PeerSessions, accept each peer's transfer
 /// channel, and receive one file or folder per connection into `dir`. Advertises
 /// presence via discovery so senders find us.
@@ -1401,6 +1446,18 @@ async fn serve_loop(
                     }
                 };
 
+                // Peek the sender's transfer id before consuming any bytes, so
+                // the chat bridge below can correlate this receive with a
+                // FileRef-offered row even if the transfer itself later
+                // fails — `peek_incoming_meta` replays the frame it reads, so
+                // `receive_on_channel` sees exactly what it would have
+                // without this call. `transfer_id` is empty when nothing
+                // could be peeked (closed/malformed/slow first frame), which
+                // the bridge below reads as "no correlation possible" and
+                // skips entirely. Mirrors the FFI's own `handle_incoming`
+                // peek (`peek_incoming_meta`).
+                let (incoming_ch, preview) = peek_incoming_meta(incoming_ch).await;
+
                 let storage_ref = &storage;
                 let handle = &session.handle;
                 let (ptx, mut prx) = mpsc::unbounded_channel();
@@ -1448,6 +1505,26 @@ async fn serve_loop(
                         } else {
                             ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
                         }
+                        // Chat bridge: a completed receive settles Received (+
+                        // where it landed); an observed cancellation settles
+                        // Failed. Both are no-ops unless this transfer's id
+                        // genuinely names our own in-flight file row.
+                        match rcv.outcome {
+                            TransferOutcome::Completed => settle_received_chat_file(
+                                &chat,
+                                &peer_id,
+                                &preview.transfer_id,
+                                peerbeam_chat::Status::Received,
+                                Some(&saved),
+                            ),
+                            TransferOutcome::Cancelled => settle_received_chat_file(
+                                &chat,
+                                &peer_id,
+                                &preview.transfer_id,
+                                peerbeam_chat::Status::Failed,
+                                None,
+                            ),
+                        }
                     }
                     Ok(ChannelReceived::Folder(fr)) => {
                         let saved = std::path::Path::new(dir)
@@ -1484,6 +1561,17 @@ async fn serve_loop(
                         } else {
                             ctx.line(&ctx.red(&format!("transfer failed: {e}")));
                         }
+                        // Chat bridge: a transfer failure settles the row
+                        // Failed too — a no-op unless the id genuinely names
+                        // our own in-flight file row (see
+                        // `settle_received_chat_file`'s doc).
+                        settle_received_chat_file(
+                            &chat,
+                            &peer_id,
+                            &preview.transfer_id,
+                            peerbeam_chat::Status::Failed,
+                            None,
+                        );
                     }
                 }
                 session.close().await;
@@ -2175,5 +2263,181 @@ mod chat_wiring_dial_regression {
 
         // And b's own bookkeeping is consistent: delivered + dequeued.
         assert!(chat_b.outbox_for(&a_id).expect("outbox").is_empty());
+    }
+}
+
+/// `settle_received_chat_file` (`serve_loop`'s receive-side chat bridge) —
+/// unit-tested directly against a real `ChatStore` rather than through a live
+/// QUIC receive, since the function's whole job is dispatching into
+/// `peerbeam_chat`'s guarded `settle_file_row`/`set_file_row_path` correctly
+/// (peer, id, direction, ordering), and that guard's own authorization logic
+/// (kind/direction/status, including the hostile-collision cases and their
+/// mutation proof) is already exhaustively tested where it lives —
+/// `peerbeam-chat/src/store.rs`. These tests are the CLI-side counterpart:
+/// do `serve_loop`'s call sites pass the right namespace, direction, and
+/// ordering.
+#[cfg(test)]
+mod chat_receive_bridge_tests {
+    use super::settle_received_chat_file;
+    use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, FileMeta, FileRef, Kind, Status};
+    use peerbeam_crypto::{derive_subkey, AeadCrypto};
+    use peerbeam_domain::id::DeviceId;
+    use peerbeam_domain::port::EncryptionProvider;
+    use std::sync::Arc;
+
+    fn seeded_store() -> (ChatStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
+        let key = derive_subkey(&[11u8; 32], b"peerbeam-appstore-v1");
+        let app = Arc::new(peerbeam_appstore_fs::FsAppStore::open(
+            dir.path().join("appstore"),
+            key,
+            enc,
+        ));
+        (ChatStore::new(app), dir)
+    }
+
+    /// A completed receive settles the chat row `Received` and records where
+    /// it landed — this is the fix: without it, a file shared via chat and
+    /// successfully received here stayed `PendingApproval` forever.
+    #[test]
+    fn a_completed_receive_settles_received_with_its_local_path() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        chat.append(&ChatRecord::file_in(&peer, &r)).unwrap(); // In/File/PendingApproval
+
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Received,
+            Some("/home/me/Downloads/report.pdf"),
+        );
+
+        let rec = chat.get(&peer, &r.id).unwrap().expect("row");
+        assert_eq!(rec.status, Status::Received);
+        assert_eq!(
+            rec.file.unwrap().local_path.as_deref(),
+            Some("/home/me/Downloads/report.pdf")
+        );
+    }
+
+    /// A cancelled/failed receive settles `Failed`, with no path (there may
+    /// be no complete file to point at).
+    #[test]
+    fn a_failed_receive_settles_failed_without_a_path() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        chat.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Failed, None);
+
+        let rec = chat.get(&peer, &r.id).unwrap().expect("row");
+        assert_eq!(rec.status, Status::Failed);
+        assert!(rec.file.unwrap().local_path.is_none());
+    }
+
+    /// The ordinary case, by far the most common: a plain (non-chat)
+    /// transfer's id has no chat row at all. Must be a complete no-op — no
+    /// row is ever invented for an ordinary file transfer.
+    #[test]
+    fn a_plain_non_chat_receive_writes_nothing() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            "tx-plain-42",
+            Status::Received,
+            Some("/tmp/x"),
+        );
+        assert!(chat.get(&peer, "tx-plain-42").unwrap().is_none());
+    }
+
+    /// An empty `transfer_id` (nothing could be peeked — `peek_incoming_meta`
+    /// timed out or the first frame was malformed) must be a no-op too,
+    /// never an attempted lookup under an empty key.
+    #[test]
+    fn an_empty_transfer_id_is_a_no_op() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        chat.append(&ChatRecord::sent(&peer, &ChatMessage::new("hi").unwrap()))
+            .unwrap();
+        settle_received_chat_file(&chat, "pb-bob", "", Status::Received, Some("/tmp/x"));
+        // The one real row in this conversation must be completely untouched.
+        let hist = chat.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].body, "hi");
+    }
+
+    /// The hostile case (a): an already-paired peer's ordinary transfer's
+    /// peer-supplied `transfer_id` collides with the id of OUR OWN outbound
+    /// text message in that thread. Must write and emit nothing — proven at
+    /// the CLI's own call site, not just in `peerbeam-chat`'s guard tests.
+    #[test]
+    fn hostile_collision_with_an_existing_text_row_writes_nothing() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::new("hello there").unwrap();
+        chat.append(&ChatRecord::sent(&peer, &msg)).unwrap(); // Out/Text/Sent
+
+        settle_received_chat_file(&chat, "pb-bob", &msg.id, Status::Received, Some("/tmp/x"));
+
+        let rec = chat
+            .get(&peer, &msg.id)
+            .unwrap()
+            .expect("row still present");
+        assert_eq!(rec.kind, Kind::Text, "kind must be untouched");
+        assert_eq!(rec.status, Status::Sent, "status must be untouched");
+        assert_eq!(rec.body, "hello there", "body must be untouched");
+    }
+
+    /// The hostile case (b): a peer-supplied `transfer_id` collides with a
+    /// FILE row we already settled (e.g. one we declined). Must write and
+    /// emit nothing — a declined file must never flip to `Received`.
+    #[test]
+    fn hostile_collision_with_an_already_settled_file_row_writes_nothing() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("suspicious.exe", 4096).unwrap();
+        let mut declined = ChatRecord::file_in(&peer, &r);
+        declined.status = Status::Declined;
+        chat.append(&declined).unwrap();
+
+        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Received, Some("/tmp/x"));
+
+        let rec = chat.get(&peer, &r.id).unwrap().expect("row still present");
+        assert_eq!(
+            rec.status,
+            Status::Declined,
+            "a declined file must not flip to Received"
+        );
+    }
+
+    /// A sender's own row (`Out`/`File`/`Transferring`) must not be
+    /// settleable by a *receive*-side call — direction must agree, not just
+    /// id and kind.
+    #[test]
+    fn a_sending_row_is_not_settled_by_a_receive_call() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some("/tmp/report.pdf".into()),
+        };
+        chat.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
+            .unwrap();
+
+        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Received, Some("/tmp/x"));
+
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Transferring,
+            "an outbound row must not be settled by the receive-side bridge"
+        );
     }
 }
