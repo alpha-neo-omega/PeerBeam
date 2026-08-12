@@ -10,6 +10,27 @@ use crate::message::{ChatError, ChatMessage};
 use crate::record::ChatRecord;
 use crate::store::ChatStore;
 
+/// Send one already-built [`ChatMessage`] over a channel that has already
+/// reached [`ChannelState::Open`] (factored out of [`send_message`] so
+/// [`flush_to_session`] can reuse the same wire-send step for each queued
+/// entry without re-minting a message or re-opening the channel).
+async fn send_on_open_channel(
+    handle: &SessionHandle,
+    channel: ChannelId,
+    msg: &ChatMessage,
+) -> Result<(), SendError> {
+    let frame = msg.to_frame(channel)?;
+    handle
+        .send_on_channel(
+            channel,
+            ChatMessage::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
+}
+
 /// Failure sending a chat message.
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
@@ -51,19 +72,48 @@ pub async fn send_message(
         .await
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
-    let frame = msg.to_frame(channel)?;
-    handle
-        .send_on_channel(
-            channel,
-            ChatMessage::message_type(),
-            frame.flags,
-            frame.payload,
-        )
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
+    send_on_open_channel(handle, channel, &msg).await?;
     let rec = ChatRecord::sent(peer, &msg);
     store.append(&rec)?;
     Ok(rec)
+}
+
+/// Flush all of `peer`'s queued outbox messages over an established session.
+/// Opens the CHAT channel once, sends each queued message in FIFO order, and on
+/// each success upserts the conversation record to `Sent` and removes the
+/// outbox entry. Returns the message ids flushed. A per-message send error
+/// stops this peer's flush (the rest stay queued); a channel-open failure
+/// returns `Err`.
+pub async fn flush_to_session(
+    handle: &SessionHandle,
+    store: &ChatStore,
+    peer: &DeviceId,
+) -> Result<Vec<String>, SendError> {
+    let entries = store.outbox_for(peer)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+
+    let mut flushed = Vec::new();
+    for entry in entries {
+        let msg = ChatMessage {
+            id: entry.message_id.clone(),
+            timestamp: entry.timestamp.clone(),
+            body: entry.body.clone(),
+        };
+        if send_on_open_channel(handle, channel, &msg).await.is_err() {
+            break; // peer went away mid-flush; remaining entries stay queued
+        }
+        store.record_sent(&entry)?;
+        store.outbox_remove(&entry.message_id)?;
+        flushed.push(entry.message_id);
+    }
+    Ok(flushed)
 }
 
 /// What one poll of `handle.channels()` tells us to do next.

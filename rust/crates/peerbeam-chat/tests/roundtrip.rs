@@ -288,6 +288,225 @@ async fn send_message_waits_for_channel_open_when_receiver_run_loop_is_delayed()
     assert_eq!(hist.len(), 1, "store_b persisted exactly one record");
 }
 
+/// Flush increment (1b): messages enqueued to the offline outbox while no
+/// session was open must go out, in FIFO order, over a session opened later —
+/// and the sender's own history must flip from `Pending` to `Sent`.
+#[tokio::test]
+async fn flush_delivers_queued_messages_and_marks_sent() {
+    // ── B: receiver, registers a ChatHandler ────────────────────────────────
+    let store_b = chat_store(20);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    // ── Build two real PeerSessions over an in-memory transport, exactly as
+    //    peerbeam-transfer/tests/session.rs's `open()` helper does. ─────────
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    // Sender (A, Initiator): advertises CHAT, no chat handler.
+    let a_cfg = SessionConfig::new(caps());
+    // Receiver (B, Responder): advertises CHAT + registers the ChatHandler.
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+
+    // Bind the receiver's peer slot to the sender's device id BEFORE the run
+    // loops start dispatching frames.
+    let _ = peer_slot_b.set(a_id.clone());
+
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // ── Enqueue two messages for B while "offline" (before sending anything
+    //    over the session). ────────────────────────────────────────────────
+    let store_a = chat_store(21);
+    let m1 = ChatMessage::new("first").unwrap();
+    let m2 = ChatMessage::new("second").unwrap();
+    store_a.enqueue(&b_id, &m1).unwrap();
+    store_a.enqueue(&b_id, &m2).unwrap();
+    assert_eq!(store_a.outbox_for(&b_id).unwrap().len(), 2);
+
+    // ── Flush over the live session. ────────────────────────────────────────
+    let flushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)
+        .await
+        .expect("flush succeeds");
+    assert_eq!(flushed.len(), 2);
+    assert_eq!(flushed, vec![m1.id.clone(), m2.id.clone()]);
+
+    // Sender: outbox drained, records flipped to Sent.
+    assert!(store_a.outbox_for(&b_id).unwrap().is_empty());
+    let hist_a = store_a.history(&b_id).unwrap();
+    assert_eq!(hist_a.len(), 2);
+    assert!(hist_a
+        .iter()
+        .all(|r| r.status == peerbeam_chat::Status::Sent));
+
+    // Receiver: both delivered + persisted, in order (poll briefly rather than
+    // a fixed sleep — real async/network timing).
+    let mut hist_b = Vec::new();
+    for _ in 0..200 {
+        hist_b = store_b.history(&a_id).expect("store_b history readable");
+        if hist_b.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hist_b.len(), 2, "both queued messages delivered");
+    assert_eq!(hist_b[0].body, "first");
+    assert_eq!(hist_b[1].body, "second");
+}
+
+/// Re-flush idempotency (1b): the sender may legitimately re-send the same
+/// message id twice (e.g. re-queued after a partial flush failure) — the
+/// receiver's existing dedup-by-id (1a) must still land exactly one record.
+#[tokio::test]
+async fn reflush_is_idempotent_on_the_receiver() {
+    // ── B: receiver, registers a ChatHandler ────────────────────────────────
+    let store_b = chat_store(22);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+
+    let _ = peer_slot_b.set(a_id.clone());
+
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    let store_a = chat_store(23);
+    let m = ChatMessage::new("only once").unwrap();
+    store_a.enqueue(&b_id, &m).unwrap();
+
+    let flushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)
+        .await
+        .expect("first flush succeeds");
+    assert_eq!(flushed, vec![m.id.clone()]);
+
+    // Poll for the first delivery before re-enqueuing, so the re-flush is a
+    // genuine duplicate delivery rather than a race with the first.
+    let mut first_delivered = false;
+    for _ in 0..200 {
+        if !store_b
+            .history(&a_id)
+            .expect("store_b history readable")
+            .is_empty()
+        {
+            first_delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(first_delivered, "first flush did not deliver in time");
+
+    // Re-enqueue the SAME message id (same id/timestamp/body — a genuine
+    // re-send, not a new message) and flush again.
+    let dup = ChatMessage {
+        id: m.id.clone(),
+        timestamp: m.timestamp.clone(),
+        body: m.body.clone(),
+    };
+    store_a.enqueue(&b_id, &dup).unwrap();
+    let reflushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)
+        .await
+        .expect("second flush succeeds");
+    assert_eq!(reflushed, vec![m.id.clone()]);
+
+    // Give the duplicate a moment to be processed (it should be dropped by
+    // the receiver's dedup, not added as a second record).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let hist_b = store_b.history(&a_id).expect("store_b history readable");
+    assert_eq!(
+        hist_b.len(),
+        1,
+        "receiver keeps exactly one record for the re-flushed id"
+    );
+    assert_eq!(hist_b[0].body, "only once");
+}
+
 /// Regression for the review's follow-up finding: when the peer rejects our
 /// channel open, `send_message` must fail *fast* (well under the full poll
 /// budget), not spin out the whole timeout.
