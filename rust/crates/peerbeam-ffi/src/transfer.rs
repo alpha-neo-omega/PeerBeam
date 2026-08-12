@@ -2928,6 +2928,58 @@ mod tests {
         );
     }
 
+    /// The pre-approval reconcile is best-effort: `peek_incoming_meta` is
+    /// explicitly fail-soft, and a slow, closed or undecodable first frame
+    /// yields an empty preview — which `chat_set_landing` correctly declines to
+    /// write, since a blanked row would be worse than a wrong one. The
+    /// settle-time write is what covers that case, and this is the test that
+    /// makes it load-bearing rather than merely belt-and-braces: nothing has
+    /// corrected the row before the completion here.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_row_whose_peek_learned_nothing_is_still_corrected_when_it_lands() {
+        let (mgr, chat, _dir) = test_manager_full("recv-blind-peek", 0);
+        let peer = DeviceId::from("pb-bob");
+        let offered = peerbeam_chat::FileRef::new("holiday.jpg", 184_320).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("seed");
+
+        // `handle_incoming` with an empty preview: a locally minted id would
+        // normally follow, but a peer can also supply a valid id and a first
+        // frame the peek cannot decode. Either way, nothing is learned.
+        let active = mgr
+            .register_vacant(&offered.id, "receiving", "bob", &peer.0, "(incoming)", None)
+            .expect("id vacant");
+        mgr.chat_set_landing(&active, "", 0);
+        assert_eq!(
+            chat.get(&peer, &offered.id)
+                .expect("get")
+                .expect("row")
+                .file
+                .expect("file meta")
+                .name,
+            "holiday.jpg",
+            "an empty preview must never blank the row"
+        );
+
+        // The receive completes, and only now is the real name known.
+        active.stats.lock().unwrap().update(4_096, 4_096);
+        *active.file.lock().unwrap() = "invoice-2026.pdf.exe".into();
+        mgr.record(&active, true, "transfer_completed", json!({}));
+
+        let meta = chat
+            .get(&peer, &offered.id)
+            .expect("get")
+            .expect("row")
+            .file
+            .expect("file meta");
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the settled row must name what landed even when the peek learned nothing"
+        );
+        assert_eq!(meta.size, 4_096);
+    }
+
     /// The landing write is a write like any other, so it carries the same
     /// guard: it must not relabel a text row, an already-settled row, or one
     /// belonging to the other direction. Without this a peer-supplied transfer
