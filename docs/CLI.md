@@ -94,19 +94,24 @@ Working now:
   (pipes cleanly, e.g. `peerbeam clipboard get | wl-copy`).
 - `chat send [--to <peer>|--addr IP:PORT] <text>` — send a text/markdown message
   to a peer. `--to` resolves a peer via discovery (id / name / prefix, or
-  interactive pick); `--addr` dials directly, skipping discovery. If the peer is
-  offline or unreachable, the message is queued locally and returns immediately
-  (does not block or fail). Queued messages are stored encrypted locally
-  (per-conversation, key derived from the device identity) and are retried
-  indefinitely when a running host (the app, or `peerbeam daemon start` /
-  `peerbeam chat watch`) next reaches the peer. `Sent` status means the message
-  was handed to a live session (delivery attempted on the wire); it is not a read
-  receipt and does not confirm the peer's user has seen it.
+  interactive pick); `--addr` dials directly, skipping discovery. The message is
+  durably queued locally and a bounded best-effort delivery attempt is made
+  before the command returns (does not block indefinitely or error on failure).
+  Queued messages are stored encrypted locally (per-conversation, key derived
+  from the device identity). For `--to` sends, messages are retried indefinitely
+  when a running host (the app, or `peerbeam daemon start` / `peerbeam chat
+  watch`) next reaches the peer. Note: `--addr` sends are queued under a routing
+  placeholder; if the initial delivery attempt fails, the message stays queued
+  (visible via `chat history`) but is not picked up by later drain or
+  flush-on-connect — retry a `--addr` send manually once the peer is reachable.
+  `Sent` status means the message was handed to a live session (delivery
+  attempted on the wire); it is not a read receipt and does not confirm the
+  peer's user has seen it.
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest.
 - `chat watch [--port N]` — listen for and print incoming chat messages in
   real-time. Must be running to receive messages. `--port` specifies the QUIC
-  port to listen on (default: from config `transfer_port`).
+  port to listen on (default: from config `transfer.port`).
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
