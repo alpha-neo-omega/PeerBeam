@@ -15,7 +15,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use peerbeam_chat::{ChatStore, FileRef, Status as ChatStatus};
+use peerbeam_chat::{
+    ChatStore, Direction as ChatDirection, FileRef, Kind as ChatKind, Status as ChatStatus,
+};
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
     Device, DeviceType, Direction, Progress, TransferSession, TransferStatus,
@@ -873,39 +875,106 @@ impl Manager {
         // `Failed` with the reason attached — distinguishable from a network
         // failure by the reason, and far better than a row left `Transferring`
         // with no further event coming.
-        self.chat_settle(&a.peer_id, &a.id, ChatStatus::Failed, Some("cancelled"));
+        self.chat_settle(&a, ChatStatus::Failed, Some("cancelled"));
     }
 
-    /// Mirror a transfer's terminal outcome onto its chat row, when it has one.
+    /// Whether the chat record living at this transfer's id is genuinely **this
+    /// transfer's own row**, and is still waiting on it.
+    ///
+    /// This is the authorization check for every write the transfer layer makes
+    /// into the chat store. It is not a formality — without it, a transfer id
+    /// is a write primitive aimed at an arbitrary conversation row:
+    ///
+    /// * an incoming transfer registers under the id the **peer** put on its
+    ///   first frame (`handle_incoming` → `register_vacant(&preview.transfer_id,
+    ///   …)`), and that id only has to pass `is_valid_transfer_id`;
+    /// * chat message ids are wire fields the peer has already seen, and
+    ///   `mint_id()` emits 29 ASCII alphanumerics, which pass that check
+    ///   trivially.
+    ///
+    /// So an already-paired peer could open an ordinary, non-chat transfer
+    /// whose `transfer_id` is the id of a message in *our* thread with them, and
+    /// the terminal path would then stamp a status onto that unrelated row: our
+    /// own outbound "sent" text becoming `Received`, or a file we `Declined`
+    /// flipping to `Received` while keeping the old name and size — the
+    /// conversation asserting we accepted something we refused. An honest peer
+    /// reaches the same place by retrying a transfer under a settled id.
+    ///
+    /// `register_vacant` hardens the *active-transfer registry* against exactly
+    /// this; the chat store is a second map that needs its own guard. Matching
+    /// the object rather than the key is that guard. All three must hold:
+    ///
+    /// 1. **`kind == File`** — a text row is never a transfer's business;
+    /// 2. **`direction` agrees with the transfer** — `Out` for a send, `In` for
+    ///    a receive, so a peer cannot drive our outbound rows or vice versa;
+    /// 3. **the row is still in flight** (`Transferring` | `PendingApproval`) —
+    ///    a settled row is final, which makes every terminal write once-only and
+    ///    kills the reopen-a-declined-file move.
+    ///
+    /// Verified against 2a's full state table: every legitimate transition
+    /// starts from one of those two statuses. A sender's row is written
+    /// `Transferring` by `prepare_file_send` and leaves it as `Sent`/`Failed`; a
+    /// receiver's row is written `PendingApproval` by `ChatHandler` and leaves
+    /// it as `Received`/`Declined`/`Failed` (nothing moves a receiving row to
+    /// `Transferring` in 2a). Failing the check is a silent no-op — no write, no
+    /// event — which is also what keeps every ordinary transfer, the vast
+    /// majority, from touching the chat store at all.
+    fn is_settleable_chat_row(&self, a: &Active) -> bool {
+        let peer = DeviceId::from(a.peer_id.clone());
+        let Ok(Some(rec)) = self.chat.get(&peer, &a.id) else {
+            return false; // no row here: an ordinary transfer, or an unreadable one
+        };
+        let expected = if a.direction == "sending" {
+            ChatDirection::Out
+        } else {
+            ChatDirection::In
+        };
+        rec.kind == ChatKind::File
+            && rec.direction == expected
+            && matches!(
+                rec.status,
+                ChatStatus::Transferring | ChatStatus::PendingApproval
+            )
+    }
+
+    /// Mirror a transfer's terminal outcome onto its chat row, when that row is
+    /// really its own.
     ///
     /// A file shared inside a conversation is deliberately **one identity**: the
     /// `FileRef` message id *is* the transfer id, so the transfer's own terminal
-    /// event is the only thing that knows how the row ended. This is the bridge.
-    ///
-    /// **Guarded, because most transfers are not chat files.** Every ordinary
-    /// send/receive reaches the same terminal paths, and for those there is no
-    /// record under this id in this peer's conversation. `ChatStore::set_status`
-    /// already no-ops on a missing record, but a no-op write is not enough: an
-    /// unguarded `chat_status` would announce a status change for a row that
-    /// does not exist, on every plain transfer, and a surface that creates rows
-    /// optimistically from events would materialise phantom conversation
-    /// entries. So presence is checked *first*, and nothing at all — no write,
-    /// no event — happens when the row is absent.
-    ///
-    /// `peer_id` is the transfer's own `Active::peer_id`, which is the same
-    /// namespace the row was written under on both sides (the request's device
-    /// id for a send, the authenticated peer for a receive), so this can never
-    /// reach into an unrelated conversation.
-    fn chat_settle(&self, peer_id: &str, id: &str, status: ChatStatus, error: Option<&str>) {
-        let peer = DeviceId::from(peer_id.to_string());
-        if !self.chat.contains(&peer, id).unwrap_or(false) {
-            return; // not a chat file — an ordinary transfer, nothing to settle
-        }
-        if let Err(e) = self.chat.set_status(&peer, id, status) {
-            tracing::warn!(error = %e, transfer_id = %id, "chat row status not persisted");
+    /// event is the only thing that knows how the row ended. This is the bridge
+    /// — gated by [`is_settleable_chat_row`](Self::is_settleable_chat_row),
+    /// which is where the real guarantee is documented: right conversation,
+    /// right row, still in flight.
+    fn chat_settle(&self, a: &Active, status: ChatStatus, error: Option<&str>) {
+        if !self.is_settleable_chat_row(a) {
             return;
         }
-        events::chat_status_detail(peer_id, id, chat_status_str(status), error);
+        let peer = DeviceId::from(a.peer_id.clone());
+        if let Err(e) = self.chat.set_status(&peer, &a.id, status) {
+            tracing::warn!(error = %e, transfer_id = %a.id, "chat row status not persisted");
+            return;
+        }
+        events::chat_status_detail(&a.peer_id, &a.id, chat_status_str(status), error);
+    }
+
+    /// Record where a received chat file landed, so its row can offer "Open".
+    ///
+    /// Runs under the same guard as [`chat_settle`](Self::chat_settle) — a
+    /// path is as much a write as a status, and a peer must not be able to
+    /// point an unrelated row at a file of its choosing.
+    ///
+    /// **Must be called before `chat_settle`**, not after: they share the
+    /// in-flight leg of that guard, so once the row reads `Received` it is
+    /// deliberately no longer writable and the path would be dropped.
+    fn chat_set_local_path(&self, a: &Active, local_path: &str) {
+        if !self.is_settleable_chat_row(a) {
+            return;
+        }
+        let peer = DeviceId::from(a.peer_id.clone());
+        if let Err(e) = self.chat.set_file_path(&peer, &a.id, local_path) {
+            tracing::warn!(error = %e, transfer_id = %a.id, "chat row path not persisted");
+        }
     }
 
     fn finish_failed(&self, active: &Arc<Active>, (code, msg): (Code, String)) {
@@ -926,7 +995,7 @@ impl Manager {
             }),
         );
         self.record_history(&a.id, &a, false);
-        self.chat_settle(&a.peer_id, &a.id, ChatStatus::Failed, Some(&msg));
+        self.chat_settle(&a, ChatStatus::Failed, Some(&msg));
     }
 
     /// Success path: emit completed + append history.
@@ -948,7 +1017,7 @@ impl Manager {
         });
         let stats = a.stats.lock().unwrap().dto();
         let mut payload =
-            json!({ "stats": stats, "file": file, "path": path, "peer_id": a.peer_id });
+            json!({ "stats": stats, "file": file, "path": &path, "peer_id": a.peer_id });
         if let Value::Object(m) = &mut payload {
             if let Value::Object(e) = extra {
                 m.extend(e);
@@ -960,12 +1029,20 @@ impl Manager {
             // A completed chat file reads as `Sent` in our own thread when we
             // sent it and `Received` when we did not — the same two statuses a
             // text message uses, so a file row needs no special vocabulary.
-            let settled = if a.direction == "sending" {
+            let sending = a.direction == "sending";
+            if !sending {
+                // A received file's row learns where it landed, so the bubble
+                // can offer "Open". Strictly before the settle below: both
+                // share the in-flight guard, and settling closes the row to
+                // further writes.
+                self.chat_set_local_path(&a, &path);
+            }
+            let settled = if sending {
                 ChatStatus::Sent
             } else {
                 ChatStatus::Received
             };
-            self.chat_settle(&a.peer_id, id, settled, None);
+            self.chat_settle(&a, settled, None);
         }
     }
 
@@ -1088,7 +1165,7 @@ impl Manager {
         // A cancelled chat file is `Failed`, not left `Transferring`: the task
         // was aborted, so no terminal event is coming to settle the row, and a
         // row that spins forever is worse than one that says it did not arrive.
-        self.chat_settle(&a.peer_id, id, ChatStatus::Failed, Some("cancelled"));
+        self.chat_settle(&a, ChatStatus::Failed, Some("cancelled"));
         Ok(json!({ "cancelled": true }))
     }
 
@@ -1697,7 +1774,7 @@ impl Manager {
                 // rather than `Failed` — nothing went wrong, we chose. Guarded
                 // like every other bridge: a declined *ordinary* transfer has
                 // no chat row and settles nothing.
-                self.chat_settle(&session.peer_device.0, &id, ChatStatus::Declined, None);
+                self.chat_settle(&active, ChatStatus::Declined, None);
             }
             session.close().await;
             return;
@@ -2254,37 +2331,102 @@ mod tests {
         }
     }
 
-    /// The guard requirement in one test: a transfer that has **no** chat row —
-    /// which is every ordinary send and receive — must produce no chat write and
-    /// no `chat_status` event, while a transfer that *is* a chat file settles
-    /// normally. `ChatStore::set_status` already no-ops on a missing record, so
-    /// only the event half can actually go wrong here, and only an assertion on
-    /// the emitted events can catch it: an unguarded bridge would announce a
-    /// status change for a row that does not exist on every plain transfer.
+    /// Register a transfer so a bridge test has a real `Active` to settle from.
+    fn active_for(mgr: &Manager, id: &str, direction: &'static str, peer_id: &str) -> Arc<Active> {
+        mgr.register_vacant(id, direction, "bob", peer_id, "a.bin", None)
+            .expect("id vacant")
+    }
+
+    /// The guard, in one test. A terminal transfer event may only ever write to
+    /// **its own** chat row: the right conversation, the right row, and one that
+    /// is still in flight. Everything else — an ordinary transfer with no row at
+    /// all, a peer-chosen id that lands on a *text* row, one that lands on an
+    /// already-settled file row, and one whose direction disagrees with the
+    /// transfer — must be a total no-op: no write, no event.
+    ///
+    /// The negative cases are not hypothetical. An incoming transfer registers
+    /// under the id the peer put on the wire, and chat message ids are wire
+    /// fields the peer already knows, so a presence-only guard turns a transfer
+    /// id into a write primitive aimed at any row in that conversation: an
+    /// already-paired peer could stamp `Received` onto our own outbound text, or
+    /// re-open a file we declined. The positive cases are here too, so the guard
+    /// cannot pass by simply refusing everything.
     #[tokio::test]
     #[serial_test::serial]
     async fn chat_settle_is_silent_for_a_transfer_that_has_no_chat_row() {
         let (mgr, chat, _dir) = test_manager_full("bridge", 0);
         let peer = DeviceId::from("pb-bob");
+        let file_row = |r: &peerbeam_chat::FileRef, status| {
+            chat.append(&peerbeam_chat::ChatRecord::file_out(
+                &peer,
+                r,
+                file_meta(r),
+                status,
+            ))
+            .expect("seed a file row");
+        };
 
-        // A real chat file row, and an ordinary transfer id that is not one.
-        let r = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
-        chat.append(&peerbeam_chat::ChatRecord::file_out(
-            &peer,
-            &r,
-            file_meta(&r),
-            ChatStatus::Transferring,
-        ))
-        .expect("seed the file row");
+        // (+) An outbound file genuinely in flight: our own send, mid-transfer.
+        let in_flight = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
+        file_row(&in_flight, ChatStatus::Transferring);
+        // (+) An inbound file awaiting our approval.
+        let offered = peerbeam_chat::FileRef::new("b.bin", 4).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("seed the offered row");
+        // (-) Our own outbound TEXT message, already sent.
+        let text = peerbeam_chat::ChatMessage::new("hello there").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &text))
+            .expect("seed the text row");
+        // (-) A file share that already reached a terminal state.
+        let settled = peerbeam_chat::FileRef::new("c.bin", 5).expect("file ref");
+        file_row(&settled, ChatStatus::Sent);
+        // (-) An outbound file row, but claimed by a *receiving* transfer.
+        let wrong_way = peerbeam_chat::FileRef::new("d.bin", 6).expect("file ref");
+        file_row(&wrong_way, ChatStatus::Transferring);
 
         BRIDGE_EVENTS.lock().unwrap().clear();
         crate::events::set_callback(Some(collect_bridge));
-        // An ordinary transfer to the same peer: same conversation, different id.
-        mgr.chat_settle(&peer.0, "tx-4242-0", ChatStatus::Sent, None);
-        // A transfer to a peer with no conversation at all.
-        mgr.chat_settle("pb-nobody", "tx-4242-1", ChatStatus::Sent, None);
-        // The genuine chat file.
-        mgr.chat_settle(&peer.0, &r.id, ChatStatus::Sent, None);
+        // (-) An ordinary transfer to the same peer: same conversation, no row.
+        mgr.chat_settle(
+            &active_for(&mgr, "tx-4242-0", "sending", &peer.0),
+            ChatStatus::Sent,
+            None,
+        );
+        // (-) A transfer to a peer with no conversation at all.
+        mgr.chat_settle(
+            &active_for(&mgr, "tx-4242-1", "sending", "pb-nobody"),
+            ChatStatus::Sent,
+            None,
+        );
+        // (-) A peer-chosen id that happens to name our own text message.
+        mgr.chat_settle(
+            &active_for(&mgr, &text.id, "receiving", &peer.0),
+            ChatStatus::Received,
+            None,
+        );
+        // (-) A peer-chosen id that names an already-settled file row.
+        mgr.chat_settle(
+            &active_for(&mgr, &settled.id, "receiving", &peer.0),
+            ChatStatus::Received,
+            None,
+        );
+        // (-) Right row, wrong direction.
+        mgr.chat_settle(
+            &active_for(&mgr, &wrong_way.id, "receiving", &peer.0),
+            ChatStatus::Received,
+            None,
+        );
+        // (+) The two genuine ones.
+        mgr.chat_settle(
+            &active_for(&mgr, &in_flight.id, "sending", &peer.0),
+            ChatStatus::Sent,
+            None,
+        );
+        mgr.chat_settle(
+            &active_for(&mgr, &offered.id, "receiving", &peer.0),
+            ChatStatus::Received,
+            None,
+        );
         crate::events::set_callback(None);
 
         let events = BRIDGE_EVENTS.lock().unwrap().clone();
@@ -2294,18 +2436,41 @@ mod tests {
             .collect();
         assert_eq!(
             statuses.len(),
-            1,
-            "only a transfer that really has a chat row may announce one: {events:?}"
+            2,
+            "only a transfer that owns an in-flight row may announce one: {events:?}"
         );
-        assert_eq!(statuses[0]["message_id"], r.id);
-        assert_eq!(statuses[0]["peer_id"], peer.0);
-        assert_eq!(statuses[0]["status"], "sent");
+        let announced: Vec<&Value> = statuses.iter().map(|e| &e["message_id"]).collect();
+        assert!(
+            announced.iter().any(|m| **m == in_flight.id)
+                && announced.iter().any(|m| **m == offered.id),
+            "the two genuine rows are the ones announced: {announced:?}"
+        );
 
-        // The conversation gained nothing and lost nothing.
-        let hist = chat.history(&peer).expect("history");
-        assert_eq!(hist.len(), 1, "no phantom rows: {hist:?}");
-        assert_eq!(hist[0].id, r.id);
-        assert_eq!(hist[0].status, ChatStatus::Sent);
+        let row = |id: &str| chat.get(&peer, id).expect("get").expect("row present");
+        // The genuine rows moved.
+        assert_eq!(row(&in_flight.id).status, ChatStatus::Sent);
+        assert_eq!(row(&offered.id).status, ChatStatus::Received);
+        // Nothing else did — and the text row is still text, with its body.
+        let untouched = row(&text.id);
+        assert_eq!(untouched.status, ChatStatus::Sent, "text row not restamped");
+        assert_eq!(untouched.kind, ChatKind::Text);
+        assert_eq!(untouched.body, "hello there");
+        assert_eq!(
+            row(&settled.id).status,
+            ChatStatus::Sent,
+            "a settled file row is final"
+        );
+        assert_eq!(
+            row(&wrong_way.id).status,
+            ChatStatus::Transferring,
+            "a receiving transfer may not settle an outbound row"
+        );
+
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            5,
+            "no phantoms"
+        );
         assert!(
             chat.history(&DeviceId::from("pb-nobody"))
                 .expect("history")
@@ -2332,7 +2497,11 @@ mod tests {
 
         BRIDGE_EVENTS.lock().unwrap().clear();
         crate::events::set_callback(Some(collect_bridge));
-        mgr.chat_settle(&peer.0, &r.id, ChatStatus::Failed, Some("peer went away"));
+        mgr.chat_settle(
+            &active_for(&mgr, &r.id, "sending", &peer.0),
+            ChatStatus::Failed,
+            Some("peer went away"),
+        );
         crate::events::set_callback(None);
 
         let events = BRIDGE_EVENTS.lock().unwrap().clone();
@@ -2345,6 +2514,65 @@ mod tests {
         assert_eq!(
             chat.history(&peer).expect("history")[0].status,
             ChatStatus::Failed
+        );
+    }
+
+    /// A completed *incoming* chat file must record where it landed, or the
+    /// receiver's bubble has no path to open. The saved path is already computed
+    /// by `record` for the event payload; this is the same value reaching the
+    /// row. Written before the status flips, since a settled row is closed to
+    /// further writes — a check-then-write in the wrong order would silently
+    /// drop the path.
+    ///
+    /// The negative half matters just as much: an ordinary (non-chat) transfer
+    /// completing must write nothing, so a peer cannot use a completion to point
+    /// an unrelated row at a file of its choosing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_received_chat_file_records_where_it_landed() {
+        let (mgr, chat, dir) = test_manager_full("recv-path", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // The row the peer's FileRef created: In/File/PendingApproval.
+        let r = peerbeam_chat::FileRef::new("report.pdf", 4096).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &r))
+            .expect("seed the offered row");
+        // Our own outbound text, as a bystander an ordinary transfer must not touch.
+        let text = peerbeam_chat::ChatMessage::new("unrelated").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &text))
+            .expect("seed the text row");
+
+        // The receive completes. `record` derives the saved path from the save
+        // directory + the received file name (no explicit `Active::path`).
+        let active = mgr
+            .register_vacant(&r.id, "receiving", "bob", &peer.0, "report.pdf", None)
+            .expect("id vacant");
+        mgr.record(&active, true, "transfer_completed", json!({}));
+
+        let row = chat.get(&peer, &r.id).expect("get").expect("row present");
+        assert_eq!(row.status, ChatStatus::Received);
+        let expected = dir.path().join("report.pdf").to_string_lossy().into_owned();
+        assert_eq!(
+            row.file.expect("file meta").local_path,
+            Some(expected),
+            "the received file's saved path must reach the row"
+        );
+
+        // An ordinary transfer completing writes nothing at all.
+        let plain = mgr
+            .register_vacant("tx-9999-0", "receiving", "bob", &peer.0, "other.bin", None)
+            .expect("id vacant");
+        mgr.record(&plain, true, "transfer_completed", json!({}));
+        let bystander = chat
+            .get(&peer, &text.id)
+            .expect("get")
+            .expect("row present");
+        assert_eq!(bystander.status, ChatStatus::Sent);
+        assert!(bystander.file.is_none());
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            2,
+            "no row invented for a plain transfer"
         );
     }
 

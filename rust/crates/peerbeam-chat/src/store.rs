@@ -99,6 +99,27 @@ impl ChatStore {
             .map_err(|e| ChatError::Serialization(e.to_string()))
     }
 
+    /// One record from the conversation with `peer`, or `None` if absent.
+    ///
+    /// [`contains`](Self::contains) answers only "is this key taken", which is
+    /// enough for receiver-side dedup but *not* enough for any caller that is
+    /// about to mutate the record: a key can be occupied by a completely
+    /// different row than the caller expects (a transfer id is peer-supplied,
+    /// and a chat message id is a wire field the peer already knows). A caller
+    /// that intends to write must load the record and check that it is the one
+    /// it means — see `Manager::chat_settle` in `peerbeam-ffi`.
+    pub fn get(&self, peer: &DeviceId, id: &str) -> Result<Option<ChatRecord>, ChatError> {
+        let ns = namespace(peer);
+        match self
+            .store
+            .get(&ns, id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            Some(bytes) => ChatRecord::decode(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Persist an outgoing message as Pending and enqueue it to the outbox.
     pub fn enqueue(&self, peer: &DeviceId, msg: &ChatMessage) -> Result<(), ChatError> {
         self.append(&ChatRecord::out(peer, msg, Status::Pending))?;
@@ -194,6 +215,33 @@ impl ChatStore {
         };
         let mut rec = ChatRecord::decode(&bytes)?;
         rec.status = status;
+        self.append(&rec)
+    }
+
+    /// Record where a file record's bytes live on THIS device: the saved path
+    /// on the receiver (the sender's own path is set at `prepare_file_send`
+    /// time). Upserts in place, so `kind`, `status`, `name` and `size` all
+    /// survive — the same read-modify-append shape as
+    /// [`set_status`](Self::set_status), and for the same reason: rebuilding
+    /// the record would silently drop whatever the caller did not think to
+    /// carry over.
+    ///
+    /// A missing record, or one carrying no [`FileMeta`](crate::FileMeta) at
+    /// all, is a no-op rather than an error — a completion event can outlive
+    /// its row, and a text row has no path to set.
+    pub fn set_file_path(
+        &self,
+        peer: &DeviceId,
+        id: &str,
+        local_path: &str,
+    ) -> Result<(), ChatError> {
+        let Some(mut rec) = self.get(peer, id)? else {
+            return Ok(());
+        };
+        let Some(file) = rec.file.as_mut() else {
+            return Ok(());
+        };
+        file.local_path = Some(local_path.to_string());
         self.append(&rec)
     }
 
@@ -419,6 +467,60 @@ mod tests {
         assert_eq!(hist[0].kind, Kind::File, "kind survives a status change");
         // Absent id is a no-op, not an error.
         assert!(cs.set_status(&peer, "nope", Status::Failed).is_ok());
+    }
+
+    /// `get` is what lets a caller check *which* row occupies a key before
+    /// writing to it — `contains` cannot tell an Out/Text row from an
+    /// In/File one.
+    #[test]
+    fn get_returns_the_whole_record_or_none() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        assert!(cs.get(&peer, "nope").unwrap().is_none());
+
+        let m = ChatMessage::new("hello").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+        let got = cs.get(&peer, &m.id).unwrap().expect("record present");
+        assert_eq!(got.kind, Kind::Text);
+        assert_eq!(got.direction, Direction::Out);
+        assert_eq!(got.status, Status::Sent);
+        assert_eq!(got.body, "hello");
+    }
+
+    #[test]
+    fn set_file_path_upserts_in_place_and_no_ops_on_absent_or_text_rows() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap(); // In/File/PendingApproval
+
+        cs.set_file_path(&peer, &r.id, "/home/me/Downloads/report.pdf")
+            .unwrap();
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1, "upsert, not a second row");
+        let meta = hist[0].file.clone().expect("file meta survives");
+        assert_eq!(
+            meta.local_path.as_deref(),
+            Some("/home/me/Downloads/report.pdf")
+        );
+        assert_eq!(meta.name, "report.pdf", "name survives");
+        assert_eq!(meta.size, 4096, "size survives");
+        assert_eq!(
+            hist[0].status,
+            Status::PendingApproval,
+            "status is not touched"
+        );
+
+        // A missing record is a no-op, not an error.
+        assert!(cs.set_file_path(&peer, "nope", "/tmp/x").is_ok());
+        // A text record has no path to set: no-op, and no phantom FileMeta.
+        let m = ChatMessage::new("hi").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+        assert!(cs.set_file_path(&peer, &m.id, "/tmp/x").is_ok());
+        let text = cs.get(&peer, &m.id).unwrap().unwrap();
+        assert!(text.file.is_none(), "a text row gains no file metadata");
+        assert_eq!(text.body, "hi");
     }
 
     #[test]
