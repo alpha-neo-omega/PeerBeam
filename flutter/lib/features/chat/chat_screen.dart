@@ -122,11 +122,23 @@ class _ChatScreenState extends State<ChatScreen> {
                       itemCount: items.length,
                       itemBuilder: (context, i) {
                         final message = items[items.length - 1 - i];
+                        // A row the engine refused to send exists only here,
+                        // so only the user can clear it.
+                        final unsent = state.chat.isUnsent(
+                          widget.peerId,
+                          message.id,
+                        );
                         return Appear(
                           index: i,
                           child: _ChatBubble(
                             message: message,
                             error: state.chat.errorFor(message.id),
+                            onDismiss: unsent
+                                ? () => state.chat.dismiss(
+                                    widget.peerId,
+                                    message.id,
+                                  )
+                                : null,
                           ),
                         );
                       },
@@ -156,7 +168,11 @@ class _ChatBubble extends StatelessWidget {
 
   /// Why this row failed, when the engine said so (never persisted).
   final String? error;
-  const _ChatBubble({required this.message, this.error});
+
+  /// Non-null only for a row the engine never persisted (a refused share):
+  /// nothing else will ever clear it, so the user must be able to.
+  final VoidCallback? onDismiss;
+  const _ChatBubble({required this.message, this.error, this.onDismiss});
 
   @override
   Widget build(BuildContext context) {
@@ -221,15 +237,27 @@ class _ChatBubble extends StatelessWidget {
                           if (mine) ...[
                             const Gap(AppSpace.xxs),
                             Icon(
-                              message.status == ChatStatusValue.pending
-                                  ? Icons.schedule
-                                  : Icons.check_rounded,
+                              _deliveryGlyph(message.status),
                               size: 14,
-                              color: fg.withValues(alpha: 0.7),
+                              color: _failedStatus(message.status)
+                                  ? scheme.error
+                                  : fg.withValues(alpha: 0.7),
                             ),
                           ],
                         ],
                       ),
+                      // Nothing else will ever clear this row — it exists only
+                      // in this session, because the engine refused to send it
+                      // and therefore persisted nothing. A full-size action,
+                      // not a cramped glyph: it is the only way out.
+                      if (onDismiss != null)
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton(
+                            onPressed: onDismiss,
+                            child: const Text('Dismiss'),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -251,6 +279,31 @@ class _ChatBubble extends StatelessWidget {
         '${local.minute.toString().padLeft(2, '0')}';
   }
 }
+
+/// Whether a status means the row did not, and will not, arrive.
+bool _failedStatus(String status) => const {
+  ChatStatusValue.failed,
+  ChatStatusValue.declined,
+  ChatStatusValue.interrupted,
+}.contains(status);
+
+/// The trailing marker on one's OWN row: what happened to it.
+///
+/// Deliberately not a two-state pending/tick test. Since files share a
+/// conversation, an outgoing row can now be `transferring`, `failed`,
+/// `declined` or `interrupted` — showing the delivered tick for any of those
+/// would tell the user a file arrived when the same bubble says it failed.
+/// The tick means delivered, and nothing else does.
+IconData _deliveryGlyph(String status) => switch (status) {
+  ChatStatusValue.pending ||
+  ChatStatusValue.transferring ||
+  ChatStatusValue.pendingApproval => Icons.schedule,
+  ChatStatusValue.failed => Icons.error_outline_rounded,
+  ChatStatusValue.declined => Icons.block_rounded,
+  ChatStatusValue.interrupted => Icons.help_outline_rounded,
+  // `sent` (and a text row's `received`) — the only delivered states.
+  _ => Icons.check_rounded,
+};
 
 /// The path a settled file row can be opened at, or null when there is
 /// nothing to open (still in flight, declined/failed, or a receive that
@@ -399,13 +452,15 @@ class _FileBody extends StatelessWidget {
     );
   }
 
-  IconData _icon(ChatMessage m) => switch (m.status) {
-    ChatStatusValue.failed => Icons.error_outline_rounded,
-    ChatStatusValue.declined => Icons.block_rounded,
-    ChatStatusValue.interrupted => Icons.help_outline_rounded,
-    ChatStatusValue.pendingApproval => Icons.move_to_inbox_rounded,
-    _ => Icons.insert_drive_file_rounded,
-  };
+  /// The leading icon: what this row *is*, except when it went wrong — then it
+  /// borrows the trailing marker's glyph so the two can never disagree about
+  /// which failure state this is.
+  IconData _icon(ChatMessage m) {
+    if (_failedStatus(m.status)) return _deliveryGlyph(m.status);
+    return m.status == ChatStatusValue.pendingApproval
+        ? Icons.move_to_inbox_rounded
+        : Icons.insert_drive_file_rounded;
+  }
 
   /// Plain language for a record status, from the row's own point of view.
   String _statusLabel(ChatMessage m) => switch (m.status) {

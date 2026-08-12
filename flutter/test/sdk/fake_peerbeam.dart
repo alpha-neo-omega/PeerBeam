@@ -106,14 +106,18 @@ class FakePeerBeam implements PeerBeamApi {
   int _chatSeq = 0;
 
   /// When true, [chatSendFile] throws instead of persisting a row — the
-  /// engine's own behaviour for a path it refuses (missing file, a folder),
-  /// where nothing is persisted and nothing is sent.
+  /// engine's own behaviour for a path it refuses (missing file, a folder,
+  /// an over-long name), where nothing is persisted and nothing is sent.
   bool failChatSendFile = false;
+
+  /// Individual paths [chatSendFile] refuses, for a mixed multi-select where
+  /// some files are accepted and some are not.
+  final Set<String> refusedFilePaths = {};
 
   @override
   Future<String> chatSendFile(PeerTarget peer, String path) async {
     calls.add('chatSendFile:$path');
-    if (failChatSendFile) {
+    if (failChatSendFile || refusedFilePaths.contains(path)) {
       throw InvalidArgumentException('cannot read $path');
     }
     // Mirrors `Manager::chat_send_file`: the outgoing row is validated and

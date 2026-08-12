@@ -522,6 +522,55 @@ void main() {
       final row = repo.messagesFor('pb-bob').single;
       expect(row.status, ChatStatusValue.failed);
       expect(repo.errorFor(row.id), contains('cannot read'));
+      expect(repo.isUnsent('pb-bob', row.id), isTrue);
+
+      // The engine persisted NOTHING for this row, so every later reconcile
+      // reads a history that does not contain it. It must survive them all —
+      // any sibling send, any incoming message, or reopening the thread would
+      // otherwise erase the only evidence the file never left.
+      await repo.refresh('pb-bob');
+      await repo.refresh('pb-bob');
+      final after = repo.messagesFor('pb-bob').single;
+      expect(after.id, row.id);
+      expect(after.status, ChatStatusValue.failed);
+      expect(repo.errorFor(row.id), contains('cannot read'));
+
+      // Until the user acknowledges it.
+      repo.dismiss('pb-bob', row.id);
+      expect(repo.messagesFor('pb-bob'), isEmpty);
+      expect(repo.errorFor(row.id), isNull);
+      await repo.refresh('pb-bob');
+      expect(repo.messagesFor('pb-bob'), isEmpty);
+    });
+
+    test('a mixed multi-select keeps the refused file visible alongside the '
+        'ones that went through', () async {
+      final fake = FakePeerBeam()..refusedFilePaths.add('/tmp/b.bin');
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-bob',
+        name: 'bob',
+        addresses: ['127.0.0.1'],
+        port: 49600,
+      );
+
+      await Future.wait([
+        repo.sendFile('pb-bob', target, '/tmp/a.bin', name: 'a.bin'),
+        repo.sendFile('pb-bob', target, '/tmp/b.bin', name: 'b.bin'),
+        repo.sendFile('pb-bob', target, '/tmp/c.bin', name: 'c.bin'),
+      ]);
+
+      final rows = repo.messagesFor('pb-bob');
+      expect(rows, hasLength(3));
+      expect(rows.map((m) => m.fileName), containsAll(['a.bin', 'b.bin']));
+      final refused = rows.singleWhere((m) => m.fileName == 'b.bin');
+      expect(refused.status, ChatStatusValue.failed);
+      expect(repo.errorFor(refused.id), contains('cannot read'));
+      // The two that were accepted are the engine's own persisted rows.
+      expect(
+        rows.where((m) => m.status == ChatStatusValue.transferring),
+        hasLength(2),
+      );
     });
 
     test('a chat_status for a file row flips its status and keeps the error '

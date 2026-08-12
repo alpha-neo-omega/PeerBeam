@@ -435,28 +435,22 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
-  /// Open a chat with a saved (by-address) device. Saved devices are always
-  /// listed, online or not, so this is the entry point that keeps a thread
-  /// reachable for a peer discovery cannot see at all.
+  /// The discovered device behind a saved (by-address) entry, or null when
+  /// discovery cannot currently see it.
   ///
-  /// The conversation is keyed by the saved device's own id — the same id
-  /// `_sendToSaved` puts on the target, so both halves of the conversation
-  /// agree on the namespace.
-  void _chatWithSaved(BuildContext context, SavedDevice d) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ChatScreen(
-          peerId: d.id,
-          peer: PeerTarget(
-            id: d.id,
-            name: d.name,
-            addresses: [d.host],
-            port: d.port,
-          ),
-        ),
-      ),
-    );
-  }
+  /// A conversation may only be opened under a peer's **real** device id.
+  /// A [SavedDevice]'s id is a locally minted timestamp that the peer has
+  /// never heard of: the engine would file our own rows under it while every
+  /// inbound record is keyed by the authenticated device id, so replies would
+  /// land in a conversation with no entry point, and queued text — flushed per
+  /// authenticated peer — could never be delivered at all. So a saved entry
+  /// gets a chat action only once it can be resolved to a real identity, and
+  /// [_chatWith] then routes it exactly like any discovered device.
+  ///
+  /// Re-keying a thread client-side is deliberately NOT attempted here; that
+  /// needs an engine-side identity for by-address peers.
+  Device? _discovered(BuildContext context, SavedDevice d) =>
+      AppScope.of(context).device.deviceAtAddress(d.host, d.port);
 
   @override
   Widget build(BuildContext context) {
@@ -652,7 +646,15 @@ class HomeScreen extends StatelessWidget {
                               child: _SavedDeviceCard(
                                 device: saved[i],
                                 onTap: () => _sendToSaved(context, saved[i]),
-                                onChat: () => _chatWithSaved(context, saved[i]),
+                                // Only when it resolves to a real device id —
+                                // see `_discovered`. Null hides the action
+                                // rather than offering a thread whose replies
+                                // would be filed somewhere else.
+                                onChat: switch (_discovered(context, saved[i])) {
+                                  final Device found => () =>
+                                      _chatWith(context, found),
+                                  null => null,
+                                },
                                 onShare: () => _shareSaved(context, saved[i]),
                                 onEdit: () =>
                                     _editSavedDevice(context, saved[i]),
@@ -821,7 +823,11 @@ class _SearchPill extends StatelessWidget {
 class _SavedDeviceCard extends StatelessWidget {
   final SavedDevice device;
   final VoidCallback onTap;
-  final VoidCallback onChat;
+
+  /// Null when this saved entry cannot be resolved to a discovered device —
+  /// there is then no real peer id to key a conversation by, so no action is
+  /// offered at all rather than a dead or misfiling one.
+  final VoidCallback? onChat;
   final VoidCallback onShare;
   final VoidCallback onEdit;
   final VoidCallback onRemove;
@@ -881,17 +887,15 @@ class _SavedDeviceCard extends StatelessWidget {
                   ],
                 ),
               ),
-              // A saved device is reachable-by-address and always listed, so
-              // this is the entry point that keeps a conversation openable
-              // even when discovery cannot see the peer at all.
-              IconButton(
-                onPressed: onChat,
-                icon: const Icon(
-                  Icons.chat_bubble_outline_rounded,
-                  size: AppIcons.sm,
+              if (onChat != null)
+                IconButton(
+                  onPressed: onChat,
+                  icon: const Icon(
+                    Icons.chat_bubble_outline_rounded,
+                    size: AppIcons.sm,
+                  ),
+                  tooltip: 'Chat with ${device.name}',
                 ),
-                tooltip: 'Chat with ${device.name}',
-              ),
               PopupMenuButton<String>(
                 tooltip: 'Device actions',
                 onSelected: (v) => switch (v) {

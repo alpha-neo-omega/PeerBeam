@@ -83,7 +83,13 @@ void main() {
     expect(_button(tester, 'Send to Live Laptop').onPressed, isNull);
   });
 
-  testWidgets('a saved (by-address) device offers a chat action', (
+  // A saved device's id is a locally minted timestamp, NOT the peer's real
+  // device id. Opening a thread under it would namespace our own rows under an
+  // id the peer never uses, so replies (keyed by the authenticated device id)
+  // land in a different conversation and queued text can never flush. So there
+  // is no chat action at all unless the peer is actually discovered — and then
+  // it must route with the DISCOVERED id.
+  testWidgets('a saved device that is not discovered offers no chat action', (
     tester,
   ) async {
     SharedPreferences.setMockInitialValues({});
@@ -96,6 +102,39 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.byTooltip('Chat with Server'), findsOneWidget);
+    expect(find.text('Server'), findsOneWidget);
+    expect(find.byTooltip('Chat with Server'), findsNothing);
+  });
+
+  testWidgets('a saved device that IS discovered chats under the discovered '
+      'device\'s real id, never the saved entry\'s synthetic one', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    final saved = await state.saved.add(
+      name: 'Server',
+      host: '127.0.0.1',
+      port: 49600,
+    );
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+
+    // The same box turns up on discovery, at the saved address.
+    fake.emit(const DeviceAdded(_laptop));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    await tester.tap(find.byTooltip('Chat with Server'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // The thread it opened is the one the peer will actually write into.
+    expect(fake.calls, contains('chatHistory:x1'));
+    expect(fake.calls, isNot(contains('chatHistory:${saved.id}')));
   });
 }

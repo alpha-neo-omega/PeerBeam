@@ -40,6 +40,26 @@ class DiscoveryRepository extends ChangeNotifier {
     );
   }
 
+  /// The discovered device currently advertising [host] on [port], if any.
+  ///
+  /// Lets a saved (by-address) entry be resolved to the peer's **real** device
+  /// id, which is the only id the engine keys a conversation by. A saved
+  /// entry's own id is locally minted and means nothing to the peer, so
+  /// anything that needs a genuine identity has to come through here — and
+  /// accept a null when discovery cannot currently see the peer.
+  ///
+  /// Matched on the exact advertised address: a saved MagicDNS/host name that
+  /// discovery reports as an IP will not match, which is the honest answer
+  /// (nothing here can prove the two are the same machine).
+  Device? deviceAtAddress(String host, int port) {
+    for (final raw in _raw.values) {
+      if (raw.port == port && raw.addresses.contains(host)) {
+        return _byId[raw.id];
+      }
+    }
+    return null;
+  }
+
   /// Start discovery and reflect it in [scanning] (used at boot, so the
   /// Scan/Stop control is truthful from the first frame). Safe to call when
   /// already scanning.

@@ -47,10 +47,25 @@ Future<T> withProcessing<T>(
       },
     ),
   );
+  void dismiss() {
+    final ctx = dialogContext;
+    if (ctx != null && ctx.mounted) Navigator.of(ctx).pop();
+  }
+
   try {
     return await action();
   } finally {
-    final ctx = dialogContext;
-    if (ctx != null && ctx.mounted) Navigator.of(ctx).pop();
+    if (dialogContext != null) {
+      dismiss();
+    } else {
+      // The route is pushed now but its `builder` — which is what assigns
+      // `dialogContext` — does not run until the next frame. An action that
+      // completes inside this same frame (a cancelled pick, a mocked channel,
+      // anything already resolved) therefore reaches here with nothing to pop,
+      // and the barrier of a `PopScope(canPop: false)` dialog would stay up
+      // for good, wedging the app behind a spinner. Retry once the frame that
+      // builds it has run.
+      WidgetsBinding.instance.addPostFrameCallback((_) => dismiss());
+    }
   }
 }

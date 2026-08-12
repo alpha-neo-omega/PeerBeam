@@ -24,6 +24,17 @@ class ChatRepository extends ChangeNotifier {
   /// engine persists the failed *status* but not a reason, and the reason
   /// arrives only on the `chat_status` event that reports it.
   final Map<String, String> _errors = {};
+
+  /// Rows the engine deliberately never persisted, per peer.
+  ///
+  /// `chat_send_file` validates the path *before* it writes anything, so a
+  /// refused one (a folder, a file that moved, an over-long name) leaves no
+  /// record at all — and [refresh] rebuilds a conversation from engine history
+  /// alone. Without this, the "it never left" bubble would be erased by the
+  /// very next reconcile: a sibling in the same multi-select, the next text
+  /// message, an incoming file settling, or simply reopening the thread. They
+  /// are re-appended by [refresh] and cleared only by [dismiss].
+  final Map<String, List<ChatMessage>> _unsent = {};
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
   int _optimisticSeq = 0;
@@ -51,6 +62,21 @@ class ChatRepository extends ChangeNotifier {
   /// never saw — the reason isn't persisted).
   String? errorFor(String messageId) => _errors[messageId];
 
+  /// Whether this row exists only in this session because the engine refused
+  /// to send it — nothing was persisted, so the user is the only one who can
+  /// clear it (see [dismiss]).
+  bool isUnsent(String peerId, String messageId) =>
+      _unsent[peerId]?.any((m) => m.id == messageId) ?? false;
+
+  /// Acknowledge an unsent row: drop it from the conversation for good.
+  void dismiss(String peerId, String messageId) {
+    _unsent[peerId]?.removeWhere((m) => m.id == messageId);
+    if (_unsent[peerId]?.isEmpty ?? false) _unsent.remove(peerId);
+    _errors.remove(messageId);
+    _byPeer[peerId]?.removeWhere((m) => m.id == messageId);
+    notifyListeners();
+  }
+
   /// Pull the persisted conversation with [peerId] from the engine.
   Future<void> refresh(String peerId) async {
     final api = _api;
@@ -62,7 +88,12 @@ class ChatRepository extends ChangeNotifier {
       // lists (optimistic rows, live `chat_received`), so holding the SDK's
       // list would both mutate the caller's data and break outright on a
       // fixed-length/const one.
-      _byPeer[peerId] = List<ChatMessage>.of(msgs);
+      //
+      // Engine history is authoritative for everything it knows about, but it
+      // cannot know about a share the engine refused before persisting
+      // anything — so those rows are carried across, newest last (they were
+      // created just now, and nothing will ever deliver them). See [_unsent].
+      _byPeer[peerId] = [...msgs, ...?_unsent[peerId]];
       notifyListeners();
     } catch (_) {
       // Keep the current view on transient errors.
@@ -162,13 +193,17 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
-  /// Mark a message failed in place and remember why.
+  /// Mark a message failed in place, remember why, and — because the engine
+  /// persisted nothing for it — remember the row itself so no later reconcile
+  /// can quietly erase the fact that it never left.
   void _fail(String peerId, String messageId, String reason) {
     _errors[messageId] = reason;
     final list = _byPeer[peerId];
     final i = list?.indexWhere((m) => m.id == messageId) ?? -1;
     if (list != null && i >= 0) {
-      list[i] = list[i].copyWith(status: ChatStatusValue.failed);
+      final failed = list[i].copyWith(status: ChatStatusValue.failed);
+      list[i] = failed;
+      (_unsent[peerId] ??= <ChatMessage>[]).add(failed);
     }
     notifyListeners();
   }

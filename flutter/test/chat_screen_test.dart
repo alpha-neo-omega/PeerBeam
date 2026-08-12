@@ -93,6 +93,74 @@ void main() {
     expect(find.text('c.bin'), findsOneWidget);
   });
 
+  testWidgets('a file the engine refuses stays visible next to the ones that '
+      'went through, and clears only when dismissed', (tester) async {
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (call) async => call.method == 'pickFiles'
+          ? [
+              {'path': '/tmp/a.bin', 'name': 'a.bin', 'size': 1},
+              {'path': '/tmp/gone.bin', 'name': 'gone.bin', 'size': 2},
+            ]
+          : null,
+    );
+    final fake = FakePeerBeam()..refusedFilePaths.add('/tmp/gone.bin');
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.attach_file_rounded));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // The accepted sibling's own reconcile has already run by now; the
+    // refused row must have survived it.
+    expect(find.text('a.bin'), findsOneWidget);
+    expect(find.text('gone.bin'), findsOneWidget);
+    expect(find.textContaining('cannot read'), findsOneWidget);
+
+    // Let the staggered entrance animation settle before tapping (the row's
+    // indeterminate progress bar animates forever, so pumpAndSettle can't be
+    // used here).
+    await tester.pump(const Duration(seconds: 1));
+    await tester.tap(find.text('Dismiss'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('gone.bin'), findsNothing);
+    expect(find.text('a.bin'), findsOneWidget);
+  });
+
+  testWidgets('a failed outgoing row never shows the delivered tick', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.failed),
+      _file(id: 'fr-2', direction: 'out', status: ChatStatusValue.sent),
+    ];
+    await _open(tester, fake);
+
+    // Exactly one tick: the row that really was delivered.
+    expect(find.byIcon(Icons.check_rounded), findsOneWidget);
+    expect(find.byIcon(Icons.error_outline_rounded), findsWidgets);
+  });
+
+  testWidgets('an in-flight outgoing row shows a pending marker, not a tick', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.transferring,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.byIcon(Icons.check_rounded), findsNothing);
+    expect(find.byIcon(Icons.schedule), findsOneWidget);
+  });
+
   testWidgets('a file row renders its name and size, never a blank bubble', (
     tester,
   ) async {
