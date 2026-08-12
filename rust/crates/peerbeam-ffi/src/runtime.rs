@@ -257,9 +257,11 @@ async fn chat_drain_loop(engine: Arc<Engine>, manager: Arc<Manager>) {
 /// reconciles exactly the peers the runtime can already name:
 /// [`ChatStore::outbox_peers`], i.e. peers with queued **text**. A peer whose
 /// only unsettled row is a file — the case this feature actually creates, since
-/// increment 2a has no file outbox — is *not* covered here and is instead
-/// reconciled by the UI when that thread is opened. Worth revisiting if the
-/// `AppStore` port ever grows namespace enumeration.
+/// increment 2a has no file outbox — is *not* covered here. Those are settled
+/// per-conversation by [`crate::pb_chat_reconcile`], which a surface calls when
+/// it opens a thread (and which additionally skips any row whose transfer is
+/// live, since by then one can be). Worth revisiting if the `AppStore` port
+/// ever grows namespace enumeration.
 fn reconcile_chat(chat: &peerbeam_chat::ChatStore) {
     let peers = match chat.outbox_peers() {
         Ok(p) => p,

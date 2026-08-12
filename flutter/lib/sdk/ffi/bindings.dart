@@ -62,6 +62,7 @@ class Bindings {
   final _ArgRetDart _chatSend;
   final _ArgRetDart _chatSendFile;
   final _ArgRetDart _chatHistory;
+  final _ArgRetDart _chatReconcile;
 
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
@@ -107,6 +108,9 @@ class Bindings {
       ),
       _chatHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_chat_history',
+      ),
+      _chatReconcile = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_reconcile',
       );
 
   /// Load the native library. `overridePath` forces a specific file (tests).
@@ -152,6 +156,7 @@ class Bindings {
   String chatSend(String json) => _withArg(json, _chatSend);
   String chatSendFile(String json) => _withArg(json, _chatSendFile);
   String chatHistory(String json) => _withArg(json, _chatHistory);
+  String chatReconcile(String json) => _withArg(json, _chatReconcile);
 
   /// Read a Rust-owned string and free it (ownership contract).
   String _consume(Pointer<Utf8> ptr) {

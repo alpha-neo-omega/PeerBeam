@@ -171,4 +171,30 @@ class FakePeerBeam implements PeerBeamApi {
     calls.add('chatHistory:$peerId');
     return chatHistories[peerId] ?? const [];
   }
+
+  /// Transfer ids the engine currently has registered. `chatReconcile` skips
+  /// their rows, exactly as `Manager::chat_reconcile` skips anything in
+  /// `active` — a row is only orphaned if nothing is still driving it.
+  final Set<String> liveTransferIds = {};
+
+  @override
+  Future<int> chatReconcile(String peerId) async {
+    calls.add('chatReconcile:$peerId');
+    // Mirrors `Manager::chat_reconcile`: a row still in flight in the store,
+    // with no live transfer behind it, is one nothing will ever finish.
+    final rows = chatHistories[peerId];
+    if (rows == null) return 0;
+    var changed = 0;
+    for (var i = 0; i < rows.length; i++) {
+      final status = rows[i].status;
+      final inFlight =
+          status == ChatStatusValue.transferring ||
+          status == ChatStatusValue.pendingApproval;
+      if (inFlight && !liveTransferIds.contains(rows[i].id)) {
+        rows[i] = rows[i].copyWith(status: ChatStatusValue.interrupted);
+        changed++;
+      }
+    }
+    return changed;
+  }
 }

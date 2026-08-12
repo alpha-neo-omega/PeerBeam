@@ -37,13 +37,18 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    // Refresh once the first frame is up (not in initState directly — the
+    // Load once the first frame is up (not in initState directly — the
     // repository may not be attached to a live engine yet during boot, same
     // reasoning as the other repositories' "don't refresh in the constructor"
     // note).
+    //
+    // `openThread`, not `refresh`: opening is also when a row a crash left
+    // mid-flight gets settled, and that has to happen before the thread is
+    // rendered or a dead Accept button is offered for a transfer that no
+    // longer exists.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      AppScope.of(context).chat.refresh(widget.peerId);
+      AppScope.of(context).chat.openThread(widget.peerId);
     });
   }
 

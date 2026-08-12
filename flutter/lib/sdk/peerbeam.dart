@@ -80,8 +80,18 @@ abstract class PeerBeamApi {
   /// case nothing is persisted and nothing is sent.
   Future<String> chatSendFile(PeerTarget peer, String path);
 
-  /// Chat history with a given peer, oldest first.
+  /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
+
+  /// Settle rows in this conversation that no event will ever finish — a file
+  /// left mid-flight by a crash or a hard restart — and return how many were
+  /// changed. Rows whose transfer is live right now are left alone.
+  ///
+  /// Call it when a thread is opened, **before** rendering its history: the
+  /// engine's startup pass can only reach peers with queued text, so a
+  /// file-only thread would otherwise show an eternal progress bar or offer an
+  /// Accept button for a transfer that no longer exists.
+  Future<int> chatReconcile(String peerId);
 }
 
 /// Real, FFI-backed implementation.
@@ -263,6 +273,14 @@ class PeerBeam implements PeerBeamApi {
       _req().chatHistory(jsonEncode({'peer_id': peerId})),
     );
     return _list(data['messages']).map(ChatMessage.fromJson).toList();
+  }
+
+  @override
+  Future<int> chatReconcile(String peerId) async {
+    final data = _data(
+      _req().chatReconcile(jsonEncode({'peer_id': peerId})),
+    );
+    return (data['changed'] as num?)?.toInt() ?? 0;
   }
 
   // ── envelope handling ─────────────────────────────────────────

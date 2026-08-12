@@ -9,6 +9,7 @@ import 'package:peerbeam/data/discovery_repository.dart';
 import 'package:peerbeam/data/history_repository.dart';
 import 'package:peerbeam/data/transfer_repository.dart';
 import 'package:peerbeam/sdk/events.dart';
+import 'package:peerbeam/sdk/exceptions.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/models.dart' as ui;
 
@@ -16,6 +17,13 @@ import '../sdk/fake_peerbeam.dart';
 
 /// Flush pending microtasks so stream listeners run.
 Future<void> flush() => Future(() {});
+
+/// An engine whose reconcile call fails — opening a thread must still show it.
+class _ReconcileFailsPeerBeam extends FakePeerBeam {
+  @override
+  Future<int> chatReconcile(String peerId) async =>
+      throw const InternalException('reconcile exploded');
+}
 
 SdkDevice dev(String id, {bool online = true}) => SdkDevice(
   id: id,
@@ -281,6 +289,53 @@ void main() {
 
       await repo.refresh('bob');
       expect(repo.messagesFor('bob').single.body, 'hi');
+    });
+
+    test('openThread settles crash-orphaned rows BEFORE it reads the thread, '
+        'so nothing renders as in-flight that never will be', () async {
+      final fake = FakePeerBeam();
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: '',
+          at: DateTime.now(),
+          status: ChatStatusValue.pendingApproval,
+          kind: ChatMessageKind.file,
+          fileName: 'a.bin',
+          fileSize: 7,
+        ),
+      ];
+      final repo = ChatRepository(api: fake);
+
+      await repo.openThread('pb-bob');
+
+      // Order matters: reading first would render a dead Accept button.
+      expect(fake.calls, ['chatReconcile:pb-bob', 'chatHistory:pb-bob']);
+      expect(
+        repo.messagesFor('pb-bob').single.status,
+        ChatStatusValue.interrupted,
+      );
+    });
+
+    test('openThread still loads the conversation when the reconcile fails', () async {
+      final fake = _ReconcileFailsPeerBeam();
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'm1',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: 'hi',
+          at: DateTime.now(),
+          status: ChatStatusValue.received,
+        ),
+      ];
+      final repo = ChatRepository(api: fake);
+
+      await repo.openThread('pb-bob');
+
+      expect(repo.messagesFor('pb-bob').single.body, 'hi');
     });
 
     test(

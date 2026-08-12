@@ -1535,6 +1535,71 @@ impl Manager {
     }
 
     /// Conversation history with one peer, chronological (oldest first).
+    /// Settle one conversation's rows that nothing will ever finish:
+    /// `{peer_id}` → `{changed}`.
+    ///
+    /// A file row is written `Transferring` (sender) or `PendingApproval`
+    /// (receiver) and is only ever moved off that state by a live transfer
+    /// event. Transfer ids are process-scoped and nothing replays them, so a
+    /// row that survives a restart in either state spins forever: the sender's
+    /// bubble shows an eternal progress bar, and the receiver's keeps offering
+    /// an Accept button whose transfer no longer exists.
+    ///
+    /// Startup reconciliation ([`crate::runtime`]'s `reconcile_chat`) cannot
+    /// reach these. It enumerates peers via `ChatStore::outbox_peers`, i.e.
+    /// peers with queued **text**, because the `AppStore` port cannot list
+    /// namespaces — and a thread whose only unsettled row is a file has no
+    /// queued text at all (increment 2a has no file outbox). This is the entry
+    /// point that covers them, called when a surface opens a thread.
+    ///
+    /// **Why this is a separate call and not part of
+    /// [`chat_history`](Self::chat_history).** Reconciling is a write, and
+    /// history is read constantly during a live conversation — on open, after
+    /// every send, and again when a file settles. Folding the two together
+    /// would mark a genuinely in-flight row `Interrupted` moments after
+    /// `chat_send_file` created it, and since a settled row is deliberately no
+    /// longer writable, its real completion would then be dropped.
+    ///
+    /// A row whose transfer is registered **right now** is skipped for the
+    /// same reason: a user can open a thread while a share to that peer is
+    /// still moving. That check is why this cannot simply delegate to
+    /// `ChatStore::reconcile_peer`, which knows nothing about transfers.
+    pub fn chat_reconcile(&self, req: &Value) -> Op {
+        let peer_id = req
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "peer_id required".into()))?;
+        let peer = DeviceId::from(peer_id.to_string());
+        let history = self
+            .chat
+            .history(&peer)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let mut changed = 0_u64;
+        for rec in history {
+            if !matches!(
+                rec.status,
+                ChatStatus::Transferring | ChatStatus::PendingApproval
+            ) {
+                continue;
+            }
+            // Its transfer exists in this process: genuinely in flight, and the
+            // terminal event that owns this row is still coming.
+            if self.active.lock().unwrap().contains_key(&rec.id) {
+                continue;
+            }
+            if let Err(e) = self
+                .chat
+                .set_status(&peer, &rec.id, ChatStatus::Interrupted)
+            {
+                tracing::warn!(error = %e, message_id = %rec.id, "chat row not marked interrupted");
+                continue;
+            }
+            changed += 1;
+            events::chat_status(&peer.0, &rec.id, chat_status_str(ChatStatus::Interrupted));
+        }
+        Ok(json!({ "changed": changed }))
+    }
+
     pub fn chat_history(&self, req: &Value) -> Op {
         let peer_id = req
             .get("peer_id")
@@ -2638,6 +2703,122 @@ mod tests {
             "a refused share must persist nothing"
         );
         assert_eq!(mgr.active_len(), 0, "and register no transfer");
+    }
+
+    /// The thread-open reconcile. A file row is only ever moved off
+    /// `Transferring`/`PendingApproval` by a live transfer event, and transfer
+    /// ids are process-scoped with nothing replaying them — so a row that
+    /// survived a crash in either state would spin forever, and an inbound one
+    /// would keep offering an Accept button whose transfer no longer exists.
+    ///
+    /// Startup reconciliation cannot reach these: it can only enumerate peers
+    /// with queued *text*, and a file-only thread has none. This is the entry
+    /// point that settles them, and it must leave everything else alone.
+    #[tokio::test]
+    async fn chat_reconcile_settles_only_the_rows_nothing_will_ever_finish() {
+        let (mgr, chat, _dir) = test_manager_full("reconcile", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // (+) Our own send, left mid-flight by a restart.
+        let stranded = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &stranded,
+            file_meta(&stranded),
+            ChatStatus::Transferring,
+        ))
+        .expect("seed");
+        // (+) An offer whose approval prompt died with the process.
+        let offered = peerbeam_chat::FileRef::new("b.bin", 4).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("seed");
+        // (-) A settled file row.
+        let done = peerbeam_chat::FileRef::new("c.bin", 5).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &done,
+            file_meta(&done),
+            ChatStatus::Sent,
+        ))
+        .expect("seed");
+        // (-) Ordinary text.
+        let text = peerbeam_chat::ChatMessage::new("hello there").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &text))
+            .expect("seed");
+
+        let out = mgr
+            .chat_reconcile(&json!({ "peer_id": peer.0 }))
+            .expect("reconcile");
+        assert_eq!(out["changed"], 2);
+
+        let status_of = |id: &str| {
+            chat.get(&peer, id)
+                .expect("read")
+                .expect("row present")
+                .status
+        };
+        assert_eq!(status_of(&stranded.id), ChatStatus::Interrupted);
+        assert_eq!(status_of(&offered.id), ChatStatus::Interrupted);
+        assert_eq!(
+            status_of(&done.id),
+            ChatStatus::Sent,
+            "settled rows are final"
+        );
+        assert_eq!(
+            status_of(&text.id),
+            ChatStatus::Sent,
+            "text is never a transfer's business"
+        );
+
+        // Idempotent: a second pass has nothing left to settle.
+        let again = mgr
+            .chat_reconcile(&json!({ "peer_id": peer.0 }))
+            .expect("reconcile");
+        assert_eq!(again["changed"], 0);
+    }
+
+    /// The reason this is not `reconcile_peer` and not reconcile-on-read: a
+    /// thread can be opened while a share to that peer is genuinely in flight
+    /// (attach a file, navigate away, come back). Marking that row
+    /// `Interrupted` would settle a transfer that is actively moving bytes,
+    /// and — because a settled row is deliberately no longer writable — its
+    /// real completion would then be dropped on the floor.
+    #[tokio::test]
+    async fn chat_reconcile_leaves_a_row_whose_transfer_is_live_alone() {
+        let (mgr, chat, _dir) = test_manager_full("reconcile-live", 0);
+        let peer = DeviceId::from("pb-bob");
+        let live = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &live,
+            file_meta(&live),
+            ChatStatus::Transferring,
+        ))
+        .expect("seed");
+        // Its transfer is registered right now.
+        let _active = active_for(&mgr, &live.id, "sending", &peer.0);
+
+        let out = mgr
+            .chat_reconcile(&json!({ "peer_id": peer.0 }))
+            .expect("reconcile");
+
+        assert_eq!(out["changed"], 0);
+        assert_eq!(
+            chat.get(&peer, &live.id)
+                .expect("read")
+                .expect("row present")
+                .status,
+            ChatStatus::Transferring,
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_reconcile_requires_a_peer_id() {
+        let mgr = test_manager("reconcile-args");
+        let err = mgr
+            .chat_reconcile(&json!({}))
+            .expect_err("peer_id is required");
+        assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
     }
 
     #[tokio::test]

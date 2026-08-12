@@ -77,6 +77,25 @@ class ChatRepository extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Open a conversation: settle anything a crash left mid-flight, then load
+  /// it.
+  ///
+  /// The reconcile runs **before** the read, and its result is rendered rather
+  /// than the pre-reconcile state: a file row that survived a restart as
+  /// `transferring`/`pendingapproval` is one nothing will ever complete, so
+  /// showing it as in-flight means an eternal progress bar and — worse — an
+  /// Accept button for a transfer that no longer exists. A reconcile failure
+  /// is not fatal: the conversation still loads.
+  Future<void> openThread(String peerId) async {
+    try {
+      await _api?.chatReconcile(peerId);
+    } catch (_) {
+      // Best-effort: an unreconciled row is stale, not wrong to show.
+    }
+    if (_disposed) return;
+    await refresh(peerId);
+  }
+
   /// Pull the persisted conversation with [peerId] from the engine.
   Future<void> refresh(String peerId) async {
     final api = _api;

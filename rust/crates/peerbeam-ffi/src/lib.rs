@@ -331,13 +331,29 @@ pub unsafe extern "C" fn pb_chat_send_file(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_send_file(&read_json(json)?))()))
 }
 
-/// Conversation history: `{peer_id}` → `{messages:[...]}`.
+/// Conversation history: `{peer_id}` → `{messages:[...]}`. A pure read.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_history(&read_json(json)?))()))
+}
+
+/// Settle one conversation's rows that no event will ever finish — a file left
+/// mid-flight by a crash or a hard restart: `{peer_id}` → `{changed}`. Emits a
+/// `chat_status` per settled row.
+///
+/// Call it when a thread is opened, before rendering its history: startup
+/// reconciliation can only reach peers with queued text, so a file-only thread
+/// would otherwise show an eternal progress bar or a dead Accept button. Rows
+/// whose transfer is live right now are deliberately left alone.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_reconcile(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_reconcile(&read_json(json)?))()))
 }
 
 // ── clipboard ───────────────────────────────────────────────────

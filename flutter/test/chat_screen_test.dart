@@ -147,7 +147,7 @@ void main() {
   testWidgets('an in-flight outgoing row shows a pending marker, not a tick', (
     tester,
   ) async {
-    final fake = FakePeerBeam();
+    final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
       _file(
         id: 'fr-1',
@@ -199,6 +199,9 @@ void main() {
   testWidgets('an incoming offer shows inline Accept / Trust / Decline wired '
       'to the existing transfer approval', (tester) async {
     final fake = FakePeerBeam();
+    // Its transfer is registered and waiting on the decision — this is a live
+    // offer, not one a crash left behind.
+    fake.liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
       _file(
         id: 'fr-1',
@@ -226,6 +229,26 @@ void main() {
     expect(fake.calls, contains('reject:fr-1'));
   });
 
+  // A row left `pendingapproval` by a crash has no transfer behind it any
+  // more, so its Accept button would be dead. Opening the thread reconciles
+  // first, and the row renders as interrupted instead.
+  testWidgets('a crash-orphaned offer is settled on open, not left offering a '
+      'dead Accept', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'in',
+        status: ChatStatusValue.pendingApproval,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(fake.calls, contains('chatReconcile:pb-bob'));
+    expect(find.text('Accept'), findsNothing);
+    expect(find.textContaining('Interrupted'), findsOneWidget);
+  });
+
   testWidgets('a settled row offers no approval buttons', (tester) async {
     final fake = FakePeerBeam();
     fake.chatHistories['pb-bob'] = [
@@ -239,7 +262,9 @@ void main() {
 
   testWidgets('an in-flight row shows progress from the live transfer, and '
       'still renders when there is none', (tester) async {
-    final fake = FakePeerBeam();
+    // The engine has the transfer registered, so the row is genuinely in
+    // flight — but this process has not seen a progress event for it yet.
+    final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
       _file(
         id: 'fr-1',
@@ -249,8 +274,8 @@ void main() {
     ];
     await _open(tester, fake);
 
-    // No live Transfer (e.g. after a restart): an indeterminate bar, not a
-    // crash and not a fake 0%.
+    // Nothing in TransferRepository yet: an indeterminate bar, not a crash
+    // and not a fake 0%.
     LinearProgressIndicator bar() =>
         tester.widget<LinearProgressIndicator>(
           find.byType(LinearProgressIndicator),
