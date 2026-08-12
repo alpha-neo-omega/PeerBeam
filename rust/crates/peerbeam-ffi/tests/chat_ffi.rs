@@ -432,6 +432,109 @@ async fn chat_received_into_ffi_and_history_round_trip() {
     pb_shutdown();
 }
 
+/// A manually-built real peer dials into the FFI engine purely to deliver
+/// chat — no transfer stream is ever opened, exactly like `chat_flush_peer`,
+/// the drain loop, and flush-on-connect since chat 1b. Regression test for the
+/// bug where `handle_incoming` registered an "(incoming)" transfer and
+/// blocked on the approval gate before it knew whether any transfer stream
+/// was coming at all — so every inbound chat message raised a phantom
+/// file-approval prompt on the receiver, and (with auto-accept on) a
+/// failed-transfer history row for what was only a chat message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn chat_only_dial_does_not_register_phantom_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49903;
+    init_ffi(port, dir.path());
+
+    let (enc, trust, identity) = peer_identity(dir.path(), "sender");
+    let sender_store = peer_chat_store(dir.path(), "sender", 9);
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    let send_fut = async move {
+        // Bounded retry instead of a fixed sleep: the daemon's listener bind
+        // races this dial, and a single unretried attempt right after
+        // `pb_init` can flake if the bind hasn't landed yet.
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_only_caps());
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+        peerbeam_chat::send_message(&handle, &sender_store, &DeviceId::from("ffi-peer"), "hi")
+            .await
+            .expect("send_message succeeds")
+    };
+
+    let sent_rec = send_fut.await;
+    assert_eq!(sent_rec.body, "hi");
+
+    // FFI must have emitted `chat_received` for this message.
+    let event = tokio::task::spawn_blocking(|| {
+        wait_event(5, |e| {
+            e["type"] == "chat_received" && e["message"]["body"] == "hi"
+        })
+    })
+    .await
+    .unwrap()
+    .expect("expected a chat_received event");
+    assert_eq!(event["message"]["direction"], "in");
+    assert_eq!(event["message"]["status"], "received");
+
+    // A chat-only dial must not fabricate a transfer. Pre-fix, handle_incoming
+    // registered an "(incoming)" transfer and blocked on the approval gate
+    // before it knew whether any stream channel was coming — so every inbound
+    // chat message raised a phantom file-approval prompt on the receiver.
+    let events = events_snapshot();
+    let phantom: Vec<&Value> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("transfer_queued"))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "a chat-only dial must emit no transfer_queued; got {phantom:?}"
+    );
+
+    // ...and no transfer may be left sitting in `active`.
+    // `pb_transfers_active` takes no arguments, so it is safe to call directly;
+    // its envelope is `{ok, data: {transfers: [...]}}` (Manager::active_list).
+    let active = take(pb_transfers_active());
+    let list = active
+        .get("data")
+        .and_then(|d| d.get("transfers"))
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        list.is_empty(),
+        "a chat-only dial must leave no active transfer; got {list:?}"
+    );
+
+    pb_shutdown();
+}
+
 /// The background chat drain (`runtime::chat_drain_loop`, spawned from
 /// `pb_init`) retries delivery to a peer that was unreachable at `chat_send`
 /// time, once discovery reports it back online — this is a *distinct*

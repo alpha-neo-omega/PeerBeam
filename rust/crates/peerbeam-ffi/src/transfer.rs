@@ -1155,6 +1155,23 @@ impl Manager {
                 events::chat_status(&session.peer_device.0, mid, "sent");
             }
         }
+
+        // Only a connection that actually opens a transfer stream is a
+        // transfer. Since chat 1b, peers dial purely to deliver chat, so
+        // registering a transfer and prompting the user before knowing whether
+        // any stream is coming raised a phantom "incoming file" approval for
+        // every chat message — and, with auto-accept on, wrote a failed-transfer
+        // history row for it. Wait for the stream first, bounded.
+        let incoming_ch = match tokio::time::timeout(STREAM_GRACE, session.next_incoming()).await {
+            Ok(Some(c)) => c,
+            // No stream channel: a chat-only dial. Close quietly — no `active`
+            // entry, no transfer_queued, no approval prompt, no history row.
+            Ok(None) | Err(_) => {
+                session.close().await;
+                return;
+            }
+        };
+
         let id = self.next_id();
         // Prefer the peer's human name from the handshake; fall back to the raw
         // device id only when the peer presented no name.
@@ -1205,16 +1222,6 @@ impl Manager {
 
         events::transfer(&id, "transfer_started", json!({ "peer": peer }));
         *active.status.lock().unwrap() = "transferring".into();
-
-        // Await the peer's transfer channel.
-        let incoming_ch = match session.next_incoming().await {
-            Some(c) => c,
-            None => {
-                self.finish_failed(&id, (Code::Connection, "closed before data".into()));
-                session.close().await;
-                return;
-            }
-        };
 
         let save_dir = self.save_dir();
         let storage = self.storage();
@@ -1270,6 +1277,15 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long to wait for the peer's first progress report before assuming the
 /// peer doesn't support the back-channel and falling back to bytes-sent.
 const PEER_PROGRESS_GRACE: Duration = Duration::from_secs(3);
+
+/// How long to wait for the peer's first transfer stream channel before
+/// concluding this connection carries no transfer at all. Since chat 1b a peer
+/// may dial purely to deliver chat (`chat_flush_peer`, the drain loop,
+/// flush-on-connect), and such a dial must not register a transfer or raise an
+/// approval prompt. A real sender opens its stream immediately after the
+/// handshake, so this only has to absorb scheduling jitter — same order as
+/// `PEER_PROGRESS_GRACE` above.
+const STREAM_GRACE: Duration = Duration::from_secs(3);
 
 /// Minimum spacing between emitted progress updates (~20/s) — keeps small-chunk
 /// progress smooth without flooding the event bridge.
