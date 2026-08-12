@@ -48,8 +48,12 @@ const CHAT: ChannelType = ChannelType::CHAT;
 /// The session config every CLI PeerSession uses: advertise + accept the
 /// Transfer capability as the stream channel, and advertise the Chat
 /// capability alongside it. `chat_handler`, when present, is registered to
-/// serve the Chat channel; absent, CHAT is still advertised but nothing
-/// handles it (the sending side, which never receives a Chat frame).
+/// serve the Chat channel. Every call site in this file passes `Some(...)` —
+/// on every dial AND every accept — so a message pushed from either side of
+/// an established session is always received; see this module's top doc
+/// comment for why that symmetry is a correctness requirement, not a nicety.
+/// A future dial/accept call site that omits it would silently drop any CHAT
+/// frame pushed to it instead of erroring.
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
     let caps = CapabilitySet::new()
         .with(Capability::new(TRANSFER))

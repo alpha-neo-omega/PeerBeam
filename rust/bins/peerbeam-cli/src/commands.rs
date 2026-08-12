@@ -1,5 +1,6 @@
 //! Command implementations + dispatch.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1029,7 +1030,11 @@ async fn daemon(ctx: &Ctx, args: DaemonArgs, path_override: Option<&str>) -> Cli
 
 /// This device's authentication material (crypto + trust + identity). Held as
 /// `Arc`s so they can be shared into `PeerSession::open` (which takes owned
-/// trait-object handles).
+/// trait-object handles). `Clone` is cheap (`enc`/`trust` are `Arc` clones;
+/// `ident` is a small fixed-size keypair) — used to hand an owned copy into a
+/// spawned task (e.g. `chat::spawn_drain_tick`) that must outlive its
+/// caller's stack frame.
+#[derive(Clone)]
 pub struct SecureCtx {
     pub enc: Arc<AeadCrypto>,
     pub trust: Arc<FsTrust>,
@@ -1209,26 +1214,33 @@ async fn serve_loop(
     // connection registers a chat handler too, so a peer's `chat send` is
     // received while we serve files/folders, and a periodic drain tick
     // retries delivery to any peer whose outbox still has queued messages
-    // once discovery reports them reachable (`crate::chat::drain_tick`). The
-    // same `quic` instance both serves (above) and dials (the drain tick) —
-    // `serve_channels_on` binds its own server-side endpoint independent of
-    // the client endpoint `dial_channels` uses, so no second transport is
-    // needed (mirrors the FFI's `Manager`, which reuses one `self.quic` for
-    // both `serve()` and `chat_flush_peer`'s dial).
+    // once discovery reports them reachable (`crate::chat::drain_tick`, via
+    // the non-blocking `crate::chat::spawn_drain_tick`). The same `quic`
+    // instance both serves (above) and dials (the drain tick, through its
+    // own `RouteManager::new(quic.clone())`) — `serve_channels_on` binds its
+    // own server-side endpoint independent of the client endpoint
+    // `dial_channels` uses, so no second transport is needed (mirrors the
+    // FFI's `Manager`, which reuses one `self.quic` for both `serve()` and
+    // `chat_flush_peer`'s dial).
     let chat = chat_store(config, &sc.enc, &sc.ident);
-    let routes = RouteManager::new(quic.clone());
     let sink = crate::chat::received_sink(ctx);
     let mut drain = tokio::time::interval(crate::chat::DRAIN_EVERY);
     // If a tick is missed (e.g. we were busy serving a long-lived transfer),
     // resume the plain periodic cadence rather than firing a burst of
     // catch-up ticks — mirrors the FFI's `chat_drain_loop`.
     drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Single-flight guard for `spawn_drain_tick` — see its doc comment: the
+    // sweep runs on its own spawned task rather than inline in the `select!`
+    // arm below, so a backlog of unreachable peers (each subject to the QUIC
+    // connect timeout) can never stall this loop's accept arm — including on
+    // the very first tick, which `tokio::time::interval` fires immediately.
+    let draining = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
             _ = drain.tick() => {
                 if let Some(eng) = &engine {
-                    crate::chat::drain_tick(eng, &chat, &quic, &routes, &sc, &sink).await;
+                    crate::chat::spawn_drain_tick(&draining, eng, &chat, &quic, &sc, &sink);
                 }
             }
             item = incoming.next() => {

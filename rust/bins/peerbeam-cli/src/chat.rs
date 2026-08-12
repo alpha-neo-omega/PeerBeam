@@ -20,6 +20,8 @@
 //! correctness requirement, not a nicety (see the FFI's `Manager::chat_wiring`
 //! for the bug this mirrors-and-avoids).
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -147,6 +149,74 @@ pub(crate) async fn drain_tick(
             session.close().await;
         }
     }
+}
+
+/// Spawn `work` on its own task, unless a previous call's `work` is still
+/// running — in which case this call is a silent no-op, and whatever
+/// triggered it (a timer tick, here) is simply skipped. `flight` is the
+/// shared guard: swapped to `true` before spawning, and cleared once `work`
+/// completes, via a drop guard so a panic inside `work` can never leave the
+/// flag stuck `true` forever (which would silently and permanently disable
+/// every future call).
+///
+/// Factored out from [`spawn_drain_tick`] purely so the single-flight
+/// mechanism is unit-testable on its own, independent of `drain_tick`'s
+/// network behavior (see the tests below) — [`spawn_drain_tick`] is its only
+/// real caller.
+fn spawn_single_flight(flight: &Arc<AtomicBool>, work: impl Future<Output = ()> + Send + 'static) {
+    if flight.swap(true, Ordering::AcqRel) {
+        return; // already running; this call is skipped.
+    }
+    let flight = flight.clone();
+    tokio::spawn(async move {
+        struct ClearOnDrop(Arc<AtomicBool>);
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _clear = ClearOnDrop(flight);
+        work.await;
+    });
+}
+
+/// Single-flight, non-blocking wrapper around [`drain_tick`]: spawns the
+/// sweep on its own task (via [`spawn_single_flight`]) so the caller's
+/// `tokio::select!` accept loop is never blocked waiting for it. A
+/// synchronous drain dials every reachable peer serially, each subject to
+/// the QUIC connect timeout per route candidate — with a backlog of
+/// unreachable/firewalled peers that can run tens of seconds, during which
+/// an inline `.await` here would starve the same `select!`'s accept arm and
+/// stall inbound connections. Since `tokio::time::interval`'s first tick
+/// fires immediately, an inline await would do this on every
+/// `serve_loop`/`chat watch` startup, not just occasionally.
+///
+/// `draining` guards against overlapping sweeps: if the previous tick's
+/// sweep is still running when the next one fires, this tick is simply
+/// skipped — the periodic cadence already tolerates a skipped tick
+/// (`MissedTickBehavior::Skip`, set by both callers), and the next tick will
+/// pick up whatever is still queued.
+pub(crate) fn spawn_drain_tick(
+    draining: &Arc<AtomicBool>,
+    engine: &Engine,
+    store: &ChatStore,
+    quic: &Arc<QuicTransport>,
+    sc: &SecureCtx,
+    sink: &ReceivedSink,
+) {
+    let engine = engine.clone();
+    let store = store.clone();
+    let quic = quic.clone();
+    let sc = sc.clone();
+    let sink = sink.clone();
+    spawn_single_flight(draining, async move {
+        // Reconstructed rather than shared: both callers build `routes` as a
+        // bare `RouteManager::new(quic.clone())` with no further
+        // configuration, so an equivalent instance here is simpler than
+        // giving `RouteManager` a `Clone` impl just to move it into this task.
+        let routes = RouteManager::new(quic.clone());
+        drain_tick(&engine, &store, &quic, &routes, &sc, &sink).await;
+    });
 }
 
 /// `chat send` — resolve the peer exactly like `commands::send`, enqueue the
@@ -384,13 +454,13 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
     let sc = SecureCtx::build(&config)?;
     let store = commands::chat_store(&config, &sc.enc, &sc.ident);
     let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
-    // Same `QuicTransport` instance serves (below) and dials (the drain tick):
+    // Same `QuicTransport` instance serves (below) and dials (the drain tick,
+    // via `spawn_drain_tick`'s own `RouteManager::new(quic.clone())`):
     // `serve_channels_on` binds its own server-side endpoint per call, entirely
     // independent of the client endpoint `dial_channels` uses (created once in
     // `QuicTransport::new`) — no second transport needed. Mirrors the FFI's
     // `Manager`, which reuses a single `self.quic` for both `serve()` and
     // `chat_flush_peer`'s dial.
-    let routes = RouteManager::new(quic.clone());
     let bind_port = port.unwrap_or(config.transfer.port);
     let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, bind_port));
     let (local, mut incoming) = quic.serve_channels_on(addr).await.map_err(CliError::from)?;
@@ -424,12 +494,17 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
     // session), resume the plain periodic cadence rather than firing a burst
     // of catch-up ticks — mirrors the FFI's `chat_drain_loop`.
     drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Single-flight guard for `spawn_drain_tick` — see its doc comment for
+    // why the sweep is spawned rather than awaited inline here (an inline
+    // await would stall this loop's accept arm, including on the very first
+    // tick, which fires immediately).
+    let draining = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
             _ = drain.tick() => {
                 if let Some(eng) = &engine {
-                    drain_tick(eng, &store, &quic, &routes, &sc, &sink).await;
+                    spawn_drain_tick(&draining, eng, &store, &quic, &sc, &sink);
                 }
             }
             item = incoming.next() => {
@@ -490,7 +565,9 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
 
 #[cfg(test)]
 mod tests {
-    use super::{reachable_targets, render_history_json, resolve_history_peer, send};
+    use super::{
+        reachable_targets, render_history_json, resolve_history_peer, send, spawn_single_flight,
+    };
     use crate::commands::{self, SecureCtx};
     use crate::output::Ctx;
     use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, Status};
@@ -500,7 +577,9 @@ mod tests {
     use peerbeam_domain::id::DeviceId;
     use peerbeam_domain::port::EncryptionProvider;
     use peerbeam_engine::ManagedDevice;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn quiet_ctx() -> Ctx {
         Ctx::new(true, true, 0, true, true)
@@ -739,5 +818,88 @@ mod tests {
         assert!(reachable_targets(&[], &[]).is_empty());
         let peers = vec![DeviceId::from("pb-a")];
         assert!(reachable_targets(&peers, &[]).is_empty());
+    }
+
+    // Regression coverage for the drain-tick-blocks-the-accept-loop fix:
+    // `spawn_drain_tick` is `serve_loop`/`watch`'s only caller of
+    // `drain_tick`, and it delegates its single-flight, spawn-not-await
+    // guard entirely to `spawn_single_flight`. A full end-to-end
+    // reproduction (real QUIC sockets, an actually-unreachable peer, timing
+    // the accept arm against the ~8s connect timeout) would need a much
+    // heavier network test harness than this file otherwise uses, so instead
+    // this exercises the guard mechanism itself — the part that is new and
+    // load-bearing — with a controllable fake `work` future standing in for
+    // `drain_tick`. That the caller (`spawn_drain_tick`, and in turn the
+    // `select!` arm in `serve_loop`/`watch`) can never block on `work` is
+    // additionally guaranteed by construction: `spawn_single_flight` is a
+    // plain, non-`async` function, so it has no `.await` point of its own
+    // and cannot itself suspend the caller — the only way to reintroduce the
+    // original bug would be to make it `async` and await `work` inline
+    // again, which the doc comments above now explicitly warn against.
+    #[tokio::test]
+    async fn spawn_single_flight_skips_overlap_and_clears_after_completion() {
+        let flight = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        // First "tick": records that it started, then parks on `gate` —
+        // standing in for `drain_tick` mid-dial against an unreachable peer.
+        {
+            let started = started.clone();
+            let finished = finished.clone();
+            let gate = gate.clone();
+            spawn_single_flight(&flight, async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+                finished.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        wait_until(|| started.load(Ordering::SeqCst) == 1).await;
+
+        // A second "tick" while the first is still parked must be skipped
+        // entirely, not queued — proving overlapping ticks never pile up a
+        // second concurrent sweep against the same store/peers.
+        {
+            let started = started.clone();
+            spawn_single_flight(&flight, async move {
+                started.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "an overlapping call must be skipped while the first is still running"
+        );
+
+        // Release the first sweep; the guard must clear once it completes.
+        gate.notify_one();
+        wait_until(|| finished.load(Ordering::SeqCst) == 1).await;
+
+        // With the guard clear, a later call must run normally — proving the
+        // flag can never get stuck `true` forever (e.g. after a completed,
+        // or even a panicking, sweep).
+        {
+            let started = started.clone();
+            spawn_single_flight(&flight, async move {
+                started.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        wait_until(|| started.load(Ordering::SeqCst) == 2).await;
+    }
+
+    /// Poll `pred` until it's true, panicking after a generous bound. Used
+    /// instead of a fixed sleep so the test fails fast (rather than hanging)
+    /// if the single-flight guard regresses, while tolerating scheduling
+    /// jitter under a loaded CI runner.
+    async fn wait_until(mut pred: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if pred() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("condition not met within the test's timeout budget");
     }
 }

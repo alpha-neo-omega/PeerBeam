@@ -27,10 +27,16 @@ use crate::error::{from_domain, Code};
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
 
-/// Chat wiring for a session: the store + a received-sink. Present on the
-/// receiving (accept) side so inbound chat is persisted + surfaced; the
-/// sending side advertises the Chat capability but registers no handler here
-/// (sending chat is Task 6).
+/// Chat wiring for a session: the store + a received-sink. Every dial AND
+/// every accept call site in this codebase registers this (built via
+/// `Manager::chat_wiring()`, never `None` in production) — a session with no
+/// `ChatHandler` bound on a given side doesn't error on an inbound CHAT
+/// frame, it silently drops it, so a message the peer pushes over an
+/// established session (its own flush-on-connect, a reply, or anything else)
+/// would be lost with no error on either side. See `Manager::chat_wiring`'s
+/// doc comment for the full rationale. Any NEW dial or accept call site
+/// added in the future must register this too, or it reintroduces exactly
+/// this silent-message-loss bug.
 ///
 /// `Clone` (both fields are: `ChatStore` derives it, `ReceivedSink` is an
 /// `Arc`) so `dial`'s retry loop can hand each connection attempt its own
@@ -43,8 +49,11 @@ pub struct ChatWiring {
 
 /// A session config advertising both the TRANSFER (stream) and CHAT (message)
 /// capabilities. `chat_handler`, when present, is registered to serve the Chat
-/// channel; absent, CHAT is still advertised but no handler serves it (the
-/// dial/sender side, until Task 6 wires chat sending).
+/// channel. Every dial and every accept call site in this codebase passes
+/// `Some(...)` (via `Manager::chat_wiring()`), so a message pushed from
+/// either side of an established session can always be received — a new dial
+/// or accept call site that passes `None` would silently drop any CHAT frame
+/// pushed to it instead of erroring (see `ChatWiring`'s doc comment).
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
     let caps = CapabilitySet::new()
         .with(Capability::new(TRANSFER))

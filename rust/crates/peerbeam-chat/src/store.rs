@@ -18,7 +18,23 @@ pub fn namespace(peer: &DeviceId) -> String {
 
 /// The AppStore namespace holding all undelivered outbound messages (across all
 /// peers), keyed by message id (time-ordered), so `list` returns FIFO order.
-pub const OUTBOX_NS: &str = "chat-outbox";
+///
+/// Deliberately `.` — not `-` — as the 5th character. [`namespace`] always
+/// produces `chat-<peer_id>` (dash), so as long as this constant's first five
+/// characters are anything other than `chat-`, no per-peer conversation
+/// namespace can ever collide with this one, *for any peer id string
+/// whatsoever* — not just the ones tested. That matters because device ids
+/// are peer-supplied over the wire (the handshake in
+/// `peerbeam_transfer::auth` takes `device_id` verbatim from the peer's own
+/// Hello), so a malicious or buggy peer can claim any id it likes, including
+/// the literal string `"outbox"`. Before this constant used `.`, such a peer's
+/// conversation namespace (`chat-outbox`) was byte-identical to this one,
+/// silently corrupting the outbox (see
+/// `outbox_namespace_never_collides_with_a_peer_literally_named_outbox`
+/// below) — every past and future queued message would stay `Pending`
+/// forever, on disk, with no error surfaced anywhere. Do not change this back
+/// to a `-`.
+pub const OUTBOX_NS: &str = "chat.outbox";
 
 /// One queued outbound message awaiting delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +281,57 @@ mod tests {
         assert_eq!(a_only.len(), 2);
         assert_eq!(a_only[0].message_id, m1.id);
         assert_eq!(a_only[1].message_id, m3.id);
+    }
+
+    // Regression test for the outbox/conversation namespace collision: a peer
+    // whose device id is literally "outbox" (device ids are peer-supplied
+    // over the wire, so any peer can claim this) must never be able to
+    // corrupt the shared outbox namespace, and `outbox_pending` must keep
+    // succeeding (not error out) with exactly the unrelated peers' queued
+    // entries. This is a REAL correctness assertion, not just "doesn't
+    // panic": before the `OUTBOX_NS` fix, `namespace(&DeviceId::from("outbox"))`
+    // and `OUTBOX_NS` were the same string (`"chat-outbox"`), so the `append`
+    // below would have landed a `ChatRecord` inside the outbox namespace;
+    // `OutboxEntry::decode` would then hard-fail on it (no `message_id`
+    // field), and `outbox_pending` would return `Err`, taking down every
+    // caller that swallows that error via `.unwrap_or_default()` (the drain
+    // loop, flush-on-connect, the opportunistic flush) — permanently and
+    // silently.
+    #[test]
+    fn outbox_namespace_never_collides_with_a_peer_literally_named_outbox() {
+        let (cs, _dir) = store();
+
+        // A normal peer with a message queued for offline delivery.
+        let normal_peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::new("queued for bob").unwrap();
+        cs.enqueue(&normal_peer, &msg).unwrap();
+
+        // A peer that has claimed the device id "outbox" — nothing stops a
+        // peer from presenting any id it likes in its Hello. It has its own
+        // (unrelated) conversation history, e.g. a message it sent us.
+        let outbox_named_peer = DeviceId::from("outbox");
+        cs.append(&ChatRecord::received(
+            &outbox_named_peer,
+            &ChatMessage::new("hi from a peer named outbox").unwrap(),
+        ))
+        .unwrap();
+
+        // The real outbox must still be readable at all (the old bug made
+        // this an `Err`) and must contain exactly — and only — the normal
+        // peer's queued entry.
+        let pending = cs
+            .outbox_pending()
+            .expect("outbox_pending must succeed even when a peer is literally named \"outbox\"");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].peer_id, "pb-bob");
+        assert_eq!(pending[0].message_id, msg.id);
+        assert_eq!(pending[0].body, "queued for bob");
+
+        // And the "outbox"-named peer's own conversation is intact and
+        // isolated — unaffected by (and not polluting) the real outbox.
+        let their_history = cs.history(&outbox_named_peer).unwrap();
+        assert_eq!(their_history.len(), 1);
+        assert_eq!(their_history[0].body, "hi from a peer named outbox");
     }
 
     #[test]

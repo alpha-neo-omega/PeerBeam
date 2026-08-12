@@ -56,12 +56,15 @@ class ChatRepository extends ChangeNotifier {
 
   /// Send [text] to [peer], filed under [peerId] in the conversation map.
   ///
-  /// `chatSend` performs a full synchronous dial+handshake+send under the
-  /// hood (inherent to this increment; a queued outbox lands later), so it
-  /// can block briefly. An optimistic outgoing message is appended
-  /// immediately — before the await — so the UI feels instant; `refresh`
-  /// reconciles with the persisted record once the call resolves. On error
-  /// the optimistic message is simply left in place (no retry/outbox yet).
+  /// `chatSend` enqueues the message durably and returns immediately (1b:
+  /// offline-first send) — it does not block on a dial/handshake. Delivery
+  /// happens via an opportunistic flush right after enqueueing, plus a
+  /// background drain/flush-on-connect that keeps retrying indefinitely
+  /// while the peer stays unreachable. An optimistic outgoing message is
+  /// appended immediately — before the await — so the UI feels instant;
+  /// `refresh` reconciles with the persisted record once the call resolves,
+  /// and a `chat_status` event later flips the message's status in place
+  /// (via [_onStatus]) once it's actually delivered.
   Future<void> send(String peerId, PeerTarget peer, String text) async {
     final body = text.trim();
     if (body.isEmpty) return;
@@ -79,7 +82,11 @@ class ChatRepository extends ChangeNotifier {
       await _api?.chatSend(peer, body);
       await refresh(peerId);
     } catch (_) {
-      // No outbox/retry in this increment — leave the optimistic message.
+      // chatSend itself only fails on a local/validation error (enqueueing
+      // is durable and always attempted) — an unreachable peer is not an
+      // error here, it stays queued in the engine's outbox and is retried by
+      // the drain/flush-on-connect until delivered. Leave the optimistic
+      // message in place; `_onStatus` will update it once delivery happens.
     }
   }
 
