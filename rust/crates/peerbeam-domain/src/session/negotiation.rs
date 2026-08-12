@@ -72,6 +72,15 @@ pub fn negotiate_version(local: Version, peer: Version) -> VersionNegotiation {
     }
 }
 
+/// Feature bit on the CHAT capability: this peer understands the `FileRef`
+/// message (chat MessageType 2) and can correlate it with a transfer.
+///
+/// `Capability.features` is already on the wire and `CapabilitySet::intersect`
+/// already ANDs the bits, so advertising this is not a wire change: a peer from
+/// before this feature advertises `features: 0`, the intersection clears the
+/// bit, and a sender simply never offers it a `FileRef`.
+pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
+
 /// One advertised capability: a channel type the peer supports, with a bitset of
 /// optional per-capability feature flags (`0` = base capability, no extras).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

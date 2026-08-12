@@ -8,7 +8,7 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::AppStore;
 
 use crate::message::{ChatError, ChatMessage};
-use crate::record::{ChatRecord, Direction, Status};
+use crate::record::{ChatRecord, Direction, Kind, Status};
 
 /// The AppStore namespace for a conversation with `peer`.
 #[must_use]
@@ -161,6 +161,8 @@ impl ChatStore {
             timestamp: entry.timestamp.clone(),
             body: entry.body.clone(),
             status: Status::Sent,
+            kind: Kind::Text,
+            file: None,
         };
         self.append(&rec)
     }

@@ -133,7 +133,7 @@ pub fn session(session_id: &str, ty: &str, payload: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use peerbeam_chat::{ChatRecord, Direction, Status};
+    use peerbeam_chat::{ChatRecord, Direction, Kind, Status};
     use std::ffi::CStr;
     use std::sync::Mutex;
 
@@ -162,6 +162,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             body: "hello".to_string(),
             status: Status::Received,
+            kind: Kind::Text,
+            file: None,
         };
         chat(&rec);
 
