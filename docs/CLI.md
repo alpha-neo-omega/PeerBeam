@@ -103,7 +103,8 @@ Working now:
   watch`) next reaches the peer. Note: `--addr` sends are queued under a routing
   placeholder; if the initial delivery attempt fails, the message stays queued
   (visible via `chat history`) but is not picked up by later drain or
-  flush-on-connect — retry a `--addr` send manually once the peer is reachable.
+  flush-on-connect — there is currently no way to auto-deliver a queued `--addr`
+  message; re-send the same text via `--to` once the peer is discoverable.
   `Sent` status means the message was handed to a live session (delivery
   attempted on the wire); it is not a read receipt and does not confirm the
   peer's user has seen it.
