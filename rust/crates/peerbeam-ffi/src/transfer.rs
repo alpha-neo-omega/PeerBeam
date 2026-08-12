@@ -550,6 +550,15 @@ impl Manager {
     /// check-then-insert window), and a collision is refused rather than
     /// merged. Callers fall back to a freshly minted id
     /// ([`register_fresh`](Self::register_fresh)) or report an error.
+    ///
+    /// **Scope of this guarantee:** it rules out only a *simultaneous*
+    /// collision — two live transfers holding one id at the same instant. It
+    /// says nothing about the same id being used again *later*, which a wire-
+    /// supplied id makes ordinary rather than exotic: a cancelled chat file
+    /// retried under its `FileRef` id re-uses that id by design. Terminal
+    /// removal must therefore not trust the id alone — see
+    /// [`claim`](Self::claim), which is what actually keeps one transfer's
+    /// unwind from tearing out its successor.
     fn register_vacant(
         &self,
         id: &str,
@@ -602,6 +611,46 @@ impl Manager {
             {
                 return (id, active);
             }
+        }
+    }
+
+    /// Atomically claim `mine` out of the registry: remove it, but **only if
+    /// the entry currently registered under its id is this exact transfer**.
+    /// Returns `None` — a no-op — otherwise.
+    ///
+    /// This is the terminal-event claim. Exactly one of {`cancel()`, the task's
+    /// own unwind} may ever act on a given transfer, and the claim is what
+    /// decides which. It used to be a bare `remove(id)`, which was sound only
+    /// while ids were unique *for all time*: a locally minted `tx-<pid>-<n>` is
+    /// never issued twice, so an id could only ever name the one transfer.
+    ///
+    /// A wire-supplied id is not unique for all time. Consider a receive that
+    /// the user cancels: `cancel` frees the slot immediately, but the receive
+    /// task keeps running (only the send paths populate [`Active::task`], so
+    /// nothing aborts it) and unwinds later, through a `session.close()` whose
+    /// graceful close can wait seconds on an unresponsive peer. If a *second*
+    /// transfer registers under the same id inside that window — which the
+    /// peer chooses, and which the file-in-chat design makes routine, since a
+    /// retried file re-uses its `FileRef` id — then the first transfer's late
+    /// `remove(id)` would tear out the second: it would vanish from the UI on
+    /// a `transfer_cancelled` it never earned, become uncancellable ("no active
+    /// transfer"), and finish silently with no completion event and no history
+    /// row while still writing to disk. With two different peers, the terminal
+    /// event would also carry the wrong `peer_id` and route to the wrong
+    /// conversation.
+    ///
+    /// Comparing `Arc` identity instead of the id closes that: a stale claim
+    /// finds its own `Arc` absent and correctly does nothing. The `get` and the
+    /// `remove` share one lock guard, so the check and the removal are atomic.
+    ///
+    /// `cancel()` deliberately does **not** use this: it acts on whatever is
+    /// registered under the id the user pointed at, which is the current
+    /// transfer by definition.
+    fn claim(&self, mine: &Arc<Active>) -> Option<Arc<Active>> {
+        let mut active = self.active.lock().unwrap();
+        match active.get(&mine.id) {
+            Some(current) if Arc::ptr_eq(current, mine) => active.remove(&mine.id),
+            _ => None,
         }
     }
 
@@ -678,7 +727,7 @@ impl Manager {
 
         let session = match self.open_send_retry(&id, &active, &device, &meta).await {
             Ok(s) => s,
-            Err(e) => return self.finish_failed(&id, e),
+            Err(e) => return self.finish_failed(&active, e),
         };
         events::transfer(
             &id,
@@ -712,7 +761,7 @@ impl Manager {
         )
         .await;
         session.close().await;
-        self.finish(&id, outcome);
+        self.finish(&active, outcome);
     }
 
     async fn run_send_folder(
@@ -726,7 +775,7 @@ impl Manager {
         let meta = self.session(&id, device.id.clone(), 0);
         let session = match self.open_send_retry(&id, &active, &device, &meta).await {
             Ok(s) => s,
-            Err(e) => return self.finish_failed(&id, e),
+            Err(e) => return self.finish_failed(&active, e),
         };
         events::transfer(
             &id,
@@ -758,16 +807,20 @@ impl Manager {
         )
         .await;
         session.close().await;
-        self.finish(&id, outcome);
+        self.finish(&active, outcome);
     }
 
-    fn finish(&self, id: &str, outcome: DResult<TransferOutcome>) {
+    /// Terminal handling for `active`'s own transfer. Takes the `Arc<Active>`
+    /// rather than an id string so the claim below is identity-checked — see
+    /// [`claim`](Self::claim). The id is read from the entry itself
+    /// (`Active::id`), so it can never disagree with the entry being claimed.
+    fn finish(&self, active: &Arc<Active>, outcome: DResult<TransferOutcome>) {
         match outcome {
             Ok(TransferOutcome::Completed) => {
-                self.record(id, true, "transfer_completed", json!({}));
+                self.record(active, true, "transfer_completed", json!({}));
             }
-            Ok(TransferOutcome::Cancelled) => self.finish_cancelled(id),
-            Err(e) => self.finish_failed(id, from_domain(e)),
+            Ok(TransferOutcome::Cancelled) => self.finish_cancelled(active),
+            Err(e) => self.finish_failed(active, from_domain(e)),
         }
     }
 
@@ -775,45 +828,49 @@ impl Manager {
     /// chunks) and unwound with `TransferOutcome::Cancelled` — most often
     /// because `cancel()` already removed the entry and emitted
     /// `transfer_cancelled` synchronously, racing ahead of the task's own
-    /// unwind. `remove` is the atomic claim: exactly one of {`cancel()`,
-    /// this} ever gets `Some` back for a given id, so exactly one of them
-    /// emits the terminal event. No history entry for a user cancel.
-    fn finish_cancelled(&self, id: &str) {
-        let Some(a) = self.active.lock().unwrap().remove(id) else {
+    /// unwind. [`claim`](Self::claim) settles that race: exactly one of
+    /// {`cancel()`, this} ever gets `Some` back for a given transfer, so
+    /// exactly one of them emits the terminal event — and because the claim is
+    /// by identity, a late unwind can never emit against a *different*
+    /// transfer that has since taken the same id. No history entry for a user
+    /// cancel.
+    fn finish_cancelled(&self, active: &Arc<Active>) {
+        let Some(a) = self.claim(active) else {
             return;
         };
         *a.status.lock().unwrap() = "cancelled".into();
-        events::transfer(id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
+        events::transfer(&a.id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
     }
 
-    fn finish_failed(&self, id: &str, (code, msg): (Code, String)) {
-        // Claim the entry atomically: only whoever successfully removes it
-        // emits the terminal event. A concurrent `cancel()` may have already
-        // claimed (and removed) this id — in which case there is nothing
-        // left to fail here.
-        let Some(a) = self.active.lock().unwrap().remove(id) else {
+    fn finish_failed(&self, active: &Arc<Active>, (code, msg): (Code, String)) {
+        // Claim this exact transfer: only whoever successfully claims it emits
+        // the terminal event. A concurrent `cancel()` may have already claimed
+        // (and removed) it — in which case there is nothing left to fail here,
+        // and whatever now holds the id belongs to someone else.
+        let Some(a) = self.claim(active) else {
             return;
         };
         *a.status.lock().unwrap() = "failed".into();
         events::transfer(
-            id,
+            &a.id,
             "transfer_failed",
             json!({
                 "peer_id": a.peer_id,
                 "error": { "code": code.as_str(), "message": msg },
             }),
         );
-        self.record_history(id, &a, false);
+        self.record_history(&a.id, &a, false);
     }
 
     /// Success path: emit completed + append history.
-    fn record(&self, id: &str, success: bool, event: &str, extra: Value) {
-        // Same atomic-claim rationale as `finish_failed`: a concurrent
-        // `cancel()` may have already removed this id, in which case there
-        // is nothing left to record.
-        let Some(a) = self.active.lock().unwrap().remove(id) else {
+    fn record(&self, active: &Arc<Active>, success: bool, event: &str, extra: Value) {
+        // Same identity-checked claim as `finish_failed`: a concurrent
+        // `cancel()` may have already removed this transfer, in which case
+        // there is nothing left to record.
+        let Some(a) = self.claim(active) else {
             return;
         };
+        let id = &a.id;
         *a.status.lock().unwrap() = "completed".into();
         let file = a.file.lock().unwrap().clone();
         let path = a.path.lock().unwrap().clone().unwrap_or_else(|| {
@@ -1368,12 +1425,21 @@ impl Manager {
             self.wait_for_accept(&id, &session.peer_device).await
         };
         if !accepted {
-            events::transfer(
-                &id,
-                "transfer_cancelled",
-                json!({ "peer_id": session.peer_device.0, "reason": "rejected" }),
-            );
-            self.active.lock().unwrap().remove(&id);
+            // Claim before emitting, and emit only if the claim lands. The
+            // decision can arrive after `cancel()` already claimed this
+            // transfer and announced it (a user cancel fires the pending
+            // sender with `Reject`, which is one of the ways we get here), and
+            // — since the id came off the wire — the entry now under it may
+            // even belong to a *different*, live transfer. Emitting
+            // unconditionally would announce a cancellation against whichever
+            // of those the surface is currently showing.
+            if self.claim(&active).is_some() {
+                events::transfer(
+                    &id,
+                    "transfer_cancelled",
+                    json!({ "peer_id": session.peer_device.0, "reason": "rejected" }),
+                );
+            }
             session.close().await;
             return;
         }
@@ -1424,7 +1490,7 @@ impl Manager {
             }
         }
         session.close().await;
-        self.finish(&id, outcome);
+        self.finish(&active, outcome);
     }
 }
 
@@ -2088,6 +2154,154 @@ mod tests {
         let _ = mgr.stop_daemon();
     }
 
+    // ── a stale terminal claim must not tear out its successor ──────────
+    //
+    // `register_vacant` stops two live transfers holding one id at the same
+    // instant. It says nothing about the id being used AGAIN LATER — which a
+    // wire-supplied id makes ordinary: `cancel()` frees the slot at once, but
+    // a receive task keeps running (only the send paths populate
+    // `Active::task`, so nothing aborts it) and unwinds seconds later through
+    // `session.close()`. A second transfer can register under the same id in
+    // that window, and a retried chat file re-uses its `FileRef` id by design.
+    //
+    // These tests pin that the late unwind no-ops instead of removing,
+    // stamping, and announcing the *successor*. Each asserts `!Arc::ptr_eq`
+    // first so it cannot pass vacuously by both handles being the same entry.
+
+    /// Build the exact hijack window: transfer 1 registered under `id`, the
+    /// user cancels it (slot freed, task still running), transfer 2 claims the
+    /// now-vacant id. Returns both handles, distinctness already asserted.
+    fn contested(mgr: &Manager, id: &str) -> (Arc<Active>, Arc<Active>) {
+        let first = mgr
+            .register_vacant(id, "receiving", "mallory", "pb-mallory", "one.bin", None)
+            .expect("transfer 1 claims a vacant id");
+        mgr.cancel(id).expect("the user cancels transfer 1");
+        let second = mgr
+            .register_vacant(id, "receiving", "victim", "pb-victim", "two.bin", None)
+            .expect("the id is vacant while transfer 1 is still unwinding");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the test needs two genuinely distinct transfers, or it proves nothing"
+        );
+        (first, second)
+    }
+
+    /// The reported hijack: transfer 1's late `finish_cancelled` must not
+    /// remove transfer 2, stamp it "cancelled", or announce it. Pre-fix this
+    /// removed transfer 2 outright — it vanished from the UI on a
+    /// `transfer_cancelled` it never earned and could no longer be cancelled,
+    /// while still writing to disk.
+    #[tokio::test]
+    async fn a_late_finish_cancelled_does_not_tear_out_a_reregistered_transfer() {
+        let mgr = test_manager("Device");
+        let id = "peer-chosen-id";
+        let (first, second) = contested(&mgr, id);
+
+        mgr.finish_cancelled(&first); // transfer 1's unwind, arriving late
+
+        let still = mgr
+            .get_active(id)
+            .expect("transfer 2 must still be registered");
+        assert!(
+            Arc::ptr_eq(&still, &second),
+            "the registry must still hold TRANSFER 2"
+        );
+        assert_ne!(
+            *still.status.lock().unwrap(),
+            "cancelled",
+            "transfer 2 must not be stamped cancelled by transfer 1's unwind"
+        );
+        // The user can still stop it...
+        assert!(
+            mgr.cancel(id).is_ok(),
+            "transfer 2 must remain cancellable, not \"no active transfer\""
+        );
+    }
+
+    /// ...and if it is left alone, its own completion still claims: it emits
+    /// `transfer_completed` and writes its history row. (`record` emits and
+    /// records under the same claim, so the history row is the observable
+    /// proof the event fired — the event sink itself is process-global and
+    /// cannot be captured from a non-serial test.)
+    #[tokio::test]
+    async fn a_reregistered_transfer_still_completes_and_records_its_own_history() {
+        let mgr = test_manager("Device");
+        let id = "peer-chosen-id-2";
+        let (first, second) = contested(&mgr, id);
+
+        mgr.finish_cancelled(&first);
+        mgr.record(&second, true, "transfer_completed", json!({}));
+
+        let hist = mgr.history.lock().unwrap();
+        assert_eq!(hist.len(), 1, "exactly transfer 2's completion is recorded");
+        assert_eq!(hist[0]["id"], id);
+        assert_eq!(
+            hist[0]["file"], "two.bin",
+            "the recorded row must be TRANSFER 2's, not transfer 1's"
+        );
+        assert_eq!(hist[0]["peer_id"], "pb-victim");
+        assert_eq!(hist[0]["success"], true);
+    }
+
+    /// The same protection on the failure path: a late `finish_failed` must
+    /// not remove the successor or write a failure row against it.
+    #[tokio::test]
+    async fn a_late_finish_failed_does_not_tear_out_a_reregistered_transfer() {
+        let mgr = test_manager("Device");
+        let id = "peer-chosen-id-3";
+        let (first, second) = contested(&mgr, id);
+
+        mgr.finish_failed(&first, (Code::Connection, "link dropped".into()));
+
+        let still = mgr.get_active(id).expect("transfer 2 still registered");
+        assert!(Arc::ptr_eq(&still, &second));
+        assert!(
+            mgr.history.lock().unwrap().is_empty(),
+            "no failure row may be written against a transfer that did not fail"
+        );
+    }
+
+    /// And on the success path: a late `record` must not claim the successor
+    /// (which would emit a completion for a transfer that has not finished).
+    #[tokio::test]
+    async fn a_late_record_does_not_tear_out_a_reregistered_transfer() {
+        let mgr = test_manager("Device");
+        let id = "peer-chosen-id-4";
+        let (first, second) = contested(&mgr, id);
+
+        mgr.record(&first, true, "transfer_completed", json!({}));
+
+        let still = mgr.get_active(id).expect("transfer 2 still registered");
+        assert!(Arc::ptr_eq(&still, &second));
+        assert!(
+            mgr.history.lock().unwrap().is_empty(),
+            "a stale completion must not record history against the successor"
+        );
+    }
+
+    /// The primitive every terminal site now shares — including the inline
+    /// decline branch in `handle_incoming`, whose whole removal step is this
+    /// call. Claiming is by `Arc` identity, never by id string.
+    #[tokio::test]
+    async fn claim_removes_only_the_exact_transfer_it_was_given() {
+        let mgr = test_manager("Device");
+        let id = "peer-chosen-id-5";
+        let (first, second) = contested(&mgr, id);
+
+        // A stale handle claims nothing, and leaves the registry untouched.
+        assert!(
+            mgr.claim(&first).is_none(),
+            "a transfer no longer registered must not claim the entry that replaced it"
+        );
+        assert!(Arc::ptr_eq(&mgr.get_active(id).unwrap(), &second));
+
+        // The live handle claims exactly once; the second attempt is a no-op.
+        let got = mgr.claim(&second).expect("the live transfer claims itself");
+        assert!(Arc::ptr_eq(&got, &second));
+        assert!(mgr.claim(&second).is_none(), "claiming twice must not work");
+        assert!(mgr.active.lock().unwrap().is_empty());
+    }
+
     // ── BUG 2: exactly one terminal event/history entry per transfer ────
     //
     // `cancel()` and the terminal paths (`record`/`finish_failed`/
@@ -2101,7 +2315,8 @@ mod tests {
     async fn cancel_then_finish_failed_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-cancel-first";
-        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+        let a = mgr
+            .register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
             .expect("freshly registered id is vacant");
 
         mgr.cancel(id)
@@ -2111,7 +2326,7 @@ mod tests {
         // The task's own unwind races in *after* cancel already claimed
         // (removed) the entry — this must be a no-op: no second terminal
         // event/history entry for an id the UI was already told is gone.
-        mgr.finish_failed(id, (Code::Connection, "link dropped".into()));
+        mgr.finish_failed(&a, (Code::Connection, "link dropped".into()));
 
         assert!(
             mgr.history.lock().unwrap().is_empty(),
@@ -2124,10 +2339,11 @@ mod tests {
     async fn finish_failed_then_cancel_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-finish-first";
-        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+        let a = mgr
+            .register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
             .expect("freshly registered id is vacant");
 
-        mgr.finish_failed(id, (Code::Connection, "link dropped".into()));
+        mgr.finish_failed(&a, (Code::Connection, "link dropped".into()));
         assert_eq!(
             mgr.history.lock().unwrap().len(),
             1,
@@ -2150,10 +2366,11 @@ mod tests {
     async fn record_then_cancel_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-record-first";
-        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+        let a = mgr
+            .register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
             .expect("freshly registered id is vacant");
 
-        mgr.record(id, true, "transfer_completed", json!({}));
+        mgr.record(&a, true, "transfer_completed", json!({}));
         assert_eq!(mgr.history.lock().unwrap().len(), 1);
 
         let res = mgr.cancel(id);
