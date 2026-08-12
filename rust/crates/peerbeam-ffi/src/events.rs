@@ -81,6 +81,20 @@ pub fn chat(rec: &peerbeam_chat::ChatRecord) {
     }));
 }
 
+/// Emit a `chat_status` event when a queued message's delivery status changes
+/// (currently only `"sent"`, fired once a background flush delivers a
+/// previously-queued message — see `Manager::chat_flush_peer` and the
+/// flush-on-connect path in `handle_incoming`).
+pub fn chat_status(peer_id: &str, message_id: &str, status: &str) {
+    emit(&json!({
+        "type": "chat_status",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message_id": message_id,
+        "peer_id": peer_id,
+        "status": status,
+    }));
+}
+
 /// Additive PeerSession lifecycle event vocabulary. New `type` strings only —
 /// existing consumers ignore unknown types, so this never breaks the callback
 /// contract. Published so consumers (Dart) can subscribe additively; marked

@@ -78,6 +78,28 @@ fn wait_record(secs: u64, records: &Mutex<Vec<ChatRecord>>) -> Option<ChatRecord
     None
 }
 
+/// Poll `pb_chat_history` for `peer_id` until the message `msg_id` shows
+/// `status`, up to `secs` (bounded, ~50ms steps — no fixed sleep). Needed
+/// because `chat_send` now enqueues (`Pending`) and returns immediately,
+/// delivering — and flipping the record to `Sent` — via a spawned background
+/// flush (`Manager::chat_flush_peer`), so the status update can lag the
+/// `chat_send` call by a beat instead of being visible synchronously.
+fn wait_chat_status(secs: u64, peer_id: &str, msg_id: &str, status: &str) -> Option<Value> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let hist = call_json(pb_chat_history, &json!({ "peer_id": peer_id }));
+        if let Some(messages) = hist["data"]["messages"].as_array() {
+            if let Some(m) = messages.iter().find(|m| m["id"] == msg_id) {
+                if m["status"] == status {
+                    return Some(m.clone());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
 // ── FFI call helpers (mirrors transfer_ffi.rs) ──────────────────
 
 fn take(ptr: *mut c_char) -> Value {
@@ -255,16 +277,25 @@ async fn chat_send_from_ffi_reaches_peer_and_persists_sent_record() {
     assert_eq!(got.body, "hi");
     assert_eq!(got.id, msg_id, "same message id round-trips");
 
-    // The FFI engine's own chat_history shows the record it just sent.
+    // The FFI engine's own chat_history shows the record it just sent, once
+    // the background flush (spawned by `chat_send`) has delivered it and
+    // flipped it from `Pending` to `Sent` — bounded poll, not an immediate
+    // assertion, since `chat_send` no longer blocks until delivery.
+    let sent_msg = wait_chat_status(5, "receiver", &msg_id, "sent")
+        .expect("message did not reach status \"sent\" within 5s");
+    assert_eq!(sent_msg["id"], msg_id);
+    assert_eq!(sent_msg["body"], "hi");
+    assert_eq!(sent_msg["peer_id"], "receiver");
+    assert_eq!(sent_msg["direction"], "out");
+
     let hist = call_json(pb_chat_history, &json!({ "peer_id": "receiver" }));
     assert_eq!(hist["ok"], true, "chat_history: {hist}");
     let messages = hist["data"]["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["id"], msg_id);
-    assert_eq!(messages[0]["body"], "hi");
-    assert_eq!(messages[0]["peer_id"], "receiver");
-    assert_eq!(messages[0]["direction"], "out");
-    assert_eq!(messages[0]["status"], "sent");
+    assert_eq!(
+        messages.len(),
+        1,
+        "exactly one history record for this peer"
+    );
 
     pb_shutdown();
 }

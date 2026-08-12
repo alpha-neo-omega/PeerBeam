@@ -931,58 +931,80 @@ impl Manager {
 
     // ── chat ────────────────────────────────────────────────────
 
-    /// Send a chat message to a peer: dial (advertising the Chat capability
-    /// but registering no handler on this side — see
-    /// `session_exec::session_cfg`; the receiver's `handle_incoming` is what
-    /// registers the `ChatHandler`), open a Chat channel, send one Message
-    /// frame, and persist the Sent record. Blocks the calling thread on the
-    /// FFI runtime for the duration of the dial + send (bounded by `dial`'s
-    /// per-route attempt and `send_message`'s channel-open budget) so the
-    /// caller gets the persisted record's id synchronously.
-    pub fn chat_send(&self, req: &Value) -> Op {
+    /// Queue a chat message to a peer and return immediately: persists it as
+    /// `Pending` and enqueues it to the outbox synchronously (so the id is
+    /// durable and visible in `chat_history` before this returns), then spawns
+    /// a best-effort opportunistic flush in the background. Delivery — and
+    /// the resulting `chat_status: "sent"` event — happens asynchronously via
+    /// [`Self::chat_flush_peer`]; if the peer is unreachable right now the
+    /// message simply stays queued for a later flush (a drain tick, or the
+    /// next flush-on-connect).
+    pub fn chat_send(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
         let text = req
             .get("text")
             .and_then(|v| v.as_str())
-            .ok_or((Code::InvalidArgument, "text required".into()))?
-            .to_string();
-        let peer_id = device.id.clone();
-        let meta = self.session(&format!("chat-{}", peer_id.0), peer_id.clone(), 0);
-        let (quic, rm, ident, enc, trust, chat) = (
-            self.quic.clone(),
-            self.rm.clone(),
+            .ok_or((Code::InvalidArgument, "text required".into()))?;
+        let msg = peerbeam_chat::ChatMessage::new(text)
+            .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        // Persist Pending + enqueue immediately; return without waiting on the network.
+        self.chat
+            .enqueue(&device.id, &msg)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let id = msg.id.clone();
+        // Opportunistic delivery in the background (best-effort; a later
+        // drain/flush-on-connect covers the rest if this peer is unreachable
+        // right now).
+        let me = self.clone();
+        crate::runtime::spawn(async move {
+            let _ = me.chat_flush_peer(device).await;
+        });
+        Ok(json!({ "id": id }))
+    }
+
+    /// Distinct peers that currently have queued (undelivered) messages.
+    /// Unused within this crate today — `chat_send`'s opportunistic flush and
+    /// `handle_incoming`'s flush-on-connect are the only delivery paths wired
+    /// so far — but published for a future periodic drain tick to iterate.
+    #[allow(dead_code)]
+    pub fn chat_outbox_peers(&self) -> Vec<DeviceId> {
+        self.chat.outbox_peers().unwrap_or_default()
+    }
+
+    /// Dial `device` and flush its queued messages over a fresh session,
+    /// emitting `chat_status: "sent"` for each one delivered. Best-effort: an
+    /// unreachable peer leaves its queue intact for a later attempt (the next
+    /// `chat_send`'s opportunistic flush, a periodic drain, or the peer's own
+    /// next flush-on-connect). Returns the flushed message ids.
+    pub async fn chat_flush_peer(&self, device: Device) -> Vec<String> {
+        let meta = self.session(&format!("chat-{}", device.id.0), device.id.clone(), 0);
+        let session = match crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
             self.identity(),
             self.enc.clone(),
             self.trust.clone(),
-            self.chat.clone(),
-        );
-        let rec = crate::runtime::block_on(async move {
-            let session =
-                crate::session_exec::dial(&quic, &rm, &device, &meta, ident, enc, trust, None)
-                    .await?;
-            // Capture the outcome WITHOUT short-circuiting: the session must be
-            // closed on every path once it exists, or a post-dial failure (peer
-            // rejects the Chat channel, send times out) leaks the QUIC
-            // connection, its run-loop task, and its diagnostics-registry entry
-            // forever (`Session` has no `Drop` that closes it). Mirrors
-            // `run_send`/`run_send_folder`, which always call `session.close()`
-            // regardless of outcome.
-            // The record's peer must be the session's *authenticated* peer id,
-            // not the pre-dial (possibly discovered/advertised) `device.id` —
-            // chat history is namespaced by device id, so using the pre-dial
-            // id would let it diverge from the authenticated identity the
-            // receiving side records under, splitting the conversation across
-            // two namespaces. Mirrors the CLI's `chat send` (`bins/peerbeam-
-            // cli/src/chat.rs`), which uses `session.peer_id` for the same
-            // reason.
-            let result: Result<_, (Code, String)> =
-                peerbeam_chat::send_message(&session.handle, &chat, &session.peer_device, &text)
-                    .await
-                    .map_err(|e| (Code::Connection, e.to_string()));
-            session.close().await;
-            result
-        })?;
-        Ok(json!({ "id": rec.id }))
+            None,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(), // unreachable; stays queued
+        };
+        // The authenticated peer, not the pre-dial `device.id` — mirrors the
+        // same rationale documented on the old `chat_send`: the outbox/history
+        // are namespaced by the authenticated identity.
+        let peer = session.peer_device.clone();
+        let flushed = peerbeam_chat::flush_to_session(&session.handle, &self.chat, &peer)
+            .await
+            .unwrap_or_default();
+        session.close().await;
+        for mid in &flushed {
+            events::chat_status(&peer.0, mid, "sent");
+        }
+        flushed
     }
 
     /// Conversation history with one peer, chronological (oldest first).
@@ -1099,6 +1121,20 @@ impl Manager {
                 return;
             }
         };
+        // Flush-on-connect: deliver anything queued for this peer over the
+        // session we just accepted (cheaper + faster than waiting for the
+        // next drain tick), independent of whatever this inbound connection
+        // is actually for (a transfer, or nothing at all) — best-effort, so a
+        // peer with an empty outbox costs nothing beyond the lookup.
+        {
+            let flushed =
+                peerbeam_chat::flush_to_session(&session.handle, &self.chat, &session.peer_device)
+                    .await
+                    .unwrap_or_default();
+            for mid in &flushed {
+                events::chat_status(&session.peer_device.0, mid, "sent");
+            }
+        }
         let id = self.next_id();
         // Prefer the peer's human name from the handshake; fall back to the raw
         // device id only when the peer presented no name.
