@@ -609,3 +609,138 @@ async fn send_message_fails_fast_when_the_peer_rejects_the_channel() {
         "a rejected send must not persist a Sent record"
     );
 }
+
+/// Regression for the FFI review's Finding 1 (PeerBeam increment 1b, task 3
+/// re-review): "flush-on-connect" pushes queued messages from the ACCEPT side
+/// (Responder, here B — analogous to the FFI's `handle_incoming`) onto the
+/// session toward the peer that DIALED IN (Initiator, here A — analogous to a
+/// `session_exec::dial`ed session). The bug: every dial in `peerbeam-ffi`
+/// registered no `ChatHandler` on its own side (`chat: None`), so a session it
+/// dialed could *send* fine but could not *receive* — a message pushed onto it
+/// from the far side was silently dropped by the channel dispatch loop (`if
+/// let Some(h) = &handler { h.handle(sf) }`, no `else` — see
+/// `peerbeam-transfer`'s channel actor), even though the flushing side had
+/// already marked it `Sent` and removed it from its own outbox. Net effect:
+/// the message vanished, reported delivered, never actually received, never
+/// retried.
+///
+/// This test reproduces the exact push direction the bug was in and proves
+/// the fix's shape: A (the dialer) is given a `ChatHandler`, matching what the
+/// FFI's fixed `open_send_retry`/`chat_flush_peer` now always wire up (instead
+/// of `chat: None`). B has a message queued for A *before* this session
+/// exists (the offline-then-connect scenario), then flushes it over the
+/// session it (as Responder) accepted. Against the pre-fix shape — drop
+/// `.with_handlers(...)` from `a_cfg` below, reproducing a bare dial with no
+/// handler — this test fails: the receive-side poll below times out and the
+/// `.expect(...)` panics, because the frame is decoded (dispatch loop runs)
+/// but never reaches any handler to persist it.
+#[tokio::test]
+async fn flush_pushes_from_the_accept_side_to_a_handler_equipped_dialer() {
+    // ── A: the "dialer" (Initiator) — must have a ChatHandler registered to
+    //    receive a message the far side pushes onto this same session. ─────
+    let store_a = chat_store(24);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_a, peer_slot_a) = ChatHandler::new(store_a.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    // Dialer (A, Initiator): advertises CHAT AND registers a handler — this
+    // is the fix under test (the FFI's pre-fix dial passed `chat: None`).
+    let a_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_a));
+    // Accept side (B, Responder): no handler needed here — B only ever
+    // flushes OUT in this test, mirroring `handle_incoming`'s flush-on-connect
+    // (it never itself receives a chat frame in that codepath).
+    let b_cfg = SessionConfig::new(caps());
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let b_handle = b.handle();
+
+    // Bind the dialer's peer slot to the accept side's device id before the
+    // run loops start dispatching frames.
+    let _ = peer_slot_a.set(b_id.clone());
+
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // ── B (the accept-analog) has a message queued for A (the dial-analog)
+    //    from before this session existed — the flush-on-connect scenario. ──
+    let store_b = chat_store(25);
+    let msg = ChatMessage::new("pushed on accept").unwrap();
+    store_b.enqueue(&a_id, &msg).unwrap();
+
+    // ── B flushes over the session it just accepted, pushing toward A. ──────
+    let flushed = peerbeam_chat::flush_to_session(&b_handle, &store_b, &a_id)
+        .await
+        .expect("flush succeeds");
+    assert_eq!(flushed, vec![msg.id.clone()]);
+
+    // B's own bookkeeping: outbox drained, record flipped to Sent — this part
+    // passed even in the pre-fix (buggy) code, which is exactly the danger:
+    // B reports success while the message never arrives.
+    assert!(store_b.outbox_for(&a_id).unwrap().is_empty());
+    let hist_b = store_b.history(&a_id).unwrap();
+    assert_eq!(hist_b.len(), 1);
+    assert_eq!(hist_b[0].status, peerbeam_chat::Status::Sent);
+
+    // ── A (the dialer) must actually receive + persist it — this is the
+    //    assertion that only passes with a handler registered on A. ─────────
+    let mut got: Option<ChatRecord> = None;
+    for _ in 0..200 {
+        let snapshot = received.lock().unwrap().clone();
+        if let Some(first) = snapshot.into_iter().next() {
+            got = Some(first);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let received_rec = got.expect(
+        "A (the dialer) did not receive the pushed message within 2s — this is exactly the \
+         FFI bug: a dialed session with no ChatHandler silently drops a pushed CHAT frame",
+    );
+    assert_eq!(received_rec.body, "pushed on accept");
+    assert_eq!(received_rec.peer_id, b_id.0);
+
+    let hist_a = store_a.history(&b_id).expect("store_a history readable");
+    assert_eq!(hist_a.len(), 1, "A persisted exactly one record");
+    assert_eq!(hist_a[0].body, "pushed on accept");
+    assert_eq!(hist_a[0].id, msg.id, "same message id round-trips");
+}

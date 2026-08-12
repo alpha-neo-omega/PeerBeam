@@ -294,6 +294,24 @@ impl Manager {
         *self.identity_name.write().unwrap() = name;
     }
 
+    /// The chat wiring every session registers, regardless of which side
+    /// dialed. Chat frames get *pushed* over whichever session happens to
+    /// exist between two peers, in either direction — `chat_send`'s
+    /// opportunistic flush and `chat_flush_peer` push over a session *we*
+    /// dialed; `handle_incoming`'s flush-on-connect pushes over a session the
+    /// peer dialed into us. A session with no `ChatHandler` registered on a
+    /// given side doesn't error on an inbound CHAT frame — the channel
+    /// dispatch loop just silently drops it (see `peerbeam-transfer`'s
+    /// channel actor: `if let Some(h) = &handler { h.handle(sf) }`, no
+    /// `else`) — so every session, dial or accept, needs this wired or a
+    /// pushed message is lost even though the sender marks it delivered.
+    fn chat_wiring(&self) -> crate::session_exec::ChatWiring {
+        crate::session_exec::ChatWiring {
+            store: self.chat.clone(),
+            sink: Arc::new(|rec| crate::events::chat(&rec)),
+        }
+    }
+
     pub fn daemon_status(&self) -> Value {
         json!({
             "running": self.daemon_running.load(Ordering::SeqCst),
@@ -507,10 +525,13 @@ impl Manager {
                 self.identity(),
                 self.enc.clone(),
                 self.trust.clone(),
-                // The sender advertises the Chat capability (see
-                // `session_exec::session_cfg`) but registers no handler here —
-                // chat *sending* is wired in a later task.
-                None,
+                // Register chat wiring even for a plain file-transfer dial:
+                // this session can still be the one a concurrent
+                // `chat_send`/flush pushes a queued message over from the
+                // other side, and without a handler that pushed frame is
+                // silently dropped instead of persisted (see `chat_wiring`'s
+                // doc comment).
+                Some(self.chat_wiring()),
             )
             .await
             {
@@ -986,7 +1007,10 @@ impl Manager {
             self.identity(),
             self.enc.clone(),
             self.trust.clone(),
-            None,
+            // Same rationale as `open_send_retry`: this dialed session must
+            // be able to receive a CHAT frame the peer pushes back (e.g. its
+            // own flush-on-connect), not just carry ours out.
+            Some(self.chat_wiring()),
         )
         .await
         {
@@ -1098,20 +1122,16 @@ impl Manager {
     }
 
     async fn handle_incoming(self: Arc<Self>, qc: QuicChannels) {
-        // Chat wiring for the accept side: the handler persists each inbound
-        // record via `self.chat` itself, then calls this sink purely to
-        // notify — the sink must not re-persist.
-        let wiring = crate::session_exec::ChatWiring {
-            store: self.chat.clone(),
-            sink: Arc::new(|rec| crate::events::chat(&rec)),
-        };
         // Establish the responder PeerSession (runs the handshake internally).
+        // Chat wiring: the handler persists each inbound record via
+        // `self.chat` itself, then calls the sink purely to notify — the
+        // sink must not re-persist.
         let mut session = match crate::session_exec::accept(
             qc,
             self.identity(),
             self.enc.clone(),
             self.trust.clone(),
-            Some(wiring),
+            Some(self.chat_wiring()),
         )
         .await
         {
