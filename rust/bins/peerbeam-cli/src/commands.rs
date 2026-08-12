@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::error::Result as DResult;
+use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::{ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
@@ -1158,111 +1159,273 @@ async fn serve_loop(
     // load failure here shouldn't abort an otherwise-working receive/daemon —
     // `SecureCtx::build` above already proved the identity file is usable, but
     // this stays defensive rather than assuming that. `engine` is carried past
-    // the loop below so discovery can be stopped on the way out.
+    // the loop below so discovery can be stopped on the way out, and doubles as
+    // the drain tick's peer-reachability source (see below).
     let engine = build_engine(config.clone()).ok();
     if let (Some(engine), Ok(self_device)) = (&engine, me(config)) {
         let _ = engine.start_discovery(self_device).await;
     }
 
-    loop {
-        let qc = match incoming.next().await {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => {
-                if !ctx.json {
-                    ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
-                }
-                continue;
-            }
-            None => break,
-        };
-        // Establish the PeerSession (runs the handshake internally).
-        let mut session =
-            match crate::session_transfer::accept(qc, &sc.ident, &sc.enc, &sc.trust, None).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if ctx.json {
-                        ctx.json_line(
-                            &json!({"event": "error", "message": format!("session failed: {e}")}),
-                        );
-                    } else {
-                        ctx.line(&ctx.dim(&format!("session failed: {e}")));
-                    }
-                    continue;
-                }
-            };
-        let newly_trusted = session.newly_trusted;
-        let peer_id = session.peer_id.clone();
-        if newly_trusted && !ctx.json {
-            ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
-            ctx.line(&format!(
-                "  pairing code: {}",
-                ctx.bold(&session.pairing_code)
-            ));
-        }
+    // Chat: this session is dual-purpose (transfer + chat) — every accepted
+    // connection registers a chat handler too, so a peer's `chat send` is
+    // received while we serve files/folders, and a periodic drain tick
+    // retries delivery to any peer whose outbox still has queued messages
+    // once discovery reports them reachable (`crate::chat::drain_tick`). The
+    // same `quic` instance both serves (above) and dials (the drain tick) —
+    // `serve_channels_on` binds its own server-side endpoint independent of
+    // the client endpoint `dial_channels` uses, so no second transport is
+    // needed (mirrors the FFI's `Manager`, which reuses one `self.quic` for
+    // both `serve()` and `chat_flush_peer`'s dial).
+    let chat = chat_store(config, &sc.enc, &sc.ident);
+    let routes = RouteManager::new(quic.clone());
+    let sink = crate::chat::received_sink(ctx);
+    let mut drain = tokio::time::interval(crate::chat::DRAIN_EVERY);
+    // If a tick is missed (e.g. we were busy serving a long-lived transfer),
+    // resume the plain periodic cadence rather than firing a burst of
+    // catch-up ticks — mirrors the FFI's `chat_drain_loop`.
+    drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Optional first-contact pairing check: when the toggle is on and this
-        // peer was just pinned, require the operator to confirm the pairing
-        // code matches before accepting the transfer. Declining (or having no
-        // way to prompt — JSON/non-interactive mode) un-pins the peer and
-        // aborts this connection; discovery/serving continues.
-        let answer = if config.device.require_pairing_confirmation && newly_trusted {
-            if ctx.json {
-                None // cannot prompt in JSON/non-interactive mode
-            } else {
-                ctx.line("Does the pairing code match the other device? [y/N]");
-                let mut stdin = std::io::stdin().lock();
-                read_confirm(&mut stdin)
+    loop {
+        tokio::select! {
+            _ = drain.tick() => {
+                if let Some(eng) = &engine {
+                    crate::chat::drain_tick(eng, &chat, &quic, &routes, &sc, &sink).await;
+                }
             }
-        } else {
-            None
-        };
-        match pairing_gate(
-            newly_trusted,
-            config.device.require_pairing_confirmation,
-            answer,
-        ) {
-            PairingGate::Proceed | PairingGate::Confirmed => {}
-            PairingGate::Revoke => {
-                // `peer_id` here is the plain-string form the CLI's `Session`
-                // wrapper surfaces (see `session_transfer::Session::peer_id`);
-                // `FsTrust::remove` takes the newtyped `DeviceId`. This is a
-                // security-relevant un-pin: swallowing an `Err` here would
-                // leave the peer trusted on disk while claiming otherwise —
-                // the next connection would then find it already trusted,
-                // skip the gate entirely (no `newly_trusted`), and silently
-                // defeat the whole check. So the result is checked, and a
-                // failed un-pin still fails the connection closed (it must
-                // never fall through to receiving data either way).
-                match sc
-                    .trust
-                    .remove(&peerbeam_domain::id::DeviceId::from(peer_id.clone()))
+            item = incoming.next() => {
+                let qc = match item {
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => {
+                        if !ctx.json {
+                            ctx.line(&ctx.dim(&format!("inbound rejected: {e}")));
+                        }
+                        continue;
+                    }
+                    None => break,
+                };
+                // Establish the PeerSession (runs the handshake internally);
+                // register the chat handler on this side too (see
+                // `crate::chat`'s module doc on why dial/accept symmetry
+                // matters — an unhandled push is silently dropped, not
+                // errored).
+                let mut session = match crate::session_transfer::accept(
+                    qc,
+                    &sc.ident,
+                    &sc.enc,
+                    &sc.trust,
+                    Some((chat.clone(), sink.clone())),
+                )
+                .await
                 {
-                    Ok(_) => {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if ctx.json {
+                            ctx.json_line(
+                                &json!({"event": "error", "message": format!("session failed: {e}")}),
+                            );
+                        } else {
+                            ctx.line(&ctx.dim(&format!("session failed: {e}")));
+                        }
+                        continue;
+                    }
+                };
+                let newly_trusted = session.newly_trusted;
+                let peer_id = session.peer_id.clone();
+                // Flush-on-connect: push anything already queued for this peer
+                // now that we have a live session with them — cheaper/faster
+                // than waiting for the next drain tick, and independent of
+                // whatever this connection is otherwise for (a transfer, or a
+                // pairing-gate rejection below). Mirrors the FFI's
+                // `handle_incoming` flush-on-connect (runs before the
+                // transfer-accept gate, since chat delivery is orthogonal to
+                // transfer consent).
+                let _ = peerbeam_chat::flush_to_session(
+                    &session.handle,
+                    &chat,
+                    &DeviceId::from(peer_id.clone()),
+                )
+                .await;
+                if newly_trusted && !ctx.json {
+                    ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
+                    ctx.line(&format!(
+                        "  pairing code: {}",
+                        ctx.bold(&session.pairing_code)
+                    ));
+                }
+
+                // Optional first-contact pairing check: when the toggle is on and this
+                // peer was just pinned, require the operator to confirm the pairing
+                // code matches before accepting the transfer. Declining (or having no
+                // way to prompt — JSON/non-interactive mode) un-pins the peer and
+                // aborts this connection; discovery/serving continues.
+                let answer = if config.device.require_pairing_confirmation && newly_trusted {
+                    if ctx.json {
+                        None // cannot prompt in JSON/non-interactive mode
+                    } else {
+                        ctx.line("Does the pairing code match the other device? [y/N]");
+                        let mut stdin = std::io::stdin().lock();
+                        read_confirm(&mut stdin)
+                    }
+                } else {
+                    None
+                };
+                match pairing_gate(
+                    newly_trusted,
+                    config.device.require_pairing_confirmation,
+                    answer,
+                ) {
+                    PairingGate::Proceed | PairingGate::Confirmed => {}
+                    PairingGate::Revoke => {
+                        // `peer_id` here is the plain-string form the CLI's `Session`
+                        // wrapper surfaces (see `session_transfer::Session::peer_id`);
+                        // `FsTrust::remove` takes the newtyped `DeviceId`. This is a
+                        // security-relevant un-pin: swallowing an `Err` here would
+                        // leave the peer trusted on disk while claiming otherwise —
+                        // the next connection would then find it already trusted,
+                        // skip the gate entirely (no `newly_trusted`), and silently
+                        // defeat the whole check. So the result is checked, and a
+                        // failed un-pin still fails the connection closed (it must
+                        // never fall through to receiving data either way).
+                        match sc
+                            .trust
+                            .remove(&peerbeam_domain::id::DeviceId::from(peer_id.clone()))
+                        {
+                            Ok(_) => {
+                                if ctx.json {
+                                    ctx.json_line(&json!({
+                                        "event": "error",
+                                        "message": "pairing code not confirmed; peer un-pinned",
+                                        "peer": peer_id,
+                                    }));
+                                } else {
+                                    ctx.line(&ctx.red(
+                                        "pairing code not confirmed — un-pinned peer (possible MITM); transfer aborted",
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                if ctx.json {
+                                    ctx.json_line(&json!({
+                                        "event": "error",
+                                        "message": format!(
+                                            "pairing code not confirmed; FAILED to un-pin peer: {e}"
+                                        ),
+                                        "peer": peer_id,
+                                    }));
+                                } else {
+                                    ctx.line(&ctx.red(&format!(
+                                        "pairing code not confirmed — FAILED to un-pin peer ({e}); transfer aborted regardless",
+                                    )));
+                                }
+                            }
+                        }
+                        session.close().await;
+                        if once {
+                            break;
+                        }
+                        continue; // move on to the next inbound connection
+                    }
+                }
+
+                // Await the peer's transfer channel.
+                let incoming_ch = match session.next_incoming().await {
+                    Some(c) => c,
+                    None => {
+                        if ctx.json {
+                            ctx.json_line(&json!({"event": "error", "message": "closed before data"}));
+                        } else {
+                            ctx.line(&ctx.red("transfer failed: closed before data"));
+                        }
+                        session.close().await;
+                        if once {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let storage_ref = &storage;
+                let handle = &session.handle;
+                let (ptx, mut prx) = mpsc::unbounded_channel();
+                let ctrl = TransferControl::new();
+                let recv = async move {
+                    let r = receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx).await;
+                    drop(ptx);
+                    r
+                };
+                // Human progress bar (created lazily once the total size is known).
+                let pump = async move {
+                    let mut bar: Option<crate::output::Bar> = None;
+                    while let Some(p) = prx.recv().await {
+                        if !ctx.json {
+                            let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
+                            b.update(p.transferred_bytes);
+                        }
+                    }
+                    if let Some(b) = bar {
+                        b.finish();
+                    }
+                };
+                let (r, _) = tokio::join!(recv, pump);
+                let hist = history::path_for(&config.storage.data_directory);
+                match r {
+                    Ok(ChannelReceived::File(rcv)) => {
+                        let saved = std::path::Path::new(dir)
+                            .join(&rcv.name)
+                            .to_string_lossy()
+                            .into_owned();
+                        history::record(
+                            &hist,
+                            history::entry("receiving", &peer_id, &rcv.name, &saved, rcv.bytes, true),
+                        );
                         if ctx.json {
                             ctx.json_line(&json!({
-                                "event": "error",
-                                "message": "pairing code not confirmed; peer un-pinned",
+                                "event": "received",
+                                "file": rcv.name,
+                                "bytes": rcv.bytes,
                                 "peer": peer_id,
+                                "newly_trusted": newly_trusted,
+                                "pairing_code": session.pairing_code.clone(),
+                                "transport": "peersession",
                             }));
                         } else {
-                            ctx.line(&ctx.red(
-                                "pairing code not confirmed — un-pinned peer (possible MITM); transfer aborted",
-                            ));
+                            ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
+                        }
+                    }
+                    Ok(ChannelReceived::Folder(fr)) => {
+                        let saved = std::path::Path::new(dir)
+                            .join(&fr.root)
+                            .to_string_lossy()
+                            .into_owned();
+                        history::record(
+                            &hist,
+                            history::entry("receiving", &peer_id, &fr.root, &saved, 0, true),
+                        );
+                        if ctx.json {
+                            ctx.json_line(&json!({
+                                "event": "received_folder",
+                                "folder": fr.root,
+                                "files": fr.files,
+                                "peer": peer_id,
+                                "newly_trusted": newly_trusted,
+                                "pairing_code": session.pairing_code.clone(),
+                                "transport": "peersession",
+                            }));
+                        } else {
+                            ctx.line(
+                                &ctx.green(&format!("received folder {} ({} files)", fr.root, fr.files)),
+                            );
                         }
                     }
                     Err(e) => {
+                        history::record(
+                            &hist,
+                            history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
+                        );
                         if ctx.json {
-                            ctx.json_line(&json!({
-                                "event": "error",
-                                "message": format!(
-                                    "pairing code not confirmed; FAILED to un-pin peer: {e}"
-                                ),
-                                "peer": peer_id,
-                            }));
+                            ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
                         } else {
-                            ctx.line(&ctx.red(&format!(
-                                "pairing code not confirmed — FAILED to un-pin peer ({e}); transfer aborted regardless",
-                            )));
+                            ctx.line(&ctx.red(&format!("transfer failed: {e}")));
                         }
                     }
                 }
@@ -1270,115 +1433,7 @@ async fn serve_loop(
                 if once {
                     break;
                 }
-                continue; // move on to the next inbound connection
             }
-        }
-
-        // Await the peer's transfer channel.
-        let incoming_ch = match session.next_incoming().await {
-            Some(c) => c,
-            None => {
-                if ctx.json {
-                    ctx.json_line(&json!({"event": "error", "message": "closed before data"}));
-                } else {
-                    ctx.line(&ctx.red("transfer failed: closed before data"));
-                }
-                session.close().await;
-                if once {
-                    break;
-                }
-                continue;
-            }
-        };
-
-        let storage_ref = &storage;
-        let handle = &session.handle;
-        let (ptx, mut prx) = mpsc::unbounded_channel();
-        let ctrl = TransferControl::new();
-        let recv = async move {
-            let r = receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx).await;
-            drop(ptx);
-            r
-        };
-        // Human progress bar (created lazily once the total size is known).
-        let pump = async move {
-            let mut bar: Option<crate::output::Bar> = None;
-            while let Some(p) = prx.recv().await {
-                if !ctx.json {
-                    let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
-                    b.update(p.transferred_bytes);
-                }
-            }
-            if let Some(b) = bar {
-                b.finish();
-            }
-        };
-        let (r, _) = tokio::join!(recv, pump);
-        let hist = history::path_for(&config.storage.data_directory);
-        match r {
-            Ok(ChannelReceived::File(rcv)) => {
-                let saved = std::path::Path::new(dir)
-                    .join(&rcv.name)
-                    .to_string_lossy()
-                    .into_owned();
-                history::record(
-                    &hist,
-                    history::entry("receiving", &peer_id, &rcv.name, &saved, rcv.bytes, true),
-                );
-                if ctx.json {
-                    ctx.json_line(&json!({
-                        "event": "received",
-                        "file": rcv.name,
-                        "bytes": rcv.bytes,
-                        "peer": peer_id,
-                        "newly_trusted": newly_trusted,
-                        "pairing_code": session.pairing_code.clone(),
-                        "transport": "peersession",
-                    }));
-                } else {
-                    ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
-                }
-            }
-            Ok(ChannelReceived::Folder(fr)) => {
-                let saved = std::path::Path::new(dir)
-                    .join(&fr.root)
-                    .to_string_lossy()
-                    .into_owned();
-                history::record(
-                    &hist,
-                    history::entry("receiving", &peer_id, &fr.root, &saved, 0, true),
-                );
-                if ctx.json {
-                    ctx.json_line(&json!({
-                        "event": "received_folder",
-                        "folder": fr.root,
-                        "files": fr.files,
-                        "peer": peer_id,
-                        "newly_trusted": newly_trusted,
-                        "pairing_code": session.pairing_code.clone(),
-                        "transport": "peersession",
-                    }));
-                } else {
-                    ctx.line(
-                        &ctx.green(&format!("received folder {} ({} files)", fr.root, fr.files)),
-                    );
-                }
-            }
-            Err(e) => {
-                history::record(
-                    &hist,
-                    history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
-                );
-                if ctx.json {
-                    ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
-                } else {
-                    ctx.line(&ctx.red(&format!("transfer failed: {e}")));
-                }
-            }
-        }
-        session.close().await;
-        if once {
-            break;
         }
     }
 

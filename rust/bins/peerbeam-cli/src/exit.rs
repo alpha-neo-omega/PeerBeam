@@ -90,3 +90,15 @@ impl From<peerbeam_engine::EngineError> for CliError {
         }
     }
 }
+
+impl From<peerbeam_chat::ChatError> for CliError {
+    fn from(e: peerbeam_chat::ChatError) -> Self {
+        // Only `TooLarge` is a usage error (bad input, e.g. `chat send` with an
+        // over-cap body); everything else (serialization, wrong wire type) is
+        // an internal/unexpected failure the caller cannot fix by rephrasing.
+        match &e {
+            peerbeam_chat::ChatError::TooLarge { .. } => CliError::Usage(e.to_string()),
+            _ => CliError::Other(e.to_string()),
+        }
+    }
+}
