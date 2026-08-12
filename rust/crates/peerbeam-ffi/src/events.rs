@@ -63,6 +63,27 @@ pub fn transfer(id: &str, ty: &str, payload: Value) {
     }));
 }
 
+/// The JSON projection of one persisted chat record — the single shape every
+/// surface sees, whether a record arrives live on a `chat_received` event or is
+/// read back from `pb_chat_history`. Shared by both so the two can never drift
+/// (a field visible in history but missing from the event, or the reverse, is
+/// a bug that only shows up in one code path).
+///
+/// `kind`/`file` are additive: a text record serializes `kind: "text"` and a
+/// null `file`, exactly as before for every consumer that ignores them.
+pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
+    json!({
+        "id": rec.id,
+        "peer_id": rec.peer_id,
+        "direction": rec.direction,
+        "timestamp": rec.timestamp,
+        "body": rec.body,
+        "status": rec.status,
+        "kind": rec.kind,
+        "file": rec.file,
+    })
+}
+
 /// Emit a `chat_received` event carrying one persisted record. The handler
 /// that decoded and persisted the record calls this only to notify — it does
 /// not re-persist (the `ChatStore` write already happened in `ChatHandler`).
@@ -70,14 +91,7 @@ pub fn chat(rec: &peerbeam_chat::ChatRecord) {
     emit(&json!({
         "type": "chat_received",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "message": {
-            "id": rec.id,
-            "peer_id": rec.peer_id,
-            "direction": rec.direction,
-            "timestamp": rec.timestamp,
-            "body": rec.body,
-            "status": rec.status,
-        },
+        "message": record_dto(rec),
     }));
 }
 

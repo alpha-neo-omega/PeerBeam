@@ -98,6 +98,32 @@ fn parse_folder(frame: &Frame) -> Result<FolderMessage> {
         .map_err(|e| DomainError::Transfer(format!("bad folder message: {e}")))
 }
 
+/// Decode a folder transfer's opening `Manifest` frame into just the parts a
+/// caller can show before accepting: the sender's transfer id, the sanitized
+/// root name, and the summed byte total.
+///
+/// Kept here (rather than exposing `FolderMessage`) so the folder wire enum
+/// stays private, and deliberately *frame-shaped* rather than link-shaped:
+/// `recv_manifest` loops reading frames until it finds a manifest, which would
+/// consume the frame a peek has already read. `session::peek_incoming_meta`
+/// reads exactly one frame and hands it here.
+///
+/// Returns `None` for anything that is not a well-formed `Manifest` — the
+/// caller treats that as "nothing learned", never as a failure.
+pub(crate) fn manifest_preview(frame: &Frame) -> Option<(String, String, u64)> {
+    match parse_folder(frame).ok()? {
+        FolderMessage::Manifest {
+            transfer_id,
+            root,
+            files,
+        } => {
+            let total = files.iter().map(|f| f.size).fold(0u64, u64::saturating_add);
+            Some((transfer_id, sanitize_name(&root), total))
+        }
+        _ => None,
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────
 
 /// Parameters for sending a folder.

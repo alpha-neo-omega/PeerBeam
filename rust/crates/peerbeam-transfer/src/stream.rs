@@ -196,10 +196,7 @@ pub async fn receive_file(
     let meta = recv_meta(link).await?;
 
     // Sanitize: only the base name, never an attacker-chosen path.
-    let base = std::path::Path::new(&meta.name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "received.bin".to_string());
+    let base = sanitize_file_name(&meta.name);
     let dest = format!("{}/{}", dest_dir.trim_end_matches('/'), base);
     // Data is written to a `.part` file; the final name only appears once the
     // whole file is received and verified (safe, atomic, no partial clobber).
@@ -460,6 +457,22 @@ async fn cancel_or_pause(
         return Ok(Some(TransferOutcome::Cancelled));
     }
     Ok(None)
+}
+
+/// Reduce a sender-supplied file name to the single, safe path component the
+/// receiver will actually write under `dest_dir`.
+///
+/// The name comes straight off the wire, so it is attacker-controlled: only the
+/// base component survives, and a name that has no base component at all
+/// (empty, `/`, `..`) falls back to a fixed placeholder. Shared with
+/// `session::peek_incoming_meta` so the name shown in an approval prompt is
+/// *exactly* the name that would land on disk — a preview that sanitized
+/// differently would be a prompt that lies about what it is approving.
+pub(crate) fn sanitize_file_name(name: &str) -> String {
+    std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "received.bin".to_string())
 }
 
 async fn recv_meta(link: &mut dyn Link) -> Result<TransferMeta> {

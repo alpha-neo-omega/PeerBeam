@@ -26,9 +26,9 @@ use peerbeam_domain::port::TrustStore;
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    receive_on_channel, send_file_on_session, send_folder_on_session, ChannelReceived,
-    FolderSendRequest, Identity, SendRequest, TransferControl, TransferOutcome, BACK_PAUSE,
-    BACK_RESUME,
+    peek_incoming_meta, receive_on_channel, send_file_on_session, send_folder_on_session,
+    ChannelReceived, FolderSendRequest, Identity, SendRequest, TransferControl, TransferOutcome,
+    BACK_PAUSE, BACK_RESUME,
 };
 use peerbeam_transfer_quic::{QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
@@ -138,6 +138,13 @@ struct Active {
     id: String,
     direction: &'static str,
     peer: String,
+    /// The peer's device id — the stable, routable identity, kept alongside the
+    /// human-readable `peer` name so every terminal event this transfer emits
+    /// can say *which device* it belongs to. A surface needs that to route a
+    /// transfer event to a conversation: the name is neither unique nor stable,
+    /// and `finish`/`finish_failed`/`record` only ever hold the `Active`, never
+    /// the session it came from.
+    peer_id: String,
     ctrl: TransferControl,
     stats: Arc<Mutex<Stats>>,
     file: Arc<Mutex<String>>,
@@ -158,6 +165,7 @@ impl Active {
             "id": self.id,
             "direction": self.direction,
             "peer": self.peer,
+            "peer_id": self.peer_id,
             "file": *self.file.lock().unwrap(),
             "status": *self.status.lock().unwrap(),
             "stats": self.stats.lock().unwrap().dto(),
@@ -389,12 +397,30 @@ impl Manager {
 
     /// Queue one or more files to a peer. Returns the assigned transfer ids;
     /// the actual work runs in the background and reports via events.
+    ///
+    /// An optional `transfer_id` in the request pins the id instead of minting
+    /// one, so a caller that has already published that id out of band (the
+    /// chat file-share, whose `FileRef` message id *is* the transfer id) can
+    /// make the transfer and its chat row one identity. It applies to a single
+    /// path only — one id cannot name several transfers — and is refused if it
+    /// is already in use, rather than silently substituted: a caller asking for
+    /// a specific id needs that exact id or an error, never a different one.
     pub fn send(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
+        let requested_id = match req.get("transfer_id") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(valid_transfer_id(v)?),
+        };
         let paths = req
             .get("paths")
             .and_then(|p| p.as_array())
             .ok_or((Code::InvalidArgument, "paths[] required".into()))?;
+        if requested_id.is_some() && paths.len() != 1 {
+            return Err((
+                Code::InvalidArgument,
+                "transfer_id applies to exactly one path".into(),
+            ));
+        }
 
         // Validate *every* path before registering or spawning anything, so a
         // bad entry can't leave some transfers already queued while the call
@@ -424,12 +450,35 @@ impl Manager {
 
         let mut ids = Vec::new();
         for (path, name, size) in validated {
-            let id = self.next_id();
-            let active = self.register(&id, "sending", &device.name, &name, Some(path.clone()));
+            let (id, active) = match &requested_id {
+                Some(rid) => {
+                    let active = self
+                        .register_vacant(
+                            rid,
+                            "sending",
+                            &device.name,
+                            &device.id.0,
+                            &name,
+                            Some(path.clone()),
+                        )
+                        .ok_or((
+                            Code::InvalidArgument,
+                            format!("transfer id already in use: {rid}"),
+                        ))?;
+                    (rid.clone(), active)
+                }
+                None => self.register_fresh(
+                    "sending",
+                    &device.name,
+                    &device.id.0,
+                    &name,
+                    Some(path.clone()),
+                ),
+            };
             events::transfer(
                 &id,
                 "transfer_queued",
-                json!({ "peer": device.name, "file": name }),
+                json!({ "peer": device.name, "peer_id": device.id.0, "file": name }),
             );
             ids.push(id.clone());
 
@@ -460,12 +509,17 @@ impl Manager {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "folder".into());
-        let id = self.next_id();
-        let active = self.register(&id, "sending", &device.name, &name, Some(path.clone()));
+        let (id, active) = self.register_fresh(
+            "sending",
+            &device.name,
+            &device.id.0,
+            &name,
+            Some(path.clone()),
+        );
         events::transfer(
             &id,
             "transfer_queued",
-            json!({ "peer": device.name, "folder": name }),
+            json!({ "peer": device.name, "peer_id": device.id.0, "folder": name }),
         );
 
         let mgr = self.clone();
@@ -478,18 +532,38 @@ impl Manager {
         Ok(json!({ "id": id }))
     }
 
-    fn register(
+    /// Register a transfer under `id` — but only if that id is not already
+    /// claimed. Returns `None` when it is.
+    ///
+    /// A transfer id is the registry key, and the same key that
+    /// `accept`/`reject`/`cancel` act on and that the terminal-event *claim*
+    /// (`remove`) is taken against. Overwriting an entry would therefore splice
+    /// two unrelated transfers together: the displaced one keeps running with
+    /// no registry entry, its eventual terminal event removes — and reports
+    /// against — the survivor's state, and a user `cancel` hits whichever of
+    /// the two happens to be in the map.
+    ///
+    /// That used to be unreachable, because every id was minted locally by a
+    /// monotonic counter. It is reachable now: an incoming transfer registers
+    /// under the id the *sender* put on the wire, and a caller may supply one
+    /// too. So the insert is a claim (`Entry`, under one lock acquisition — no
+    /// check-then-insert window), and a collision is refused rather than
+    /// merged. Callers fall back to a freshly minted id
+    /// ([`register_fresh`](Self::register_fresh)) or report an error.
+    fn register_vacant(
         &self,
         id: &str,
         direction: &'static str,
         peer: &str,
+        peer_id: &str,
         file: &str,
         path: Option<String>,
-    ) -> Arc<Active> {
+    ) -> Option<Arc<Active>> {
         let active = Arc::new(Active {
             id: id.to_string(),
             direction,
             peer: peer.to_string(),
+            peer_id: peer_id.to_string(),
             ctrl: TransferControl::new(),
             stats: Arc::new(Mutex::new(Stats::new())),
             file: Arc::new(Mutex::new(file.to_string())),
@@ -497,11 +571,38 @@ impl Manager {
             path: Mutex::new(path),
             task: Mutex::new(None),
         });
-        self.active
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), active.clone());
-        active
+        match self.active.lock().unwrap().entry(id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(active.clone());
+                Some(active)
+            }
+        }
+    }
+
+    /// Register under a freshly minted id, skipping any id already claimed.
+    ///
+    /// The skip is not paranoia: a peer-supplied id now occupies the same
+    /// keyspace as our own, so a peer could name a *future* `next_id()` value
+    /// and lie in wait for it. `next_id()` is strictly increasing and the
+    /// registry is finite, so this settles on a vacant id in at most as many
+    /// steps as there are entries.
+    fn register_fresh(
+        &self,
+        direction: &'static str,
+        peer: &str,
+        peer_id: &str,
+        file: &str,
+        path: Option<String>,
+    ) -> (String, Arc<Active>) {
+        loop {
+            let id = self.next_id();
+            if let Some(active) =
+                self.register_vacant(&id, direction, peer, peer_id, file, path.clone())
+            {
+                return (id, active);
+            }
+        }
     }
 
     /// Establish an initiator PeerSession, retrying transient connection
@@ -547,7 +648,11 @@ impl Manager {
                     events::transfer(
                         id,
                         "transfer_retrying",
-                        json!({ "attempt": attempt, "delay_ms": delay.as_millis() as u64 }),
+                        json!({
+                            "peer_id": device.id.0,
+                            "attempt": attempt,
+                            "delay_ms": delay.as_millis() as u64,
+                        }),
                     );
                     tokio::time::sleep(delay).await;
                     if active.ctrl.is_cancelled() {
@@ -578,7 +683,7 @@ impl Manager {
         events::transfer(
             &id,
             "transfer_started",
-            json!({ "peer": device.name, "file": name }),
+            json!({ "peer": device.name, "peer_id": device.id.0, "file": name }),
         );
         *active.status.lock().unwrap() = "transferring".into();
 
@@ -623,7 +728,11 @@ impl Manager {
             Ok(s) => s,
             Err(e) => return self.finish_failed(&id, e),
         };
-        events::transfer(&id, "transfer_started", json!({ "peer": device.name }));
+        events::transfer(
+            &id,
+            "transfer_started",
+            json!({ "peer": device.name, "peer_id": device.id.0 }),
+        );
         *active.status.lock().unwrap() = "transferring".into();
 
         let handle = session.handle.clone();
@@ -674,7 +783,7 @@ impl Manager {
             return;
         };
         *a.status.lock().unwrap() = "cancelled".into();
-        events::transfer(id, "transfer_cancelled", json!({}));
+        events::transfer(id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
     }
 
     fn finish_failed(&self, id: &str, (code, msg): (Code, String)) {
@@ -689,7 +798,10 @@ impl Manager {
         events::transfer(
             id,
             "transfer_failed",
-            json!({ "error": { "code": code.as_str(), "message": msg } }),
+            json!({
+                "peer_id": a.peer_id,
+                "error": { "code": code.as_str(), "message": msg },
+            }),
         );
         self.record_history(id, &a, false);
     }
@@ -711,7 +823,8 @@ impl Manager {
                 .into_owned()
         });
         let stats = a.stats.lock().unwrap().dto();
-        let mut payload = json!({ "stats": stats, "file": file, "path": path });
+        let mut payload =
+            json!({ "stats": stats, "file": file, "path": path, "peer_id": a.peer_id });
         if let Value::Object(m) = &mut payload {
             if let Value::Object(e) = extra {
                 m.extend(e);
@@ -740,6 +853,7 @@ impl Manager {
                 "id": id,
                 "direction": a.direction,
                 "peer": a.peer,
+                "peer_id": a.peer_id,
                 "file": file,
                 "path": path,
                 "bytes": a.stats.lock().unwrap().transferred,
@@ -792,7 +906,7 @@ impl Manager {
         let a = self.get_active(id)?;
         a.ctrl.pause();
         *a.status.lock().unwrap() = "paused".into();
-        events::transfer(id, "transfer_paused", json!({}));
+        events::transfer(id, "transfer_paused", json!({ "peer_id": a.peer_id }));
         Ok(json!({ "paused": true }))
     }
 
@@ -804,7 +918,7 @@ impl Manager {
         // instantaneous speed and an inflated ETA (BUG 3).
         a.stats.lock().unwrap().mark_resumed();
         *a.status.lock().unwrap() = "transferring".into();
-        events::transfer(id, "transfer_resumed", json!({}));
+        events::transfer(id, "transfer_resumed", json!({ "peer_id": a.peer_id }));
         Ok(json!({ "resumed": true }))
     }
 
@@ -835,7 +949,7 @@ impl Manager {
         }
         // An aborted task won't run finish(); do the cleanup + notify here.
         *a.status.lock().unwrap() = "cancelled".into();
-        events::transfer(id, "transfer_cancelled", json!({}));
+        events::transfer(id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
         Ok(json!({ "cancelled": true }))
     }
 
@@ -1042,19 +1156,7 @@ impl Manager {
             .chat
             .history(&peer)
             .map_err(|e| (Code::Internal, e.to_string()))?;
-        let messages: Vec<Value> = hist
-            .into_iter()
-            .map(|r| {
-                json!({
-                    "id": r.id,
-                    "peer_id": r.peer_id,
-                    "direction": r.direction,
-                    "timestamp": r.timestamp,
-                    "body": r.body,
-                    "status": r.status,
-                })
-            })
-            .collect();
+        let messages: Vec<Value> = hist.iter().map(events::record_dto).collect();
         Ok(json!({ "messages": messages }))
     }
 
@@ -1172,7 +1274,18 @@ impl Manager {
             }
         };
 
-        let id = self.next_id();
+        // Read the transfer's opening frame WITHOUT consuming it: the sender's
+        // own transfer id, the file/folder name, and the size. The returned
+        // channel replays that frame, so `receive_on_channel` below runs
+        // exactly as it did before this existed. This is only possible because
+        // the stream channel is now obtained before any registration.
+        //
+        // Everything the peek yields is fail-soft: an absent, malformed,
+        // undecodable or merely slow first frame gives an empty preview and we
+        // fall back to a locally minted id and the "(incoming)" placeholder —
+        // i.e. exactly the behaviour that predates this.
+        let (incoming_ch, preview) = peek_incoming_meta(incoming_ch).await;
+
         // Prefer the peer's human name from the handshake; fall back to the raw
         // device id only when the peer presented no name.
         let peer = {
@@ -1183,13 +1296,54 @@ impl Manager {
                 n.to_string()
             }
         };
-        let active = self.register(&id, "receiving", &peer, "(incoming)", None);
+
+        // `preview` is entirely PEER-SUPPLIED, and both fields taken from it
+        // are load-bearing: the id becomes a registry key, the name is shown in
+        // the approval prompt the user acts on. Neither is trusted:
+        //
+        //  * the name arrives already reduced to the single, sanitized path
+        //    component the receive path will actually write (see
+        //    `peek_incoming_meta`), so the prompt cannot be made to display a
+        //    path, and the name it shows is the name that lands on disk;
+        //  * the id is charset/length-checked and then only *claimed if
+        //    vacant* — a peer can neither overwrite an existing transfer nor
+        //    pre-empt a future one (see `register_vacant`). A refused id costs
+        //    only the correlation, never the transfer.
+        let display = if preview.name.is_empty() {
+            "(incoming)".to_string()
+        } else {
+            preview.name.clone()
+        };
+        let claimed = if is_valid_transfer_id(&preview.transfer_id) {
+            self.register_vacant(
+                &preview.transfer_id,
+                "receiving",
+                &peer,
+                &session.peer_device.0,
+                &display,
+                None,
+            )
+            .map(|a| (preview.transfer_id.clone(), a))
+        } else {
+            None
+        };
+        let (id, active) = match claimed {
+            Some(pair) => pair,
+            None => self.register_fresh("receiving", &peer, &session.peer_device.0, &display, None),
+        };
+        // Seed the total so the size shown before the first progress update is
+        // the real one rather than 0; every later `update()` overwrites it from
+        // the wire anyway.
+        active.stats.lock().unwrap().total = preview.size;
         events::transfer(
             &id,
             "transfer_queued",
             json!({
                 "peer": peer,
+                "peer_id": session.peer_device.0,
                 "incoming": true,
+                "file": display,
+                "size": preview.size,
                 "newly_trusted": session.newly_trusted,
                 "pairing_code": session.pairing_code.clone(),
             }),
@@ -1214,13 +1368,21 @@ impl Manager {
             self.wait_for_accept(&id, &session.peer_device).await
         };
         if !accepted {
-            events::transfer(&id, "transfer_cancelled", json!({ "reason": "rejected" }));
+            events::transfer(
+                &id,
+                "transfer_cancelled",
+                json!({ "peer_id": session.peer_device.0, "reason": "rejected" }),
+            );
             self.active.lock().unwrap().remove(&id);
             session.close().await;
             return;
         }
 
-        events::transfer(&id, "transfer_started", json!({ "peer": peer }));
+        events::transfer(
+            &id,
+            "transfer_started",
+            json!({ "peer": peer, "peer_id": session.peer_device.0 }),
+        );
         *active.status.lock().unwrap() = "transferring".into();
 
         let save_dir = self.save_dir();
@@ -1579,6 +1741,43 @@ fn daemon_event(kind: &str, port: u16) {
     }));
 }
 
+/// Longest transfer id accepted from outside this process. Generous next to
+/// anything real (a minted `tx-<pid>-<n>` is ~20 bytes, a chat `FileRef` id is
+/// exactly 29) and small enough that an id can never be a payload in its own
+/// right — it is echoed into every event and into the persisted history.
+const MAX_TRANSFER_ID: usize = 128;
+
+/// Whether an id supplied from outside this process — by a caller in the
+/// request JSON, or by a peer on the wire — is usable as a transfer id.
+///
+/// It is deliberately narrow. The id is a registry key, is echoed verbatim
+/// into every event payload and into the persisted history document, and is
+/// read back by surfaces that may treat it as an identifier: keeping it to a
+/// bounded, boring, single-token charset means none of those can be surprised
+/// by it. `.`/`..` are rejected outright — the id is never used as a path
+/// today, and this keeps that true if some future consumer forgets.
+fn is_valid_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TRANSFER_ID
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Read a caller-supplied `transfer_id` out of request JSON, rejecting
+/// anything [`is_valid_transfer_id`] refuses.
+fn valid_transfer_id(v: &Value) -> Result<String, (Code, String)> {
+    match v.as_str() {
+        Some(s) if is_valid_transfer_id(s) => Ok(s.to_string()),
+        _ => Err((
+            Code::InvalidArgument,
+            format!("transfer_id must be 1-{MAX_TRANSFER_ID} chars of [A-Za-z0-9._-]"),
+        )),
+    }
+}
+
 /// Build a target `Device` from a `peer` JSON object.
 fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)> {
     let peer = peer.ok_or((Code::InvalidArgument, "peer required".into()))?;
@@ -1902,7 +2101,8 @@ mod tests {
     async fn cancel_then_finish_failed_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-cancel-first";
-        mgr.register(id, "sending", "peer", "file.bin", None);
+        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+            .expect("freshly registered id is vacant");
 
         mgr.cancel(id)
             .expect("cancel finds the freshly-registered transfer");
@@ -1924,7 +2124,8 @@ mod tests {
     async fn finish_failed_then_cancel_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-finish-first";
-        mgr.register(id, "sending", "peer", "file.bin", None);
+        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+            .expect("freshly registered id is vacant");
 
         mgr.finish_failed(id, (Code::Connection, "link dropped".into()));
         assert_eq!(
@@ -1949,7 +2150,8 @@ mod tests {
     async fn record_then_cancel_only_the_remover_acts() {
         let mgr = test_manager("Device");
         let id = "tx-race-record-first";
-        mgr.register(id, "sending", "peer", "file.bin", None);
+        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+            .expect("freshly registered id is vacant");
 
         mgr.record(id, true, "transfer_completed", json!({}));
         assert_eq!(mgr.history.lock().unwrap().len(), 1);
@@ -1968,7 +2170,8 @@ mod tests {
     async fn cancel_is_not_idempotent_a_second_cancel_errs() {
         let mgr = test_manager("Device");
         let id = "tx-double-cancel";
-        mgr.register(id, "sending", "peer", "file.bin", None);
+        mgr.register_vacant(id, "sending", "peer", "pb-peer", "file.bin", None)
+            .expect("freshly registered id is vacant");
 
         mgr.cancel(id).expect("first cancel succeeds");
         let second = mgr.cancel(id);
@@ -1977,6 +2180,174 @@ mod tests {
             "a second cancel on an already-cancelled id must not re-fire \
              the terminal event"
         );
+    }
+
+    // ── peer-supplied transfer ids may not collide with the registry ────
+    //
+    // An incoming transfer now registers under the id the SENDER put on the
+    // wire, and a caller may pin one too. That makes the registry keyspace
+    // reachable from outside this process for the first time, so these tests
+    // pin the two properties that keep it safe: an occupied id is never
+    // overwritten, and a freshly minted id never lands on one a peer has
+    // already squatted.
+
+    /// The hijack: a peer names an id that is already in the registry. It must
+    /// be refused, and the incumbent must be left exactly as it was — if the
+    /// entry were replaced, the displaced transfer would keep running with no
+    /// registry entry, its terminal event would fire against the intruder's
+    /// state, and a user `cancel` would hit the wrong transfer.
+    #[tokio::test]
+    async fn register_vacant_refuses_to_overwrite_a_claimed_id() {
+        let mgr = test_manager("Device");
+        let id = "tx-contested";
+        let incumbent = mgr
+            .register_vacant(id, "sending", "alice", "pb-alice", "mine.bin", None)
+            .expect("first claim wins");
+
+        let intruder =
+            mgr.register_vacant(id, "receiving", "mallory", "pb-mallory", "theirs.bin", None);
+
+        assert!(intruder.is_none(), "a claimed id must not be re-registered");
+        let held = mgr.get_active(id).expect("incumbent still registered");
+        assert!(
+            Arc::ptr_eq(&held, &incumbent),
+            "the registry must still hold the ORIGINAL entry, not a replacement"
+        );
+        assert_eq!(*held.file.lock().unwrap(), "mine.bin");
+        assert_eq!(held.peer_id, "pb-alice");
+    }
+
+    /// The pre-emption: a peer squats an id our own counter has not reached
+    /// yet, waiting for a local transfer to collide with it. Minting must skip
+    /// straight past it instead of overwriting.
+    #[tokio::test]
+    async fn register_fresh_skips_an_id_a_peer_squatted_in_advance() {
+        let mgr = test_manager("Device");
+        // Exactly what `next_id()` will produce first for this process.
+        let squatted = format!("tx-{}-0", std::process::id());
+        let squatter = mgr
+            .register_vacant(
+                &squatted,
+                "receiving",
+                "mallory",
+                "pb-mallory",
+                "bait.bin",
+                None,
+            )
+            .expect("the squat itself succeeds");
+
+        let (id, _active) = mgr.register_fresh("sending", "alice", "pb-alice", "real.bin", None);
+
+        assert_ne!(id, squatted, "minting must not land on the squatted id");
+        let still_there = mgr.get_active(&squatted).expect("squatter untouched");
+        assert!(
+            Arc::ptr_eq(&still_there, &squatter),
+            "the squatted entry must survive intact, not be silently replaced"
+        );
+        assert_eq!(mgr.active.lock().unwrap().len(), 2, "two distinct entries");
+    }
+
+    /// A caller pinning an id gets that id or an error — never a different one
+    /// silently substituted, which would break the very correlation it asked
+    /// for. (`send` validates every path before registering, so the refusal
+    /// also leaves nothing half-queued.)
+    #[tokio::test]
+    async fn send_refuses_a_transfer_id_already_in_use() {
+        let mgr = Arc::new(test_manager("Device"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"payload").unwrap();
+        let id = "shared-id";
+        mgr.register_vacant(id, "sending", "alice", "pb-alice", "other.bin", None)
+            .expect("occupy the id");
+
+        let err = mgr
+            .send(&json!({
+                "peer": { "id": "pb-alice", "name": "alice", "addresses": ["127.0.0.1"], "port": 1234 },
+                "paths": [file.to_string_lossy()],
+                "transfer_id": id,
+            }))
+            .expect_err("a taken id must be refused");
+
+        assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
+        assert!(err.1.contains("already in use"), "{}", err.1);
+        assert_eq!(
+            mgr.active.lock().unwrap().len(),
+            1,
+            "nothing extra was queued by the refused call"
+        );
+    }
+
+    /// One pinned id cannot name several transfers.
+    #[tokio::test]
+    async fn send_refuses_a_transfer_id_with_multiple_paths() {
+        let mgr = Arc::new(test_manager("Device"));
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let err = mgr
+            .send(&json!({
+                "peer": { "id": "pb-alice", "name": "alice", "addresses": ["127.0.0.1"], "port": 1234 },
+                "paths": [a.to_string_lossy(), b.to_string_lossy()],
+                "transfer_id": "one-id",
+            }))
+            .expect_err("one id cannot cover two paths");
+        assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
+        assert!(mgr.active.lock().unwrap().is_empty(), "nothing was queued");
+    }
+
+    /// Without a `transfer_id` the request behaves exactly as before: an id is
+    /// minted per path.
+    #[tokio::test]
+    async fn send_without_a_transfer_id_still_mints_one_per_path() {
+        let mgr = Arc::new(test_manager("Device"));
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        std::fs::write(&a, b"a").unwrap();
+
+        let res = mgr
+            .send(&json!({
+                "peer": { "id": "pb-alice", "name": "alice", "addresses": ["127.0.0.1"], "port": 1234 },
+                "paths": [a.to_string_lossy()],
+            }))
+            .expect("plain send still works");
+        let ids = res["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0].as_str().unwrap().starts_with("tx-"));
+        // Stop the spawned send task from outliving the test's temp dir.
+        let _ = mgr.cancel(ids[0].as_str().unwrap());
+    }
+
+    #[test]
+    fn transfer_id_validation_accepts_real_ids_and_rejects_hostile_ones() {
+        // What actually occurs in production.
+        assert!(is_valid_transfer_id("tx-12345-0"));
+        assert!(is_valid_transfer_id("1785559080834abcdef0123456789"));
+        assert!(is_valid_transfer_id("late-send"));
+        assert!(is_valid_transfer_id("a.b_c-1"));
+        // Empty, over-long, path-ish, whitespace, control characters, and
+        // anything else a peer might hope a consumer mishandles.
+        assert!(!is_valid_transfer_id(""));
+        assert!(!is_valid_transfer_id(&"x".repeat(MAX_TRANSFER_ID + 1)));
+        assert!(is_valid_transfer_id(&"x".repeat(MAX_TRANSFER_ID)));
+        assert!(!is_valid_transfer_id("."));
+        assert!(!is_valid_transfer_id(".."));
+        assert!(!is_valid_transfer_id("../../etc/passwd"));
+        assert!(!is_valid_transfer_id("/abs"));
+        assert!(!is_valid_transfer_id("a b"));
+        assert!(!is_valid_transfer_id("a\nb"));
+        assert!(!is_valid_transfer_id("a\0b"));
+        assert!(!is_valid_transfer_id("naïve"));
+    }
+
+    #[test]
+    fn valid_transfer_id_rejects_non_strings() {
+        assert!(valid_transfer_id(&json!(42)).is_err());
+        assert!(valid_transfer_id(&json!(null)).is_err());
+        assert!(valid_transfer_id(&json!("ok-1")).is_ok());
     }
 
     // ── BUG 3: resume must reset the rate baseline, not progress ─────────

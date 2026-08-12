@@ -15,19 +15,21 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use peerbeam_chat::{ChatHandler, ChatRecord, ChatStore, ReceivedSink};
+use peerbeam_chat::{ChatHandler, ChatRecord, ChatStore, FileRef, ReceivedSink};
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
 use peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT;
 use peerbeam_domain::entity::{Direction, Route, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
-use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
+use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, Frame, FrameKind, TrustStore};
+use peerbeam_domain::session::{
+    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEREF,
+};
 use peerbeam_ffi::*;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
     send_file_on_session, HandlerRegistry, Identity, PeerSession, SendRequest, SessionConfig,
-    SessionRole, TransferControl, TransferOutcome,
+    SessionHandle, SessionRole, TransferControl, TransferOutcome,
 };
 use peerbeam_transfer_quic::{direct_route, QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
@@ -40,6 +42,54 @@ use tokio::net::UdpSocket;
 /// `session_exec::session_cfg`, which additionally advertises TRANSFER.
 fn chat_only_caps() -> CapabilitySet {
     CapabilitySet::new().with(Capability::new(ChannelType::CHAT))
+}
+
+/// What a peer that shares a file inside a chat thread advertises: CHAT with
+/// the `FileRef` feature bit (so the FFI engine's negotiated set keeps it) AND
+/// TRANSFER as a stream capability, since the bytes ride the ordinary transfer
+/// channel — the whole point of the design is that this is two existing
+/// channels correlated by one id, not a new transport.
+fn chat_and_transfer_caps() -> CapabilitySet {
+    CapabilitySet::new()
+        .with(Capability::with_features(
+            ChannelType::CHAT,
+            CHAT_FEAT_FILEREF,
+        ))
+        .with(Capability::new(ChannelType::TRANSFER))
+}
+
+/// Send one `FileRef` over a live session's CHAT channel.
+///
+/// Hand-rolled here rather than reusing a library helper because the sending
+/// half of file-in-chat does not exist yet — this test stands in for a peer
+/// that already has it, which is exactly what the receiving side must
+/// interoperate with.
+async fn send_file_ref(handle: &SessionHandle, r: &FileRef) {
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .expect("open chat channel");
+    // `open_channel` returns as soon as the open is queued locally; wait for the
+    // peer's accept before sending, or the send races it and hard-fails.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let open = handle
+            .channels()
+            .await
+            .expect("channel snapshot")
+            .iter()
+            .any(|c| c.id == channel && c.state.is_open());
+        if open {
+            break;
+        }
+        assert!(Instant::now() < deadline, "chat channel never opened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let frame = r.to_frame(channel).expect("encode FileRef");
+    handle
+        .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
+        .await
+        .expect("send FileRef");
 }
 
 // ── event capture (mirrors transfer_ffi.rs) ─────────────────────
@@ -809,6 +859,254 @@ async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
 
     let got = std::fs::read(dir.path().join("recv").join("late.bin")).unwrap();
     assert_eq!(got, payload, "received file byte-exact");
+
+    pb_shutdown();
+}
+
+/// **The correlation crux.** A real peer offers a file inside a chat thread:
+/// it sends a `FileRef` on CHAT and then sends the bytes over TRANSFER using
+/// the *same* id as `SendRequest.transfer_id`. The FFI engine must bind the two
+/// into one thing:
+///
+/// - the transfer is registered under the SENDER's id, not a locally minted
+///   one, so the chat row and the transfer are the same identity on both ends;
+/// - the approval prompt carries the real name and size, learned by peeking
+///   the transfer's first frame before registering — not the "(incoming)"
+///   placeholder that was all the receiver could say before it held the stream;
+/// - every transfer event carries `peer_id`, so a surface can route it to a
+///   conversation (the human-readable peer name is neither unique nor stable).
+///
+/// Before this task all four of those assertions failed: the receiver minted
+/// `tx-<pid>-<n>`, the payload had no `file`/`size`/`peer_id` at all, and
+/// nothing tied the chat row to the transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49905;
+    init_ffi(port, dir.path());
+
+    // A 4096-byte "report.pdf" so the size assertion is a real wire value.
+    let payload = vec![9u8; 4096];
+    let src = dir.path().join("report.pdf");
+    std::fs::write(&src, &payload).unwrap();
+
+    let sender_device_id = "file-ref-sender";
+    let (enc, trust, identity) = peer_identity(dir.path(), sender_device_id);
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    // The id the sender mints ONCE and uses for both the chat message and the
+    // transfer — the entire correlation mechanism in one value.
+    let file_ref = FileRef::new("report.pdf", payload.len() as u64).unwrap();
+    let file_ref_id = file_ref.id.clone();
+
+    let send_fut = async {
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_and_transfer_caps())
+            .with_stream_channel_type(ChannelType::TRANSFER);
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        // The FFI engine must have negotiated the feature bit with us.
+        assert_eq!(
+            ps.capabilities().features(ChannelType::CHAT),
+            Some(CHAT_FEAT_FILEREF),
+            "the engine must advertise CHAT_FEAT_FILEREF so it survives intersection"
+        );
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+
+        // 1) The chat row: a FileRef on the CHAT channel.
+        send_file_ref(&handle, &file_ref).await;
+
+        // 2) The bytes: an ordinary transfer, tagged with the SAME id.
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        let req = SendRequest {
+            transfer_id: file_ref.id.clone(),
+            name: "report.pdf".into(),
+            path: src.to_string_lossy().into(),
+            size: payload.len() as u64,
+            chunk_size: 1024,
+        };
+        send_file_on_session(&handle, &FsStorage::new(), req, &ctrl, &ptx, 3).await
+    };
+
+    let expected_id = file_ref_id.clone();
+    let driver = async move {
+        // The approval prompt must carry the real name and size — not "(incoming)".
+        let queued = tokio::task::spawn_blocking(|| {
+            wait_event(15, |e| {
+                e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
+            })
+        })
+        .await
+        .unwrap()
+        .expect("expected transfer_queued for the incoming file");
+
+        assert_eq!(
+            queued["transfer_id"], expected_id,
+            "the receiver must register under the SENDER'S id, not a minted one"
+        );
+        let p = &queued["payload"];
+        assert_eq!(
+            p["file"], "report.pdf",
+            "the peeked name reaches the prompt"
+        );
+        assert_eq!(p["size"], 4096, "the peeked size reaches the prompt");
+        assert_eq!(
+            p["peer_id"], "file-ref-sender",
+            "events must carry the peer device id"
+        );
+
+        let v = call_json(pb_transfer_accept, &json!({ "id": expected_id }));
+        assert_eq!(v["ok"], true, "accept by the sender's id: {v}");
+        expected_id
+    };
+
+    let (send_res, recv_id) = tokio::join!(send_fut, driver);
+    assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
+
+    let done = tokio::task::spawn_blocking(move || {
+        wait_event(10, |e| {
+            e["type"] == "transfer_completed" && e["transfer_id"] == recv_id
+        })
+    })
+    .await
+    .unwrap()
+    .expect("expected transfer_completed under the shared id");
+    assert_eq!(
+        done["payload"]["peer_id"], "file-ref-sender",
+        "the terminal event carries the peer device id too"
+    );
+
+    // The bytes really landed.
+    let got = std::fs::read(dir.path().join("recv").join("report.pdf")).unwrap();
+    assert_eq!(got, payload, "received file byte-exact");
+
+    // And the chat row the FileRef created is the SAME id.
+    let hist = call_json(pb_chat_history, &json!({ "peer_id": sender_device_id }));
+    assert_eq!(hist["ok"], true, "chat_history: {hist}");
+    let msgs = hist["data"]["messages"].as_array().unwrap();
+    let row = msgs
+        .iter()
+        .find(|m| m["id"] == file_ref_id)
+        .unwrap_or_else(|| panic!("no chat row under the shared id: {msgs:?}"));
+    assert_eq!(row["kind"], "file");
+    assert_eq!(row["direction"], "in");
+    assert_eq!(row["file"]["name"], "report.pdf");
+    assert_eq!(row["file"]["size"], 4096);
+
+    pb_shutdown();
+}
+
+/// Fail-soft: a peer whose transfer opens with a frame the peek cannot decode
+/// (here a bare `Chunk` — no `Meta`, no manifest) must be handled *exactly* as
+/// before the peek existed: a locally minted id and the "(incoming)"
+/// placeholder. The peek is an optimisation on the prompt, never a
+/// precondition for receiving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn undecodable_first_frame_falls_back_to_a_minted_id_and_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49906;
+    init_ffi(port, dir.path());
+
+    let (enc, trust, identity) = peer_identity(dir.path(), "garbage-sender");
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    let send_fut = async {
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg =
+            SessionConfig::new(CapabilitySet::new().with(Capability::new(ChannelType::TRANSFER)))
+                .with_stream_channel_type(ChannelType::TRANSFER);
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+
+        // Open a transfer stream and write something that is not a transfer
+        // opening at all, then hold the stream so the receiver's own read is
+        // what decides the outcome.
+        let (_channel, mut link) = handle
+            .open_stream_channel(ChannelType::TRANSFER)
+            .await
+            .expect("open stream channel");
+        link.send_frame(Frame {
+            kind: FrameKind::Chunk,
+            payload: bytes::Bytes::from_static(b"not a transfer opening"),
+        })
+        .await
+        .expect("write garbage");
+        // Keep the link (and so the session) alive while the receiver reacts.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+
+    let driver = tokio::task::spawn_blocking(|| {
+        wait_event(15, |e| {
+            e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
+        })
+    });
+
+    let (_, queued) = tokio::join!(send_fut, driver);
+    let queued = queued.unwrap().expect("expected transfer_queued anyway");
+
+    let id = queued["transfer_id"].as_str().unwrap();
+    assert!(
+        id.starts_with("tx-"),
+        "an undecodable opening must fall back to a locally minted id, got {id:?}"
+    );
+    assert_eq!(
+        queued["payload"]["file"], "(incoming)",
+        "and to the placeholder display name"
+    );
+    assert_eq!(queued["payload"]["size"], 0);
+    // The peer identity is still known — it comes from the handshake, not the
+    // peeked frame — so routing still works even with nothing learned.
+    assert_eq!(queued["payload"]["peer_id"], "garbage-sender");
 
     pb_shutdown();
 }
