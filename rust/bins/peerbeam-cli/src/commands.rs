@@ -773,6 +773,18 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
     let storage = FsStorage::new();
     let chunk = clamp_chunk_size(config.transfer.chunk_size);
 
+    // Chat wiring on this dial too — not just on chat's own call sites. The
+    // *receiving* peer's `serve_loop`/`daemon` runs flush-on-connect
+    // unconditionally on every accepted session, regardless of what the
+    // dialer established it for: if this plain-file dial registered no
+    // `ChatHandler`, a message the peer pushes back over this same session
+    // would silently decode-and-drop (frame counted in stats, never
+    // dispatched, no error on either side) while the pusher marks it `Sent`
+    // and dequeues it — permanent, silent loss. Mirrors the FFI's own fix for
+    // the identical bug class (`Manager::chat_wiring()` / `open_send_retry`).
+    let chat = chat_store(&config, &sc.enc, &sc.ident);
+    let sink = crate::chat::received_sink(ctx);
+
     let hist = history::path_for(&config.storage.data_directory);
     for p in &args.paths {
         let path = std::path::Path::new(p);
@@ -781,9 +793,10 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file.bin".into());
         if path.is_dir() {
-            let r =
-                secure_send_folder(ctx, &quic, &routes, &target, &sc, &storage, p, &name, chunk)
-                    .await;
+            let r = secure_send_folder(
+                ctx, &quic, &routes, &target, &sc, &chat, &sink, &storage, p, &name, chunk,
+            )
+            .await;
             history::record(
                 &hist,
                 history::entry(
@@ -799,7 +812,7 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
         } else {
             let size = std::fs::metadata(path)?.len();
             let r = secure_send_file(
-                ctx, &quic, &routes, &target, &sc, &storage, p, &name, size, chunk,
+                ctx, &quic, &routes, &target, &sc, &chat, &sink, &storage, p, &name, size, chunk,
             )
             .await;
             history::record(
@@ -813,7 +826,10 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
 }
 
 /// Establish a PeerSession and stream a whole folder over a transfer channel;
-/// returns total bytes sent.
+/// returns total bytes sent. `chat`/`sink` are threaded through so this dial
+/// registers chat wiring too — see `send`'s call site for why a plain
+/// file/folder transfer still needs to be able to *receive* a peer's pushed
+/// chat message over the same session.
 #[allow(clippy::too_many_arguments)]
 async fn secure_send_folder(
     ctx: &Ctx,
@@ -821,13 +837,22 @@ async fn secure_send_folder(
     routes: &RouteManager,
     device: &peerbeam_domain::entity::Device,
     sc: &SecureCtx,
+    chat: &peerbeam_chat::ChatStore,
+    sink: &peerbeam_chat::ReceivedSink,
     storage: &FsStorage,
     path: &str,
     name: &str,
     chunk: u32,
 ) -> Result<u64, CliError> {
     let session = crate::session_transfer::dial(
-        quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust, None,
+        quic,
+        routes,
+        device,
+        name,
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        Some((chat.clone(), sink.clone())),
     )
     .await?;
     let newly_trusted = session.newly_trusted;
@@ -1051,7 +1076,12 @@ pub(crate) fn chat_store(
 
 /// Select a route (via the RouteManager), authenticate, wrap in `SecureLink`,
 /// and stream one file with progress. The route chosen is the manager's
-/// concern — this function never sees it.
+/// concern — this function never sees it. `chat`/`sink` are threaded through
+/// so this dial registers chat wiring too: the receiving peer's `serve_loop`/
+/// `daemon` runs flush-on-connect unconditionally on every accepted session,
+/// so a session dialed with `chat: None` would silently drop any message the
+/// peer pushes back over it (see `send`'s call site doc for the full bug this
+/// avoids).
 #[allow(clippy::too_many_arguments)]
 async fn secure_send_file(
     ctx: &Ctx,
@@ -1059,6 +1089,8 @@ async fn secure_send_file(
     routes: &RouteManager,
     device: &peerbeam_domain::entity::Device,
     sc: &SecureCtx,
+    chat: &peerbeam_chat::ChatStore,
+    sink: &peerbeam_chat::ReceivedSink,
     storage: &FsStorage,
     path: &str,
     name: &str,
@@ -1066,7 +1098,14 @@ async fn secure_send_file(
     chunk: u32,
 ) -> CliResult {
     let session = crate::session_transfer::dial(
-        quic, routes, device, name, &sc.ident, &sc.enc, &sc.trust, None,
+        quic,
+        routes,
+        device,
+        name,
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        Some((chat.clone(), sink.clone())),
     )
     .await?;
     let newly_trusted = session.newly_trusted;
@@ -1231,20 +1270,6 @@ async fn serve_loop(
                 };
                 let newly_trusted = session.newly_trusted;
                 let peer_id = session.peer_id.clone();
-                // Flush-on-connect: push anything already queued for this peer
-                // now that we have a live session with them — cheaper/faster
-                // than waiting for the next drain tick, and independent of
-                // whatever this connection is otherwise for (a transfer, or a
-                // pairing-gate rejection below). Mirrors the FFI's
-                // `handle_incoming` flush-on-connect (runs before the
-                // transfer-accept gate, since chat delivery is orthogonal to
-                // transfer consent).
-                let _ = peerbeam_chat::flush_to_session(
-                    &session.handle,
-                    &chat,
-                    &DeviceId::from(peer_id.clone()),
-                )
-                .await;
                 if newly_trusted && !ctx.json {
                     ctx.line(&ctx.dim(&format!("pinned new peer {peer_id}")));
                     ctx.line(&format!(
@@ -1326,6 +1351,26 @@ async fn serve_loop(
                         continue; // move on to the next inbound connection
                     }
                 }
+
+                // Flush-on-connect: push anything already queued for this peer
+                // now that the pairing gate has let this connection through —
+                // cheaper/faster than waiting for the next drain tick, and
+                // independent of whatever this connection is otherwise for (a
+                // transfer, or nothing at all). Deliberately placed AFTER the
+                // pairing gate (not before, unlike the FFI's `handle_incoming`,
+                // which has no such gate to order against): `PairingGate::Revoke`
+                // means the operator suspects this newly-pinned peer of being a
+                // MITM and the connection is being torn down above — chat
+                // content must not be pushed to a peer we're actively revoking
+                // trust in. `Revoke`'s branch always `continue`s/`break`s before
+                // reaching here, so this line only ever runs on
+                // Proceed/Confirmed.
+                let _ = peerbeam_chat::flush_to_session(
+                    &session.handle,
+                    &chat,
+                    &DeviceId::from(peer_id.clone()),
+                )
+                .await;
 
                 // Await the peer's transfer channel.
                 let incoming_ch = match session.next_incoming().await {
@@ -1947,5 +1992,176 @@ mod clamp_chunk_size_tests {
     #[test]
     fn u32_max_itself_is_unchanged() {
         assert_eq!(clamp_chunk_size(u32::MAX as u64), u32::MAX);
+    }
+}
+
+// ── regression: plain-send dial must register chat wiring (review round 1) ─
+#[cfg(test)]
+mod chat_wiring_dial_regression {
+    use super::{chat_store, secure_send_file, SecureCtx};
+    use crate::output::Ctx;
+    use futures::StreamExt;
+    use peerbeam_chat::ChatMessage;
+    use peerbeam_config::EngineConfig;
+    use peerbeam_domain::id::DeviceId;
+    use peerbeam_engine::RouteManager;
+    use peerbeam_storage_fs::FsStorage;
+    use peerbeam_transfer::{receive_on_channel, TransferControl};
+    use peerbeam_transfer_quic::QuicTransport;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn quiet_ctx() -> Ctx {
+        Ctx::new(true, true, 0, true, true)
+    }
+
+    fn isolated_config(dir: &std::path::Path) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.storage.data_directory = dir.join("data").to_string_lossy().into_owned();
+        config.storage.save_directory = dir.join("recv").to_string_lossy().into_owned();
+        config.transfer.port = 0;
+        config
+    }
+
+    /// Regression guard for review round 1's Finding 1: `secure_send_file`'s
+    /// own dial must register chat wiring (`Some`, not `None`), because the
+    /// *receiving* peer's `serve_loop` runs flush-on-connect unconditionally
+    /// on every accepted session — independent of what the dialer established
+    /// it for. Without a `ChatHandler` on the dialer's side, a message pushed
+    /// back over that same session silently decodes-and-drops (counted in
+    /// stats, never dispatched, no error raised anywhere) while the pusher
+    /// marks it `Sent` and dequeues it: permanent, silent loss.
+    ///
+    /// Scenario: "b" already has a message queued for "a" (as if queued while
+    /// "a" was offline in a prior conversation). "a" now dials "b" with a
+    /// PLAIN file send (`secure_send_file`, not `chat send`). "b" accepts and
+    /// immediately flushes (mirroring `serve_loop`'s flush-on-connect) over
+    /// that same session. Asserts "a" actually receives + persists it.
+    #[tokio::test]
+    async fn secure_send_file_dial_receives_a_pushed_chat_message() {
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let cfg_a = isolated_config(dir_a.path());
+        let cfg_b = isolated_config(dir_b.path());
+        let sc_a = SecureCtx::build(&cfg_a).expect("sc a");
+        let sc_b = SecureCtx::build(&cfg_b).expect("sc b");
+        let chat_a = chat_store(&cfg_a, &sc_a.enc, &sc_a.ident);
+        let chat_b = chat_store(&cfg_b, &sc_b.enc, &sc_b.ident);
+
+        // "b" already has a message queued for "a", keyed by a's real device
+        // id — exactly what a legitimate prior conversation leaves behind
+        // while a is offline.
+        let a_id = sc_a.ident.device_id.clone();
+        let queued = ChatMessage::new("queued while you were offline").expect("msg");
+        chat_b.enqueue(&a_id, &queued).expect("enqueue");
+
+        // "b": a real QUIC listener (mirrors serve_loop's bind).
+        let quic_b = Arc::new(QuicTransport::new().expect("quic b"));
+        let (addr_b, mut incoming_b) = quic_b
+            .serve_channels_on("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("serve b");
+
+        let content = b"not a real pdf, just bytes for the test";
+        let src = dir_a.path().join("report.pdf");
+        std::fs::write(&src, content).expect("write src");
+
+        let ctx = quiet_ctx();
+        let device_b = super::target_device("b".into(), addr_b.ip().to_string(), addr_b.port());
+        let a_sink = crate::chat::received_sink(&ctx);
+        let b_sink = crate::chat::received_sink(&ctx);
+
+        let a_side = async {
+            let quic_a = Arc::new(QuicTransport::new().expect("quic a"));
+            let routes_a = RouteManager::new(quic_a.clone());
+            let storage_a = FsStorage::new();
+            secure_send_file(
+                &ctx,
+                &quic_a,
+                &routes_a,
+                &device_b,
+                &sc_a,
+                &chat_a,
+                &a_sink,
+                &storage_a,
+                src.to_str().expect("utf8 src"),
+                "report.pdf",
+                content.len() as u64,
+                64 * 1024,
+            )
+            .await
+        };
+
+        let b_side = async {
+            let qc = incoming_b
+                .next()
+                .await
+                .expect("inbound connection")
+                .expect("accepted");
+            let mut session_b = crate::session_transfer::accept(
+                qc,
+                &sc_b.ident,
+                &sc_b.enc,
+                &sc_b.trust,
+                Some((chat_b.clone(), b_sink)),
+            )
+            .await
+            .expect("accept b");
+
+            // Flush-on-connect, mirroring `serve_loop`'s (fixed, post-pairing-
+            // gate) ordering — there is no pairing gate to simulate here since
+            // this test dials straight in without discovery/TOFU-prompt state.
+            let peer = DeviceId::from(session_b.peer_id.clone());
+            let _ = peerbeam_chat::flush_to_session(&session_b.handle, &chat_b, &peer).await;
+
+            // Service a's incoming file transfer channel so a's send actually
+            // completes (secure_send_file would otherwise hang/error waiting
+            // for a peer that never opens/drains the channel).
+            let incoming_ch = session_b
+                .next_incoming()
+                .await
+                .expect("incoming transfer channel");
+            let storage_b = FsStorage::new();
+            let (ptx, mut prx) = mpsc::unbounded_channel();
+            let ctrl = TransferControl::new();
+            let recv_dir = dir_b.path().join("recv");
+            std::fs::create_dir_all(&recv_dir).expect("recv dir");
+            let handle_b = &session_b.handle;
+            let recv = async {
+                let r = receive_on_channel(
+                    incoming_ch,
+                    handle_b,
+                    &storage_b,
+                    recv_dir.to_str().expect("utf8 recv dir"),
+                    &ctrl,
+                    &ptx,
+                )
+                .await;
+                drop(ptx);
+                r
+            };
+            let drain = async { while prx.recv().await.is_some() {} };
+            let (r, _) = tokio::join!(recv, drain);
+            r.expect("receive file");
+            session_b.close().await;
+        };
+
+        let (a_result, ()) = tokio::join!(a_side, b_side);
+        a_result.expect("secure_send_file succeeds");
+
+        // The actual bug this guards: with `chat: None` on a's dial, this
+        // history would be empty even though b's outbox/history already show
+        // the message delivered — a would simply never know.
+        let b_device_id = sc_b.ident.device_id.clone();
+        let hist_a = chat_a.history(&b_device_id).expect("history a");
+        assert_eq!(
+            hist_a.len(),
+            1,
+            "a must have received b's pushed message: {hist_a:?}"
+        );
+        assert_eq!(hist_a[0].body, "queued while you were offline");
+
+        // And b's own bookkeeping is consistent: delivered + dequeued.
+        assert!(chat_b.outbox_for(&a_id).expect("outbox").is_empty());
     }
 }

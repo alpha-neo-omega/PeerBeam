@@ -10,11 +10,15 @@
 //! Transfer, so a `chat send` from either side is accepted regardless of what
 //! the session was originally established for. When the caller passes a
 //! `(ChatStore, ReceivedSink)` pair, a `ChatHandler` is registered to persist +
-//! surface inbound Chat frames. Today only `chat watch` does this; `send`,
-//! `chat send`, and `receive`/`daemon` (`serve_loop`) all pass `None` — CHAT is
-//! still advertised on every session (so a peer's `chat send` is accepted
-//! regardless), but nothing handles it on those paths, since none of them
-//! currently surface inbound chat.
+//! surface inbound Chat frames. Every CLI call site now passes `Some(...)` —
+//! plain `send` (`secure_send_file`/`secure_send_folder`), `chat send`'s
+//! opportunistic dial, the periodic drain tick (`chat::drain_tick`), and
+//! `receive`/`daemon` (`serve_loop`)/`chat watch`'s accept — because a peer
+//! can push a queued chat message back over *any* live session regardless of
+//! what it was dialed/accepted for, and a side with no `ChatHandler`
+//! registered doesn't error on an inbound CHAT frame, it silently drops it
+//! (decoded, counted in stats, never dispatched) — see `crate::chat`'s module
+//! doc for the bug class this avoids.
 //!
 //! This module only *establishes* the session and hands back its handle; the
 //! transfer itself reuses the engine (`send_file`/`receive_file` via the channel

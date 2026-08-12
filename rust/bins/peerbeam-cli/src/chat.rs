@@ -149,9 +149,12 @@ pub(crate) async fn drain_tick(
     }
 }
 
-/// `chat send` — resolve the peer exactly like `commands::send`, dial a
-/// PeerSession advertising Chat (no handler needed on this side — we only
-/// send), and send one message.
+/// `chat send` — resolve the peer exactly like `commands::send`, enqueue the
+/// message, and make one opportunistic dial+flush attempt. The dial registers
+/// chat wiring on this side too (not "we only send" — a session we dial can
+/// just as easily have the peer push something back over it, e.g. their own
+/// flush-on-connect, which would be silently dropped without a `ChatHandler`
+/// here; see this module's top doc comment on chat-wiring symmetry).
 async fn send(
     ctx: &Ctx,
     to: Option<String>,
@@ -247,7 +250,14 @@ async fn send(
                 .await
                 .unwrap_or_default();
             session.close().await;
-            !flushed.is_empty()
+            // `flush_to_session` sends a peer's queued entries FIFO and stops
+            // at the first per-message failure, returning only the ids it
+            // actually got through — so a non-empty `flushed` does NOT mean
+            // *this* message (the newest/last FIFO entry, if the peer already
+            // had backlog) was among them. Check membership by id, not
+            // emptiness, or a backlog message succeeding while this one is
+            // still Pending would misreport as delivered.
+            flushed.contains(&id)
         }
         Err(_) => false,
     };
