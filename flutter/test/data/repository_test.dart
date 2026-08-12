@@ -200,9 +200,60 @@ void main() {
       repo.pause('t1');
       repo.resume('t1');
       repo.cancel('t1');
+      repo.accept('t1');
+      repo.acceptTrust('t1');
+      repo.reject('t1');
       await flush();
-      expect(fake.calls, containsAll(['pause:t1', 'resume:t1', 'cancel:t1']));
+      expect(
+        fake.calls,
+        containsAll([
+          'pause:t1',
+          'resume:t1',
+          'cancel:t1',
+          'accept:t1',
+          'acceptTrust:t1',
+          'reject:t1',
+        ]),
+      );
     });
+
+    test(
+      'an approval the engine refuses is surfaced, never swallowed',
+      () async {
+        // The approval actions are the user's consent, and they only mean
+        // anything while a decision is genuinely open. They used to
+        // `.catchError((_) {})`, so a tap on a stale Accept/Decline did
+        // nothing at all and looked exactly like success — the same shape as
+        // this project's pairing-gate fail-open.
+        final fake = FakePeerBeam()..noPendingDecisionIds.add('t7');
+        final repo = TransferRepository(api: fake);
+        final errors = <String>[];
+        repo.errors.listen(errors.add);
+
+        fake.emit(
+          ev('transfer_queued', 't7', {
+            'peer': 'Bob',
+            'file': 'report.pdf',
+            'incoming': true,
+          }),
+        );
+        await flush();
+
+        repo.accept('t7');
+        await flush();
+        expect(errors, hasLength(1));
+        expect(errors.single, contains('report.pdf'));
+        expect(errors.single, contains("Couldn't accept"));
+
+        repo.reject('t7');
+        await flush();
+        expect(errors, hasLength(2));
+        expect(errors.last, contains("Couldn't decline"));
+
+        // …and a refusal must not throw out of the fire-and-forget call site.
+        expect(fake.calls, containsAll(['accept:t7', 'reject:t7']));
+      },
+    );
 
     test(
       'a queued folder send is labeled with the folder name, not blank',

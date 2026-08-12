@@ -60,12 +60,26 @@ class FakePeerBeam implements PeerBeamApi {
   Future<void> resume(String id) async => calls.add('resume:$id');
   @override
   Future<void> cancel(String id) async => calls.add('cancel:$id');
+  /// Transfer ids for which the engine holds no open decision, so
+  /// `accept`/`acceptTrust`/`reject` fail the way the real engine does
+  /// (`no pending transfer <id>` → `invalid_argument`). That happens whenever
+  /// the prompt timed out, the peer vanished, or the transfer was
+  /// auto-accepted and never asked at all.
+  final Set<String> noPendingDecisionIds = {};
+
+  void _decision(String verb, String id) {
+    calls.add('$verb:$id');
+    if (noPendingDecisionIds.contains(id)) {
+      throw InvalidArgumentException('no pending transfer $id');
+    }
+  }
+
   @override
-  Future<void> accept(String id) async => calls.add('accept:$id');
+  Future<void> accept(String id) async => _decision('accept', id);
   @override
-  Future<void> acceptTrust(String id) async => calls.add('acceptTrust:$id');
+  Future<void> acceptTrust(String id) async => _decision('acceptTrust', id);
   @override
-  Future<void> reject(String id) async => calls.add('reject:$id');
+  Future<void> reject(String id) async => _decision('reject', id);
 
   @override
   Future<List<TransferSnapshot>> activeTransfers() async => const [];

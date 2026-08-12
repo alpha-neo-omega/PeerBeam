@@ -66,9 +66,36 @@ class TransferRepository extends ChangeNotifier {
   void pause(String id) => _api?.pause(id).catchError((_) {});
   void resume(String id) => _api?.resume(id).catchError((_) {});
   void cancel(String id) => _api?.cancel(id).catchError((_) {});
-  void accept(String id) => _api?.accept(id).catchError((_) {});
-  void acceptTrust(String id) => _api?.acceptTrust(id).catchError((_) {});
-  void reject(String id) => _api?.reject(id).catchError((_) {});
+
+  /// The three approval actions. Unlike pause/resume/cancel these are the
+  /// user's **consent**, and they only mean anything while the engine is
+  /// actually holding a decision open — the engine answers
+  /// `no pending transfer <id>` otherwise, which happens whenever the prompt
+  /// has already timed out, the peer went away, or the transfer was
+  /// auto-accepted and never asked at all.
+  ///
+  /// Swallowing that answer is what made a chat file row render live-looking
+  /// Accept / Trust / Decline buttons that did nothing when tapped: silence is
+  /// indistinguishable from success. It is also the exact shape of this
+  /// project's pairing-gate fail-open. So the failure is surfaced, on the same
+  /// channel every other transfer failure uses.
+  void accept(String id) => _decide(id, 'accept', _api?.accept(id));
+  void acceptTrust(String id) =>
+      _decide(id, 'accept', _api?.acceptTrust(id));
+  void reject(String id) => _decide(id, 'decline', _api?.reject(id));
+
+  void _decide(String id, String verb, Future<void>? call) {
+    if (call == null) return;
+    unawaited(
+      call.catchError((Object e) {
+        final what = _byId[id]?.fileName;
+        final subject = (what == null || what.isEmpty)
+            ? 'this transfer'
+            : what;
+        _errors.add("Couldn't $verb $subject — ${friendlyError(e)}");
+      }),
+    );
+  }
 
   /// Send files to a peer; the engine returns ids and drives events.
   Future<void> send(PeerTarget peer, List<String> paths) async {

@@ -429,33 +429,68 @@ class _FileBody extends StatelessWidget {
         // The peer is offering us a file. These are the ordinary transfer
         // approvals — the chat row's id IS the transfer's id, so they take it
         // unchanged, and there is no second approval path to keep in step.
-        if (message.awaitingApproval) ...[
-          const Gap(AppSpace.xxs),
-          Wrap(
-            spacing: AppSpace.xs,
-            runSpacing: AppSpace.xxs,
-            children: [
-              TextButton(
-                onPressed: () => state.transfer.reject(message.id),
-                child: const Text('Decline'),
-              ),
-              FilledButton.tonal(
-                onPressed: () => state.transfer.accept(message.id),
-                child: const Text('Accept'),
-              ),
-              Tooltip(
-                message: 'Accept and always trust this device',
-                child: FilledButton(
-                  onPressed: () => state.transfer.acceptTrust(message.id),
-                  child: const Text('Trust'),
+        //
+        // Gated on the LIVE transfer as well as the persisted status, the same
+        // way the Transfers screen gates its own approval actions. The
+        // persisted status alone is not enough: it is written by the engine and
+        // reaches us on a `chat_status` event that necessarily lands *after*
+        // the `transfer_started` announcing the bytes are already moving, and
+        // under auto-accept the engine never opened a decision at all (no
+        // `pending` entry), so Decline would be a no-op from the first frame —
+        // a rendered consent control for a decision that was never asked and
+        // cannot be revoked here. See [_offersApproval].
+        if (message.awaitingApproval)
+          AnimatedBuilder(
+            animation: state.transfer,
+            builder: (context, _) {
+              if (!_offersApproval(state.transfer.byId(message.id))) {
+                return const SizedBox.shrink();
+              }
+              return Padding(
+                padding: const EdgeInsets.only(top: AppSpace.xxs),
+                child: Wrap(
+                  spacing: AppSpace.xs,
+                  runSpacing: AppSpace.xxs,
+                  children: [
+                    TextButton(
+                      onPressed: () => state.transfer.reject(message.id),
+                      child: const Text('Decline'),
+                    ),
+                    FilledButton.tonal(
+                      onPressed: () => state.transfer.accept(message.id),
+                      child: const Text('Accept'),
+                    ),
+                    Tooltip(
+                      message: 'Accept and always trust this device',
+                      child: FilledButton(
+                        onPressed: () => state.transfer.acceptTrust(message.id),
+                        child: const Text('Trust'),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ],
+              );
+            },
           ),
-        ],
       ],
     );
   }
+
+  /// Whether a decision is still genuinely open, given this row's live
+  /// transfer ([Transfer]) — `null` when the engine has no entry for it.
+  ///
+  /// A null is deliberately permissive: the live map is ephemeral and empty
+  /// after a restart, and there is a real window where the peer's `FileRef`
+  /// has arrived on the CHAT channel but its first TRANSFER frame has not, so
+  /// no entry exists yet. Refusing to render buttons there would hide a
+  /// legitimate offer. (A row genuinely orphaned by a crash is settled by the
+  /// engine's reconcile when the thread opens, so it never reaches here still
+  /// reading `pendingapproval`.)
+  ///
+  /// Anything past [TransferState.pending] means the answer is in and the
+  /// bytes are moving: no buttons.
+  bool _offersApproval(Transfer? live) =>
+      live == null || live.state == TransferState.pending;
 
   /// The leading icon: what this row *is*, except when it went wrong — then it
   /// borrows the trailing marker's glyph so the two can never disagree about

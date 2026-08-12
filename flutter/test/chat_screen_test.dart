@@ -249,6 +249,61 @@ void main() {
     expect(find.textContaining('Interrupted'), findsOneWidget);
   });
 
+  // Auto-accept + a trusted device: the engine short-circuits its approval
+  // wait entirely, so it never opens a decision — there is no pending entry
+  // for Decline to resolve, and the bytes are already landing. Offering
+  // Accept / Trust / Decline there is a rendered consent control for a
+  // decision that was never asked and cannot be revoked; tapping it just
+  // errors. The persisted status cannot carry this on its own: the engine's
+  // `chat_status: transferring` necessarily trails `transfer_started`, so the
+  // row still reads `pendingapproval` for that beat.
+  testWidgets('under auto-accept the approval controls are never offered — '
+      'the decision was never open', (tester) async {
+    final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'in', status: ChatStatusValue.pendingApproval),
+    ];
+    await _open(tester, fake);
+
+    // A genuine, still-open offer does show them — otherwise this test would
+    // pass by never rendering anything.
+    expect(find.text('Accept'), findsOneWidget);
+    expect(find.text('Decline'), findsOneWidget);
+    expect(find.text('Trust'), findsOneWidget);
+
+    // The engine registers the transfer and starts it in the same breath —
+    // that is what auto-accept looks like on the event stream.
+    fake.emit(
+      const TransferEvent(
+        kind: 'transfer_queued',
+        transferId: 'fr-1',
+        timestamp: '',
+        payload: {
+          'peer': 'Bob',
+          'peer_id': 'pb-bob',
+          'file': 'report.pdf',
+          'incoming': true,
+        },
+      ),
+    );
+    fake.emit(
+      const TransferEvent(
+        kind: 'transfer_started',
+        transferId: 'fr-1',
+        timestamp: '',
+        payload: {'peer': 'Bob', 'peer_id': 'pb-bob'},
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Accept'), findsNothing);
+    expect(find.text('Decline'), findsNothing);
+    expect(find.text('Trust'), findsNothing);
+    // The row itself is still there — only the dead controls are gone.
+    expect(find.text('report.pdf'), findsOneWidget);
+  });
+
   testWidgets('a settled row offers no approval buttons', (tester) async {
     final fake = FakePeerBeam();
     fake.chatHistories['pb-bob'] = [
