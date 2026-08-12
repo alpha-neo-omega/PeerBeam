@@ -122,6 +122,9 @@ pub struct FolderReceived {
     pub files: usize,
     /// Total bytes written during this transfer.
     pub bytes: u64,
+    /// The sender's transfer id, from the wire meta — lets a caller correlate
+    /// this receive with an out-of-band reference such as a chat FileRef.
+    pub transfer_id: String,
 }
 
 /// Send a folder recursively over `link`, preserving structure. Skips (with a
@@ -519,6 +522,7 @@ pub async fn receive_folder(
         root,
         files: files_completed as usize,
         bytes: done,
+        transfer_id,
     })
 }
 

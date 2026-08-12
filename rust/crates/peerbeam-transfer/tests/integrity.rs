@@ -209,3 +209,38 @@ async fn clean_transfer_verifies_ok() {
     rr.unwrap();
     assert_eq!(std::fs::read(out.join("f.bin")).unwrap(), bytes);
 }
+
+#[tokio::test]
+async fn receiver_learns_sender_transfer_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("f.bin");
+    let out = dir.path().join("out");
+    let bytes: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let req = SendRequest {
+        transfer_id: "test-transfer-id-123".into(),
+        name: "f.bin".into(),
+        path: src.to_string_lossy().into(),
+        size: bytes.len() as u64,
+        chunk_size: 64 * 1024,
+    };
+
+    let send = send_file(&mut la, &storage, req.clone(), &cs, &ptx, 3);
+    let recv = receive_file(&mut lb, &storage, &out_str, &cr, &ptx);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    rs.unwrap();
+    let received = rr.unwrap();
+    assert_eq!(
+        received.transfer_id, req.transfer_id,
+        "the receiver must learn the sender's transfer id"
+    );
+}

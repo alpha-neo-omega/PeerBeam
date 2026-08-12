@@ -73,6 +73,9 @@ pub struct Received {
     pub name: String,
     /// Bytes written to disk.
     pub bytes: u64,
+    /// The sender's transfer id, from the wire meta — lets a caller correlate
+    /// this receive with an out-of-band reference such as a chat FileRef.
+    pub transfer_id: String,
 }
 
 /// Send a file over `link`, resuming from the receiver's offset and streaming
@@ -411,6 +414,7 @@ pub async fn receive_file(
         outcome,
         name: final_name,
         bytes: received,
+        transfer_id: meta.transfer_id,
     })
 }
 
