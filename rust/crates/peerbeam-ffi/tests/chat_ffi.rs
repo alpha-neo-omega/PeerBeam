@@ -24,7 +24,11 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
 use peerbeam_ffi::*;
-use peerbeam_transfer::{HandlerRegistry, Identity, PeerSession, SessionConfig, SessionRole};
+use peerbeam_storage_fs::FsStorage;
+use peerbeam_transfer::{
+    send_file_on_session, HandlerRegistry, Identity, PeerSession, SendRequest, SessionConfig,
+    SessionRole, TransferControl, TransferOutcome,
+};
 use peerbeam_transfer_quic::{direct_route, QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 use tokio::net::UdpSocket;
@@ -688,5 +692,123 @@ async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
     // Stop refreshing the peer's discovered presence before shutdown; no
     // further assertions depend on it.
     announce_task.abort();
+    pb_shutdown();
+}
+
+/// Regression test for `STREAM_GRACE` (`peerbeam-ffi/src/transfer.rs`):
+/// `handle_incoming` bounds how long it waits for the peer's first transfer
+/// stream channel before concluding "chat-only dial, close quietly".
+/// `open_stream_channel` sends no probe frame (unlike `open_channel`), so
+/// that wait resolves only on the sender's first application WRITE on the
+/// stream — not on the `ChannelOpen` control message. A real folder sender's
+/// first write is the manifest, which is only emitted after the entire tree
+/// has been recursively enumerated, and on cold-cache/network/FUSE storage
+/// that can take many seconds.
+///
+/// This test stands in for that delay directly: a real peer completes the
+/// session handshake immediately, then deliberately waits 5s — comfortably
+/// longer than the pre-fix 3s grace — before opening its transfer stream and
+/// writing a file. The FFI engine must still register the transfer
+/// (`transfer_queued`) and let it complete, not time out and close the
+/// session out from under the late sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49904;
+    init_ffi(port, dir.path());
+
+    let payload = b"late stream payload, well past the old 3s grace".to_vec();
+    let src = dir.path().join("late.bin");
+    std::fs::write(&src, &payload).unwrap();
+
+    let (enc, trust, identity) = peer_identity(dir.path(), "late-sender");
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    let send_fut = async {
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg =
+            SessionConfig::new(CapabilitySet::new().with(Capability::new(ChannelType::TRANSFER)))
+                .with_stream_channel_type(ChannelType::TRANSFER);
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+
+        // The handshake above is already done; simulate a slow recursive
+        // folder-enumeration delay before the sender's first write — the
+        // exact gap `STREAM_GRACE` exists to survive.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        let req = SendRequest {
+            transfer_id: "late-send".into(),
+            name: "late.bin".into(),
+            path: src.to_string_lossy().into(),
+            size: payload.len() as u64,
+            chunk_size: 64 * 1024,
+        };
+        send_file_on_session(&handle, &FsStorage::new(), req, &ctrl, &ptx, 3).await
+    };
+
+    let driver = async {
+        let queued = tokio::task::spawn_blocking(|| {
+            wait_event(15, |e| {
+                e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
+            })
+        })
+        .await
+        .unwrap()
+        .expect(
+            "expected transfer_queued for the late-opening sender's stream: \
+             STREAM_GRACE must outlast the sender's delay before its first write",
+        );
+        let id = queued["transfer_id"].as_str().unwrap().to_string();
+        let v = call_json(pb_transfer_accept, &json!({ "id": id }));
+        assert_eq!(v["ok"], true, "accept: {v}");
+        id
+    };
+
+    let (send_res, recv_id) = tokio::join!(send_fut, driver);
+    assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
+
+    let done = tokio::task::spawn_blocking(move || {
+        wait_event(5, |e| {
+            e["type"] == "transfer_completed" && e["transfer_id"] == recv_id
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        done.is_some(),
+        "expected transfer_completed for the late-opened stream"
+    );
+
+    let got = std::fs::read(dir.path().join("recv").join("late.bin")).unwrap();
+    assert_eq!(got, payload, "received file byte-exact");
+
     pb_shutdown();
 }

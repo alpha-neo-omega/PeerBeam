@@ -152,6 +152,15 @@ mod tests {
         assert_eq!(a.id.len(), 13 + 16);
     }
 
+    /// `MAX_BODY` is a frozen wire constant (docs/MESSAGE_REGISTRY.md §4, Chat
+    /// `Message = 1`): raising it is a breaking wire change requiring
+    /// capability negotiation, not a silent bump. If this trips, you are
+    /// about to change it — stop and read the registry entry first.
+    #[test]
+    fn max_body_is_pinned() {
+        assert_eq!(MAX_BODY, 16384);
+    }
+
     #[test]
     fn oversize_body_is_rejected() {
         let big = "x".repeat(MAX_BODY + 1);

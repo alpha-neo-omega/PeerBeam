@@ -5,9 +5,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::session::{
-    ChannelType, MessageFlags, MessageHandler, SessionError, SessionFrame,
-};
+use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
 use crate::message::{ChatMessage, MSG_TEXT};
 use crate::record::ChatRecord;
@@ -65,7 +63,7 @@ impl MessageHandler for ChatHandler {
         // for a function whose job is "decode a text chat message" — so the
         // rule belongs here, at dispatch, not there.
         if frame.message_type.get() != MSG_TEXT {
-            if frame.flags.contains(MessageFlags::OPTIONAL) {
+            if frame.flags.is_optional() {
                 // Ignored on purpose: a newer peer sent an additive message this
                 // build does not implement. (No log — this crate has no tracing
                 // dependency and one is not worth adding for a skipped frame.)

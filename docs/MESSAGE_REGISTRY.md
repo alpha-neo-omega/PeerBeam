@@ -86,7 +86,7 @@ detail belongs to each capability's future spec):
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
   `Cancel`, `Pause`, `Resume` — i.e. today's [transfer
   protocol](TRANSFER_PROTOCOL.md), unchanged, now scoped to this channel.
-- **Chat (0x0101):** `Message = 1` (implemented, 1a); `Receipt`, `Reaction`, `Edit` reserved (not implemented). The Chat handler honors §6: unknown MessageTypes flagged `OPTIONAL` are ignored and the channel continues; unknown required types close that channel only.
+- **Chat (0x0101):** `Message = 1` (implemented, 1a); `Receipt`, `Reaction`, `Edit` reserved (not implemented). The Chat handler honors §6: unknown MessageTypes flagged `OPTIONAL` are ignored and the channel continues; unknown required types close that channel only. `Message`'s body is capped at `MAX_BODY = 16384` bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is a **frozen wire constant**: raising it is a breaking change for any peer still on the old cap (an older peer's decoder would reject an over-cap frame as `ChatError::TooLarge`, closing that channel), so it requires capability negotiation, not a silent bump.
 - **Presence (0x0103):** `Heartbeat`, `Subscribe`, `Unsubscribe`.
 
 A capability may add MessageTypes to its own namespace at will; that is a

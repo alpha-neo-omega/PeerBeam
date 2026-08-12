@@ -1282,10 +1282,30 @@ const PEER_PROGRESS_GRACE: Duration = Duration::from_secs(3);
 /// concluding this connection carries no transfer at all. Since chat 1b a peer
 /// may dial purely to deliver chat (`chat_flush_peer`, the drain loop,
 /// flush-on-connect), and such a dial must not register a transfer or raise an
-/// approval prompt. A real sender opens its stream immediately after the
-/// handshake, so this only has to absorb scheduling jitter — same order as
-/// `PEER_PROGRESS_GRACE` above.
-const STREAM_GRACE: Duration = Duration::from_secs(3);
+/// approval prompt.
+///
+/// This timeout is NOT what detects a chat-only dial: a chat-only dialer
+/// closes its side right after flushing (`Manager::chat_flush_peer`; the CLI's
+/// own drain loop notes the same — "a `chat send` always closes right after
+/// sending"), so `next_incoming()` resolves to `None` promptly and the early
+/// return above fires immediately, regardless of this value. This is only a
+/// backstop against a peer that opens a session and then neither opens a
+/// stream nor closes it.
+///
+/// It must be generous: `open_stream_channel` sends no probe frame (unlike
+/// `open_channel`), so the receiver's `next_incoming()` resolves only when the
+/// sender performs its first application write on the stream — not when it
+/// calls `open_stream_channel`. For a folder send, that first write is the
+/// manifest, emitted only after the entire tree has been recursively
+/// enumerated — which, on cold-cache, network-mounted, or FUSE-backed storage,
+/// can take many seconds. Erring long costs only a lingering session task;
+/// erring short silently drops a real transfer (the receiver times out and
+/// closes while the sender is mid-enumeration, and the sender's first write
+/// then fails with a bare connection error indistinguishable from a network
+/// fault). It also guards any accepted session still receiving a chat
+/// backlog: cutting it off early would mark in-flight messages Sent and lose
+/// them (see `flush_to_session`).
+const STREAM_GRACE: Duration = Duration::from_secs(60);
 
 /// Minimum spacing between emitted progress updates (~20/s) — keeps small-chunk
 /// progress smooth without flooding the event bridge.
