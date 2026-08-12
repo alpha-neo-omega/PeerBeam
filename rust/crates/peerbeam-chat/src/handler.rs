@@ -5,9 +5,11 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
+use peerbeam_domain::session::{
+    ChannelType, MessageFlags, MessageHandler, SessionError, SessionFrame,
+};
 
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, MSG_TEXT};
 use crate::record::ChatRecord;
 use crate::store::ChatStore;
 
@@ -53,6 +55,27 @@ impl MessageHandler for ChatHandler {
         let Some(peer) = self.peer.get() else {
             return Err(SessionError::FrameDecode("chat peer not bound".into()));
         };
+        // MESSAGE_REGISTRY.md §6 — an unknown MessageType within a known
+        // channel is governed by the frame's OPTIONAL flag: set means the
+        // receiver ignores the message and the channel continues (forward
+        // compatibility for additive message types); clear means the message
+        // was required, so this channel fails — and only this channel.
+        //
+        // `ChatMessage::from_frame` rejects any non-TEXT type, which is correct
+        // for a function whose job is "decode a text chat message" — so the
+        // rule belongs here, at dispatch, not there.
+        if frame.message_type.get() != MSG_TEXT {
+            if frame.flags.contains(MessageFlags::OPTIONAL) {
+                // Ignored on purpose: a newer peer sent an additive message this
+                // build does not implement. (No log — this crate has no tracing
+                // dependency and one is not worth adding for a skipped frame.)
+                return Ok(());
+            }
+            return Err(SessionError::FrameDecode(format!(
+                "unsupported chat message type {} (required)",
+                frame.message_type.get()
+            )));
+        }
         let msg = ChatMessage::from_frame(&frame)?; // ChatError -> SessionError
                                                     // Dedup by id (idempotent re-delivery).
         if self
@@ -162,6 +185,60 @@ mod tests {
             Bytes::from_static(b"not json"),
         );
         let err = handler.handle(bad).await.unwrap_err();
+        assert!(matches!(err, SessionError::FrameDecode(_)));
+    }
+
+    /// MESSAGE_REGISTRY.md §6: an unknown MessageType flagged OPTIONAL must be
+    /// ignored — the message is skipped and the channel survives. Without this,
+    /// adding any second chat message type tears down an older peer's channel.
+    #[tokio::test]
+    async fn handle_ignores_unknown_optional_message_type() {
+        let (cs, _dir) = store(5);
+        let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_cl = received.clone();
+        let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+        let (handler, peer_slot) = ChatHandler::new(cs.clone(), sink);
+        let peer = DeviceId::from("pb-sender");
+        let _ = peer_slot.set(peer.clone());
+
+        // An additive future message type (e.g. a file reference), marked
+        // OPTIONAL by its sender, carrying a body this build cannot parse.
+        let unknown = SessionFrame::new(
+            ChannelId::new(1),
+            MessageType::new(2),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            Bytes::from_static(b"{\"whatever\":true}"),
+        );
+
+        handler
+            .handle(unknown)
+            .await
+            .expect("optional unknown is ignored, not an error");
+
+        assert!(received.lock().unwrap().is_empty(), "sink must not fire");
+        assert!(
+            cs.history(&peer).unwrap().is_empty(),
+            "nothing may be persisted for an ignored frame"
+        );
+    }
+
+    /// The other half of §6: an unknown MessageType that is NOT optional was
+    /// required, so it still fails this channel (and only this channel).
+    #[tokio::test]
+    async fn handle_still_rejects_unknown_required_message_type() {
+        let (cs, _dir) = store(6);
+        let sink: ReceivedSink = Arc::new(|_rec| {});
+        let (handler, peer_slot) = ChatHandler::new(cs, sink);
+        let _ = peer_slot.set(DeviceId::from("pb-sender"));
+
+        let required = SessionFrame::new(
+            ChannelId::new(1),
+            MessageType::new(2),
+            MessageFlags::END_OF_MESSAGE, // no OPTIONAL bit
+            Bytes::from_static(b"{\"whatever\":true}"),
+        );
+
+        let err = handler.handle(required).await.unwrap_err();
         assert!(matches!(err, SessionError::FrameDecode(_)));
     }
 }

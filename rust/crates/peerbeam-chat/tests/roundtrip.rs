@@ -12,6 +12,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::mpsc::unbounded_channel;
 
 use common::MemTransport;
@@ -20,7 +21,9 @@ use peerbeam_chat::{send_message, ChatHandler, ChatMessage, ChatRecord, ChatStor
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{EncryptionProvider, TrustStore};
-use peerbeam_domain::session::{Capability, CapabilitySet, ChannelId, ChannelType, MessageHandler};
+use peerbeam_domain::session::{
+    Capability, CapabilitySet, ChannelId, ChannelType, MessageFlags, MessageHandler, MessageType,
+};
 use peerbeam_transfer::{HandlerRegistry, Identity, PeerSession, SessionConfig, SessionRole};
 use peerbeam_trust_fs::FsTrust;
 
@@ -743,4 +746,124 @@ async fn flush_pushes_from_the_accept_side_to_a_handler_equipped_dialer() {
     assert_eq!(hist_a.len(), 1, "A persisted exactly one record");
     assert_eq!(hist_a[0].body, "pushed on accept");
     assert_eq!(hist_a[0].id, msg.id, "same message id round-trips");
+}
+
+/// Regression (MESSAGE_REGISTRY.md §6): an unknown MessageType flagged OPTIONAL
+/// must be ignored WITHOUT killing the channel. Pre-fix, `ChatHandler::handle`
+/// returned `Err` for any non-TEXT type and the channel actor treats any handler
+/// error as fatal — so the unknown frame tore the chat channel down and the text
+/// message that followed it on that same channel never arrived.
+#[tokio::test]
+async fn unknown_optional_message_does_not_kill_the_chat_channel() {
+    let store_b = chat_store(2);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+    let _ = peer_slot_b.set(a_id.clone());
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // Open ONE chat channel and wait for the peer to accept it.
+    let channel = a_handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .expect("open chat channel");
+    let mut opened = false;
+    for _ in 0..500 {
+        let chans = a_handle.channels().await.expect("channels");
+        if chans.iter().any(|c| c.id == channel && c.state.is_open()) {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(opened, "chat channel never opened");
+
+    // 1. An additive future message type this build does not implement,
+    //    correctly flagged OPTIONAL by its sender.
+    a_handle
+        .send_on_channel(
+            channel,
+            MessageType::new(2),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            Bytes::from_static(b"{\"file\":\"report.pdf\"}"),
+        )
+        .await
+        .expect("send unknown optional frame");
+
+    // 2. A perfectly ordinary text message on the SAME channel, after it.
+    let msg = ChatMessage::new("still here").expect("mint");
+    let frame = msg.to_frame(channel).expect("encode");
+    a_handle
+        .send_on_channel(
+            channel,
+            ChatMessage::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .expect("send text frame");
+
+    // The text must arrive: the unknown frame was skipped, not fatal.
+    let mut got: Option<ChatRecord> = None;
+    for _ in 0..300 {
+        if let Some(first) = received.lock().unwrap().first().cloned() {
+            got = Some(first);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rec = got
+        .expect("text after an unknown OPTIONAL frame never arrived — the channel was torn down");
+    assert_eq!(rec.body, "still here");
+    assert_eq!(
+        store_b.history(&a_id).expect("history").len(),
+        1,
+        "exactly one record: the unknown frame persisted nothing"
+    );
 }
