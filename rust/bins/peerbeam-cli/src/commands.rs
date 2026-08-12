@@ -715,7 +715,7 @@ fn completions(shell: clap_complete::Shell) -> CliResult {
 /// handing the transfer engine a zero chunk size. Clamping into range first
 /// and applying the minimum after the value is already a valid `u32` closes
 /// that gap.
-fn clamp_chunk_size(chunk_size: u64) -> u32 {
+pub(crate) fn clamp_chunk_size(chunk_size: u64) -> u32 {
     chunk_size.clamp(1, u32::MAX as u64) as u32
 }
 

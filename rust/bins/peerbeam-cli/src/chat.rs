@@ -28,11 +28,17 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde_json::json;
 
-use peerbeam_chat::{flush_to_session, ChatRecord, ChatStore, Direction, ReceivedSink};
+use peerbeam_chat::{
+    flush_to_session, prepare_file_send, send_file_ref, ChatRecord, ChatStore, Direction, FileMeta,
+    Kind, ReceivedSink, Status,
+};
 use peerbeam_config::EngineConfig;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_engine::{Engine, ManagedDevice, RouteManager};
+use peerbeam_storage_fs::FsStorage;
+use peerbeam_transfer::{send_file_on_session, SendRequest, TransferControl};
 use peerbeam_transfer_quic::QuicTransport;
+use tokio::sync::mpsc;
 
 use crate::cli::ChatAction;
 use crate::commands::{self, SecureCtx};
@@ -43,7 +49,25 @@ use crate::session_transfer;
 
 pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) -> CliResult {
     match action {
-        ChatAction::Send { to, addr, text } => send(ctx, to, addr, text, path_override).await,
+        // clap enforces exactly one of `text`/`file` via `required_unless_present`
+        // + `conflicts_with` (see `cli::ChatAction::Send`); the two error arms
+        // below only guard a library caller that builds `ChatAction` directly
+        // (e.g. a test), bypassing that parser-level guarantee.
+        ChatAction::Send {
+            to,
+            addr,
+            text,
+            file,
+        } => match (text, file) {
+            (Some(text), None) => send(ctx, to, addr, text, path_override).await,
+            (None, Some(path)) => send_file(ctx, to, addr, path, path_override).await,
+            (Some(_), Some(_)) => Err(CliError::Usage(
+                "provide either message text or --file, not both".into(),
+            )),
+            (None, None) => Err(CliError::Usage(
+                "provide message text or --file <path>".into(),
+            )),
+        },
         ChatAction::History { peer } => history(ctx, peer, path_override).await,
         ChatAction::Watch { port } => watch(ctx, port, path_override).await,
     }
@@ -69,16 +93,27 @@ pub(crate) fn received_sink(ctx: &Ctx) -> ReceivedSink {
     let color = ctx.color;
     Arc::new(move |rec: ChatRecord| {
         if json {
-            let line = json!({
+            let mut line = json!({
                 "event": "chat_received",
                 "id": rec.id,
                 "peer": rec.peer_id,
                 "body": rec.body,
                 "timestamp": rec.timestamp,
+                "kind": rec.kind,
             });
+            if let Some(file) = &rec.file {
+                line["file"] = json!(file);
+            }
             println!("{}", serde_json::to_string(&line).unwrap_or_default());
         } else {
-            let line = format!("[{}] {}", rec.peer_id, rec.body);
+            // A `Kind::File` record's `body` is always empty (see
+            // `ChatRecord::file_out`/`file_in`) — printing it the way a text
+            // record's line does would render a blank line, so a file gets
+            // its own shape naming what was actually offered.
+            let line = match (&rec.kind, &rec.file) {
+                (Kind::File, Some(file)) => render_file_line(&rec, file),
+                _ => format!("[{}] {}", rec.peer_id, rec.body),
+            };
             if color {
                 println!("\x1b[32m{line}\x1b[0m");
             } else {
@@ -86,6 +121,45 @@ pub(crate) fn received_sink(ctx: &Ctx) -> ReceivedSink {
             }
         }
     })
+}
+
+/// Human-readable direction label, matching `history`'s existing text
+/// rendering (`"out"`/`"in"`).
+fn dir_str(d: Direction) -> &'static str {
+    match d {
+        Direction::Out => "out",
+        Direction::In => "in",
+    }
+}
+
+/// Lowercase wire-form of a [`Status`] (its `serde(rename_all = "lowercase")`
+/// form — the same word `chat history --json`/`chat_received`'s JSON would
+/// carry for it), so a human-mode file line reads consistently with the
+/// JSON one. `serde_json::to_value` on a fieldless-variant enum cannot fail
+/// in practice; the fallback just avoids ever panicking on it.
+fn status_str(status: Status) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{status:?}").to_lowercase())
+}
+
+/// One-line human rendering of a `Kind::File` record: names the file, its
+/// size, and its delivery status instead of the (always empty) `body`.
+/// Shared by `history` and [`received_sink`] — and, through the sink, by
+/// every call site that registers it (`watch`, `serve_loop`'s
+/// flush-on-connect, the drain tick, and `send`'s own opportunistic dial) —
+/// so a file row never renders as a blank line anywhere a chat record is
+/// printed.
+fn render_file_line(r: &ChatRecord, file: &FileMeta) -> String {
+    format!(
+        "[{}] {} file: {} ({} bytes) — {}",
+        r.timestamp,
+        dir_str(r.direction),
+        file.name,
+        file.size,
+        status_str(r.status),
+    )
 }
 
 /// From `peers` (outbox peer ids) and the current device snapshot, select the
@@ -350,6 +424,180 @@ async fn send(
     Ok(())
 }
 
+/// `chat send --file <path>` — attach a file to a conversation. Increment 2a,
+/// ONLINE ONLY: unlike text `send`, there is no outbox for files yet, so an
+/// unreachable peer (or one that cannot receive chat attachments) is a hard
+/// failure, never a silent queue. The bytes ride the TRANSFER stream channel
+/// exactly like a plain `send`; a small `FileRef` control message rides the
+/// CHAT channel so the file gets a row in the peer's own conversation —
+/// `SendRequest.transfer_id` is set to the `FileRef`'s id so the two are the
+/// SAME id, which is the whole point of the feature (`prepare_file_send`'s
+/// doc comment).
+///
+/// Order matters: the row is validated + persisted (`prepare_file_send`)
+/// BEFORE any network work, and the `FileRef` is sent BEFORE the bytes — so a
+/// peer who could see the offer always sees it before (or never after) the
+/// transfer starts. The session is closed on every exit — dial failure (none
+/// established), a `supports_file_ref` refusal, a `send_file_ref` failure, and
+/// the transfer's own outcome — never via a bare `?` that could skip it.
+async fn send_file(
+    ctx: &Ctx,
+    to: Option<String>,
+    addr: Option<String>,
+    path: String,
+    path_override: Option<&str>,
+) -> CliResult {
+    let config = commands::load_config(path_override)?;
+
+    // Resolve the target peer — identical to `send`'s (text) resolution.
+    let target = if let Some(addr) = &addr {
+        let sa = commands::resolve_addr(addr)?;
+        commands::target_device(addr.clone(), sa.ip().to_string(), sa.port())
+    } else {
+        let devices = commands::snapshot(config.clone(), 2).await;
+        let candidates: Vec<(String, String)> = devices
+            .iter()
+            .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+            .collect();
+        let index = commands::resolve_peer(ctx, &candidates, &to)?;
+        let dev = devices[index].device.clone();
+        if dev.addresses.is_empty() {
+            return Err(CliError::NotFound(format!(
+                "no reachable address for {}",
+                dev.name
+            )));
+        }
+        dev
+    };
+
+    if target.port == 0 {
+        return Err(CliError::NotFound(format!(
+            "{} did not advertise a transfer port",
+            target.name
+        )));
+    }
+
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+
+    // Validate the path and persist the (Transferring) row BEFORE any network
+    // work — a refused path (missing, a directory, a bad name) leaves no row
+    // and touches no network at all.
+    let (file_ref, _rec) = prepare_file_send(&store, &target.id, &path).map_err(CliError::from)?;
+    let id = file_ref.id.clone();
+
+    let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
+    let routes = RouteManager::new(quic.clone());
+    let sink = received_sink(ctx);
+    let session = match session_transfer::dial(
+        &quic,
+        &routes,
+        &target,
+        &id,
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        Some((store.clone(), sink)),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            // No session was established — nothing to close. 2a is online
+            // only: an unreachable peer is a hard failure, not a queue.
+            let _ = store.set_status(&target.id, &id, Status::Failed);
+            return Err(CliError::Connection(format!(
+                "cannot reach {} to send {}: {e}",
+                target.name, file_ref.name
+            )));
+        }
+    };
+
+    let newly_trusted = session.newly_trusted;
+    let pairing_code = session.pairing_code.clone();
+    if newly_trusted && !ctx.json {
+        ctx.line(&ctx.dim(&format!("pinned new peer {}", session.peer_id)));
+        ctx.line(&format!("  pairing code: {}", ctx.bold(&pairing_code)));
+    }
+
+    // NEVER silently fall back to a plain transfer: a peer that never
+    // negotiated the FileRef feature has no way to place the file in a
+    // conversation, so refuse outright rather than sending bytes it cannot
+    // surface — the user must never be told an attachment "landed" somewhere
+    // the peer can't see it.
+    if !session.supports_file_ref() {
+        session.close().await;
+        let _ = store.set_status(&target.id, &id, Status::Failed);
+        return Err(CliError::Other(format!(
+            "{} cannot receive chat attachments — its build predates file sharing in chat. Send {} as a plain transfer instead.",
+            target.name, file_ref.name
+        )));
+    }
+
+    // The FileRef goes out on CHAT before a single byte moves on TRANSFER, so
+    // the peer's row exists before (never after) the transfer starts.
+    if let Err(e) = send_file_ref(&session.handle, &file_ref).await {
+        session.close().await;
+        let _ = store.set_status(&target.id, &id, Status::Failed);
+        return Err(CliError::Other(format!(
+            "could not offer {} to {}: {e}",
+            file_ref.name, target.name
+        )));
+    }
+
+    let chunk = commands::clamp_chunk_size(config.transfer.chunk_size);
+    let storage = FsStorage::new();
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let ctrl = TransferControl::new();
+    let req = SendRequest {
+        transfer_id: id.clone(), // the FileRef's id — the shared correlation the feature rests on.
+        name: file_ref.name.clone(),
+        path: path.clone(),
+        size: file_ref.size,
+        chunk_size: chunk,
+    };
+    let bar = ctx.bar(file_ref.size, &file_ref.name);
+
+    let handle = &session.handle;
+    let send = async {
+        let r = send_file_on_session(handle, &storage, req, &ctrl, &ptx, 3).await;
+        drop(ptx);
+        r
+    };
+    let pump = async {
+        while let Some(p) = prx.recv().await {
+            bar.update(p.transferred_bytes);
+        }
+        bar.finish();
+    };
+    let (result, _) = tokio::join!(send, pump);
+    // Close on every path, including the transfer's own failure — capture the
+    // result first, then close, then propagate (never a `?` before `close()`,
+    // which would skip it on exactly this branch).
+    session.close().await;
+
+    match result {
+        Ok(_outcome) => {
+            let _ = store.set_status(&target.id, &id, Status::Sent);
+            if ctx.json {
+                ctx.json_line(&json!({
+                    "event": "chat_file_sent",
+                    "id": id,
+                    "peer": target.id.0,
+                    "delivered": true,
+                }));
+            } else {
+                ctx.line(&ctx.green(&format!("sent {} to {}", file_ref.name, target.name)));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = store.set_status(&target.id, &id, Status::Failed);
+            Err(CliError::from(e))
+        }
+    }
+}
+
 /// `chat history <peer>` — print a conversation's persisted history. `peer`
 /// may be a raw device id (`pb-<fingerprint>`) or a friendly name; see
 /// [`resolve_history_peer`] for how the two are told apart.
@@ -371,11 +619,13 @@ async fn history(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliRes
         return Ok(());
     }
     for r in &records {
-        let dir = match r.direction {
-            Direction::Out => "out",
-            Direction::In => "in",
-        };
-        ctx.line(&format!("[{}] {}: {}", r.timestamp, dir, r.body));
+        match (&r.kind, &r.file) {
+            (Kind::File, Some(file)) => ctx.line(&render_file_line(r, file)),
+            _ => {
+                let dir = dir_str(r.direction);
+                ctx.line(&format!("[{}] {}: {}", r.timestamp, dir, r.body));
+            }
+        }
     }
     Ok(())
 }
@@ -438,10 +688,55 @@ fn render_history_json(records: &[ChatRecord]) -> serde_json::Value {
                 "timestamp": r.timestamp,
                 "body": r.body,
                 "status": r.status,
+                "kind": r.kind,
+                "file": r.file,
             })
         })
         .collect();
     json!({ "messages": messages })
+}
+
+/// `chat watch`'s [`ReceivedSink`]: [`received_sink`]'s rendering, plus a
+/// one-time operator notice whenever an incoming `FileRef` lands. `chat
+/// watch` never reads a peer-opened TRANSFER channel — its accept loop below
+/// (`while session.next_incoming().await.is_some() {}`) discards every
+/// incoming stream channel without touching its bytes, and its drain tick's
+/// own dials (`drain_tick`) close right after flushing the CHAT outbox,
+/// without ever awaiting one either. So a bare `chat watch` can display a
+/// file offer but can never actually receive it: the sender would otherwise
+/// block writing to a stream nobody reads until the transport's own timeout,
+/// with no explanation on either side. This notice tells the operator up
+/// front which command actually accepts file bytes.
+///
+/// Deliberately NOT folded into [`received_sink`] itself: that sink is also
+/// registered by `serve_loop` (`receive`/`daemon`), where this note would be
+/// actively wrong — that process IS running an accept loop that receives the
+/// bytes.
+fn watch_sink(ctx: &Ctx) -> ReceivedSink {
+    let base = received_sink(ctx);
+    let json = ctx.json;
+    Arc::new(move |rec: ChatRecord| {
+        if rec.kind == Kind::File && rec.direction == Direction::In {
+            if let Some(file) = &rec.file {
+                if json {
+                    let line = json!({
+                        "event": "chat_file_needs_receiver",
+                        "id": rec.id,
+                        "peer": rec.peer_id,
+                        "name": file.name,
+                        "size": file.size,
+                    });
+                    println!("{}", serde_json::to_string(&line).unwrap_or_default());
+                } else {
+                    println!(
+                        "note: '{}' ({} bytes) offered — `chat watch` cannot receive file bytes; run `peerbeam receive` or `peerbeam daemon start` to accept it",
+                        file.name, file.size
+                    );
+                }
+            }
+        }
+        base(rec);
+    })
 }
 
 /// `chat watch` — serve inbound PeerSessions and print each received chat
@@ -488,7 +783,11 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
         let _ = engine.start_discovery(self_device).await;
     }
 
-    let sink = received_sink(ctx);
+    // `watch_sink`, not the plain `received_sink`: every session this process
+    // touches (both this accept loop and the drain tick's own dials below)
+    // never reads a peer-opened TRANSFER channel, so an incoming `FileRef`
+    // needs the extra operator notice `watch_sink` adds — see its doc comment.
+    let sink = watch_sink(ctx);
     let mut drain = tokio::time::interval(DRAIN_EVERY);
     // If a tick is missed (e.g. we were busy dispatching a long-lived accepted
     // session), resume the plain periodic cadence rather than firing a burst
@@ -566,11 +865,12 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
 #[cfg(test)]
 mod tests {
     use super::{
-        reachable_targets, render_history_json, resolve_history_peer, send, spawn_single_flight,
+        reachable_targets, render_file_line, render_history_json, resolve_history_peer, send,
+        send_file, spawn_single_flight,
     };
     use crate::commands::{self, SecureCtx};
     use crate::output::Ctx;
-    use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, Status};
+    use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, FileMeta, FileRef, Kind, Status};
     use peerbeam_config::EngineConfig;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
     use peerbeam_domain::entity::{Device, DeviceType};
@@ -629,6 +929,66 @@ mod tests {
     fn render_history_json_empty_history_is_empty_array() {
         let value = render_history_json(&[]);
         assert_eq!(value["messages"].as_array().expect("array").len(), 0);
+    }
+
+    /// A `Kind::Text` record's JSON must keep decoding the same way it always
+    /// has (`kind`/`file` are additive), with the two new fields present and
+    /// honest about there being no file.
+    #[test]
+    fn render_history_json_text_record_carries_kind_text_and_null_file() {
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("hi").expect("msg");
+        let rec = ChatRecord::sent(&peer, &m);
+        let value = render_history_json(&[rec]);
+        let messages = value["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["kind"], "text");
+        assert!(messages[0]["file"].is_null());
+    }
+
+    /// The test the brief asks for: a `Kind::File` record's JSON must carry
+    /// `kind` and `file` — the fields a JSON consumer needs since `body` is
+    /// always empty for a file share.
+    #[test]
+    fn render_history_json_file_record_carries_kind_file_and_file_meta() {
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).expect("file ref");
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some("/tmp/report.pdf".into()),
+        };
+        let rec = ChatRecord::file_out(&peer, &r, meta, Status::Transferring);
+        let value = render_history_json(&[rec]);
+        let messages = value["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["kind"], "file");
+        assert_eq!(messages[0]["body"], "", "body stays empty for a file row");
+        assert_eq!(messages[0]["file"]["name"], "report.pdf");
+        assert_eq!(messages[0]["file"]["size"], 4096);
+        assert_eq!(messages[0]["file"]["local_path"], "/tmp/report.pdf");
+        assert_eq!(messages[0]["status"], "transferring");
+    }
+
+    /// The other half of the brief's rendering test: the human-mode line for
+    /// a `Kind::File` record must name the file and its size — never the
+    /// (always empty) `body`, which is what a blank line would come from.
+    #[test]
+    fn render_file_line_names_the_file_size_and_status_not_a_blank_body() {
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).expect("file ref");
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        };
+        let rec = ChatRecord::file_out(&peer, &r, meta.clone(), Status::Transferring);
+        let line = render_file_line(&rec, &meta);
+        assert_eq!(
+            line,
+            format!(
+                "[{}] out file: report.pdf (4096 bytes) — transferring",
+                r.timestamp
+            )
+        );
     }
 
     // `resolve_history_peer`'s fast paths (offline history already exists, or
@@ -770,6 +1130,87 @@ mod tests {
             "message must still be queued in the outbox"
         );
         assert_eq!(outbox[0].body, "hello offline");
+    }
+
+    // `chat send --file` to an unreachable peer must FAIL — increment 2a has
+    // no file outbox, so (unlike text's queue-and-return-`Ok`) this must
+    // surface as a command error, and the row `prepare_file_send` persisted
+    // up front must be marked `Failed` rather than left `Transferring`
+    // forever (which reconciliation would only later flip to `Interrupted`).
+    #[tokio::test]
+    async fn send_file_to_unreachable_addr_fails_and_marks_the_record_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+
+        let file_path = dir.path().join("report.pdf");
+        std::fs::write(&file_path, vec![7u8; 128]).expect("write file");
+
+        let ctx = quiet_ctx();
+        let result = send_file(
+            &ctx,
+            None,
+            Some("127.0.0.1:1".to_string()),
+            file_path.to_string_lossy().into_owned(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "chat send --file to an unreachable peer must fail, not queue: {result:?}"
+        );
+
+        // Read back through a fresh store, exactly what a real `chat history`
+        // would show afterwards.
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let target_id = DeviceId::from("addr"); // `--addr`'s routing placeholder id.
+
+        let hist = store.history(&target_id).expect("history");
+        assert_eq!(
+            hist.len(),
+            1,
+            "the row is persisted before any network work, whatever happens next"
+        );
+        assert_eq!(hist[0].kind, Kind::File);
+        assert_eq!(
+            hist[0].status,
+            Status::Failed,
+            "an unreachable peer must mark the row Failed, never leave it Transferring"
+        );
+        assert_eq!(hist[0].file.as_ref().expect("file meta").name, "report.pdf");
+    }
+
+    // clap's `required_unless_present`/`conflicts_with` (see `cli::ChatAction::
+    // Send`) keep a real CLI invocation from ever reaching `chat()` with both
+    // or neither of `text`/`file` — but `chat()` itself is a library function
+    // any caller can invoke directly (as these tests do), so its own arms for
+    // those two cases are exercised here rather than left dead.
+    #[tokio::test]
+    async fn chat_send_rejects_both_text_and_file() {
+        let ctx = quiet_ctx();
+        let action = crate::cli::ChatAction::Send {
+            to: None,
+            addr: None,
+            text: Some("hi".to_string()),
+            file: Some("/tmp/a.bin".to_string()),
+        };
+        let result = super::chat(&ctx, action, None).await;
+        assert!(result.is_err(), "text and file are mutually exclusive");
+    }
+
+    #[tokio::test]
+    async fn chat_send_rejects_neither_text_nor_file() {
+        let ctx = quiet_ctx();
+        let action = crate::cli::ChatAction::Send {
+            to: None,
+            addr: None,
+            text: None,
+            file: None,
+        };
+        let result = super::chat(&ctx, action, None).await;
+        assert!(result.is_err(), "one of text or file is required");
     }
 
     /// A `ManagedDevice` fixture: `id` reachable at `addresses`/`port` if

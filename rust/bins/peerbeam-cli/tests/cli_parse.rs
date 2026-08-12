@@ -130,10 +130,68 @@ fn chat_send_addr_conflicts_with_to() {
         Cli::try_parse_from(["peerbeam", "chat", "send", "--addr", "1.2.3.4:49600", "hi"]).unwrap();
     match cli.command {
         Command::Chat(a) => match a.action {
-            ChatAction::Send { to, addr, text } => {
+            ChatAction::Send {
+                to,
+                addr,
+                text,
+                file,
+            } => {
                 assert!(to.is_none());
                 assert_eq!(addr.as_deref(), Some("1.2.3.4:49600"));
-                assert_eq!(text, "hi");
+                assert_eq!(text.as_deref(), Some("hi"));
+                assert!(file.is_none());
+            }
+            _ => panic!("expected send"),
+        },
+        _ => panic!("expected chat"),
+    }
+}
+
+#[test]
+fn chat_send_requires_either_text_or_file() {
+    // Neither `text` nor `--file` given: clap must reject it.
+    assert!(Cli::try_parse_from(["peerbeam", "chat", "send", "--to", "phone"]).is_err());
+}
+
+#[test]
+fn chat_send_text_and_file_are_mutually_exclusive() {
+    assert!(Cli::try_parse_from([
+        "peerbeam",
+        "chat",
+        "send",
+        "--to",
+        "phone",
+        "--file",
+        "/tmp/a.bin",
+        "hi",
+    ])
+    .is_err());
+}
+
+#[test]
+fn chat_send_file_parses_with_text_omitted() {
+    let cli = Cli::try_parse_from([
+        "peerbeam",
+        "chat",
+        "send",
+        "--to",
+        "bob",
+        "--file",
+        "/tmp/a.bin",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::Send {
+                to,
+                addr,
+                text,
+                file,
+            } => {
+                assert_eq!(to.as_deref(), Some("bob"));
+                assert!(addr.is_none());
+                assert!(text.is_none());
+                assert_eq!(file.as_deref(), Some("/tmp/a.bin"));
             }
             _ => panic!("expected send"),
         },

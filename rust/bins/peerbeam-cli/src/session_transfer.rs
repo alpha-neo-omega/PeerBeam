@@ -32,7 +32,9 @@ use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
 use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
-use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
+use peerbeam_domain::session::{
+    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEREF,
+};
 use peerbeam_engine::RouteManager;
 use peerbeam_transfer::{
     HandlerRegistry, Identity, IncomingStreamChannel, PeerSession, SessionConfig, SessionHandle,
@@ -54,15 +56,33 @@ const CHAT: ChannelType = ChannelType::CHAT;
 /// comment for why that symmetry is a correctness requirement, not a nicety.
 /// A future dial/accept call site that omits it would silently drop any CHAT
 /// frame pushed to it instead of erroring.
+///
+/// CHAT additionally advertises [`CHAT_FEAT_FILEREF`]: this build understands
+/// the `FileRef` message and can correlate it with a transfer (mirrors the
+/// FFI's `session_exec::session_cfg`). Advertising a feature bit is not a wire
+/// change — `Capability.features` is already on the wire and
+/// `CapabilitySet::intersect` ANDs it — so a peer from before this feature
+/// simply advertises `0`, the intersection clears the bit, and
+/// [`Session::supports_file_ref`] reports false for it.
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
     let caps = CapabilitySet::new()
         .with(Capability::new(TRANSFER))
-        .with(Capability::new(CHAT));
+        .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF));
     let mut cfg = SessionConfig::new(caps).with_stream_channel_type(TRANSFER);
     if let Some(h) = chat_handler {
         cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
     }
     cfg
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// chat `FileRef` feature. Split out of [`Session::supports_file_ref`] so the
+/// decision is unit-testable without a live session (mirrors the FFI's
+/// `session_exec::caps_support_file_ref`; kept as an independent copy rather
+/// than shared, since the two frontends have no common crate to host one in).
+fn caps_support_file_ref(caps: &CapabilitySet) -> bool {
+    caps.features(CHAT)
+        .is_some_and(|f| f & CHAT_FEAT_FILEREF != 0)
 }
 
 /// Transfer-session metadata used to dial (routing/telemetry only).
@@ -93,11 +113,25 @@ pub struct Session {
     /// The first-contact pairing code from this session's handshake (empty
     /// for a resumed session — there is no handshake to derive it from).
     pub pairing_code: String,
+    /// The capabilities both sides agreed on (already intersected). Read via
+    /// [`supports_file_ref`](Self::supports_file_ref). Captured here — rather
+    /// than fetched on demand — because the negotiated value has to be read
+    /// before the `PeerSession` is consumed by the run loop.
+    capabilities: CapabilitySet,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
 }
 
 impl Session {
+    /// Whether the peer negotiated the chat `FileRef` feature. A peer from
+    /// before this feature advertises `features: 0`, so this is false and
+    /// `chat send --file` must refuse rather than silently sending the bytes
+    /// with no way for the peer to place them in a conversation.
+    #[must_use]
+    pub fn supports_file_ref(&self) -> bool {
+        caps_support_file_ref(&self.capabilities)
+    }
+
     /// Await the next incoming transfer channel the peer opens (receiver side).
     pub async fn next_incoming(&mut self) -> Option<IncomingStreamChannel> {
         self.incoming.recv().await
@@ -157,6 +191,10 @@ async fn establish(
     let peer_id = ps.peer().0.clone();
     let newly_trusted = ps.newly_trusted();
     let pairing_code = ps.pairing_code().to_string();
+    // Read alongside the other post-handshake fields, before `ps` moves into
+    // the run closure below — this is the negotiated (intersected) set, so it
+    // already reflects what the *peer* advertised, not just what we asked for.
+    let capabilities = ps.capabilities().clone();
     let handle = ps.handle();
     let run = tokio::spawn(async move {
         let _ = ps.run().await;
@@ -166,6 +204,7 @@ async fn establish(
         peer_id,
         newly_trusted,
         pairing_code,
+        capabilities,
         incoming,
         run,
     })
@@ -233,4 +272,63 @@ pub async fn accept(
         chat,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a peer that predates file-in-chat advertises for CHAT.
+    fn legacy_peer_caps() -> CapabilitySet {
+        CapabilitySet::new().with(Capability::new(CHAT))
+    }
+
+    /// What this build advertises (the CHAT half of `session_cfg`).
+    fn our_caps() -> CapabilitySet {
+        CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF))
+    }
+
+    /// The negotiation contract `chat send --file`'s refusal rests on:
+    /// `intersect` ANDs the feature bits, so advertising `CHAT_FEAT_FILEREF`
+    /// against a peer that advertises `features: 0` yields a *negotiated* set
+    /// without the bit — and this build must therefore never offer that peer
+    /// a file in chat.
+    #[test]
+    fn a_peer_without_the_feature_bit_negotiates_to_unsupported() {
+        let negotiated = our_caps().intersect(&legacy_peer_caps());
+        assert!(
+            negotiated.supports(CHAT),
+            "CHAT itself still negotiates — only the feature is absent"
+        );
+        assert_eq!(negotiated.features(CHAT), Some(0), "the bit is ANDed away");
+        assert!(!caps_support_file_ref(&negotiated));
+    }
+
+    /// Two builds that both advertise it keep it after intersection.
+    #[test]
+    fn two_peers_with_the_feature_bit_negotiate_to_supported() {
+        let negotiated = our_caps().intersect(&our_caps());
+        assert!(caps_support_file_ref(&negotiated));
+    }
+
+    /// A peer with no CHAT capability at all is unsupported, not a panic —
+    /// the intersection simply drops the channel.
+    #[test]
+    fn a_peer_without_chat_at_all_is_unsupported() {
+        let transfer_only = CapabilitySet::new().with(Capability::new(TRANSFER));
+        let negotiated = our_caps().intersect(&transfer_only);
+        assert!(!negotiated.supports(CHAT));
+        assert!(!caps_support_file_ref(&negotiated));
+    }
+
+    /// Unknown future feature bits from a newer peer must not be mistaken for
+    /// this one: only bit 0 answers `supports_file_ref`.
+    #[test]
+    fn an_unrelated_future_feature_bit_does_not_imply_file_ref() {
+        let future_peer = CapabilitySet::new().with(Capability::with_features(CHAT, 1 << 3));
+        let negotiated = our_caps().intersect(&future_peer);
+        assert!(!caps_support_file_ref(&negotiated));
+    }
 }

@@ -102,3 +102,17 @@ impl From<peerbeam_chat::ChatError> for CliError {
         }
     }
 }
+
+impl From<peerbeam_chat::SendError> for CliError {
+    fn from(e: peerbeam_chat::SendError) -> Self {
+        // `Chat` wraps a `ChatError` (e.g. `prepare_file_send`/`FileRef::new`
+        // rejecting a bad name or an over-cap body) — reuse that mapping
+        // rather than duplicating it. `Session` is a session/channel-level
+        // failure (the chat channel never opened, or was rejected) with no
+        // more specific `CliError` category, so it falls back to `Other`.
+        match e {
+            peerbeam_chat::SendError::Chat(inner) => inner.into(),
+            peerbeam_chat::SendError::Session(_) => CliError::Other(e.to_string()),
+        }
+    }
+}

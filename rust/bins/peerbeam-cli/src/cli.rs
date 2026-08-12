@@ -195,7 +195,7 @@ pub struct ChatArgs {
 
 #[derive(Subcommand)]
 pub enum ChatAction {
-    /// Send a message to a peer.
+    /// Send a message — or a file attachment — to a peer.
     Send {
         /// Target device (id, name, or name prefix).
         #[arg(long)]
@@ -203,8 +203,14 @@ pub enum ChatAction {
         /// Dial a peer directly at `IP:PORT`, skipping discovery.
         #[arg(long, value_name = "IP:PORT", conflicts_with = "to")]
         addr: Option<String>,
-        /// Message text.
-        text: String,
+        /// Message text. Required unless `--file` is given.
+        #[arg(required_unless_present = "file")]
+        text: Option<String>,
+        /// Share a file in the conversation instead of text (increment 2a:
+        /// the peer must be reachable now — an unreachable peer fails rather
+        /// than queuing).
+        #[arg(long, value_name = "PATH", conflicts_with = "text")]
+        file: Option<String>,
     },
     /// Print a conversation's history.
     History {
