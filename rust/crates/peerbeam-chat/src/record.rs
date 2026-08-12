@@ -62,6 +62,20 @@ impl ChatRecord {
         }
     }
 
+    /// An outgoing record with an explicit status (used for the offline outbox:
+    /// `Pending` on enqueue, `Sent` once flushed).
+    #[must_use]
+    pub fn out(peer: &DeviceId, msg: &ChatMessage, status: Status) -> ChatRecord {
+        ChatRecord {
+            id: msg.id.clone(),
+            peer_id: peer.0.clone(),
+            direction: Direction::Out,
+            timestamp: msg.timestamp.clone(),
+            body: msg.body.clone(),
+            status,
+        }
+    }
+
     /// Serialize to opaque bytes for the AppStore.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
