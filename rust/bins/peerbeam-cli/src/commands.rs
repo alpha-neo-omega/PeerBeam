@@ -910,8 +910,12 @@ async fn secure_send_folder(
         last_bytes
     };
     let (r, bytes) = tokio::join!(send, pump);
-    let outcome = r.map_err(CliError::from)?;
+    // Capture the result, close the session, THEN propagate — a `?` here
+    // before `session.close()` would skip the close on exactly the failure
+    // path where it matters (leaking the session's pump task), the same bug
+    // class already fixed twice elsewhere in this feature.
     session.close().await;
+    let outcome = r.map_err(CliError::from)?;
 
     if ctx.json {
         ctx.json_line(&json!({
@@ -1149,8 +1153,12 @@ async fn secure_send_file(
         bar.finish();
     };
     let (r, _) = tokio::join!(send, pump);
-    r.map_err(CliError::from)?;
+    // Capture the result, close the session, THEN propagate — a `?` here
+    // before `session.close()` would skip the close on exactly the failure
+    // path where it matters (leaking the session's pump task), the same bug
+    // class already fixed twice elsewhere in this feature.
     session.close().await;
+    r.map_err(CliError::from)?;
 
     if ctx.json {
         ctx.json_line(&json!({
