@@ -45,8 +45,54 @@ pub enum Kind {
     File,
 }
 
+/// Whether `c` must never reach a *rendered* file name.
+///
+/// A chat file row prints its name directly above an Accept button, so the
+/// glyphs the user reads are the entire basis of that decision. Two families of
+/// character break the correspondence between what is read and what is there:
+///
+/// * **C0/C1 controls** (`U+0000`–`U+001F`, `U+007F`–`U+009F`, i.e. Unicode
+///   category `Cc`) — a newline lets a name paint extra lines into the bubble,
+///   and a terminal surface (`peerbeam chat history`) would act on an escape
+///   sequence outright;
+/// * **bidi overrides and isolates** (`U+200E`, `U+200F`, `U+202A`–`U+202E`,
+///   `U+2066`–`U+2069`) — the classic homograph: `photo\u{202E}gnp.exe` renders
+///   as `photoexe.png`, an executable that reads as an image.
+fn is_display_hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The render-safe form of a peer- or user-supplied file name: every
+/// [display-hostile](is_display_hostile) character replaced by `U+FFFD`.
+///
+/// This is a **display** policy and nothing more. What lands on disk is decided
+/// solely by `peerbeam_transfer`'s `sanitize_file_name`, which remains the one
+/// authority for that and is untouched by this; and this is deliberately *not*
+/// a second, stricter `validate_name` — refusing the frame would give chat a
+/// name policy plain transfers do not have, and a file a transfer would accept
+/// would become unreceivable merely because it was offered in a conversation.
+///
+/// Substitution rather than deletion, because deleting is the attack: dropping
+/// the override from `photo\u{202E}gnp.exe` yields `photognp.exe`, which hides
+/// that anything was ever there. `U+FFFD` leaves visible evidence.
+///
+/// Returns the input unchanged — allocation aside — for every name that holds
+/// none of those characters, which is every ordinary file.
+#[must_use]
+pub fn display_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if is_display_hostile(c) { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// Record-side file metadata. NEVER serialized to a frame — `local_path` is the
 /// owner's private filesystem layout (the wire type is `FileRef`).
+///
+/// Build it with [`FileMeta::new`] rather than a struct literal: `name` is what
+/// every surface renders next to an approval control, so it must go through
+/// [`display_name`] first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub name: String,
@@ -55,6 +101,19 @@ pub struct FileMeta {
     /// saved path on the receiver. `None` until a receive completes.
     #[serde(default)]
     pub local_path: Option<String>,
+}
+
+impl FileMeta {
+    /// Record-side metadata for a shared file, with `name` reduced to its
+    /// render-safe form ([`display_name`]).
+    #[must_use]
+    pub fn new(name: &str, size: u64, local_path: Option<String>) -> FileMeta {
+        FileMeta {
+            name: display_name(name),
+            size,
+            local_path,
+        }
+    }
 }
 
 /// A chat message persisted in one conversation.
@@ -147,11 +206,12 @@ impl ChatRecord {
             body: String::new(),
             status: Status::PendingApproval,
             kind: Kind::File,
-            file: Some(FileMeta {
-                name: r.name.clone(),
-                size: r.size,
-                local_path: None,
-            }),
+            // The peer's own claim about the file, rendered safely. It is only
+            // a *claim*: the bytes ride a separate TRANSFER stream whose
+            // `TransferMeta` decides what is actually written, and the two are
+            // correlated by id alone. `ChatStore::set_file_row_landing`
+            // reconciles this row against that stream.
+            file: Some(FileMeta::new(&r.name, r.size, None)),
         }
     }
 
@@ -171,7 +231,8 @@ impl ChatRecord {
     /// id happens to equal a message id in *our* thread with them, and an
     /// ungated write would then stamp our own outbound "sent" text as
     /// `Received`, or flip a file we `Declined` back to `Received` while
-    /// keeping its old name/size. All three of the following must hold:
+    /// keeping its old name/size, or relabel an unrelated row with a name and
+    /// size of the peer's choosing. All three of the following must hold:
     ///
     /// 1. **`kind == File`** — a text row is never a transfer's business;
     /// 2. **`direction` agrees with `expected`** — `Out` for a send, `In` for
@@ -180,6 +241,12 @@ impl ChatRecord {
     /// 3. **still in flight** (`Transferring` | `PendingApproval`) — a
     ///    settled row is final, which makes every terminal write once-only
     ///    and rules out reopening an already-declined/received file.
+    ///
+    /// Both in-flight statuses are writable, in both directions: a *receiving*
+    /// row legitimately moves `PendingApproval` → `Transferring` the moment the
+    /// bytes are cleared to start (`Manager::handle_incoming`), and must stay
+    /// writable afterwards so its landing metadata, its path and its final
+    /// `Received` can still be recorded.
     ///
     /// [`ChatStore::settle_file_row`]: crate::ChatStore::settle_file_row
     /// [`ChatStore::set_file_row_path`]: crate::ChatStore::set_file_row_path
@@ -303,6 +370,68 @@ mod tests {
         );
         assert!(!file_row(Direction::In, Status::PendingApproval)
             .is_settleable_file_row(Direction::Out));
+    }
+
+    /// The homograph this exists for: a name that *renders* as a `.png` while
+    /// ending in `.exe`, shown directly above an Accept button. The override
+    /// must be visible in the rendered string, not silently dropped (which
+    /// would hide that anything was there).
+    #[test]
+    fn display_name_defuses_a_bidi_override() {
+        let hostile = "photo\u{202E}gnp.exe";
+        let shown = display_name(hostile);
+        assert!(
+            !shown.contains('\u{202E}'),
+            "the override must not survive: {shown:?}"
+        );
+        assert_eq!(shown, "photo\u{FFFD}gnp.exe");
+        assert!(
+            shown.ends_with(".exe"),
+            "the real extension must still read as the last thing in the name"
+        );
+    }
+
+    #[test]
+    fn display_name_defuses_controls_and_isolates_and_leaves_ordinary_names_alone() {
+        // C0, DEL, C1, and every bidi mark/override/isolate.
+        for hostile in [
+            "a\nb.txt",
+            "a\rb.txt",
+            "a\u{0}b.txt",
+            "a\u{1B}b.txt",
+            "a\u{7F}b.txt",
+            "a\u{9B}b.txt",
+            "a\u{200E}b.txt",
+            "a\u{200F}b.txt",
+            "a\u{202A}b.txt",
+            "a\u{202D}b.txt",
+            "a\u{202E}b.txt",
+            "a\u{2066}b.txt",
+            "a\u{2069}b.txt",
+        ] {
+            assert_eq!(
+                display_name(hostile),
+                "a\u{FFFD}b.txt",
+                "not defused: {hostile:?}"
+            );
+        }
+        // Ordinary names — including non-ASCII and emoji — are untouched.
+        for ok in ["report.pdf", "Ünïcödé — file (1).tar.gz", "🎉 party.mov"] {
+            assert_eq!(display_name(ok), ok);
+        }
+    }
+
+    /// The one construction path production code uses must apply the policy;
+    /// a row built from a hostile `FileRef` is already safe to render.
+    #[test]
+    fn file_in_renders_a_hostile_peer_name_safely() {
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("ok.txt", 1).unwrap();
+        // A peer can put this on the wire: `validate_name` (deliberately the
+        // same policy transfers use) only rejects paths/lengths.
+        r.name = "photo\u{202E}gnp.exe".to_string();
+        let rec = ChatRecord::file_in(&peer, &r);
+        assert_eq!(rec.file.unwrap().name, "photo\u{FFFD}gnp.exe");
     }
 
     #[test]

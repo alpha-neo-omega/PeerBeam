@@ -299,14 +299,62 @@ mod tests {
 
     /// The wire type must never leak the sender's local path. `FileMeta` (record
     /// side) holds it; `FileRef` (wire side) must not even have the field.
+    ///
+    /// Asserting only that the *key* is absent is weak: a future
+    /// `local_path: Option<String>` carrying
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` would keep such an
+    /// assertion green. So this pins two stronger properties as well:
+    ///
+    /// 1. the frame does not contain the **populated value** the record-side
+    ///    twin really holds — the exact `(FileRef, FileMeta)` pairing
+    ///    `prepare_file_send` produces, where the path is definitely present on
+    ///    one side and must never appear on the other;
+    /// 2. the serialized object's key set is **exactly** the four wire fields,
+    ///    so any added field is caught the moment it serializes at all.
+    ///
+    /// Between them, a new field could only slip through by being both
+    /// skip-serialized *and* never populated — in which case it leaks nothing.
     #[test]
     fn file_ref_frame_never_contains_a_local_path() {
+        const SECRET_PATH: &str = "/home/alice/Private/taxes/report.pdf";
         let r = FileRef::new("report.pdf", 1).unwrap();
+        // The record-side twin the sender persists beside this very FileRef,
+        // with the path POPULATED — not a hypothetical.
+        let meta = crate::record::FileMeta::new(&r.name, r.size, Some(SECRET_PATH.to_string()));
+        assert_eq!(
+            meta.local_path.as_deref(),
+            Some(SECRET_PATH),
+            "the record side must really hold the path, or this proves nothing"
+        );
+
         let frame = r.to_frame(ChannelId::new(1)).unwrap();
         let json = String::from_utf8(frame.payload.to_vec()).unwrap();
         assert!(
             !json.contains("local_path"),
-            "wire frame leaked a local path: {json}"
+            "wire frame leaked the local-path key: {json}"
+        );
+        assert!(
+            !json.contains(SECRET_PATH) && !json.contains("/home/alice"),
+            "wire frame leaked a populated local path: {json}"
+        );
+
+        let object: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut keys: Vec<String> = object
+            .as_object()
+            .expect("a FileRef frame is a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "id".to_string(),
+                "name".to_string(),
+                "size".to_string(),
+                "timestamp".to_string()
+            ],
+            "the FileRef wire shape gained or lost a field: {json}"
         );
     }
 

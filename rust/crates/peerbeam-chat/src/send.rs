@@ -153,11 +153,7 @@ pub fn prepare_file_send(
     let rec = ChatRecord::file_out(
         peer,
         &r,
-        FileMeta {
-            name: r.name.clone(),
-            size: r.size,
-            local_path: Some(path.to_string()),
-        },
+        FileMeta::new(&r.name, r.size, Some(path.to_string())),
         Status::Transferring,
     );
     store.append(&rec)?;

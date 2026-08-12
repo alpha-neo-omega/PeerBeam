@@ -300,6 +300,51 @@ impl ChatStore {
         Ok(true)
     }
 
+    /// Guarded write of what a transfer says is **actually landing** — the
+    /// same authorization guard as [`settle_file_row`](Self::settle_file_row),
+    /// and the same ordering requirement: it **must run before** that call,
+    /// because a settled row is deliberately closed to further writes.
+    ///
+    /// A receiving row's `name`/`size` start out as the peer's **`FileRef`
+    /// claim**, made on the CHAT channel. The bytes ride a *separate* TRANSFER
+    /// stream whose own `TransferMeta` decides what is written to disk, and the
+    /// two are correlated **by id alone** — nothing anywhere forces them to
+    /// agree. Without this reconciliation a peer can offer
+    /// `holiday.jpg · 180 KB` in the conversation while streaming
+    /// `invoice-2026.pdf.exe`, leaving a row permanently labelled with the
+    /// first while its "open" target is the second: the bubble would lie about
+    /// the file directly above the Accept button the user pressed.
+    ///
+    /// `name` is stored through [`display_name`](crate::display_name), like
+    /// every other name a record carries. An empty `name` means the caller
+    /// learned nothing and is a no-op — never a blanked row. Returns whether a
+    /// write happened.
+    pub fn set_file_row_landing(
+        &self,
+        peer: &DeviceId,
+        id: &str,
+        expected_direction: Direction,
+        name: &str,
+        size: u64,
+    ) -> Result<bool, ChatError> {
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut rec) = self.get(peer, id)? else {
+            return Ok(false);
+        };
+        if !rec.is_settleable_file_row(expected_direction) {
+            return Ok(false);
+        }
+        let Some(file) = rec.file.as_mut() else {
+            return Ok(false); // a File row always has one; belt and braces
+        };
+        file.name = crate::display_name(name);
+        file.size = size;
+        self.append(&rec)?;
+        Ok(true)
+    }
+
     /// Settle records left mid-flight by a crash or restart. Transfer ids are
     /// process-scoped and no event replays, so a record still `Transferring` or
     /// `PendingApproval` at startup would spin forever. Returns how many were
@@ -831,6 +876,131 @@ mod tests {
             Status::Transferring,
             "an outbound row must not be settled by a wrong-direction (receive) call"
         );
+    }
+
+    // ── set_file_row_landing — the FileRef-claim vs. TransferMeta-reality
+    // reconciliation. ────────────────────────────────────────────────────────
+
+    /// The mismatch this exists for: the peer's CHAT-channel `FileRef` says
+    /// one thing, the TRANSFER stream lands another, and the two are
+    /// correlated by id alone. The settled row must describe what is on disk,
+    /// not what was advertised — and the name must be render-safe.
+    #[test]
+    fn set_file_row_landing_replaces_the_peers_claim_with_what_actually_landed() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        // What the peer put in the conversation.
+        let mut r = FileRef::new("holiday.jpg", 184_320).unwrap();
+        r.name = "holiday.jpg".into();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        // What the transfer actually wrote — a different name, a different
+        // size, and a bidi override for good measure.
+        let wrote = cs
+            .set_file_row_landing(
+                &peer,
+                &r.id,
+                Direction::In,
+                "invoice-2026.pdf\u{202E}exe.",
+                4_096,
+            )
+            .unwrap();
+        assert!(wrote);
+        // Ordering: landing first, then settle (both share the in-flight leg).
+        assert!(cs
+            .set_file_row_path(&peer, &r.id, Direction::In, "/home/me/Downloads/x")
+            .unwrap());
+        assert!(cs
+            .settle_file_row(&peer, &r.id, Direction::In, Status::Received)
+            .unwrap());
+
+        let meta = cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap();
+        assert_eq!(meta.name, "invoice-2026.pdf\u{FFFD}exe.");
+        assert_eq!(meta.size, 4_096);
+        assert_eq!(meta.local_path.as_deref(), Some("/home/me/Downloads/x"));
+    }
+
+    /// It carries the identical guard as its siblings: a text row is never a
+    /// transfer's business, an already-settled row is final, and a direction
+    /// mismatch means the peer is reaching for our own outbound row. All three
+    /// are silent no-ops.
+    #[test]
+    fn set_file_row_landing_is_silent_for_every_row_that_is_not_its_own() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+
+        // (a) A text row.
+        let msg = ChatMessage::new("hello there").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &msg)).unwrap();
+        assert!(!cs
+            .set_file_row_landing(&peer, &msg.id, Direction::In, "evil.exe", 1)
+            .unwrap());
+        let text = cs.get(&peer, &msg.id).unwrap().unwrap();
+        assert_eq!(text.body, "hello there");
+        assert!(text.file.is_none(), "no phantom FileMeta");
+
+        // (b) An already-settled (declined) file row.
+        let declined_ref = FileRef::new("suspicious.exe", 4096).unwrap();
+        let mut declined = ChatRecord::file_in(&peer, &declined_ref);
+        declined.status = Status::Declined;
+        cs.append(&declined).unwrap();
+        assert!(!cs
+            .set_file_row_landing(&peer, &declined_ref.id, Direction::In, "evil.exe", 1)
+            .unwrap());
+        assert_eq!(
+            cs.get(&peer, &declined_ref.id)
+                .unwrap()
+                .unwrap()
+                .file
+                .unwrap()
+                .name,
+            "suspicious.exe"
+        );
+
+        // (c) Our own OUTBOUND row, reached for by a receive.
+        let out_ref = FileRef::new("mine.pdf", 10).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &out_ref,
+            FileMeta::new(&out_ref.name, out_ref.size, Some("/tmp/mine.pdf".into())),
+            Status::Transferring,
+        ))
+        .unwrap();
+        assert!(!cs
+            .set_file_row_landing(&peer, &out_ref.id, Direction::In, "evil.exe", 1)
+            .unwrap());
+        assert_eq!(
+            cs.get(&peer, &out_ref.id)
+                .unwrap()
+                .unwrap()
+                .file
+                .unwrap()
+                .name,
+            "mine.pdf"
+        );
+
+        // (d) No row at all — the ordinary transfer, by far the common case.
+        assert!(!cs
+            .set_file_row_landing(&peer, "tx-plain", Direction::In, "x.bin", 1)
+            .unwrap());
+        assert!(cs.get(&peer, "tx-plain").unwrap().is_none());
+    }
+
+    /// "Learned nothing" must never blank a row: an empty name is a no-op, so
+    /// a caller whose peek failed can call unconditionally.
+    #[test]
+    fn set_file_row_landing_ignores_an_empty_name() {
+        let (cs, _dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        assert!(!cs
+            .set_file_row_landing(&peer, &r.id, Direction::In, "", 0)
+            .unwrap());
+        let meta = cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap();
+        assert_eq!(meta.name, "report.pdf");
+        assert_eq!(meta.size, 4096);
     }
 
     /// `set_file_row_path` shares the identical guard: a text row (no `file`
