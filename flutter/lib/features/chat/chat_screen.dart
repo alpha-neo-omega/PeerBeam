@@ -82,7 +82,9 @@ class _ChatScreenState extends State<ChatScreen> {
                       itemCount: items.length,
                       itemBuilder: (context, i) => Appear(
                         index: i,
-                        child: _ChatBubble(message: items[items.length - 1 - i]),
+                        child: _ChatBubble(
+                          message: items[items.length - 1 - i],
+                        ),
                       ),
                     );
                   },
@@ -135,13 +137,31 @@ class _ChatBubble extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(message.body, style: text.bodyMedium?.copyWith(color: fg)),
-                  const Gap(AppSpace.xxs),
                   Text(
-                    _time(message.at),
-                    style: text.labelSmall?.copyWith(
-                      color: fg.withValues(alpha: 0.7),
-                    ),
+                    message.body,
+                    style: text.bodyMedium?.copyWith(color: fg),
+                  ),
+                  const Gap(AppSpace.xxs),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _time(message.at),
+                        style: text.labelSmall?.copyWith(
+                          color: fg.withValues(alpha: 0.7),
+                        ),
+                      ),
+                      if (mine) ...[
+                        const Gap(AppSpace.xxs),
+                        Icon(
+                          message.status == 'pending'
+                              ? Icons.schedule
+                              : Icons.check_rounded,
+                          size: 14,
+                          color: fg.withValues(alpha: 0.7),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),

@@ -283,64 +283,64 @@ void main() {
       expect(repo.messagesFor('bob').single.body, 'hi');
     });
 
-    test('a chat_received event appends to that peer\'s conversation', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
-
-      fake.emit(
-        ChatReceived(
-          ChatMessage(
-            id: 'm2',
-            peerId: 'alice',
-            direction: 'in',
-            body: 'yo',
-            at: DateTime.now(),
-            status: 'received',
-          ),
-        ),
-      );
-      await flush();
-
-      expect(repo.messagesFor('alice').single.body, 'yo');
-      // Untouched conversations stay empty.
-      expect(repo.messagesFor('bob'), isEmpty);
-    });
-
     test(
-      'send shows the message immediately, then reconciles with the engine '
-      '— keyed by the peer\'s real id, not its display name',
+      'a chat_received event appends to that peer\'s conversation',
       () async {
-        // Regression guard for the PeerTarget-carries-no-id bug: `id` and
-        // `name` deliberately differ here. If `PeerTarget.id` weren't wired
-        // through (or the fake/engine keyed by name again instead of id),
-        // `chatSend` would persist under 'carol' while this test's `refresh`
-        // reads 'pb-carol' — the reconcile step would find nothing and the
-        // status would stay 'pending' forever, failing the last expectation.
         final fake = FakePeerBeam();
         final repo = ChatRepository(api: fake);
-        const target = PeerTarget(
-          id: 'pb-carol',
-          name: 'carol',
-          addresses: ['127.0.0.1'],
-          port: 49600,
+
+        fake.emit(
+          ChatReceived(
+            ChatMessage(
+              id: 'm2',
+              peerId: 'alice',
+              direction: 'in',
+              body: 'yo',
+              at: DateTime.now(),
+              status: 'received',
+            ),
+          ),
         );
+        await flush();
 
-        // Not awaited on purpose: the optimistic append happens synchronously
-        // before chatSend's own await, exactly like the fire-and-forget call
-        // the chat screen makes from a button handler.
-        final pending = repo.send('pb-carol', target, '  hello  ');
-        expect(repo.messagesFor('pb-carol').single.body, 'hello');
-        expect(repo.messagesFor('pb-carol').single.status, 'pending');
-
-        await pending;
-        expect(fake.calls, contains('chatSend:hello'));
-        // Reconciled from chatHistory('pb-carol'): the fake's persisted
-        // record (keyed by peer.id) replaces the optimistic placeholder.
-        expect(repo.messagesFor('pb-carol').single.status, 'sent');
-        // The name is never used as a conversation key.
-        expect(repo.messagesFor('carol'), isEmpty);
+        expect(repo.messagesFor('alice').single.body, 'yo');
+        // Untouched conversations stay empty.
+        expect(repo.messagesFor('bob'), isEmpty);
       },
     );
+
+    test('send shows the message immediately, then reconciles with the engine '
+        '— keyed by the peer\'s real id, not its display name', () async {
+      // Regression guard for the PeerTarget-carries-no-id bug: `id` and
+      // `name` deliberately differ here. If `PeerTarget.id` weren't wired
+      // through (or the fake/engine keyed by name again instead of id),
+      // `chatSend` would persist under 'carol' while this test's `refresh`
+      // reads 'pb-carol' — the reconcile step would find nothing and the
+      // status would stay 'pending' forever, failing the last expectation.
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-carol',
+        name: 'carol',
+        addresses: ['127.0.0.1'],
+        port: 49600,
+      );
+
+      // Not awaited on purpose: the optimistic append happens synchronously
+      // before chatSend's own await, exactly like the fire-and-forget call
+      // the chat screen makes from a button handler.
+      final pending = repo.send('pb-carol', target, '  hello  ');
+      expect(repo.messagesFor('pb-carol').single.body, 'hello');
+      expect(repo.messagesFor('pb-carol').single.status, 'pending');
+
+      await pending;
+      expect(fake.calls, contains('chatSend:hello'));
+      // Reconciled from chatHistory('pb-carol'): the fake's persisted
+      // record (keyed by peer.id) replaces the optimistic placeholder.
+      expect(repo.messagesFor('pb-carol').single.status, 'sent');
+      // The name is never used as a conversation key.
+      expect(repo.messagesFor('carol'), isEmpty);
+    });
 
     test('send ignores blank text', () async {
       final fake = FakePeerBeam();
@@ -351,6 +351,95 @@ void main() {
 
       expect(repo.messagesFor('dave'), isEmpty);
       expect(fake.calls, isEmpty);
+    });
+
+    test('a chat_status event flips the matching message\'s status in place, '
+        'leaving other messages/fields untouched', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      // Seed the conversation via chat_received rather than refresh, so
+      // this doesn't depend on the fake's chatHistory plumbing.
+      final first = ChatMessage(
+        id: 'm1',
+        peerId: 'alice',
+        direction: 'out',
+        body: 'hi',
+        at: DateTime.now(),
+        status: 'pending',
+      );
+      final second = ChatMessage(
+        id: 'm2',
+        peerId: 'alice',
+        direction: 'in',
+        body: 'hey back',
+        at: DateTime.now(),
+        status: 'received',
+      );
+      fake.emit(ChatReceived(first));
+      fake.emit(ChatReceived(second));
+      await flush();
+
+      fake.emit(
+        const ChatStatus(messageId: 'm1', peerId: 'alice', status: 'sent'),
+      );
+      await flush();
+
+      final messages = repo.messagesFor('alice');
+      final updated = messages.firstWhere((m) => m.id == 'm1');
+      expect(updated.status, 'sent');
+      // Every other field on the updated message is untouched.
+      expect(updated.peerId, first.peerId);
+      expect(updated.direction, first.direction);
+      expect(updated.body, first.body);
+      expect(updated.at, first.at);
+      // The other message in the same conversation is untouched.
+      final other = messages.firstWhere((m) => m.id == 'm2');
+      expect(other.status, 'received');
+    });
+
+    test('a chat_status event for an unknown peer or message id is a safe '
+        'no-op', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'm1',
+            peerId: 'alice',
+            direction: 'out',
+            body: 'hi',
+            at: DateTime.now(),
+            status: 'pending',
+          ),
+        ),
+      );
+      await flush();
+
+      // Unknown peer id: no conversation exists yet for 'bob'.
+      expect(
+        () => fake.emit(
+          const ChatStatus(messageId: 'm1', peerId: 'bob', status: 'sent'),
+        ),
+        returnsNormally,
+      );
+      await flush();
+      expect(repo.messagesFor('bob'), isEmpty);
+
+      // Unknown message id within a known conversation.
+      expect(
+        () => fake.emit(
+          const ChatStatus(
+            messageId: 'does-not-exist',
+            peerId: 'alice',
+            status: 'sent',
+          ),
+        ),
+        returnsNormally,
+      );
+      await flush();
+      expect(repo.messagesFor('alice').single.status, 'pending');
     });
   });
 }

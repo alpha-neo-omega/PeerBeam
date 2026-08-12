@@ -245,4 +245,13 @@ class ChatMessage {
     at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
     status: j['status'] as String? ?? 'received',
   );
+
+  ChatMessage copyWith({String? status}) => ChatMessage(
+    id: id,
+    peerId: peerId,
+    direction: direction,
+    body: body,
+    at: at,
+    status: status ?? this.status,
+  );
 }

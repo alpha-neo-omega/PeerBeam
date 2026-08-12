@@ -32,6 +32,7 @@ class ChatRepository extends ChangeNotifier {
   ChatRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen((e) {
       if (e is ChatReceived) _onReceived(e.message);
+      if (e is ChatStatus) _onStatus(e);
     });
   }
 
@@ -84,6 +85,19 @@ class ChatRepository extends ChangeNotifier {
 
   void _onReceived(ChatMessage m) {
     (_byPeer[m.peerId] ??= <ChatMessage>[]).add(m);
+    notifyListeners();
+  }
+
+  /// Flip a previously-sent message's status in place (e.g. `pending` →
+  /// `sent`, once the engine's outbox actually delivers it). A safe no-op
+  /// when the peer or message id isn't known locally — e.g. a stale/late
+  /// status event for a conversation this session never loaded.
+  void _onStatus(ChatStatus e) {
+    final list = _byPeer[e.peerId];
+    if (list == null) return;
+    final i = list.indexWhere((m) => m.id == e.messageId);
+    if (i < 0) return;
+    list[i] = list[i].copyWith(status: e.status);
     notifyListeners();
   }
 

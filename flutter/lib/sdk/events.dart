@@ -51,6 +51,12 @@ sealed class BridgeEvent {
         return const DeviceResync();
       case 'chat_received':
         return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
+      case 'chat_status':
+        return ChatStatus(
+          messageId: j['message_id'] as String? ?? '',
+          peerId: j['peer_id'] as String? ?? '',
+          status: j['status'] as String? ?? '',
+        );
       default:
         return null;
     }
@@ -149,4 +155,16 @@ class DeviceResync extends BridgeEvent {
 class ChatReceived extends BridgeEvent {
   final ChatMessage message;
   const ChatReceived(this.message);
+}
+
+/// A delivery-status change for a previously-sent chat message.
+class ChatStatus extends BridgeEvent {
+  final String messageId;
+  final String peerId;
+  final String status;
+  const ChatStatus({
+    required this.messageId,
+    required this.peerId,
+    required this.status,
+  });
 }
