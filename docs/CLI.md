@@ -92,27 +92,55 @@ Working now:
   `echo hi | peerbeam clipboard send --addr host:49600`.
 - `clipboard get` — print the newest received clipboard text raw to stdout
   (pipes cleanly, e.g. `peerbeam clipboard get | wl-copy`).
-- `chat send [--to <peer>|--addr IP:PORT] <text>` — send a text/markdown message
-  to a peer. `--to` resolves a peer via discovery (id / name / prefix, or
-  interactive pick); `--addr` dials directly, skipping discovery. The message is
-  durably queued locally and a bounded best-effort delivery attempt is made
-  before the command returns (does not block indefinitely or error on failure).
-  Queued messages are stored encrypted locally (per-conversation, key derived
-  from the device identity). For `--to` sends, messages are retried indefinitely
-  when a running host (the app, or `peerbeam daemon start` / `peerbeam chat
-  watch`) next reaches the peer. Note: `--addr` sends are queued under a routing
-  placeholder; if the initial delivery attempt fails, the message stays queued
-  (visible via `chat history`) but is not picked up by later drain or
-  flush-on-connect — there is currently no way to auto-deliver a queued `--addr`
-  message; re-send the same text via `--to` once the peer is discoverable.
-  `Sent` status means the message was handed to a live session (delivery
-  attempted on the wire); it is not a read receipt and does not confirm the
-  peer's user has seen it.
+- `chat send [--to <peer>|--addr IP:PORT] (--file <path> | <text>)` — send a
+  text/markdown message, or share a file, in a conversation with a peer.
+  `--to` resolves a peer via discovery (id / name / prefix, or interactive
+  pick); `--addr` dials directly, skipping discovery. Exactly one of `<text>`
+  or `--file <path>` must be given — clap rejects both and requires one
+  (`chat send` with neither fails with "the following required arguments were
+  not provided: `<TEXT>`"; `--file x hello` fails with "the argument
+  `--file <PATH>` cannot be used with `[TEXT]`"). Without `--file`: the
+  message is durably queued locally and a bounded best-effort delivery
+  attempt is made before the command returns (does not block indefinitely or
+  error on failure). Queued messages are stored encrypted locally
+  (per-conversation, key derived from the device identity). For `--to` sends,
+  messages are retried indefinitely when a running host (the app, or
+  `peerbeam daemon start` / `peerbeam chat watch`) next reaches the peer.
+  Note: `--addr` sends are queued under a routing placeholder; if the initial
+  delivery attempt fails, the message stays queued (visible via `chat
+  history`) but is not picked up by later drain or flush-on-connect — there
+  is currently no way to auto-deliver a queued `--addr` message; re-send the
+  same text via `--to` once the peer is discoverable. `Sent` status means the
+  message was handed to a live session (delivery attempted on the wire); it
+  is not a read receipt and does not confirm the peer's user has seen it.
+  With `--file <path>`: shares one file in the conversation instead of text —
+  the bytes ride the same QUIC transfer path as plain `send`, while a small
+  reference (name, size) rides the chat channel so the file gets a row in the
+  conversation, correlated with the transfer by one shared id. A folder is
+  refused up front, before any network work (`error: chat session error:
+  folders aren't supported in chat yet — use Send folder`; use plain `send`
+  for a folder). If the peer's build predates file sharing in chat (it never
+  negotiated the `FileRef` feature), the send is refused rather than falling
+  back to a plain, chat-invisible transfer (`error: <peer> cannot receive
+  chat attachments — its build predates file sharing in chat. Send <file> as
+  a plain transfer instead.`). Increment 2a is online only: unlike text,
+  there is no offline queue for files yet — an unreachable peer fails the
+  command outright (a connection error) instead of queuing for later
+  delivery. Because of that, a peer running only `peerbeam chat watch` can
+  never actually receive the bytes of an incoming chat file: `watch`'s accept
+  loop discards every incoming transfer stream unread (it only dispatches
+  Chat-channel frames). A headless receiver needs `peerbeam receive` or
+  `peerbeam daemon start` running to accept an incoming chat file; `chat
+  watch` alone will only show that a file was offered, not receive it.
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
-  id, or a name resolved via discovery. Messages are encrypted at rest.
+  id, or a name resolved via discovery. Messages are encrypted at rest. A file
+  share's row shows its name, size, and status instead of message text.
 - `chat watch [--port N]` — listen for and print incoming chat messages in
   real-time. Must be running to receive messages. `--port` specifies the QUIC
-  port to listen on (default: from config `transfer.port`).
+  port to listen on (default: from config `transfer.port`). A file share
+  still appears here (with a note that `watch` cannot receive its bytes — see
+  `chat send --file` above); run `peerbeam receive`/`daemon start` instead to
+  actually accept the file.
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.

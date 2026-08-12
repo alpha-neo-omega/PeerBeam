@@ -39,7 +39,7 @@ near-term). Assignments are stable once published.
 |---|---|---|---|
 | `0x0000` | Control | A | session protocol; always present |
 | `0x0100` | Transfer | A | today's file/folder transfer, reframed as a channel |
-| `0x0101` | Chat | B | text/markdown messages |
+| `0x0101` | Chat | B | text/markdown messages; file references (implemented, 2a) |
 | `0x0102` | Clipboard | B | clipboard payloads / sync |
 | `0x0103` | Presence | B | device status heartbeats |
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
@@ -86,7 +86,29 @@ detail belongs to each capability's future spec):
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
   `Cancel`, `Pause`, `Resume` — i.e. today's [transfer
   protocol](TRANSFER_PROTOCOL.md), unchanged, now scoped to this channel.
-- **Chat (0x0101):** `Message = 1` (implemented, 1a); `Receipt`, `Reaction`, `Edit` reserved (not implemented). The Chat handler honors §6: unknown MessageTypes flagged `OPTIONAL` are ignored and the channel continues; unknown required types close that channel only. `Message`'s body is capped at `MAX_BODY = 16384` bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is a **frozen wire constant**: raising it is a breaking change for any peer still on the old cap (an older peer's decoder would reject an over-cap frame as `ChatError::TooLarge`, closing that channel), so it requires capability negotiation, not a silent bump.
+- **Chat (0x0101):** `Message = 1` (implemented, 1a); `FileRef = 2` (implemented,
+  2a) — a reference to a file shared in the conversation: a bare file `name`
+  (never a path — the sender's filesystem layout is private), a `size`, and an
+  `id` that doubles as the file's transfer id on the Transfer channel
+  (0x0100), so the chat row and the byte transfer are correlated by one
+  shared id. Sent `OPTIONAL` (§6/§7) so a peer that does not understand it
+  simply ignores the frame instead of failing the channel. `FileRef` also
+  carries the first feature bit assigned on the Chat capability:
+  `CHAT_FEAT_FILEREF = 1 << 0` (`peerbeam_domain::session::CHAT_FEAT_FILEREF`,
+  a bit of `Capability.features` for `ChannelType::CHAT`). A sender only
+  offers `FileRef` to a peer whose negotiated Chat capability includes this
+  bit — an older peer advertises `features: 0`, `CapabilitySet::intersect`
+  ANDs it away, and the sender never emits a `FileRef` to it (Capability-
+  advertised, not assumed, §7); this is layered on top of, not instead of,
+  the `OPTIONAL` flag above. `Receipt`, `Reaction`, `Edit` reserved (not
+  implemented). The Chat handler honors §6: unknown MessageTypes flagged
+  `OPTIONAL` are ignored and the channel continues; unknown required types
+  close that channel only. `Message`'s body is capped at `MAX_BODY = 16384`
+  bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is
+  a **frozen wire constant**: raising it is a breaking change for any peer
+  still on the old cap (an older peer's decoder would reject an over-cap
+  frame as `ChatError::TooLarge`, closing that channel), so it requires
+  capability negotiation, not a silent bump.
 - **Presence (0x0103):** `Heartbeat`, `Subscribe`, `Unsubscribe`.
 
 A capability may add MessageTypes to its own namespace at will; that is a
