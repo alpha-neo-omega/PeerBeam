@@ -60,6 +60,7 @@ class Bindings {
   final _RetDart _settingsGet;
   final _ArgRetDart _settingsSet;
   final _ArgRetDart _chatSend;
+  final _ArgRetDart _chatSendFile;
   final _ArgRetDart _chatHistory;
 
   Bindings._(DynamicLibrary lib)
@@ -101,6 +102,9 @@ class Bindings {
         'pb_settings_set',
       ),
       _chatSend = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_send'),
+      _chatSendFile = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_send_file',
+      ),
       _chatHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_chat_history',
       );
@@ -146,6 +150,7 @@ class Bindings {
   String settingsGet() => _consume(_settingsGet());
   String settingsSet(String json) => _withArg(json, _settingsSet);
   String chatSend(String json) => _withArg(json, _chatSend);
+  String chatSendFile(String json) => _withArg(json, _chatSendFile);
   String chatHistory(String json) => _withArg(json, _chatHistory);
 
   /// Read a Rust-owned string and free it (ownership contract).

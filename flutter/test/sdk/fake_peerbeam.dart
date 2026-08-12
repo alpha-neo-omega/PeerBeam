@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:peerbeam/sdk/events.dart';
+import 'package:peerbeam/sdk/exceptions.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/sdk/peerbeam.dart';
 
@@ -103,6 +104,43 @@ class FakePeerBeam implements PeerBeamApi {
 
   final Map<String, List<ChatMessage>> chatHistories = {};
   int _chatSeq = 0;
+
+  /// When true, [chatSendFile] throws instead of persisting a row — the
+  /// engine's own behaviour for a path it refuses (missing file, a folder),
+  /// where nothing is persisted and nothing is sent.
+  bool failChatSendFile = false;
+
+  @override
+  Future<String> chatSendFile(PeerTarget peer, String path) async {
+    calls.add('chatSendFile:$path');
+    if (failChatSendFile) {
+      throw InvalidArgumentException('cannot read $path');
+    }
+    // Mirrors `Manager::chat_send_file`: the outgoing row is validated and
+    // persisted SYNCHRONOUSLY, before the call returns and before anything is
+    // dialed, and it starts life as `transferring`. Keyed by the peer's real
+    // id — the same id-not-name guard the text path has.
+    final id = 'file-${++_chatSeq}';
+    final peerId = peer.id ?? peer.name;
+    final name = path.split('/').last;
+    chatHistories
+        .putIfAbsent(peerId, () => [])
+        .add(
+          ChatMessage(
+            id: id,
+            peerId: peerId,
+            direction: 'out',
+            body: '',
+            at: DateTime.now(),
+            status: ChatStatusValue.transferring,
+            kind: ChatMessageKind.file,
+            fileName: name,
+            fileSize: 0,
+            localPath: path,
+          ),
+        );
+    return id;
+  }
 
   @override
   Future<String> chatSend(PeerTarget peer, String text) async {

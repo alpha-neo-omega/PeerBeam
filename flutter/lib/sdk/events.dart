@@ -56,6 +56,7 @@ sealed class BridgeEvent {
           messageId: j['message_id'] as String? ?? '',
           peerId: j['peer_id'] as String? ?? '',
           status: j['status'] as String? ?? '',
+          error: j['error'] as String?,
         );
       default:
         return null;
@@ -121,6 +122,16 @@ class TransferEvent extends BridgeEvent {
   String? get folder => payload['folder'] as String?;
   String? get peer => payload['peer'] as String?;
 
+  /// The peer's **device id** — the stable, routable identity the display
+  /// [peer] name is not. Present on every `transfer_*` event, and what lets a
+  /// surface route a transfer to a conversation.
+  String? get peerId => payload['peer_id'] as String?;
+
+  /// Total size in bytes, when the engine knows it at `transfer_queued` time
+  /// (a chat file share and a peeked incoming transfer both do). The
+  /// authoritative running totals still come from [stats].
+  int? get size => (payload['size'] as num?)?.toInt();
+
   /// Local path of the completed item (on `transfer_completed`).
   String? get path => payload['path'] as String?;
   bool get incoming => payload['incoming'] == true;
@@ -157,14 +168,28 @@ class ChatReceived extends BridgeEvent {
   const ChatReceived(this.message);
 }
 
-/// A delivery-status change for a previously-sent chat message.
+/// A delivery-status change for a chat row: a queued text message finally
+/// delivered, or the terminal status a shared file's transfer settled on.
+///
+/// [status] is the record's own spelling (see `ChatStatusValue`), so it can be
+/// applied straight onto a row read from `chatHistory` with no second
+/// vocabulary. It deliberately does NOT carry file metadata — a received
+/// file's saved path is written to the persisted record just before the
+/// status settles, so re-reading the conversation is what picks it up.
 class ChatStatus extends BridgeEvent {
   final String messageId;
   final String peerId;
   final String status;
+
+  /// A human-readable reason, present only when the user is owed an
+  /// explanation (a file refused because the peer can't receive chat
+  /// attachments, or a send that failed before any byte moved).
+  final String? error;
+
   const ChatStatus({
     required this.messageId,
     required this.peerId,
     required this.status,
+    this.error,
   });
 }

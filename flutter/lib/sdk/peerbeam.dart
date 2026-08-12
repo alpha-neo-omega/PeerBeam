@@ -67,6 +67,19 @@ abstract class PeerBeamApi {
   /// Send a chat text message to a peer. Returns the new message id.
   Future<String> chatSend(PeerTarget peer, String text);
 
+  /// Share the file at [path] inside the conversation with [peer]. Returns the
+  /// new message id — which is ALSO the id of the transfer carrying the bytes,
+  /// so progress, approval and cancellation all line up with the chat row
+  /// without a second correlation table.
+  ///
+  /// Returns as soon as the row is persisted; the dial, the capability check
+  /// and the transfer all run in the background and report through
+  /// `chat_status` + the ordinary `transfer_*` events. **Online only**: an
+  /// unreachable peer settles the row as failed rather than queueing it.
+  /// Throws when the path itself is refused (missing, or a folder), in which
+  /// case nothing is persisted and nothing is sent.
+  Future<String> chatSendFile(PeerTarget peer, String path);
+
   /// Chat history with a given peer, oldest first.
   Future<List<ChatMessage>> chatHistory(String peerId);
 }
@@ -232,6 +245,14 @@ class PeerBeam implements PeerBeamApi {
   Future<String> chatSend(PeerTarget peer, String text) async {
     final data = _data(
       _req().chatSend(jsonEncode({'peer': peer.toJson(), 'text': text})),
+    );
+    return data['id'] as String;
+  }
+
+  @override
+  Future<String> chatSendFile(PeerTarget peer, String path) async {
+    final data = _data(
+      _req().chatSendFile(jsonEncode({'peer': peer.toJson(), 'path': path})),
     );
     return data['id'] as String;
   }

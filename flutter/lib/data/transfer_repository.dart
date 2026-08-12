@@ -24,6 +24,14 @@ class TransferRepository extends ChangeNotifier {
 
   List<Transfer> get transfers => List.unmodifiable(_byId.values);
 
+  /// The live transfer with [id], or null when there is none.
+  ///
+  /// This map is **ephemeral** — it holds only what is in flight right now and
+  /// is empty after a restart — so a caller that renders persisted state (a
+  /// chat file row, whose id is its transfer's id) must treat a null as
+  /// "no progress to overlay", never as "no such item".
+  Transfer? byId(String id) => _byId[id];
+
   /// User-facing failure messages (surface as a snackbar/notification).
   Stream<String> get errors => _errors.stream;
 
@@ -85,7 +93,12 @@ class TransferRepository extends ChangeNotifier {
               ? TransferDirection.receiving
               : TransferDirection.sending,
           state: TransferState.pending,
-          totalBytes: e.stats?.totalBytes ?? 0,
+          // `transfer_queued` carries no stats; the engine now puts the known
+          // size on the payload instead (a chat file share knows it up front,
+          // and an incoming transfer's first frame is peeked for it). Falling
+          // back to it means the size is truthful before the first progress
+          // update rather than 0.
+          totalBytes: e.stats?.totalBytes ?? e.size ?? 0,
           doneBytes: 0,
         );
       case 'transfer_started':

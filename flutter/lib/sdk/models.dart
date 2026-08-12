@@ -216,7 +216,58 @@ class TrustedDevice {
   );
 }
 
+/// What a chat record holds, as the engine serializes `peerbeam_chat::Kind`.
+abstract final class ChatMessageKind {
+  /// A text message — and every record written before file-in-chat, which has
+  /// no `kind` key at all (the Rust side defaults it, and so do we).
+  static const text = 'text';
+
+  /// A file shared inside the conversation. Its `body` is empty; the file's
+  /// name/size/local path live under [ChatMessage.fileName] etc.
+  static const file = 'file';
+}
+
+/// The delivery/lifecycle statuses of a chat record, spelled exactly as the
+/// engine serializes `peerbeam_chat::Status`.
+///
+/// That enum carries `#[serde(rename_all = "lowercase")]`, which lowercases
+/// the whole variant name **without inserting a separator** — so `PendingApproval`
+/// is on the wire as `pendingapproval`, not `pendingApproval` and not
+/// `pending_approval`. The same spellings come back on a `chat_status` event
+/// (Rust pins the two together in `chat_status_str`), so a surface can apply an
+/// event's status straight onto a row it read from `pb_chat_history`.
+abstract final class ChatStatusValue {
+  /// Queued in the engine's offline outbox (text only — 2a never queues files).
+  static const pending = 'pending';
+
+  /// Delivered to the peer.
+  static const sent = 'sent';
+
+  /// Received from the peer.
+  static const received = 'received';
+
+  /// A file the peer is offering us, awaiting the user's accept/decline.
+  static const pendingApproval = 'pendingapproval';
+
+  /// A file whose bytes are moving.
+  static const transferring = 'transferring';
+
+  /// The peer (or we) turned the file down.
+  static const declined = 'declined';
+
+  /// The transfer failed.
+  static const failed = 'failed';
+
+  /// Left mid-flight by a crash/restart; no event will ever complete it.
+  static const interrupted = 'interrupted';
+}
+
 /// A single chat message, sent or received via a [PeerTarget].
+///
+/// A record is either text or a shared file ([kind]); both ride the same
+/// conversation and the same status vocabulary. A file record's [body] is
+/// **empty** — rendering it as text produces a blank bubble — and its metadata
+/// arrives under the record's `file` object.
 @immutable
 class ChatMessage {
   final String id;
@@ -224,7 +275,25 @@ class ChatMessage {
   final String direction; // 'out' | 'in'
   final String body;
   final DateTime at;
-  final String status; // 'pending' | 'sent' | 'received'
+
+  /// One of [ChatStatusValue].
+  final String status;
+
+  /// One of [ChatMessageKind]. Defaults to text, so a record persisted before
+  /// file-in-chat (no `kind` key) reads exactly as it always did.
+  final String kind;
+
+  /// File metadata, all null unless [isFile].
+  final String? fileName;
+  final int? fileSize;
+
+  /// Where the file lives on THIS device: the source path on the sender, the
+  /// saved path on the receiver. Null until a receive completes.
+  ///
+  /// On Android it can dangle: the engine's private copy is deleted once the
+  /// file has been published into the user's SAF folder, so an "open" must be
+  /// prepared to fall back to opening it by [fileName].
+  final String? localPath;
 
   const ChatMessage({
     required this.id,
@@ -233,25 +302,52 @@ class ChatMessage {
     required this.body,
     required this.at,
     required this.status,
+    this.kind = ChatMessageKind.text,
+    this.fileName,
+    this.fileSize,
+    this.localPath,
   });
 
   bool get isMine => direction == 'out';
 
-  factory ChatMessage.fromJson(Map<String, dynamic> j) => ChatMessage(
-    id: j['id'] as String? ?? '',
-    peerId: j['peer_id'] as String? ?? '',
-    direction: j['direction'] as String? ?? 'in',
-    body: j['body'] as String? ?? '',
-    at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
-    status: j['status'] as String? ?? 'received',
-  );
+  /// Whether this row is a shared file rather than text.
+  bool get isFile => kind == ChatMessageKind.file;
 
-  ChatMessage copyWith({String? status}) => ChatMessage(
+  /// A file the peer is offering us that still needs a decision. The row's id
+  /// is also the transfer id, so the existing accept/trust/reject calls take
+  /// it unchanged.
+  bool get awaitingApproval =>
+      isFile && !isMine && status == ChatStatusValue.pendingApproval;
+
+  factory ChatMessage.fromJson(Map<String, dynamic> j) {
+    // `file` is absent on a legacy record and an explicit null on every text
+    // record; neither may be mistaken for metadata.
+    final raw = j['file'];
+    final file = raw is Map ? Map<String, dynamic>.from(raw) : null;
+    return ChatMessage(
+      id: j['id'] as String? ?? '',
+      peerId: j['peer_id'] as String? ?? '',
+      direction: j['direction'] as String? ?? 'in',
+      body: j['body'] as String? ?? '',
+      at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
+      status: j['status'] as String? ?? ChatStatusValue.received,
+      kind: j['kind'] as String? ?? ChatMessageKind.text,
+      fileName: file?['name'] as String?,
+      fileSize: (file?['size'] as num?)?.toInt(),
+      localPath: file?['local_path'] as String?,
+    );
+  }
+
+  ChatMessage copyWith({String? status, String? localPath}) => ChatMessage(
     id: id,
     peerId: peerId,
     direction: direction,
     body: body,
     at: at,
     status: status ?? this.status,
+    kind: kind,
+    fileName: fileName,
+    fileSize: fileSize,
+    localPath: localPath ?? this.localPath,
   );
 }

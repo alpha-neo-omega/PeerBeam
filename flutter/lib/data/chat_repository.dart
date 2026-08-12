@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../sdk/events.dart';
+import '../sdk/exceptions.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 
@@ -18,6 +19,11 @@ import '../sdk/peerbeam.dart';
 class ChatRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
   final Map<String, List<ChatMessage>> _byPeer = {};
+
+  /// Why a row failed, keyed by message id. Session-scoped on purpose: the
+  /// engine persists the failed *status* but not a reason, and the reason
+  /// arrives only on the `chat_status` event that reports it.
+  final Map<String, String> _errors = {};
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
   int _optimisticSeq = 0;
@@ -40,6 +46,11 @@ class ChatRepository extends ChangeNotifier {
   List<ChatMessage> messagesFor(String peerId) =>
       List.unmodifiable(_byPeer[peerId] ?? const []);
 
+  /// Why the message with [messageId] failed, when the engine said so. Null
+  /// for every message that hasn't failed (and for a failure this session
+  /// never saw — the reason isn't persisted).
+  String? errorFor(String messageId) => _errors[messageId];
+
   /// Pull the persisted conversation with [peerId] from the engine.
   Future<void> refresh(String peerId) async {
     final api = _api;
@@ -47,7 +58,11 @@ class ChatRepository extends ChangeNotifier {
     try {
       final msgs = await api.chatHistory(peerId);
       if (_disposed) return;
-      _byPeer[peerId] = msgs;
+      // Copied, not stored by reference: this repository appends to its own
+      // lists (optimistic rows, live `chat_received`), so holding the SDK's
+      // list would both mutate the caller's data and break outright on a
+      // fixed-length/const one.
+      _byPeer[peerId] = List<ChatMessage>.of(msgs);
       notifyListeners();
     } catch (_) {
       // Keep the current view on transient errors.
@@ -90,22 +105,120 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
+  /// Share the file at [path] inside the conversation with [peer].
+  ///
+  /// Mirrors [send], with one deliberate difference: **there is no outbox**.
+  /// `chatSendFile` is online-only (increment 2a), so a peer that cannot be
+  /// reached fails the row rather than promising a later delivery — and a
+  /// failure is therefore worth showing, not swallowing.
+  ///
+  /// [name] and [size] are only used for the optimistic row shown before the
+  /// engine answers; the persisted record is authoritative from `refresh` on.
+  /// The engine validates and persists the row synchronously (before it dials
+  /// anything), so that reconcile always finds it.
+  ///
+  /// Call this once per picked file. A multi-select fans out here, never at
+  /// the engine — sending only the first of several files the user chose is
+  /// silent data loss.
+  Future<void> sendFile(
+    String peerId,
+    PeerTarget peer,
+    String path, {
+    String? name,
+    int? size,
+  }) async {
+    if (path.isEmpty) return;
+    final id = 'local-${++_optimisticSeq}';
+    (_byPeer[peerId] ??= <ChatMessage>[]).add(
+      ChatMessage(
+        id: id,
+        peerId: peerId,
+        direction: 'out',
+        // A file row carries no text — the engine persists an empty body too.
+        body: '',
+        at: DateTime.now(),
+        status: ChatStatusValue.transferring,
+        kind: ChatMessageKind.file,
+        fileName: name ?? _basename(path),
+        fileSize: size,
+        localPath: path,
+      ),
+    );
+    notifyListeners();
+    try {
+      await _api?.chatSendFile(peer, path);
+      await refresh(peerId);
+    } on PeerBeamException catch (e) {
+      // The engine refused the path itself (missing file, a folder): nothing
+      // was persisted and nothing was sent, so a `refresh` here would silently
+      // erase the row the user is looking at. Fail it in place instead, with
+      // the engine's own reason.
+      _fail(peerId, id, e.message);
+    } catch (_) {
+      // Anything else (a malformed reply, a dead engine): still the user's
+      // row to account for. This call is fire-and-forget from the attach
+      // button, so an escaping error would be an unhandled async one.
+      _fail(peerId, id, 'Could not share ${name ?? _basename(path)}');
+    }
+  }
+
+  /// Mark a message failed in place and remember why.
+  void _fail(String peerId, String messageId, String reason) {
+    _errors[messageId] = reason;
+    final list = _byPeer[peerId];
+    final i = list?.indexWhere((m) => m.id == messageId) ?? -1;
+    if (list != null && i >= 0) {
+      list[i] = list[i].copyWith(status: ChatStatusValue.failed);
+    }
+    notifyListeners();
+  }
+
+  static String _basename(String path) {
+    final norm = path.replaceAll('\\', '/');
+    final i = norm.lastIndexOf('/');
+    return i >= 0 ? norm.substring(i + 1) : norm;
+  }
+
   void _onReceived(ChatMessage m) {
     (_byPeer[m.peerId] ??= <ChatMessage>[]).add(m);
     notifyListeners();
   }
 
-  /// Flip a previously-sent message's status in place (e.g. `pending` →
-  /// `sent`, once the engine's outbox actually delivers it). A safe no-op
-  /// when the peer or message id isn't known locally — e.g. a stale/late
-  /// status event for a conversation this session never loaded.
+  /// Flip a message's status in place: `pending` → `sent` once the engine's
+  /// outbox delivers a text message, or the terminal status a shared file's
+  /// transfer settled on. A safe no-op when the peer or message id isn't known
+  /// locally — e.g. a stale/late status event for a conversation this session
+  /// never loaded.
+  ///
+  /// This is the ONLY thing that drives a chat row's status. The engine
+  /// deliberately gates which rows a transfer may settle (right conversation,
+  /// right row, still in flight) before emitting this, so deriving statuses
+  /// here from raw `transfer_*` events as well would be a second, ungated path
+  /// to the same state — the live [TransferRepository] entry is used purely to
+  /// overlay progress on an in-flight row.
   void _onStatus(ChatStatus e) {
+    // A status without a reason supersedes any earlier one: the row moved on,
+    // so a stale explanation must not stay under it.
+    final reason = e.error;
+    if (reason != null) {
+      _errors[e.messageId] = reason;
+    } else {
+      _errors.remove(e.messageId);
+    }
     final list = _byPeer[e.peerId];
     if (list == null) return;
     final i = list.indexWhere((m) => m.id == e.messageId);
     if (i < 0) return;
-    list[i] = list[i].copyWith(status: e.status);
+    final updated = list[i].copyWith(status: e.status);
+    list[i] = updated;
     notifyListeners();
+    // A received file's saved location is written onto the persisted record
+    // just before the row settles, and is not carried by this event — re-read
+    // the conversation so the row can offer "Open". Narrow on purpose: no
+    // other status transition adds anything a re-read would find.
+    if (updated.isFile && e.status == ChatStatusValue.received) {
+      unawaited(refresh(e.peerId));
+    }
   }
 
   @override

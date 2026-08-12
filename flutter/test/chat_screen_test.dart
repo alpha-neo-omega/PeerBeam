@@ -1,0 +1,250 @@
+// Chat screen behaviours for file-in-chat (increment 2a, online only):
+// the attach button's fan-out over a multi-select, the file bubble rendered
+// from the PERSISTED record, inline approval on an incoming offer, and the
+// Android SAF fallback when a received file's recorded path no longer exists.
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:peerbeam/features/chat/chat_screen.dart';
+import 'package:peerbeam/sdk/events.dart';
+import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/state/app_scope.dart';
+import 'package:peerbeam/state/stores.dart';
+
+import 'sdk/fake_peerbeam.dart';
+
+const _peer = PeerTarget(
+  id: 'pb-bob',
+  name: 'Bob',
+  addresses: ['127.0.0.1'],
+  port: 49600,
+);
+
+Widget _screen(AppState state) => AppScope(
+  state: state,
+  child: const MaterialApp(
+    home: ChatScreen(peerId: 'pb-bob', peer: _peer),
+  ),
+);
+
+/// Pump the screen and let its post-frame `refresh` land.
+Future<AppState> _open(WidgetTester tester, FakePeerBeam fake) async {
+  final state = AppState.live(fake);
+  addTearDown(state.dispose);
+  await tester.pumpWidget(_screen(state));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+  return state;
+}
+
+ChatMessage _file({
+  required String id,
+  required String direction,
+  required String status,
+  String name = 'report.pdf',
+  int size = 4096,
+  String? localPath,
+}) => ChatMessage(
+  id: id,
+  peerId: 'pb-bob',
+  direction: direction,
+  body: '',
+  at: DateTime.now(),
+  status: status,
+  kind: ChatMessageKind.file,
+  fileName: name,
+  fileSize: size,
+  localPath: localPath,
+);
+
+void main() {
+  testWidgets('the attach button sends EVERY picked file, not just the first', (
+    tester,
+  ) async {
+    // flutter_test's target platform is Android, so `pickFilesToStage` takes
+    // the native `peerbeam/android` branch; stub a three-file multi-select.
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (call) async => call.method == 'pickFiles'
+          ? [
+              {'path': '/tmp/a.bin', 'name': 'a.bin', 'size': 1},
+              {'path': '/tmp/b.bin', 'name': 'b.bin', 'size': 2},
+              {'path': '/tmp/c.bin', 'name': 'c.bin', 'size': 3},
+            ]
+          : null,
+    );
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.attach_file_rounded));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), [
+      'chatSendFile:/tmp/a.bin',
+      'chatSendFile:/tmp/b.bin',
+      'chatSendFile:/tmp/c.bin',
+    ]);
+    // All three rows are in the thread.
+    expect(find.text('a.bin'), findsOneWidget);
+    expect(find.text('b.bin'), findsOneWidget);
+    expect(find.text('c.bin'), findsOneWidget);
+  });
+
+  testWidgets('a file row renders its name and size, never a blank bubble', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.sent),
+    ];
+    await _open(tester, fake);
+
+    expect(find.text('report.pdf'), findsOneWidget);
+    expect(find.textContaining('4.0 KB'), findsOneWidget);
+    expect(find.textContaining('Sent'), findsWidgets);
+  });
+
+  testWidgets('a legacy record (no kind/file keys) still renders as text', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    // Decoded from the raw JSON an engine predating file-in-chat persisted.
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage.fromJson(const {
+        'id': 'm-legacy',
+        'peer_id': 'pb-bob',
+        'direction': 'in',
+        'timestamp': '2026-08-10T12:00:00Z',
+        'body': 'hello from 1a',
+        'status': 'received',
+      }),
+    ];
+    await _open(tester, fake);
+
+    expect(find.text('hello from 1a'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('an incoming offer shows inline Accept / Trust / Decline wired '
+      'to the existing transfer approval', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'in',
+        status: ChatStatusValue.pendingApproval,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.text('Accept'), findsOneWidget);
+    expect(find.text('Trust'), findsOneWidget);
+    expect(find.text('Decline'), findsOneWidget);
+
+    // The ids match by construction: the chat message id IS the transfer id.
+    await tester.tap(find.text('Accept'));
+    await tester.pump();
+    expect(fake.calls, contains('accept:fr-1'));
+
+    await tester.tap(find.text('Trust'));
+    await tester.pump();
+    expect(fake.calls, contains('acceptTrust:fr-1'));
+
+    await tester.tap(find.text('Decline'));
+    await tester.pump();
+    expect(fake.calls, contains('reject:fr-1'));
+  });
+
+  testWidgets('a settled row offers no approval buttons', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'in', status: ChatStatusValue.received),
+    ];
+    await _open(tester, fake);
+
+    expect(find.text('Accept'), findsNothing);
+    expect(find.text('Decline'), findsNothing);
+  });
+
+  testWidgets('an in-flight row shows progress from the live transfer, and '
+      'still renders when there is none', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.transferring,
+      ),
+    ];
+    await _open(tester, fake);
+
+    // No live Transfer (e.g. after a restart): an indeterminate bar, not a
+    // crash and not a fake 0%.
+    LinearProgressIndicator bar() =>
+        tester.widget<LinearProgressIndicator>(
+          find.byType(LinearProgressIndicator),
+        );
+    expect(bar().value, isNull);
+
+    // The transfer registers and reports progress under the SAME id.
+    fake.emit(
+      const TransferEvent(
+        kind: 'transfer_queued',
+        transferId: 'fr-1',
+        timestamp: '',
+        payload: {'peer': 'Bob', 'peer_id': 'pb-bob', 'file': 'report.pdf'},
+      ),
+    );
+    fake.emit(
+      const TransferEvent(
+        kind: 'transfer_progress',
+        transferId: 'fr-1',
+        timestamp: '',
+        payload: {
+          'peer_id': 'pb-bob',
+          'stats': {'transferred_bytes': 2048, 'total_bytes': 4096},
+        },
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(bar().value, closeTo(0.5, 0.001));
+  });
+
+  testWidgets('tapping a received file whose recorded copy is gone falls back '
+      'to opening it by name through SAF', (tester) async {
+    final calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (call) async {
+        calls.add(call);
+        return call.method == 'safOpen' ? true : null;
+      },
+    );
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'in',
+        status: ChatStatusValue.received,
+        // The engine's copy was deleted after the SAF publish: this dangles.
+        localPath: '/data/user/0/app/files/report.pdf',
+      ),
+    ];
+    await _open(tester, fake);
+
+    await tester.tap(find.text('report.pdf'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    final saf = calls.where((c) => c.method == 'safOpen');
+    expect(saf, hasLength(1));
+    expect((saf.single.arguments as Map)['name'], 'report.pdf');
+    // The fallback worked, so the user is not told it failed.
+    expect(find.byType(SnackBar), findsNothing);
+  });
+}

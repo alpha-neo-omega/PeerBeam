@@ -413,19 +413,47 @@ class HomeScreen extends StatelessWidget {
 
   /// Open a chat with a discovered device (pushed, not a nav tab — see
   /// task-9 brief for the M1 rationale).
+  ///
+  /// Not gated on the device being online: the conversation is local history,
+  /// so the thread opens either way. Only the *send* needs the peer, and it
+  /// reports its own failure. The one hard stop is a device with no address at
+  /// all, where there is nothing to send to even when it comes back.
   void _chatWith(BuildContext context, Device device) {
     final target = AppScope.of(context).device.peerTarget(device.id);
     if (target == null) {
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(
-          SnackBar(content: Text('${device.name} is not reachable right now')),
+          SnackBar(content: Text('No address known for ${device.name}')),
         );
       return;
     }
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ChatScreen(peerId: device.id, peer: target),
+      ),
+    );
+  }
+
+  /// Open a chat with a saved (by-address) device. Saved devices are always
+  /// listed, online or not, so this is the entry point that keeps a thread
+  /// reachable for a peer discovery cannot see at all.
+  ///
+  /// The conversation is keyed by the saved device's own id — the same id
+  /// `_sendToSaved` puts on the target, so both halves of the conversation
+  /// agree on the namespace.
+  void _chatWithSaved(BuildContext context, SavedDevice d) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          peerId: d.id,
+          peer: PeerTarget(
+            id: d.id,
+            name: d.name,
+            addresses: [d.host],
+            port: d.port,
+          ),
+        ),
       ),
     );
   }
@@ -450,11 +478,13 @@ class HomeScreen extends StatelessWidget {
             child: AnimatedBuilder(
               animation: Listenable.merge([state.device, state.saved]),
               builder: (context, _) {
-                // Nearby shows live peers only — a device that drops offline
-                // disappears (the engine still tracks it; the CLI can list it).
-                final devices = state.device.devices
-                    .where((d) => d.online)
-                    .toList();
+                // Every device the engine currently knows about, online or
+                // not: a peer that drops offline stays listed (dimmed, with
+                // send disabled — see `DeviceTile`) rather than vanishing,
+                // because its conversation is local history that stays worth
+                // opening. The engine removes a device outright when it
+                // genuinely goes away, and that still drops it from here.
+                final devices = state.device.devices.toList();
                 final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [
@@ -622,6 +652,7 @@ class HomeScreen extends StatelessWidget {
                               child: _SavedDeviceCard(
                                 device: saved[i],
                                 onTap: () => _sendToSaved(context, saved[i]),
+                                onChat: () => _chatWithSaved(context, saved[i]),
                                 onShare: () => _shareSaved(context, saved[i]),
                                 onEdit: () =>
                                     _editSavedDevice(context, saved[i]),
@@ -790,12 +821,14 @@ class _SearchPill extends StatelessWidget {
 class _SavedDeviceCard extends StatelessWidget {
   final SavedDevice device;
   final VoidCallback onTap;
+  final VoidCallback onChat;
   final VoidCallback onShare;
   final VoidCallback onEdit;
   final VoidCallback onRemove;
   const _SavedDeviceCard({
     required this.device,
     required this.onTap,
+    required this.onChat,
     required this.onShare,
     required this.onEdit,
     required this.onRemove,
@@ -847,6 +880,17 @@ class _SavedDeviceCard extends StatelessWidget {
                     ),
                   ],
                 ),
+              ),
+              // A saved device is reachable-by-address and always listed, so
+              // this is the entry point that keeps a conversation openable
+              // even when discovery cannot see the peer at all.
+              IconButton(
+                onPressed: onChat,
+                icon: const Icon(
+                  Icons.chat_bubble_outline_rounded,
+                  size: AppIcons.sm,
+                ),
+                tooltip: 'Chat with ${device.name}',
               ),
               PopupMenuButton<String>(
                 tooltip: 'Device actions',

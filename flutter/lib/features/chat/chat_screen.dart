@@ -1,15 +1,27 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../platform/desktop_files.dart';
+import '../../platform/open_path.dart';
+import '../../platform/saf.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
+import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
+import '../../widgets/processing.dart';
 
 /// A one-to-one chat with [peer]. [peerId] is the discovered device's real
 /// id — the conversation key. [PeerTarget] does carry its own `id` field
 /// now, but it's optional (a manually-entered host:port target has none), so
 /// the id is threaded through separately here rather than read off [peer].
+///
+/// The thread is reachable whether or not the peer is online: history is
+/// local. Sending is not — a text message queues in the engine's outbox, and
+/// a file (increment 2a) fails with a clear reason rather than promising a
+/// delivery this build cannot make.
 class ChatScreen extends StatefulWidget {
   final String peerId;
   final PeerTarget peer;
@@ -53,6 +65,34 @@ class _ChatScreenState extends State<ChatScreen> {
     chat.send(widget.peerId, widget.peer, text);
   }
 
+  /// Attach files to the conversation.
+  ///
+  /// [pickFilesToStage] is a MULTI-select: every file it returns gets its own
+  /// row and its own transfer. Sending only the first while the user watched
+  /// themselves choose five is silent data loss, so the loop is the point.
+  Future<void> _attach() async {
+    final chat = AppScope.of(context).chat;
+    final picked = await withProcessing(
+      context,
+      'Preparing files…',
+      pickFilesToStage,
+    );
+    if (picked.isEmpty || !mounted) return;
+    for (final file in picked) {
+      // Not awaited, and deliberately not sequential: each call appends its
+      // optimistic row synchronously, so all of them appear at once.
+      unawaited(
+        chat.sendFile(
+          widget.peerId,
+          widget.peer,
+          file.path,
+          name: file.name,
+          size: file.size,
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
@@ -80,17 +120,25 @@ class _ChatScreenState extends State<ChatScreen> {
                       reverse: true,
                       padding: const EdgeInsets.all(AppSpace.md),
                       itemCount: items.length,
-                      itemBuilder: (context, i) => Appear(
-                        index: i,
-                        child: _ChatBubble(
-                          message: items[items.length - 1 - i],
-                        ),
-                      ),
+                      itemBuilder: (context, i) {
+                        final message = items[items.length - 1 - i];
+                        return Appear(
+                          index: i,
+                          child: _ChatBubble(
+                            message: message,
+                            error: state.chat.errorFor(message.id),
+                          ),
+                        );
+                      },
                     );
                   },
                 ),
               ),
-              _Composer(controller: _controller, onSend: _send),
+              _Composer(
+                controller: _controller,
+                onSend: _send,
+                onAttach: _attach,
+              ),
             ],
           ),
         ),
@@ -100,10 +148,15 @@ class _ChatScreenState extends State<ChatScreen> {
 }
 
 /// One message bubble: own messages lean right in `primaryContainer`, the
-/// peer's lean left in `surfaceContainerHighest`.
+/// peer's lean left in `surfaceContainerHighest`. A file row renders its own
+/// body ([_FileBody]) instead of the message text — a file record's `body` is
+/// empty, so rendering it as text would be a blank bubble.
 class _ChatBubble extends StatelessWidget {
   final ChatMessage message;
-  const _ChatBubble({required this.message});
+
+  /// Why this row failed, when the engine said so (never persisted).
+  final String? error;
+  const _ChatBubble({required this.message, this.error});
 
   @override
   Widget build(BuildContext context) {
@@ -124,46 +177,62 @@ class _ChatBubble extends StatelessWidget {
             constraints: BoxConstraints(
               maxWidth: MediaQuery.sizeOf(context).width * 0.75,
             ),
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppSpace.sm,
-                vertical: AppSpace.xs,
-              ),
-              decoration: BoxDecoration(
-                color: bg,
-                borderRadius: BorderRadius.circular(AppRadius.lg),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    message.body,
-                    style: text.bodyMedium?.copyWith(color: fg),
+            child: Material(
+              color: bg,
+              borderRadius: BorderRadius.circular(AppRadius.lg),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: message.isFile && _openablePath(message) != null
+                    ? () => _open(context, message)
+                    : null,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpace.sm,
+                    vertical: AppSpace.xs,
                   ),
-                  const Gap(AppSpace.xxs),
-                  Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(
-                        _time(message.at),
-                        style: text.labelSmall?.copyWith(
-                          color: fg.withValues(alpha: 0.7),
+                      if (message.isFile)
+                        _FileBody(message: message, fg: fg)
+                      else
+                        Text(
+                          message.body,
+                          style: text.bodyMedium?.copyWith(color: fg),
                         ),
-                      ),
-                      if (mine) ...[
+                      if (error != null) ...[
                         const Gap(AppSpace.xxs),
-                        Icon(
-                          message.status == 'pending'
-                              ? Icons.schedule
-                              : Icons.check_rounded,
-                          size: 14,
-                          color: fg.withValues(alpha: 0.7),
+                        Text(
+                          error!,
+                          style: text.labelSmall?.copyWith(color: scheme.error),
                         ),
                       ],
+                      const Gap(AppSpace.xxs),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _time(message.at),
+                            style: text.labelSmall?.copyWith(
+                              color: fg.withValues(alpha: 0.7),
+                            ),
+                          ),
+                          if (mine) ...[
+                            const Gap(AppSpace.xxs),
+                            Icon(
+                              message.status == ChatStatusValue.pending
+                                  ? Icons.schedule
+                                  : Icons.check_rounded,
+                              size: 14,
+                              color: fg.withValues(alpha: 0.7),
+                            ),
+                          ],
+                        ],
+                      ),
                     ],
                   ),
-                ],
+                ),
               ),
             ),
           ),
@@ -183,11 +252,187 @@ class _ChatBubble extends StatelessWidget {
   }
 }
 
-/// The bottom compose bar: a text field plus a send button.
+/// The path a settled file row can be opened at, or null when there is
+/// nothing to open (still in flight, declined/failed, or a receive that
+/// completed on an engine that recorded no path).
+String? _openablePath(ChatMessage message) {
+  const settled = {ChatStatusValue.sent, ChatStatusValue.received};
+  if (!settled.contains(message.status)) return null;
+  final path = message.localPath;
+  return (path == null || path.isEmpty) ? null : path;
+}
+
+/// Open a received/sent file with the OS handler.
+///
+/// On Android the engine's own copy of a received file is deleted once it has
+/// been published into the user's SAF folder, so the recorded path dangles.
+/// That is not an error — the file is exactly where the user asked for it — so
+/// fall back to opening it there by name, the same fallback the History screen
+/// uses for the same reason.
+Future<void> _open(BuildContext context, ChatMessage message) async {
+  final error = await openLocalPath(_openablePath(message) ?? '');
+  if (error == null) return;
+  final name = message.fileName ?? '';
+  if (!message.isMine &&
+      name.isNotEmpty &&
+      Saf.isSupported &&
+      await Saf.open(name)) {
+    return;
+  }
+  if (context.mounted) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(error)));
+  }
+}
+
+/// A shared file's row: icon, name, size + status, and — while it is in
+/// flight or awaiting a decision — progress or the approval actions.
+///
+/// Everything here is sourced from the PERSISTED [ChatMessage]. The live
+/// [Transfer] is consulted only to overlay progress on an in-flight row, and
+/// is expected to be absent (after a restart, or once the transfer settles).
+class _FileBody extends StatelessWidget {
+  final ChatMessage message;
+  final Color fg;
+  const _FileBody({required this.message, required this.fg});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    final text = Theme.of(context).textTheme;
+    final muted = fg.withValues(alpha: 0.7);
+    final size = message.fileSize;
+    final meta = [
+      if (size != null && size > 0) formatBytes(size),
+      _statusLabel(message),
+    ].join(' · ');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(_icon(message), size: AppIcons.md, color: fg),
+            const Gap(AppSpace.xs),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    message.fileName ?? 'File',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.bodyMedium?.copyWith(
+                      color: fg,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    meta,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: text.labelSmall?.copyWith(color: muted),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        if (message.status == ChatStatusValue.transferring) ...[
+          const Gap(AppSpace.xs),
+          // The one place a live transfer is read: purely a progress overlay.
+          // No live entry (a restart, or a row that settled) leaves an
+          // indeterminate bar rather than a fabricated 0%.
+          AnimatedBuilder(
+            animation: state.transfer,
+            builder: (context, _) {
+              final live = state.transfer.byId(message.id);
+              final total = (live != null && live.totalBytes > 0)
+                  ? live.totalBytes
+                  : (message.fileSize ?? 0);
+              final value = (live == null || total <= 0)
+                  ? null
+                  : (live.doneBytes / total).clamp(0.0, 1.0).toDouble();
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+                child: LinearProgressIndicator(
+                  value: value,
+                  minHeight: 4,
+                  backgroundColor: fg.withValues(alpha: 0.15),
+                ),
+              );
+            },
+          ),
+        ],
+        // The peer is offering us a file. These are the ordinary transfer
+        // approvals — the chat row's id IS the transfer's id, so they take it
+        // unchanged, and there is no second approval path to keep in step.
+        if (message.awaitingApproval) ...[
+          const Gap(AppSpace.xxs),
+          Wrap(
+            spacing: AppSpace.xs,
+            runSpacing: AppSpace.xxs,
+            children: [
+              TextButton(
+                onPressed: () => state.transfer.reject(message.id),
+                child: const Text('Decline'),
+              ),
+              FilledButton.tonal(
+                onPressed: () => state.transfer.accept(message.id),
+                child: const Text('Accept'),
+              ),
+              Tooltip(
+                message: 'Accept and always trust this device',
+                child: FilledButton(
+                  onPressed: () => state.transfer.acceptTrust(message.id),
+                  child: const Text('Trust'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
+  IconData _icon(ChatMessage m) => switch (m.status) {
+    ChatStatusValue.failed => Icons.error_outline_rounded,
+    ChatStatusValue.declined => Icons.block_rounded,
+    ChatStatusValue.interrupted => Icons.help_outline_rounded,
+    ChatStatusValue.pendingApproval => Icons.move_to_inbox_rounded,
+    _ => Icons.insert_drive_file_rounded,
+  };
+
+  /// Plain language for a record status, from the row's own point of view.
+  String _statusLabel(ChatMessage m) => switch (m.status) {
+    ChatStatusValue.transferring => m.isMine ? 'Sending…' : 'Receiving…',
+    ChatStatusValue.sent => 'Sent',
+    ChatStatusValue.received => 'Received · tap to open',
+    ChatStatusValue.pendingApproval => m.isMine
+        ? 'Waiting for approval'
+        : 'Wants to send you this',
+    ChatStatusValue.declined => 'Declined',
+    ChatStatusValue.failed => 'Failed',
+    ChatStatusValue.interrupted => 'Interrupted',
+    ChatStatusValue.pending => 'Waiting',
+    _ => m.status,
+  };
+}
+
+/// The bottom compose bar: attach, a text field, and a send button.
 class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final VoidCallback onSend;
-  const _Composer({required this.controller, required this.onSend});
+  final VoidCallback onAttach;
+  const _Composer({
+    required this.controller,
+    required this.onSend,
+    required this.onAttach,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -202,6 +447,12 @@ class _Composer extends StatelessWidget {
         ),
         child: Row(
           children: [
+            IconButton(
+              onPressed: onAttach,
+              icon: const Icon(Icons.attach_file_rounded),
+              tooltip: 'Attach files',
+            ),
+            const Gap(AppSpace.xxs),
             Expanded(
               child: TextField(
                 controller: controller,

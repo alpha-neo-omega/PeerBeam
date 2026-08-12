@@ -80,8 +80,12 @@ class DeviceTile extends StatelessWidget {
                     ),
                     if (onChat != null) ...[
                       const Gap(AppSpace.xxs),
+                      // Deliberately NOT gated on `online`, unlike send: a
+                      // conversation is local history, so an offline peer's
+                      // thread is still worth opening and reading. Sending
+                      // into it is what may fail, and it says so there.
                       IconButton(
-                        onPressed: device.online ? onChat : null,
+                        onPressed: onChat,
                         icon: const Icon(
                           Icons.chat_bubble_outline_rounded,
                           size: AppIcons.sm,

@@ -441,5 +441,257 @@ void main() {
       await flush();
       expect(repo.messagesFor('alice').single.status, 'pending');
     });
+
+    test('sendFile shows the file row immediately, then reconciles with the '
+        'engine — keyed by the peer\'s real id, not its display name', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-carol',
+        name: 'carol',
+        addresses: ['127.0.0.1'],
+        port: 49600,
+      );
+
+      // Not awaited: the optimistic row is appended synchronously, before
+      // chatSendFile's own await, exactly like the fire-and-forget call the
+      // attach button makes.
+      final pending = repo.sendFile(
+        'pb-carol',
+        target,
+        '/tmp/report.pdf',
+        name: 'report.pdf',
+        size: 4096,
+      );
+      final optimistic = repo.messagesFor('pb-carol').single;
+      expect(optimistic.isFile, isTrue);
+      expect(optimistic.fileName, 'report.pdf');
+      expect(optimistic.fileSize, 4096);
+      expect(optimistic.status, ChatStatusValue.transferring);
+      expect(optimistic.isMine, isTrue);
+      // A file row carries no text: rendering `body` would be a blank bubble.
+      expect(optimistic.body, isEmpty);
+
+      await pending;
+      expect(fake.calls, contains('chatSendFile:/tmp/report.pdf'));
+      // Reconciled from chatHistory('pb-carol'): the persisted record (keyed
+      // by peer.id) replaces the optimistic placeholder.
+      final settled = repo.messagesFor('pb-carol').single;
+      expect(settled.id, 'file-1');
+      expect(settled.isFile, isTrue);
+      // The name is never used as a conversation key.
+      expect(repo.messagesFor('carol'), isEmpty);
+    });
+
+    test('sendFile is called once per file when several are attached', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-bob',
+        name: 'bob',
+        addresses: ['127.0.0.1'],
+        port: 49600,
+      );
+
+      await Future.wait([
+        repo.sendFile('pb-bob', target, '/tmp/a.bin', name: 'a.bin'),
+        repo.sendFile('pb-bob', target, '/tmp/b.bin', name: 'b.bin'),
+        repo.sendFile('pb-bob', target, '/tmp/c.bin', name: 'c.bin'),
+      ]);
+
+      expect(
+        fake.calls.where((c) => c.startsWith('chatSendFile:')),
+        ['chatSendFile:/tmp/a.bin', 'chatSendFile:/tmp/b.bin', 'chatSendFile:/tmp/c.bin'],
+      );
+      expect(repo.messagesFor('pb-bob'), hasLength(3));
+    });
+
+    test('a local sendFile failure marks the row failed and keeps the reason '
+        '(nothing was persisted, so it must not just vanish)', () async {
+      final fake = FakePeerBeam()..failChatSendFile = true;
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-bob',
+        name: 'bob',
+        addresses: ['127.0.0.1'],
+        port: 49600,
+      );
+
+      await repo.sendFile('pb-bob', target, '/tmp/gone.bin', name: 'gone.bin');
+
+      final row = repo.messagesFor('pb-bob').single;
+      expect(row.status, ChatStatusValue.failed);
+      expect(repo.errorFor(row.id), contains('cannot read'));
+    });
+
+    test('a chat_status for a file row flips its status and keeps the error '
+        'the engine sent with it', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'fr-1',
+            peerId: 'pb-bob',
+            direction: 'out',
+            body: '',
+            at: DateTime.now(),
+            status: ChatStatusValue.transferring,
+            kind: ChatMessageKind.file,
+            fileName: 'a.bin',
+            fileSize: 7,
+          ),
+        ),
+      );
+      await flush();
+
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.failed,
+          error: 'cannot reach Bob to send a.bin: no route',
+        ),
+      );
+      await flush();
+
+      final row = repo.messagesFor('pb-bob').single;
+      expect(row.status, ChatStatusValue.failed);
+      // Every other field survives the flip.
+      expect(row.isFile, isTrue);
+      expect(row.fileName, 'a.bin');
+      expect(row.fileSize, 7);
+      expect(repo.errorFor('fr-1'), 'cannot reach Bob to send a.bin: no route');
+    });
+
+    test('a received file re-reads the conversation so the row learns where '
+        'the file actually landed', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      // The offer arrives on the CHAT channel first: no local path yet.
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'fr-1',
+            peerId: 'pb-bob',
+            direction: 'in',
+            body: '',
+            at: DateTime.now(),
+            status: ChatStatusValue.pendingApproval,
+            kind: ChatMessageKind.file,
+            fileName: 'a.bin',
+            fileSize: 7,
+          ),
+        ),
+      );
+      await flush();
+      expect(repo.messagesFor('pb-bob').single.localPath, isNull);
+
+      // The engine writes `file.local_path` on the persisted record BEFORE it
+      // settles the row, so a re-read after `received` picks the path up. The
+      // status event itself never carries it.
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: '',
+          at: DateTime.now(),
+          status: ChatStatusValue.received,
+          kind: ChatMessageKind.file,
+          fileName: 'a.bin',
+          fileSize: 7,
+          localPath: '/home/me/Downloads/a.bin',
+        ),
+      ];
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.received,
+        ),
+      );
+      await flush();
+      await flush();
+
+      final row = repo.messagesFor('pb-bob').single;
+      expect(row.status, ChatStatusValue.received);
+      expect(row.localPath, '/home/me/Downloads/a.bin');
+    });
+
+    test('a text chat_status never triggers a re-read', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'm1',
+            peerId: 'pb-bob',
+            direction: 'out',
+            body: 'hi',
+            at: DateTime.now(),
+            status: ChatStatusValue.pending,
+          ),
+        ),
+      );
+      await flush();
+
+      fake.emit(
+        const ChatStatus(
+          messageId: 'm1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.sent,
+        ),
+      );
+      await flush();
+      await flush();
+
+      expect(fake.calls.where((c) => c.startsWith('chatHistory:')), isEmpty);
+      expect(repo.messagesFor('pb-bob').single.status, ChatStatusValue.sent);
+    });
+
+    test('messagesFor keeps text and file rows distinct in one thread', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'm1',
+            peerId: 'pb-bob',
+            direction: 'in',
+            body: 'here you go',
+            at: DateTime.now(),
+            status: ChatStatusValue.received,
+          ),
+        ),
+      );
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'fr-1',
+            peerId: 'pb-bob',
+            direction: 'in',
+            body: '',
+            at: DateTime.now(),
+            status: ChatStatusValue.pendingApproval,
+            kind: ChatMessageKind.file,
+            fileName: 'a.bin',
+            fileSize: 7,
+          ),
+        ),
+      );
+      await flush();
+
+      final rows = repo.messagesFor('pb-bob');
+      expect(rows, hasLength(2));
+      expect(rows.first.isFile, isFalse);
+      expect(rows.first.body, 'here you go');
+      expect(rows.last.isFile, isTrue);
+      expect(rows.last.fileName, 'a.bin');
+    });
   });
 }
