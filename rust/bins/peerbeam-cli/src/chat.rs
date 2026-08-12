@@ -1182,6 +1182,166 @@ mod tests {
         assert_eq!(hist[0].file.as_ref().expect("file meta").name, "report.pdf");
     }
 
+    // **The refusal.** A peer whose build predates file-in-chat advertises
+    // CHAT with no `CHAT_FEAT_FILEREF`, so `CapabilitySet::intersect` ANDs the
+    // bit away and `Session::supports_file_ref()` is false. `chat send --file`
+    // must then fail loudly rather than degrade into a plain transfer: the peer
+    // would receive an ordinary file with no row in any conversation while our
+    // user was told the attachment had been sent (invariant I9 — never a silent
+    // downgrade).
+    //
+    // The FFI's equivalent branch is covered end to end and mutation-confirmed;
+    // the CLI's was not. This is that test, and it asserts the part that makes
+    // the refusal meaningful: **no transfer is started** — no `FileRef` on the
+    // peer's CHAT channel, and no transfer stream opened at all.
+    //
+    // The peer deliberately advertises a full TRANSFER capability, so the only
+    // thing that can produce this refusal is the missing feature bit.
+    #[tokio::test]
+    async fn send_file_refuses_a_peer_that_cannot_receive_attachments() {
+        use peerbeam_chat::{ChatHandler, ReceivedSink};
+        use peerbeam_domain::port::{ChannelTransport, TrustStore};
+        use peerbeam_domain::session::{Capability, CapabilitySet, ChannelType, MessageHandler};
+        use peerbeam_transfer::{
+            HandlerRegistry, Identity, PeerSession, SessionConfig, SessionRole,
+        };
+        use peerbeam_transfer_quic::QuicTransport;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+
+        let file_path = dir.path().join("report.pdf");
+        std::fs::write(&file_path, vec![7u8; 128]).expect("write file");
+
+        // A peer from before file-in-chat: CHAT with `features: 0`, plus a full
+        // TRANSFER stream capability.
+        let peer_enc = AeadCrypto::new();
+        let keypair = peer_enc.generate_keypair();
+        let identity = Identity {
+            device_id: DeviceId::from("legacy-peer"),
+            name: "legacy-peer".into(),
+            keypair,
+        };
+        let peer_trust = peerbeam_trust_fs::FsTrust::open(dir.path().join("peer-trust.json"))
+            .expect("peer trust");
+        let peer_store = {
+            let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
+            let key = derive_subkey(&[77u8; 32], b"peerbeam-appstore-v1");
+            ChatStore::new(Arc::new(peerbeam_appstore_fs::FsAppStore::open(
+                dir.path().join("peer-appstore"),
+                key,
+                enc,
+            )))
+        };
+
+        // If the CLI wrongly offered a FileRef anyway, this records it.
+        let offered: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let offered_cl = offered.clone();
+        let sink: ReceivedSink = Arc::new(move |rec| offered_cl.lock().unwrap().push(rec));
+        let (handler, peer_slot) = ChatHandler::new(peer_store, sink);
+
+        // …and this records any transfer stream it opened. Must stay zero.
+        let streams = Arc::new(AtomicUsize::new(0));
+        let streams_cl = streams.clone();
+
+        let quic = QuicTransport::new().expect("quic");
+        let (addr, mut incoming) = quic
+            .serve_channels_on("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("listen");
+
+        let peer_task = tokio::spawn(async move {
+            use futures::StreamExt;
+            let qc = incoming
+                .next()
+                .await
+                .expect("an inbound connection")
+                .expect("accepted");
+            let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+            let enc: Arc<dyn EncryptionProvider> = Arc::new(peer_enc);
+            let trust: Arc<dyn TrustStore> = Arc::new(peer_trust);
+            let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+            let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+            let (inc, mut inc_rx) = tokio::sync::mpsc::unbounded_channel();
+            let caps = CapabilitySet::new()
+                .with(Capability::new(ChannelType::CHAT)) // features: 0
+                .with(Capability::new(ChannelType::TRANSFER));
+            let cfg = SessionConfig::new(caps)
+                .with_stream_channel_type(ChannelType::TRANSFER)
+                .with_handlers(HandlerRegistry::new().with(handler as Arc<dyn MessageHandler>));
+            let mut ps = PeerSession::open(
+                transport,
+                SessionRole::Responder,
+                cfg,
+                ev,
+                ch,
+                inc,
+                None,
+                identity,
+                enc,
+                trust,
+            )
+            .await
+            .expect("responder session");
+            let _ = peer_slot.set(ps.peer().clone());
+            tokio::spawn(async move {
+                while inc_rx.recv().await.is_some() {
+                    streams_cl.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let _ = ps.run().await;
+        });
+
+        let ctx = quiet_ctx();
+        let err = send_file(
+            &ctx,
+            None,
+            Some(format!("127.0.0.1:{}", addr.port())),
+            file_path.to_string_lossy().into_owned(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect_err("a peer without the feature bit must be refused");
+        assert!(
+            err.to_string().contains("cannot receive chat attachments"),
+            "the refusal must name the actual problem, got: {err}"
+        );
+
+        // The row says so too, and is still a file row.
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let hist = store.history(&DeviceId::from("addr")).expect("history"); // `--addr`'s routing placeholder id
+        assert_eq!(
+            hist.len(),
+            1,
+            "the row is persisted before any network work"
+        );
+        assert_eq!(hist[0].kind, Kind::File);
+        assert_eq!(hist[0].status, Status::Failed);
+
+        // Nothing was transferred, and nothing was offered.
+        assert!(
+            offered.lock().unwrap().is_empty(),
+            "no FileRef may be offered to a peer that cannot understand it"
+        );
+        assert_eq!(
+            streams.load(Ordering::SeqCst),
+            0,
+            "a refused attachment must open no transfer stream at all"
+        );
+
+        // The refusal path closes the session it dialed rather than leaking it,
+        // so the peer's own run loop ends on its own.
+        let ended = tokio::time::timeout(Duration::from_secs(10), peer_task).await;
+        assert!(
+            ended.is_ok(),
+            "the refusal path must close the session it dialed"
+        );
+    }
+
     // clap's `required_unless_present`/`conflicts_with` (see `cli::ChatAction::
     // Send`) keep a real CLI invocation from ever reaching `chat()` with both
     // or neither of `text`/`file` — but `chat()` itself is a library function

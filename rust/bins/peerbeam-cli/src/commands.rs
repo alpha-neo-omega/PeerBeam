@@ -1198,22 +1198,34 @@ async fn secure_send_file(
 /// exactly the ordinary-transfer case, which is the overwhelming majority of
 /// receives.
 ///
-/// `local_path`, when given, is written **before** `status` — both share the
-/// in-flight leg of the guard, so once the row reads a terminal status it is
-/// deliberately closed to further writes (mirrors the FFI's own ordering
-/// note on `chat_set_local_path`). Silently does nothing when `transfer_id`
-/// is empty (nothing could be peeked — see `peek_incoming_meta`'s doc).
+/// `landed` and `local_path`, when given, are written **before** `status` —
+/// all three share the in-flight leg of the guard, so once the row reads a
+/// terminal status it is deliberately closed to further writes (mirrors the
+/// FFI's own ordering note on `chat_set_landing`/`chat_set_local_path`).
+/// Silently does nothing when `transfer_id` is empty (nothing could be
+/// peeked — see `peek_incoming_meta`'s doc).
+///
+/// `landed` is the `(name, bytes)` the receive *actually* wrote. The row's own
+/// name/size came from the peer's separate CHAT-channel `FileRef`, correlated
+/// with this stream by id alone and never checked against it, so without this
+/// the conversation would keep describing whatever was advertised rather than
+/// what is on disk — see `ChatStore::set_file_row_landing`.
 fn settle_received_chat_file(
     chat: &peerbeam_chat::ChatStore,
     peer_id: &str,
     transfer_id: &str,
     status: peerbeam_chat::Status,
+    landed: Option<(&str, u64)>,
     local_path: Option<&str>,
 ) {
     if transfer_id.is_empty() {
         return;
     }
     let peer = DeviceId::from(peer_id.to_string());
+    if let Some((name, size)) = landed {
+        let _ =
+            chat.set_file_row_landing(&peer, transfer_id, peerbeam_chat::Direction::In, name, size);
+    }
     if let Some(path) = local_path {
         let _ = chat.set_file_row_path(&peer, transfer_id, peerbeam_chat::Direction::In, path);
     }
@@ -1466,6 +1478,24 @@ async fn serve_loop(
                 // peek (`peek_incoming_meta`).
                 let (incoming_ch, preview) = peek_incoming_meta(incoming_ch).await;
 
+                // A chat file row starts life `PendingApproval`, describing the
+                // peer's `FileRef` claim. Bytes are now moving, and the peek has
+                // just told us what the *stream* says is arriving — so correct
+                // the row's name/size against it and move it off
+                // `PendingApproval`, mirroring the FFI's `chat_set_landing` +
+                // `chat_settle(Transferring)` pair. Without this a `chat
+                // history` run mid-receive shows a file still "waiting" and
+                // labelled with whatever was advertised. A no-op for every
+                // ordinary transfer (no row) and when nothing could be peeked.
+                settle_received_chat_file(
+                    &chat,
+                    &peer_id,
+                    &preview.transfer_id,
+                    peerbeam_chat::Status::Transferring,
+                    (!preview.name.is_empty()).then_some((preview.name.as_str(), preview.size)),
+                    None,
+                );
+
                 let storage_ref = &storage;
                 let handle = &session.handle;
                 let (ptx, mut prx) = mpsc::unbounded_channel();
@@ -1523,6 +1553,7 @@ async fn serve_loop(
                                 &peer_id,
                                 &preview.transfer_id,
                                 peerbeam_chat::Status::Received,
+                                Some((rcv.name.as_str(), rcv.bytes)),
                                 Some(&saved),
                             ),
                             TransferOutcome::Cancelled => settle_received_chat_file(
@@ -1530,6 +1561,7 @@ async fn serve_loop(
                                 &peer_id,
                                 &preview.transfer_id,
                                 peerbeam_chat::Status::Failed,
+                                None,
                                 None,
                             ),
                         }
@@ -1578,6 +1610,7 @@ async fn serve_loop(
                             &peer_id,
                             &preview.transfer_id,
                             peerbeam_chat::Status::Failed,
+                            None,
                             None,
                         );
                     }
@@ -2320,6 +2353,7 @@ mod chat_receive_bridge_tests {
             "pb-bob",
             &r.id,
             Status::Received,
+            Some(("report.pdf", 4096)),
             Some("/home/me/Downloads/report.pdf"),
         );
 
@@ -2328,6 +2362,92 @@ mod chat_receive_bridge_tests {
         assert_eq!(
             rec.file.unwrap().local_path.as_deref(),
             Some("/home/me/Downloads/report.pdf")
+        );
+    }
+
+    /// **The mismatch.** The peer's CHAT-channel `FileRef` advertised
+    /// `holiday.jpg · 180 KB`; the TRANSFER stream it is correlated with —
+    /// *by id alone* — landed something else entirely. The settled row must
+    /// describe what is on disk, because that is what its "open" action hands
+    /// the OS. Before this, a row stayed permanently labelled with the
+    /// advertisement while pointing at the other file.
+    #[test]
+    fn a_receive_settles_with_what_landed_not_with_what_the_file_ref_claimed() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut offered = FileRef::new("holiday.jpg", 184_320).unwrap();
+        offered.name = "holiday.jpg".into();
+        chat.append(&ChatRecord::file_in(&peer, &offered)).unwrap();
+
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &offered.id,
+            Status::Received,
+            Some(("invoice-2026.pdf.exe", 4_000_000_000)),
+            Some("/home/me/Downloads/invoice-2026.pdf.exe"),
+        );
+
+        let meta = chat
+            .get(&peer, &offered.id)
+            .unwrap()
+            .expect("row")
+            .file
+            .expect("file meta");
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the row must name the file that landed, not the one advertised"
+        );
+        assert_eq!(meta.size, 4_000_000_000);
+        assert_eq!(
+            meta.local_path.as_deref(),
+            Some("/home/me/Downloads/invoice-2026.pdf.exe"),
+            "and the open target must be the same file the label names"
+        );
+    }
+
+    /// The row leaves `PendingApproval` the moment bytes start moving, and is
+    /// still writable afterwards — `Transferring` is inside the guard's
+    /// in-flight set, so the later `Received` + path + landing all still land.
+    /// A row that stayed `PendingApproval` for the whole download would read
+    /// as still waiting on a decision that was already made.
+    #[test]
+    fn a_receive_marks_the_row_transferring_and_still_settles_received_after() {
+        let (chat, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        chat.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        // serve_loop's post-peek call.
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Transferring,
+            Some(("report.pdf", 4096)),
+            None,
+        );
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Transferring,
+            "the row must not still claim it is awaiting a decision"
+        );
+
+        // …and the completion still lands on it.
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Received,
+            Some(("report.pdf", 4096)),
+            Some("/home/me/Downloads/report.pdf"),
+        );
+        let rec = chat.get(&peer, &r.id).unwrap().expect("row");
+        assert_eq!(rec.status, Status::Received);
+        assert_eq!(
+            rec.file.unwrap().local_path.as_deref(),
+            Some("/home/me/Downloads/report.pdf"),
+            "going Transferring first must not close the row to its own completion"
         );
     }
 
@@ -2340,7 +2460,7 @@ mod chat_receive_bridge_tests {
         let r = FileRef::new("report.pdf", 4096).unwrap();
         chat.append(&ChatRecord::file_in(&peer, &r)).unwrap();
 
-        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Failed, None);
+        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Failed, None, None);
 
         let rec = chat.get(&peer, &r.id).unwrap().expect("row");
         assert_eq!(rec.status, Status::Failed);
@@ -2359,6 +2479,7 @@ mod chat_receive_bridge_tests {
             "pb-bob",
             "tx-plain-42",
             Status::Received,
+            Some(("other.bin", 7)),
             Some("/tmp/x"),
         );
         assert!(chat.get(&peer, "tx-plain-42").unwrap().is_none());
@@ -2373,7 +2494,14 @@ mod chat_receive_bridge_tests {
         let peer = DeviceId::from("pb-bob");
         chat.append(&ChatRecord::sent(&peer, &ChatMessage::new("hi").unwrap()))
             .unwrap();
-        settle_received_chat_file(&chat, "pb-bob", "", Status::Received, Some("/tmp/x"));
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            "",
+            Status::Received,
+            Some(("x.bin", 1)),
+            Some("/tmp/x"),
+        );
         // The one real row in this conversation must be completely untouched.
         let hist = chat.history(&peer).unwrap();
         assert_eq!(hist.len(), 1);
@@ -2391,7 +2519,14 @@ mod chat_receive_bridge_tests {
         let msg = ChatMessage::new("hello there").unwrap();
         chat.append(&ChatRecord::sent(&peer, &msg)).unwrap(); // Out/Text/Sent
 
-        settle_received_chat_file(&chat, "pb-bob", &msg.id, Status::Received, Some("/tmp/x"));
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &msg.id,
+            Status::Received,
+            Some(("evil.exe", 1)),
+            Some("/tmp/x"),
+        );
 
         let rec = chat
             .get(&peer, &msg.id)
@@ -2400,6 +2535,10 @@ mod chat_receive_bridge_tests {
         assert_eq!(rec.kind, Kind::Text, "kind must be untouched");
         assert_eq!(rec.status, Status::Sent, "status must be untouched");
         assert_eq!(rec.body, "hello there", "body must be untouched");
+        assert!(
+            rec.file.is_none(),
+            "the landing write must not conjure file metadata onto a text row"
+        );
     }
 
     /// The hostile case (b): a peer-supplied `transfer_id` collides with a
@@ -2414,13 +2553,25 @@ mod chat_receive_bridge_tests {
         declined.status = Status::Declined;
         chat.append(&declined).unwrap();
 
-        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Received, Some("/tmp/x"));
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Received,
+            Some(("evil.exe", 1)),
+            Some("/tmp/x"),
+        );
 
         let rec = chat.get(&peer, &r.id).unwrap().expect("row still present");
         assert_eq!(
             rec.status,
             Status::Declined,
             "a declined file must not flip to Received"
+        );
+        assert_eq!(
+            rec.file.expect("file meta").name,
+            "suspicious.exe",
+            "nor may it be relabelled — the landing write shares the same guard"
         );
     }
 
@@ -2432,15 +2583,18 @@ mod chat_receive_bridge_tests {
         let (chat, _dir) = seeded_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
-        let meta = FileMeta {
-            name: r.name.clone(),
-            size: r.size,
-            local_path: Some("/tmp/report.pdf".into()),
-        };
+        let meta = FileMeta::new(&r.name, r.size, Some("/tmp/report.pdf".into()));
         chat.append(&ChatRecord::file_out(&peer, &r, meta, Status::Transferring))
             .unwrap();
 
-        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Received, Some("/tmp/x"));
+        settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Received,
+            Some(("evil.exe", 1)),
+            Some("/tmp/x"),
+        );
 
         assert_eq!(
             chat.get(&peer, &r.id).unwrap().unwrap().status,

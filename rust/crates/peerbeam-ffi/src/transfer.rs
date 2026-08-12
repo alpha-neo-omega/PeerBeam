@@ -915,12 +915,18 @@ impl Manager {
     ///
     /// Verified against 2a's full state table: every legitimate transition
     /// starts from one of those two statuses. A sender's row is written
-    /// `Transferring` by `prepare_file_send` and leaves it as `Sent`/`Failed`; a
-    /// receiver's row is written `PendingApproval` by `ChatHandler` and leaves
-    /// it as `Received`/`Declined`/`Failed` (nothing moves a receiving row to
-    /// `Transferring` in 2a). Failing the check is a silent no-op — no write, no
-    /// event — which is also what keeps every ordinary transfer, the vast
-    /// majority, from touching the chat store at all.
+    /// `Transferring` by `prepare_file_send` and leaves it as `Sent`/`Failed`.
+    /// A receiver's row is written `PendingApproval` by `ChatHandler`; it moves
+    /// to `Transferring` the moment the bytes are cleared to start (see
+    /// [`handle_incoming`](Self::handle_incoming), beside the `transfer_started`
+    /// emit) and from either state leaves as `Received`/`Declined`/`Failed`.
+    /// Both in-flight statuses stay writable, which is exactly what lets a
+    /// receiving row pick up its landing metadata and its saved path *after*
+    /// it has already gone `Transferring`.
+    ///
+    /// Failing the check is a silent no-op — no write, no event — which is also
+    /// what keeps every ordinary transfer, the vast majority, from touching the
+    /// chat store at all.
     fn is_settleable_chat_row(&self, a: &Active) -> bool {
         let peer = DeviceId::from(a.peer_id.clone());
         let Ok(Some(rec)) = self.chat.get(&peer, &a.id) else {
@@ -978,6 +984,51 @@ impl Manager {
         }
     }
 
+    /// Reconcile a receiving chat row with what the **transfer** says is
+    /// landing, rather than what the peer's `FileRef` claimed.
+    ///
+    /// The row's name and size arrive on the CHAT channel; the bytes arrive on
+    /// a TRANSFER stream whose own `TransferMeta` decides what is written to
+    /// disk. The only thing tying them together is the shared id — nothing
+    /// forces them to agree. A paired peer can therefore offer
+    /// `holiday.jpg · 180 KB` in the thread and stream `invoice-2026.pdf.exe`,
+    /// leaving a bubble that describes one file directly above an Accept button
+    /// while tap-to-open hands the OS another. This is what closes that.
+    ///
+    /// Called twice, with the same meaning both times — "the transfer says this
+    /// is the file":
+    ///
+    /// * from [`handle_incoming`](Self::handle_incoming) with the peeked
+    ///   `TransferPreview`, **before** the approval gate, so the user decides on
+    ///   the real name and size (the moment that actually matters);
+    /// * from [`record`](Self::record) with what genuinely landed, before the
+    ///   settle, which also covers the case where the peek learned nothing.
+    ///
+    /// Runs under the same guard as [`chat_settle`](Self::chat_settle) — a name
+    /// is as much a write as a status — and, like
+    /// [`chat_set_local_path`](Self::chat_set_local_path), **must precede** the
+    /// settle: a settled row is deliberately no longer writable.
+    ///
+    /// The approval *decision* is untouched: this only makes the metadata the
+    /// decision is shown with accurate.
+    fn chat_set_landing(&self, a: &Active, name: &str, size: u64) {
+        if !self.is_settleable_chat_row(a) {
+            return;
+        }
+        let peer = DeviceId::from(a.peer_id.clone());
+        let expected = if a.direction == "sending" {
+            ChatDirection::Out
+        } else {
+            ChatDirection::In
+        };
+        if let Err(e) = self
+            .chat
+            .set_file_row_landing(&peer, &a.id, expected, name, size)
+        {
+            tracing::warn!(error = %e, transfer_id = %a.id, "chat row landing not persisted");
+        }
+    }
+
     fn finish_failed(&self, active: &Arc<Active>, (code, msg): (Code, String)) {
         // Claim this exact transfer: only whoever successfully claims it emits
         // the terminal event. A concurrent `cancel()` may have already claimed
@@ -1032,10 +1083,19 @@ impl Manager {
             // text message uses, so a file row needs no special vocabulary.
             let sending = a.direction == "sending";
             if !sending {
-                // A received file's row learns where it landed, so the bubble
-                // can offer "Open". Strictly before the settle below: both
-                // share the in-flight guard, and settling closes the row to
-                // further writes.
+                // A received file's row is reconciled with what ACTUALLY
+                // landed — `a.file` is the name `receive_file` wrote (taken
+                // from the stream's own `TransferMeta`, then sanitized), and
+                // the byte count is the one the history row records, so the
+                // three agree. Without this the row would keep describing the
+                // peer's separate CHAT-channel `FileRef` claim forever, which
+                // nothing has ever checked against the stream.
+                let landed_bytes = a.stats.lock().unwrap().transferred;
+                self.chat_set_landing(&a, &file, landed_bytes);
+                // …and learns where it landed, so the bubble can offer "Open".
+                // Strictly before the settle below: all three share the
+                // in-flight guard, and settling closes the row to further
+                // writes.
                 self.chat_set_local_path(&a, &path);
             }
             let settled = if sending {
@@ -1334,6 +1394,19 @@ impl Manager {
     /// clear message and a `Failed` row rather than queueing. Offline file
     /// queueing is a separate increment, and quietly reusing the text outbox
     /// would promise a delivery this build cannot make.
+    ///
+    /// The id is also claimed in the `active` registry **synchronously, here**,
+    /// before the background task is even spawned — not later, once the dial has
+    /// succeeded. [`chat_reconcile`](Self::chat_reconcile) treats "a
+    /// `Transferring` row with no entry in `active`" as an orphan and settles it
+    /// `Interrupted`, and `Interrupted` is outside the writable set, so the real
+    /// completion would afterwards be dropped. Claiming after the dial left a
+    /// multi-second window (the dial itself, plus `peerbeam_chat`'s
+    /// `CHANNEL_OPEN_BUDGET`) in which merely leaving the thread and coming back
+    /// — an ordinary gesture, and one the UI performs on every open — marked a
+    /// perfectly healthy transfer `Interrupted` forever, disagreeing with the
+    /// receiver's own row. The claim is what makes the reconcile's skip cover
+    /// that window.
     pub fn chat_send_file(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
         let path = req
@@ -1346,8 +1419,33 @@ impl Manager {
         let (file_ref, _rec) = peerbeam_chat::prepare_file_send(&self.chat, &device.id, &path)
             .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
         let id = file_ref.id.clone();
+        // `register_vacant` refuses rather than overwrites, so a squatted id
+        // fails this share instead of splicing it onto someone else's transfer.
+        let Some(active) = self.register_vacant(
+            &id,
+            "sending",
+            &device.name,
+            &device.id.0,
+            &file_ref.name,
+            Some(path.clone()),
+        ) else {
+            // Report it the way every other failure of this call is reported —
+            // a `Failed` row plus a `chat_status` carrying the reason — rather
+            // than as a call error. The row already exists (persisted a line
+            // above), so an `Err` here would leave the caller's own optimistic
+            // row *and* this one describing the same file. Identical observable
+            // behaviour to when this check lived in the spawned task.
+            self.fail_chat_file(
+                &device.id.0,
+                &id,
+                &format!("transfer id already in use: {id}"),
+            );
+            return Ok(json!({ "id": id }));
+        };
         let me = self.clone();
-        crate::runtime::spawn(async move { me.run_chat_file_send(device, path, file_ref).await });
+        crate::runtime::spawn(async move {
+            me.run_chat_file_send(device, path, file_ref, active).await
+        });
         Ok(json!({ "id": id }))
     }
 
@@ -1355,28 +1453,43 @@ impl Manager {
     /// check what the peer can actually receive, publish the `FileRef` on CHAT,
     /// then move the bytes over TRANSFER under the same id.
     ///
-    /// Every early return closes the session it holds and settles the row, so
-    /// the user is never left with a row stuck at `Transferring` and a session
-    /// leaked into the peer:
+    /// Every early return closes the session it holds, releases the `active`
+    /// claim [`chat_send_file`](Self::chat_send_file) took, and settles the row
+    /// — so the user is never left with a row stuck at `Transferring`, a
+    /// session leaked into the peer, or a phantom entry in
+    /// `pb_transfers_active`:
     ///
-    /// | Failure | Session | Row |
-    /// | --- | --- | --- |
-    /// | dial failed | none was established | `Failed` + `chat_status` |
-    /// | peer lacks `CHAT_FEAT_FILEREF` | closed here | `Failed` + `chat_status` |
-    /// | `FileRef` send failed | closed here | `Failed` + `chat_status` |
-    /// | transfer id already claimed | closed here | `Failed` + `chat_status` |
-    /// | transfer failed/cancelled | closed by `run_send_on_session` | `Failed` via `finish` |
-    /// | success | closed by `run_send_on_session` | `Sent` via `finish` |
+    /// | Failure | Session | `active` claim | Row |
+    /// | --- | --- | --- | --- |
+    /// | dial failed | none was established | released | `Failed` + `chat_status` |
+    /// | peer lacks `CHAT_FEAT_FILEREF` | closed here | released | `Failed` + `chat_status` |
+    /// | `FileRef` send failed | closed here | released | `Failed` + `chat_status` |
+    /// | transfer failed/cancelled | closed by `run_send_on_session` | released by `finish` | `Failed` via `finish` |
+    /// | success | closed by `run_send_on_session` | released by `finish` | `Sent` via `finish` |
+    ///
+    /// (The remaining case — the id was already claimed — is now decided
+    /// synchronously in `chat_send_file`, before this task exists.)
+    ///
+    /// Every one of those releases goes through
+    /// [`abandon_chat_file`](Self::abandon_chat_file) rather than being spelled
+    /// out per branch, so a future `?` or a new early return cannot skip it.
     ///
     /// **No silent fallback to a plain transfer.** If the negotiated
     /// capabilities lack the feature bit, the peer's build has no `FileRef`
     /// handler: it would show the file as an ordinary incoming transfer with no
     /// row in the conversation. Sending it anyway would tell our user the
     /// attachment landed in a thread the peer cannot see, which is worse than
-    /// failing. So the refusal is terminal, and **no transfer is registered or
-    /// started** — the `Active` entry is deliberately created only after this
-    /// gate, so a refused share leaves nothing in `pb_transfers_active` either.
-    async fn run_chat_file_send(self: Arc<Self>, device: Device, path: String, file_ref: FileRef) {
+    /// failing. So the refusal is terminal and **no transfer is started**: no
+    /// `transfer_queued`, no bytes, and the `active` claim is released before
+    /// the failure is announced, so a refused share leaves nothing in
+    /// `pb_transfers_active` either.
+    async fn run_chat_file_send(
+        self: Arc<Self>,
+        device: Device,
+        path: String,
+        file_ref: FileRef,
+        active: Arc<Active>,
+    ) {
         let peer_id = device.id.0.clone();
         let id = file_ref.id.clone();
         let name = file_ref.name.clone();
@@ -1399,9 +1512,8 @@ impl Manager {
             // Increment 2a is online-only: say so plainly instead of implying
             // the file is queued somewhere.
             Err((_, msg)) => {
-                return self.fail_chat_file(
-                    &peer_id,
-                    &id,
+                return self.abandon_chat_file(
+                    &active,
                     &format!("cannot reach {} to send {name}: {msg}", device.name),
                 );
             }
@@ -1412,9 +1524,8 @@ impl Manager {
         // that skips `session.close()`.
         if !session.supports_file_ref() {
             session.close().await;
-            return self.fail_chat_file(
-                &peer_id,
-                &id,
+            return self.abandon_chat_file(
+                &active,
                 &format!(
                     "{} cannot receive chat attachments — its build predates \
                      file sharing in chat. Send {name} as a plain transfer instead.",
@@ -1429,28 +1540,9 @@ impl Manager {
         // transfer then settles.
         if let Err(e) = peerbeam_chat::send_file_ref(&session.handle, &file_ref).await {
             session.close().await;
-            return self.fail_chat_file(&peer_id, &id, &format!("could not offer {name}: {e}"));
+            return self.abandon_chat_file(&active, &format!("could not offer {name}: {e}"));
         }
 
-        // Claim the id for the transfer. `register_vacant` refuses rather than
-        // overwrites, so a collision (a peer squatting this id, or a retry
-        // racing its own predecessor) fails this share instead of splicing it
-        // onto someone else's transfer.
-        let Some(active) = self.register_vacant(
-            &id,
-            "sending",
-            &device.name,
-            &peer_id,
-            &name,
-            Some(path.clone()),
-        ) else {
-            session.close().await;
-            return self.fail_chat_file(
-                &peer_id,
-                &id,
-                &format!("transfer id already in use: {id}"),
-            );
-        };
         events::transfer(
             &id,
             "transfer_queued",
@@ -1463,15 +1555,39 @@ impl Manager {
             .await;
     }
 
+    /// Abandon a chat file share that never became a moving transfer: release
+    /// the `active` claim [`chat_send_file`](Self::chat_send_file) took, then
+    /// settle the row and tell every surface why.
+    ///
+    /// One method rather than two calls repeated at each early return, because
+    /// the release is not optional and is easy to lose. While the id sits in
+    /// `active`, [`chat_reconcile`](Self::chat_reconcile) deliberately skips its
+    /// row — that skip is what protects a genuinely in-flight share — so a
+    /// leaked claim leaves a `Transferring` row that no reconcile will ever
+    /// settle and no transfer event will ever finish: an eternal progress bar,
+    /// surviving every reopen, for a share that failed seconds after it
+    /// started. This feature's history already includes a `?` that skipped a
+    /// cleanup twice; funnelling every path through one method is how that stops
+    /// being possible here.
+    ///
+    /// The release is [`claim`](Self::claim) — identity-checked — so a late call
+    /// can never tear out a *different* transfer that has since taken this id.
+    fn abandon_chat_file(&self, active: &Arc<Active>, reason: &str) {
+        let _ = self.claim(active);
+        self.fail_chat_file(&active.peer_id, &active.id, reason);
+    }
+
     /// Settle a chat file-share that never reached the transfer stage: mark the
     /// row `Failed` and tell every surface why.
     ///
-    /// Used only before an `Active` exists — after that point the ordinary
-    /// terminal paths (`finish`/`finish_failed`) own the row. Writes directly
-    /// rather than going through [`chat_settle`](Self::chat_settle)'s presence
-    /// check: here the row is *known* to exist, because
+    /// Used only where the ordinary terminal paths (`finish`/`finish_failed`)
+    /// do not own the row — i.e. before any bytes moved. Writes directly rather
+    /// than going through [`chat_settle`](Self::chat_settle)'s presence check:
+    /// here the row is *known* to exist, because
     /// [`chat_send_file`](Self::chat_send_file) persisted it before this task
-    /// was even spawned.
+    /// was even spawned. Callers that hold an `Active` must go through
+    /// [`abandon_chat_file`](Self::abandon_chat_file) instead, so the claim is
+    /// released too.
     fn fail_chat_file(&self, peer_id: &str, id: &str, reason: &str) {
         let peer = DeviceId::from(peer_id.to_string());
         if let Err(e) = self.chat.set_status(&peer, id, ChatStatus::Failed) {
@@ -1564,6 +1680,34 @@ impl Manager {
     /// same reason: a user can open a thread while a share to that peer is
     /// still moving. That check is why this cannot simply delegate to
     /// `ChatStore::reconcile_peer`, which knows nothing about transfers.
+    ///
+    /// **The two windows where a live row has no `active` entry**, stated
+    /// plainly rather than implied away, because "is it in `active`?" is the
+    /// whole basis of the skip:
+    ///
+    /// * **The sender's dial window — closed.** The row is written
+    ///   `Transferring` by `prepare_file_send` before anything is dialed, and
+    ///   the dial plus `peerbeam_chat`'s `CHANNEL_OPEN_BUDGET` can take several
+    ///   seconds. [`chat_send_file`](Self::chat_send_file) therefore claims the
+    ///   id in `active` **synchronously**, before spawning the network task, so
+    ///   this window is covered. It was not always: backing out of a thread and
+    ///   re-entering inside it fired this reconcile, wrote `Interrupted` — a
+    ///   status outside the writable set — and the real `Sent` was then
+    ///   silently dropped, leaving a perfectly transferred file reading
+    ///   "Interrupted" forever while the receiver's row said `Received`.
+    ///
+    /// * **The receiver's pre-first-frame window — open, and accepted.** The
+    ///   inbound row is written `PendingApproval` by `ChatHandler` the moment
+    ///   the peer's `FileRef` lands on the CHAT channel, while the transfer is
+    ///   only registered (`register_vacant`) once the *first TRANSFER frame*
+    ///   arrives and is peeked. A reconcile fired inside that gap settles the
+    ///   row `Interrupted`. It is left open deliberately: the alternative is
+    ///   registering a transfer on a peer's say-so before any transfer exists,
+    ///   which is exactly the phantom-transfer bug the `STREAM_GRACE` wait was
+    ///   introduced to remove. The gap is one round trip — the sender opens the
+    ///   stream immediately after the `FileRef` — and the cost of losing that
+    ///   race is a row the user can ask for again, not a wrong outcome for a
+    ///   file that moved.
     pub fn chat_reconcile(&self, req: &Value) -> Op {
         let peer_id = req
             .get("peer_id")
@@ -1789,6 +1933,14 @@ impl Manager {
         // the real one rather than 0; every later `update()` overwrites it from
         // the wire anyway.
         active.stats.lock().unwrap().total = preview.size;
+        // If this transfer is carrying a file offered in a conversation, the
+        // row was written from the peer's CHAT-channel `FileRef` — a claim
+        // never checked against the stream that decides what lands on disk.
+        // Correct it now, BEFORE the approval gate below: the name and size the
+        // user is about to consent to must be the transfer's, not the offer's.
+        // A no-op for the vast majority (an ordinary transfer has no row), and
+        // a no-op when the peek learned nothing (empty name).
+        self.chat_set_landing(&active, &preview.name, preview.size);
         events::transfer(
             &id,
             "transfer_queued",
@@ -1852,6 +2004,16 @@ impl Manager {
             json!({ "peer": peer, "peer_id": session.peer_device.0 }),
         );
         *active.status.lock().unwrap() = "transferring".into();
+        // The decision is made and the bytes are cleared to move, so a chat
+        // file row must stop saying it is waiting on one. Until this existed,
+        // a receiving row sat at `PendingApproval` for the entire download:
+        // its bubble showed a dead progress bar and — worse — kept rendering
+        // live-looking Accept / Trust / Decline controls for a decision that
+        // had already been made, and which under auto-accept was never asked
+        // (the `wait_for_accept` short-circuit above leaves no `pending` entry,
+        // so Decline could not even be honoured). Guarded like every other
+        // bridge: an ordinary transfer has no row and settles nothing.
+        self.chat_settle(&active, ChatStatus::Transferring, None);
 
         let save_dir = self.save_dir();
         let storage = self.storage();
@@ -2642,6 +2804,179 @@ mod tests {
         );
     }
 
+    /// A receiving row must not sit at `PendingApproval` for the whole
+    /// download. Nothing wrote `Transferring` for a receive before this: the
+    /// bubble showed "Wants to send you this" with live-looking Accept / Trust
+    /// / Decline controls — for a decision already made, and under auto-accept
+    /// one that was never asked and could not be revoked (the `wait_for_accept`
+    /// short-circuit leaves no `pending` entry for Decline to resolve) — while
+    /// the progress bar, gated on `transferring`, stayed dead.
+    ///
+    /// The second half is what makes the fix safe: `Transferring` is inside the
+    /// guard's writable set, so the completion still lands. A status that
+    /// closed the row would have traded a stuck prompt for a lost outcome.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_receiving_row_goes_transferring_and_still_settles_received_after() {
+        let (mgr, chat, dir) = test_manager_full("recv-transferring", 0);
+        let peer = DeviceId::from("pb-bob");
+        let r = peerbeam_chat::FileRef::new("report.pdf", 4096).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &r))
+            .expect("seed the offered row");
+
+        let active = mgr
+            .register_vacant(&r.id, "receiving", "bob", &peer.0, "report.pdf", None)
+            .expect("id vacant");
+
+        // `handle_incoming`, immediately after the approval gate clears.
+        mgr.chat_settle(&active, ChatStatus::Transferring, None);
+        let row = chat.get(&peer, &r.id).expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            ChatStatus::Transferring,
+            "the row must stop claiming it is awaiting a decision"
+        );
+
+        // …and the completion is still able to write to it.
+        mgr.record(&active, true, "transfer_completed", json!({}));
+        let row = chat.get(&peer, &r.id).expect("get").expect("row");
+        assert_eq!(row.status, ChatStatus::Received);
+        let expected = dir.path().join("report.pdf").to_string_lossy().into_owned();
+        assert_eq!(
+            row.file.expect("file meta").local_path,
+            Some(expected),
+            "going Transferring first must not close the row to its own completion"
+        );
+    }
+
+    /// **The mismatch.** The row's name and size come from the peer's
+    /// CHAT-channel `FileRef`; the bytes come from a TRANSFER stream whose own
+    /// `TransferMeta` decides what is written. They are correlated by id alone
+    /// and nothing ever checked one against the other, so a paired peer could
+    /// leave a row permanently reading `holiday.jpg · 180 KB · Received` whose
+    /// tap-to-open handed the OS `invoice-2026.pdf.exe`.
+    ///
+    /// Both write points are exercised: the pre-approval reconcile against the
+    /// peeked preview (the moment the user actually decides) and the
+    /// settle-time write of what genuinely landed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_receiving_row_is_relabelled_with_what_the_transfer_actually_lands() {
+        let (mgr, chat, dir) = test_manager_full("recv-mismatch", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // What the peer put in the conversation.
+        let offered = peerbeam_chat::FileRef::new("holiday.jpg", 184_320).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("seed the offered row");
+        let name_of = |chat: &ChatStore| {
+            chat.get(&peer, &offered.id)
+                .expect("get")
+                .expect("row")
+                .file
+                .expect("file meta")
+        };
+        assert_eq!(name_of(&chat).name, "holiday.jpg", "the claim, as offered");
+
+        // What the transfer says is arriving (the peeked `TransferMeta`).
+        let active = mgr
+            .register_vacant(
+                &offered.id,
+                "receiving",
+                "bob",
+                &peer.0,
+                "invoice-2026.pdf.exe",
+                None,
+            )
+            .expect("id vacant");
+        mgr.chat_set_landing(&active, "invoice-2026.pdf.exe", 4_096);
+
+        let meta = name_of(&chat);
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the user must approve the name that will land, not the one advertised"
+        );
+        assert_eq!(meta.size, 4_096);
+        assert_eq!(
+            chat.get(&peer, &offered.id)
+                .expect("get")
+                .expect("row")
+                .status,
+            ChatStatus::PendingApproval,
+            "correcting the metadata must not itself decide the approval"
+        );
+
+        // The receive completes: 4096 bytes of it.
+        active.stats.lock().unwrap().update(4_096, 4_096);
+        *active.file.lock().unwrap() = "invoice-2026.pdf.exe".into();
+        mgr.record(&active, true, "transfer_completed", json!({}));
+
+        let row = chat.get(&peer, &offered.id).expect("get").expect("row");
+        assert_eq!(row.status, ChatStatus::Received);
+        let meta = row.file.expect("file meta");
+        assert_eq!(meta.name, "invoice-2026.pdf.exe");
+        assert_eq!(meta.size, 4_096);
+        assert_eq!(
+            meta.local_path,
+            Some(
+                dir.path()
+                    .join("invoice-2026.pdf.exe")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "the label and the open target must name the same file"
+        );
+    }
+
+    /// The landing write is a write like any other, so it carries the same
+    /// guard: it must not relabel a text row, an already-settled row, or one
+    /// belonging to the other direction. Without this a peer-supplied transfer
+    /// id would be a rename primitive aimed at any row in the conversation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_set_landing_is_silent_for_a_row_that_is_not_the_transfers_own() {
+        let (mgr, chat, _dir) = test_manager_full("landing-guard", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let text = peerbeam_chat::ChatMessage::new("hello there").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &text))
+            .expect("seed");
+        mgr.chat_set_landing(
+            &active_for(&mgr, &text.id, "receiving", &peer.0),
+            "evil.exe",
+            1,
+        );
+        let row = chat.get(&peer, &text.id).expect("get").expect("row");
+        assert_eq!(row.kind, ChatKind::Text);
+        assert_eq!(row.body, "hello there");
+        assert!(row.file.is_none(), "no file metadata conjured onto text");
+
+        // Our own outbound file share, reached for by a *receiving* transfer.
+        let mine = peerbeam_chat::FileRef::new("mine.pdf", 10).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &mine,
+            file_meta(&mine),
+            ChatStatus::Transferring,
+        ))
+        .expect("seed");
+        mgr.chat_set_landing(
+            &active_for(&mgr, &mine.id, "receiving", &peer.0),
+            "evil.exe",
+            1,
+        );
+        assert_eq!(
+            chat.get(&peer, &mine.id)
+                .expect("get")
+                .expect("row")
+                .file
+                .expect("file meta")
+                .name,
+            "mine.pdf",
+            "a receive must not rename our own outbound row"
+        );
+    }
+
     /// The event vocabulary must be the record's own serde spelling: a surface
     /// applies an event's `status` straight onto a row it read from
     /// `pb_chat_history`, so a second spelling would make the row disagree with
@@ -2809,6 +3144,63 @@ mod tests {
                 .expect("row present")
                 .status,
             ChatStatus::Transferring,
+        );
+    }
+
+    /// **The dial window.** `chat_send_file` persists the row `Transferring`
+    /// before it touches the network, and the dial that follows — plus
+    /// `peerbeam_chat`'s five-second `CHANNEL_OPEN_BUDGET` — can run for
+    /// seconds. While the id was only claimed *after* all of that, this
+    /// reconcile saw a `Transferring` row with nothing in `active` and wrote
+    /// `Interrupted`; since `Interrupted` is outside the writable set, the real
+    /// `Sent` was afterwards dropped, and a file that transferred perfectly read
+    /// "Interrupted" forever while the receiver's row said `Received`. Backing
+    /// out of a thread and re-entering is enough to fire it, and the UI
+    /// reconciles on every open.
+    ///
+    /// So: the claim is taken synchronously, on this thread, before the network
+    /// task is spawned — which is exactly what this asserts, and why the
+    /// assertion can be made the instant the call returns.
+    #[tokio::test]
+    async fn a_reconcile_inside_the_send_dial_window_leaves_the_row_alone() {
+        let (mgr, chat, dir) = test_manager_full("dial-window", 0);
+        let mgr = Arc::new(mgr);
+        let src = dir.path().join("report.pdf");
+        std::fs::write(&src, vec![7u8; 4096]).expect("write");
+
+        // Port 1 on loopback: nothing is listening, so the spawned dial cannot
+        // succeed — the row is in the dial window for as long as that attempt
+        // takes, which is exactly the window under test.
+        let out = mgr
+            .chat_send_file(&json!({
+                "peer": {
+                    "id": "pb-bob", "name": "bob", "addresses": ["127.0.0.1"], "port": 1,
+                },
+                "path": src.to_string_lossy(),
+            }))
+            .expect("staged");
+        let id = out["id"].as_str().expect("id").to_string();
+
+        // The claim is taken before `chat_send_file` returns, so no dial can
+        // have raced it away by here.
+        assert!(
+            mgr.active.lock().unwrap().contains_key(&id),
+            "the transfer id must be claimed synchronously, before the dial"
+        );
+
+        // The user backs out of the thread and comes straight back in.
+        let out = mgr
+            .chat_reconcile(&json!({ "peer_id": "pb-bob" }))
+            .expect("reconcile");
+        assert_eq!(out["changed"], 0, "a live share must not be reconciled");
+        assert_eq!(
+            chat.get(&DeviceId::from("pb-bob"), &id)
+                .expect("get")
+                .expect("row")
+                .status,
+            ChatStatus::Transferring,
+            "a share still dialing must not be marked Interrupted — that status \
+             is outside the writable set, so its real outcome would be dropped"
         );
     }
 

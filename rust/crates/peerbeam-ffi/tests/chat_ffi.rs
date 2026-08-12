@@ -1033,6 +1033,187 @@ async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
     pb_shutdown();
 }
 
+/// **The two channels can disagree, and the row must side with the bytes.**
+///
+/// A chat file share is one id spanning two independent channels: the peer's
+/// `FileRef` (CHAT) puts the row in the thread and supplies the name and size
+/// the bubble renders; the `TransferMeta` (TRANSFER) decides what is actually
+/// written to disk. They are correlated **by id alone** — nothing forces them
+/// to agree, and a paired peer can simply make them differ.
+///
+/// Here the offer says `holiday.jpg · 180 KB` while the stream carries
+/// `invoice-2026.pdf.exe`. Both moments are asserted:
+///
+/// 1. **before the approval** — the row the user is deciding on must already
+///    read the name and size that will land, not the advertisement. This is the
+///    moment that matters: the bubble renders that name directly above Accept.
+/// 2. **while it moves** — the row must read `transferring`, not still be
+///    offering Accept / Trust / Decline for a decision already made.
+/// 3. **after it lands** — the label, the size and the tap-to-open target must
+///    all name the same file, and that file must be the one on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49912;
+    init_ffi(port, dir.path());
+
+    // What really travels: a small, differently-named file.
+    let payload = vec![3u8; 4096];
+    let landed_name = "invoice-2026.pdf.exe";
+    let src = dir.path().join(landed_name);
+    std::fs::write(&src, &payload).unwrap();
+
+    let sender_device_id = "two-faced-sender";
+    let (enc, trust, identity) = peer_identity(dir.path(), sender_device_id);
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    // What the conversation is told: a different name and a wildly different
+    // size, under the id the transfer will also use.
+    let file_ref = FileRef::new("holiday.jpg", 184_320).unwrap();
+    let shared_id = file_ref.id.clone();
+
+    let send_fut = async {
+        let qc =
+            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_and_transfer_caps())
+            .with_stream_channel_type(ChannelType::TRANSFER);
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+
+        send_file_ref(&handle, &file_ref).await;
+
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        let req = SendRequest {
+            transfer_id: file_ref.id.clone(),
+            name: landed_name.into(),
+            path: src.to_string_lossy().into(),
+            size: payload.len() as u64,
+            chunk_size: 1024,
+        };
+        send_file_on_session(&handle, &FsStorage::new(), req, &ctrl, &ptx, 3).await
+    };
+
+    let expected_id = shared_id.clone();
+    let driver = async move {
+        let queued = tokio::task::spawn_blocking({
+            let id = expected_id.clone();
+            move || {
+                wait_event(15, |e| {
+                    e["type"] == "transfer_queued" && e["transfer_id"] == id
+                })
+            }
+        })
+        .await
+        .unwrap()
+        .expect("expected transfer_queued under the shared id");
+        assert_eq!(
+            queued["payload"]["file"], landed_name,
+            "the prompt shows the transfer's name, as it always has"
+        );
+
+        // (1) …and so, now, does the conversation row the user is looking at
+        // while deciding. `transfer_queued` is emitted after the reconcile, so
+        // by here the write has landed.
+        let hist = call_json(pb_chat_history, &json!({ "peer_id": sender_device_id }));
+        let msgs = hist["data"]["messages"].as_array().unwrap().clone();
+        let row = msgs
+            .iter()
+            .find(|m| m["id"] == expected_id)
+            .unwrap_or_else(|| panic!("no chat row under the shared id: {msgs:?}"));
+        assert_eq!(row["status"], "pendingapproval", "still awaiting us");
+        assert_eq!(
+            row["file"]["name"], landed_name,
+            "the row must name the file that will land, not the one advertised"
+        );
+        assert_eq!(
+            row["file"]["size"], 4096,
+            "and its size, not the advertised 180 KB"
+        );
+
+        let v = call_json(pb_transfer_accept, &json!({ "id": expected_id }));
+        assert_eq!(v["ok"], true, "accept by the shared id: {v}");
+        expected_id
+    };
+
+    let (send_res, recv_id) = tokio::join!(send_fut, driver);
+    assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
+
+    // (2) The row reported itself in flight rather than still asking.
+    let moving = tokio::task::spawn_blocking({
+        let id = recv_id.clone();
+        move || {
+            wait_event(10, |e| {
+                e["type"] == "chat_status" && e["message_id"] == id && e["status"] == "transferring"
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        moving.is_some(),
+        "an accepted chat file must report `transferring`, not keep offering Accept"
+    );
+
+    tokio::task::spawn_blocking({
+        let id = recv_id.clone();
+        move || {
+            wait_event(15, |e| {
+                e["type"] == "transfer_completed" && e["transfer_id"] == id
+            })
+        }
+    })
+    .await
+    .unwrap()
+    .expect("expected transfer_completed under the shared id");
+
+    // (3) The bytes are on disk under the transfer's name…
+    let saved = dir.path().join("recv").join(landed_name);
+    assert_eq!(std::fs::read(&saved).unwrap(), payload, "byte-exact");
+
+    // …and the settled row describes exactly that file.
+    let row = wait_chat_status(10, sender_device_id, &recv_id, "received")
+        .expect("the chat row was not settled received");
+    assert_eq!(row["kind"], "file");
+    assert_eq!(row["direction"], "in");
+    assert_eq!(
+        row["file"]["name"], landed_name,
+        "a settled row must never keep the advertised name"
+    );
+    assert_eq!(row["file"]["size"], 4096);
+    assert_eq!(
+        row["file"]["local_path"],
+        saved.to_string_lossy().into_owned(),
+        "the label and the tap-to-open target must be the same file"
+    );
+
+    pb_shutdown();
+}
+
 /// **The send path, end to end.** `pb_chat_send_file` attaches a real file to a
 /// conversation with a real peer that advertises `CHAT_FEAT_FILEREF`: the FFI
 /// engine dials, checks the negotiated feature, publishes a `FileRef` on the
