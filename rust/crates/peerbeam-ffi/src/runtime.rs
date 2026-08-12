@@ -40,6 +40,12 @@ static DIAGNOSTICS: Mutex<Option<Arc<SessionDiagnostics>>> = Mutex::new(None);
 /// Tracks whether discovery is currently running, so a live rename knows
 /// whether to re-announce (no equivalent query exists on `Engine` itself).
 static DISCOVERING: AtomicBool = AtomicBool::new(false);
+/// Handle to the background chat drain task ([`chat_drain_loop`]), spawned
+/// fresh in [`init`]. It holds its own `Arc<Engine>`/`Arc<Manager>` clones
+/// (independent of the statics above), so [`shutdown`] must explicitly abort
+/// it — otherwise it would keep ticking, and keep that whole engine graph
+/// alive, forever across every `pb_init`/`pb_shutdown` cycle.
+static CHAT_DRAIN: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 
 type OpResult = Result<Value, (Code, String)>;
 
@@ -344,13 +350,16 @@ pub fn init(config_json: &str) -> OpResult {
 
     // Background chat drain: periodically retries delivery to any peer whose
     // outbox still has queued messages once discovery reports it reachable.
-    // Clone before `engine`/`manager` are moved into the statics below.
-    rt().spawn(chat_drain_loop(engine.clone(), manager.clone()));
+    // Clone before `engine`/`manager` are moved into the statics below. The
+    // handle is stashed in `CHAT_DRAIN` so `shutdown()` can abort it — see
+    // that static's doc comment for why this matters.
+    let drain_handle = rt().spawn(chat_drain_loop(engine.clone(), manager.clone()));
 
     *lock(&ME) = Some(me(&config, &device_id));
     *lock(&ENGINE) = Some(engine);
     *lock(&MANAGER) = Some(manager);
     *lock(&DIAGNOSTICS) = Some(diagnostics);
+    *lock(&CHAT_DRAIN) = Some(drain_handle);
     Ok(json!({ "initialised": true }))
 }
 
@@ -393,6 +402,16 @@ pub fn shutdown() {
     // QUIC port bound — a later `pb_init()` would then fail to rebind.
     if let Ok(manager) = manager() {
         let _ = manager.stop_daemon();
+    }
+    // Abort the chat drain before releasing the engine/manager statics: it
+    // holds its own `Arc<Engine>`/`Arc<Manager>` clones (captured at spawn
+    // time, not borrowed from these statics), so without this the Engine
+    // could never actually drop once `ENGINE` below is cleared — which in
+    // turn used to keep `forward_device_changes` running past shutdown too,
+    // since it only stops once the Engine's broadcast `Sender` (owned by the
+    // Engine) is dropped.
+    if let Some(handle) = lock(&CHAT_DRAIN).take() {
+        handle.abort();
     }
     *lock(&ENGINE) = None;
     *lock(&ME) = None;
@@ -478,6 +497,66 @@ mod tests {
                 .iter()
                 .any(|v| v["type"] == "device_removed" && v["id"] == "sentinel"),
             "expected the forwarder to keep delivering changes after Lagged, got: {events:?}"
+        );
+    }
+
+    /// Regression guard for the chat-drain shutdown leak: `chat_drain_loop`
+    /// captures its own `Arc<Engine>`/`Arc<Manager>` clones at spawn time,
+    /// independent of the `ENGINE`/`MANAGER` statics, so if `shutdown()`
+    /// only cleared those statics without also aborting the drain task, the
+    /// Engine could never actually deallocate — every `pb_init`/`pb_shutdown`
+    /// cycle (e.g. a Flutter hot-restart) would leak the whole engine graph
+    /// and leave a stale drain ticking forever. A `Weak` reference lets this
+    /// assert on that real, load-bearing outcome (the Engine drops) instead
+    /// of only "`shutdown()` completes", which a leak wouldn't fail either.
+    ///
+    /// `#[serial_test::serial]` (same convention as `lib.rs`'s own
+    /// init/shutdown tests): this drives the real global `ENGINE`/`MANAGER`/
+    /// `CHAT_DRAIN` statics, so it must not run concurrently with any other
+    /// test that also calls `init`/`shutdown` on them.
+    #[test]
+    #[serial_test::serial]
+    fn shutdown_drops_the_chat_drain_and_lets_the_engine_deallocate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = EngineConfig::default();
+        cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
+        cfg.storage.save_directory = dir.path().join("recv").to_string_lossy().into_owned();
+        std::fs::create_dir_all(dir.path().join("recv")).unwrap();
+        cfg.transfer.port = 0; // OS-assigned; this test never dials/serves real traffic.
+        let cfg_json = serde_json::to_string(&cfg).unwrap();
+
+        let res = init(&cfg_json);
+        assert!(res.is_ok(), "init: {res:?}");
+
+        let weak_engine = Arc::downgrade(&engine().expect("engine initialised after init()"));
+        assert!(
+            weak_engine.upgrade().is_some(),
+            "engine should be alive right after init()"
+        );
+        assert!(
+            lock(&CHAT_DRAIN).is_some(),
+            "init() should stash the drain task's handle in CHAT_DRAIN"
+        );
+
+        shutdown();
+
+        assert!(
+            lock(&CHAT_DRAIN).is_none(),
+            "shutdown() must clear CHAT_DRAIN (and abort the task it held)"
+        );
+
+        // Aborting a tokio task is cooperative cancellation: the runtime
+        // drops the task's captured state (including its Arc<Engine> clone)
+        // on its next poll, not synchronously inside `abort()` itself — so
+        // poll briefly (bounded, not a fixed sleep) rather than asserting
+        // immediately.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while weak_engine.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            weak_engine.upgrade().is_none(),
+            "Engine should deallocate once shutdown() aborts the chat drain — its last Arc holder"
         );
     }
 }

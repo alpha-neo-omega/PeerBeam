@@ -129,6 +129,28 @@ fn status_reports_runtime_shape() {
     pb_shutdown();
 }
 
+/// Smoke test for the chat-drain shutdown fix: a full two-cycle
+/// init/shutdown/init/shutdown must complete promptly (an un-aborted drain
+/// task would at worst hang `shutdown()`) and each `init()` must succeed
+/// (`init()`'s own `assert_eq!(v["ok"], true, ...)` above fails loudly
+/// otherwise). Note this doesn't by itself distinguish the fix from the
+/// regression — `stop_daemon()` already explicitly kills the previous
+/// daemon/port-bind regardless of the drain task, so port reuse alone
+/// succeeds either way; see `runtime::tests::shutdown_drops_the_chat_drain_and_lets_the_engine_deallocate`
+/// for the precise white-box regression guard (Engine actually deallocates
+/// once the drain's `Arc` clone is aborted).
+#[test]
+#[serial_test::serial]
+fn shutdown_releases_chat_drain_so_repeated_init_shutdown_cycles_stay_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path());
+    pb_shutdown();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    init(dir2.path());
+    pb_shutdown();
+}
+
 #[test]
 #[serial_test::serial]
 fn logs_get_subscribe_export() {
