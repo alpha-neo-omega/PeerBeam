@@ -80,8 +80,9 @@ fresh keys with no nonce reuse. Resume never repeats the authenticated handshake
 
 ## 4. Per-channel MessageType namespaces
 
-Each ChannelType defines its own messages (illustrative; **not** implemented here —
-detail belongs to each capability's future spec):
+Each ChannelType defines its own messages. Entries marked **implemented** are live on
+the wire today and are binding; the rest are reserved and illustrative, with detail
+belonging to each capability's future spec:
 
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
   `Cancel`, `Pause`, `Resume` — i.e. today's [transfer
