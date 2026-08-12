@@ -11,5 +11,5 @@ pub use message::{
     mint_id, ChatError, ChatMessage, FileRef, MAX_BODY, MAX_NAME, MSG_FILE_REF, MSG_TEXT,
 };
 pub use record::{ChatRecord, Direction, FileMeta, Kind, Status};
-pub use send::{flush_to_session, send_message, SendError};
+pub use send::{flush_to_session, prepare_file_send, send_file_ref, send_message, SendError};
 pub use store::{namespace, ChatStore, OutboxEntry, OUTBOX_NS};

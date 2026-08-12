@@ -241,6 +241,42 @@ async fn chat_drain_loop(engine: Arc<Engine>, manager: Arc<Manager>) {
     }
 }
 
+/// Settle chat records left mid-flight by a crash or a hard restart.
+///
+/// A file row is written `Transferring` (sender) or `PendingApproval`
+/// (receiver) and is only ever moved off that state by a live transfer event.
+/// Transfer ids are process-scoped and nothing replays them, so a row that
+/// survives a restart in either state would spin forever with no event coming;
+/// `reconcile_peer` flips those to `Interrupted`.
+///
+/// **What this actually covers, and what it does not.** The store is an
+/// `AppStore`, whose port has `put`/`get`/`list`/`delete`/`clear` — all
+/// namespace-scoped. There is *no* way to enumerate namespaces, so nothing here
+/// can discover "every peer with a conversation" without adding a store-wide
+/// scan to the port, which is out of scope for this increment. So this
+/// reconciles exactly the peers the runtime can already name:
+/// [`ChatStore::outbox_peers`], i.e. peers with queued **text**. A peer whose
+/// only unsettled row is a file — the case this feature actually creates, since
+/// increment 2a has no file outbox — is *not* covered here and is instead
+/// reconciled by the UI when that thread is opened. Worth revisiting if the
+/// `AppStore` port ever grows namespace enumeration.
+fn reconcile_chat(chat: &peerbeam_chat::ChatStore) {
+    let peers = match chat.outbox_peers() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "chat reconcile skipped: outbox unreadable");
+            return;
+        }
+    };
+    for peer in peers {
+        match chat.reconcile_peer(&peer) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(peer = %peer.0, count = n, "chat records marked interrupted"),
+            Err(e) => tracing::warn!(error = %e, peer = %peer.0, "chat reconcile failed"),
+        }
+    }
+}
+
 /// Initialise the runtime + engine and start the event forwarder.
 ///
 /// Idempotent: a second call without an intervening [`shutdown`] (e.g. a
@@ -319,6 +355,7 @@ pub fn init(config_json: &str) -> OpResult {
         peerbeam_appstore_fs::FsAppStore::open(appstore_root, chat_key, enc.clone()),
     );
     let chat = peerbeam_chat::ChatStore::new(appstore);
+    reconcile_chat(&chat);
 
     let manager = Arc::new(Manager::new(
         route_manager,

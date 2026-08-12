@@ -95,18 +95,35 @@ pub fn chat(rec: &peerbeam_chat::ChatRecord) {
     }));
 }
 
-/// Emit a `chat_status` event when a queued message's delivery status changes
-/// (currently only `"sent"`, fired once a background flush delivers a
-/// previously-queued message — see `Manager::chat_flush_peer` and the
-/// flush-on-connect path in `handle_incoming`).
+/// Emit a `chat_status` event when a record's delivery status changes: `"sent"`
+/// once a background flush delivers a previously-queued message (see
+/// `Manager::chat_flush_peer` and the flush-on-connect path in
+/// `handle_incoming`), and — for a file shared inside a conversation — the
+/// terminal status its transfer settled on.
+///
+/// `status` is always the record's own serialized [`peerbeam_chat::Status`]
+/// spelling, so a surface can apply it to the row without a second vocabulary.
 pub fn chat_status(peer_id: &str, message_id: &str, status: &str) {
-    emit(&json!({
+    chat_status_detail(peer_id, message_id, status, None);
+}
+
+/// [`chat_status`] plus a human-readable reason, for a status a user is owed an
+/// explanation for — a file refused because the peer's build cannot receive
+/// chat attachments, or a send that failed before any byte moved. The `error`
+/// key is present only when there is something to say, so every existing
+/// consumer of the plain event is unaffected.
+pub fn chat_status_detail(peer_id: &str, message_id: &str, status: &str, error: Option<&str>) {
+    let mut ev = json!({
         "type": "chat_status",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "message_id": message_id,
         "peer_id": peer_id,
         "status": status,
-    }));
+    });
+    if let (Value::Object(m), Some(e)) = (&mut ev, error) {
+        m.insert("error".to_string(), Value::String(e.to_string()));
+    }
+    emit(&ev);
 }
 
 /// Additive PeerSession lifecycle event vocabulary. New `type` strings only —

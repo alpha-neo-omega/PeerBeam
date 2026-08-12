@@ -6,8 +6,8 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
 use peerbeam_transfer::SessionHandle;
 
-use crate::message::{ChatError, ChatMessage};
-use crate::record::ChatRecord;
+use crate::message::{ChatError, ChatMessage, FileRef};
+use crate::record::{ChatRecord, FileMeta, Status};
 use crate::store::ChatStore;
 
 /// Send one already-built [`ChatMessage`] over a channel that has already
@@ -116,6 +116,77 @@ pub async fn flush_to_session(
     Ok(flushed)
 }
 
+/// Validate a path and stage a file-share: mint the [`FileRef`] and persist the
+/// outgoing record. Does no I/O beyond metadata — the bytes move over TRANSFER,
+/// correlated with the returned reference by its `id`.
+///
+/// The record is written **before** anything touches the network, and written
+/// as [`Status::Transferring`], on purpose:
+///
+/// * the id has to be durable and visible in history before it is published
+///   out of band as a transfer id, so a failure mid-send can never leave a
+///   half-sent file with no row to settle;
+/// * a dial that never connects therefore leaves a `Transferring` row, which
+///   [`ChatStore::reconcile_peer`] flips to `Status::Interrupted` at the next
+///   start. That is the intended shape: a row that outlives its process is
+///   settled by reconciliation, not by hoping an event still arrives.
+///
+/// Rejects a directory outright — a folder share is a different wire shape
+/// (`send_folder`) and is not part of file-in-chat.
+pub fn prepare_file_send(
+    store: &ChatStore,
+    peer: &DeviceId,
+    path: &str,
+) -> Result<(FileRef, ChatRecord), SendError> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| SendError::Session(format!("cannot read {path}: {e}")))?;
+    if meta.is_dir() {
+        return Err(SendError::Session(
+            "folders aren't supported in chat yet — use Send folder".into(),
+        ));
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| SendError::Session(format!("no file name in {path}")))?;
+    let r = FileRef::new(&name, meta.len())?;
+    let rec = ChatRecord::file_out(
+        peer,
+        &r,
+        FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: Some(path.to_string()),
+        },
+        Status::Transferring,
+    );
+    store.append(&rec)?;
+    Ok((r, rec))
+}
+
+/// Send a prepared [`FileRef`] over the session's CHAT channel.
+///
+/// Takes no store and no peer: the record was already persisted by
+/// [`prepare_file_send`], and re-deriving the peer here would risk writing the
+/// row into a second namespace. This is purely the wire step.
+///
+/// Waits for the peer's channel accept first, for the same reason
+/// [`send_message`] does — `open_channel` resolves as soon as the open is
+/// queued locally, so sending immediately would race the accept over any real
+/// transport.
+pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), SendError> {
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+    let frame = r.to_frame(channel)?;
+    handle
+        .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
+}
+
 /// What one poll of `handle.channels()` tells us to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollOutcome {
@@ -198,6 +269,90 @@ async fn wait_for_channel_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{Direction, Kind};
+    use peerbeam_appstore_fs::FsAppStore;
+    use peerbeam_crypto::{derive_subkey, AeadCrypto};
+    use peerbeam_domain::port::EncryptionProvider;
+    use std::sync::Arc;
+
+    fn store() -> (ChatStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
+        let key = derive_subkey(&[3u8; 32], b"peerbeam-appstore-v1");
+        let app = Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
+        (ChatStore::new(app), dir)
+    }
+
+    /// The staging contract the whole send path rests on: one id names both the
+    /// chat row and (later) the transfer, the row is persisted before anything
+    /// is dialed, and it carries the sender's local path so the UI can open it.
+    #[test]
+    fn prepare_file_send_persists_a_transferring_row_keyed_by_the_file_ref_id() {
+        let (cs, dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let (r, rec) = prepare_file_send(&cs, &peer, &path).unwrap();
+
+        assert_eq!(r.name, "report.pdf", "name is the path's base component");
+        assert_eq!(r.size, 4096, "size is read from the filesystem");
+        assert_eq!(rec.id, r.id, "the record key IS the FileRef id");
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].id, r.id);
+        assert_eq!(hist[0].kind, Kind::File);
+        assert_eq!(hist[0].direction, Direction::Out);
+        assert_eq!(
+            hist[0].status,
+            Status::Transferring,
+            "persisted before the network, so a crash is reconcilable"
+        );
+        let meta = hist[0].file.clone().expect("file meta");
+        assert_eq!(meta.name, "report.pdf");
+        assert_eq!(meta.size, 4096);
+        assert_eq!(
+            meta.local_path.as_deref(),
+            Some(path.as_str()),
+            "the sender's own path is kept record-side (never on the wire)"
+        );
+    }
+
+    /// A folder is a different wire shape entirely; refusing it here is what
+    /// keeps `chat send --file some/dir` from silently sending a 0-byte file.
+    #[test]
+    fn prepare_file_send_refuses_a_directory_and_writes_nothing() {
+        let (cs, dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let sub = dir.path().join("a-folder");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let err = prepare_file_send(&cs, &peer, &sub.to_string_lossy()).unwrap_err();
+        assert!(
+            err.to_string().contains("folders aren't supported"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            cs.history(&peer).unwrap().is_empty(),
+            "a refused share must leave no row behind"
+        );
+    }
+
+    #[test]
+    fn prepare_file_send_refuses_a_missing_path_and_writes_nothing() {
+        let (cs, dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let missing = dir.path().join("nope.bin");
+
+        let err = prepare_file_send(&cs, &peer, &missing.to_string_lossy()).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot read"),
+            "unexpected error: {err}"
+        );
+        assert!(cs.history(&peer).unwrap().is_empty());
+    }
 
     #[test]
     fn decide_opens_once_state_is_open() {

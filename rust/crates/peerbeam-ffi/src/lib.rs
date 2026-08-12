@@ -319,6 +319,18 @@ pub unsafe extern "C" fn pb_chat_send(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_send(&read_json(json)?))()))
 }
 
+/// Share a file inside a chat thread: `{peer:{name,addresses[],port},path}` →
+/// `{id}`. The id names both the conversation row and the transfer carrying the
+/// bytes. Online only: an unreachable peer fails (via `chat_status`) rather
+/// than queueing.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_send_file(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_send_file(&read_json(json)?))()))
+}
+
 /// Conversation history: `{peer_id}` → `{messages:[...]}`.
 ///
 /// # Safety

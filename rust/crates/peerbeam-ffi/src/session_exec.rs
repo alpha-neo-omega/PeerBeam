@@ -103,12 +103,9 @@ pub struct Session {
     pub pairing_code: String,
     /// The capabilities both sides agreed on (already intersected).
     ///
-    /// Read via [`supports_file_ref`](Self::supports_file_ref); the only
-    /// consumer is the chat file-share *send* path, which lands in the next
-    /// increment — hence `allow(dead_code)` rather than a missing field (the
-    /// negotiated value has to be captured here, before `ps` is consumed by
-    /// the run loop, so it cannot simply be fetched later).
-    #[allow(dead_code)]
+    /// Read via [`supports_file_ref`](Self::supports_file_ref). Captured here
+    /// rather than fetched on demand because the negotiated value has to be
+    /// read before `ps` is consumed by the run loop.
     pub capabilities: CapabilitySet,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
@@ -119,11 +116,11 @@ impl Session {
     /// before this feature advertises `features: 0`, so this is false and we
     /// must not offer it a file in chat.
     ///
-    /// Nothing sends a `FileRef` yet (that is the send path, next increment);
-    /// the receive side needs no such check because it correlates purely off
-    /// the id it peeks from the transfer itself.
+    /// Checked by `Manager::run_chat_file_send` before it sends anything: a
+    /// false here is a hard refusal, never a fallback to a plain transfer. The
+    /// receive side needs no such check — it correlates purely off the id it
+    /// peeks from the transfer itself.
     #[must_use]
-    #[allow(dead_code)]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
     }

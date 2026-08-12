@@ -15,7 +15,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use peerbeam_chat::ChatStore;
+use peerbeam_chat::{ChatStore, FileRef, Status as ChatStatus};
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
     Device, DeviceType, Direction, Progress, TransferSession, TransferStatus,
@@ -729,8 +729,37 @@ impl Manager {
             Ok(s) => s,
             Err(e) => return self.finish_failed(&active, e),
         };
+        self.run_send_on_session(session, &id, &active, &device, path, name, size)
+            .await;
+    }
+
+    /// Send one file over an **already-established** session, then close that
+    /// session and settle the transfer.
+    ///
+    /// Split out of [`run_send`](Self::run_send) so the chat file-share can
+    /// reuse the identical body over a session it had to establish itself (it
+    /// must inspect the negotiated capabilities and push a `FileRef` on the
+    /// CHAT channel *before* any byte moves — see
+    /// [`run_chat_file_send`](Self::run_chat_file_send)). Both callers get the
+    /// same events, the same `drive` pump, the same close, and the same
+    /// terminal handling, so the two paths cannot drift.
+    ///
+    /// Takes the session **by value** and closes it on the single exit below:
+    /// there is no `?` and no early return in this function, so no path can
+    /// leak it.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_send_on_session(
+        self: &Arc<Self>,
+        session: crate::session_exec::Session,
+        id: &str,
+        active: &Arc<Active>,
+        device: &Device,
+        path: String,
+        name: String,
+        size: u64,
+    ) {
         events::transfer(
-            &id,
+            id,
             "transfer_started",
             json!({ "peer": device.name, "peer_id": device.id.0, "file": name }),
         );
@@ -738,7 +767,7 @@ impl Manager {
 
         let handle = session.handle.clone();
         let req = SendRequest {
-            transfer_id: id.clone(),
+            transfer_id: id.to_string(),
             name,
             path,
             size,
@@ -747,7 +776,7 @@ impl Manager {
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
         let outcome = drive(
-            id.clone(),
+            id.to_string(),
             active.stats.clone(),
             active.file.clone(),
             active.ctrl.clone(),
@@ -761,7 +790,7 @@ impl Manager {
         )
         .await;
         session.close().await;
-        self.finish(&active, outcome);
+        self.finish(active, outcome);
     }
 
     async fn run_send_folder(
@@ -840,6 +869,43 @@ impl Manager {
         };
         *a.status.lock().unwrap() = "cancelled".into();
         events::transfer(&a.id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
+        // `Status` has no `Cancelled` variant, so a cancelled chat file lands on
+        // `Failed` with the reason attached — distinguishable from a network
+        // failure by the reason, and far better than a row left `Transferring`
+        // with no further event coming.
+        self.chat_settle(&a.peer_id, &a.id, ChatStatus::Failed, Some("cancelled"));
+    }
+
+    /// Mirror a transfer's terminal outcome onto its chat row, when it has one.
+    ///
+    /// A file shared inside a conversation is deliberately **one identity**: the
+    /// `FileRef` message id *is* the transfer id, so the transfer's own terminal
+    /// event is the only thing that knows how the row ended. This is the bridge.
+    ///
+    /// **Guarded, because most transfers are not chat files.** Every ordinary
+    /// send/receive reaches the same terminal paths, and for those there is no
+    /// record under this id in this peer's conversation. `ChatStore::set_status`
+    /// already no-ops on a missing record, but a no-op write is not enough: an
+    /// unguarded `chat_status` would announce a status change for a row that
+    /// does not exist, on every plain transfer, and a surface that creates rows
+    /// optimistically from events would materialise phantom conversation
+    /// entries. So presence is checked *first*, and nothing at all — no write,
+    /// no event — happens when the row is absent.
+    ///
+    /// `peer_id` is the transfer's own `Active::peer_id`, which is the same
+    /// namespace the row was written under on both sides (the request's device
+    /// id for a send, the authenticated peer for a receive), so this can never
+    /// reach into an unrelated conversation.
+    fn chat_settle(&self, peer_id: &str, id: &str, status: ChatStatus, error: Option<&str>) {
+        let peer = DeviceId::from(peer_id.to_string());
+        if !self.chat.contains(&peer, id).unwrap_or(false) {
+            return; // not a chat file — an ordinary transfer, nothing to settle
+        }
+        if let Err(e) = self.chat.set_status(&peer, id, status) {
+            tracing::warn!(error = %e, transfer_id = %id, "chat row status not persisted");
+            return;
+        }
+        events::chat_status_detail(peer_id, id, chat_status_str(status), error);
     }
 
     fn finish_failed(&self, active: &Arc<Active>, (code, msg): (Code, String)) {
@@ -860,6 +926,7 @@ impl Manager {
             }),
         );
         self.record_history(&a.id, &a, false);
+        self.chat_settle(&a.peer_id, &a.id, ChatStatus::Failed, Some(&msg));
     }
 
     /// Success path: emit completed + append history.
@@ -889,6 +956,17 @@ impl Manager {
         }
         events::transfer(id, event, payload);
         self.record_history(id, &a, success);
+        if success {
+            // A completed chat file reads as `Sent` in our own thread when we
+            // sent it and `Received` when we did not — the same two statuses a
+            // text message uses, so a file row needs no special vocabulary.
+            let settled = if a.direction == "sending" {
+                ChatStatus::Sent
+            } else {
+                ChatStatus::Received
+            };
+            self.chat_settle(&a.peer_id, id, settled, None);
+        }
     }
 
     /// Append a history entry for an already-claimed (removed from `active`)
@@ -1007,6 +1085,10 @@ impl Manager {
         // An aborted task won't run finish(); do the cleanup + notify here.
         *a.status.lock().unwrap() = "cancelled".into();
         events::transfer(id, "transfer_cancelled", json!({ "peer_id": a.peer_id }));
+        // A cancelled chat file is `Failed`, not left `Transferring`: the task
+        // was aborted, so no terminal event is coming to settle the row, and a
+        // row that spins forever is worse than one that says it did not arrive.
+        self.chat_settle(&a.peer_id, id, ChatStatus::Failed, Some("cancelled"));
         Ok(json!({ "cancelled": true }))
     }
 
@@ -1152,6 +1234,178 @@ impl Manager {
             let _ = me.chat_flush_peer(device).await;
         });
         Ok(json!({ "id": id }))
+    }
+
+    /// Share a file inside a conversation with `peer`: `{peer, path}` → `{id}`.
+    ///
+    /// The returned id is one identity for two things — the `FileRef` message
+    /// that puts a row in the thread, and the transfer that carries the bytes.
+    /// That is the whole design: the row and the transfer are the same object
+    /// seen from two channels, so progress, cancellation and history all line
+    /// up without a second correlation table.
+    ///
+    /// Validates and persists the outgoing row **synchronously**, before this
+    /// returns and before anything is dialed, so the caller's id is durable and
+    /// visible in `chat_history` immediately and a later network failure can
+    /// never leave a half-sent file with no row to settle. The network half runs
+    /// in the background ([`run_chat_file_send`](Self::run_chat_file_send)) and
+    /// reports through `chat_status` + the ordinary `transfer_*` events.
+    ///
+    /// **Online only (increment 2a).** Unlike [`chat_send`](Self::chat_send),
+    /// there is no outbox: a peer that cannot be reached right now fails with a
+    /// clear message and a `Failed` row rather than queueing. Offline file
+    /// queueing is a separate increment, and quietly reusing the text outbox
+    /// would promise a delivery this build cannot make.
+    pub fn chat_send_file(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let path = req
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "path required".into()))?
+            .to_string();
+        // Validate + persist the outgoing row first, so a failure never
+        // half-sends: after this line there is always a row to settle.
+        let (file_ref, _rec) = peerbeam_chat::prepare_file_send(&self.chat, &device.id, &path)
+            .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        let id = file_ref.id.clone();
+        let me = self.clone();
+        crate::runtime::spawn(async move { me.run_chat_file_send(device, path, file_ref).await });
+        Ok(json!({ "id": id }))
+    }
+
+    /// The network half of [`chat_send_file`](Self::chat_send_file): dial,
+    /// check what the peer can actually receive, publish the `FileRef` on CHAT,
+    /// then move the bytes over TRANSFER under the same id.
+    ///
+    /// Every early return closes the session it holds and settles the row, so
+    /// the user is never left with a row stuck at `Transferring` and a session
+    /// leaked into the peer:
+    ///
+    /// | Failure | Session | Row |
+    /// | --- | --- | --- |
+    /// | dial failed | none was established | `Failed` + `chat_status` |
+    /// | peer lacks `CHAT_FEAT_FILEREF` | closed here | `Failed` + `chat_status` |
+    /// | `FileRef` send failed | closed here | `Failed` + `chat_status` |
+    /// | transfer id already claimed | closed here | `Failed` + `chat_status` |
+    /// | transfer failed/cancelled | closed by `run_send_on_session` | `Failed` via `finish` |
+    /// | success | closed by `run_send_on_session` | `Sent` via `finish` |
+    ///
+    /// **No silent fallback to a plain transfer.** If the negotiated
+    /// capabilities lack the feature bit, the peer's build has no `FileRef`
+    /// handler: it would show the file as an ordinary incoming transfer with no
+    /// row in the conversation. Sending it anyway would tell our user the
+    /// attachment landed in a thread the peer cannot see, which is worse than
+    /// failing. So the refusal is terminal, and **no transfer is registered or
+    /// started** — the `Active` entry is deliberately created only after this
+    /// gate, so a refused share leaves nothing in `pb_transfers_active` either.
+    async fn run_chat_file_send(self: Arc<Self>, device: Device, path: String, file_ref: FileRef) {
+        let peer_id = device.id.0.clone();
+        let id = file_ref.id.clone();
+        let name = file_ref.name.clone();
+        let size = file_ref.size;
+
+        let meta = self.session(&id, device.id.clone(), size);
+        let session = match crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+        )
+        .await
+        {
+            Ok(s) => s,
+            // Increment 2a is online-only: say so plainly instead of implying
+            // the file is queued somewhere.
+            Err((_, msg)) => {
+                return self.fail_chat_file(
+                    &peer_id,
+                    &id,
+                    &format!("cannot reach {} to send {name}: {msg}", device.name),
+                );
+            }
+        };
+
+        // The gate. Capture the answer, then close on the refusal path — the
+        // exact bug this ordering exists to prevent is a `?`-style early return
+        // that skips `session.close()`.
+        if !session.supports_file_ref() {
+            session.close().await;
+            return self.fail_chat_file(
+                &peer_id,
+                &id,
+                &format!(
+                    "{} cannot receive chat attachments — its build predates \
+                     file sharing in chat. Send {name} as a plain transfer instead.",
+                    device.name
+                ),
+            );
+        }
+
+        // The row in the peer's thread. Sent before the bytes so the file has
+        // somewhere to land: the receiver's `FileRef` handler persists a
+        // `PendingApproval` row keyed by this same id, which the incoming
+        // transfer then settles.
+        if let Err(e) = peerbeam_chat::send_file_ref(&session.handle, &file_ref).await {
+            session.close().await;
+            return self.fail_chat_file(&peer_id, &id, &format!("could not offer {name}: {e}"));
+        }
+
+        // Claim the id for the transfer. `register_vacant` refuses rather than
+        // overwrites, so a collision (a peer squatting this id, or a retry
+        // racing its own predecessor) fails this share instead of splicing it
+        // onto someone else's transfer.
+        let Some(active) = self.register_vacant(
+            &id,
+            "sending",
+            &device.name,
+            &peer_id,
+            &name,
+            Some(path.clone()),
+        ) else {
+            session.close().await;
+            return self.fail_chat_file(
+                &peer_id,
+                &id,
+                &format!("transfer id already in use: {id}"),
+            );
+        };
+        events::transfer(
+            &id,
+            "transfer_queued",
+            json!({ "peer": device.name, "peer_id": peer_id, "file": name, "size": size }),
+        );
+        // From here the ordinary send path owns it: same events, same close,
+        // same terminal handling — and `finish` settles the row through
+        // `chat_settle`, so success and failure both land on the record.
+        self.run_send_on_session(session, &id, &active, &device, path, name, size)
+            .await;
+    }
+
+    /// Settle a chat file-share that never reached the transfer stage: mark the
+    /// row `Failed` and tell every surface why.
+    ///
+    /// Used only before an `Active` exists — after that point the ordinary
+    /// terminal paths (`finish`/`finish_failed`) own the row. Writes directly
+    /// rather than going through [`chat_settle`](Self::chat_settle)'s presence
+    /// check: here the row is *known* to exist, because
+    /// [`chat_send_file`](Self::chat_send_file) persisted it before this task
+    /// was even spawned.
+    fn fail_chat_file(&self, peer_id: &str, id: &str, reason: &str) {
+        let peer = DeviceId::from(peer_id.to_string());
+        if let Err(e) = self.chat.set_status(&peer, id, ChatStatus::Failed) {
+            tracing::warn!(error = %e, message_id = %id, "chat file row not marked failed");
+        }
+        tracing::warn!(peer_id = %peer_id, message_id = %id, reason = %reason, "chat file send failed");
+        events::chat_status_detail(
+            peer_id,
+            id,
+            chat_status_str(ChatStatus::Failed),
+            Some(reason),
+        );
     }
 
     /// Distinct peers that currently have queued (undelivered) messages.
@@ -1439,6 +1693,11 @@ impl Manager {
                     "transfer_cancelled",
                     json!({ "peer_id": session.peer_device.0, "reason": "rejected" }),
                 );
+                // We turned this file down, so our own row says `Declined`
+                // rather than `Failed` — nothing went wrong, we chose. Guarded
+                // like every other bridge: a declined *ordinary* transfer has
+                // no chat row and settles nothing.
+                self.chat_settle(&session.peer_device.0, &id, ChatStatus::Declined, None);
             }
             session.close().await;
             return;
@@ -1807,6 +2066,26 @@ fn daemon_event(kind: &str, port: u16) {
     }));
 }
 
+/// The wire spelling of a chat [`ChatStatus`] for a `chat_status` event.
+///
+/// Must stay byte-identical to the record's own serde representation: a
+/// surface applies the event's `status` straight onto the row it already read
+/// from `pb_chat_history`, so two spellings for one state would show a row that
+/// disagrees with itself. Pinned by
+/// `chat_status_str_matches_the_records_serialized_form`.
+fn chat_status_str(status: ChatStatus) -> &'static str {
+    match status {
+        ChatStatus::Pending => "pending",
+        ChatStatus::Sent => "sent",
+        ChatStatus::Received => "received",
+        ChatStatus::PendingApproval => "pendingapproval",
+        ChatStatus::Transferring => "transferring",
+        ChatStatus::Declined => "declined",
+        ChatStatus::Failed => "failed",
+        ChatStatus::Interrupted => "interrupted",
+    }
+}
+
 /// Longest transfer id accepted from outside this process. Generous next to
 /// anything real (a minted `tx-<pid>-<n>` is ~20 bytes, a chat `FileRef` id is
 /// exactly 29) and small enough that an id can never be a payload in its own
@@ -1900,6 +2179,14 @@ mod tests {
     /// tests that exercise `start_daemon()`/`serve()` against a port they
     /// control (e.g. one already occupied, to force a bind failure).
     fn test_manager_with_port(name: &str, daemon_port: u16) -> Manager {
+        test_manager_full(name, daemon_port).0
+    }
+
+    /// The full construction: the manager, a clone of the `ChatStore` it writes
+    /// to (so a test can seed and read conversation rows against the same
+    /// on-disk store), and the `TempDir` that backs both — returned so the
+    /// caller can keep it alive for the duration of the test.
+    fn test_manager_full(name: &str, daemon_port: u16) -> (Manager, ChatStore, tempfile::TempDir) {
         let quic = Arc::new(QuicTransport::new().expect("quic transport"));
         let rm = Arc::new(RouteManager::new(quic.clone()));
         let enc = Arc::new(AeadCrypto::new());
@@ -1920,19 +2207,208 @@ mod tests {
                 enc.clone(),
             ));
         let chat = ChatStore::new(appstore);
-        Manager::new(
+        let mgr = Manager::new(
             rm,
             quic,
             enc,
             trust,
-            chat,
+            chat.clone(),
             identity,
             dir.path().to_string_lossy().into_owned(),
             false,
             1024,
             daemon_port,
             None,
-        )
+        );
+        (mgr, chat, dir)
+    }
+
+    // ── the transfer → chat-record bridge ────────────────────────
+
+    /// Collected events for the serial bridge test below. `events::CALLBACK` is
+    /// process-global, so anything reading it must be `#[serial_test::serial]`
+    /// (same convention as `events.rs`'s own callback test).
+    static BRIDGE_EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+    extern "C" fn collect_bridge(ptr: *const std::os::raw::c_char) {
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        // The callback owns the string, exactly as `pb_free_string` would.
+        unsafe {
+            drop(std::ffi::CString::from_raw(
+                ptr as *mut std::os::raw::c_char,
+            ))
+        };
+        if let Ok(v) = serde_json::from_str(&s) {
+            BRIDGE_EVENTS.lock().unwrap().push(v);
+        }
+    }
+
+    fn file_meta(r: &peerbeam_chat::FileRef) -> peerbeam_chat::FileMeta {
+        peerbeam_chat::FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        }
+    }
+
+    /// The guard requirement in one test: a transfer that has **no** chat row —
+    /// which is every ordinary send and receive — must produce no chat write and
+    /// no `chat_status` event, while a transfer that *is* a chat file settles
+    /// normally. `ChatStore::set_status` already no-ops on a missing record, so
+    /// only the event half can actually go wrong here, and only an assertion on
+    /// the emitted events can catch it: an unguarded bridge would announce a
+    /// status change for a row that does not exist on every plain transfer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_settle_is_silent_for_a_transfer_that_has_no_chat_row() {
+        let (mgr, chat, _dir) = test_manager_full("bridge", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // A real chat file row, and an ordinary transfer id that is not one.
+        let r = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            file_meta(&r),
+            ChatStatus::Transferring,
+        ))
+        .expect("seed the file row");
+
+        BRIDGE_EVENTS.lock().unwrap().clear();
+        crate::events::set_callback(Some(collect_bridge));
+        // An ordinary transfer to the same peer: same conversation, different id.
+        mgr.chat_settle(&peer.0, "tx-4242-0", ChatStatus::Sent, None);
+        // A transfer to a peer with no conversation at all.
+        mgr.chat_settle("pb-nobody", "tx-4242-1", ChatStatus::Sent, None);
+        // The genuine chat file.
+        mgr.chat_settle(&peer.0, &r.id, ChatStatus::Sent, None);
+        crate::events::set_callback(None);
+
+        let events = BRIDGE_EVENTS.lock().unwrap().clone();
+        let statuses: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "chat_status")
+            .collect();
+        assert_eq!(
+            statuses.len(),
+            1,
+            "only a transfer that really has a chat row may announce one: {events:?}"
+        );
+        assert_eq!(statuses[0]["message_id"], r.id);
+        assert_eq!(statuses[0]["peer_id"], peer.0);
+        assert_eq!(statuses[0]["status"], "sent");
+
+        // The conversation gained nothing and lost nothing.
+        let hist = chat.history(&peer).expect("history");
+        assert_eq!(hist.len(), 1, "no phantom rows: {hist:?}");
+        assert_eq!(hist[0].id, r.id);
+        assert_eq!(hist[0].status, ChatStatus::Sent);
+        assert!(
+            chat.history(&DeviceId::from("pb-nobody"))
+                .expect("history")
+                .is_empty(),
+            "an unrelated conversation must not be created"
+        );
+    }
+
+    /// A failure reason rides the event so a surface can explain itself, and it
+    /// is absent when there is nothing to explain.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_settle_carries_a_reason_only_when_there_is_one() {
+        let (mgr, chat, _dir) = test_manager_full("bridge-reason", 0);
+        let peer = DeviceId::from("pb-bob");
+        let r = peerbeam_chat::FileRef::new("a.bin", 3).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            file_meta(&r),
+            ChatStatus::Transferring,
+        ))
+        .expect("seed the file row");
+
+        BRIDGE_EVENTS.lock().unwrap().clear();
+        crate::events::set_callback(Some(collect_bridge));
+        mgr.chat_settle(&peer.0, &r.id, ChatStatus::Failed, Some("peer went away"));
+        crate::events::set_callback(None);
+
+        let events = BRIDGE_EVENTS.lock().unwrap().clone();
+        let ev = events
+            .iter()
+            .find(|e| e["type"] == "chat_status")
+            .unwrap_or_else(|| panic!("no chat_status: {events:?}"));
+        assert_eq!(ev["status"], "failed");
+        assert_eq!(ev["error"], "peer went away");
+        assert_eq!(
+            chat.history(&peer).expect("history")[0].status,
+            ChatStatus::Failed
+        );
+    }
+
+    /// The event vocabulary must be the record's own serde spelling: a surface
+    /// applies an event's `status` straight onto a row it read from
+    /// `pb_chat_history`, so a second spelling would make the row disagree with
+    /// itself.
+    #[test]
+    fn chat_status_str_matches_the_records_serialized_form() {
+        for s in [
+            ChatStatus::Pending,
+            ChatStatus::Sent,
+            ChatStatus::Received,
+            ChatStatus::PendingApproval,
+            ChatStatus::Transferring,
+            ChatStatus::Declined,
+            ChatStatus::Failed,
+            ChatStatus::Interrupted,
+        ] {
+            let serialized = serde_json::to_value(s).expect("status serializes");
+            assert_eq!(
+                serialized.as_str(),
+                Some(chat_status_str(s)),
+                "event spelling drifted from the record's for {s:?}"
+            );
+        }
+    }
+
+    /// `chat_send_file` must refuse before it persists anything: a bad path
+    /// leaves no row, so a caller never sees a `Transferring` row for a file
+    /// that was never staged.
+    #[tokio::test]
+    async fn chat_send_file_refuses_a_bad_path_without_persisting_a_row() {
+        let (mgr, chat, dir) = test_manager_full("bad-path", 0);
+        let mgr = Arc::new(mgr);
+        let peer = json!({
+            "id": "pb-bob", "name": "bob", "addresses": ["127.0.0.1"], "port": 1,
+        });
+
+        let missing = dir.path().join("does-not-exist.bin");
+        let err = mgr
+            .chat_send_file(&json!({ "peer": peer, "path": missing.to_string_lossy() }))
+            .expect_err("a missing path must be refused");
+        assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
+        assert!(err.1.contains("cannot read"), "unexpected error: {}", err.1);
+
+        let folder = dir.path().join("a-folder");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let err = mgr
+            .chat_send_file(&json!({ "peer": peer, "path": folder.to_string_lossy() }))
+            .expect_err("a directory must be refused");
+        assert!(
+            err.1.contains("folders aren't supported"),
+            "unexpected error: {}",
+            err.1
+        );
+
+        assert!(
+            chat.history(&DeviceId::from("pb-bob"))
+                .expect("history")
+                .is_empty(),
+            "a refused share must persist nothing"
+        );
+        assert_eq!(mgr.active_len(), 0, "and register no transfer");
     }
 
     #[tokio::test]
