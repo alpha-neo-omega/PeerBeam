@@ -984,10 +984,10 @@ impl Manager {
     }
 
     /// Distinct peers that currently have queued (undelivered) messages.
-    /// Unused within this crate today — `chat_send`'s opportunistic flush and
-    /// `handle_incoming`'s flush-on-connect are the only delivery paths wired
-    /// so far — but published for a future periodic drain tick to iterate.
-    #[allow(dead_code)]
+    /// Consumed by the background chat drain (`runtime::chat_drain_loop`),
+    /// which retries delivery to any of these peers once discovery reports
+    /// them reachable — in addition to `chat_send`'s opportunistic flush and
+    /// `handle_incoming`'s flush-on-connect.
     pub fn chat_outbox_peers(&self) -> Vec<DeviceId> {
         self.chat.outbox_peers().unwrap_or_default()
     }

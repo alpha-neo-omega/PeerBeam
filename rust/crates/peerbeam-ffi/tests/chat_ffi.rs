@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use peerbeam_chat::{ChatHandler, ChatRecord, ChatStore, ReceivedSink};
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
+use peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT;
 use peerbeam_domain::entity::{Direction, Route, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
@@ -26,6 +27,7 @@ use peerbeam_ffi::*;
 use peerbeam_transfer::{HandlerRegistry, Identity, PeerSession, SessionConfig, SessionRole};
 use peerbeam_transfer_quic::{direct_route, QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
+use tokio::net::UdpSocket;
 
 /// The session config a manual chat-only peer advertises: just CHAT (plus the
 /// always-implicit CONTROL) — matches `peerbeam-chat/tests/roundtrip.rs`.
@@ -194,6 +196,52 @@ async fn dial_channels_retrying(
             }
         }
     }
+}
+
+// ── driving discovery without real LAN/mDNS hardware ───────────
+
+/// A raw discovery `Announce` datagram in the same wire shape as
+/// `peerbeam_discovery_udp`'s (private) `Wire` type — mirrored by hand here
+/// the same way `peerbeam-discovery-udp/tests/loopback.rs` does, since the
+/// type itself isn't exported. Sent straight at the FFI engine's own
+/// discovery socket below to make a manually-built chat peer show up as
+/// `online` in `engine.devices()`, without depending on real broadcast
+/// traffic reaching the test sandbox.
+fn announce_json(id: &str, port: u16) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "v": 1,
+        "kind": "announce",
+        "id": id,
+        "name": id,
+        "device_type": "Desktop",
+        "platform": "linux",
+        "port": port,
+    }))
+    .unwrap()
+}
+
+/// Repeatedly announce `id`/`port` to the FFI engine's UDP discovery port
+/// (bound by `pb_discovery_start`) every 750ms — comfortably inside
+/// `peerbeam_discovery_udp`'s default 6s liveness TTL — so the peer stays
+/// visible (and `online`) in `engine.devices()` for as long as the returned
+/// task keeps running. Abort it once the test no longer needs the peer to
+/// look reachable.
+fn spawn_periodic_announce(id: &str, port: u16) -> tokio::task::JoinHandle<()> {
+    let id = id.to_string();
+    tokio::spawn(async move {
+        let sock = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind announce socket");
+        loop {
+            let _ = sock
+                .send_to(
+                    &announce_json(&id, port),
+                    ("127.0.0.1", DEFAULT_DISCOVERY_PORT),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+    })
 }
 
 // ── tests ─────────────────────────────────────────────────────
@@ -381,5 +429,161 @@ async fn chat_received_into_ffi_and_history_round_trip() {
     assert_eq!(messages[0]["direction"], "in");
     assert_eq!(messages[0]["status"], "received");
 
+    pb_shutdown();
+}
+
+/// The background chat drain (`runtime::chat_drain_loop`, spawned from
+/// `pb_init`) retries delivery to a peer that was unreachable at `chat_send`
+/// time, once discovery reports it back online — this is a *distinct*
+/// delivery path from the two already covered above/in 1a:
+/// - `chat_send`'s own one-shot opportunistic flush already ran (and failed,
+///   since nothing was listening yet) by the time the peer comes online.
+/// - `handle_incoming`'s flush-on-connect never fires here because the
+///   manual peer only ever *listens*; it never dials into the FFI engine.
+///
+/// So any delivery observed below can only be the new periodic drain tick.
+///
+/// Real LAN/mDNS/Tailscale broadcast hardware isn't available in a test
+/// sandbox, so "discovery reports the peer online" is driven directly: a raw
+/// UDP `Announce` datagram is sent straight at the FFI engine's own
+/// discovery socket (`pb_discovery_start` binds
+/// `peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT`), re-sent periodically so
+/// the peer doesn't age out of the provider's liveness TTL before the
+/// drain's 15s tick fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49902, dir.path());
+
+    // `runtime::discovery_start` blocks on the shared runtime directly (no
+    // `Handle::try_current` fallback like `shutdown`/`init` have) — calling
+    // it from this `#[tokio::test]`'s own async context would hit tokio's
+    // "cannot start a runtime from within a runtime" panic. A plain OS thread
+    // has no tokio context at all, matching how a real (non-async) Dart
+    // caller invokes it.
+    let discovery = std::thread::spawn(|| take(pb_discovery_start()))
+        .join()
+        .unwrap();
+    assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+
+    let peer_id = "drain-peer";
+    let peer_port: u16 = 49964;
+
+    // 1) Enqueue while nothing is listening at `peer_port` — `chat_send` must
+    // return immediately with the message Pending, not block on delivery.
+    let peer_device = json!({
+        "id": peer_id,
+        "name": peer_id,
+        "addresses": ["127.0.0.1"],
+        "port": peer_port,
+    });
+    let sent = call_json(
+        pb_chat_send,
+        &json!({ "peer": peer_device, "text": "offline then online" }),
+    );
+    assert_eq!(sent["ok"], true, "chat_send: {sent}");
+    let msg_id = sent["data"]["id"].as_str().expect("id string").to_string();
+
+    let hist = call_json(pb_chat_history, &json!({ "peer_id": peer_id }));
+    let messages = hist["data"]["messages"].as_array().expect("messages array");
+    let pending = messages
+        .iter()
+        .find(|m| m["id"] == msg_id)
+        .expect("enqueued message present in history");
+    assert_eq!(
+        pending["status"], "pending",
+        "chat_send must enqueue Pending without blocking while the peer is unreachable"
+    );
+
+    // `chat_send` already spawned its own one-shot opportunistic flush attempt
+    // (see `Manager::chat_send`), dialing `peer_port` in the background right
+    // now while nothing is listening there. That dial is bounded by
+    // `peerbeam_transfer_quic`'s 8s `CONNECT_TIMEOUT`; if the peer's listener
+    // came up *during* that window, a QUIC retransmit could still land on it
+    // and this attempt — not the drain loop — would be what delivers the
+    // message, making the test pass for the wrong reason. Wait past that
+    // timeout first so the opportunistic flush has conclusively failed (the
+    // record is still Pending, asserted above) before the peer ever exists —
+    // only the periodic drain tick can succeed after this point.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+
+    // 2) Bring the peer online: a real QUIC listener at the exact address the
+    // Pending message targets, plus a periodic discovery announce so
+    // `engine.devices()` reports it online for the drain loop to find.
+    let (enc, trust, identity) = peer_identity(dir.path(), peer_id);
+    let recv_quic = QuicTransport::new().unwrap();
+    let (_addr, mut incoming) = recv_quic
+        .serve_channels_on(format!("127.0.0.1:{peer_port}").parse().unwrap())
+        .await
+        .unwrap();
+    let peer_store = peer_chat_store(dir.path(), peer_id, 99);
+
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler, peer_slot) = ChatHandler::new(peer_store.clone(), sink);
+
+    let recv_fut = async move {
+        use futures::StreamExt;
+        let qc = incoming.next().await.unwrap().unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_only_caps())
+            .with_handlers(HandlerRegistry::new().with(handler as Arc<dyn MessageHandler>));
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Responder,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        // Bind the handler's peer slot to the FFI engine's device id before
+        // the run loop can dispatch any Chat frame.
+        let _ = peer_slot.set(ps.peer().clone());
+        ps.run().await
+    };
+    tokio::spawn(recv_fut);
+
+    // The manual peer never dials the FFI engine, so `handle_incoming`'s own
+    // flush-on-connect cannot be what delivers this message — only the new
+    // periodic drain tick can, since it dials out on the FFI's own schedule.
+    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+
+    // 3) Wait (bounded, generous enough for one ~15s `DRAIN_EVERY` tick
+    // measured from `pb_init`, of which ~9s has already elapsed above) for the
+    // drain to actually flush it: the peer receives the message, the FFI
+    // emits `chat_status: "sent"`, and `pb_chat_history` flips the record
+    // from Pending to Sent.
+    let got = wait_record(20, &received)
+        .expect("drain loop did not deliver the queued message to the peer in time");
+    assert_eq!(got.body, "offline then online");
+    assert_eq!(got.id, msg_id, "same message id round-trips");
+
+    let event = wait_event(5, |e| {
+        e["type"] == "chat_status" && e["message_id"] == msg_id && e["status"] == "sent"
+    })
+    .expect("expected a chat_status \"sent\" event for the drained message");
+    assert_eq!(event["peer_id"], peer_id);
+
+    let sent_msg = wait_chat_status(5, peer_id, &msg_id, "sent")
+        .expect("pb_chat_history did not flip the record to Sent after the drain flush");
+    assert_eq!(sent_msg["status"], "sent");
+    assert_eq!(sent_msg["direction"], "out");
+
+    // Stop refreshing the peer's discovered presence before shutdown; no
+    // further assertions depend on it.
+    announce_task.abort();
     pb_shutdown();
 }

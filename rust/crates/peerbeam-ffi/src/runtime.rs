@@ -43,6 +43,10 @@ static DISCOVERING: AtomicBool = AtomicBool::new(false);
 
 type OpResult = Result<Value, (Code, String)>;
 
+/// How often the background chat drain sweeps the outbox for peers that have
+/// since become reachable. See [`chat_drain_loop`].
+const DRAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The shared multi-thread runtime (created on first use).
 fn rt() -> &'static Runtime {
     RT.get_or_init(|| {
@@ -204,6 +208,33 @@ async fn forward_device_changes(
     }
 }
 
+/// Periodically deliver queued chat messages to peers that are now reachable.
+/// Lives here so it can hold the engine (for `devices()`) and the manager (for
+/// dial+flush) directly. Keep-forever: an unreachable peer's queue is retried
+/// every tick, never dropped.
+async fn chat_drain_loop(engine: Arc<Engine>, manager: Arc<Manager>) {
+    let mut ticker = tokio::time::interval(DRAIN_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let peers = manager.chat_outbox_peers();
+        if peers.is_empty() {
+            continue;
+        }
+        let online = engine.devices();
+        for peer in peers {
+            // Resolve the peer's current address from discovery; skip if offline.
+            let Some(md) = online.iter().find(|m| m.device.id == peer && m.online) else {
+                continue;
+            };
+            if md.device.addresses.is_empty() || md.device.port == 0 {
+                continue;
+            }
+            let _ = manager.chat_flush_peer(md.device.clone()).await;
+        }
+    }
+}
+
 /// Initialise the runtime + engine and start the event forwarder.
 ///
 /// Idempotent: a second call without an intervening [`shutdown`] (e.g. a
@@ -310,6 +341,11 @@ pub fn init(config_json: &str) -> OpResult {
     // The engine's single source of truth for live PeerSession status. Empty
     // until sessions run; the additive diagnostics FFI reads it (M8).
     let diagnostics = Arc::new(SessionDiagnostics::new());
+
+    // Background chat drain: periodically retries delivery to any peer whose
+    // outbox still has queued messages once discovery reports it reachable.
+    // Clone before `engine`/`manager` are moved into the statics below.
+    rt().spawn(chat_drain_loop(engine.clone(), manager.clone()));
 
     *lock(&ME) = Some(me(&config, &device_id));
     *lock(&ENGINE) = Some(engine);
