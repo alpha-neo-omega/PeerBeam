@@ -489,6 +489,14 @@ class _FileBody extends StatelessWidget {
   ///
   /// Anything past [TransferState.pending] means the answer is in and the
   /// bytes are moving: no buttons.
+  ///
+  /// Two shorter windows are permissive for the same reason and are left so
+  /// deliberately: between `transfer_queued` and `transfer_started` under
+  /// auto-accept (bounded by one synchronous trust lookup), and between
+  /// `transfer_completed` — which drops the live entry, so this reads `null`
+  /// again — and the `chat_status: received` that settles the row. Both are
+  /// sub-frame in practice and neither can outlive the event pair that closes
+  /// it.
   bool _offersApproval(Transfer? live) =>
       live == null || live.state == TransferState.pending;
 

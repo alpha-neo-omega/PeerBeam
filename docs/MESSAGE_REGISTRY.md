@@ -85,7 +85,7 @@ the wire today and are binding; the rest are reserved and illustrative, with det
 belonging to each capability's future spec:
 
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
-  `Cancel`, `Pause`, `Resume` — i.e. today's [transfer
+  `Cancel`, `Pause`, `Resume` (implemented) — i.e. today's [transfer
   protocol](TRANSFER_PROTOCOL.md), unchanged, now scoped to this channel.
 - **Chat (0x0101):** `Message = 1` (implemented, 1a); `FileRef = 2` (implemented,
   2a) — a reference to a file shared in the conversation: a bare file `name`

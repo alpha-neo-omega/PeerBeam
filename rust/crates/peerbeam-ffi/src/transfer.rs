@@ -1433,8 +1433,10 @@ impl Manager {
             // a `Failed` row plus a `chat_status` carrying the reason — rather
             // than as a call error. The row already exists (persisted a line
             // above), so an `Err` here would leave the caller's own optimistic
-            // row *and* this one describing the same file. Identical observable
-            // behaviour to when this check lived in the spawned task.
+            // row *and* this one describing the same file. The caller sees what
+            // it saw when this check lived in the spawned task; the peer sees
+            // strictly less, since we no longer dial it or offer it a `FileRef`
+            // for a share that cannot proceed.
             self.fail_chat_file(
                 &device.id.0,
                 &id,
