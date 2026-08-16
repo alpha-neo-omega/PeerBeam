@@ -6342,6 +6342,63 @@ mod tests {
         assert_eq!(again["kept"], 0);
     }
 
+    /// **A file still being copied into the outbox is kept, and reported.**
+    ///
+    /// `chat_send_file` writes the row `Staging` and returns immediately; the
+    /// copy runs in a spawned task for as long as the file is big. Nothing
+    /// reaches the outbox until it finishes, so for that whole window an
+    /// outbox-only keep set does not name the row — and a delete landing there
+    /// removed it, leaving the finished copy to queue an entry with no record
+    /// behind it. `run_queued_file` offers that to the peer and only then
+    /// throws the entry and the bytes away.
+    ///
+    /// Driven by seeding the row rather than by racing a real copy: the whole
+    /// window is "however long the copy takes", so a test that tried to land a
+    /// delete inside it would either be slow and disk-hungry or would silently
+    /// stop testing anything the day the copy got faster. What is asserted
+    /// here is the FFI's own decision at the seam — kept, and counted.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_keeps_and_reports_a_file_that_is_still_staging() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let m = peerbeam_chat::ChatMessage::new("settled").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+        // Exactly what `begin_file_send` leaves behind before the copy starts.
+        let r = peerbeam_chat::FileRef::new("holiday.mp4", 8_000_000_000).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            peerbeam_chat::FileMeta::new(&r.name, r.size, Some("/home/me/holiday.mp4".into())),
+            ChatStatus::Staging,
+        ))
+        .expect("seed the staging row");
+        assert!(
+            chat.outbox_for(&peer).expect("outbox").is_empty(),
+            "nothing is queued until the copy finishes — that IS the window"
+        );
+
+        let out = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(out["removed"], 1, "the settled text, and only that: {out}");
+        assert_eq!(
+            out["kept"], 1,
+            "a file the user attached seconds ago is 'still waiting to be sent': {out}"
+        );
+
+        let left = chat.history(&peer).expect("history");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].id, r.id);
+        assert_eq!(left[0].status, ChatStatus::Staging);
+        // The thread stays listed, so the kept row is visible immediately
+        // rather than reappearing when the copy lands.
+        let listed = mgr.chat_conversations(&json!({})).expect("conversations");
+        assert_eq!(listed["peers"].as_array().expect("peers").len(), 1);
+    }
+
     /// **`kept` counts what survived, including a row this build cannot read.**
     ///
     /// `delete_conversation` keeps rows by stored key, decodable or not, so a
