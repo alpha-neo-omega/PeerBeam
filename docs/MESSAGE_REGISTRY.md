@@ -39,7 +39,7 @@ near-term). Assignments are stable once published.
 |---|---|---|---|
 | `0x0000` | Control | A | session protocol; always present |
 | `0x0100` | Transfer | A | today's file/folder transfer, reframed as a channel |
-| `0x0101` | Chat | B | text/markdown messages; file references (implemented, 2a) |
+| `0x0101` | Chat | B | text/markdown messages; file references (2a) + file declines (2b), implemented |
 | `0x0102` | Clipboard | B | clipboard payloads / sync |
 | `0x0103` | Presence | B | device status heartbeats |
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
@@ -101,8 +101,43 @@ belonging to each capability's future spec:
   bit — an older peer advertises `features: 0`, `CapabilitySet::intersect`
   ANDs it away, and the sender never emits a `FileRef` to it (Capability-
   advertised, not assumed, §7); this is layered on top of, not instead of,
-  the `OPTIONAL` flag above. `Receipt`, `Reaction`, `Edit` reserved (not
-  implemented). The Chat handler honors §6: unknown MessageTypes flagged
+  the `OPTIONAL` flag above.
+  **Since 2b, `FileRef.id` is validated on decode** (`FileRef::from_frame`),
+  as `name` already was. The rule is the transfer-id rule, because this id
+  *is* a transfer id as well as a storage key: 1–128 bytes, `[A-Za-z0-9._-]`
+  only, never `.` or `..`. **This narrows what the wire accepts** — a peer
+  minting an exotic id that a 2a build decoded is now refused, and because
+  the refusal is a frame-decode error it closes the Chat channel (never the
+  session or its other channels, per §6's channel-scoped rule). The same rule
+  runs on encode (`FileRef::to_frame`), so no PeerBeam build can emit an id
+  its own peers would reject; a non-conforming id therefore only arrives from
+  another implementation. An id is **rejected, never sanitised** — a rewritten
+  id could collide with an unrelated row or an unrelated file.
+  `FileDecline = 3` (implemented, 2b) — "the file you offered under this `id`
+  was turned down": an `id` (the `FileRef`'s, hence also the transfer's) and a
+  `timestamp`, nothing else. It is an ordinary chat message rather than a
+  transfer-channel signal so that a decline made while the *sender* is offline
+  queues in the decliner's own outbox and delivers later, over machinery that
+  already exists. Sent `OPTIONAL` (§6/§7), like `FileRef`. It carries the
+  second feature bit assigned on the Chat capability:
+  `CHAT_FEAT_FILEDECLINE = 1 << 1`
+  (`peerbeam_domain::session::CHAT_FEAT_FILEDECLINE`). Advertising it asserts
+  that **this peer understands/handles MessageType 3** — that telling it "I
+  declined your file" will mean something — and a sender must see the bit in
+  the *negotiated* set before putting one on the wire (Capability-advertised,
+  not assumed, §7). A peer that predates the feature advertises `features: 0`,
+  `CapabilitySet::intersect` clears the bit, and no `FileDecline` is ever put
+  on the wire toward it — it would skip the frame harmlessly, but sending a
+  type the negotiation says the peer does not speak is exactly the silent
+  drift §7 exists to prevent. A file offered to such a peer therefore gets no
+  refusal signal at all, and PeerBeam retires it with a bounded local budget
+  instead: three offers that *reached* the peer and were refused, then
+  terminal (a connection failure is not counted — nobody was asked).
+  PeerBeam's own builds advertise the bit for both halves, sending a
+  `FileDecline` when their user refuses a file and settling their own outgoing
+  row on receiving one. `Receipt`, `Reaction`, `Edit` reserved (not
+  implemented; they were never numbered, so `3` was free and nothing was
+  renumbered). The Chat handler honors §6: unknown MessageTypes flagged
   `OPTIONAL` are ignored and the channel continues; unknown required types
   close that channel only. `Message`'s body is capped at `MAX_BODY = 16384`
   bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is

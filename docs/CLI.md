@@ -117,21 +117,78 @@ Working now:
   the bytes ride the same QUIC transfer path as plain `send`, while a small
   reference (name, size) rides the chat channel so the file gets a row in the
   conversation, correlated with the transfer by one shared id. A folder is
-  refused up front, before any network work (`error: chat session error:
-  folders aren't supported in chat yet — use Send folder`; use plain `send`
-  for a folder). If the peer's build predates file sharing in chat (it never
+  refused up front, before any network work (`error: folders aren't supported
+  in chat yet — use Send folder`; use plain `send` for a folder), as is a
+  missing path. If the peer's build predates file sharing in chat (it never
   negotiated the `FileRef` feature), the send is refused rather than falling
   back to a plain, chat-invisible transfer (`error: <peer> cannot receive
   chat attachments — its build predates file sharing in chat. Send <file> as
-  a plain transfer instead.`). Increment 2a is online only: unlike text,
-  there is no offline queue for files yet — an unreachable peer fails the
-  command outright (a connection error) instead of queuing for later
-  delivery. Because of that, a peer running only `peerbeam chat watch` can
-  never actually receive the bytes of an incoming chat file: `watch`'s accept
-  loop discards every incoming transfer stream unread (it only dispatches
-  Chat-channel frames). A headless receiver needs `peerbeam receive` or
-  `peerbeam daemon start` running to accept an incoming chat file; `chat
-  watch` alone will only show that a file was offered, not receive it.
+  a plain transfer instead.`) — that stays a **hard error even now that an
+  unreachable peer queues**, because an unreachable peer is merely away and
+  waiting helps, while a peer that can never receive a chat attachment would
+  be a promise nothing keeps.
+  **Every file send stages first.** Before any network work the file is
+  stream-copied into the outbox's own storage
+  (`<storage.data_directory>/outbox-blobs`), and it is that copy — never the
+  path — that is offered and sent, so deleting, moving or rewriting the
+  original afterwards cannot change what the peer receives. Unlike the chat log
+  and queued text, a staged blob is **plaintext** on disk (owner-only, `0600`),
+  for the lifetime of the queue entry that owns it. Two consequences, both new:
+  **disk I/O is doubled** (a 5 GiB share writes 5 GiB before a byte moves), and
+  a send can be **refused for space** where earlier builds streamed it straight
+  from the source. The two bounds are ordinary config
+  keys — `device.max_queued_file_bytes` (default 16 GiB / `17179869184`, a
+  backstop against the absurd rather than a product limit) and
+  `device.min_free_bytes` (default 512 MiB / `536870912`, which staging
+  refuses to eat into) — so `peerbeam config set device.min_free_bytes
+  1073741824` moves the floor. A refusal names the reason, its numbers and the
+  key behind the bound, copies nothing and touches no network — e.g. with the
+  cap lowered to 65536: `error: cannot stage movie.mkv: 200000 bytes is over
+  the 65536-byte limit for a chat attachment. Both staging bounds are
+  configurable: device.max_queued_file_bytes and device.min_free_bytes.` The
+  free-space refusal has the same shape and names the floor it would have
+  breached. Both exit `1`.
+  While the copy runs the row reads `staging` in `chat history`, a progress bar
+  shows on stderr, and `--json` emits `chat_staging` lines (both throttled to
+  one report per percent).
+  **An unreachable peer is queued, not an error** — the row stays `pending`,
+  the queue entry and the staged copy stay on disk, and the command exits `0`
+  after printing how many bytes it staged and what will deliver them: *a
+  running PeerBeam app sharing this data directory*, naming
+  `daemon`/`receive`/`chat watch` as draining queued text and declines, **not**
+  files. Take that literally: **this CLI does not deliver queued files.**
+  `daemon start`, `receive` and `chat watch` drain queued **text and declines
+  only** — their drain skips file entries by design, because the bytes need a
+  transfer engine the chat crate does not own. A file queued here is delivered
+  by a running PeerBeam **app** pointed at the same `storage.data_directory`
+  (same appstore under the same identity-derived key, same `outbox-blobs`), or
+  it is dropped with `chat cancel`. File queueing and text queueing are **not**
+  the same behaviour on this surface. The `--addr` caveat above applies to files
+  too, and harder: such a send is queued under the same routing placeholder,
+  which discovery can never resolve, so neither this CLI nor a running app will
+  ever pick it up — re-send via `--to` once the peer is discoverable, and `chat
+  cancel` the placeholder copy. Note also that every attempt mints a new id and
+  stages its own copy, so three tries at the same 5 GiB file against an offline
+  peer hold 15 GiB until they are sent or cancelled.
+  Independently of all that, a peer running only `peerbeam chat watch` cannot
+  receive the bytes of an incoming chat file: `watch`'s accept loop discards
+  every incoming transfer stream unread (it only dispatches Chat-channel
+  frames). A headless receiver needs `peerbeam receive` or `peerbeam daemon
+  start` running to accept an incoming chat file; `chat watch` alone will only
+  show that a file was offered, not receive it.
+- `chat cancel <peer> <id>` — call off a file *we* are sharing: drop it from
+  the queue, delete the copy the outbox made of it, and settle the row
+  `failed`. `<peer>` is a device id or a discoverable name (same resolution as
+  `chat history`); `<id>` is the share's message id, as printed by `chat
+  history --json` or by the queued-file notice above. Only an outgoing file row
+  that has not already been sent or declined can be cancelled — anything else
+  (a text row, a file the peer is offering *us*, a completed share, an unknown
+  id) is `not found`, **exit 3**, and rewrites nothing. It cannot stop a copy or
+  a transfer running *right now* in another `chat send --file` process (there is
+  no CLI-to-CLI IPC); it stops everything that outlives that process, including
+  a row stranded by a Ctrl-C mid-stage. Cancelling a row whose queue entry has
+  already gone still succeeds (`— nothing was still queued`), so it is safe to
+  re-run.
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
@@ -203,6 +260,23 @@ emits machine-readable JSON (NDJSON for streaming/long-running commands):
   per transfer (or `{"event":"error","message"}`).
 - `status --json` → `{"device_name","platform","transfer_port","save_directory","data_directory","providers":[…],"listening":bool}`.
 - `discover --json` → array (or NDJSON with `--watch`) of devices.
+- `chat send --json` → `{"event":"chat_sent","id","peer","delivered":bool}` for
+  text, `{"event":"chat_file_sent","id","peer","delivered":bool}` for `--file`.
+  **`delivered:false` means queued, not failed** — the command still exits `0`
+  — and on the file event that value is newly reachable (before offline
+  queueing it was always `true`). A `--file` send also emits
+  `{"event":"chat_staging","id","peer","done","total"}` while the file is being
+  copied into the outbox, one line per percent.
+- `chat cancel --json` → `{"event":"chat_cancelled","id","peer","cancelled":true,"dequeued":bool}`;
+  `dequeued` distinguishes "stopped a queued delivery" from "settled a row whose
+  queue entry had already gone".
+- `chat watch --json` / chat traffic seen by `receive`/`daemon` →
+  `{"event":"chat_received","id","peer","body","timestamp","kind"[,"file"]}` per
+  message, and — `chat watch` only — `{"event":"chat_file_needs_receiver","id","peer","name","size"}`
+  when a file is offered to a process that cannot accept its bytes.
+- `chat history --json` is not a stream: one `{"messages":[…]}` object, each
+  message carrying `status` (`staging`/`pending`/`sent`/…) and, for a file,
+  `kind:"file"` plus `{"name","size","local_path"}`.
 
 Branch on the exit code for success/failure; parse the JSON for details.
 
