@@ -2408,6 +2408,66 @@ impl Manager {
         Ok(json!({ "peers": peers }))
     }
 
+    /// Delete this device's copy of one conversation:
+    /// `{peer_id}` → `{removed, kept}`.
+    ///
+    /// **Local only.** Nothing goes on the wire and the peer keeps its own
+    /// copy — this is "forget this thread here", never "unsend".
+    ///
+    /// `removed` is how many records were deleted; `kept` is how many were
+    /// deliberately left behind because they still back a **queued** outbound
+    /// message. Both are counted, not estimated, so a surface can tell the user
+    /// what actually happened rather than what it hoped would.
+    ///
+    /// The keep set is the whole point, and
+    /// [`ChatStore::delete_conversation`] carries the long form: clearing the
+    /// namespace outright would destroy the queue, because the drain reads a
+    /// **missing** record as "nothing will ever settle this"
+    /// ([`row_may_still_deliver`](Self::row_may_still_deliver)) and releases the
+    /// entry along with its staged bytes. So a queued file's row stays, its
+    /// entry stays, its blob stays — and the next drain delivers it exactly as
+    /// if the user had never touched the thread.
+    ///
+    /// No event is emitted: nothing else in this process holds conversation
+    /// rows, and the surface that asked already knows. It refreshes its own
+    /// list from [`chat_conversations`](Self::chat_conversations), where a
+    /// thread that kept a queued record is still listed — correctly, and
+    /// immediately, rather than reappearing later out of nowhere.
+    ///
+    /// [`ChatStore::delete_conversation`]: peerbeam_chat::ChatStore::delete_conversation
+    pub fn chat_delete(&self, req: &Value) -> Op {
+        // Held to exactly the rule `chat_cancel` uses — the increment's other
+        // destructive call — rather than a second, parallel one: non-empty, and
+        // required. A peer id is not a path or a registry key here (it names a
+        // namespace the store itself builds), so `is_valid_transfer_id`'s
+        // charset rule is not the applicable guard; what matters is that an
+        // absent or empty id can never be read as "some conversation".
+        let peer_id = req
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or((Code::InvalidArgument, "peer_id required".into()))?
+            .to_string();
+        let peer = DeviceId::from(peer_id);
+        let removed = self
+            .chat
+            .delete_conversation(&peer)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        // Counted from what is actually on disk *after* the delete — the
+        // records still present under a queued entry — rather than from the
+        // rule that chose them. A number the user is shown ("1 queued file will
+        // still be sent") should be an observation, not a restatement of the
+        // intent.
+        let kept = self
+            .chat
+            .outbox_for(&peer)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| matches!(self.chat.get(&peer, &e.message_id), Ok(Some(_))))
+            .count();
+        Ok(json!({ "removed": removed, "kept": kept }))
+    }
+
     /// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
     ///
     /// Stops the copy if one is running, stops the transfer if the bytes are
@@ -6146,5 +6206,121 @@ mod tests {
         let peers = out["peers"].as_array().expect("peers array").clone();
         assert_eq!(peers.len(), 1, "{peers:?}");
         assert_eq!(peers[0]["peer_id"], "pb-bob");
+    }
+
+    // ── deleting a conversation ─────────────────────────────────
+
+    /// **Deleting a thread must not disarm the queue.** This is the whole trap:
+    /// the drain re-opens the record a queue entry is named after, and reads a
+    /// *missing* record as "nothing will ever settle this" — releasing the
+    /// entry and deleting the staged bytes. So the delete keeps that record,
+    /// and this asserts the consequence in the drain's own terms rather than
+    /// only in the store's: [`Manager::row_may_still_deliver`] — the exact
+    /// predicate `run_queued_file` consults before letting go — still answers
+    /// yes afterwards.
+    ///
+    /// It also proves the delete is not simply a no-op: the settled history
+    /// around the queued file really is gone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_keeps_a_queued_file_deliverable_and_removes_the_rest() {
+        let (mgr, chat, dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        for body in ["settled one", "settled two"] {
+            let m = peerbeam_chat::ChatMessage::new(body).expect("message");
+            chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+                .expect("seed history");
+        }
+        let (queued_id, blob) = seed_queued_file(
+            &chat,
+            &dir.path().join("outbox-blobs"),
+            &peer,
+            "waiting.mkv",
+        );
+
+        let out = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(out["removed"], 2, "the settled text, and only that");
+        assert_eq!(out["kept"], 1, "the record backing the queued file");
+
+        // The drain's own decision, unchanged by the delete.
+        assert!(
+            mgr.row_may_still_deliver(&peer, &queued_id),
+            "the delete must leave the queued file deliverable — a missing row \
+             here is what makes `run_queued_file` throw the bytes away"
+        );
+        assert_eq!(
+            chat.outbox_for(&peer).expect("outbox").len(),
+            1,
+            "the entry is still queued"
+        );
+        assert!(blob.exists(), "and its staged bytes are still on disk");
+
+        // Not a no-op: the rest of the thread is gone.
+        let left = chat.history(&peer).expect("history");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].id, queued_id);
+    }
+
+    /// With nothing queued the thread goes completely, and stops being listed —
+    /// which is what makes the row disappear from a surface rather than come
+    /// back empty.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_with_nothing_queued_removes_the_whole_thread() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+        for body in ["one", "two", "three"] {
+            let m = peerbeam_chat::ChatMessage::new(body).expect("message");
+            chat.append(&peerbeam_chat::ChatRecord::received(&peer, &m))
+                .expect("seed history");
+        }
+
+        let out = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(out["removed"], 3);
+        assert_eq!(out["kept"], 0, "nothing was queued, so nothing is kept");
+
+        let listed = mgr.chat_conversations(&json!({})).expect("conversations");
+        assert!(
+            listed["peers"].as_array().expect("peers").is_empty(),
+            "a deleted thread must not still be listed: {listed}"
+        );
+
+        // Deleting again is honest about having found nothing, rather than an
+        // error a surface that raced itself has to handle.
+        let again = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(again["removed"], 0);
+        assert_eq!(again["kept"], 0);
+    }
+
+    /// An absent or empty `peer_id` is a caller bug, not "some conversation" —
+    /// held to the same rule as `chat_cancel`, the increment's other
+    /// destructive call.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_requires_a_non_empty_peer_id() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+        let m = peerbeam_chat::ChatMessage::new("still here").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+
+        for bad in [json!({}), json!({ "peer_id": "" }), json!({ "peer_id": 7 })] {
+            let err = mgr
+                .chat_delete(&bad)
+                .expect_err("peer_id is required: {bad}");
+            assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
+        }
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            1,
+            "and nothing was deleted on the way to refusing"
+        );
     }
 }

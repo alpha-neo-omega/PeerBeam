@@ -105,6 +105,25 @@ abstract class PeerBeamApi {
   /// does and does not mean.
   Future<List<ChatConversation>> chatConversations();
 
+  /// Delete this device's copy of the conversation with [peerId], returning
+  /// what actually happened: how many records were `removed`, and how many were
+  /// `kept` because they still back a **queued** outbound message.
+  ///
+  /// **Local only.** Nothing goes on the wire and the peer keeps its own copy —
+  /// this is "forget this thread here", never "unsend".
+  ///
+  /// Anything still waiting to be sent survives, queue entry and staged bytes
+  /// included, and will still be sent. That is not a nicety: the engine's drain
+  /// reads a *missing* conversation record as "nothing will ever settle this"
+  /// and throws the queued file away, so a delete that took those rows with it
+  /// would destroy the file minutes later from a background tick. The thread
+  /// therefore stays listed exactly when something is still going out — visible
+  /// straight away rather than reappearing out of nowhere later.
+  ///
+  /// Both counts are the engine's own, so a surface can report the outcome
+  /// rather than guess at it.
+  Future<({int removed, int kept})> chatDelete(String peerId);
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -323,6 +342,15 @@ class PeerBeam implements PeerBeamApi {
     // The export takes no arguments; `{}` is the empty request it expects.
     final data = _data(_req().chatConversations('{}'));
     return _list(data['peers']).map(ChatConversation.fromJson).toList();
+  }
+
+  @override
+  Future<({int removed, int kept})> chatDelete(String peerId) async {
+    final data = _data(_req().chatDelete(jsonEncode({'peer_id': peerId})));
+    return (
+      removed: (data['removed'] as num?)?.toInt() ?? 0,
+      kept: (data['kept'] as num?)?.toInt() ?? 0,
+    );
   }
 
   // ── envelope handling ─────────────────────────────────────────

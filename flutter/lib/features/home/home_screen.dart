@@ -6,7 +6,7 @@ import '../../app/theme.dart';
 import '../../data/saved_devices_repository.dart' show SavedDevice;
 import '../../platform/desktop_files.dart';
 import '../../sdk/error_text.dart';
-import '../../sdk/models.dart' show ChatConversation, PeerTarget;
+import '../../sdk/models.dart' show PeerTarget;
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../state/staging.dart';
@@ -22,9 +22,11 @@ import '../send/send_staged.dart';
 import '../send/send_text.dart';
 import '../send/staged_sheet.dart';
 
-/// Home — conversations, nearby devices, quick actions. Listens to the device,
-/// saved-device and chat stores only, so transfer/history changes never rebuild
-/// it.
+/// Home — nearby devices, saved devices, quick actions. Listens to the device
+/// and saved-device stores only, so transfer/history/chat changes never rebuild
+/// it. Conversations have their own nav destination (see `ChatsScreen`): a
+/// thread must stay reachable for a peer discovery cannot see, and that is a
+/// list in its own right rather than a section under the device list.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -33,19 +35,6 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  @override
-  void initState() {
-    super.initState();
-    // After the first frame, not in `initState` directly: repositories are
-    // constructed before the engine's `initialize()` has been awaited, so an
-    // earlier read would just hit `not_initialised` and be swallowed. Same
-    // reasoning as the chat screen's own post-frame `openThread`.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      AppScope.of(context).chat.refreshConversations();
-    });
-  }
-
   /// Open a search over discovered devices; on pick, send files to it.
   Future<void> _searchDevices(BuildContext context) async {
     final devices = AppScope.of(
@@ -471,46 +460,6 @@ class _HomeScreenState extends State<HomeScreen> {
   Device? _discovered(BuildContext context, SavedDevice d) =>
       AppScope.of(context).device.deviceAtAddress(d.host, d.port);
 
-  /// The best name we can put to a conversation's peer id.
-  ///
-  /// Discovery first (a live name, kept current), then the trust store (a peer
-  /// we have chatted with has almost always been pinned, and that name outlives
-  /// discovery), and finally the device id itself — ugly, but the truth, and
-  /// never a fabricated "Unknown device" that two different peers would share.
-  String _peerName(BuildContext context, String peerId) {
-    final state = AppScope.of(context);
-    for (final d in state.device.devices) {
-      if (d.id == peerId) return d.name;
-    }
-    for (final t in state.trust.items) {
-      if (t.id == peerId && t.name.isNotEmpty) return t.name;
-    }
-    return peerId;
-  }
-
-  /// Open the thread for a conversation row.
-  ///
-  /// Keyed by the **authenticated peer id the engine returned**, never a
-  /// locally minted one: that is the whole reason this list can reach a peer
-  /// discovery cannot see, and the bug 2a removed saved-device chat over.
-  ///
-  /// The send target is discovery's when it has one and an address-less
-  /// placeholder otherwise — the thread stays readable either way, and the chat
-  /// screen disables its composer rather than accepting messages the engine
-  /// would refuse.
-  void _openConversation(BuildContext context, String peerId) {
-    final state = AppScope.of(context);
-    final name = _peerName(context, peerId);
-    final target =
-        state.device.peerTarget(peerId) ??
-        PeerTarget(id: peerId, name: name, addresses: const [], port: 0);
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ChatScreen(peerId: peerId, peer: target),
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
@@ -529,13 +478,7 @@ class _HomeScreenState extends State<HomeScreen> {
               maxWidth: Breakpoints.contentMaxWidth,
             ),
             child: AnimatedBuilder(
-              animation: Listenable.merge([
-                state.device,
-                state.saved,
-                // The conversations list is chat state; a new thread or a new
-                // file offer must show up here without a manual refresh.
-                state.chat,
-              ]),
+              animation: Listenable.merge([state.device, state.saved]),
               builder: (context, _) {
                 // Every device the engine currently knows about, online or
                 // not: a peer that drops offline stays listed (dimmed, with
@@ -545,7 +488,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 // genuinely goes away, and that still drops it from here.
                 final devices = state.device.devices.toList();
                 final saved = state.saved.devices;
-                final conversations = state.chat.conversations;
                 return CustomScrollView(
                   slivers: [
                     // Brand only on compact (no rail): the nav rail already
@@ -656,59 +598,6 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                     ),
-
-                    // Conversations — every thread on disk, whether or not
-                    // discovery can currently see the peer. Without this a
-                    // thread is only reachable through a device tile, so a
-                    // queued file waiting for an offline peer would have no
-                    // entry point at all.
-                    //
-                    // Hidden entirely when there are none: this is a resume
-                    // surface, and an empty header on a fresh install is
-                    // clutter advertising nothing.
-                    if (conversations.isNotEmpty) ...[
-                      const SliverPadding(
-                        padding: EdgeInsets.fromLTRB(
-                          AppSpace.md,
-                          AppSpace.xs,
-                          AppSpace.md,
-                          AppSpace.xxs,
-                        ),
-                        sliver: SliverToBoxAdapter(
-                          child: SectionHeader(title: 'Conversations'),
-                        ),
-                      ),
-                      SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(
-                          AppSpace.md,
-                          0,
-                          AppSpace.md,
-                          AppSpace.xs,
-                        ),
-                        sliver: SliverList.builder(
-                          itemCount: conversations.length,
-                          itemBuilder: (context, i) => Appear(
-                            index: i,
-                            child: Padding(
-                              padding: const EdgeInsets.only(
-                                bottom: AppSpace.xs,
-                              ),
-                              child: _ConversationCard(
-                                conversation: conversations[i],
-                                name: _peerName(
-                                  context,
-                                  conversations[i].peerId,
-                                ),
-                                onTap: () => _openConversation(
-                                  context,
-                                  conversations[i].peerId,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
 
                     // Saved devices — manual/Tailscale-by-address, always
                     // visible so peers discovery can't surface stay reachable.
@@ -930,117 +819,6 @@ class _SearchPill extends StatelessWidget {
                 ),
               ],
             ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// One conversation on Home: who it is with, when it last moved, and — when
-/// the engine says so — that it is waiting on the user for a decision.
-///
-/// **The badge is not an unread count.** `unread_hint` counts inbound file
-/// offers still awaiting an accept/decline, which is the only thing about a
-/// thread's state PeerBeam can assert without inventing read receipts, so the
-/// row says exactly that and never "N unread". A thread full of unread text
-/// legitimately shows nothing here.
-class _ConversationCard extends StatelessWidget {
-  final ChatConversation conversation;
-
-  /// The peer's display name, already resolved by the caller (discovery, then
-  /// the trust store, then the device id itself).
-  final String name;
-  final VoidCallback onTap;
-  const _ConversationCard({
-    required this.conversation,
-    required this.name,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final text = Theme.of(context).textTheme;
-    final waiting = conversation.unreadHint;
-    final last = conversation.lastAt;
-    return Card(
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: AppSpace.sm,
-            vertical: AppSpace.xs,
-          ),
-          child: Row(
-            children: [
-              CircleAvatar(
-                radius: 22,
-                backgroundColor: scheme.secondaryContainer,
-                child: Icon(
-                  Icons.chat_bubble_outline_rounded,
-                  size: AppIcons.md,
-                  color: scheme.onSecondaryContainer,
-                ),
-              ),
-              const Gap(AppSpace.sm),
-              Expanded(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.titleSmall,
-                    ),
-                    const Gap(2),
-                    Text(
-                      switch ((waiting, last)) {
-                        (1, _) => '1 file offer needs your attention',
-                        (final n, _) when n > 1 =>
-                          '$n file offers need your attention',
-                        // No decision pending: say when the thread last moved.
-                        // A null timestamp is a thread this build could not
-                        // read — still listed, with nothing to say about
-                        // itself, rather than a fabricated date.
-                        (_, final DateTime at) => 'Last message ${formatAgo(at)}',
-                        _ => 'No messages to show',
-                      },
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.bodySmall?.copyWith(
-                        color: conversation.needsAttention
-                            ? scheme.primary
-                            : scheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              if (conversation.needsAttention)
-                Tooltip(
-                  // Deliberately not "unread": these are decisions, not
-                  // messages someone has or hasn't looked at.
-                  message: waiting == 1
-                      ? '1 file offer is waiting for your decision'
-                      : '$waiting file offers are waiting for your decision',
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpace.sm,
-                    ),
-                    child: Badge(
-                      label: Text('$waiting'),
-                      child: Icon(
-                        Icons.move_to_inbox_rounded,
-                        size: AppIcons.md,
-                        color: scheme.primary,
-                      ),
-                    ),
-                  ),
-                ),
-            ],
           ),
         ),
       ),

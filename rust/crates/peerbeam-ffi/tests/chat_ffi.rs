@@ -2690,3 +2690,207 @@ async fn chat_conversations_lists_a_peer_whose_only_row_is_a_file() {
 
     pb_shutdown();
 }
+
+/// **Deleting a conversation keeps the queue armed — end to end, through a real
+/// drain.**
+///
+/// This is the consequence the whole delete design turns on. The drain re-opens
+/// the conversation record a queue entry is named after
+/// (`ChatStore::reopen_for_retry`), and a **missing** record is read there as
+/// "nothing will ever settle this": `run_queued_file` releases the entry and
+/// deletes the staged blob. So a delete that cleared the namespace would not
+/// merely forget a thread — it would destroy the user's queued file minutes
+/// later, from a background tick, with nothing on any surface to say so.
+///
+/// Asserted the only way that means anything: the file is queued for an absent
+/// peer, the conversation is deleted, and only then does the peer appear. The
+/// bytes that arrive have to have come from a queue that survived the delete —
+/// and the source file is removed first, so they can only have come from the
+/// staged copy.
+///
+/// The delete is proven to be doing real work on the way past: a second file is
+/// cancelled first, so the thread holds one removable record and one that must
+/// be kept, and the call reports exactly `removed: 1, kept: 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_delivers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49922, dir.path());
+
+    let peer_id = "delete-peer";
+    let peer_port: u16 = 49982;
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    // Two files queued for a peer that is not there.
+    let payload = vec![7u8; 4096];
+    let keep_src = dir.path().join("keep-me.pdf");
+    std::fs::write(&keep_src, &payload).unwrap();
+    let drop_src = dir.path().join("call-me-off.zip");
+    std::fs::write(&drop_src, vec![1u8; 512]).unwrap();
+
+    let mut ids = Vec::new();
+    for src in [&keep_src, &drop_src] {
+        let sent = call_json(
+            pb_chat_send_file,
+            &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+        );
+        assert_eq!(sent["ok"], true, "chat_send_file: {sent}");
+        ids.push(sent["data"]["id"].as_str().unwrap().to_string());
+    }
+    for id in &ids {
+        wait_chat_status(20, peer_id, id, "pending").expect("both queue for an absent peer");
+    }
+    assert_eq!(staged_blobs(dir.path()), 2, "both are staged");
+
+    // Call the second one off, so the thread holds one settled (removable)
+    // record alongside the one that must survive.
+    let cancelled = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": ids[1] }),
+    );
+    assert_eq!(cancelled["data"]["cancelled"], true, "{cancelled}");
+    wait_chat_status(10, peer_id, &ids[1], "failed").expect("the cancelled row settles");
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 1).await,
+        "only the queued file's bytes are left staged"
+    );
+
+    // Delete the conversation. Local only — nothing is sent, and the counts are
+    // the real ones.
+    let deleted = call_json(pb_chat_delete, &json!({ "peer_id": peer_id }));
+    assert_eq!(deleted["ok"], true, "chat_delete: {deleted}");
+    assert_eq!(
+        deleted["data"]["removed"], 1,
+        "the cancelled file's record is gone: {deleted}"
+    );
+    assert_eq!(
+        deleted["data"]["kept"], 1,
+        "the queued file's record is kept: {deleted}"
+    );
+    assert!(
+        chat_row(peer_id, &ids[1]).is_none(),
+        "the cancelled record really was removed"
+    );
+    let survivor = chat_row(peer_id, &ids[0]).expect("the queued file's row survives the delete");
+    assert_eq!(
+        survivor["status"], "pending",
+        "and is still queued, not settled: {survivor}"
+    );
+    assert_eq!(
+        staged_blobs(dir.path()),
+        1,
+        "a delete never touches staged bytes"
+    );
+    // The thread is still listed, because something in it is still going out —
+    // the user sees that immediately rather than having it reappear later.
+    let listed = call_json(pb_chat_conversations, &json!({}));
+    let peers = listed["data"]["peers"].as_array().cloned().unwrap();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!(peers[0]["peer_id"], peer_id);
+
+    // The user's own copy goes away: from here the staged blob is the only one.
+    std::fs::remove_file(&keep_src).unwrap();
+
+    // The peer appears. Discovery is driven directly (no LAN in a sandbox), and
+    // only the periodic drain can deliver from here.
+    let discovery = std::thread::spawn(|| take(pb_discovery_start()))
+        .join()
+        .unwrap();
+    assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+
+    let (enc, trust, identity) = peer_identity(dir.path(), peer_id);
+    let recv_quic = QuicTransport::new().unwrap();
+    let (_addr, mut incoming) = recv_quic
+        .serve_channels_on(format!("127.0.0.1:{peer_port}").parse().unwrap())
+        .await
+        .unwrap();
+    let peer_store = peer_chat_store(dir.path(), peer_id, 91);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler, peer_slot) = ChatHandler::new(peer_store.clone(), sink);
+    let peer_dest = dir.path().join("peer-recv");
+    std::fs::create_dir_all(&peer_dest).unwrap();
+    let peer_dest_str = peer_dest.to_string_lossy().into_owned();
+
+    let peer_task = tokio::spawn(async move {
+        use futures::StreamExt;
+        let qc = incoming.next().await.unwrap().unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, mut inc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_and_transfer_caps())
+            .with_stream_channel_type(ChannelType::TRANSFER)
+            .with_handlers(HandlerRegistry::new().with(handler as Arc<dyn MessageHandler>));
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Responder,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let _ = peer_slot.set(ps.peer().clone());
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+        let stream = inc_rx
+            .recv()
+            .await
+            .expect("the queued file's transfer stream");
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        receive_on_channel(
+            stream,
+            &handle,
+            &FsStorage::new(),
+            &peer_dest_str,
+            &ctrl,
+            &ptx,
+        )
+        .await
+        .expect("peer receives the queued file")
+    });
+    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+
+    // The drain delivers it — after the delete, from the staged copy.
+    let got = tokio::time::timeout(Duration::from_secs(45), peer_task)
+        .await
+        .expect("the drain did not deliver the queued file after the conversation was deleted")
+        .expect("peer task panicked");
+    let ChannelReceived::File(file) = got else {
+        panic!("expected a single-file receive");
+    };
+    assert_eq!(file.transfer_id, ids[0], "the queued file keeps its id");
+    assert_eq!(file.name, "keep-me.pdf");
+    assert_eq!(
+        std::fs::read(peer_dest.join("keep-me.pdf")).unwrap(),
+        payload,
+        "byte-exact, from bytes staged before the conversation was deleted and \
+         after the user's own copy was removed"
+    );
+    let offered = wait_record(5, &received).expect("the FileRef reached the peer");
+    assert_eq!(offered.id, ids[0]);
+
+    // And the ordinary terminal path still runs on the row the delete kept.
+    wait_chat_status(15, peer_id, &ids[0], "sent").expect("the row never reached sent");
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        "a delivered file's staged blob is released as usual"
+    );
+
+    announce_task.abort();
+    pb_shutdown();
+}

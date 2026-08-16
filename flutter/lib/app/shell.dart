@@ -15,12 +15,23 @@ class AppShell extends StatelessWidget {
 
   const AppShell({super.key, required this.navigationShell});
 
+  /// Nav order, which is also the Ctrl/⌘+1..N order and the branch order in
+  /// `buildRouter` — the three are index-for-index and must stay that way.
   static const _destinations = [
     _Dest(Icons.home_outlined, Icons.home_rounded, 'Home'),
+    _Dest(Icons.forum_outlined, Icons.forum_rounded, 'Chats'),
     _Dest(Icons.swap_horiz_outlined, Icons.swap_horiz_rounded, 'Transfers'),
     _Dest(Icons.history_outlined, Icons.history_rounded, 'History'),
     _Dest(Icons.settings_outlined, Icons.settings_rounded, 'Settings'),
   ];
+
+  /// The destination whose icon carries the active-transfer badge. Derived from
+  /// [_destinations] rather than hardcoded: it moved once already when Chats
+  /// was inserted ahead of Transfers, and a stale literal here would badge the
+  /// wrong tab silently.
+  static final int _badgedIndex = _destinations.indexWhere(
+    (d) => d.label == 'Transfers',
+  );
 
   void _go(int index) => navigationShell.goBranch(
     index,
@@ -111,18 +122,27 @@ class AppShell extends StatelessWidget {
   }
 
   Widget _wrapBadge(int i, Widget icon, Widget Function(Widget) badge) =>
-      i == 1 ? badge(icon) : icon;
+      i == _badgedIndex ? badge(icon) : icon;
 
-  /// Desktop keyboard navigation: Ctrl/⌘ + 1..4 jumps to a destination.
+  /// Desktop keyboard navigation: Ctrl/⌘ + 1..N jumps to a destination, by
+  /// position — so the digits follow [_destinations] rather than naming
+  /// screens. Inserting Chats at position 2 therefore moved Transfers to
+  /// Ctrl+3, History to Ctrl+4 and Settings to Ctrl+5.
   Widget _withShortcuts(Widget child) {
     const keys = [
       LogicalKeyboardKey.digit1,
       LogicalKeyboardKey.digit2,
       LogicalKeyboardKey.digit3,
       LogicalKeyboardKey.digit4,
+      LogicalKeyboardKey.digit5,
     ];
+    // Never bind past the end of either list: a digit with no destination
+    // would jump to a branch `goBranch` does not have.
+    final n = keys.length < _destinations.length
+        ? keys.length
+        : _destinations.length;
     final bindings = <ShortcutActivator, VoidCallback>{};
-    for (var i = 0; i < keys.length; i++) {
+    for (var i = 0; i < n; i++) {
       bindings[SingleActivator(keys[i], control: true)] = () => _go(i);
       bindings[SingleActivator(keys[i], meta: true)] = () => _go(i);
     }

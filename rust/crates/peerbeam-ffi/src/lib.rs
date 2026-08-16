@@ -382,6 +382,25 @@ pub unsafe extern "C" fn pb_chat_conversations(json: *const c_char) -> *mut c_ch
     })
 }
 
+/// Delete this device's copy of one conversation: `{peer_id}` →
+/// `{removed, kept}`.
+///
+/// **Local only** — nothing goes on the wire, and the peer keeps its own copy.
+///
+/// Everything in the thread is removed **except the records still backing
+/// queued outbound messages**, which are kept along with their queue entries
+/// and staged bytes: the drain reads a missing record as "nothing will ever
+/// settle this" and would throw the queued file away. `removed` and `kept` are
+/// both counted from what actually happened, so a surface can report the
+/// outcome honestly rather than guess at it. See `Manager::chat_delete`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_delete(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_delete(&read_json(json)?))()))
+}
+
 /// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
 ///
 /// Stops the staging copy if one is running, stops the transfer if the bytes

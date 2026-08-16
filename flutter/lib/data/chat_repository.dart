@@ -177,6 +177,41 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
+  /// Delete this device's copy of one conversation, returning the engine's own
+  /// counts: how many records were `removed`, and how many were `kept` because
+  /// they still back a queued outbound message.
+  ///
+  /// **Local only** — nothing goes on the wire, and the peer keeps its copy.
+  ///
+  /// The cached thread is dropped and the conversation list refreshed, in that
+  /// order, so the surface that asked never renders rows the engine has just
+  /// removed. What the engine *kept* comes straight back in the refresh: a
+  /// thread with something still going out stays listed, which is the honest
+  /// outcome and the one the confirmation promised.
+  ///
+  /// Session-only state for the thread goes too ([_errors], [_staging],
+  /// [_unsent]): most of it describes rows that no longer exist, and an unsent
+  /// row in particular — one the engine never persisted — would otherwise be
+  /// re-appended by the very next [refresh], resurrecting a message the user
+  /// just deleted. A *kept* row loses only its live staging progress, which its
+  /// next `chat_status` event restores; until then its bar is indeterminate,
+  /// which is what that row already renders before its first progress event.
+  Future<({int removed, int kept})> deleteConversation(String peerId) async {
+    final api = _api;
+    if (api == null) return (removed: 0, kept: 0);
+    final result = await api.chatDelete(peerId);
+    if (_disposed) return result;
+    for (final m in _byPeer[peerId] ?? const <ChatMessage>[]) {
+      _errors.remove(m.id);
+      _staging.remove(m.id);
+    }
+    _byPeer.remove(peerId);
+    _unsent.remove(peerId);
+    notifyListeners();
+    await refreshConversations();
+    return result;
+  }
+
   /// Call off a file we are sharing, and report **honestly** whether anything
   /// was cancelled.
   ///

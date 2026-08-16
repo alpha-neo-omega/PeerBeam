@@ -677,6 +677,102 @@ impl ChatStore {
         }
         Ok(changed)
     }
+
+    /// Forget this device's copy of the conversation with `peer`, **keeping
+    /// every record that still backs a queued outbound message**. Returns how
+    /// many records were removed.
+    ///
+    /// Local only: nothing goes on the wire, and the peer keeps its own copy.
+    /// This is "forget this thread here", never "unsend".
+    ///
+    /// # Why this is not [`AppStore::clear`]
+    ///
+    /// Clearing the namespace would destroy the queue, and would do it *later*,
+    /// silently, somewhere else. A queued outbound file is delivered by the
+    /// FFI's drain, which re-opens the record the entry is named after
+    /// ([`reopen_for_retry`](Self::reopen_for_retry)); a **missing** record is
+    /// read there — correctly — as "nothing will ever settle this", so the
+    /// entry is released and its staged blob deleted (`row_may_still_deliver`
+    /// and `drop_queued_file` in `peerbeam_ffi::transfer`). Since staging holds
+    /// the only copy the queue owns, and the user's own file may well be gone
+    /// by then, the bytes would not come back.
+    ///
+    /// So the records backing queued entries stay, and staged blobs are never
+    /// touched here at all. What the user gets is the honest outcome in both
+    /// directions: nothing still to be sent is lost, and the thread does not
+    /// mysteriously return days later — whatever survives is queued *right
+    /// now*, and is visible immediately.
+    ///
+    /// # An unreadable outbox refuses, rather than under-report
+    ///
+    /// The keep set is read strictly, hard-failing on any entry that will not
+    /// decode — the same asymmetry, and for the same reason, as
+    /// [`outbox_owned_blobs`](Self::outbox_owned_blobs), whose doc has the long
+    /// form. Every *other* outbox reader exists to deliver, where skipping one
+    /// unreadable row saves every row queued behind it. This one decides what
+    /// to **delete**: a keep set that is merely incomplete does not cost a row,
+    /// it takes the record out from under a queue entry and hands the next
+    /// drain tick the "nothing will ever settle this" verdict above. The sharp
+    /// case is a wholly-unreadable outbox, which the lenient readers report as
+    /// `Ok(vec![])` — indistinguishable from a queue that is genuinely empty,
+    /// and enough to strand every queued file on the device. Refusing costs the
+    /// user a delete they can retry; guessing costs them a file.
+    ///
+    /// [`AppStore::clear`]: peerbeam_domain::port::AppStore::clear
+    pub fn delete_conversation(&self, peer: &DeviceId) -> Result<usize, ChatError> {
+        let keep = self.queued_message_ids(peer)?;
+        let ns = namespace(peer);
+        let rows = self
+            .store
+            .list(&ns)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        let mut removed = 0;
+        for (key, _) in rows {
+            if keep.contains(&key) {
+                continue;
+            }
+            // Deliberately keyed off the STORED KEY, not off a decoded record:
+            // a row this build cannot read is still the user's to delete, and
+            // `history` would silently skip it — leaving a thread that
+            // reappears at the next namespace scan with nothing in it the user
+            // can see or remove.
+            if self
+                .store
+                .delete(&ns, &key)
+                .map_err(|e| ChatError::Serialization(e.to_string()))?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Message ids queued for `peer` — or an error when that set cannot be
+    /// established **completely**. See
+    /// [`delete_conversation`](Self::delete_conversation), the only caller, for
+    /// why an incomplete answer is not usable here.
+    fn queued_message_ids(&self, peer: &DeviceId) -> Result<HashSet<String>, ChatError> {
+        let raw = self
+            .store
+            .list(OUTBOX_NS)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        let mut ids = HashSet::new();
+        for (key, value) in raw {
+            let entry = OutboxEntry::decode(&value).map_err(|e| {
+                ChatError::Serialization(format!(
+                    "outbox entry {key} is unreadable, so the records still backing \
+                     queued messages cannot be established: {e}"
+                ))
+            })?;
+            // An unreadable entry is refused above whoever it belongs to: its
+            // peer is exactly what could not be read, so "it is probably not
+            // this conversation's" is not something this can know.
+            if entry.peer_id == peer.0 {
+                ids.insert(entry.message_id);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 #[cfg(test)]
@@ -2036,6 +2132,223 @@ mod tests {
             staging.sweep(&naive),
             2,
             "the lenient reader would have destroyed both queued files"
+        );
+    }
+
+    // ── delete_conversation — "delete the history, keep the queue" ──────────
+
+    /// THE TRAP this method exists to avoid, at store level: the record backing
+    /// a still-queued file **must survive**, because the drain reads a missing
+    /// record as "nothing will ever settle this" and throws the file away.
+    ///
+    /// Everything else in the thread goes — settled text, a delivered file, the
+    /// peer's own messages — and the staged blob is not touched, since the
+    /// queue still owns it.
+    #[test]
+    fn delete_conversation_keeps_the_records_backing_queued_messages_and_removes_the_rest() {
+        let (cs, _store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        // Settled history: our text, their text, a delivered file.
+        let mine = ChatMessage::new("mine, delivered").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &mine)).unwrap();
+        let theirs = ChatMessage::new("theirs").unwrap();
+        cs.append(&ChatRecord::received(&peer, &theirs)).unwrap();
+        let done = FileRef::new("delivered.pdf", 10).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &done,
+            FileMeta::new(&done.name, 10, None),
+            Status::Sent,
+        ))
+        .unwrap();
+
+        // One file still queued for this (offline) peer, its bytes staged.
+        let queued = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &queued.id);
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &queued,
+            FileMeta::new(&queued.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        cs.enqueue_file(
+            &peer,
+            &queued,
+            &StagedFile {
+                name: "waiting.mkv".into(),
+                size: 30,
+                staged_path: blob.clone(),
+            },
+        )
+        .unwrap();
+        // …and one queued TEXT message, which is queued just the same.
+        let pending_text = ChatMessage::new("not sent yet").unwrap();
+        cs.enqueue(&peer, &pending_text).unwrap();
+
+        // Another peer's thread must be untouched by any of this.
+        let other = DeviceId::from("pb-carol");
+        let elsewhere = ChatMessage::new("different thread").unwrap();
+        cs.append(&ChatRecord::sent(&other, &elsewhere)).unwrap();
+
+        assert_eq!(cs.history(&peer).unwrap().len(), 5);
+        let removed = cs.delete_conversation(&peer).unwrap();
+        assert_eq!(removed, 3, "the three settled records, and only those");
+
+        let left = cs.history(&peer).unwrap();
+        let ids: Vec<&str> = left.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "exactly the two records still backing queued entries: {ids:?}"
+        );
+        assert!(
+            ids.contains(&queued.id.as_str()),
+            "the queued file's record"
+        );
+        assert!(
+            ids.contains(&pending_text.id.as_str()),
+            "the queued text's record"
+        );
+
+        // The queue itself is untouched — entries and bytes both.
+        let still_queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(still_queued.len(), 2, "no entry is dequeued by a delete");
+        assert!(
+            std::path::Path::new(&blob).exists(),
+            "a queued file's only copy must survive deleting its conversation"
+        );
+        assert_eq!(
+            cs.outbox_owned_blobs().unwrap().len(),
+            1,
+            "and the queue still owns it, so no sweep will collect it either"
+        );
+
+        // Blast radius is one conversation.
+        assert_eq!(cs.history(&other).unwrap().len(), 1);
+    }
+
+    /// With nothing queued there is nothing to protect, so the thread goes
+    /// completely — and `conversations` stops listing it, which is what makes
+    /// the row disappear from the UI instead of returning empty.
+    #[test]
+    fn delete_conversation_with_nothing_queued_removes_every_record() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        for n in 0..4 {
+            let m = ChatMessage::new(&format!("message {n}")).unwrap();
+            cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+        }
+        let theirs = FileRef::new("theirs.bin", 5).unwrap();
+        let mut received = ChatRecord::file_in(&peer, &theirs);
+        received.status = Status::Received;
+        cs.append(&received).unwrap();
+
+        assert_eq!(cs.delete_conversation(&peer).unwrap(), 5);
+        assert!(cs.history(&peer).unwrap().is_empty());
+        assert!(
+            !cs.conversations().unwrap().contains(&peer),
+            "an emptied thread is not a thread: the row must not come back"
+        );
+
+        // Deleting again removes nothing and says so, rather than erroring at a
+        // surface that legitimately raced itself.
+        assert_eq!(cs.delete_conversation(&peer).unwrap(), 0);
+    }
+
+    /// A record this build cannot decode is still the user's to delete.
+    /// `history` skips such a row, so keying the delete off decoded records
+    /// would leave it behind — and one invisible leftover is enough for
+    /// `conversations` to keep listing a thread the user just deleted, with
+    /// nothing in it they can see or remove.
+    #[test]
+    fn delete_conversation_removes_a_row_this_build_cannot_read() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("readable").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+        store
+            .put(
+                &namespace(&peer),
+                "0000000000009",
+                b"{\"from\":\"the-future\"}",
+            )
+            .unwrap();
+
+        assert_eq!(
+            cs.history(&peer).unwrap().len(),
+            1,
+            "the bad row is skipped"
+        );
+        assert_eq!(
+            cs.delete_conversation(&peer).unwrap(),
+            2,
+            "both are removed"
+        );
+        assert!(
+            !cs.conversations().unwrap().contains(&peer),
+            "nothing is left behind to keep the thread alive"
+        );
+    }
+
+    /// THE OTHER TRAP: the keep set must be **complete**. The lenient outbox
+    /// readers skip an entry they cannot decode, so a wholly-unreadable outbox
+    /// reads back as "nothing is queued" — and a delete driven by that would
+    /// remove the record under a queued file, which is precisely the state the
+    /// drain reads as "nothing will ever settle this" before deleting the
+    /// staged bytes.
+    ///
+    /// So this refuses, and the last block proves the assertion is not vacuous:
+    /// the lenient keep set really does authorise removing that record.
+    #[test]
+    fn delete_conversation_refuses_when_the_outbox_cannot_be_read_completely() {
+        let (cs, store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        let queued = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &queued.id);
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &queued,
+            FileMeta::new(&queued.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        cs.enqueue_file(
+            &peer,
+            &queued,
+            &StagedFile {
+                name: "waiting.mkv".into(),
+                size: 30,
+                staged_path: blob,
+            },
+        )
+        .unwrap();
+
+        // Every outbox row becomes undecodable — a newer schema, as seen by an
+        // older binary, applied to the whole namespace.
+        for (key, _) in store.list(OUTBOX_NS).unwrap() {
+            store
+                .put(OUTBOX_NS, &key, b"{\"from\":\"the-future\"}")
+                .unwrap();
+        }
+
+        let err = cs
+            .delete_conversation(&peer)
+            .expect_err("an incomplete keep set must not authorise a delete");
+        assert!(matches!(err, ChatError::Serialization(_)), "{err:?}");
+        assert_eq!(
+            cs.history(&peer).unwrap().len(),
+            1,
+            "and the record backing the queued file is still there"
+        );
+
+        // Not vacuous: the lenient reader — the one every delivery path uses —
+        // reports an empty queue here, which would have let the record go.
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "the lenient reader cannot tell this from an empty queue"
         );
     }
 }

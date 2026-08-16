@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import '../features/chats/chats_screen.dart';
 import '../features/history/history_screen.dart';
 import '../features/home/home_screen.dart';
 import '../features/settings/settings_screen.dart';
@@ -29,6 +30,14 @@ GoRouter buildRouter() {
               GoRoute(
                 path: '/home',
                 pageBuilder: (c, s) => _fade(const HomeScreen()),
+              ),
+            ],
+          ),
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/chats',
+                pageBuilder: (c, s) => _fade(const ChatsScreen()),
               ),
             ],
           ),

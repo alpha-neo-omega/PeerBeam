@@ -27,23 +27,82 @@ void main() {
     expect(find.byType(StatusDot), findsOneWidget);
   });
 
-  testWidgets('Ctrl+3 keyboard shortcut switches to the History tab', (
+  // The shortcuts are Ctrl/⌘ + N **by position**, so they follow the nav order
+  // rather than naming screens. Inserting Chats at position 2 therefore moved
+  // Transfers to Ctrl+3, History to Ctrl+4 and Settings to Ctrl+5 — a real
+  // behaviour change, asserted here as the whole mapping rather than one digit
+  // so the next insertion cannot quietly renumber half of it.
+  testWidgets('Ctrl+N switches destinations by position, Chats at 2', (
     tester,
   ) async {
     await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    // Start on Home — no History AppBar yet.
-    expect(find.widgetWithText(AppBar, 'History'), findsNothing);
+    Future<void> press(LogicalKeyboardKey digit) async {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(digit);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+    }
 
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.digit3);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    // Start on Home — none of the other destinations' AppBars are up yet.
+    for (final title in ['Chats', 'Transfers', 'History', 'Settings']) {
+      expect(find.widgetWithText(AppBar, title), findsNothing);
+    }
+
+    final order = <LogicalKeyboardKey, String>{
+      LogicalKeyboardKey.digit2: 'Chats',
+      LogicalKeyboardKey.digit3: 'Transfers',
+      LogicalKeyboardKey.digit4: 'History',
+      LogicalKeyboardKey.digit5: 'Settings',
+    };
+    for (final entry in order.entries) {
+      await press(entry.key);
+      expect(
+        find.widgetWithText(AppBar, entry.value),
+        findsOneWidget,
+        reason: '${entry.key.keyLabel} must open ${entry.value}',
+      );
+    }
+
+    // And Ctrl+1 comes back to Home, which has no AppBar title of its own.
+    await press(LogicalKeyboardKey.digit1);
+    expect(find.widgetWithText(AppBar, 'Settings'), findsNothing);
+  });
+
+  // The shortcuts above go through `goBranch(i)`, which indexes the ROUTER's
+  // branches — so they keep working even if the nav destinations are reordered
+  // without the routes. That desync is its own bug, and a nasty one: the item
+  // labelled "Chats" would open Settings. So this asserts the other half —
+  // that a destination opens the screen its own label names.
+  testWidgets('every nav destination opens the screen its label names', (
+    tester,
+  ) async {
+    // Wide enough for the rail, which renders every destination label as text.
+    tester.view.physicalSize = const Size(1400, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    // History screen is now shown (its AppBar carries the title).
-    expect(find.widgetWithText(AppBar, 'History'), findsOneWidget);
+    for (final title in ['Chats', 'Transfers', 'History', 'Settings']) {
+      await tester.tap(
+        find.descendant(
+          of: find.byType(NavigationRail),
+          matching: find.text(title),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        find.widgetWithText(AppBar, title),
+        findsOneWidget,
+        reason: 'the "$title" destination must open the $title screen',
+      );
+    }
   });
 }

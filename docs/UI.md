@@ -19,7 +19,7 @@ lib/
     stores.dart             per-domain ChangeNotifiers + sample data
     app_scope.dart          InheritedWidget exposing AppState
   widgets/                  StatusDot, DeviceTile, QuickAction, EmptyState, Appear, …
-  features/{home,transfers,history,settings}/
+  features/{home,chats,transfers,history,settings}/
 ```
 
 ## How the audit findings were addressed
@@ -70,8 +70,13 @@ A dedicated pass over the whole app (no new features — experience only):
   entrance stagger (`Appear`) resolves instantly, the empty-state icon skips its
   scale-in, and transfer progress jumps rather than tweening. Screen-reader
   labels/semantics were already in place (device tiles, quick actions, status).
-- **Keyboard shortcuts.** Desktop navigation with **Ctrl/⌘ + 1–4** to jump to
-  Home / Transfers / History / Settings (`CallbackShortcuts` at the shell).
+- **Keyboard shortcuts.** Desktop navigation with **Ctrl/⌘ + 1–5** to jump to
+  Home / Chats / Transfers / History / Settings (`CallbackShortcuts` at the
+  shell). The digits are **positional** — they index the nav order, not named
+  screens — so inserting Chats at position 2 moved Transfers to Ctrl+3, History
+  to Ctrl+4 and Settings to Ctrl+5. `test/ux_test.dart` pins the whole mapping,
+  and separately pins that each destination opens the screen its own label
+  names (the nav order and the router's branch order must not drift apart).
 - **Destructive-action confirmation.** "Clear history" now asks for confirmation
   ("cannot be undone") before wiping records.
 - **Copy.** User-facing placeholder text is friendly ("… is coming soon")

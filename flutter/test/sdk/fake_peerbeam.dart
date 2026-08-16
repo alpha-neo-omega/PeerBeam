@@ -214,6 +214,38 @@ class FakePeerBeam implements PeerBeamApi {
     return changed;
   }
 
+  /// Message ids the engine still has **queued** for delivery, across all
+  /// peers — the fake's stand-in for the outbox. `chatDelete` keeps exactly the
+  /// records these name, mirroring `ChatStore::delete_conversation`: a record
+  /// taken out from under a queue entry is one the real drain reads as "nothing
+  /// will ever settle this" before throwing the file away.
+  final Set<String> queuedMessageIds = {};
+
+  /// When true, [chatDelete] throws instead of deleting — the engine refuses a
+  /// delete it cannot make safely (an outbox it cannot read completely, so the
+  /// set of records backing queued messages is unknown), and a surface must not
+  /// present that as a thread that went away.
+  bool failChatDelete = false;
+
+  @override
+  Future<({int removed, int kept})> chatDelete(String peerId) async {
+    calls.add('chatDelete:$peerId');
+    if (failChatDelete) throw InternalException('outbox unreadable');
+    final rows = chatHistories[peerId];
+    if (rows == null) return (removed: 0, kept: 0);
+    final keep = rows.where((m) => queuedMessageIds.contains(m.id)).toList();
+    final removed = rows.length - keep.length;
+    // An emptied thread stops existing, exactly as the engine derives its
+    // conversation list from the namespaces that still hold records — so the
+    // row disappears rather than coming back empty.
+    if (keep.isEmpty) {
+      chatHistories.remove(peerId);
+    } else {
+      chatHistories[peerId] = keep;
+    }
+    return (removed: removed, kept: keep.length);
+  }
+
   @override
   Future<bool> chatCancel(String peerId, String messageId) async {
     calls.add('chatCancel:$peerId/$messageId');
@@ -232,7 +264,9 @@ class FakePeerBeam implements PeerBeamApi {
       return false;
     }
     // And, like the engine, settle the row `failed` with the reason and say so
-    // on the event stream rather than only in the store.
+    // on the event stream rather than only in the store — and let go of the
+    // queue entry, which is what makes the row removable by a later delete.
+    queuedMessageIds.remove(messageId);
     rows[i] = row.copyWith(status: ChatStatusValue.failed);
     emit(
       ChatStatus(
