@@ -40,7 +40,15 @@ char*    pb_devices_json(void);                // {"devices":[…]}
 `pb_abi_version` is bumped on any breaking change to a signature or the
 envelope/DTO shape. Error codes: `not_initialised`, `invalid_argument`,
 `connection`, `integrity`, `cancelled`, `storage`, `transfer`, `encryption`,
-`unimplemented`, `internal`.
+`unimplemented`, `queue_unreadable`, `internal`.
+
+`queue_unreadable` is narrower than the rest: `pb_chat_delete` returns it when
+the shared outbox holds an entry it cannot decode, so the delete is refused
+rather than risking a queued file's only staged copy (see
+`ChatStore::delete_conversation`). Unlike every other code, retrying the exact
+same call will not clear it on its own — the offending entry may not even
+belong to the conversation being deleted, since the outbox is shared across
+every peer. Any other failure of the same call still reports `internal`.
 
 ### Transfer (M2, additive — ABI still v1)
 

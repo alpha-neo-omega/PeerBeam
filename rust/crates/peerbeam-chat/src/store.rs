@@ -824,7 +824,7 @@ impl ChatStore {
         let mut ids = HashSet::new();
         for (key, value) in raw {
             let entry = OutboxEntry::decode(&value).map_err(|e| {
-                ChatError::Serialization(format!(
+                ChatError::QueueUnreadable(format!(
                     "outbox entry {key} is unreadable, so the records still backing \
                      queued messages cannot be established: {e}"
                 ))
@@ -2587,7 +2587,7 @@ mod tests {
         let err = cs
             .delete_conversation(&peer)
             .expect_err("an incomplete keep set must not authorise a delete");
-        assert!(matches!(err, ChatError::Serialization(_)), "{err:?}");
+        assert!(matches!(err, ChatError::QueueUnreadable(_)), "{err:?}");
         assert_eq!(
             cs.history(&peer).unwrap().len(),
             1,

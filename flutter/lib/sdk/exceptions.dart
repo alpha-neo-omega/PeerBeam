@@ -16,6 +16,7 @@ sealed class PeerBeamException implements Exception {
       'transfer' => TransferException(message),
       'encryption' => EncryptionException(message),
       'unimplemented' => UnimplementedException(message),
+      'queue_unreadable' => QueueUnreadableException(message),
       _ => InternalException(message),
     };
   }
@@ -58,6 +59,15 @@ class EncryptionException extends PeerBeamException {
 
 class UnimplementedException extends PeerBeamException {
   const UnimplementedException(super.message);
+}
+
+/// A destructive chat operation (currently only deleting a conversation)
+/// refused because the shared send queue holds an entry the engine could not
+/// read, and it could not rule out that entry backing something still waiting
+/// to go out. Unlike every other exception here, retrying the same call will
+/// not clear this on its own — see `friendlyError` for the user-facing text.
+class QueueUnreadableException extends PeerBeamException {
+  const QueueUnreadableException(super.message);
 }
 
 class InternalException extends PeerBeamException {

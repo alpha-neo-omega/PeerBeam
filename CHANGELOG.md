@@ -48,6 +48,15 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 - **The delete report counts every row it kept**, including one written by a
   newer version this build cannot read — previously reported as nothing kept
   while the thread stayed listed.
+- **A conversation that refuses to delete now says why.** The shared send
+  queue is checked as a whole before any delete proceeds, and if even one
+  entry in it — belonging to any peer, not necessarily the conversation being
+  deleted — cannot be read, the delete is refused rather than risk destroying
+  the record behind someone's still-queued file. That refusal used to surface
+  as "Something went wrong. Please try again," advice that could never be
+  followed to a fix, since retrying never touches the unreadable entry. It now
+  carries its own error and its own message, explaining that something still
+  queued to send can't be read right now, so deleting is on hold.
 
 ## [0.3.0] - 2026-08-08 — Beta
 

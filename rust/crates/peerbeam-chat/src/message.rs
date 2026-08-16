@@ -40,6 +40,21 @@ pub enum ChatError {
     BadName(String),
     #[error("bad file id: {0}")]
     BadId(String),
+    /// An outbox entry exists but could not be decoded — most likely written
+    /// by a newer schema. Deliberately distinct from
+    /// [`Serialization`](Self::Serialization): that variant means the *store*
+    /// failed (I/O, or a validation error at the storage layer); this one
+    /// means the store answered fine and handed back bytes this build simply
+    /// cannot parse. `ChatStore::queued_message_ids` (reached only through
+    /// `ChatStore::delete_conversation`) raises this when it cannot account
+    /// for every queued message and must refuse rather than guess.
+    ///
+    /// The distinction matters one layer up: a caller across the FFI boundary
+    /// needs to tell "retrying changes nothing until the queue clears" apart
+    /// from an ordinary store failure — which is why this is its own variant
+    /// rather than a string that caller would have to sniff.
+    #[error("a queued outbox entry could not be decoded: {0}")]
+    QueueUnreadable(String),
 }
 
 impl From<ChatError> for SessionError {

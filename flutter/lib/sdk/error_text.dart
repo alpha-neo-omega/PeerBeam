@@ -29,5 +29,8 @@ String _forException(PeerBeamException e) => switch (e) {
   PeerBeamUnavailable() => 'The transfer engine is unavailable in this build.',
   InvalidArgumentException() => "That action can't be completed.",
   UnimplementedException() => "That feature isn't available yet.",
+  QueueUnreadableException() =>
+    "Something still queued to send can't be read right now, so deleting "
+        "is on hold — that could discard it before it goes out.",
   InternalException() => 'Something went wrong. Please try again.',
 };

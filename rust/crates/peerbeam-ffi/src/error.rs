@@ -34,6 +34,14 @@ pub enum Code {
     Encryption,
     /// The feature is not implemented yet.
     Unimplemented,
+    /// A destructive chat operation refused because the shared send queue
+    /// holds an entry this build cannot decode, and guessing which records it
+    /// backs risks discarding something still waiting to be delivered (see
+    /// `ChatStore::delete_conversation`). Unlike every other code here,
+    /// retrying the exact same call will not clear this on its own — the
+    /// offending entry is not necessarily even owned by the conversation the
+    /// caller asked about, since the queue is shared across every peer.
+    QueueUnreadable,
     /// A Rust panic was caught at the boundary (never propagated as UB).
     Internal,
 }
@@ -50,6 +58,7 @@ impl Code {
             Code::Transfer => "transfer",
             Code::Encryption => "encryption",
             Code::Unimplemented => "unimplemented",
+            Code::QueueUnreadable => "queue_unreadable",
             Code::Internal => "internal",
         }
     }

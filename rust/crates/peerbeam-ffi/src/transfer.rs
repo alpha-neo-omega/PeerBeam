@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use peerbeam_chat::{
-    ChatStore, Direction as ChatDirection, FileRef, PendingFile, StagingLimits, StagingStore,
-    Status as ChatStatus,
+    ChatError, ChatStore, Direction as ChatDirection, FileRef, PendingFile, StagingLimits,
+    StagingStore, Status as ChatStatus,
 };
 // Only referenced by the guard test's assertions below; the guard's own
 // kind check now lives solely in `ChatRecord::is_settleable_file_row`.
@@ -2450,6 +2450,17 @@ impl Manager {
     /// thread that kept a queued record is still listed — correctly, and
     /// immediately, rather than reappearing later out of nowhere.
     ///
+    /// **A refusal carries its own code.** When [`ChatStore::delete_conversation`]
+    /// refuses because the shared outbox holds an entry it cannot decode, that
+    /// reaches the caller as [`Code::QueueUnreadable`], never
+    /// [`Code::Internal`] — the two are told apart on the
+    /// [`ChatError`] variant, not by matching the message text. The
+    /// distinction is not cosmetic: a plain store failure may well clear on
+    /// its own retry, but this one won't — the offending entry might not even
+    /// belong to the conversation being deleted, since the outbox is shared
+    /// across every peer. Any other failure (a real store I/O error) still
+    /// reports `Internal`, unchanged.
+    ///
     /// [`ChatStore::delete_conversation`]: peerbeam_chat::ChatStore::delete_conversation
     pub fn chat_delete(&self, req: &Value) -> Op {
         // Held to exactly the rule `chat_cancel` uses — the increment's other
@@ -2465,10 +2476,16 @@ impl Manager {
             .ok_or((Code::InvalidArgument, "peer_id required".into()))?
             .to_string();
         let peer = DeviceId::from(peer_id);
-        let removed = self
-            .chat
-            .delete_conversation(&peer)
-            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let removed = self.chat.delete_conversation(&peer).map_err(|e| {
+            // `QueueUnreadable` is the one refusal a retry cannot clear by
+            // itself, so it earns its own code; everything else (a genuine
+            // store failure) keeps reporting `Internal`, exactly as before.
+            let code = match &e {
+                ChatError::QueueUnreadable(_) => Code::QueueUnreadable,
+                _ => Code::Internal,
+            };
+            (code, e.to_string())
+        })?;
         // Counted from what is actually on disk *after* the delete — every row
         // still present is one the delete chose to keep — rather than from the
         // rule that chose them. A number the user is shown ("1 queued file will
@@ -6515,5 +6532,84 @@ mod tests {
             1,
             "and nothing was deleted on the way to refusing"
         );
+    }
+
+    /// **The refusal for an unreadable outbox entry carries its own code.**
+    ///
+    /// `delete_conversation` refuses whenever the shared outbox holds an
+    /// entry it cannot decode (see its doc for why guessing here is worse
+    /// than refusing). Before this, that refusal reached the caller as bare
+    /// `Internal` — indistinguishable from any other unexpected failure —
+    /// which left the only user-visible message "Something went wrong.
+    /// Please try again", advice that can never be followed to a fix, since
+    /// retrying never touches the offending entry.
+    ///
+    /// The corrupted entry deliberately belongs to a DIFFERENT peer than the
+    /// one being deleted: the outbox is shared across every conversation, so
+    /// this is the actual failure mode — one unrelated peer's unreadable
+    /// entry blocks every other conversation's delete, not just its own.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_reports_queue_unreadable_for_an_undecodable_outbox_entry() {
+        let (mgr, chat, raw, dir) = test_manager_parts("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let m = peerbeam_chat::ChatMessage::new("settled").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+        seed_queued_file(
+            &chat,
+            &dir.path().join("outbox-blobs"),
+            &peer,
+            "waiting.mkv",
+        );
+
+        // An entirely unrelated peer's outbox entry, corrupted — the shape a
+        // newer schema takes to this build.
+        let other = peerbeam_chat::FileRef::new("unrelated.bin", 4).expect("file ref");
+        raw.put(
+            peerbeam_chat::OUTBOX_NS,
+            &other.id,
+            b"{\"from\":\"the-future\"}",
+        )
+        .expect("corrupt an unrelated peer's outbox entry");
+
+        let err = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect_err("an unreadable outbox entry anywhere must refuse the delete");
+        assert_eq!(err.0.as_str(), Code::QueueUnreadable.as_str());
+
+        // Nothing was deleted on the way to refusing.
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            2,
+            "the settled text and the queued file's row are both untouched"
+        );
+    }
+
+    /// **A genuine store failure still reports `Internal`.** The previous
+    /// test proves the new code fires for an unreadable outbox entry; this
+    /// one proves it does NOT fire for just any failure — a real store error
+    /// must still surface as `Internal`, so the two are told apart by the
+    /// actual `ChatError` variant `delete_conversation` returns, never by the
+    /// shape of whatever went wrong.
+    ///
+    /// `FsAppStore` validates a namespace's characters before ever touching
+    /// disk, so a `peer_id` that cannot form a valid namespace (`/` is not in
+    /// `[A-Za-z0-9._-]`) deterministically fails the conversation-namespace
+    /// list call inside `delete_conversation` — a different failure than an
+    /// unreadable outbox entry, and one no amount of outbox decoding could
+    /// have avoided. Nothing needs to be queued for this: the failure happens
+    /// on the conversation's OWN namespace, after the (empty, and therefore
+    /// trivially readable) outbox keep set has already been established.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_still_reports_internal_for_a_genuine_store_failure() {
+        let (mgr, _chat, _dir) = test_manager_full("deleter", 0);
+
+        let err = mgr
+            .chat_delete(&json!({ "peer_id": "pb/bob" }))
+            .expect_err("an invalid conversation namespace must fail the delete");
+        assert_eq!(err.0.as_str(), Code::Internal.as_str());
     }
 }
