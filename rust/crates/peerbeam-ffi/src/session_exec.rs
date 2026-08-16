@@ -15,7 +15,8 @@ use peerbeam_domain::entity::{Device, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
-    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEREF,
+    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
+    CHAT_FEAT_FILEREF,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_transfer::{
@@ -57,21 +58,38 @@ pub struct ChatWiring {
 /// or accept call site that passes `None` would silently drop any CHAT frame
 /// pushed to it instead of erroring (see `ChatWiring`'s doc comment).
 ///
-/// CHAT additionally advertises [`CHAT_FEAT_FILEREF`]: this build understands
-/// the `FileRef` message and can correlate it with a transfer. Advertising a
-/// feature bit is not a wire change — `Capability.features` is already on the
-/// wire and `CapabilitySet::intersect` ANDs it — so a peer from before the
-/// feature simply advertises `0`, the intersection clears the bit, and
-/// [`Session::supports_file_ref`] reports false for it.
+/// CHAT additionally advertises [`CHAT_FEAT_FILEREF`] (this build understands
+/// the `FileRef` message and can correlate it with a transfer) and
+/// [`CHAT_FEAT_FILEDECLINE`] (this build both sends a `FileDecline` when its
+/// user turns a file down and settles its own outgoing row on receiving one),
+/// mirroring the CLI's `session_transfer::session_cfg` — both frontends must
+/// advertise the same set or a peer's behaviour would depend on which of ours
+/// it happens to be talking to. Advertising a feature bit is not a wire
+/// change — `Capability.features` is already on the wire and
+/// `CapabilitySet::intersect` ANDs it — so a peer from before either feature
+/// simply advertises `0`, the intersection clears the bit, and
+/// [`Session::supports_file_ref`] / [`Session::supports_file_decline`] report
+/// false for it.
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
-    let caps = CapabilitySet::new()
-        .with(Capability::new(TRANSFER))
-        .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF));
-    let mut cfg = SessionConfig::new(caps).with_stream_channel_type(TRANSFER);
+    let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
     if let Some(h) = chat_handler {
         cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
     }
     cfg
+}
+
+/// Exactly what this build puts on the wire, split out of [`session_cfg`] so a
+/// test can read it without standing up a session. Keeping it as the single
+/// definition — rather than restating it in the test module — is what makes an
+/// "is the bit advertised?" assertion mean anything: a copy would keep passing
+/// while `session_cfg` quietly stopped advertising.
+fn advertised_caps() -> CapabilitySet {
+    CapabilitySet::new()
+        .with(Capability::new(TRANSFER))
+        .with(Capability::with_features(
+            CHAT,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
+        ))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -83,6 +101,14 @@ fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
 fn caps_support_file_ref(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_FILEREF != 0)
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// chat `FileDecline` feature. Same shape and same reason as
+/// [`caps_support_file_ref`].
+fn caps_support_file_decline(caps: &CapabilitySet) -> bool {
+    caps.features(CHAT)
+        .is_some_and(|f| f & CHAT_FEAT_FILEDECLINE != 0)
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
@@ -123,6 +149,21 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
+    }
+
+    /// Whether the peer negotiated the chat `FileDecline` feature — i.e.
+    /// whether telling it "I turned your file down" would mean anything.
+    ///
+    /// Checked by `Manager::handle_incoming` before it sends a decline. A peer
+    /// from before this feature advertises `features: 0`, so this is false and
+    /// we send nothing: an unknown OPTIONAL type would be skipped harmlessly on
+    /// its side, but putting a message on the wire that the negotiation says
+    /// the peer does not speak is exactly the silent drift capability
+    /// negotiation exists to prevent. Such a sender falls back to its own
+    /// bounded retry backstop instead.
+    #[must_use]
+    pub fn supports_file_decline(&self) -> bool {
+        caps_support_file_decline(&self.capabilities)
     }
 
     /// Await the next incoming transfer channel the peer opens (receiver side).
@@ -288,11 +329,51 @@ mod tests {
         CapabilitySet::new().with(Capability::new(CHAT))
     }
 
-    /// What this build advertises (the CHAT half of `session_cfg`).
+    /// What this build advertises — the real thing `session_cfg` puts on the
+    /// wire, not a restatement of it.
     fn our_caps() -> CapabilitySet {
-        CapabilitySet::new()
-            .with(Capability::new(TRANSFER))
-            .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF))
+        advertised_caps()
+    }
+
+    /// Both chat feature bits must be advertised by **this** frontend. The CLI
+    /// has the identical test: 2a shipped with only one of the two surfaces
+    /// advertising `CHAT_FEAT_FILEREF`, so a peer's behaviour depended on which
+    /// of our own frontends it reached. One test per surface is what makes that
+    /// impossible to repeat.
+    #[test]
+    fn both_chat_feature_bits_are_advertised() {
+        let caps = advertised_caps();
+        let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
+        assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
+        assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");
+    }
+
+    /// A 2a-era peer negotiates the decline bit away, so we must never send it
+    /// one — the same ANDing that gates `FileRef`, checked independently
+    /// because the two bits gate two different sends.
+    #[test]
+    fn a_legacy_peer_negotiates_the_decline_bit_away() {
+        let negotiated = our_caps().intersect(&legacy_peer_caps());
+        assert!(!caps_support_file_decline(&negotiated));
+        assert!(caps_support_file_decline(
+            &our_caps().intersect(&our_caps())
+        ));
+    }
+
+    /// The bits are independent: a peer that speaks `FileRef` but not
+    /// `FileDecline` (exactly what a 2a build advertises) must read as
+    /// file-sharing-capable and decline-incapable, not both or neither.
+    #[test]
+    fn the_two_chat_feature_bits_are_read_independently() {
+        let file_ref_only =
+            CapabilitySet::new().with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF));
+        let negotiated = our_caps().intersect(&file_ref_only);
+        assert!(caps_support_file_ref(&negotiated));
+        assert!(!caps_support_file_decline(&negotiated));
+        assert_ne!(
+            CHAT_FEAT_FILEREF, CHAT_FEAT_FILEDECLINE,
+            "two features sharing a bit would make the check meaningless"
+        );
     }
 
     /// The negotiation contract the whole feature rests on: `intersect` ANDs

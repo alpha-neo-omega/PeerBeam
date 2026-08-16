@@ -81,6 +81,19 @@ pub fn negotiate_version(local: Version, peer: Version) -> VersionNegotiation {
 /// bit, and a sender simply never offers it a `FileRef`.
 pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
 
+/// Feature bit on the CHAT capability: this peer sends a `FileDecline`
+/// (chat MessageType 3) when its user turns down an offered file.
+///
+/// Without it a sender cannot tell "you declined" from "the network dropped",
+/// so a refused file would be re-offered forever and re-prompt its receiver
+/// every time. A peer that does not advertise this is handled by the sender's
+/// bounded backstop instead.
+///
+/// Like [`CHAT_FEAT_FILEREF`], advertising it is not a wire change: it rides
+/// the `Capability.features` bitset that is already on the wire, and
+/// [`CapabilitySet::intersect`] ANDs it away against a peer that predates it.
+pub const CHAT_FEAT_FILEDECLINE: u32 = 1 << 1;
+
 /// One advertised capability: a channel type the peer supports, with a bitset of
 /// optional per-capability feature flags (`0` = base capability, no extras).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

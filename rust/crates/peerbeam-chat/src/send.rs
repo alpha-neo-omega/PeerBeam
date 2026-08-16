@@ -6,7 +6,7 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
 use peerbeam_transfer::SessionHandle;
 
-use crate::message::{ChatError, ChatMessage, FileRef};
+use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
 use crate::record::{ChatRecord, FileMeta, Status};
 use crate::store::ChatStore;
 
@@ -179,6 +179,37 @@ pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), Se
     let frame = r.to_frame(channel)?;
     handle
         .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
+}
+
+/// Tell the sender we turned their file down, over the session's CHAT channel.
+///
+/// Takes no store and no peer for the same reason [`send_file_ref`] does: the
+/// caller has already settled its own row locally, and re-deriving the peer
+/// here would risk writing into a second namespace. This is purely the wire
+/// step, and it is best-effort by design — the decline exists to spare the
+/// sender a pointless retry, never to gate the local decision, which is already
+/// final whether or not this frame lands.
+///
+/// Only call this for a peer whose negotiated capabilities carry
+/// `CHAT_FEAT_FILEDECLINE`; sending a message the negotiation says the peer does
+/// not speak is exactly the silent wire drift capability negotiation exists to
+/// prevent.
+pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Result<(), SendError> {
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+    let frame = d.to_frame(channel)?;
+    handle
+        .send_on_channel(
+            channel,
+            FileDecline::message_type(),
+            frame.flags,
+            frame.payload,
+        )
         .await
         .map_err(|e| SendError::Session(e.to_string()))
 }

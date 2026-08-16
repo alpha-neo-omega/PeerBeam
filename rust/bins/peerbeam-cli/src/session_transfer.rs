@@ -33,7 +33,8 @@ use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
-    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEREF,
+    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
+    CHAT_FEAT_FILEREF,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_transfer::{
@@ -57,22 +58,36 @@ const CHAT: ChannelType = ChannelType::CHAT;
 /// A future dial/accept call site that omits it would silently drop any CHAT
 /// frame pushed to it instead of erroring.
 ///
-/// CHAT additionally advertises [`CHAT_FEAT_FILEREF`]: this build understands
-/// the `FileRef` message and can correlate it with a transfer (mirrors the
-/// FFI's `session_exec::session_cfg`). Advertising a feature bit is not a wire
-/// change — `Capability.features` is already on the wire and
-/// `CapabilitySet::intersect` ANDs it — so a peer from before this feature
-/// simply advertises `0`, the intersection clears the bit, and
-/// [`Session::supports_file_ref`] reports false for it.
+/// CHAT additionally advertises [`CHAT_FEAT_FILEREF`] (this build understands
+/// the `FileRef` message and can correlate it with a transfer) and
+/// [`CHAT_FEAT_FILEDECLINE`] (this build's `ChatHandler` settles an outgoing
+/// file row on a peer's `FileDecline`), mirroring the FFI's
+/// `session_exec::session_cfg` — both frontends must advertise the same set or
+/// a peer's behaviour would depend on which of ours it happens to be talking
+/// to. Advertising a feature bit is not a wire change — `Capability.features`
+/// is already on the wire and `CapabilitySet::intersect` ANDs it — so a peer
+/// from before either feature simply advertises `0`, the intersection clears
+/// the bit, and [`Session::supports_file_ref`] reports false for it.
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
-    let caps = CapabilitySet::new()
-        .with(Capability::new(TRANSFER))
-        .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF));
-    let mut cfg = SessionConfig::new(caps).with_stream_channel_type(TRANSFER);
+    let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
     if let Some(h) = chat_handler {
         cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
     }
     cfg
+}
+
+/// Exactly what this build puts on the wire, split out of [`session_cfg`] so a
+/// test can read it without standing up a session. Keeping it as the single
+/// definition — rather than restating it in the test module — is what makes an
+/// "is the bit advertised?" assertion mean anything: a copy would keep passing
+/// while `session_cfg` quietly stopped advertising.
+fn advertised_caps() -> CapabilitySet {
+    CapabilitySet::new()
+        .with(Capability::new(TRANSFER))
+        .with(Capability::with_features(
+            CHAT,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
+        ))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -283,11 +298,23 @@ mod tests {
         CapabilitySet::new().with(Capability::new(CHAT))
     }
 
-    /// What this build advertises (the CHAT half of `session_cfg`).
+    /// What this build advertises — the real thing `session_cfg` puts on the
+    /// wire, not a restatement of it.
     fn our_caps() -> CapabilitySet {
-        CapabilitySet::new()
-            .with(Capability::new(TRANSFER))
-            .with(Capability::with_features(CHAT, CHAT_FEAT_FILEREF))
+        advertised_caps()
+    }
+
+    /// Both chat feature bits must be advertised by **this** frontend. The FFI
+    /// has the identical test: 2a shipped with only one of the two surfaces
+    /// advertising `CHAT_FEAT_FILEREF`, so a peer's behaviour depended on which
+    /// of our own frontends it reached. One test per surface is what makes that
+    /// impossible to repeat.
+    #[test]
+    fn both_chat_feature_bits_are_advertised() {
+        let caps = advertised_caps();
+        let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
+        assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
+        assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");
     }
 
     /// The negotiation contract `chat send --file`'s refusal rests on:

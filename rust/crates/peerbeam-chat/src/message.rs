@@ -18,6 +18,8 @@ pub const MSG_TEXT: u16 = 1;
 pub const MAX_NAME: usize = 255;
 /// MessageType id for a file reference within the Chat channel namespace.
 pub const MSG_FILE_REF: u16 = 2;
+/// MessageType id for a file decline within the Chat channel namespace.
+pub const MSG_FILE_DECLINE: u16 = 3;
 
 /// Errors from encoding/decoding/validating a chat message.
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +184,69 @@ impl FileRef {
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         validate_name(&r.name)?;
         Ok(r)
+    }
+}
+
+/// "I turned down the file you offered." Carries only the id of the [`FileRef`]
+/// being refused — everything else about the file is already in both threads.
+///
+/// It travels as an ordinary chat message on the CHAT channel rather than as a
+/// transfer-protocol frame, and deliberately so: if the sender is offline at
+/// the moment its receiver declines, the decline queues in the decliner's own
+/// outbox and delivers later over machinery that already exists. A
+/// transfer-channel signal would simply be lost with the connection, leaving
+/// the sender unable to tell a refusal from a dropped network — which is the
+/// whole reason a refused file would otherwise be re-offered forever,
+/// re-prompting its receiver every single time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDecline {
+    /// The id of the `FileRef` being refused (also the transfer id).
+    pub id: String,
+    /// RFC3339 timestamp minted by the decliner.
+    pub timestamp: String,
+}
+
+impl FileDecline {
+    /// Refuse the file offered under `id`, minting the timestamp.
+    #[must_use]
+    pub fn new(id: &str) -> FileDecline {
+        FileDecline {
+            id: id.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// The chat MessageType (`FileDecline` = 3).
+    #[must_use]
+    pub fn message_type() -> MessageType {
+        MessageType::new(MSG_FILE_DECLINE)
+    }
+
+    /// Encode as a Chat-channel frame. Sent OPTIONAL so a peer that does not
+    /// implement it skips the message instead of failing the channel
+    /// (MESSAGE_REGISTRY.md §6/§7) — a 2a-era sender must keep its conversation
+    /// even if one of these ever reaches it.
+    pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, ChatError> {
+        let payload = serde_json::to_vec(self)
+            .map(Bytes::from)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(SessionFrame::new(
+            channel,
+            Self::message_type(),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            payload,
+        ))
+    }
+
+    /// Decode from a Chat-channel frame. `id` needs no validation here: it is
+    /// never a path and is never trusted as a key on its own — every write it
+    /// drives goes through `ChatStore::settle_file_row`, which authorizes
+    /// against the stored record rather than the id.
+    pub fn from_frame(frame: &SessionFrame) -> Result<FileDecline, ChatError> {
+        if frame.message_type.get() != MSG_FILE_DECLINE {
+            return Err(ChatError::WrongType(frame.message_type.get()));
+        }
+        serde_json::from_slice(&frame.payload).map_err(|e| ChatError::Serialization(e.to_string()))
     }
 }
 
@@ -394,5 +459,52 @@ mod tests {
             FileRef::from_frame(&text),
             Err(ChatError::WrongType(_))
         ));
+    }
+
+    #[test]
+    fn file_decline_round_trips_and_ships_optional() {
+        let d = FileDecline::new("0000000000001");
+        let frame = d.to_frame(ChannelId::new(7)).unwrap();
+        assert_eq!(frame.message_type.get(), MSG_FILE_DECLINE);
+        // OPTIONAL so a peer that does not know type 3 ignores it and keeps
+        // the channel (MESSAGE_REGISTRY.md section 6) rather than tearing the
+        // conversation down.
+        assert!(frame.flags.is_optional());
+        assert!(frame.flags.contains(MessageFlags::END_OF_MESSAGE));
+        assert_eq!(FileDecline::from_frame(&frame).unwrap(), d);
+    }
+
+    #[test]
+    fn file_decline_rejects_a_frame_of_the_wrong_type() {
+        let r = FileRef::new("a.bin", 1).unwrap();
+        let frame = r.to_frame(ChannelId::new(7)).unwrap();
+        assert!(matches!(
+            FileDecline::from_frame(&frame),
+            Err(ChatError::WrongType(MSG_FILE_REF))
+        ));
+    }
+
+    /// A decline names a file by id and nothing else. Pinning the exact key set
+    /// keeps a future field from quietly joining it — the id is already known to
+    /// both sides, so anything added here would be new information travelling
+    /// out of a refusal, which is the one moment the user chose to share less.
+    #[test]
+    fn file_decline_carries_nothing_but_the_id_and_its_timestamp() {
+        let d = FileDecline::new("0000000000001");
+        let frame = d.to_frame(ChannelId::new(1)).unwrap();
+        let json = String::from_utf8(frame.payload.to_vec()).unwrap();
+        let object: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut keys: Vec<String> = object
+            .as_object()
+            .expect("a FileDecline frame is a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["id".to_string(), "timestamp".to_string()],
+            "the FileDecline wire shape gained or lost a field: {json}"
+        );
     }
 }

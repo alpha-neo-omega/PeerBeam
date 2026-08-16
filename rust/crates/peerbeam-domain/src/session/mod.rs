@@ -23,6 +23,7 @@ pub use frame::{MessageFlags, SessionFrame};
 pub use handler::MessageHandler;
 pub use ids::{ChannelId, ChannelType, MessageType, SessionId};
 pub use negotiation::{
-    negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation, CHAT_FEAT_FILEREF,
+    negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation,
+    CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF,
 };
 pub use state::SessionState;

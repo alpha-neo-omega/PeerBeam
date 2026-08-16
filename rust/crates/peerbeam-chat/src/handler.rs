@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
-use crate::message::{ChatMessage, FileRef, MSG_FILE_REF, MSG_TEXT};
-use crate::record::ChatRecord;
+use crate::message::{ChatMessage, FileDecline, FileRef, MSG_FILE_DECLINE, MSG_FILE_REF, MSG_TEXT};
+use crate::record::{ChatRecord, Direction, Status};
 use crate::store::ChatStore;
 
 /// Called with each newly received (deduped) record so a surface can display it.
@@ -86,6 +86,31 @@ impl MessageHandler for ChatHandler {
                 (self.sink)(rec);
                 Ok(())
             }
+            // MUST stay above the `other =>` fallback: a `FileDecline` ships
+            // OPTIONAL, so an arm placed below it would be swallowed as an
+            // "unknown optional type", return `Ok`, and settle nothing —
+            // silently, with no error anywhere to notice.
+            MSG_FILE_DECLINE => {
+                // The peer turned down a file WE offered. Only our own OUTGOING
+                // file row can be declined, and only while it is still in
+                // flight. `settle_file_row` enforces exactly that — the same
+                // guard every other wire-driven write goes through, so a peer
+                // cannot use a decline to rewrite a text row, an inbound row,
+                // or a row that already settled. A decline naming any of those,
+                // or an id we have never seen, is a silent success: it neither
+                // writes nor fails the channel.
+                //
+                // No dedup and no sink: the write is idempotent (a second
+                // decline finds the row already settled and no-ops), and a
+                // status change on an existing row is not a new record to
+                // surface.
+                let d = FileDecline::from_frame(&frame)?;
+                let _ = self
+                    .store
+                    .settle_file_row(peer, &d.id, Direction::Out, Status::Declined)
+                    .map_err(SessionError::from)?;
+                Ok(())
+            }
             // MESSAGE_REGISTRY.md §6 — unknown type: OPTIONAL means skip and keep
             // the channel; required means fail this channel only. (Increment 0.)
             other => {
@@ -107,13 +132,14 @@ impl MessageHandler for ChatHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Kind, Status};
+    use crate::record::{FileMeta, Kind, Status};
     use bytes::Bytes;
     use peerbeam_appstore_fs::FsAppStore;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
     use peerbeam_domain::port::EncryptionProvider;
     use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType};
     use std::sync::Mutex;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     fn store(seed: u8) -> (ChatStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -121,6 +147,25 @@ mod tests {
         let key = derive_subkey(&[seed; 32], b"peerbeam-appstore-v1");
         let app = Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
         (ChatStore::new(app), dir)
+    }
+
+    /// A handler plus everything a test needs to see what it did: the peer slot
+    /// to bind, the store behind it, a receiver of every record handed to the
+    /// sink, and the tempdir that must outlive both.
+    fn new_handler() -> (
+        Arc<ChatHandler>,
+        Arc<OnceLock<DeviceId>>,
+        ChatStore,
+        UnboundedReceiver<ChatRecord>,
+        tempfile::TempDir,
+    ) {
+        let (cs, dir) = store(10);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: ReceivedSink = Arc::new(move |rec| {
+            let _ = tx.send(rec);
+        });
+        let (handler, peer_slot) = ChatHandler::new(cs.clone(), sink);
+        (handler, peer_slot, cs, rx, dir)
     }
 
     #[tokio::test]
@@ -324,5 +369,168 @@ mod tests {
             bytes::Bytes::from_static(br#"{"id":"x","timestamp":"t","name":"../escape","size":1}"#);
         assert!(handler.handle(frame).await.is_err());
         assert!(cs.history(&peer).unwrap().is_empty());
+    }
+
+    // ── FileDecline ─────────────────────────────────────────────────────────
+    //
+    // A decline is the only thing that makes a refusal terminal for the sender:
+    // without it a queued file is retried keep-forever and re-prompts its
+    // receiver on every drain tick. Every write it drives goes through
+    // `ChatStore::settle_file_row`, so the tests below are as much about what a
+    // decline CANNOT touch as about what it settles.
+
+    #[tokio::test]
+    async fn a_decline_settles_our_own_outgoing_row() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        store
+            .append(&ChatRecord::file_out(
+                &peer,
+                &r,
+                FileMeta::new(&r.name, r.size, Some("/src/report.pdf".into())),
+                Status::Transferring,
+            ))
+            .unwrap();
+
+        let d = FileDecline::new(&r.id);
+        handler
+            .handle(d.to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        let rec = store.get(&peer, &r.id).unwrap().unwrap();
+        assert_eq!(rec.status, Status::Declined);
+    }
+
+    #[tokio::test]
+    async fn a_decline_naming_a_row_that_is_not_ours_to_decline_is_ignored() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        // Our own INCOMING row: the peer declining a file they sent us is
+        // meaningless, and must not rewrite anything.
+        let r = FileRef::new("theirs.pdf", 10).unwrap();
+        store.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        handler
+            .handle(FileDecline::new(&r.id).to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::PendingApproval,
+            "an inbound row is untouched by a decline"
+        );
+    }
+
+    /// A chat message id is a wire field the peer has already seen, and it is
+    /// also what a peer puts in `transfer_id`. So a decline naming one of our
+    /// TEXT rows must change nothing — otherwise a decline is a write primitive
+    /// aimed at any row in the conversation.
+    #[tokio::test]
+    async fn a_decline_naming_a_text_row_is_ignored() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        let msg = ChatMessage::new("our own outgoing text").unwrap();
+        store.append(&ChatRecord::sent(&peer, &msg)).unwrap();
+
+        handler
+            .handle(
+                FileDecline::new(&msg.id)
+                    .to_frame(ChannelId::new(1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let rec = store.get(&peer, &msg.id).unwrap().unwrap();
+        assert_eq!(rec.status, Status::Sent, "a text row is not declinable");
+        assert_eq!(rec.kind, Kind::Text);
+        assert_eq!(rec.body, "our own outgoing text");
+    }
+
+    /// A settled row is final. Without this, a peer that already received a
+    /// file could re-declare it declined and make the conversation assert the
+    /// opposite of what happened.
+    #[tokio::test]
+    async fn a_decline_for_an_already_settled_row_is_ignored() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        let r = FileRef::new("done.pdf", 7).unwrap();
+        store
+            .append(&ChatRecord::file_out(
+                &peer,
+                &r,
+                FileMeta::new(&r.name, r.size, None),
+                Status::Sent,
+            ))
+            .unwrap();
+
+        handler
+            .handle(FileDecline::new(&r.id).to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Sent,
+            "a delivered file cannot be retroactively declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decline_for_an_unknown_id_is_a_silent_no_op() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        handler
+            .handle(
+                FileDecline::new("never-existed")
+                    .to_frame(ChannelId::new(1))
+                    .unwrap(),
+            )
+            .await
+            .expect("an unknown id must not fail the channel");
+        assert!(store.history(&peer).unwrap().is_empty());
+    }
+
+    /// The dispatch arm has to sit BEFORE `handle`'s `other =>` fallback. A
+    /// `FileDecline` ships OPTIONAL, so an arm placed after the fallback would
+    /// be swallowed by it and nothing would ever settle — silently, with the
+    /// call still returning `Ok`. This is what catches that: same frame, same
+    /// `Ok`, but a row that actually moved.
+    #[tokio::test]
+    async fn the_decline_arm_precedes_the_optional_unknown_type_fallback() {
+        let (handler, peer_slot, store, _rx, _tmp) = new_handler();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let _ = peer_slot.set(peer.clone());
+        let r = FileRef::new("ordered.pdf", 3).unwrap();
+        store
+            .append(&ChatRecord::file_out(
+                &peer,
+                &r,
+                FileMeta::new(&r.name, r.size, None),
+                Status::Transferring,
+            ))
+            .unwrap();
+
+        let frame = FileDecline::new(&r.id).to_frame(ChannelId::new(1)).unwrap();
+        assert!(
+            frame.flags.is_optional(),
+            "the fallback only swallows OPTIONAL frames — if this stops being \
+             optional the test no longer proves ordering"
+        );
+        handler.handle(frame).await.unwrap();
+
+        assert_eq!(
+            store.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Declined,
+            "the decline was swallowed by the unknown-type fallback"
+        );
     }
 }

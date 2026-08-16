@@ -1996,6 +1996,40 @@ impl Manager {
                 // no chat row and settles nothing.
                 self.chat_settle(&active, ChatStatus::Declined, None);
             }
+            // Tell the sender, so the refusal is terminal for them too. Without
+            // this the sender cannot tell "you declined" from "the network
+            // dropped", and a queued file — retried keep-forever like text —
+            // would be re-offered every drain tick, re-prompting this user
+            // every single time.
+            //
+            // Two gates, both deliberate:
+            //  * `supports_file_decline` — a peer that predates the feature
+            //    negotiated the bit away and must never be sent one (a message
+            //    the negotiation says the peer does not speak is silent wire
+            //    drift; it falls back to its own bounded backstop instead);
+            //  * `contains` — only a transfer that really has a row in this
+            //    conversation is a chat file share. The overwhelming majority
+            //    of declines are ordinary transfers, which must put nothing
+            //    extra on the wire. This is deliberately *not* the settleable-
+            //    row guard: `chat_settle` above just moved the row to
+            //    `Declined`, so that guard now reads false by design. The
+            //    authorization that matters runs on the RECEIVING side, where
+            //    `settle_file_row` re-checks kind/direction/in-flight against
+            //    the sender's own stored record.
+            //
+            // Best-effort: our row is already `Declined` locally either way, so
+            // a send failure changes nothing here.
+            if session.supports_file_decline()
+                && self
+                    .chat
+                    .contains(&session.peer_device, &id)
+                    .unwrap_or(false)
+            {
+                let d = peerbeam_chat::FileDecline::new(&id);
+                if let Err(e) = peerbeam_chat::send_file_decline(&session.handle, &d).await {
+                    tracing::debug!(error = %e, transfer_id = %id, "file decline not delivered");
+                }
+            }
             session.close().await;
             return;
         }
