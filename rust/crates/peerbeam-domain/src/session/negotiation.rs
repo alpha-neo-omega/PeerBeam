@@ -81,8 +81,18 @@ pub fn negotiate_version(local: Version, peer: Version) -> VersionNegotiation {
 /// bit, and a sender simply never offers it a `FileRef`.
 pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
 
-/// Feature bit on the CHAT capability: this peer sends a `FileDecline`
-/// (chat MessageType 3) when its user turns down an offered file.
+/// Feature bit on the CHAT capability: this peer understands and handles the
+/// `FileDecline` message (chat MessageType 3) — telling it "the file you offered
+/// under this id was turned down" will mean something to it.
+///
+/// **A receive capability, like [`CHAT_FEAT_FILEREF`], and read as one**: the
+/// party that consults it is the one *sending* a `FileDecline`, which asks
+/// whether the PEER negotiated the bit before putting the message on the wire
+/// (`peerbeam_ffi::transfer::should_send_decline`). It therefore says nothing
+/// about whether the advertiser ever sends a decline of its own — a build with
+/// no decline action to offer its user still advertises this truthfully, because
+/// what it asserts is comprehension, not behaviour. Every capability bit in this
+/// module reads that way; see `docs/MESSAGE_REGISTRY.md`.
 ///
 /// Without it a sender cannot tell "you declined" from "the network dropped",
 /// so a refused file would be re-offered forever and re-prompt its receiver
