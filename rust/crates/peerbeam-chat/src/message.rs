@@ -16,6 +16,12 @@ pub const MAX_BODY: usize = 16384;
 pub const MSG_TEXT: u16 = 1;
 /// Maximum length of a `FileRef` name, in bytes.
 pub const MAX_NAME: usize = 255;
+/// Maximum length of a `FileRef` id, in bytes. Generous next to the 29 bytes
+/// [`mint_id`] produces, and small enough that an id can never be a payload in
+/// its own right — it is echoed into events, into persisted history, and into
+/// every log line about the transfer. Deliberately the same bound the FFI's
+/// `is_valid_transfer_id` applies, because this id **is** that transfer id.
+pub const MAX_ID: usize = 128;
 /// MessageType id for a file reference within the Chat channel namespace.
 pub const MSG_FILE_REF: u16 = 2;
 /// MessageType id for a file decline within the Chat channel namespace.
@@ -32,6 +38,8 @@ pub enum ChatError {
     WrongType(u16),
     #[error("bad file name: {0}")]
     BadName(String),
+    #[error("bad file id: {0}")]
+    BadId(String),
 }
 
 impl From<ChatError> for SessionError {
@@ -123,6 +131,48 @@ fn validate_name(name: &str) -> Result<(), ChatError> {
     Ok(())
 }
 
+/// Validate a peer- or user-supplied file id: one bounded, boring token.
+///
+/// `FileRef.id` is the single most load-bearing field in this feature and the
+/// least obviously dangerous: it is the chat-store dedup key, the persisted
+/// record id, the `AppStore` key, **and** the transfer id. Until now only
+/// `name` was validated on decode, so every one of those consumers was trusting
+/// a string the peer chose freely.
+///
+/// Three concrete reasons this is not decoration:
+///
+/// * `StagingStore::stage` refuses any id that is not a bare file name — it
+///   interpolates the id into a path and `open_write` is `File::create`, so a
+///   `..` or a separator would truncate a file outside the blob root. Rejecting
+///   here means no consumer has to remember that.
+/// * The receiving FFI validates the transfer id with `is_valid_transfer_id`
+///   and falls back to a locally minted one when it fails. An id this side
+///   accepted but that side refuses would silently break the correlation the
+///   whole feature rests on — the row and its bytes would stop being one thing.
+/// * The id is echoed verbatim into events, history and logs.
+///
+/// The rule is deliberately identical to `is_valid_transfer_id`'s: non-empty,
+/// at most [`MAX_ID`] bytes, `[A-Za-z0-9._-]`, and never `.` or `..`. The right
+/// response to a failure is to **reject the message**, never to sanitise the id
+/// — a sanitised id could collide with another blob or another row.
+fn validate_id(id: &str) -> Result<(), ChatError> {
+    if id.is_empty() || id.len() > MAX_ID {
+        return Err(ChatError::BadId(format!("bad length: {}", id.len())));
+    }
+    if id == "." || id == ".." {
+        return Err(ChatError::BadId(format!("reserved name: {id}")));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(ChatError::BadId(format!(
+            "not a bare [A-Za-z0-9._-] token: {id}"
+        )));
+    }
+    Ok(())
+}
+
 /// A reference to a file being shared in a conversation, as it travels on the
 /// wire. Carries NO local path — the sender's filesystem layout is private (the
 /// record-side `FileMeta` holds that). The bytes themselves travel over the
@@ -163,6 +213,7 @@ impl FileRef {
     /// (MESSAGE_REGISTRY.md §6/§7).
     pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, ChatError> {
         validate_name(&self.name)?;
+        validate_id(&self.id)?;
         let payload = serde_json::to_vec(self)
             .map(Bytes::from)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
@@ -174,8 +225,9 @@ impl FileRef {
         ))
     }
 
-    /// Decode from a Chat-channel frame. The name is re-validated: it is
-    /// attacker-controlled input.
+    /// Decode from a Chat-channel frame. The name **and the id** are
+    /// re-validated: both are attacker-controlled input, and the id is the more
+    /// dangerous of the two (see [`validate_id`]).
     pub fn from_frame(frame: &SessionFrame) -> Result<FileRef, ChatError> {
         if frame.message_type.get() != MSG_FILE_REF {
             return Err(ChatError::WrongType(frame.message_type.get()));
@@ -183,6 +235,7 @@ impl FileRef {
         let r: FileRef = serde_json::from_slice(&frame.payload)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         validate_name(&r.name)?;
+        validate_id(&r.id)?;
         Ok(r)
     }
 }
@@ -446,6 +499,82 @@ mod tests {
         assert!(matches!(
             FileRef::from_frame(&frame),
             Err(ChatError::BadName(_))
+        ));
+    }
+
+    /// `FileRef.id` is the chat-store key, the persisted record id, the
+    /// `AppStore` key AND the transfer id, and it arrives from the peer. A
+    /// traversal id reaching `StagingStore::stage` is an arbitrary write; one
+    /// the receiving FFI's `is_valid_transfer_id` refuses silently breaks the
+    /// id correlation the feature rests on. So a hostile id must be rejected on
+    /// decode, exactly like a hostile name — never sanitised, since a sanitised
+    /// id could collide with a different blob or a different row.
+    #[test]
+    fn from_frame_rejects_a_hostile_id() {
+        let good = FileRef::new("ok.txt", 1).unwrap();
+        for bad in [
+            "../escape",
+            "/etc/passwd",
+            "a/b",
+            "a\\b",
+            "",
+            ".",
+            "..",
+            "has space",
+            "nul\u{0}byte",
+            "emoji🎉",
+        ] {
+            let mut frame = good.to_frame(ChannelId::new(1)).unwrap();
+            let payload = serde_json::json!({
+                "id": bad, "timestamp": "t", "name": "ok.txt", "size": 1u64,
+            });
+            frame.payload = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap());
+            assert!(
+                matches!(FileRef::from_frame(&frame), Err(ChatError::BadId(_))),
+                "accepted a hostile id: {bad:?}"
+            );
+        }
+        // Over-long is refused; exactly at the bound is fine.
+        let mut frame = good.to_frame(ChannelId::new(1)).unwrap();
+        let long = "x".repeat(MAX_ID + 1);
+        frame.payload = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": long, "timestamp": "t", "name": "ok.txt", "size": 1u64,
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            FileRef::from_frame(&frame),
+            Err(ChatError::BadId(_))
+        ));
+
+        // The guard cannot pass by refusing everything: a real minted id, and
+        // the boring tokens another implementation might plausibly mint, all
+        // survive the round trip.
+        for ok in [good.id.as_str(), "tx-1234-7", "a.b_c-D9"] {
+            let mut frame = good.to_frame(ChannelId::new(1)).unwrap();
+            frame.payload = bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "id": ok, "timestamp": "t", "name": "ok.txt", "size": 1u64,
+                }))
+                .unwrap(),
+            );
+            assert_eq!(
+                FileRef::from_frame(&frame).expect("a bare id decodes").id,
+                ok
+            );
+        }
+    }
+
+    /// The same rule on the way out, so a locally-built `FileRef` cannot put an
+    /// id on the wire that our own receive path would refuse.
+    #[test]
+    fn to_frame_refuses_a_hostile_id() {
+        let mut r = FileRef::new("ok.txt", 1).unwrap();
+        r.id = "../escape".into();
+        assert!(matches!(
+            r.to_frame(ChannelId::new(1)),
+            Err(ChatError::BadId(_))
         ));
     }
 
