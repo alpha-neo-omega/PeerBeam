@@ -83,8 +83,19 @@ impl ChatStore {
             .list(&ns)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         let mut out = Vec::with_capacity(raw.len());
-        for (_key, value) in raw {
-            out.push(ChatRecord::decode(&value)?);
+        for (key, value) in raw {
+            match ChatRecord::decode(&value) {
+                Ok(rec) => out.push(rec),
+                // A row this build cannot read — most likely written by a newer
+                // version whose schema grew. Skipping it loses one row; failing
+                // the call loses the entire conversation, including every row
+                // this build understands perfectly well. Forward compatibility
+                // is the whole point: 2b adds a `Status` variant that a 2a
+                // binary hits exactly here.
+                Err(e) => {
+                    tracing::warn!(error = %e, key = %key, "skipping unreadable chat record");
+                }
+            }
         }
         Ok(out)
     }
@@ -141,8 +152,17 @@ impl ChatStore {
             .list(OUTBOX_NS)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         let mut out = Vec::with_capacity(raw.len());
-        for (_key, value) in raw {
-            out.push(OutboxEntry::decode(&value)?);
+        for (key, value) in raw {
+            match OutboxEntry::decode(&value) {
+                Ok(entry) => out.push(entry),
+                // Same rationale as `history`, but the blast radius is wider:
+                // both `outbox_for` and `outbox_peers` read through this, so
+                // one unreadable row must not take down delivery for every
+                // other peer waiting behind it in the shared outbox.
+                Err(e) => {
+                    tracing::warn!(error = %e, key = %key, "skipping unreadable outbox entry");
+                }
+            }
         }
         Ok(out)
     }
@@ -373,17 +393,23 @@ mod tests {
     use peerbeam_domain::port::EncryptionProvider;
     use std::sync::Arc;
 
-    fn store() -> (ChatStore, tempfile::TempDir) {
+    /// Builds a fresh store for a test, returning the `ChatStore` alongside
+    /// the raw `Arc<dyn AppStore>` and the `TempDir` that backs it. The raw
+    /// handle lets a test write a hand-crafted (e.g. deliberately
+    /// undecodable) value directly, bypassing `ChatStore`'s own encode paths —
+    /// something no test could do through `ChatStore` alone.
+    fn new_store() -> (ChatStore, Arc<dyn AppStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
         let key = derive_subkey(&[9u8; 32], b"peerbeam-appstore-v1");
-        let app = Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
-        (ChatStore::new(app), dir)
+        let app: Arc<dyn AppStore> =
+            Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
+        (ChatStore::new(app.clone()), app, dir)
     }
 
     #[test]
     fn append_then_history_is_chronological_and_survives_reopen() {
-        let (cs, dir) = store();
+        let (cs, _store, dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let m1 = ChatMessage::new("first").unwrap();
         let m2 = ChatMessage::new("second").unwrap();
@@ -400,7 +426,7 @@ mod tests {
 
     #[test]
     fn contains_reports_dedup_state() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let m = ChatMessage::new("hi").unwrap();
         assert!(!cs.contains(&peer, &m.id).unwrap());
@@ -410,7 +436,7 @@ mod tests {
 
     #[test]
     fn conversations_are_isolated_by_peer() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let a = DeviceId::from("pb-a");
         let b = DeviceId::from("pb-b");
         cs.append(&ChatRecord::sent(&a, &ChatMessage::new("to-a").unwrap()))
@@ -426,7 +452,7 @@ mod tests {
 
     #[test]
     fn enqueue_persists_pending_record_and_outbox_entry() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let m = ChatMessage::new("queued").unwrap();
         cs.enqueue(&peer, &m).unwrap();
@@ -448,7 +474,7 @@ mod tests {
 
     #[test]
     fn outbox_pending_and_peers_and_fifo_order() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let a = DeviceId::from("pb-a");
         let b = DeviceId::from("pb-b");
         let m1 = ChatMessage::new("a1").unwrap();
@@ -495,7 +521,7 @@ mod tests {
     // silently.
     #[test]
     fn outbox_namespace_never_collides_with_a_peer_literally_named_outbox() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
 
         // A normal peer with a message queued for offline delivery.
         let normal_peer = DeviceId::from("pb-bob");
@@ -532,7 +558,7 @@ mod tests {
 
     #[test]
     fn record_sent_flips_pending_to_sent_in_place_and_remove_dequeues() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let m = ChatMessage::new("x").unwrap();
         cs.enqueue(&peer, &m).unwrap();
@@ -550,7 +576,7 @@ mod tests {
 
     #[test]
     fn set_status_updates_in_place() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("a.bin", 3).unwrap();
         let meta = FileMeta {
@@ -574,7 +600,7 @@ mod tests {
     /// In/File one.
     #[test]
     fn get_returns_the_whole_record_or_none() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         assert!(cs.get(&peer, "nope").unwrap().is_none());
 
@@ -589,7 +615,7 @@ mod tests {
 
     #[test]
     fn set_file_path_upserts_in_place_and_no_ops_on_absent_or_text_rows() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap(); // In/File/PendingApproval
@@ -625,7 +651,7 @@ mod tests {
 
     #[test]
     fn reconcile_marks_mid_flight_records_interrupted() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let a = FileRef::new("a.bin", 1).unwrap();
         let b = FileRef::new("b.bin", 1).unwrap();
@@ -660,7 +686,7 @@ mod tests {
     /// it exists to keep the plain Text round trip covered.
     #[test]
     fn outbox_round_trip_preserves_additive_record_fields() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let msg = ChatMessage::new("queued").unwrap();
         cs.enqueue(&peer, &msg).unwrap();
@@ -691,7 +717,7 @@ mod tests {
     /// file: None }` makes this test fail on the `kind`/`file` assertions below).
     #[test]
     fn outbox_round_trip_preserves_a_file_records_additive_fields() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         let meta = FileMeta {
@@ -739,7 +765,7 @@ mod tests {
     /// everything.
     #[test]
     fn settle_file_row_settles_a_genuine_receive_and_records_its_path() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap(); // In/File/PendingApproval
@@ -767,7 +793,7 @@ mod tests {
     /// `prepare_file_send` time).
     #[test]
     fn settle_file_row_settles_a_genuine_send_completion() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         let meta = FileMeta {
@@ -790,7 +816,7 @@ mod tests {
     /// silent no-op — no row is ever invented.
     #[test]
     fn settle_file_row_is_silent_when_no_row_exists() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let settled = cs
             .settle_file_row(
@@ -810,7 +836,7 @@ mod tests {
     /// stamp our own "sent" text as `Received`. Must be a complete no-op.
     #[test]
     fn settle_file_row_is_silent_for_a_hostile_collision_with_a_text_row() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let msg = ChatMessage::new("hello there").unwrap();
         cs.append(&ChatRecord::sent(&peer, &msg)).unwrap(); // Out/Text/Sent
@@ -832,7 +858,7 @@ mod tests {
     /// keeping its old metadata. Must be a complete no-op.
     #[test]
     fn settle_file_row_is_silent_for_a_hostile_collision_with_an_already_settled_file_row() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("suspicious.exe", 4096).unwrap();
         let mut declined = ChatRecord::file_in(&peer, &r);
@@ -856,7 +882,7 @@ mod tests {
     /// OUTBOUND file share must not be settleable as if it were a receive.
     #[test]
     fn settle_file_row_is_silent_for_a_direction_mismatch() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         let meta = FileMeta {
@@ -887,7 +913,7 @@ mod tests {
     /// not what was advertised — and the name must be render-safe.
     #[test]
     fn set_file_row_landing_replaces_the_peers_claim_with_what_actually_landed() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         // What the peer put in the conversation.
         let mut r = FileRef::new("holiday.jpg", 184_320).unwrap();
@@ -926,7 +952,7 @@ mod tests {
     /// are silent no-ops.
     #[test]
     fn set_file_row_landing_is_silent_for_every_row_that_is_not_its_own() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
 
         // (a) A text row.
@@ -990,7 +1016,7 @@ mod tests {
     /// a caller whose peek failed can call unconditionally.
     #[test]
     fn set_file_row_landing_ignores_an_empty_name() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
@@ -1007,7 +1033,7 @@ mod tests {
     /// to set a path on, and the wrong `kind` regardless) must not gain one.
     #[test]
     fn set_file_row_path_is_silent_for_a_text_row() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let msg = ChatMessage::new("hi").unwrap();
         cs.append(&ChatRecord::sent(&peer, &msg)).unwrap();
@@ -1026,7 +1052,7 @@ mod tests {
     /// instead of overwriting an already-final row.
     #[test]
     fn set_file_row_path_is_silent_once_the_row_is_already_settled() {
-        let (cs, _dir) = store();
+        let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let r = FileRef::new("report.pdf", 4096).unwrap();
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
@@ -1047,5 +1073,69 @@ mod tests {
                 .is_none(),
             "a path written after settling must not land"
         );
+    }
+
+    // ── Containment — one bad row must not poison a whole namespace. A
+    // future schema addition (e.g. a `Status` variant a 2a binary cannot
+    // decode) must lose only the row it lands on, never the rest of the
+    // conversation or the whole outbox. ────────────────────────────────────
+
+    #[test]
+    fn history_skips_an_undecodable_row_and_keeps_the_rest() {
+        let (cs, store, _tmp) = new_store();
+        let peer = DeviceId::from("pb-alice".to_string());
+        let good = ChatRecord {
+            id: "0000000000001".into(),
+            peer_id: "pb-alice".into(),
+            direction: Direction::Out,
+            timestamp: "2026-08-13T10:00:00+00:00".into(),
+            body: "before".into(),
+            status: Status::Sent,
+            kind: Kind::Text,
+            file: None,
+        };
+        let later = ChatRecord {
+            id: "0000000000003".into(),
+            body: "after".into(),
+            ..good.clone()
+        };
+        cs.append(&good).unwrap();
+        // A row this build cannot read — exactly what a newer peer's schema
+        // looks like to an older binary.
+        store
+            .put(
+                &namespace(&peer),
+                "0000000000002",
+                b"{\"status\":\"from-the-future\"}",
+            )
+            .unwrap();
+        cs.append(&later).unwrap();
+
+        let got = cs
+            .history(&peer)
+            .expect("one bad row must not fail the conversation");
+        let bodies: Vec<&str> = got.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, vec!["before", "after"]);
+    }
+
+    #[test]
+    fn outbox_pending_skips_an_undecodable_entry_so_delivery_survives() {
+        let (cs, store, _tmp) = new_store();
+        let peer = DeviceId::from("pb-bob".to_string());
+        cs.enqueue(&peer, &ChatMessage::new("real").unwrap())
+            .unwrap();
+        store
+            .put(OUTBOX_NS, "0000000000009", b"not an outbox entry")
+            .unwrap();
+
+        let pending = cs
+            .outbox_pending()
+            .expect("one bad entry must not disable the whole outbox");
+        assert_eq!(pending.len(), 1, "the good entry still delivers");
+        assert_eq!(pending[0].body, "real");
+        // The cascade is the real damage: both of these read through
+        // `outbox_pending`, so a poisoned outbox silently stops every peer.
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1);
+        assert_eq!(cs.outbox_peers().unwrap().len(), 1);
     }
 }
