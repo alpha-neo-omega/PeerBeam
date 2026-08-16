@@ -12,4 +12,4 @@ pub use message::{
 };
 pub use record::{display_name, ChatRecord, Direction, FileMeta, Kind, Status};
 pub use send::{flush_to_session, prepare_file_send, send_file_ref, send_message, SendError};
-pub use store::{namespace, ChatStore, OutboxEntry, OUTBOX_NS};
+pub use store::{namespace, ChatStore, OutboxEntry, StagedFile, OUTBOX_NS};

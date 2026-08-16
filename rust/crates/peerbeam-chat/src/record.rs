@@ -32,6 +32,9 @@ pub enum Status {
     Failed,
     /// Left mid-flight by a crash/restart; no event will ever complete it.
     Interrupted,
+    /// The file is being copied into the outbox's own storage. Nothing has
+    /// been queued or offered yet, so nothing can settle it.
+    Staging,
 }
 
 /// What a record holds: a text body, or a reference to a shared file.
@@ -449,5 +452,15 @@ mod tests {
                 "{terminal:?} must not be re-settleable"
             );
         }
+    }
+
+    #[test]
+    fn staging_serializes_as_lowercase_and_is_not_settleable() {
+        let v = serde_json::to_value(Status::Staging).unwrap();
+        assert_eq!(v, serde_json::json!("staging"));
+        // Staging is before the queue, let alone before a transfer: no
+        // wire-driven settle may touch a row that has not been offered yet.
+        let rec = file_row(Direction::Out, Status::Staging);
+        assert!(!rec.is_settleable_file_row(Direction::Out));
     }
 }

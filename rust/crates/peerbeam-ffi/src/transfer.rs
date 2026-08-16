@@ -2390,6 +2390,7 @@ fn chat_status_str(status: ChatStatus) -> &'static str {
         ChatStatus::Declined => "declined",
         ChatStatus::Failed => "failed",
         ChatStatus::Interrupted => "interrupted",
+        ChatStatus::Staging => "staging",
     }
 }
 
@@ -3046,6 +3047,7 @@ mod tests {
             ChatStatus::Declined,
             ChatStatus::Failed,
             ChatStatus::Interrupted,
+            ChatStatus::Staging,
         ] {
             let serialized = serde_json::to_value(s).expect("status serializes");
             assert_eq!(

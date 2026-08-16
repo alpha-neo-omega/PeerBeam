@@ -36,6 +36,19 @@ pub fn namespace(peer: &DeviceId) -> String {
 /// to a `-`.
 pub const OUTBOX_NS: &str = "chat.outbox";
 
+/// A file staged into the outbox's own storage, ready to send.
+///
+/// `staged_path` points at a copy the outbox owns — not at the user's original
+/// file. That is the whole point of staging: once this exists, deleting,
+/// moving, renaming or editing the source cannot change or break what gets
+/// delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedFile {
+    pub name: String,
+    pub size: u64,
+    pub staged_path: String,
+}
+
 /// One queued outbound message awaiting delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEntry {
@@ -43,6 +56,18 @@ pub struct OutboxEntry {
     pub message_id: String,
     pub body: String,
     pub timestamp: String,
+    /// Text (default, so every 1b/2a entry decodes) or File.
+    #[serde(default)]
+    pub kind: Kind,
+    /// Present only when `kind == Kind::File`.
+    #[serde(default)]
+    pub file: Option<StagedFile>,
+    /// How many times an offer actually REACHED the peer and was refused or
+    /// timed out at its approval gate. A connection failure never increments
+    /// this: nobody saw the offer, nobody was prompted, and keep-forever is
+    /// the promise text already makes. See the backstop in Task 6.
+    #[serde(default)]
+    pub offers_refused: u32,
 }
 
 impl OutboxEntry {
@@ -139,6 +164,9 @@ impl ChatStore {
             message_id: msg.id.clone(),
             body: msg.body.clone(),
             timestamp: msg.timestamp.clone(),
+            kind: Kind::Text,
+            file: None,
+            offers_refused: 0,
         };
         self.store
             .put(OUTBOX_NS, &msg.id, &entry.encode())
@@ -735,6 +763,9 @@ mod tests {
             message_id: r.id.clone(),
             body: String::new(),
             timestamp: r.timestamp.clone(),
+            kind: Kind::Text,
+            file: None,
+            offers_refused: 0,
         };
         cs.record_sent(&entry).unwrap();
 
@@ -1137,5 +1168,36 @@ mod tests {
         // `outbox_pending`, so a poisoned outbox silently stops every peer.
         assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1);
         assert_eq!(cs.outbox_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_1b_era_outbox_entry_json_still_decodes() {
+        // Exactly what 1b wrote — no kind, no file, no offers_refused.
+        let raw = br#"{"peer_id":"pb-alice","message_id":"0000000000001",
+                       "body":"hi","timestamp":"2026-08-13T10:00:00+00:00"}"#;
+        let e = OutboxEntry::decode(raw).expect("legacy entry must still decode");
+        assert_eq!(e.body, "hi");
+        assert_eq!(e.kind, Kind::Text, "an entry with no kind is text");
+        assert!(e.file.is_none());
+        assert_eq!(e.offers_refused, 0);
+    }
+
+    #[test]
+    fn a_file_outbox_entry_round_trips_its_staged_blob() {
+        let e = OutboxEntry {
+            peer_id: "pb-bob".into(),
+            message_id: "0000000000002".into(),
+            body: String::new(),
+            timestamp: "2026-08-13T10:00:00+00:00".into(),
+            kind: Kind::File,
+            file: Some(StagedFile {
+                name: "report.pdf".into(),
+                size: 4096,
+                staged_path: "/data/outbox-blobs/0000000000002".into(),
+            }),
+            offers_refused: 2,
+        };
+        let back = OutboxEntry::decode(&e.encode()).unwrap();
+        assert_eq!(back, e);
     }
 }
