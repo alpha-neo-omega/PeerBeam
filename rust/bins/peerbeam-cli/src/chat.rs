@@ -474,6 +474,11 @@ fn staging_step(done: u64, total: u64) -> u64 {
 /// (`tokio::join!`, the same shape the transfer pump below uses): an unbounded
 /// channel nobody reads would hold every one of a multi-GB copy's reports in
 /// memory, which is exactly the allocation streaming exists to avoid.
+///
+/// `Ok(None)` is [`stage_file_send`]'s "the conversation was deleted while we
+/// copied" answer — another process sharing this data directory (the app, or a
+/// second CLI run) removed the thread mid-stage. Nothing was queued and no blob
+/// is left; the caller must offer the peer nothing.
 #[allow(clippy::too_many_arguments)] // mirrors `stage_file_send`'s own arity, plus `ctx`.
 async fn stage_with_progress(
     ctx: &Ctx,
@@ -484,7 +489,7 @@ async fn stage_with_progress(
     path: &str,
     limits: StagingLimits,
     ctrl: &TransferControl,
-) -> Result<StagedFile, CliError> {
+) -> Result<Option<StagedFile>, CliError> {
     // Captured before `copy` borrows `file_ref` mutably; `name` is also what a
     // refusal has to name, so it must outlive the borrow either way.
     let id = file_ref.id.clone();
@@ -522,6 +527,20 @@ async fn stage_with_progress(
     };
     let (staged, ()) = tokio::join!(copy, pump);
     staged.map_err(|e| stage_refusal(&name, e))
+}
+
+/// The refusal for a conversation that was deleted out from under a stage.
+///
+/// Not [`stage_refusal`]: nothing about the file or the bounds was wrong, so
+/// naming `device.max_queued_file_bytes` would send the user to a setting that
+/// had nothing to do with it. What happened is that the thread this attachment
+/// belongs to stopped existing, and the honest outcome is a non-zero exit that
+/// says so — the file was not queued and will not be sent.
+fn deleted_mid_stage(peer_name: &str, name: &str) -> CliError {
+    CliError::Other(format!(
+        "the conversation with {peer_name} was deleted while {name} was being staged, \
+         so nothing was queued — send it again to retry"
+    ))
 }
 
 /// Render a staging refusal honestly.
@@ -752,7 +771,7 @@ async fn send_file(
     // Copy the bytes into the outbox's own storage and queue them. What gets
     // sent from here on is the blob, not a path the user could change
     // underneath us — and, being queued, it survives this process exiting.
-    let staged = stage_with_progress(
+    let Some(staged) = stage_with_progress(
         ctx,
         &store,
         &staging,
@@ -762,7 +781,10 @@ async fn send_file(
         limits,
         &ctrl,
     )
-    .await?;
+    .await?
+    else {
+        return Err(deleted_mid_stage(&target.name, &file_ref.name));
+    };
 
     // Every terminal exit below goes through this: the row's final status, the
     // queue entry gone, and the staged blob deleted. Deliberately NOT called on

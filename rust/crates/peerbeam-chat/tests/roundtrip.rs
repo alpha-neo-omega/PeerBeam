@@ -1087,17 +1087,20 @@ async fn a_queued_decline_flushes_as_a_decline_and_a_queued_file_is_left_for_the
     // skip instead of the hand-over this test is about.
     let blob = tempfile::tempdir().unwrap().keep().join(&mine.id);
     std::fs::write(&blob, b"abc").unwrap();
-    store_a
-        .enqueue_file(
-            &b_id,
-            &mine,
-            &peerbeam_chat::StagedFile {
-                name: "mine.bin".into(),
-                size: 3,
-                staged_path: blob.to_string_lossy().into_owned(),
-            },
-        )
-        .unwrap();
+    assert!(
+        store_a
+            .enqueue_file(
+                &b_id,
+                &mine,
+                &peerbeam_chat::StagedFile {
+                    name: "mine.bin".into(),
+                    size: 3,
+                    staged_path: blob.to_string_lossy().into_owned(),
+                },
+            )
+            .unwrap(),
+        "the row seeded above is there, so it queues"
+    );
     assert_eq!(store_a.outbox_for(&b_id).unwrap().len(), 3);
 
     let flushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)

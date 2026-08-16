@@ -206,7 +206,9 @@ impl ChatStore {
     }
 
     /// Queue an already-staged file for delivery to `peer`, and mark our own
-    /// row `Pending`.
+    /// row `Pending`. Returns whether it was queued: `false` means the row is
+    /// gone — the conversation was deleted while we staged — and **nothing at
+    /// all** was written.
     ///
     /// The conversation row already exists — [`begin_file_send`] wrote it
     /// `Staging` before the copy started, so a multi-GB stage is visible rather
@@ -219,19 +221,40 @@ impl ChatStore {
     /// disagree, and the blob is what will be delivered; showing the other
     /// number would be a row that lies about its own file.
     ///
-    /// Entry first, row second, deliberately. A crash between the two leaves a
-    /// queued entry whose row still reads `Staging`, which the drain re-opens
-    /// and sends ([`reopen_for_retry`](Self::reopen_for_retry)). The reverse
-    /// order would leave a `Pending` row with nothing queued to deliver it — a
-    /// file the user is told is waiting that nothing will ever send.
+    /// # Two orderings, both load-bearing
+    ///
+    /// **The row is READ before the entry is written**, and a row that has gone
+    /// queues nothing. A queue entry whose record does not exist is the one
+    /// shape the drain reads as "nothing will ever settle this": it offers the
+    /// `FileRef` to the peer, then finds no row to re-open, then releases the
+    /// entry and deletes the staged blob (`run_queued_file` and
+    /// `drop_queued_file` in `peerbeam_ffi::transfer`). The user would lose the
+    /// only copy the queue owns *and* leave the peer holding an approval prompt
+    /// for a stream that never comes. Writing the entry first and then
+    /// discovering the row is missing — which is what this used to do — creates
+    /// exactly that state and cannot undo it, because by then the entry is on
+    /// disk and any drain tick may have taken it. So the check comes first and
+    /// the caller is told, which lets [`stage_file_send`] delete the blob it
+    /// staged and honour the delete completely.
+    ///
+    /// **The entry is written before the row**, once we have committed to
+    /// queueing. A crash between the two leaves a queued entry whose row still
+    /// reads `Staging`, which the drain re-opens and sends
+    /// ([`reopen_for_retry`](Self::reopen_for_retry)). The reverse order would
+    /// leave a `Pending` row with nothing queued to deliver it — a file the
+    /// user is told is waiting that nothing will ever send.
     ///
     /// [`begin_file_send`]: crate::begin_file_send
+    /// [`stage_file_send`]: crate::stage_file_send
     pub fn enqueue_file(
         &self,
         peer: &DeviceId,
         r: &FileRef,
         staged: &StagedFile,
-    ) -> Result<(), ChatError> {
+    ) -> Result<bool, ChatError> {
+        let Some(mut rec) = self.get(peer, &r.id)? else {
+            return Ok(false);
+        };
         let entry = OutboxEntry {
             peer_id: peer.0.clone(),
             message_id: r.id.clone(),
@@ -244,15 +267,13 @@ impl ChatStore {
         self.store
             .put(OUTBOX_NS, &r.id, &entry.encode())
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
-        let Some(mut rec) = self.get(peer, &r.id)? else {
-            return Ok(());
-        };
         rec.status = Status::Pending;
         if let Some(file) = rec.file.as_mut() {
             file.name = crate::display_name(&staged.name);
             file.size = staged.size;
         }
-        self.append(&rec)
+        self.append(&rec)?;
+        Ok(true)
     }
 
     /// Queue "I turned your file down" for a sender we could not tell live.
@@ -678,6 +699,25 @@ impl ChatStore {
         Ok(changed)
     }
 
+    /// How many records the conversation with `peer` still holds, counted by
+    /// **stored key** — a row this build cannot decode counts exactly like one
+    /// it can.
+    ///
+    /// [`history`](Self::history) deliberately skips a row it cannot read, so
+    /// counting through it would under-report a namespace holding rows from a
+    /// newer schema. The one caller is the surface's "and this many were kept"
+    /// report after a [`delete_conversation`](Self::delete_conversation): every
+    /// row still present there is one the delete chose to keep, so a count that
+    /// silently omitted the undecodable ones would tell the user nothing was
+    /// kept while the thread stayed listed with a row in it.
+    pub fn record_count(&self, peer: &DeviceId) -> Result<usize, ChatError> {
+        let ns = namespace(peer);
+        self.store
+            .list(&ns)
+            .map(|rows| rows.len())
+            .map_err(|e| ChatError::Serialization(e.to_string()))
+    }
+
     /// Forget this device's copy of the conversation with `peer`, **keeping
     /// every record that still backs a queued outbound message**. Returns how
     /// many records were removed.
@@ -703,6 +743,20 @@ impl ChatStore {
     /// mysteriously return days later — whatever survives is queued *right
     /// now*, and is visible immediately.
     ///
+    /// # A file still being staged is "still waiting to be sent" too
+    ///
+    /// The keep set from [`queued_message_ids`](Self::queued_message_ids) reads
+    /// the outbox, and a file the user attached seconds ago has no outbox entry
+    /// yet: `begin_file_send` writes the row `Staging` synchronously and the
+    /// copy — minutes, for a multi-GB file — runs before `enqueue_file` queues
+    /// anything. For that whole window an outbox-only keep set does not name
+    /// the row, so the delete would take it, and the copy would then finish
+    /// into the orphaned state above: a queued entry with no record, which the
+    /// next drain offers to the peer and then throws away along with the bytes.
+    /// So a row still reading [`Status::Staging`] is kept as well. That is what
+    /// makes the confirmation's promise true in the sense the user means it —
+    /// they attached a file, it is being copied, it is waiting to be sent.
+    ///
     /// # An unreadable outbox refuses, rather than under-report
     ///
     /// The keep set is read strictly, hard-failing on any entry that will not
@@ -727,15 +781,26 @@ impl ChatStore {
             .list(&ns)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         let mut removed = 0;
-        for (key, _) in rows {
+        for (key, value) in rows {
             if keep.contains(&key) {
+                continue;
+            }
+            // A file whose bytes are still being copied into the outbox: no
+            // entry names it yet, and destroying its row is what turns the
+            // finished copy into a queued entry with nothing behind it. Read
+            // from the value we already have in hand, so this costs no extra
+            // store round trip.
+            if is_staging(&value) {
                 continue;
             }
             // Deliberately keyed off the STORED KEY, not off a decoded record:
             // a row this build cannot read is still the user's to delete, and
             // `history` would silently skip it — leaving a thread that
             // reappears at the next namespace scan with nothing in it the user
-            // can see or remove.
+            // can see or remove. The `Staging` check above is the one exception
+            // and it is not a relaxation of this: a row that will not decode is
+            // removed exactly as before, because whether it was staging is
+            // precisely what could not be read.
             if self
                 .store
                 .delete(&ns, &key)
@@ -767,12 +832,35 @@ impl ChatStore {
             // An unreadable entry is refused above whoever it belongs to: its
             // peer is exactly what could not be read, so "it is probably not
             // this conversation's" is not something this can know.
-            if entry.peer_id == peer.0 {
+            //
+            // A queued DECLINE is deliberately not kept. Its `message_id` is
+            // the *sender's* `FileRef` id, which in our own namespace names the
+            // INBOUND row we refused — so keeping it holds a file the user
+            // turned down alive forever, reported to them as "1 queued message
+            // was kept and will still be sent", and leaves the thread listed
+            // and undeletable until that peer comes back. Nothing needs it:
+            // `flush_to_session` builds the `FileDecline` entirely from the
+            // entry and never reads the record.
+            //
+            // Text is kept, even though `record_sent` could rebuild its row
+            // from the entry alone. That rebuild is exactly the problem: the
+            // row would vanish now and REAPPEAR when the message is finally
+            // delivered, which is the "thread that mysteriously returns days
+            // later" this whole method exists to rule out.
+            if entry.peer_id == peer.0 && entry.kind != Kind::Decline {
                 ids.insert(entry.message_id);
             }
         }
         Ok(ids)
     }
+}
+
+/// Whether a stored row is a file this device is still copying into the
+/// outbox — the one status a conversation delete must step over even though no
+/// outbox entry names it yet. A value that will not decode is not staging as
+/// far as anyone here can tell, and says so.
+fn is_staging(value: &[u8]) -> bool {
+    matches!(ChatRecord::decode(value), Ok(rec) if rec.status == Status::Staging)
 }
 
 #[cfg(test)]
@@ -1582,7 +1670,10 @@ mod tests {
         let peer = DeviceId::from("pb-bob");
         let (r, staged) = staged_row(&cs, &peer, 4096, 4096);
 
-        cs.enqueue_file(&peer, &r, &staged).unwrap();
+        assert!(
+            cs.enqueue_file(&peer, &r, &staged).unwrap(),
+            "the row is there, so it queues"
+        );
 
         let queued = cs.outbox_for(&peer).unwrap();
         assert_eq!(queued.len(), 1);
@@ -1612,7 +1703,7 @@ mod tests {
         let peer = DeviceId::from("pb-bob");
         let (r, staged) = staged_row(&cs, &peer, 4096, 9001);
 
-        cs.enqueue_file(&peer, &r, &staged).unwrap();
+        assert!(cs.enqueue_file(&peer, &r, &staged).unwrap());
 
         assert_eq!(
             cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().size,
@@ -1626,7 +1717,7 @@ mod tests {
         let (cs, _store, _dir) = new_store();
         let peer = DeviceId::from("pb-bob");
         let (r, staged) = staged_row(&cs, &peer, 1, 1);
-        cs.enqueue_file(&peer, &r, &staged).unwrap();
+        assert!(cs.enqueue_file(&peer, &r, &staged).unwrap());
 
         assert_eq!(cs.outbox_bump_refused(&r.id).unwrap(), 1);
         assert_eq!(cs.outbox_bump_refused(&r.id).unwrap(), 2);
@@ -1994,16 +2085,19 @@ mod tests {
             Status::Staging,
         ))
         .unwrap();
-        cs.enqueue_file(
-            &peer,
-            &r,
-            &StagedFile {
-                name: "report.pdf".into(),
-                size: 30,
-                staged_path: owned_path.clone(),
-            },
-        )
-        .unwrap();
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &r,
+                &StagedFile {
+                    name: "report.pdf".into(),
+                    size: 30,
+                    staged_path: owned_path.clone(),
+                },
+            )
+            .unwrap(),
+            "the row seeded above is there, so it queues"
+        );
         // A text entry owns no blob and must not invent one.
         cs.enqueue(&peer, &ChatMessage::new("also queued").unwrap())
             .unwrap();
@@ -2063,16 +2157,19 @@ mod tests {
                 Status::Staging,
             ))
             .unwrap();
-            cs.enqueue_file(
-                &peer,
-                &r,
-                &StagedFile {
-                    name: name.into(),
-                    size: 30,
-                    staged_path: path.clone(),
-                },
-            )
-            .unwrap();
+            assert!(
+                cs.enqueue_file(
+                    &peer,
+                    &r,
+                    &StagedFile {
+                        name: name.into(),
+                        size: 30,
+                        staged_path: path.clone(),
+                    },
+                )
+                .unwrap(),
+                "the row seeded above is there, so it queues"
+            );
             blobs.push(path);
             staging = Some(s);
         }
@@ -2173,16 +2270,19 @@ mod tests {
             Status::Staging,
         ))
         .unwrap();
-        cs.enqueue_file(
-            &peer,
-            &queued,
-            &StagedFile {
-                name: "waiting.mkv".into(),
-                size: 30,
-                staged_path: blob.clone(),
-            },
-        )
-        .unwrap();
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &queued,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob.clone(),
+                },
+            )
+            .unwrap(),
+            "the row seeded above is there, so it queues"
+        );
         // …and one queued TEXT message, which is queued just the same.
         let pending_text = ChatMessage::new("not sent yet").unwrap();
         cs.enqueue(&peer, &pending_text).unwrap();
@@ -2292,6 +2392,153 @@ mod tests {
         );
     }
 
+    /// **THE STAGING WINDOW.** `begin_file_send` writes the row `Staging`
+    /// synchronously and the copy — minutes, for a multi-GB file — runs before
+    /// `enqueue_file` puts anything in the outbox. An outbox-only keep set does
+    /// not name that row for the whole of that window, so a delete landing in
+    /// it removed the row; the copy would then finish into a queued entry with
+    /// no record, which is exactly what the drain reads as "nothing will ever
+    /// settle this" — it offers the file to the peer and *then* releases the
+    /// entry and deletes the only copy of the bytes.
+    ///
+    /// The user was told "anything still waiting to be sent is kept and will
+    /// still be sent". A file they attached ten seconds ago is precisely that,
+    /// in every sense they mean it.
+    #[test]
+    fn delete_conversation_keeps_a_file_that_is_still_being_staged() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        // Ordinary settled history around it, all of it removable.
+        for body in ["one", "two"] {
+            cs.append(&ChatRecord::sent(&peer, &ChatMessage::new(body).unwrap()))
+                .unwrap();
+        }
+        // And a file whose bytes are still being copied: a row, and no entry.
+        let staging = FileRef::new("holiday.mp4", 8_000_000_000).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &staging,
+            FileMeta::new(
+                &staging.name,
+                staging.size,
+                Some("/home/me/holiday.mp4".into()),
+            ),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "nothing is queued until the copy finishes — that IS the window"
+        );
+
+        assert_eq!(
+            cs.delete_conversation(&peer).unwrap(),
+            2,
+            "the settled history goes"
+        );
+
+        let left = cs.history(&peer).unwrap();
+        assert_eq!(left.len(), 1, "and the staging row stays: {left:?}");
+        assert_eq!(left[0].id, staging.id);
+        assert_eq!(left[0].status, Status::Staging);
+        assert_eq!(
+            left[0].file.as_ref().unwrap().local_path.as_deref(),
+            Some("/home/me/holiday.mp4"),
+            "kept whole — the delete does not rewrite what it keeps"
+        );
+
+        // The consequence, not just the row: the copy can still finish into it,
+        // which is the only reason keeping it matters.
+        let staged = StagedFile {
+            name: "holiday.mp4".into(),
+            size: 8_000_000_000,
+            staged_path: format!("/data/outbox-blobs/{}", staging.id),
+        };
+        assert!(
+            cs.enqueue_file(&peer, &staging, &staged).unwrap(),
+            "the finished copy queues normally, exactly as if nothing happened"
+        );
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1);
+        assert_eq!(
+            cs.get(&peer, &staging.id).unwrap().unwrap().status,
+            Status::Pending
+        );
+    }
+
+    /// The other half of the same defect, and the one that must hold even
+    /// though the keep above makes it nearly unreachable: `enqueue_file` must
+    /// never leave an entry behind a record that has gone.
+    ///
+    /// Asserting the **outbox is empty** is the whole assertion. A `false`
+    /// return on its own would pass just as well against the old order — write
+    /// the entry, then discover the row is missing, then silently `Ok` — which
+    /// is the state that costs the user the file.
+    #[test]
+    fn enqueue_file_queues_nothing_when_its_row_has_been_deleted() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let (r, staged) = staged_row(&cs, &peer, 4096, 4096);
+
+        // The row goes while the copy is still running.
+        assert!(store.delete(&namespace(&peer), &r.id).unwrap());
+
+        assert!(
+            !cs.enqueue_file(&peer, &r, &staged).unwrap(),
+            "a conversation that is gone cannot take a queued file"
+        );
+        assert!(
+            cs.outbox_pending().unwrap().is_empty(),
+            "and NOTHING was queued — not an entry the caller is left to regret"
+        );
+        assert!(
+            cs.get(&peer, &r.id).unwrap().is_none(),
+            "nor is a row invented to hang it off"
+        );
+    }
+
+    /// A queued DECLINE must not keep an inbound row alive.
+    ///
+    /// Its `message_id` is the **sender's** `FileRef` id, which in our own
+    /// namespace names the row we *refused*. Keeping it left the thread listed
+    /// and undeletable until that peer came back — possibly never — and told
+    /// the user "1 queued message was kept and will still be sent" about a file
+    /// they turned down and never sent.
+    #[test]
+    fn delete_conversation_does_not_keep_an_inbound_row_for_a_queued_decline() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        // Bob offered a file, we declined, and Bob had already dropped — so the
+        // refusal is queued for whenever he returns.
+        let theirs = FileRef::new("theirs.iso", 900).unwrap();
+        let mut declined = ChatRecord::file_in(&peer, &theirs);
+        declined.status = Status::Declined;
+        cs.append(&declined).unwrap();
+        assert!(cs
+            .enqueue_decline(&peer, &FileDecline::new(&theirs.id))
+            .unwrap());
+
+        assert_eq!(
+            cs.delete_conversation(&peer).unwrap(),
+            1,
+            "the declined row is the user's to delete"
+        );
+        assert!(cs.history(&peer).unwrap().is_empty());
+        assert!(
+            !cs.conversations().unwrap().contains(&peer),
+            "the thread goes, rather than staying listed until the peer returns"
+        );
+
+        // The decline itself is untouched — still queued, still a decline. It
+        // needs no record: `flush_to_session` builds the `FileDecline` from the
+        // entry alone (which `tests/roundtrip.rs` pins end to end).
+        let queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].kind, Kind::Decline);
+        assert_eq!(queued[0].message_id, theirs.id);
+    }
+
     /// THE OTHER TRAP: the keep set must be **complete**. The lenient outbox
     /// readers skip an entry they cannot decode, so a wholly-unreadable outbox
     /// reads back as "nothing is queued" — and a delete driven by that would
@@ -2315,16 +2562,19 @@ mod tests {
             Status::Staging,
         ))
         .unwrap();
-        cs.enqueue_file(
-            &peer,
-            &queued,
-            &StagedFile {
-                name: "waiting.mkv".into(),
-                size: 30,
-                staged_path: blob,
-            },
-        )
-        .unwrap();
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &queued,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob,
+                },
+            )
+            .unwrap(),
+            "the row seeded above is there, so it queues"
+        );
 
         // Every outbox row becomes undecodable — a newer schema, as seen by an
         // older binary, applied to the whole namespace.

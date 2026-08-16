@@ -1703,7 +1703,23 @@ impl Manager {
         let cancelled = self.finish_stage(&peer_id, &id);
 
         let staged = match staged {
-            Ok(s) => s,
+            Ok(Some(s)) => s,
+            // The user deleted this conversation while the copy was running,
+            // and it finished into a thread that no longer exists. `stage_file_
+            // send` has already deleted the blob and queued nothing, so the
+            // delete is honoured completely: no bytes left over, and no offer
+            // put in front of the peer for a file this device will not send.
+            // Nothing is emitted either — there is no row for an event to
+            // describe, and inventing a status for one would put the deleted
+            // thread back on the surface that just removed it.
+            Ok(None) => {
+                tracing::info!(
+                    peer_id = %peer_id,
+                    message_id = %id,
+                    "chat file dropped: its conversation was deleted while it was being staged"
+                );
+                return;
+            }
             Err(e) => {
                 // A cancelled copy already deleted its own partial blob and
                 // nothing was queued, so there is nothing left to release —
@@ -2453,18 +2469,20 @@ impl Manager {
             .chat
             .delete_conversation(&peer)
             .map_err(|e| (Code::Internal, e.to_string()))?;
-        // Counted from what is actually on disk *after* the delete — the
-        // records still present under a queued entry — rather than from the
+        // Counted from what is actually on disk *after* the delete — every row
+        // still present is one the delete chose to keep — rather than from the
         // rule that chose them. A number the user is shown ("1 queued file will
         // still be sent") should be an observation, not a restatement of the
         // intent.
-        let kept = self
-            .chat
-            .outbox_for(&peer)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| matches!(self.chat.get(&peer, &e.message_id), Ok(Some(_))))
-            .count();
+        //
+        // Counted by STORED KEY, never by a successful decode. `delete_
+        // conversation` keeps rows by key, so a kept row written by a newer
+        // schema is real and present; a count that only saw rows this build can
+        // read would report `kept: 0` while the thread stayed listed with a row
+        // in it the user can neither see nor remove. It is also what lets a
+        // file still being staged — kept, but with no outbox entry naming it
+        // yet — be counted at all.
+        let kept = self.chat.record_count(&peer).unwrap_or_default();
         Ok(json!({ "removed": removed, "kept": kept }))
     }
 
@@ -3515,6 +3533,25 @@ mod tests {
     /// on-disk store), and the `TempDir` that backs both — returned so the
     /// caller can keep it alive for the duration of the test.
     fn test_manager_full(name: &str, daemon_port: u16) -> (Manager, ChatStore, tempfile::TempDir) {
+        let (mgr, chat, _raw, dir) = test_manager_parts(name, daemon_port);
+        (mgr, chat, dir)
+    }
+
+    /// [`test_manager_full`] plus the raw [`AppStore`] behind that `ChatStore`,
+    /// so a test can write a value no `ChatStore` method can produce — a
+    /// conversation row this build cannot decode in particular, which is what a
+    /// row written by a newer schema looks like from here.
+    ///
+    /// [`AppStore`]: peerbeam_domain::port::AppStore
+    fn test_manager_parts(
+        name: &str,
+        daemon_port: u16,
+    ) -> (
+        Manager,
+        ChatStore,
+        Arc<dyn peerbeam_domain::port::AppStore>,
+        tempfile::TempDir,
+    ) {
         let quic = Arc::new(QuicTransport::new().expect("quic transport"));
         let rm = Arc::new(RouteManager::new(quic.clone()));
         let enc = Arc::new(AeadCrypto::new());
@@ -3534,7 +3571,7 @@ mod tests {
                 chat_key,
                 enc.clone(),
             ));
-        let chat = ChatStore::new(appstore);
+        let chat = ChatStore::new(appstore.clone());
         let staging = Arc::new(StagingStore::new(
             dir.path()
                 .join("outbox-blobs")
@@ -3560,7 +3597,7 @@ mod tests {
             daemon_port,
             None,
         );
-        (mgr, chat, dir)
+        (mgr, chat, appstore, dir)
     }
 
     // ── the transfer → chat-record bridge ────────────────────────
@@ -4322,7 +4359,10 @@ mod tests {
             size: 4096,
             staged_path: blob.to_string_lossy().into_owned(),
         };
-        chat.enqueue_file(&peer, &r, &staged).expect("queue it");
+        assert!(
+            chat.enqueue_file(&peer, &r, &staged).expect("queue it"),
+            "the row seeded above is there, so it queues"
+        );
         let _ = mgr; // the manager owns the staging store these paths live under
         (peer, r.id, staged.staged_path)
     }
@@ -5831,16 +5871,19 @@ mod tests {
         std::fs::create_dir_all(blob_root).expect("blob root");
         let blob = blob_root.join(&r.id);
         std::fs::write(&blob, b"bytes").expect("seed the blob");
-        chat.enqueue_file(
-            peer,
-            &r,
-            &peerbeam_chat::StagedFile {
-                name: name.to_string(),
-                size: 5,
-                staged_path: blob.to_string_lossy().into_owned(),
-            },
-        )
-        .expect("queue it");
+        assert!(
+            chat.enqueue_file(
+                peer,
+                &r,
+                &peerbeam_chat::StagedFile {
+                    name: name.to_string(),
+                    size: 5,
+                    staged_path: blob.to_string_lossy().into_owned(),
+                },
+            )
+            .expect("queue it"),
+            "the row seeded above is there, so it queues"
+        );
         (r.id, blob)
     }
 
@@ -6297,6 +6340,99 @@ mod tests {
             .expect("delete");
         assert_eq!(again["removed"], 0);
         assert_eq!(again["kept"], 0);
+    }
+
+    /// **`kept` counts what survived, including a row this build cannot read.**
+    ///
+    /// `delete_conversation` keeps rows by stored key, decodable or not, so a
+    /// kept row written by a newer schema is really there. Counting it through
+    /// a decode instead dropped it: the user was told "Deleted 1 message" with
+    /// no mention of anything kept, while the thread stayed listed with a row
+    /// in it they can neither see nor remove.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_counts_a_kept_row_it_cannot_decode() {
+        let (mgr, chat, raw, dir) = test_manager_parts("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // One removable settled message, and one queued file whose row is then
+        // overwritten with something only a newer build could read.
+        let m = peerbeam_chat::ChatMessage::new("settled").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+        let (queued_id, _blob) = seed_queued_file(
+            &chat,
+            &dir.path().join("outbox-blobs"),
+            &peer,
+            "waiting.mkv",
+        );
+        raw.put(
+            &peerbeam_chat::namespace(&peer),
+            &queued_id,
+            b"{\"from\":\"the-future\"}",
+        )
+        .expect("make the kept row undecodable");
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            1,
+            "the undecodable row is invisible to `history` — that is the trap"
+        );
+
+        let out = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(out["removed"], 1, "the settled text: {out}");
+        assert_eq!(
+            out["kept"], 1,
+            "the row backing the queued file was kept and must be reported: {out}"
+        );
+        assert!(
+            mgr.chat
+                .contains(&peer, &queued_id)
+                .expect("the kept row is still on disk"),
+            "and it really is still there — the count is an observation"
+        );
+    }
+
+    /// **A queued decline must not keep the inbound row it names.**
+    ///
+    /// Its `message_id` is the sender's `FileRef` id, so in our namespace it
+    /// names the row we *refused*. Keeping it reported "1 queued message was
+    /// kept and will still be sent" about a file the user turned down, and left
+    /// the thread listed and undeletable until that peer returned.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_does_not_keep_a_row_for_a_queued_decline() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let theirs = peerbeam_chat::FileRef::new("theirs.iso", 900).expect("file ref");
+        let mut declined = peerbeam_chat::ChatRecord::file_in(&peer, &theirs);
+        declined.status = ChatStatus::Declined;
+        chat.append(&declined).expect("seed the declined row");
+        assert!(chat
+            .enqueue_decline(&peer, &peerbeam_chat::FileDecline::new(&theirs.id))
+            .expect("queue the decline"));
+
+        let out = mgr
+            .chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+        assert_eq!(out["removed"], 1, "{out}");
+        assert_eq!(
+            out["kept"], 0,
+            "a refused file is not something the user is still sending: {out}"
+        );
+
+        let listed = mgr.chat_conversations(&json!({})).expect("conversations");
+        assert!(
+            listed["peers"].as_array().expect("peers").is_empty(),
+            "the thread is gone rather than waiting on a peer that may never \
+             return: {listed}"
+        );
+        // The decline itself is untouched and still goes out when he does.
+        let queued = chat.outbox_for(&peer).expect("outbox");
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].message_id, theirs.id);
     }
 
     /// An absent or empty `peer_id` is a caller bug, not "some conversation" —

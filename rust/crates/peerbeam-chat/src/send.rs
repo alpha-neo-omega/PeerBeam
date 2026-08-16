@@ -294,6 +294,23 @@ pub fn begin_file_send(
 /// `progress` receives the running byte count of the copy, so a surface can show
 /// a determinate bar; `cancel` stops it within one 64 KiB buffer, leaving no
 /// blob and no queue entry.
+///
+/// # `Ok(None)`: the conversation was deleted while we copied
+///
+/// A copy runs for as long as the file is big, and `chat_delete` can land in
+/// the middle of it. `ChatStore::delete_conversation` keeps a `Staging` row
+/// precisely so that this is nearly impossible, but "nearly" is not a contract:
+/// the row is read inside [`ChatStore::enqueue_file`], and if it has gone by
+/// then nothing is queued. There is exactly one honest response, and it is the
+/// one below — delete the blob we staged and tell the caller to publish
+/// nothing.
+///
+/// Queueing anyway would offer the peer a file that the very next drain tick
+/// discards (a queue entry with no record is read as "nothing will ever settle
+/// this"), leaving them an approval prompt for a stream that never comes.
+/// Keeping the blob would leak the bytes until a sweep collected them. `None`
+/// is not a failure, so no row is marked `Failed`: there is no row, and the
+/// user's own delete is what removed it.
 #[allow(clippy::too_many_arguments)]
 pub async fn stage_file_send(
     store: &ChatStore,
@@ -304,7 +321,7 @@ pub async fn stage_file_send(
     limits: StagingLimits,
     cancel: &TransferControl,
     progress: &UnboundedSender<u64>,
-) -> Result<StagedFile, SendError> {
+) -> Result<Option<StagedFile>, SendError> {
     let staged = match staging.stage(&r.id, path, limits, cancel, progress).await {
         Ok(s) => s,
         Err(e) => {
@@ -315,8 +332,16 @@ pub async fn stage_file_send(
         }
     };
     r.size = staged.size;
-    store.enqueue_file(peer, r, &staged)?;
-    Ok(staged)
+    if !store.enqueue_file(peer, r, &staged)? {
+        staging.remove(&staged.staged_path);
+        tracing::info!(
+            message_id = %r.id,
+            peer_id = %peer.0,
+            "staged file dropped: its conversation was deleted while it was being copied"
+        );
+        return Ok(None);
+    }
+    Ok(Some(staged))
 }
 
 /// Stage a picked file and queue it for delivery: [`begin_file_send`] followed
@@ -325,6 +350,10 @@ pub async fn stage_file_send(
 /// Returns the [`FileRef`] to publish on CHAT and the [`StagedFile`] whose
 /// `staged_path` is what the transfer must read — never the user's original,
 /// which may be deleted, moved or rewritten between queueing and delivery.
+///
+/// `Ok(None)` carries [`stage_file_send`]'s own "the conversation was deleted
+/// while we copied" answer through unchanged: nothing is queued, no blob is
+/// left behind, and the caller must publish no `FileRef`.
 pub async fn prepare_file_send(
     store: &ChatStore,
     staging: &StagingStore,
@@ -333,11 +362,14 @@ pub async fn prepare_file_send(
     limits: StagingLimits,
     cancel: &TransferControl,
     progress: &UnboundedSender<u64>,
-) -> Result<(FileRef, StagedFile), SendError> {
+) -> Result<Option<(FileRef, StagedFile)>, SendError> {
     let mut r = begin_file_send(store, peer, path)?;
-    let staged =
-        stage_file_send(store, staging, peer, &mut r, path, limits, cancel, progress).await?;
-    Ok((r, staged))
+    let Some(staged) =
+        stage_file_send(store, staging, peer, &mut r, path, limits, cancel, progress).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((r, staged)))
 }
 
 /// Send a prepared [`FileRef`] over the session's CHAT channel.
@@ -529,6 +561,12 @@ mod tests {
     }
 
     /// `prepare_file_send` without the progress/cancel ceremony a caller needs.
+    ///
+    /// Unwraps the "the conversation was deleted while we copied" answer: no
+    /// test using this helper deletes anything mid-stage, so a `None` here
+    /// would be a bug in the helper's own fixture rather than a case to handle.
+    /// The tests that *do* exercise that answer call `stage_file_send`
+    /// directly.
     async fn prepare(
         cs: &ChatStore,
         st: &StagingStore,
@@ -537,7 +575,11 @@ mod tests {
         path: &str,
     ) -> Result<(FileRef, StagedFile), SendError> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        prepare_file_send(cs, st, peer, path, limits, &TransferControl::new(), &tx).await
+        Ok(
+            prepare_file_send(cs, st, peer, path, limits, &TransferControl::new(), &tx)
+                .await?
+                .expect("the row is never deleted under these tests"),
+        )
     }
 
     /// The contract the whole send path rests on: one id names the chat row, the
@@ -640,7 +682,8 @@ mod tests {
             &tx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the row is still there, so it queues");
 
         assert_eq!(staged.size, 4096, "the blob holds what was copied");
         assert_eq!(
@@ -685,6 +728,73 @@ mod tests {
         assert!(
             cs.outbox_for(&peer).unwrap().is_empty(),
             "a refused stage must queue nothing"
+        );
+    }
+
+    /// **A conversation deleted while the copy was running.** The row is read
+    /// inside `enqueue_file`, and by the time a multi-GB stage finishes it may
+    /// simply not be there.
+    ///
+    /// There is one honest outcome and this pins all of it: nothing queued, and
+    /// **no blob left on disk**. Queueing anyway would put a `FileRef` in front
+    /// of the peer that the next drain tick discards — an approval prompt for a
+    /// stream that never comes — and keeping the blob would leak the bytes
+    /// until a sweep collected them. The blob assertion is the load-bearing
+    /// one: an implementation that merely returned `None` and walked away would
+    /// pass everything else here.
+    ///
+    /// The row is removed through the raw `AppStore` rather than through
+    /// `delete_conversation`, which now (correctly) keeps a `Staging` row —
+    /// this is the residual window that keep leaves, not the one it closes.
+    #[tokio::test]
+    async fn stage_file_send_whose_row_has_gone_queues_nothing_and_leaves_no_blob() {
+        let (cs, raw, dir) = store_with_raw();
+        let (st, limits) = staging(&dir);
+        let peer = DeviceId::from("pb-bob");
+        let path = dir.path().join("holiday.mp4");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+        let mut r = begin_file_send(&cs, &peer, &path.to_string_lossy()).unwrap();
+        // The delete lands mid-copy.
+        assert!(raw.delete(&crate::store::namespace(&peer), &r.id).unwrap());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let staged = stage_file_send(
+            &cs,
+            &st,
+            &peer,
+            &mut r,
+            &path.to_string_lossy(),
+            limits,
+            &TransferControl::new(),
+            &tx,
+        )
+        .await
+        .expect("a deleted conversation is not an error, just nothing to queue");
+
+        assert!(staged.is_none(), "the caller must publish no FileRef");
+        assert!(
+            cs.outbox_pending().unwrap().is_empty(),
+            "nothing is queued for a conversation that no longer exists"
+        );
+        assert!(
+            cs.history(&peer).unwrap().is_empty(),
+            "and no row is resurrected under the peer"
+        );
+        // The bytes really were let go — the whole reason this is not simply a
+        // `false` the caller ignores.
+        let blob = dir.path().join("blobs").join(&r.id);
+        assert!(
+            !blob.exists(),
+            "the staged copy must be deleted, not left to leak: {}",
+            blob.display()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("blobs"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "no blob under any name survives"
         );
     }
 
@@ -811,16 +921,19 @@ mod tests {
         .unwrap();
         let blob = dir.path().join(&r.id);
         std::fs::write(&blob, b"a").unwrap();
-        cs.enqueue_file(
-            &peer,
-            &r,
-            &StagedFile {
-                name: "a.bin".into(),
-                size: 1,
-                staged_path: blob.to_string_lossy().into_owned(),
-            },
-        )
-        .unwrap();
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &r,
+                &StagedFile {
+                    name: "a.bin".into(),
+                    size: 1,
+                    staged_path: blob.to_string_lossy().into_owned(),
+                },
+            )
+            .unwrap(),
+            "the row seeded above is there, so it queues"
+        );
         assert_eq!(
             next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
             r.id
