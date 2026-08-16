@@ -581,8 +581,17 @@ fn begin_refusal(e: SendError) -> CliError {
 /// of the app being on this machine by coincidence — an invocation pointed
 /// elsewhere with `--config` queues somewhere that app cannot see.
 ///
+/// **And it is true only of a `--to` send.** An `--addr` target carries the
+/// routing placeholder [`commands::ADDR_PEER_ID`], so its row and its outbox
+/// entry are filed under the literal peer id `addr` — while *both* drains
+/// (`drain_tick` here, `runtime::chat_drain_loop` in the FFI) resolve the peers
+/// they flush out of discovery, which never yields that id. Nothing delivers
+/// such an entry, and no running app changes that, so the paragraph above must
+/// not be printed for one: see [`queued_lines`].
+///
 /// The staged size is named because the queue now holds a full copy of the
-/// file, and the second line is the way to get those bytes back.
+/// file, and the second line is the way to get those bytes back — the one thing
+/// that is true of both cases.
 fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: &FileRef) {
     if ctx.json {
         // The same event and the same keys the delivered case emits — only
@@ -609,14 +618,38 @@ fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: 
 /// "a running daemon/watch will deliver", which reads naturally, is one word
 /// shorter, and is false for a file on this surface. A test can catch that; a
 /// comment cannot.
+///
+/// **Two different claims, because there are two different outcomes**, and the
+/// discriminator is `peer_id` itself rather than a flag threaded down from the
+/// call site — the entry's deliverability is a property of the key it is filed
+/// under, not of how the caller happened to spell the target. A `--to` send is
+/// filed under the peer's real device id, which a running app's drain can look
+/// up in discovery and come back for. An `--addr` send is filed under
+/// [`commands::ADDR_PEER_ID`], which no drain can ever resolve, so the first
+/// line must promise nothing at all. The second line is identical either way:
+/// `chat cancel` takes whichever id the row is actually under, and releasing the
+/// bytes is the one action that works in both cases.
 fn queued_lines(peer_name: &str, peer_id: &str, file_ref: &FileRef) -> [String; 2] {
-    [
+    let first = if peer_id == commands::ADDR_PEER_ID {
+        format!(
+            "staged for {peer_name} — {} bytes copied and the row recorded, but nothing will \
+             deliver it: an `--addr` send is filed under the placeholder peer id `{}`, and every \
+             drain resolves its peers through discovery, which never yields that id. A queued \
+             file drains only for a peer addressed by name (`--to`); with `--addr` the peer must \
+             be reachable at send time.",
+            file_ref.size,
+            commands::ADDR_PEER_ID,
+        )
+    } else {
         format!(
             "queued for {peer_name} — {} bytes staged; a running PeerBeam app sharing this data \
              directory delivers it (`daemon`/`receive`/`chat watch` drain queued text and \
              declines, not files)",
             file_ref.size
-        ),
+        )
+    };
+    [
+        first,
         format!(
             "`chat cancel {peer_id} {}` drops it and frees the staged bytes",
             file_ref.id
@@ -1701,6 +1734,14 @@ mod tests {
     /// makes text's "a running daemon/watch will deliver" wording false here.
     /// The tempting edit is to borrow it anyway; this is what stops that being
     /// invisible.
+    ///
+    /// **And the `--addr` half, which is a stronger claim.** That target is
+    /// filed under the routing placeholder `commands::ADDR_PEER_ID`, and both
+    /// drains — `drain_tick` above and the FFI's `chat_drain_loop` — pick the
+    /// peers they flush out of discovery, which never yields that id. So the
+    /// running-app sentence is not merely unhelpful there, it is false: nothing
+    /// delivers that entry, ever. The two cases are pinned in one test on
+    /// purpose, so an edit to either wording has to look at the other.
     #[test]
     fn the_queued_message_names_what_actually_delivers_a_queued_file() {
         let r = FileRef::new("movie.mkv", 5_368_709_120).expect("file ref");
@@ -1730,6 +1771,38 @@ mod tests {
             second,
             format!(
                 "`chat cancel pb-bob {}` drops it and frees the staged bytes",
+                r.id
+            )
+        );
+
+        // ── `--addr`: same staging, no delivery at all. ──────────────────
+        let [addr_first, addr_second] =
+            super::queued_lines("127.0.0.1:9999", commands::ADDR_PEER_ID, &r);
+
+        assert!(
+            !addr_first.contains("a running PeerBeam app"),
+            "the `--to` promise is FALSE here — the entry is filed under a placeholder id no \
+             drain can resolve: {addr_first}"
+        );
+        assert!(
+            addr_first.contains("nothing will deliver it"),
+            "an `--addr` queue must say plainly that it never drains: {addr_first}"
+        );
+        assert!(
+            addr_first.contains("5368709120 bytes"),
+            "the bytes are on disk either way — say how many: {addr_first}"
+        );
+        assert!(
+            addr_first.contains("--to"),
+            "…and must name the only routing that lets a queued file drain: {addr_first}"
+        );
+
+        // `chat cancel` is the sole way out for this one, so it must stay
+        // copy-pasteable under the placeholder id the row is really filed under.
+        assert_eq!(
+            addr_second,
+            format!(
+                "`chat cancel addr {}` drops it and frees the staged bytes",
                 r.id
             )
         );

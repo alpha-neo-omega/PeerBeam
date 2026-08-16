@@ -975,6 +975,18 @@ pub(crate) fn read_confirm(reader: &mut impl std::io::BufRead) -> Option<bool> {
     }
 }
 
+/// The routing placeholder device id every `--addr` target carries.
+///
+/// An explicit address names no *discovered* device, so there is no real device
+/// id to put here until a session authenticates one. That is harmless for
+/// routing — the dial only needs the address — but it is load-bearing for
+/// anything durable keyed by it: every drain in this project (`chat::drain_tick`
+/// here, `runtime::chat_drain_loop` in the FFI) picks the peers it flushes out of
+/// *discovery*, which can never yield this literal. So a queue filed under it is
+/// a queue nothing will ever come back for. `chat::queued_lines` is where a user
+/// is told that, and `chat cancel addr <id>` is how they undo it.
+pub(crate) const ADDR_PEER_ID: &str = "addr";
+
 /// A minimal `Device` for a `--addr` target (a single explicit route).
 pub(crate) fn target_device(
     name: String,
@@ -984,7 +996,7 @@ pub(crate) fn target_device(
     use peerbeam_domain::entity::{Device, DeviceType};
     use peerbeam_domain::id::DeviceId;
     Device {
-        id: DeviceId::from("addr"),
+        id: DeviceId::from(ADDR_PEER_ID),
         name,
         device_type: DeviceType::Desktop,
         platform: peerbeam_platform::current(),
