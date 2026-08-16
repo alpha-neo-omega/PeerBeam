@@ -251,23 +251,35 @@ fn sender_path(chat: &ChatStore, peer: &DeviceId, id: &str) -> Option<String> {
 /// afterwards — the queued-file drain, which must decide between dequeueing,
 /// deleting the staged blob, and counting a refusal against the backstop.
 ///
-/// `Failed`'s `bytes_moved` is the entire basis of that counting rule, and it
-/// is exact rather than a heuristic. `stream::send_file` sends `Meta` and then
-/// **waits for the receiver's `Control::ResumeAck`** before it reads or sends a
-/// single chunk; the receiver only reaches the code that sends that ack after
-/// its approval gate has resolved in favour of accepting (`handle_incoming`
-/// calls `receive_on_channel` only on the accepted branch). So:
+/// `Failed` carries the two facts that decide whether an attempt may be counted
+/// as a refusal, because getting that wrong tells a user their peer refused a
+/// file when it did not:
 ///
-/// * **zero bytes** — the receiver never accepted: it refused, or nobody
-///   answered the prompt. That is an offer that *reached* the peer and was
-///   turned down at the gate, which is what the backstop counts;
-/// * **any bytes at all** — the receiver did accept, and something failed
-///   afterwards. An ordinary mid-stream fault, retryable forever, never counted.
+/// * **`bytes_moved > 0`** — the receiver definitely accepted.
+///   `stream::send_file` sends `Meta`, waits for the receiver's
+///   `Control::ResumeAck`, and only then sends chunks; the receiver reaches the
+///   code that sends that ack only after its approval gate resolved in favour
+///   of accepting (`handle_incoming` calls `receive_on_channel` on the accepted
+///   branch alone). So any byte at all means this was a mid-stream fault:
+///   retryable forever, never counted.
+/// * **`local_fault`** — the failure was **ours**: a `DomainError::Storage`,
+///   i.e. the staged blob unreadable or gone, a permissions error, or a failed
+///   `hash_prefix` on a resumed leg. Every one of those happens *after*
+///   `recv_resume_ack` returns (`send_file` does not open the source until the
+///   ack is in), so they can present as zero bytes moved even though the
+///   receiver said yes. Counting them would spend a refusal credit on our own
+///   disk, and at the third would blame the peer for it in the user's history.
+///
+/// A zero-byte failure that is neither is what the backstop counts: the offer
+/// reached the peer and died at its approval gate. One ambiguity remains and is
+/// accepted — a link that drops in the single round trip between `ResumeAck`
+/// and the first chunk is indistinguishable, without plumbing a flag out of the
+/// transfer engine, from one that drops just before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegOutcome {
     Delivered,
     Cancelled,
-    Failed { bytes_moved: u64 },
+    Failed { bytes_moved: u64, local_fault: bool },
 }
 
 /// How many offers may reach a peer and be refused (or time out) at its
@@ -960,8 +972,12 @@ impl Manager {
         let leg = match &outcome {
             Ok(TransferOutcome::Completed) => LegOutcome::Delivered,
             Ok(TransferOutcome::Cancelled) => LegOutcome::Cancelled,
-            Err(_) => LegOutcome::Failed {
+            Err(e) => LegOutcome::Failed {
                 bytes_moved: active.stats.lock().unwrap().transferred,
+                // A storage error is ours, not the peer's: `send_file` does not
+                // touch the source until after the receiver's `ResumeAck`, so
+                // this can read as zero bytes while the peer accepted perfectly.
+                local_fault: matches!(e, peerbeam_domain::error::DomainError::Storage(_)),
             },
         };
         self.finish(active, outcome);
@@ -1695,6 +1711,28 @@ impl Manager {
         let name = staged.name.clone();
         let size = staged.size;
 
+        // The bytes must still be there before anyone is offered them. Without
+        // this check a blob that has gone (app data wiped, an over-eager sweep,
+        // a full disk) is still offered: the peer is prompted, accepts, and
+        // *then* the send fails on our own `open_read` — three times over, each
+        // one a pointless prompt for a file that can never arrive.
+        //
+        // SKIP, never delete. `Path::exists` is false for a transient
+        // permissions or I/O error too, and deleting on that would throw away a
+        // perfectly good queue entry and the user's only copy of the bytes. A
+        // transient failure costs one drain tick; a permanent one costs a dial
+        // per tick, which is visible in the log rather than silent.
+        if !std::path::Path::new(&staged.staged_path).exists() {
+            session.close().await;
+            self.release_file_slot(&peer.0);
+            tracing::warn!(
+                message_id = %id,
+                staged_path = %staged.staged_path,
+                "queued file skipped: its staged bytes are not readable"
+            );
+            return;
+        }
+
         // The gate. Capture the answer, then close on the refusal path — the
         // exact bug this ordering exists to prevent is a `?`-style early return
         // that skips `session.close()`.
@@ -1750,8 +1788,37 @@ impl Manager {
             tracing::warn!(message_id = %id, "queued file deferred: transfer id in use");
             return;
         };
-        if let Err(e) = self.chat.reopen_for_retry(&peer, &id) {
-            tracing::warn!(error = %e, message_id = %id, "queued file row not re-opened");
+        // The row must actually be in flight before the bytes are, and a
+        // failure here is terminal FOR THIS ATTEMPT rather than something to
+        // warn about and carry on through.
+        //
+        // Carrying on is the trap: the row would not be `Transferring`, so
+        // `chat_settle`'s guard would silently drop the terminal write while
+        // the transfer ran anyway — the file ARRIVES, and the sender's row is
+        // stuck forever with the queue entry already dequeued, so nothing is
+        // left to retry it. Reachable without any exotic failure: a peer
+        // declines, `settle_queued_file`'s read of the row fails transiently so
+        // the entry stays queued, and the next drain finds a `Declined` row
+        // that `reopen_for_retry` (correctly) refuses.
+        match self.chat.reopen_for_retry(&peer, &id) {
+            Ok(true) => {}
+            other => {
+                let _ = self.claim(&active); // release the id we just claimed
+                session.close().await;
+                self.release_file_slot(&peer.0);
+                if matches!(other, Ok(false)) && !self.row_may_still_deliver(&peer, &id) {
+                    // Settled (`Sent`/`Declined`) or gone: no future drain can
+                    // re-open it either, so stop retrying and let go of the
+                    // bytes instead of re-dialing this peer forever.
+                    self.drop_queued_file(&id, &staged.staged_path);
+                }
+                tracing::warn!(
+                    result = ?other,
+                    message_id = %id,
+                    "queued file not offered: its row would not re-open"
+                );
+                return;
+            }
         }
 
         events::transfer(
@@ -1787,7 +1854,8 @@ impl Manager {
     /// | cancelled by the user | dequeued | deleted |
     /// | the peer declined (a `FileDecline` settled our row mid-flight) | dequeued | deleted |
     /// | failed after bytes moved (mid-stream fault) | left queued, nothing counted | kept |
-    /// | failed with no bytes (refused or unanswered at the approval gate) | counted; terminal at [`MAX_OFFERS_REFUSED`] | kept until terminal |
+    /// | failed on **our own** storage (`local_fault`) | left queued, nothing counted | kept |
+    /// | failed with no bytes and no local fault (refused or unanswered at the approval gate) | counted; terminal at [`MAX_OFFERS_REFUSED`] | kept until terminal |
     ///
     /// **A connection failure never reaches this function at all** — it fails
     /// before a session exists, so nothing is counted and the file waits
@@ -1812,17 +1880,29 @@ impl Manager {
                 LegOutcome::Delivered | LegOutcome::Cancelled => true,
                 // The receiver accepted and something failed afterwards: an
                 // ordinary fault, retryable forever, never counted as a refusal.
-                LegOutcome::Failed { bytes_moved } if bytes_moved > 0 => false,
+                LegOutcome::Failed { bytes_moved, .. } if bytes_moved > 0 => false,
+                // Our own storage failed. `send_file` opens the source only
+                // after the receiver's `ResumeAck`, so this reads as zero bytes
+                // while the peer may have accepted — counting it would spend a
+                // refusal credit on our disk and end by blaming the peer.
+                LegOutcome::Failed {
+                    local_fault: true, ..
+                } => false,
                 LegOutcome::Failed { .. } => {
                     // The offer reached the peer and was refused, or nobody
                     // answered. Count it, and give up once the budget is spent.
                     let count = self.chat.outbox_bump_refused(id).unwrap_or(0);
                     if count >= MAX_OFFERS_REFUSED {
+                        // Deliberately not "{peer} did not accept this file":
+                        // zero bytes at the gate is the *likeliest* reading, but
+                        // a link that dropped in the round trip after the
+                        // receiver's ack looks identical from here, and a
+                        // history row must not assert a refusal it cannot know.
                         self.fail_chat_file(
                             &peer.0,
                             id,
                             &format!(
-                                "{} did not accept this file after {count} attempts — \
+                                "could not be delivered to {} after {count} attempts — \
                                  it will not be offered again",
                                 peer.0
                             ),
@@ -1837,6 +1917,31 @@ impl Manager {
         if !terminal {
             return;
         }
+        self.drop_queued_file(id, staged_path);
+    }
+
+    /// Whether a future drain could still deliver the row at `(peer, id)`.
+    ///
+    /// `Sent` and `Declined` are final, and a row that is not there at all can
+    /// never be settled, so a queue entry pointing at either will never deliver
+    /// however often it is retried — those are the only two answers that
+    /// justify discarding the entry. Everything else may still become
+    /// deliverable, including a stale `Transferring` that a restart's reconcile
+    /// has not reached yet; and an *unreadable* store answers "yes", so a
+    /// transient read error never throws a queue entry away.
+    fn row_may_still_deliver(&self, peer: &DeviceId, id: &str) -> bool {
+        match self.chat.get(peer, id) {
+            Ok(Some(rec)) => !matches!(rec.status, ChatStatus::Sent | ChatStatus::Declined),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// Let go of a queue entry and the bytes it owned. Split out of
+    /// [`settle_queued_file`](Self::settle_queued_file) so the other place that
+    /// must stop retrying — a row that will never re-open — releases exactly the
+    /// same two things, in the same order.
+    fn drop_queued_file(&self, id: &str, staged_path: &str) {
         if let Err(e) = self.chat.outbox_remove(id) {
             tracing::warn!(error = %e, message_id = %id, "queued file not dequeued");
         }
@@ -3701,37 +3806,63 @@ mod tests {
         (peer, r.id, staged.staged_path)
     }
 
+    /// A leg that failed with nothing moved and no local fault — what an offer
+    /// refused (or unanswered) at the peer's approval gate looks like from the
+    /// sending side, and the only shape the backstop counts.
+    fn gate_refusal() -> LegOutcome {
+        LegOutcome::Failed {
+            bytes_moved: 0,
+            local_fault: false,
+        }
+    }
+
     /// **The backstop's counting rule, in one test.** What may be counted
     /// against a queued file is narrow, and getting it wrong in either
     /// direction is a real harm: too loose and a flapping link drops a file
     /// nobody ever declined; too tight and a peer that keeps refusing is
     /// re-prompted forever.
     ///
-    /// A mid-stream failure — bytes demonstrably moved, so the receiver had
-    /// already accepted — is not a refusal and must count nothing. Only a
-    /// failure with **zero** bytes is: the receiver's `Control::ResumeAck` is
-    /// the first thing the sender waits for and is sent only once it has
-    /// accepted, so zero bytes means the offer died at the approval gate.
+    /// Two failures that are NOT refusals, and neither may be counted:
+    ///
+    /// * bytes demonstrably moved, so the receiver had already accepted and
+    ///   this is a mid-stream fault;
+    /// * the failure was our own storage. `send_file` opens the source only
+    ///   *after* the receiver's `Control::ResumeAck`, so a missing or
+    ///   unreadable staged blob presents as zero bytes moved even though the
+    ///   peer accepted — counting it would spend a refusal credit on our disk
+    ///   and, at the third, tell the user their peer refused a file it never
+    ///   saw a byte of.
     #[tokio::test]
-    async fn a_mid_stream_failure_never_counts_against_the_backstop() {
-        let (mgr, chat, dir) = test_manager_full("backstop-bytes", 0);
-        let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
+    async fn a_mid_stream_or_local_failure_never_counts_against_the_backstop() {
+        for leg in [
+            LegOutcome::Failed {
+                bytes_moved: 1,
+                local_fault: false,
+            },
+            LegOutcome::Failed {
+                bytes_moved: 0,
+                local_fault: true,
+            },
+        ] {
+            let (mgr, chat, dir) = test_manager_full("backstop-bytes", 0);
+            let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
 
-        // Ten failures, all after bytes moved. None may be counted, and the
-        // file must still be queued with its bytes intact.
-        for _ in 0..10 {
-            mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 1 });
+            // Ten of them. None may be counted, and the file must still be
+            // queued with its bytes intact.
+            for _ in 0..10 {
+                mgr.settle_queued_file(&peer, &id, &blob, leg);
+            }
+            let queued = chat.outbox_for(&peer).expect("outbox");
+            assert_eq!(queued.len(), 1, "{leg:?} must not dequeue");
+            assert_eq!(
+                queued[0].offers_refused, 0,
+                "{leg:?} is not the peer refusing anything"
+            );
+            assert!(
+                std::path::Path::new(&blob).exists(),
+                "{leg:?} must leave the staged bytes for the retry"
+            );
         }
-        let queued = chat.outbox_for(&peer).expect("outbox");
-        assert_eq!(queued.len(), 1, "a mid-stream fault must not dequeue");
-        assert_eq!(
-            queued[0].offers_refused, 0,
-            "a peer that accepted and then lost the link refused nothing"
-        );
-        assert!(
-            std::path::Path::new(&blob).exists(),
-            "and its staged bytes must still be there for the retry"
-        );
     }
 
     /// The other half: three offers that died at the approval gate are counted,
@@ -3746,14 +3877,14 @@ mod tests {
         crate::events::set_callback(Some(collect_bridge));
 
         for expected in 1..=2 {
-            mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 0 });
+            mgr.settle_queued_file(&peer, &id, &blob, gate_refusal());
             let queued = chat.outbox_for(&peer).expect("outbox");
             assert_eq!(queued.len(), 1, "still queued after {expected} refusal(s)");
             assert_eq!(queued[0].offers_refused, expected);
             assert!(std::path::Path::new(&blob).exists());
         }
 
-        mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 0 });
+        mgr.settle_queued_file(&peer, &id, &blob, gate_refusal());
         assert!(
             chat.outbox_for(&peer).expect("outbox").is_empty(),
             "the third refusal is terminal"
@@ -3775,8 +3906,132 @@ mod tests {
             .next_back()
             .expect("the backstop must say why it gave up");
         assert!(
-            reason.contains("did not accept") && reason.contains("3 attempts"),
-            "the reason must name the backstop, not a network error: {reason}"
+            reason.contains("could not be delivered") && reason.contains("3 attempts"),
+            "the reason must name the backstop: {reason}"
+        );
+        assert!(
+            !reason.contains("did not accept"),
+            "and must not assert a refusal we cannot know: a link that dropped \
+             after the receiver's ack looks identical from here — {reason}"
+        );
+    }
+
+    /// When a queued file's row refuses to re-open, `run_queued_file` stops the
+    /// attempt — and must then decide whether to keep the entry for a later
+    /// drain or let go of it. This is that decision, which is the only part of
+    /// the bail-out that is not obvious.
+    ///
+    /// Only two answers justify discarding a user's queued file: the row is
+    /// **final** (`Sent`/`Declined` — no future drain can re-open it either), or
+    /// there is **no row at all** (nothing left to settle). Everything else must
+    /// keep it, including a stale `Transferring` a restart's reconcile has not
+    /// reached yet, and — most importantly — a store that cannot be read, where
+    /// discarding would destroy a queue entry over a transient error.
+    #[tokio::test]
+    async fn only_a_final_or_missing_row_lets_go_of_a_queued_file() {
+        let (mgr, chat, _dir) = test_manager_full("deliverable", 0);
+        let peer = DeviceId::from("pb-bob");
+        let seed = |status: ChatStatus| {
+            let r = peerbeam_chat::FileRef::new("a.bin", 1).expect("file ref");
+            chat.append(&peerbeam_chat::ChatRecord::file_out(
+                &peer,
+                &r,
+                file_meta(&r),
+                status,
+            ))
+            .expect("seed");
+            r.id
+        };
+
+        for keep in [
+            ChatStatus::Pending,
+            ChatStatus::Staging,
+            ChatStatus::Failed,
+            ChatStatus::Interrupted,
+            ChatStatus::Transferring,
+        ] {
+            let id = seed(keep);
+            assert!(
+                mgr.row_may_still_deliver(&peer, &id),
+                "{keep:?} may still deliver — its entry must be kept"
+            );
+        }
+        for done in [ChatStatus::Sent, ChatStatus::Declined] {
+            let id = seed(done);
+            assert!(
+                !mgr.row_may_still_deliver(&peer, &id),
+                "{done:?} is final — nothing will ever deliver this entry"
+            );
+        }
+        assert!(
+            !mgr.row_may_still_deliver(&peer, "no-such-row"),
+            "a queue entry pointing at nothing can never be settled"
+        );
+    }
+
+    /// **A connection failure never costs a refusal credit — proven by driving
+    /// real, completed drain attempts.**
+    ///
+    /// This is the guarantee the whole backstop is shaped around: nobody saw
+    /// the offer, nobody was prompted, and keep-forever is the promise text
+    /// already makes. Counting attempts instead of refusals would burn the
+    /// budget during a flapping link and drop a file nobody ever declined.
+    ///
+    /// It is asserted here rather than end-to-end because the end-to-end shape
+    /// cannot assert it honestly: a dial at a dead port does not return for
+    /// `CONNECT_TIMEOUT` (8 s), so a test that queues a file for an absent peer
+    /// and checks the row a moment later is asserting a state that had no
+    /// opportunity to change — it passes just as happily with the guarantee
+    /// deleted. So this drives `chat_flush_peer` itself, `MAX_OFFERS_REFUSED +
+    /// 2` times, **awaiting each one to completion**, and only then reads the
+    /// counter.
+    ///
+    /// The address is `0.0.0.0`, which quinn rejects synchronously
+    /// (`InvalidRemoteAddress`) rather than waiting out a timeout: the branch
+    /// under test is `chat_flush_peer`'s dial-failure early return, and what it
+    /// is failing on is immaterial to that branch.
+    #[tokio::test]
+    async fn a_connection_failure_never_counts_against_the_backstop() {
+        let (mgr, chat, dir) = test_manager_full("no-route", 0);
+        let mgr = Arc::new(mgr);
+        let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
+        let device = Device {
+            id: peer.clone(),
+            name: "bob".into(),
+            device_type: DeviceType::Desktop,
+            platform: peerbeam_platform::current(),
+            addresses: vec!["0.0.0.0".into()],
+            port: 9,
+            last_seen: chrono::Utc::now(),
+        };
+
+        for attempt in 1..=(MAX_OFFERS_REFUSED + 2) {
+            let flushed = mgr.chat_flush_peer(device.clone()).await;
+            assert!(
+                flushed.is_empty(),
+                "attempt {attempt} must deliver nothing — there is no peer"
+            );
+        }
+
+        let queued = chat.outbox_for(&peer).expect("outbox");
+        assert_eq!(
+            queued.len(),
+            1,
+            "a peer we could never reach must never go terminal, however many \
+             attempts elapse"
+        );
+        assert_eq!(
+            queued[0].offers_refused, 0,
+            "nobody saw the offer, so nothing may be counted against it"
+        );
+        assert!(
+            std::path::Path::new(&blob).exists(),
+            "and its staged bytes must still be waiting"
+        );
+        assert_eq!(
+            chat.get(&peer, &id).expect("get").expect("row").status,
+            ChatStatus::Pending,
+            "the row still reads Queued, not Failed"
         );
     }
 
@@ -3788,7 +4043,7 @@ mod tests {
         for (leg, decline) in [
             (LegOutcome::Delivered, false),
             (LegOutcome::Cancelled, false),
-            (LegOutcome::Failed { bytes_moved: 0 }, true),
+            (gate_refusal(), true),
         ] {
             let (mgr, chat, dir) = test_manager_full("terminal", 0);
             let (peer, id, blob) = queued_file(&mgr, &chat, &dir);

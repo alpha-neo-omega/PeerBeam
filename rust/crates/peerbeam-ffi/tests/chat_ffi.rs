@@ -2248,18 +2248,24 @@ async fn a_declined_file_goes_terminal_and_never_re_offers() {
 /// thing the sender waits for and is only sent once it has accepted. After
 /// three, the file is given up on with a reason naming the backstop.
 ///
-/// The second half is the one that matters more: a peer that is merely
-/// **unreachable** must never burn that budget, no matter how many attempts
-/// elapse. Nobody saw the offer, nobody was prompted, and keep-forever is the
-/// promise text already makes — counting attempts instead of refusals would
-/// drop files nobody ever declined.
+/// The second half asserts the *queueing* half of the promise for a peer that
+/// is simply absent: attaching does not fail, the row reads Queued and stays
+/// there, and the bytes are waiting. It deliberately does **not** claim to
+/// prove that a connection failure is never counted — a dial to a dead port
+/// does not return for `CONNECT_TIMEOUT` (8 s), so nothing here could have
+/// counted anything by assertion time, and an assertion that cannot fail is
+/// worse than none. That guarantee is proven where it can be driven to
+/// completion, in `transfer.rs`'s
+/// `a_connection_failure_never_counts_against_the_backstop`, which awaits
+/// `MAX_OFFERS_REFUSED + 2` finished drain attempts and then reads the
+/// counter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
     let dir = tempfile::tempdir().unwrap();
     init_ffi(49917, dir.path());
 
-    // ── (a) unreachable, forever ────────────────────────────────────────────
+    // ── (a) absent: the attach queues instead of failing ───────────────────
     let gone_id = "peer-that-is-away";
     let gone_json = json!({
         "id": gone_id, "name": gone_id, "addresses": ["127.0.0.1"], "port": 49974,
@@ -2341,12 +2347,15 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
         "a file the backstop gave up on is never offered again"
     );
 
-    // ── …and the unreachable peer's file is untouched by any of it. ─────────
+    // ── …and the absent peer's file is untouched by any of it: still queued,
+    //    bytes still waiting. (That it is never *counted* is proven in the
+    //    unit test named in this test's doc comment — here the dial has not
+    //    even returned yet.) ──────────────────────────────────────────────────
     let still = chat_row(gone_id, &away_id).expect("the absent peer's row");
     assert_eq!(
         still["status"], "pending",
-        "a peer we could never reach must never go terminal: nobody saw the \
-         offer, so nothing may be counted against it"
+        "attaching to a peer that is not there queues the file and leaves it \
+         queued — it must never fail the way 2a did"
     );
     assert!(
         std::path::Path::new(&dir.path().join("data").join("outbox-blobs").join(&away_id)).exists(),
