@@ -1,5 +1,6 @@
 //! Sending a chat message over an established session.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use peerbeam_domain::id::DeviceId;
@@ -174,13 +175,37 @@ pub async fn flush_to_session(
 /// An entry whose `kind` says file but that carries no staged blob is skipped
 /// and logged rather than returned: there is nothing to send, and returning it
 /// would stall every file behind it forever.
+///
+/// An entry whose blob is **gone from disk** is skipped for the same reason.
+/// The caller re-checks before offering anything (its own `open_read` would
+/// fail otherwise), but a caller-side check alone is head-of-line blocking:
+/// this function would hand back the same dead entry every drain tick and every
+/// later file queued for that peer would sit behind it forever, with nothing
+/// but a log line to show for it. That is reachable — `SECURITY.md` tells users
+/// where the blob store lives and that it can hold gigabytes, so one clear-out
+/// of `<data_directory>/outbox-blobs/` strands the oldest entry.
+///
+/// **Skipped, never dequeued.** `Path::exists` is also false for a transient
+/// permissions or I/O error, and dropping the entry on that would throw away a
+/// queued share whose bytes are fine. The entry stays queued and recovers by
+/// itself if the blob comes back; what it loses is only its place at the head
+/// of the line.
 pub fn next_file_for(store: &ChatStore, peer: &DeviceId) -> Result<Option<PendingFile>, ChatError> {
     for entry in store.outbox_for(peer)? {
         if entry.kind != Kind::File {
             continue;
         }
         match entry.file.clone() {
-            Some(file) => return Ok(Some(PendingFile { entry, file })),
+            Some(file) if Path::new(&file.staged_path).exists() => {
+                return Ok(Some(PendingFile { entry, file }))
+            }
+            Some(file) => {
+                tracing::warn!(
+                    message_id = %entry.message_id,
+                    staged_path = %file.staged_path,
+                    "skipping a queued file entry whose staged blob is not on disk"
+                );
+            }
             None => {
                 tracing::warn!(
                     message_id = %entry.message_id,
@@ -746,7 +771,7 @@ mod tests {
     /// would stall every real file behind it forever.
     #[test]
     fn next_file_for_ignores_text_a_decline_and_a_file_entry_with_no_blob() {
-        let (cs, raw, _dir) = store_with_raw();
+        let (cs, raw, dir) = store_with_raw();
         let peer = DeviceId::from("pb-bob");
         cs.enqueue(&peer, &ChatMessage::new("hi").unwrap()).unwrap();
         cs.enqueue_decline(&peer, &FileDecline::new("0000000000001"))
@@ -774,7 +799,8 @@ mod tests {
         );
 
         // The guard cannot pass by refusing everything: a real queued file, sat
-        // behind all three of those, is still found.
+        // behind all three of those, is still found. Real to the blob, too —
+        // an entry whose bytes are missing is skipped in its own right.
         let r = FileRef::new("a.bin", 1).unwrap();
         cs.append(&ChatRecord::file_out(
             &peer,
@@ -783,19 +809,73 @@ mod tests {
             Status::Staging,
         ))
         .unwrap();
+        let blob = dir.path().join(&r.id);
+        std::fs::write(&blob, b"a").unwrap();
         cs.enqueue_file(
             &peer,
             &r,
             &StagedFile {
                 name: "a.bin".into(),
                 size: 1,
-                staged_path: "/data/blobs/a".into(),
+                staged_path: blob.to_string_lossy().into_owned(),
             },
         )
         .unwrap();
         assert_eq!(
             next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
             r.id
+        );
+    }
+
+    /// **A file whose staged bytes have gone must not block the queue behind
+    /// it.** The caller re-checks the blob before offering it and skips — but if
+    /// this function kept returning that same dead entry, every later file for
+    /// that peer would sit behind it forever, on every drain tick, with only a
+    /// log line as the symptom. Reachable without any bug: `SECURITY.md` tells
+    /// users where `outbox-blobs/` lives and that it can hold gigabytes, so one
+    /// clear-out strands the oldest entry.
+    ///
+    /// Skipped, never dequeued: the entry is still in the outbox afterwards, so
+    /// it recovers by itself if the blob comes back.
+    #[tokio::test]
+    async fn next_file_for_steps_over_an_entry_whose_blob_has_gone() {
+        let (cs, dir) = store();
+        let (st, limits) = staging(&dir);
+        let peer = DeviceId::from("pb-bob");
+
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let path = dir.path().join(format!("v{n}.mp4"));
+            std::fs::write(&path, vec![n as u8; 16]).unwrap();
+            let (r, _) = prepare(&cs, &st, limits, &peer, &path.to_string_lossy())
+                .await
+                .unwrap();
+            ids.push(r.id);
+        }
+        // The oldest is the one a drain would take. Take its bytes away.
+        let first = next_file_for(&cs, &peer).unwrap().expect("the oldest");
+        assert_eq!(first.entry.message_id, ids[0], "FIFO, before the blob goes");
+        std::fs::remove_file(&first.file.staged_path).unwrap();
+
+        let next = next_file_for(&cs, &peer)
+            .unwrap()
+            .expect("the second file must still be sendable");
+        assert_eq!(
+            next.entry.message_id, ids[1],
+            "a dead head-of-queue entry must be stepped over, not returned forever"
+        );
+        assert!(
+            std::path::Path::new(&next.file.staged_path).exists(),
+            "and what is handed over always has its bytes"
+        );
+
+        // Skipped, not dequeued — and it recovers if the blob returns.
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 2, "both still queued");
+        std::fs::write(&first.file.staged_path, vec![0u8; 16]).unwrap();
+        assert_eq!(
+            next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
+            ids[0],
+            "the oldest is head of the queue again once its bytes are back"
         );
     }
 

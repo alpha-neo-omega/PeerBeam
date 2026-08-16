@@ -1081,6 +1081,12 @@ async fn a_queued_decline_flushes_as_a_decline_and_a_queued_file_is_left_for_the
             peerbeam_chat::Status::Staging,
         ))
         .unwrap();
+    // Real bytes on disk, in a leaked temp dir like `chat_store`'s: an entry
+    // whose staged blob has gone is deliberately skipped by `next_file_for`, so
+    // a fixture pointing at a path that never existed would be exercising that
+    // skip instead of the hand-over this test is about.
+    let blob = tempfile::tempdir().unwrap().keep().join(&mine.id);
+    std::fs::write(&blob, b"abc").unwrap();
     store_a
         .enqueue_file(
             &b_id,
@@ -1088,7 +1094,7 @@ async fn a_queued_decline_flushes_as_a_decline_and_a_queued_file_is_left_for_the
             &peerbeam_chat::StagedFile {
                 name: "mine.bin".into(),
                 size: 3,
-                staged_path: "/data/outbox-blobs/mine".into(),
+                staged_path: blob.to_string_lossy().into_owned(),
             },
         )
         .unwrap();
