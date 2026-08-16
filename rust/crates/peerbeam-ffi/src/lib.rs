@@ -344,10 +344,12 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
 /// mid-flight by a crash or a hard restart: `{peer_id}` → `{changed}`. Emits a
 /// `chat_status` per settled row.
 ///
-/// Call it when a thread is opened, before rendering its history: startup
-/// reconciliation can only reach peers with queued text, so a file-only thread
-/// would otherwise show an eternal progress bar or a dead Accept button. Rows
-/// whose transfer is live right now are deliberately left alone.
+/// Call it when a thread is opened, before rendering its history. Startup
+/// reconciliation now reaches every conversation, file-only ones included, so
+/// this is not that: it is the entry point for what a *running* process
+/// strands — a row left mid-flight by a session that died without the process,
+/// which no restart will come along to settle. Rows whose transfer is live
+/// right now are deliberately left alone.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.

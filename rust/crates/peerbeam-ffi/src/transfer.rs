@@ -4047,9 +4047,10 @@ mod tests {
     /// survived a crash in either state would spin forever, and an inbound one
     /// would keep offering an Accept button whose transfer no longer exists.
     ///
-    /// Startup reconciliation cannot reach these: it can only enumerate peers
-    /// with queued *text*, and a file-only thread has none. This is the entry
-    /// point that settles them, and it must leave everything else alone.
+    /// Startup reconciliation now enumerates every conversation, so it does
+    /// reach a file-only thread — but it only runs at startup. This is the
+    /// entry point for a row a *running* process stranded, and it must leave
+    /// everything else alone.
     #[tokio::test]
     async fn chat_reconcile_settles_only_the_rows_nothing_will_ever_finish() {
         let (mgr, chat, _dir) = test_manager_full("reconcile", 0);
