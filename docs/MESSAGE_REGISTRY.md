@@ -108,7 +108,15 @@ belonging to each capability's future spec:
   only, never `.` or `..`. **This narrows what the wire accepts** — a peer
   minting an exotic id that a 2a build decoded is now refused, and because
   the refusal is a frame-decode error it closes the Chat channel (never the
-  session or its other channels, per §6's channel-scoped rule). The same rule
+  session or its other channels, per §6's channel-scoped rule). It is
+  permitted under §7's *validation may tighten* rule because **the looser
+  domain was never interoperable**: this one field has two consumers, and the
+  receiving side has always validated it as a transfer id
+  (`is_valid_transfer_id`), minting a fresh id when it failed. So an exotic id
+  accepted by the chat decoder opened a row keyed by that id while its bytes
+  were correlated under a different, locally-minted one — the row and its
+  file stopped being one thing. No working behaviour is being removed; two
+  consumers of one field disagreed, and 2b makes them agree. The same rule
   runs on encode (`FileRef::to_frame`), so no PeerBeam build can emit an id
   its own peers would reject; a non-conforming id therefore only arrives from
   another implementation. An id is **rejected, never sanitised** — a rewritten
@@ -191,6 +199,14 @@ Fail-safe, never fail-crash (I11):
   reused.
 - **Capability-advertised, not assumed.** A sender only emits a MessageType/channel
   the peer advertised support for; forward compatibility is negotiated, not hoped for.
+- **Validation may tighten; meaning may not.** The set of values a field accepts may be
+  narrowed within a major version *only* when the looser domain was never interoperable
+  — e.g. a value one consumer accepted while another already refused it. Such a change
+  must be recorded in §4 against the MessageType, must state the new rule exactly, must
+  be enforced symmetrically on encode and decode so no conforming build can emit what
+  its peers refuse, and must name the resulting failure mode (per §6, a decode failure
+  closes that channel only). Widening is always safe. Narrowing that would break a
+  genuinely working peer is a major-version change.
 
 ## 8. Amending the registry
 
