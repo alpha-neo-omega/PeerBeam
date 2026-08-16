@@ -249,24 +249,28 @@ async fn chat_drain_loop(engine: Arc<Engine>, manager: Arc<Manager>) {
 /// survives a restart in either state would spin forever with no event coming;
 /// `reconcile_peer` flips those to `Interrupted`.
 ///
-/// **What this actually covers, and what it does not.** The store is an
-/// `AppStore`, whose port has `put`/`get`/`list`/`delete`/`clear` — all
-/// namespace-scoped. There is *no* way to enumerate namespaces, so nothing here
-/// can discover "every peer with a conversation" without adding a store-wide
-/// scan to the port, which is out of scope for this increment. So this
-/// reconciles exactly the peers the runtime can already name:
-/// [`ChatStore::outbox_peers`], i.e. peers with queued **text**. A peer whose
-/// only unsettled row is a file — the case this feature actually creates, since
-/// increment 2a has no file outbox — is *not* covered here. Those are settled
-/// per-conversation by [`crate::pb_chat_reconcile`], which a surface calls when
-/// it opens a thread (and which additionally skips any row whose transfer is
-/// live, since by then one can be). Worth revisiting if the `AppStore` port
-/// ever grows namespace enumeration.
+/// **Every conversation, not just the queued ones.** This enumerates
+/// [`ChatStore::conversations`], which is derived from the namespaces that
+/// actually exist, so a thread is reconciled because it is *there* — not
+/// because something happens to still be queued for it.
+///
+/// It used to enumerate `ChatStore::outbox_peers`, i.e. peers with queued
+/// **text**, because the `AppStore` port had no way to list namespaces. That
+/// left a hole exactly where this feature puts weight: a peer whose only
+/// unsettled row is a *file* has no queued text at all, so its `Transferring`
+/// row was never settled at startup and spun forever. Nothing is lost by the
+/// change — a peer with a queued entry but no conversation namespace (a queued
+/// decline writes an entry and no row of its own) has no history to reconcile
+/// in the first place.
+///
+/// [`crate::pb_chat_reconcile`] remains the per-thread entry point a surface
+/// calls when it opens a conversation; it additionally skips any row whose
+/// transfer is live, which by then one can be.
 fn reconcile_chat(chat: &peerbeam_chat::ChatStore) {
-    let peers = match chat.outbox_peers() {
+    let peers = match chat.conversations() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "chat reconcile skipped: outbox unreadable");
+            tracing::warn!(error = %e, "chat reconcile skipped: conversations unreadable");
             return;
         }
     };
@@ -374,6 +378,30 @@ pub fn init(config_json: &str) -> OpResult {
         max_bytes: config.device.max_queued_file_bytes,
         min_free_bytes: config.device.min_free_bytes,
     };
+
+    // Bytes staged by a run that crashed between staging and enqueue are owned
+    // by nothing: nothing will ever send them and nothing will ever delete
+    // them, so without this they sit on disk forever.
+    //
+    // `outbox_owned_blobs` — not the ordinary outbox readers — is what makes
+    // this safe to run at boot. `sweep` deletes every blob its `keep` set does
+    // not name, and the ordinary readers deliberately *skip* a row they cannot
+    // decode, so a wholly-unreadable outbox would hand us an empty set that is
+    // indistinguishable from an empty queue and take every queued file with
+    // it. The strict reader refuses instead, and a refusal here means we sweep
+    // nothing at all this run: leaking bytes is recoverable, deleting the
+    // user's queued file is not.
+    match chat.outbox_owned_blobs() {
+        Ok(owned) => {
+            let swept = staging.sweep(&owned);
+            if swept > 0 {
+                tracing::info!(count = swept, "removed orphaned staged files");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "orphan sweep skipped: the outbox is not fully readable");
+        }
+    }
 
     let manager = Arc::new(Manager::new(
         route_manager,
@@ -614,6 +642,55 @@ mod tests {
         assert!(
             weak_engine.upgrade().is_none(),
             "Engine should deallocate once shutdown() aborts the chat drain — its last Arc holder"
+        );
+    }
+
+    /// The hole the old startup reconciliation left, guarded where the change
+    /// actually is.
+    ///
+    /// `reconcile_chat` used to enumerate `ChatStore::outbox_peers` — peers
+    /// with something *queued*, which before 2b could only be text. A thread
+    /// whose only unsettled row is a **file**, with nothing queued at all, was
+    /// therefore never reached: its `Transferring` row survived the restart
+    /// and spun forever, showing an eternal progress bar for a transfer whose
+    /// process no longer exists. It now enumerates `conversations()`, derived
+    /// from the namespaces that actually exist, so the thread is reconciled
+    /// because it is there.
+    ///
+    /// The `outbox_peers` assertion below is what makes this discriminating:
+    /// it pins that the old enumeration genuinely had no peer to hand.
+    #[test]
+    fn reconcile_chat_settles_a_thread_whose_only_unsettled_row_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> = Arc::new(AeadCrypto::new());
+        let key = peerbeam_crypto::derive_subkey(&[7u8; 32], b"peerbeam-appstore-v1");
+        let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+            peerbeam_appstore_fs::FsAppStore::open(dir.path().join("appstore"), key, enc),
+        );
+        let chat = peerbeam_chat::ChatStore::new(app);
+
+        // An in-flight outgoing file and NOTHING queued — the exact shape the
+        // old enumeration could not name.
+        let peer = DeviceId::from("pb-file-only");
+        let r = peerbeam_chat::FileRef::new("report.pdf", 4096).unwrap();
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            peerbeam_chat::FileMeta::new(&r.name, 4096, None),
+            peerbeam_chat::Status::Transferring,
+        ))
+        .unwrap();
+        assert!(
+            chat.outbox_peers().unwrap().is_empty(),
+            "nothing is queued, so the old enumeration had no peer to reconcile"
+        );
+
+        reconcile_chat(&chat);
+
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            peerbeam_chat::Status::Interrupted,
+            "a restart must settle a row that no event will ever finish"
         );
     }
 }

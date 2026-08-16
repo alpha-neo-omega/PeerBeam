@@ -256,6 +256,16 @@ impl StagingStore {
     /// not read the queue must not call this at all rather than call it with an
     /// empty set — an empty `keep` means "nothing is owned", and every staged
     /// file waiting to be delivered would be deleted.
+    ///
+    /// Build it with [`ChatStore::outbox_owned_blobs`](crate::ChatStore::outbox_owned_blobs)
+    /// and nothing else. That call refuses (returns `Err`) rather than
+    /// under-report, which is exactly the completeness this needs; the ordinary
+    /// outbox readers deliberately *skip* an unreadable row, so a `keep` built
+    /// from one of those would silently promote that row's blob to an orphan.
+    ///
+    /// This is blocking (`read_dir` + `remove_file`). It is called once at
+    /// startup from a synchronous entry point, so it is not wrapped in
+    /// `spawn_blocking`; an async caller must do that itself.
     pub fn sweep(&self, keep: &HashSet<String>) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return 0;

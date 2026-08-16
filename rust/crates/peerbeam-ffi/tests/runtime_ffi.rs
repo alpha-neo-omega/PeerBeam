@@ -151,6 +151,88 @@ fn shutdown_releases_chat_drain_so_repeated_init_shutdown_cycles_stay_clean() {
     pb_shutdown();
 }
 
+/// The blob root `init` sweeps, and the outbox namespace directory that
+/// decides whether it may. Both are laid out by `runtime::init` /
+/// `FsAppStore` (`<data>/outbox-blobs/<id>` and
+/// `<data>/appstore/<namespace>/<hex(key)>`).
+fn blob_root(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("data/outbox-blobs")
+}
+
+/// Bytes staged by a run that crashed between staging and enqueue are owned by
+/// nothing — no queue entry will ever send them, and no settle will ever
+/// delete them, so without this they sit on disk forever.
+///
+/// This is the *genuinely empty queue* half of the startup decision, and it is
+/// what stops the guard in the next test from being satisfied by a sweep that
+/// simply never runs: an empty outbox is a complete answer, and every blob
+/// really is an orphan.
+#[test]
+#[serial_test::serial]
+fn init_sweeps_a_staged_blob_that_no_queue_entry_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    // A first run creates the identity the appstore key is derived from, so
+    // the second init below reads back the same store (readable, and empty).
+    init(dir.path());
+    pb_shutdown();
+
+    let blobs = blob_root(dir.path());
+    std::fs::create_dir_all(&blobs).unwrap();
+    let orphan = blobs.join("0000000000001");
+    std::fs::write(&orphan, b"bytes nothing owns").unwrap();
+
+    init(dir.path());
+    assert!(
+        !orphan.exists(),
+        "a staged blob no queue entry owns must not survive startup"
+    );
+    pb_shutdown();
+}
+
+/// The trap this task exists to close, end to end.
+///
+/// Every ordinary outbox reader *contains* damage rather than propagating it —
+/// an undecodable row is skipped so the rest of the queue still delivers — so
+/// a corrupted outbox reads back as "nothing is queued", indistinguishable
+/// from an empty one. `sweep` deletes every blob its `keep` set does not name.
+/// Wiring those two together naively destroys the only copy of every queued
+/// file, at boot, while each conversation row still says the file is waiting.
+///
+/// `init` consults `ChatStore::outbox_owned_blobs`, which refuses rather than
+/// under-report, and a refusal sweeps nothing at all.
+#[test]
+#[serial_test::serial]
+fn init_sweeps_nothing_when_the_outbox_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path());
+    pb_shutdown();
+
+    let blobs = blob_root(dir.path());
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob = blobs.join("0000000000002");
+    std::fs::write(&blob, b"a queued file's only copy").unwrap();
+
+    // Make the outbox unreadable. `FsAppStore` stores each record sealed at
+    // `<root>/<namespace>/<hex(key)>`; a file whose name is valid hex — so the
+    // store treats it as one of its own records rather than skipping it as
+    // debris — but whose bytes it cannot open takes the whole listing down.
+    let hex: String = "0000000000002"
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let outbox = dir.path().join("data/appstore/chat.outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    std::fs::write(outbox.join(hex), b"not a sealed record").unwrap();
+
+    init(dir.path());
+    assert!(
+        blob.exists(),
+        "a corrupted outbox must not cost the user a queued file's only copy"
+    );
+    assert_eq!(std::fs::read(&blob).unwrap(), b"a queued file's only copy");
+    pb_shutdown();
+}
+
 #[test]
 #[serial_test::serial]
 fn logs_get_subscribe_export() {

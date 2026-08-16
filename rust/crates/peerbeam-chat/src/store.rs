@@ -1,5 +1,6 @@
 //! An AppStore-backed conversation store: one namespace per peer.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,37 @@ impl ChatStore {
         self.store
             .put(&ns, &rec.id, &rec.encode())
             .map_err(|e| ChatError::Serialization(e.to_string()))
+    }
+
+    /// Every peer this device has a conversation with, ascending by id.
+    ///
+    /// Derived from the namespaces that actually exist rather than from a
+    /// separate index, which could drift from reality and silently hide a
+    /// thread — the failure this exists to prevent is a conversation nothing
+    /// at startup can name.
+    ///
+    /// [`namespace`] always emits `chat-<id>` (a dash) and the outbox is
+    /// [`OUTBOX_NS`] — `chat.outbox`, whose fifth character is a dot precisely
+    /// so the two spaces can never overlap — so this prefix scan cannot pick
+    /// the outbox up. A peer that claims the device id `outbox` still appears,
+    /// correctly, as its own conversation: that is `chat-outbox`, a different
+    /// namespace entirely.
+    ///
+    /// [`AppStore::namespaces`] reports only *populated* namespaces, so an
+    /// empty directory — left by a `clear`, or by a crash between
+    /// `create_dir_all` and the first record — is not mistaken for a thread.
+    pub fn conversations(&self) -> Result<Vec<DeviceId>, ChatError> {
+        let names = self
+            .store
+            .namespaces("chat-")
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(names
+            .into_iter()
+            .filter_map(|ns| {
+                ns.strip_prefix("chat-")
+                    .map(|id| DeviceId::from(id.to_string()))
+            })
+            .collect())
     }
 
     /// All records in the conversation with `peer`, chronological (AppStore
@@ -371,6 +403,56 @@ impl ChatStore {
         Ok(seen.into_iter().map(DeviceId::from).collect())
     }
 
+    /// Every staged blob the queue currently owns — or an error when that set
+    /// cannot be established **completely**.
+    ///
+    /// This is the one outbox reader that does *not* skip a row it cannot
+    /// decode, and the difference is the whole reason it exists as a separate
+    /// call rather than a `filter_map` over
+    /// [`outbox_pending`](Self::outbox_pending).
+    ///
+    /// Every other reader exists to **deliver**. There, skipping an unreadable
+    /// entry costs that one message and saves every other message queued
+    /// behind it in the shared outbox — containment is a strict improvement.
+    /// This one exists to decide what to **delete**:
+    /// [`StagingStore::sweep`](crate::StagingStore::sweep) removes every blob
+    /// its `keep` set does not name, so a set that is merely *incomplete* here
+    /// does not lose a row — it destroys the bytes of a file the user queued,
+    /// permanently, while that file's conversation row still says it is
+    /// waiting to be sent.
+    ///
+    /// The sharp case is an outbox that is *wholly* unreadable: `outbox_pending`
+    /// answers `Ok(vec![])` for it, which is indistinguishable from a queue
+    /// that is genuinely empty, and handing that to `sweep` would delete every
+    /// staged file on the device — at startup, before the user has done
+    /// anything. So the answer here is `Err` the moment a single entry fails to
+    /// decode: an entry we cannot read may well own a blob, and there is no way
+    /// to learn which one.
+    ///
+    /// The failure mode is therefore *leaking* bytes, never destroying them —
+    /// orphans survive until the outbox is readable again. That asymmetry is
+    /// deliberate: an orphan costs disk, a wrongly-swept blob costs the user
+    /// their file.
+    pub fn outbox_owned_blobs(&self) -> Result<HashSet<String>, ChatError> {
+        let raw = self
+            .store
+            .list(OUTBOX_NS)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        let mut owned = HashSet::with_capacity(raw.len());
+        for (key, value) in raw {
+            let entry = OutboxEntry::decode(&value).map_err(|e| {
+                ChatError::Serialization(format!(
+                    "outbox entry {key} is unreadable, so the set of staged files \
+                     still owned cannot be established: {e}"
+                ))
+            })?;
+            if let Some(file) = entry.file {
+                owned.insert(file.staged_path);
+            }
+        }
+        Ok(owned)
+    }
+
     /// Remove a delivered entry from the outbox.
     pub fn outbox_remove(&self, message_id: &str) -> Result<(), ChatError> {
         self.store
@@ -602,7 +684,7 @@ mod tests {
     use super::*;
     use crate::message::FileRef;
     use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status};
-    use crate::ChatMessage;
+    use crate::{ChatMessage, StagingStore};
     use peerbeam_appstore_fs::FsAppStore;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
     use peerbeam_domain::id::DeviceId;
@@ -1686,5 +1768,274 @@ mod tests {
         };
         let back = OutboxEntry::decode(&e.encode()).unwrap();
         assert_eq!(back, e);
+    }
+
+    // ── conversations() — startup can now name every thread, not only the
+    // ones with something queued. ───────────────────────────────────────────
+
+    /// The exact gap `outbox_peers` left. A thread whose only unsettled row is
+    /// a **file** has nothing queued as *text*, so the old startup
+    /// reconciliation could not name it and its `Transferring` row spun
+    /// forever. Also pins the two namespace confusions: the shared outbox is
+    /// never a conversation, while a peer that claims the device id `outbox`
+    /// is one — they are different namespaces (`chat.outbox` vs `chat-outbox`)
+    /// and must stay that way.
+    #[test]
+    fn conversations_lists_every_thread_including_a_file_only_one_and_never_the_outbox() {
+        let (cs, _store, _tmp) = new_store();
+
+        // (a) A peer whose only row is an in-flight file, with NOTHING queued
+        //     — invisible to `outbox_peers`, which is the whole bug.
+        let file_only = DeviceId::from("pb-file-only");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &file_only,
+            &r,
+            FileMeta::new(&r.name, 4096, None),
+            Status::Transferring,
+        ))
+        .unwrap();
+
+        // (b) A peer with queued text — the only kind `outbox_peers` could see.
+        let texter = DeviceId::from("pb-texter");
+        cs.enqueue(&texter, &ChatMessage::new("queued").unwrap())
+            .unwrap();
+
+        // (c) A peer that has claimed the device id "outbox". Device ids are
+        //     peer-supplied over the wire, so any peer can present this.
+        let impostor = DeviceId::from("outbox");
+        cs.append(&ChatRecord::received(
+            &impostor,
+            &ChatMessage::new("hi from a peer named outbox").unwrap(),
+        ))
+        .unwrap();
+
+        let mut got: Vec<String> = cs
+            .conversations()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "outbox".to_string(),
+                "pb-file-only".to_string(),
+                "pb-texter".to_string()
+            ]
+        );
+
+        // The gap, stated directly rather than implied: the old enumeration
+        // could only ever have named the peer with queued text.
+        let queued: Vec<String> = cs
+            .outbox_peers()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+        assert_eq!(queued, vec!["pb-texter".to_string()]);
+
+        // The shared outbox namespace really is populated (b queued into it),
+        // so its absence above is a discrimination, not an empty directory.
+        assert!(!cs.outbox_pending().unwrap().is_empty());
+        assert!(
+            !got.iter()
+                .any(|id| namespace(&DeviceId::from(id.clone())) == OUTBOX_NS),
+            "no conversation may map back onto the outbox namespace"
+        );
+        assert!(!got.contains(&OUTBOX_NS.to_string()));
+        // The impostor's own thread is a real conversation, under its own
+        // namespace, and reconciling it does not touch the outbox.
+        assert_eq!(namespace(&impostor), "chat-outbox");
+        assert_eq!(cs.history(&impostor).unwrap().len(), 1);
+
+        // And the payoff: the file-only thread is now reachable, so a restart
+        // settles the row that nothing will ever finish.
+        assert_eq!(cs.reconcile_peer(&file_only).unwrap(), 1);
+        assert_eq!(
+            cs.get(&file_only, &r.id).unwrap().unwrap().status,
+            Status::Interrupted
+        );
+    }
+
+    // ── outbox_owned_blobs() — the strict reader that stands between a
+    // corrupted outbox and every staged file on the device. ─────────────────
+
+    /// A staging store rooted in `dir`, plus a blob written directly into it.
+    /// Written rather than staged so this stays a synchronous test: `sweep`
+    /// only cares that a file sits in the root, not how it got there.
+    fn staged_blob(dir: &std::path::Path, id: &str) -> (StagingStore, String) {
+        let root = dir.join("outbox-blobs");
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = root.join(id);
+        std::fs::write(&blob, b"the only copy of a queued file").unwrap();
+        (
+            StagingStore::new(
+                root.to_string_lossy().into_owned(),
+                Arc::new(peerbeam_storage_fs::FsStorage::new()),
+            ),
+            blob.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The healthy case, first — otherwise "refuses to sweep" could be
+    /// satisfied by a guard that never sweeps anything at all. A readable
+    /// outbox reports exactly the blobs it owns: a text entry contributes no
+    /// phantom path, and a blob nobody queued is correctly an orphan.
+    #[test]
+    fn outbox_owned_blobs_reports_exactly_what_the_queue_owns() {
+        let (cs, _store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        let r = FileRef::new("report.pdf", 30).unwrap();
+        let (staging, owned_path) = staged_blob(tmp.path(), &r.id);
+        let (_, orphan_path) = staged_blob(tmp.path(), "0000000000000-orphan");
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &r,
+            FileMeta::new(&r.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        cs.enqueue_file(
+            &peer,
+            &r,
+            &StagedFile {
+                name: "report.pdf".into(),
+                size: 30,
+                staged_path: owned_path.clone(),
+            },
+        )
+        .unwrap();
+        // A text entry owns no blob and must not invent one.
+        cs.enqueue(&peer, &ChatMessage::new("also queued").unwrap())
+            .unwrap();
+
+        let owned = cs.outbox_owned_blobs().expect("a readable outbox answers");
+        assert_eq!(owned.len(), 1, "one file queued, one blob owned");
+        assert!(owned.contains(&owned_path));
+
+        assert_eq!(staging.sweep(&owned), 1, "the unowned blob is an orphan");
+        assert!(std::path::Path::new(&owned_path).exists());
+        assert!(!std::path::Path::new(&orphan_path).exists());
+    }
+
+    /// A genuinely empty outbox is a complete answer, not a refusal — an empty
+    /// `keep` is correct there, and every blob really is an orphan. This is
+    /// what makes the refusal below meaningful: the two cases are told apart,
+    /// rather than the sweep simply being disabled.
+    #[test]
+    fn a_genuinely_empty_outbox_answers_with_an_empty_set_and_sweeps() {
+        let (cs, _store, tmp) = new_store();
+        let (staging, orphan) = staged_blob(tmp.path(), "0000000000001");
+
+        let owned = cs
+            .outbox_owned_blobs()
+            .expect("an empty queue is a complete answer, not a failure");
+        assert!(owned.is_empty());
+        assert_eq!(staging.sweep(&owned), 1);
+        assert!(!std::path::Path::new(&orphan).exists());
+    }
+
+    /// THE TRAP, directly. `sweep` deletes every blob its `keep` set does not
+    /// name, and the ordinary outbox readers deliberately **skip** a row they
+    /// cannot decode — so a wholly-unreadable outbox reads back as
+    /// `Ok(vec![])`, indistinguishable from a queue that is genuinely empty.
+    /// Feeding that to `sweep` at startup would delete the only copy of every
+    /// file the user queued, while each conversation row still said the file
+    /// was waiting to be sent.
+    ///
+    /// `outbox_owned_blobs` refuses instead, and a refusal means the caller
+    /// sweeps nothing this run. The last block proves the assertion is not
+    /// vacuous: the naive wiring really does destroy the same bytes.
+    #[test]
+    fn an_unreadable_outbox_refuses_rather_than_under_report_and_no_blob_is_swept() {
+        let (cs, store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        // Two files queued for an offline peer, their only copies on disk.
+        let mut blobs = Vec::new();
+        let mut staging = None;
+        for name in ["report.pdf", "photo.jpg"] {
+            let r = FileRef::new(name, 30).unwrap();
+            let (s, path) = staged_blob(tmp.path(), &r.id);
+            cs.append(&ChatRecord::file_out(
+                &peer,
+                &r,
+                FileMeta::new(&r.name, 30, None),
+                Status::Staging,
+            ))
+            .unwrap();
+            cs.enqueue_file(
+                &peer,
+                &r,
+                &StagedFile {
+                    name: name.into(),
+                    size: 30,
+                    staged_path: path.clone(),
+                },
+            )
+            .unwrap();
+            blobs.push(path);
+            staging = Some(s);
+        }
+        let staging = staging.expect("two blobs staged");
+        assert_eq!(cs.outbox_owned_blobs().unwrap().len(), 2);
+
+        // Now make every outbox row undecodable — what a newer schema looks
+        // like to an older binary, applied to the whole namespace.
+        for (key, _) in store.list(OUTBOX_NS).unwrap() {
+            store
+                .put(OUTBOX_NS, &key, b"{\"from\":\"the-future\"}")
+                .unwrap();
+        }
+
+        // The delivery reader contains the damage, exactly as designed — and
+        // in doing so becomes unable to say whether anything is queued at all.
+        let lenient = cs
+            .outbox_pending()
+            .expect("containment: skipping a bad row never fails the call");
+        assert!(
+            lenient.is_empty(),
+            "every row was skipped, so this reads as 'nothing is queued'"
+        );
+
+        // The startup decision, in exactly the shape `runtime::init` makes it:
+        // sweep on a complete answer, sweep NOTHING on a refusal. Written as
+        // the real decision rather than as a bare `expect_err` so that a
+        // regression is observed where it hurts — blobs actually deleted —
+        // and not merely as a `Result` variant changing shape.
+        let swept = match cs.outbox_owned_blobs() {
+            Ok(owned) => staging.sweep(&owned),
+            Err(e) => {
+                assert!(matches!(e, ChatError::Serialization(_)), "{e:?}");
+                0
+            }
+        };
+        assert_eq!(
+            swept, 0,
+            "an unreadable outbox must authorise no deletion at all"
+        );
+        for path in &blobs {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "a queued file's only copy must survive a corrupted outbox"
+            );
+        }
+
+        // Not vacuous: the naive wiring — `sweep` fed from the lenient reader
+        // via `unwrap_or_default()` — deletes both. This is what the refusal
+        // above prevents, and it runs last so it cannot mask the assertions.
+        let naive: HashSet<String> = lenient
+            .into_iter()
+            .filter_map(|e| e.file.map(|f| f.staged_path))
+            .collect();
+        assert!(naive.is_empty());
+        assert_eq!(
+            staging.sweep(&naive),
+            2,
+            "the lenient reader would have destroyed both queued files"
+        );
     }
 }

@@ -2090,12 +2090,13 @@ impl Manager {
     /// bubble shows an eternal progress bar, and the receiver's keeps offering
     /// an Accept button whose transfer no longer exists.
     ///
-    /// Startup reconciliation ([`crate::runtime`]'s `reconcile_chat`) cannot
-    /// reach these. It enumerates peers via `ChatStore::outbox_peers`, i.e.
-    /// peers with queued **text**, because the `AppStore` port cannot list
-    /// namespaces — and a thread whose only unsettled row is a file has no
-    /// queued text at all (increment 2a has no file outbox). This is the entry
-    /// point that covers them, called when a surface opens a thread.
+    /// Startup reconciliation ([`crate::runtime`]'s `reconcile_chat`) now
+    /// reaches every conversation — it enumerates `ChatStore::conversations`,
+    /// so a thread whose only unsettled row is a file is settled at boot like
+    /// any other. This remains the entry point for everything a *running*
+    /// process leaves behind: a row stranded after the restart it would have
+    /// been settled by, and a row whose transfer died with a session rather
+    /// than with the process.
     ///
     /// **Why this is a separate call and not part of
     /// [`chat_history`](Self::chat_history).** Reconciling is a write, and
