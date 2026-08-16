@@ -106,8 +106,7 @@ class TransferRepository extends ChangeNotifier {
   /// project's pairing-gate fail-open. So the failure is surfaced, on the same
   /// channel every other transfer failure uses.
   void accept(String id) => _decide(id, 'accept', _api?.accept(id));
-  void acceptTrust(String id) =>
-      _decide(id, 'accept', _api?.acceptTrust(id));
+  void acceptTrust(String id) => _decide(id, 'accept', _api?.acceptTrust(id));
   void reject(String id) => _decide(id, 'decline', _api?.reject(id));
 
   /// Accept every inbound transfer currently [awaitingApproval] — one engine
@@ -121,37 +120,75 @@ class TransferRepository extends ChangeNotifier {
   ///
   /// Still explicit consent (I6): one tap answers one batch that is on screen
   /// right now. Nothing is remembered and nothing is inferred for next time.
-  Future<BulkDecision> acceptAll() => _decideAll(accepting: true);
+  ///
+  /// In substance this is just [acceptOnly] handed every currently-waiting
+  /// id — the two are never allowed to answer the question "which ids, and
+  /// what happened to them" differently.
+  Future<BulkDecision> acceptAll() =>
+      acceptOnly(awaitingApproval.map((t) => t.id).toList(growable: false));
 
   /// Decline every inbound transfer currently [awaitingApproval]. Symmetric
   /// with [acceptAll], including the honest tally.
-  Future<BulkDecision> declineAll() => _decideAll(accepting: false);
+  Future<BulkDecision> declineAll() =>
+      declineOnly(awaitingApproval.map((t) => t.id).toList(growable: false));
 
-  /// The shared body of [acceptAll]/[declineAll].
+  /// Accept exactly [ids] — the transfers the user selected in the Transfers
+  /// screen's selection mode — and report what actually happened. Accept-once:
+  /// this calls [PeerBeamApi.accept] and never [PeerBeamApi.acceptTrust], for
+  /// the same reason [acceptAll] does not.
+  ///
+  /// [ids] is answered for, not trusted on faith: a selection can be minutes
+  /// old, so every id is checked against [awaitingApproval] before anything
+  /// is asked of the engine. One that is no longer waiting is counted `gone`
+  /// exactly like one that vanishes mid-batch — it is never handed to the
+  /// engine as a decision.
+  Future<BulkDecision> acceptOnly(List<String> ids) =>
+      _decideMany(ids, accepting: true);
+
+  /// Decline exactly [ids]. Symmetric with [acceptOnly].
+  Future<BulkDecision> declineOnly(List<String> ids) =>
+      _decideMany(ids, accepting: false);
+
+  /// The shared body behind every batch decision — [acceptAll]/[declineAll]
+  /// (every currently-waiting id) and [acceptOnly]/[declineOnly] (exactly the
+  /// caller's ids) all fall through to this one loop, so the
+  /// `InvalidArgumentException` → `gone` classification and the
+  /// `settled + gone + failed == requested` invariant can never drift between
+  /// entry points that are supposed to agree.
   ///
   /// Unlike the per-card [accept]/[reject] this **awaits** each decision and
   /// counts the answer instead of pushing every refusal onto [errors]: five
   /// accepts where two had already settled would otherwise fire two separate
   /// error snackbars, which reads as breakage rather than as the ordinary race
   /// it is. The caller gets one verified tally and reports it once.
-  Future<BulkDecision> _decideAll({required bool accepting}) async {
+  Future<BulkDecision> _decideMany(
+    List<String> ids, {
+    required bool accepting,
+  }) async {
     final api = _api;
-    // Snapshot the ids first. Engine events keep arriving while the decisions
-    // are in flight, so the set being answered for must be the set the user
-    // saw — not one that shifts under the loop.
-    final ids = awaitingApproval.map((t) => t.id).toList(growable: false);
     if (api == null || ids.isEmpty) {
       return (requested: ids.length, settled: 0, gone: 0, failed: 0);
     }
+    // Which of the requested ids are still actually waiting, snapshotted once
+    // up front rather than trusted from whenever the caller built [ids]. A
+    // stale id — the selection is old, or this is racing an event that just
+    // landed — must never reach the engine as a decision; it is exactly as
+    // "no longer waiting" as one that fails mid-loop below.
+    final waiting = awaitingApproval.map((t) => t.id).toSet();
     var settled = 0, gone = 0, failed = 0;
     for (final id in ids) {
+      if (!waiting.contains(id)) {
+        gone++;
+        continue;
+      }
       try {
         // `accept`, never `acceptTrust` — see acceptAll's contract.
         await (accepting ? api.accept(id) : api.reject(id));
         settled++;
       } on InvalidArgumentException {
-        // `no pending transfer <id>`: it stopped waiting between the render
-        // and the tap. Expected, countable, and not an error to shout about.
+        // `no pending transfer <id>`: it stopped waiting between the snapshot
+        // above and this call landing. Expected, countable, and not an error
+        // to shout about.
         gone++;
       } catch (_) {
         // Something else went wrong. Counted separately so the report can
@@ -159,7 +196,12 @@ class TransferRepository extends ChangeNotifier {
         failed++;
       }
     }
-    return (requested: ids.length, settled: settled, gone: gone, failed: failed);
+    return (
+      requested: ids.length,
+      settled: settled,
+      gone: gone,
+      failed: failed,
+    );
   }
 
   void _decide(String id, String verb, Future<void>? call) {
@@ -167,9 +209,7 @@ class TransferRepository extends ChangeNotifier {
     unawaited(
       call.catchError((Object e) {
         final what = _byId[id]?.fileName;
-        final subject = (what == null || what.isEmpty)
-            ? 'this transfer'
-            : what;
+        final subject = (what == null || what.isEmpty) ? 'this transfer' : what;
         _errors.add("Couldn't $verb $subject — ${friendlyError(e)}");
       }),
     );

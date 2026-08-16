@@ -28,11 +28,7 @@ TransferEvent _queued(String id, {required bool incoming, String? file}) =>
       kind: 'transfer_queued',
       transferId: id,
       timestamp: '',
-      payload: {
-        'peer': 'Bob',
-        'file': file ?? '$id.bin',
-        'incoming': incoming,
-      },
+      payload: {'peer': 'Bob', 'file': file ?? '$id.bin', 'incoming': incoming},
     );
 
 TransferEvent _started(String id) => TransferEvent(
@@ -47,7 +43,10 @@ Future<AppState> _pumpTransfers(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: TransfersScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: TransfersScreen()),
+    ),
   );
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 600));
@@ -70,6 +69,19 @@ List<String> _decisions(FakePeerBeam fake) => fake.calls
           c.startsWith('reject:'),
     )
     .toList();
+
+/// The checkbox on the awaiting-approval card for [id] — there is exactly one
+/// per card, found via the same `ValueKey` the list already gives it.
+Finder _checkboxFor(String id) => find.descendant(
+  of: find.byKey(ValueKey(id)),
+  matching: find.byType(Checkbox),
+);
+
+/// Tap `Select` and let selection mode's rebuild land.
+Future<void> _enterSelectMode(WidgetTester tester) async {
+  await tester.tap(find.text('Select'));
+  await tester.pump();
+}
 
 void main() {
   group('bulk approval banner visibility', () {
@@ -281,6 +293,283 @@ void main() {
 
       expect(find.text('None were still waiting'), findsOneWidget);
       expect(find.textContaining('Accepted'), findsNothing);
+    });
+  });
+
+  // Selection mode: instead of only "all of them", the user picks which
+  // waiting transfers to answer. `Select` must never pre-select — a
+  // pre-filled selection paired with an Accept button would be a batch
+  // decision the user did not compose — and the count on screen must always
+  // be true, even as engine events keep arriving while the selection is open.
+  group('bulk approval selection mode', () {
+    testWidgets('"Select" appears alongside the banner, and entering '
+        'selection mode starts with nothing checked', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      fake.emit(_queued('in-3', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(find.text('Select'), findsOneWidget);
+
+      await _enterSelectMode(tester);
+
+      expect(find.text('0 of 3 selected'), findsOneWidget);
+      expect(find.text('Cancel'), findsOneWidget);
+      for (final id in ['in-1', 'in-2', 'in-3']) {
+        expect(tester.widget<Checkbox>(_checkboxFor(id)).value, isFalse);
+      }
+    });
+
+    testWidgets('checkboxes appear only on awaiting-approval cards, and only '
+        'while selecting', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      fake.emit(_queued('in-live', incoming: true));
+      fake.emit(_started('in-live')); // already approved and running
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // Not selecting yet: no checkboxes anywhere, on any card.
+      expect(find.byType(Checkbox), findsNothing);
+
+      await _enterSelectMode(tester);
+
+      expect(_checkboxFor('in-1'), findsOneWidget);
+      expect(_checkboxFor('in-2'), findsOneWidget);
+      // Already running: nothing left to decide, so nothing to check.
+      expect(_checkboxFor('in-live'), findsNothing);
+      expect(find.byType(Checkbox), findsNWidgets(2));
+    });
+
+    testWidgets('tapping anywhere on an awaiting-approval card toggles it, '
+        'not just the checkbox', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      // The card body, deliberately not its checkbox.
+      await tester.tap(find.byKey(const ValueKey('in-1')));
+      await tester.pump();
+
+      expect(tester.widget<Checkbox>(_checkboxFor('in-1')).value, isTrue);
+      expect(find.text('1 of 2 selected'), findsOneWidget);
+    });
+
+    testWidgets('selecting 2 of 3 and tapping Accept calls the engine for '
+        'exactly those two ids', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      fake.emit(_queued('in-3', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.tap(_checkboxFor('in-3'));
+      await tester.pump();
+      expect(find.text('2 of 3 selected'), findsOneWidget);
+
+      await tester.tap(find.text('Accept'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      // Exactly the two checked ids — in-2 was never touched.
+      expect(_decisions(fake), ['accept:in-1', 'accept:in-3']);
+    });
+
+    // THE SECURITY TEST, selection-mode's half of it. Same guard as "Accept
+    // all": this must call accept and nothing that trusts a device.
+    testWidgets('selection-mode accept calls accept — never acceptTrust', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.tap(_checkboxFor('in-2'));
+      await tester.pump();
+
+      await tester.tap(find.text('Accept'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(_decisions(fake), ['accept:in-1', 'accept:in-2']);
+      expect(
+        fake.calls.where((c) => c.startsWith('acceptTrust:')),
+        isEmpty,
+        reason: 'selection-mode Accept must never trust a device',
+      );
+    });
+
+    testWidgets('Decline/Accept are disabled, not just no-ops, with nothing '
+        'selected', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+
+      final decline = tester.widget<TextButton>(
+        find.widgetWithText(TextButton, 'Decline'),
+      );
+      final accept = tester.widget<FilledButton>(
+        find.widgetWithText(FilledButton, 'Accept'),
+      );
+      expect(decline.onPressed, isNull);
+      expect(accept.onPressed, isNull);
+
+      // Not merely a no-op: nothing reaches the engine either.
+      await tester.tap(find.text('Accept'));
+      await tester.pump();
+      expect(_decisions(fake), isEmpty);
+    });
+
+    // The defect requirement 4 exists to prevent: progress events rebuild
+    // this screen many times a second, and a selection that reset on the
+    // next tick would make selection mode unusable.
+    testWidgets('a progress event for an unrelated transfer does not clear '
+        'the selection', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      fake.emit(_queued('other', incoming: false)); // our own send
+      fake.emit(_started('other'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.pump();
+      expect(find.text('1 of 2 selected'), findsOneWidget);
+
+      fake.emit(
+        TransferEvent(
+          kind: 'transfer_progress',
+          transferId: 'other',
+          timestamp: '',
+          payload: const {
+            'stats': {'transferred_bytes': 10, 'total_bytes': 100},
+          },
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('1 of 2 selected'), findsOneWidget);
+      expect(tester.widget<Checkbox>(_checkboxFor('in-1')).value, isTrue);
+    });
+
+    testWidgets('a selected transfer that stops waiting drops out of the '
+        'count and is never sent to the engine', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      fake.emit(_queued('in-3', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.tap(_checkboxFor('in-2'));
+      await tester.pump();
+      expect(find.text('2 of 3 selected'), findsOneWidget);
+
+      // in-2 stops waiting from under the selection — started elsewhere, or
+      // its own prompt simply timed out. Either way the engine no longer
+      // holds a decision open for it.
+      fake.emit(_started('in-2'));
+      await tester.pump();
+
+      expect(find.text('1 of 2 selected'), findsOneWidget);
+
+      await tester.tap(find.text('Accept'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(_decisions(fake), ['accept:in-1']);
+      expect(fake.calls.where((c) => c.contains('in-2')), isEmpty);
+    });
+
+    testWidgets('"Cancel" exits selection mode and clears the selection', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.pump();
+      expect(find.text('1 of 2 selected'), findsOneWidget);
+
+      await tester.tap(find.text('Cancel'));
+      await tester.pump();
+
+      // Back to the not-selecting banner; per-card actions restored.
+      expect(find.text('2 items waiting for approval'), findsOneWidget);
+      expect(find.byType(Checkbox), findsNothing);
+      expect(find.text('Accept'), findsNWidgets(2));
+
+      // The clear was real, not just hidden: re-entering starts at zero.
+      await _enterSelectMode(tester);
+      expect(find.text('0 of 2 selected'), findsOneWidget);
+    });
+
+    testWidgets('selection-mode partial batch: the snackbar names the real '
+        'numbers', (tester) async {
+      final fake = FakePeerBeam()..noPendingDecisionIds.add('in-2');
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.tap(_checkboxFor('in-2'));
+      await tester.pump();
+
+      await tester.tap(find.text('Accept'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(
+        find.text('Accepted 1 of 2 — 1 was no longer waiting'),
+        findsOneWidget,
+      );
     });
   });
 }

@@ -9,8 +9,45 @@ import '../../widgets/common.dart';
 
 /// Active transfers with animated progress and per-transfer controls. Listens
 /// to the transfer store only.
-class TransfersScreen extends StatelessWidget {
+///
+/// Owns the bulk-approval selection (`_selected`/`_selecting`) itself rather
+/// than leaving it inside the banner: a checkbox lives on every card, so both
+/// the banner (its count, its Decline/Accept) and the list (each card's
+/// checkbox) have to see the same selection. A progress tick rebuilds this
+/// widget many times a second, so the selection needs state a rebuild does
+/// not reset.
+class TransfersScreen extends StatefulWidget {
   const TransfersScreen({super.key});
+
+  @override
+  State<TransfersScreen> createState() => _TransfersScreenState();
+}
+
+class _TransfersScreenState extends State<TransfersScreen> {
+  /// Ids the user has checked. Can outlive their transfer — a card can settle
+  /// while still checked — so this is never trusted directly; `build` always
+  /// narrows it to what is still waiting first.
+  Set<String> _selected = {};
+
+  /// Whether `Select` has been tapped. Kept apart from "is anything checked"
+  /// because entering selection mode must start from nothing: a pre-filled
+  /// selection paired with an Accept button would be a batch decision the
+  /// user never actually composed.
+  bool _selecting = false;
+
+  void _enterSelecting() => setState(() {
+    _selecting = true;
+    _selected = {};
+  });
+
+  void _exitSelecting() => setState(() {
+    _selecting = false;
+    _selected = {};
+  });
+
+  void _toggle(String id) => setState(() {
+    if (!_selected.remove(id)) _selected.add(id);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -34,10 +71,26 @@ class TransfersScreen extends StatelessWidget {
               // transfer its own card's Accept is already the shortest path,
               // and a banner over one card is just a second button saying the
               // same thing.
-              final waiting = state.transfer.awaitingApproval.length;
+              final waitingIds = state.transfer.awaitingApproval
+                  .map((t) => t.id)
+                  .toSet();
+              final waiting = waitingIds.length;
+              final showBanner = waiting >= 2;
+              // Engine events keep arriving while a selection sits open, so
+              // neither flag below is trusted as last set. `_selecting` only
+              // means something while there is a batch left to run it
+              // against — otherwise the banner would have to claim "0 of 0
+              // selected" instead of simply not being in selection mode — and
+              // `_selected` is narrowed to ids still genuinely waiting so a
+              // settled transfer can't keep inflating the count. Both are
+              // derived here, every build, rather than written back into
+              // state: a dead id is left to age out on the next tick, never
+              // pruned by mutating state from inside build.
+              final selecting = _selecting && showBanner;
+              final effectiveSelected = _selected.intersection(waitingIds);
               return Column(
                 children: [
-                  if (waiting >= 2)
+                  if (showBanner)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(
                         AppSpace.md,
@@ -45,20 +98,35 @@ class TransfersScreen extends StatelessWidget {
                         AppSpace.md,
                         0,
                       ),
-                      child: _BulkApprovalBanner(waiting: waiting),
+                      child: _BulkApprovalBanner(
+                        waiting: waiting,
+                        selecting: selecting,
+                        selectedIds: effectiveSelected,
+                        onSelect: _enterSelecting,
+                        onCancel: _exitSelecting,
+                        onSettled: _exitSelecting,
+                      ),
                     ),
                   Expanded(
                     child: ListView.builder(
                       padding: const EdgeInsets.all(AppSpace.md),
                       itemCount: items.length,
-                      itemBuilder: (context, i) => Appear(
-                        key: ValueKey(items[i].id),
-                        index: i,
-                        child: Padding(
-                          padding: const EdgeInsets.only(bottom: AppSpace.sm),
-                          child: _TransferCard(transfer: items[i]),
-                        ),
-                      ),
+                      itemBuilder: (context, i) {
+                        final t = items[i];
+                        return Appear(
+                          key: ValueKey(t.id),
+                          index: i,
+                          child: Padding(
+                            padding: const EdgeInsets.only(bottom: AppSpace.sm),
+                            child: _TransferCard(
+                              transfer: t,
+                              selecting: selecting,
+                              selected: effectiveSelected.contains(t.id),
+                              onToggle: () => _toggle(t.id),
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   ),
                 ],
@@ -101,37 +169,76 @@ String _bulkReport(String verbPast, BulkDecision d) {
 /// waiting transfer its own card is already the shortest path, so the banner
 /// stays hidden rather than duplicating it.
 ///
-/// Deliberately two actions, not three. The cards keep Decline / Accept /
-/// **Trust**; the banner offers accept and decline only. Trusting a device is a
-/// lasting grant of auto-accept for everything it sends from then on — a
-/// materially stronger act than approving the batch on screen — so it stays a
-/// per-device choice made on purpose. There is no "Trust all", and nothing
-/// here is remembered for next time (I6).
+/// Two views of the same batch. Not selecting, it offers the whole batch at
+/// once (`Decline all` / `Accept all`) plus `Select`, which hands the user a
+/// checkbox per card instead. Selecting, it answers only the checked ids
+/// (`Decline` / `Accept`) plus `Cancel`. Either way there is exactly one
+/// **Trust** action, and it lives on the card: trusting a device is a lasting
+/// grant of auto-accept for everything it sends from then on — a materially
+/// stronger act than approving what is on screen right now — so it stays a
+/// deliberate per-device choice. There is no "Trust all" and no "Trust
+/// selected", and nothing here is remembered for next time (I6).
 class _BulkApprovalBanner extends StatefulWidget {
   /// How many inbound transfers are awaiting approval right now.
   final int waiting;
-  const _BulkApprovalBanner({required this.waiting});
+
+  /// Whether the user has tapped `Select`. Already reconciled against
+  /// liveness by the caller (`TransfersScreen`) — this widget never
+  /// second-guesses [waiting]/[selectedIds], only renders them.
+  final bool selecting;
+
+  /// The checked ids, already narrowed to ones still awaiting approval.
+  final Set<String> selectedIds;
+
+  final VoidCallback onSelect;
+  final VoidCallback onCancel;
+
+  /// Called once a selection-mode batch has landed, so the screen can leave
+  /// selection mode. Not-selecting's `Decline all`/`Accept all` never call
+  /// this — there is no selection mode to leave.
+  final VoidCallback onSettled;
+
+  const _BulkApprovalBanner({
+    required this.waiting,
+    required this.selecting,
+    required this.selectedIds,
+    required this.onSelect,
+    required this.onCancel,
+    required this.onSettled,
+  });
 
   @override
   State<_BulkApprovalBanner> createState() => _BulkApprovalBannerState();
 }
 
 class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
-  /// A batch decision is in flight. Both actions are disabled until it lands,
-  /// so a second tap cannot re-answer ids the first has already settled and
-  /// then report them back as "no longer waiting".
+  /// A batch decision is in flight. Every action here — including
+  /// `Select`/`Cancel` — is disabled until it lands, so the user cannot swap
+  /// views mid-flight and have the result land back in a mode they already
+  /// left.
   bool _busy = false;
 
   Future<void> _decideBatch({required bool accepting}) async {
     if (_busy) return;
     final messenger = ScaffoldMessenger.of(context);
     final transfers = AppScope.of(context).transfer;
+    // Captured once: `widget.selecting` could flip under an in-flight
+    // request (a rebuild can land while this awaits), and which call was
+    // actually made must agree with whether selection mode is left
+    // afterward — not with whatever happens to be true when the future
+    // resolves.
+    final selecting = widget.selecting;
+    final ids = widget.selectedIds.toList(growable: false);
     setState(() => _busy = true);
     try {
-      // `acceptAll`, never anything that trusts.
-      final result = accepting
-          ? await transfers.acceptAll()
-          : await transfers.declineAll();
+      // `accept`, never anything that trusts, either way.
+      final result = selecting
+          ? (accepting
+                ? await transfers.acceptOnly(ids)
+                : await transfers.declineOnly(ids))
+          : (accepting
+                ? await transfers.acceptAll()
+                : await transfers.declineAll());
       messenger
         ..hideCurrentSnackBar()
         ..showSnackBar(
@@ -141,6 +248,7 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
             ),
           ),
         );
+      if (selecting) widget.onSettled();
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -150,6 +258,8 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
+    final selecting = widget.selecting;
+    final nothingSelected = widget.selectedIds.isEmpty;
     return Card(
       color: scheme.secondaryContainer,
       child: Padding(
@@ -167,7 +277,9 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
                 const Gap(AppSpace.sm),
                 Expanded(
                   child: Text(
-                    '${_files(widget.waiting)} waiting for approval',
+                    selecting
+                        ? '${widget.selectedIds.length} of ${widget.waiting} selected'
+                        : '${_files(widget.waiting)} waiting for approval',
                     style: text.titleSmall?.copyWith(
                       fontWeight: FontWeight.w600,
                       color: scheme.onSecondaryContainer,
@@ -183,20 +295,43 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
                 alignment: WrapAlignment.end,
                 spacing: AppSpace.xs,
                 runSpacing: AppSpace.xs,
-                children: [
-                  TextButton(
-                    onPressed: _busy
-                        ? null
-                        : () => _decideBatch(accepting: false),
-                    child: const Text('Decline all'),
-                  ),
-                  FilledButton(
-                    onPressed: _busy
-                        ? null
-                        : () => _decideBatch(accepting: true),
-                    child: const Text('Accept all'),
-                  ),
-                ],
+                children: selecting
+                    ? [
+                        TextButton(
+                          onPressed: _busy ? null : widget.onCancel,
+                          child: const Text('Cancel'),
+                        ),
+                        TextButton(
+                          onPressed: (_busy || nothingSelected)
+                              ? null
+                              : () => _decideBatch(accepting: false),
+                          child: const Text('Decline'),
+                        ),
+                        FilledButton(
+                          onPressed: (_busy || nothingSelected)
+                              ? null
+                              : () => _decideBatch(accepting: true),
+                          child: const Text('Accept'),
+                        ),
+                      ]
+                    : [
+                        TextButton(
+                          onPressed: _busy ? null : widget.onSelect,
+                          child: const Text('Select'),
+                        ),
+                        TextButton(
+                          onPressed: _busy
+                              ? null
+                              : () => _decideBatch(accepting: false),
+                          child: const Text('Decline all'),
+                        ),
+                        FilledButton(
+                          onPressed: _busy
+                              ? null
+                              : () => _decideBatch(accepting: true),
+                          child: const Text('Accept all'),
+                        ),
+                      ],
               ),
             ),
           ],
@@ -232,7 +367,27 @@ String _meta(Transfer t) {
 
 class _TransferCard extends StatelessWidget {
   final Transfer transfer;
-  const _TransferCard({required this.transfer});
+
+  /// Whether the screen is in selection mode. Changes only what an
+  /// awaiting-approval card renders — everything else (pause/cancel, the
+  /// progress bar) is identical either way, since a transfer whose decision
+  /// is already made has nothing left to select.
+  final bool selecting;
+
+  /// Whether this transfer's id is in the current (liveness-pruned)
+  /// selection. Meaningless unless [selecting] and this card is awaiting
+  /// approval.
+  final bool selected;
+
+  /// Toggles this transfer's membership in the selection.
+  final VoidCallback onToggle;
+
+  const _TransferCard({
+    required this.transfer,
+    required this.selecting,
+    required this.selected,
+    required this.onToggle,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -247,6 +402,10 @@ class _TransferCard extends StatelessWidget {
     // not the pause/cancel controls.
     final awaitingApproval =
         !sending && transfer.state == TransferState.pending;
+    // Only an awaiting-approval card has a decision to add to a selection; an
+    // outbound send or one already running, paused, completed or failed has
+    // nothing left to check.
+    final selectable = selecting && awaitingApproval;
 
     return Semantics(
       container: true,
@@ -255,151 +414,166 @@ class _TransferCard extends StatelessWidget {
           '${sending ? 'to' : 'from'} ${transfer.peerName}, '
           '$pct percent, ${transfer.state.label}',
       child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(AppSpace.md),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  CircleAvatar(
-                    radius: 22,
-                    backgroundColor: accent.withValues(alpha: 0.15),
-                    child: Icon(
-                      sending ? Icons.upload_rounded : Icons.download_rounded,
-                      size: AppIcons.md,
-                      color: accent,
+        child: InkWell(
+          // The whole card is the hit target while selecting, not just the
+          // checkbox — a row of small checkboxes is a fiddly target to chase
+          // on a touch screen.
+          onTap: selectable ? onToggle : null,
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpace.md),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    if (selectable) ...[
+                      Checkbox(value: selected, onChanged: (_) => onToggle()),
+                      const Gap(AppSpace.sm),
+                    ],
+                    CircleAvatar(
+                      radius: 22,
+                      backgroundColor: accent.withValues(alpha: 0.15),
+                      child: Icon(
+                        sending ? Icons.upload_rounded : Icons.download_rounded,
+                        size: AppIcons.md,
+                        color: accent,
+                      ),
                     ),
-                  ),
-                  const Gap(AppSpace.sm),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          transfer.fileName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.titleSmall?.copyWith(
-                            fontWeight: FontWeight.w600,
+                    const Gap(AppSpace.sm),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            transfer.fileName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: text.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
-                        ),
-                        const Gap(AppSpace.xxs),
-                        Row(
-                          children: [
-                            Text(
-                              '${sending ? 'To' : 'From'} ${transfer.peerName}',
-                              style: text.bodySmall?.copyWith(
-                                color: scheme.onSurfaceVariant,
+                          const Gap(AppSpace.xxs),
+                          Row(
+                            children: [
+                              Text(
+                                '${sending ? 'To' : 'From'} ${transfer.peerName}',
+                                style: text.bodySmall?.copyWith(
+                                  color: scheme.onSurfaceVariant,
+                                ),
                               ),
-                            ),
-                            const Gap(AppSpace.xs),
-                            Text(
-                              transfer.state.label,
-                              style: text.labelSmall?.copyWith(
-                                color: accent,
-                                fontWeight: FontWeight.w600,
+                              const Gap(AppSpace.xs),
+                              Text(
+                                transfer.state.label,
+                                style: text.labelSmall?.copyWith(
+                                  color: accent,
+                                  fontWeight: FontWeight.w600,
+                                ),
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const Gap(AppSpace.xs),
-                  Text(
-                    '$pct%',
-                    style: text.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
+                    const Gap(AppSpace.xs),
+                    Text(
+                      '$pct%',
+                      style: text.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                        color: accent,
+                      ),
+                    ),
+                  ],
+                ),
+                const Gap(AppSpace.sm),
+                TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0, end: transfer.progress),
+                  duration: AppMotion.duration(context, AppMotion.slow),
+                  curve: AppMotion.curve,
+                  builder: (context, value, _) => ClipRRect(
+                    borderRadius: BorderRadius.circular(AppRadius.sm),
+                    child: LinearProgressIndicator(
+                      value: value,
+                      minHeight: 8,
                       color: accent,
+                      backgroundColor: scheme.surfaceContainerHighest,
                     ),
-                  ),
-                ],
-              ),
-              const Gap(AppSpace.sm),
-              TweenAnimationBuilder<double>(
-                tween: Tween(begin: 0, end: transfer.progress),
-                duration: AppMotion.duration(context, AppMotion.slow),
-                curve: AppMotion.curve,
-                builder: (context, value, _) => ClipRRect(
-                  borderRadius: BorderRadius.circular(AppRadius.sm),
-                  child: LinearProgressIndicator(
-                    value: value,
-                    minHeight: 8,
-                    color: accent,
-                    backgroundColor: scheme.surfaceContainerHighest,
                   ),
                 ),
-              ),
-              const Gap(AppSpace.xs),
-              // A `Wrap` (not a `Row`) so the action cluster can drop to its
-              // own line on narrow widths instead of overflowing — the
-              // awaitingApproval case has three actions (Decline/Accept/
-              // Trust) where the old two-button row used to just fit.
-              Wrap(
-                alignment: WrapAlignment.spaceBetween,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                spacing: AppSpace.xs,
-                runSpacing: AppSpace.xs,
-                children: [
-                  Text(
-                    _meta(transfer),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: text.bodySmall?.copyWith(
-                      color: scheme.onSurfaceVariant,
+                const Gap(AppSpace.xs),
+                // A `Wrap` (not a `Row`) so the action cluster can drop to its
+                // own line on narrow widths instead of overflowing — the
+                // awaitingApproval case has three actions (Decline/Accept/
+                // Trust) where the old two-button row used to just fit.
+                Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: AppSpace.xs,
+                  runSpacing: AppSpace.xs,
+                  children: [
+                    Text(
+                      _meta(transfer),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: text.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
-                  ),
-                  Wrap(
-                    alignment: WrapAlignment.end,
-                    spacing: AppSpace.xs,
-                    runSpacing: AppSpace.xs,
-                    children: awaitingApproval
-                        ? [
-                            TextButton(
-                              onPressed: () =>
-                                  state.transfer.reject(transfer.id),
-                              child: const Text('Decline'),
-                            ),
-                            FilledButton.tonal(
-                              onPressed: () =>
-                                  state.transfer.accept(transfer.id),
-                              child: const Text('Accept'),
-                            ),
-                            Tooltip(
-                              message:
-                                  'Accept and always trust this device',
-                              child: FilledButton(
-                                onPressed: () => state.transfer.acceptTrust(
-                                  transfer.id,
+                    Wrap(
+                      alignment: WrapAlignment.end,
+                      spacing: AppSpace.xs,
+                      runSpacing: AppSpace.xs,
+                      children: !awaitingApproval
+                          ? [
+                              IconButton(
+                                tooltip: paused ? 'Resume' : 'Pause',
+                                onPressed: () => paused
+                                    ? state.transfer.resume(transfer.id)
+                                    : state.transfer.pause(transfer.id),
+                                icon: Icon(
+                                  paused
+                                      ? Icons.play_arrow_rounded
+                                      : Icons.pause_rounded,
                                 ),
-                                child: const Text('Trust'),
                               ),
-                            ),
-                          ]
-                        : [
-                            IconButton(
-                              tooltip: paused ? 'Resume' : 'Pause',
-                              onPressed: () => paused
-                                  ? state.transfer.resume(transfer.id)
-                                  : state.transfer.pause(transfer.id),
-                              icon: Icon(
-                                paused
-                                    ? Icons.play_arrow_rounded
-                                    : Icons.pause_rounded,
+                              IconButton(
+                                tooltip: 'Cancel',
+                                onPressed: () =>
+                                    state.transfer.cancel(transfer.id),
+                                icon: const Icon(Icons.close_rounded),
                               ),
-                            ),
-                            IconButton(
-                              tooltip: 'Cancel',
-                              onPressed: () =>
-                                  state.transfer.cancel(transfer.id),
-                              icon: const Icon(Icons.close_rounded),
-                            ),
-                          ],
-                  ),
-                ],
-              ),
-            ],
+                            ]
+                          // Selecting: the checkbox and the card tap above are
+                          // the one action path on screen. Showing Decline/
+                          // Accept/Trust here too would be a second path to the
+                          // same decision, and Trust specifically must never
+                          // read as a batch action.
+                          : selecting
+                          ? const []
+                          : [
+                              TextButton(
+                                onPressed: () =>
+                                    state.transfer.reject(transfer.id),
+                                child: const Text('Decline'),
+                              ),
+                              FilledButton.tonal(
+                                onPressed: () =>
+                                    state.transfer.accept(transfer.id),
+                                child: const Text('Accept'),
+                              ),
+                              Tooltip(
+                                message: 'Accept and always trust this device',
+                                child: FilledButton(
+                                  onPressed: () =>
+                                      state.transfer.acceptTrust(transfer.id),
+                                  child: const Text('Trust'),
+                                ),
+                              ),
+                            ],
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
