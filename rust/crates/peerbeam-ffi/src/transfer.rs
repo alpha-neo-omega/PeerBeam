@@ -2513,18 +2513,45 @@ impl Manager {
         Ok(json!({ "cancelled": stopped_stage || stopped_transfer || dequeued || settled }))
     }
 
-    /// Move a cancelled share's row to `Failed`/`cancelled`, unless it already
-    /// reads `Failed` — which it does when the live transfer's own cancel path
-    /// (`Manager::cancel` → `chat_settle`) got there first. Returns whether this
-    /// call changed anything, so a cancel that genuinely only tidied a stranded
-    /// row still reports honestly, and one that found the row already settled
-    /// does not emit a second, identical event.
+    /// Move a cancelled share's row to `Failed`/`cancelled` — but only if the
+    /// row *still* authorizes it. Returns whether this call changed anything, so
+    /// a cancel that genuinely only tidied a stranded row still reports
+    /// honestly, and one that found the row already settled does not emit a
+    /// second, identical event.
+    ///
+    /// **This re-reads the row and re-applies
+    /// [`ChatRecord::is_cancellable_outgoing_file`] — the same single rule
+    /// `chat_cancel` authorized with, not a weaker one.** The two reads are far
+    /// apart: between them `chat_cancel` takes a lock, cancels a live transfer,
+    /// and runs a whole [`ChatStore::outbox_for`] (a `list` plus an AEAD decrypt
+    /// per record). Another task's writer can land inside that window — the
+    /// transfer completing writes `Sent` (`chat_settle` via `finish`), an
+    /// arriving `FileDecline` writes `Declined` — and both are states the rule
+    /// calls final. Settling on the *earlier* read would then overwrite a
+    /// delivered file with `Failed`/"cancelled" and emit a `chat_status_detail`
+    /// saying so: the sender's history would permanently claim a file the
+    /// receiver holds was cancelled, and a peer's refusal would be relabelled as
+    /// our own cancellation. The row that gets written is the row that was
+    /// checked.
+    ///
+    /// `Failed` is excluded on top of the shared rule (which permits it, since a
+    /// failed row may still have a queue entry a later drain would retry): the
+    /// live transfer's own cancel path (`Manager::cancel` → `chat_settle`) may
+    /// have landed it moments ago, and a second identical write is not something
+    /// this call did.
+    ///
+    /// [`ChatRecord::is_cancellable_outgoing_file`]: peerbeam_chat::ChatRecord::is_cancellable_outgoing_file
+    /// [`ChatStore::outbox_for`]: peerbeam_chat::ChatStore::outbox_for
     fn settle_cancelled(&self, peer: &DeviceId, peer_id: &str, id: &str) -> bool {
-        if matches!(self.chat.get(peer, id), Ok(Some(rec)) if rec.status == ChatStatus::Failed) {
-            return false;
+        match self.chat.get(peer, id) {
+            Ok(Some(rec))
+                if rec.is_cancellable_outgoing_file() && rec.status != ChatStatus::Failed =>
+            {
+                self.fail_chat_file(peer_id, id, "cancelled");
+                true
+            }
+            _ => false,
         }
-        self.fail_chat_file(peer_id, id, "cancelled");
-        true
     }
 
     // ── receiving ───────────────────────────────────────────────
@@ -5979,6 +6006,83 @@ mod tests {
             false,
             "a second cancel stopped nothing and must not pretend otherwise"
         );
+    }
+
+    /// **A cancel that loses the race must not rewrite history.** `chat_cancel`
+    /// authorizes on one read of the row and settles on a second, and between
+    /// them it takes a lock, cancels a live transfer and decrypts the whole
+    /// outbox. Another task's writer lands in that window: the transfer
+    /// completing writes `Sent`, an arriving `FileDecline` writes `Declined`.
+    ///
+    /// The user taps Cancel as the progress bar completes. If the settle step
+    /// trusted the *first* read, it would overwrite the delivered row with
+    /// `Failed`/"cancelled" and answer `{cancelled: true}` — the sender's
+    /// history would forever claim a file the receiver actually holds was
+    /// cancelled, and a peer's refusal would be relabelled as our cancellation.
+    ///
+    /// So this drives `settle_cancelled` directly: that is the second read, and
+    /// reaching it through `chat_cancel` would need the row to change mid-call,
+    /// which no single-threaded test can stage. The public entry point is
+    /// checked too — its own gate must refuse both rows just as flatly.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancel_that_lost_the_race_never_overwrites_a_settled_row() {
+        let (mgr, chat, _dir) = test_manager_full("canceller", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // Exactly the two states the shared rule calls final, and exactly the
+        // two another task can land while a cancel is in flight.
+        let mut seeded = Vec::new();
+        for (name, status, why) in [
+            (
+                "delivered.mp4",
+                ChatStatus::Sent,
+                "a delivered file must not be relabelled cancelled",
+            ),
+            (
+                "refused.mp4",
+                ChatStatus::Declined,
+                "a peer's refusal must not be relabelled as our cancellation",
+            ),
+        ] {
+            let r = peerbeam_chat::FileRef::new(name, 4).expect("file ref");
+            chat.append(&peerbeam_chat::ChatRecord::file_out(
+                &peer,
+                &r,
+                file_meta(&r),
+                status,
+            ))
+            .expect("seed the settled row");
+            seeded.push((r.id, status, why));
+        }
+
+        for (id, status, why) in &seeded {
+            assert!(
+                !mgr.settle_cancelled(&peer, &peer.0, id),
+                "settle_cancelled must report it changed nothing: {why}"
+            );
+            assert_eq!(
+                chat.get(&peer, id)
+                    .unwrap()
+                    .expect("the row survives")
+                    .status,
+                *status,
+                "{why}"
+            );
+            assert_eq!(
+                cancel(&mgr, &peer.0, id).unwrap()["cancelled"],
+                false,
+                "and the whole cancel path agrees: {why}"
+            );
+            assert_eq!(
+                chat.get(&peer, id)
+                    .unwrap()
+                    .expect("the row survives")
+                    .status,
+                *status,
+                "still untouched after the public call: {why}"
+            );
+        }
     }
 
     // ── the conversation list ───────────────────────────────────
