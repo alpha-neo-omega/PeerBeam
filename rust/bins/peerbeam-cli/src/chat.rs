@@ -424,22 +424,31 @@ async fn send(
     Ok(())
 }
 
-/// `chat send --file <path>` — attach a file to a conversation. Increment 2a,
-/// ONLINE ONLY: unlike text `send`, there is no outbox for files yet, so an
-/// unreachable peer (or one that cannot receive chat attachments) is a hard
-/// failure, never a silent queue. The bytes ride the TRANSFER stream channel
-/// exactly like a plain `send`; a small `FileRef` control message rides the
-/// CHAT channel so the file gets a row in the peer's own conversation —
-/// `SendRequest.transfer_id` is set to the `FileRef`'s id so the two are the
-/// SAME id, which is the whole point of the feature (`prepare_file_send`'s
-/// doc comment).
+/// `chat send --file <path>` — attach a file to a conversation.
 ///
-/// Order matters: the row is validated + persisted (`prepare_file_send`)
-/// BEFORE any network work, and the `FileRef` is sent BEFORE the bytes — so a
-/// peer who could see the offer always sees it before (or never after) the
-/// transfer starts. The session is closed on every exit — dial failure (none
-/// established), a `supports_file_ref` refusal, a `send_file_ref` failure, and
-/// the transfer's own outcome — never via a bare `?` that could skip it.
+/// **Still online-only on this surface.** The bytes are now staged into the
+/// outbox's own storage first (`prepare_file_send`), exactly as the desktop and
+/// mobile surfaces do, so both frontends derive the wire `FileRef` and the
+/// transfer from the same blob and cannot disagree about what is being sent.
+/// But an unreachable peer is still a hard failure here, not a queue: this
+/// binary has no drain for a queued *file* yet, so leaving one behind would
+/// promise a delivery nothing in this process will ever make. Every terminal
+/// path therefore dequeues the entry and deletes the blob — `finish` below is
+/// the single place that does it. Queueing (and the CLI-side drain that earns
+/// it) is a separate task.
+///
+/// The bytes ride the TRANSFER stream channel exactly like a plain `send`; a
+/// small `FileRef` control message rides the CHAT channel so the file gets a row
+/// in the peer's own conversation — `SendRequest.transfer_id` is set to the
+/// `FileRef`'s id so the two are the SAME id, which is the whole point of the
+/// feature.
+///
+/// Order matters: the row is validated + persisted BEFORE any network work, and
+/// the `FileRef` is sent BEFORE the bytes — so a peer who could see the offer
+/// always sees it before (or never after) the transfer starts. The session is
+/// closed on every exit — dial failure (none established), a
+/// `supports_file_ref` refusal, a `send_file_ref` failure, and the transfer's
+/// own outcome — never via a bare `?` that could skip it.
 async fn send_file(
     ctx: &Ctx,
     to: Option<String>,
@@ -479,12 +488,36 @@ async fn send_file(
 
     let sc = SecureCtx::build(&config)?;
     let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    let staging = commands::staging_store(&config);
+    let ctrl = TransferControl::new();
 
-    // Validate the path and persist the (Transferring) row BEFORE any network
-    // work — a refused path (missing, a directory, a bad name) leaves no row
-    // and touches no network at all.
-    let (file_ref, _rec) = prepare_file_send(&store, &target.id, &path).map_err(CliError::from)?;
+    // Validate the path, persist the row, and copy the bytes into the outbox's
+    // own storage BEFORE any network work — a refused path (missing, a
+    // directory, a bad name) leaves no row and touches no network at all, and
+    // what gets sent from here on is the blob, not a path the user could change
+    // underneath us.
+    let (stage_tx, _stage_rx) = mpsc::unbounded_channel();
+    let (file_ref, staged) = prepare_file_send(
+        &store,
+        &staging,
+        &target.id,
+        &path,
+        commands::staging_limits(&config),
+        &ctrl,
+        &stage_tx,
+    )
+    .await
+    .map_err(CliError::from)?;
     let id = file_ref.id.clone();
+
+    // Every exit below goes through this: the row's final status, the queue
+    // entry gone, and the staged blob deleted. Leaving either behind would
+    // strand bytes on disk that nothing in this process will ever send.
+    let finish = |status: Status| {
+        let _ = store.set_status(&target.id, &id, status);
+        let _ = store.outbox_remove(&id);
+        staging.remove(&staged.staged_path);
+    };
 
     let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
     let routes = RouteManager::new(quic.clone());
@@ -503,9 +536,9 @@ async fn send_file(
     {
         Ok(session) => session,
         Err(e) => {
-            // No session was established — nothing to close. 2a is online
-            // only: an unreachable peer is a hard failure, not a queue.
-            let _ = store.set_status(&target.id, &id, Status::Failed);
+            // No session was established — nothing to close. This surface is
+            // online only: an unreachable peer is a hard failure, not a queue.
+            finish(Status::Failed);
             return Err(CliError::Connection(format!(
                 "cannot reach {} to send {}: {e}",
                 target.name, file_ref.name
@@ -527,7 +560,7 @@ async fn send_file(
     // the peer can't see it.
     if !session.supports_file_ref() {
         session.close().await;
-        let _ = store.set_status(&target.id, &id, Status::Failed);
+        finish(Status::Failed);
         return Err(CliError::Other(format!(
             "{} cannot receive chat attachments — its build predates file sharing in chat. Send {} as a plain transfer instead.",
             target.name, file_ref.name
@@ -538,7 +571,7 @@ async fn send_file(
     // the peer's row exists before (never after) the transfer starts.
     if let Err(e) = send_file_ref(&session.handle, &file_ref).await {
         session.close().await;
-        let _ = store.set_status(&target.id, &id, Status::Failed);
+        finish(Status::Failed);
         return Err(CliError::Other(format!(
             "could not offer {} to {}: {e}",
             file_ref.name, target.name
@@ -548,11 +581,13 @@ async fn send_file(
     let chunk = commands::clamp_chunk_size(config.transfer.chunk_size);
     let storage = FsStorage::new();
     let (ptx, mut prx) = mpsc::unbounded_channel();
-    let ctrl = TransferControl::new();
     let req = SendRequest {
         transfer_id: id.clone(), // the FileRef's id — the shared correlation the feature rests on.
         name: file_ref.name.clone(),
-        path: path.clone(),
+        // The staged blob, never `path`: the user may have deleted, moved or
+        // rewritten their file since we copied it, and the `FileRef` the peer is
+        // being shown was derived from the blob.
+        path: staged.staged_path.clone(),
         size: file_ref.size,
         chunk_size: chunk,
     };
@@ -578,7 +613,7 @@ async fn send_file(
 
     match result {
         Ok(_outcome) => {
-            let _ = store.set_status(&target.id, &id, Status::Sent);
+            finish(Status::Sent);
             if ctx.json {
                 ctx.json_line(&json!({
                     "event": "chat_file_sent",
@@ -592,7 +627,7 @@ async fn send_file(
             Ok(())
         }
         Err(e) => {
-            let _ = store.set_status(&target.id, &id, Status::Failed);
+            finish(Status::Failed);
             Err(CliError::from(e))
         }
     }

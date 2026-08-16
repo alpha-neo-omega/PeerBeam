@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
-use peerbeam_transfer::SessionHandle;
+use peerbeam_transfer::{SessionHandle, TransferControl};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
-use crate::record::{ChatRecord, FileMeta, Status};
-use crate::store::ChatStore;
+use crate::record::{ChatRecord, FileMeta, Kind, Status};
+use crate::staging::{StagingLimits, StagingStore};
+use crate::store::{ChatStore, OutboxEntry, StagedFile};
 
 /// Send one already-built [`ChatMessage`] over a channel that has already
 /// reached [`ChannelState::Open`] (factored out of [`send_message`] so
@@ -78,19 +80,41 @@ pub async fn send_message(
     Ok(rec)
 }
 
-/// Flush all of `peer`'s queued outbox messages over an established session.
-/// Opens the CHAT channel once, sends each queued message in FIFO order, and on
-/// each success upserts the conversation record to `Sent` and removes the
-/// outbox entry. Returns the message ids flushed. A per-message send error
-/// stops this peer's flush (the rest stay queued); a channel-open failure
-/// returns `Err`.
+/// Deliver a peer's queued CHAT-channel entries over an established session.
+///
+/// **Text keeps its existing behaviour precisely:** one CHAT channel, FIFO,
+/// stop at the first failure so nothing is dequeued that did not go, and the
+/// returned ids mean "delivered" so the caller can emit `chat_status: sent` for
+/// each. Two silent-message-loss bugs have already shipped through this path;
+/// it is not the place for elegance.
+///
+/// What changed is that the loop now **branches on `entry.kind`** instead of
+/// rebuilding every entry as a `ChatMessage` and sending it as `MSG_TEXT`:
+///
+/// * [`Kind::Text`] — exactly as before.
+/// * [`Kind::Decline`] — goes out as a `FileDecline` (`MSG_FILE_DECLINE`), on
+///   this same channel. Sent as text it would have arrived as an empty chat
+///   message and settled nothing. It is dequeued on success but deliberately
+///   **not** returned: its id is the *sender's* `FileRef` id, which on this side
+///   names the inbound row we declined, so reporting it as "sent" would tell the
+///   surface a file we refused had been delivered.
+/// * [`Kind::File`] — skipped here. Its bytes ride the TRANSFER stream channel,
+///   so a multi-GB upload can never block a message behind it, and the caller
+///   (which owns the transfer engine) decides which one to start via
+///   [`next_file_for`]. Skipping rather than stopping keeps FIFO for everything
+///   behind it.
 pub async fn flush_to_session(
     handle: &SessionHandle,
     store: &ChatStore,
     peer: &DeviceId,
 ) -> Result<Vec<String>, SendError> {
     let entries = store.outbox_for(peer)?;
-    if entries.is_empty() {
+    // Only text and declines travel here; a queue holding nothing but files
+    // must not open a CHAT channel it has no message for.
+    if !entries
+        .iter()
+        .any(|e| matches!(e.kind, Kind::Text | Kind::Decline))
+    {
         return Ok(Vec::new());
     }
     let channel = handle
@@ -101,43 +125,111 @@ pub async fn flush_to_session(
 
     let mut flushed = Vec::new();
     for entry in entries {
-        let msg = ChatMessage {
-            id: entry.message_id.clone(),
-            timestamp: entry.timestamp.clone(),
-            body: entry.body.clone(),
-        };
-        if send_on_open_channel(handle, channel, &msg).await.is_err() {
-            break; // peer went away mid-flush; remaining entries stay queued
+        match entry.kind {
+            Kind::Text => {
+                let msg = ChatMessage {
+                    id: entry.message_id.clone(),
+                    timestamp: entry.timestamp.clone(),
+                    body: entry.body.clone(),
+                };
+                if send_on_open_channel(handle, channel, &msg).await.is_err() {
+                    break; // peer went away mid-flush; remaining entries stay queued
+                }
+                store.record_sent(&entry)?;
+                store.outbox_remove(&entry.message_id)?;
+                flushed.push(entry.message_id);
+            }
+            Kind::Decline => {
+                let d = FileDecline {
+                    id: entry.message_id.clone(),
+                    timestamp: entry.timestamp.clone(),
+                };
+                if send_decline_on_open_channel(handle, channel, &d)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                // No `record_sent`: this id names the INBOUND row we declined,
+                // and flipping that to `Sent` would make the conversation claim
+                // we delivered a file we refused.
+                store.outbox_remove(&entry.message_id)?;
+            }
+            Kind::File => continue,
         }
-        store.record_sent(&entry)?;
-        store.outbox_remove(&entry.message_id)?;
-        flushed.push(entry.message_id);
     }
     Ok(flushed)
 }
 
-/// Validate a path and stage a file-share: mint the [`FileRef`] and persist the
-/// outgoing record. Does no I/O beyond metadata — the bytes move over TRANSFER,
-/// correlated with the returned reference by its `id`.
+/// The one file entry a drain wants sent next for `peer`, if any: the oldest
+/// queued [`Kind::File`] entry (the outbox lists FIFO by its time-ordered key).
 ///
-/// The record is written **before** anything touches the network, and written
-/// as [`Status::Transferring`], on purpose:
+/// Split out of [`flush_to_session`] because the two halves need different
+/// machinery. Text is a frame on a channel this crate already owns; a file is a
+/// transfer, and `peerbeam-chat` has no transfer engine. So this function only
+/// **decides**, and the caller — which does own one — performs the send. That
+/// also makes the one-file-in-flight rule the caller's to enforce, in the same
+/// place it tracks running transfers.
 ///
-/// * the id has to be durable and visible in history before it is published
-///   out of band as a transfer id, so a failure mid-send can never leave a
-///   half-sent file with no row to settle;
-/// * a dial that never connects therefore leaves a `Transferring` row, which
-///   [`ChatStore::reconcile_peer`] flips to `Status::Interrupted` at the next
-///   start. That is the intended shape: a row that outlives its process is
-///   settled by reconciliation, not by hoping an event still arrives.
+/// An entry whose `kind` says file but that carries no staged blob is skipped
+/// and logged rather than returned: there is nothing to send, and returning it
+/// would stall every file behind it forever.
+pub fn next_file_for(store: &ChatStore, peer: &DeviceId) -> Result<Option<PendingFile>, ChatError> {
+    for entry in store.outbox_for(peer)? {
+        if entry.kind != Kind::File {
+            continue;
+        }
+        match entry.file.clone() {
+            Some(file) => return Ok(Some(PendingFile { entry, file })),
+            None => {
+                tracing::warn!(
+                    message_id = %entry.message_id,
+                    "skipping a queued file entry with no staged blob"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The one file entry a flush wants sent next. The caller owns the transfer
+/// engine, so it performs the send; [`next_file_for`] only decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFile {
+    /// The queue entry, including its `offers_refused` backstop count.
+    pub entry: OutboxEntry,
+    /// The blob the outbox owns — what will actually be delivered, whatever has
+    /// since happened to the file the user picked.
+    pub file: StagedFile,
+}
+
+/// Validate a path, mint the [`FileRef`], and persist the outgoing row as
+/// [`Status::Staging`] — the synchronous half of a file share, doing no I/O
+/// beyond `metadata`.
+///
+/// Split from the copy ([`stage_file_send`]) because the two have opposite
+/// timing requirements. The caller must be able to hand its own caller an id
+/// *immediately* — the FFI's `chat_send_file` returns `{id}` synchronously and
+/// its surface writes an optimistic bubble against it — while staging a
+/// multi-GB file can take minutes. Doing both in one call would force either a
+/// blocked UI or an id that does not exist yet.
+///
+/// The row is written **before** the copy starts so a long stage is visible as
+/// *Staging* rather than looking like a hung attach, and it is written
+/// `Staging` rather than `Transferring` because nothing has been offered to
+/// anyone yet: no transfer exists, so no wire event can settle it, and
+/// `Staging` is deliberately outside the settle guard's writable set.
+///
+/// A refused path (missing, a directory, an unusable name) leaves **no row**
+/// and touches no network: the whole call fails before anything is persisted.
 ///
 /// Rejects a directory outright — a folder share is a different wire shape
 /// (`send_folder`) and is not part of file-in-chat.
-pub fn prepare_file_send(
+pub fn begin_file_send(
     store: &ChatStore,
     peer: &DeviceId,
     path: &str,
-) -> Result<(FileRef, ChatRecord), SendError> {
+) -> Result<FileRef, SendError> {
     let meta = std::fs::metadata(path)
         .map_err(|e| SendError::Session(format!("cannot read {path}: {e}")))?;
     if meta.is_dir() {
@@ -150,14 +242,77 @@ pub fn prepare_file_send(
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| SendError::Session(format!("no file name in {path}")))?;
     let r = FileRef::new(&name, meta.len())?;
-    let rec = ChatRecord::file_out(
+    store.append(&ChatRecord::file_out(
         peer,
         &r,
         FileMeta::new(&r.name, r.size, Some(path.to_string())),
-        Status::Transferring,
-    );
-    store.append(&rec)?;
-    Ok((r, rec))
+        Status::Staging,
+    ))?;
+    Ok(r)
+}
+
+/// Copy the picked file into outbox-owned storage and queue it — the
+/// asynchronous half of a file share, following [`begin_file_send`].
+///
+/// On success `r` describes the **staged blob**, not the source: `r.size` is
+/// overwritten with the bytes actually copied. That is not tidiness. The peer's
+/// approval prompt is rendered from this `FileRef` while the bytes it is
+/// consenting to come from the blob's own `TransferMeta`, and the two are
+/// correlated by id alone — so a source that grew during the copy (a log, a
+/// download still running) would otherwise show one size in the prompt while a
+/// different number of bytes arrived. Both must be derived from the blob.
+///
+/// Staging failure is immediate failure: nothing is queued, and the row is
+/// marked `Failed` rather than left on `Staging` forever, so the user learns now
+/// instead of waiting for a delivery that was never scheduled.
+///
+/// `progress` receives the running byte count of the copy, so a surface can show
+/// a determinate bar; `cancel` stops it within one 64 KiB buffer, leaving no
+/// blob and no queue entry.
+#[allow(clippy::too_many_arguments)]
+pub async fn stage_file_send(
+    store: &ChatStore,
+    staging: &StagingStore,
+    peer: &DeviceId,
+    r: &mut FileRef,
+    path: &str,
+    limits: StagingLimits,
+    cancel: &TransferControl,
+    progress: &UnboundedSender<u64>,
+) -> Result<StagedFile, SendError> {
+    let staged = match staging.stage(&r.id, path, limits, cancel, progress).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Nothing was queued, so the row must say so rather than sit on
+            // `Staging` forever with no transfer that could ever settle it.
+            let _ = store.set_status(peer, &r.id, Status::Failed);
+            return Err(SendError::Session(e.to_string()));
+        }
+    };
+    r.size = staged.size;
+    store.enqueue_file(peer, r, &staged)?;
+    Ok(staged)
+}
+
+/// Stage a picked file and queue it for delivery: [`begin_file_send`] followed
+/// by [`stage_file_send`], for a caller that has no reason to separate them.
+///
+/// Returns the [`FileRef`] to publish on CHAT and the [`StagedFile`] whose
+/// `staged_path` is what the transfer must read — never the user's original,
+/// which may be deleted, moved or rewritten between queueing and delivery.
+pub async fn prepare_file_send(
+    store: &ChatStore,
+    staging: &StagingStore,
+    peer: &DeviceId,
+    path: &str,
+    limits: StagingLimits,
+    cancel: &TransferControl,
+    progress: &UnboundedSender<u64>,
+) -> Result<(FileRef, StagedFile), SendError> {
+    let mut r = begin_file_send(store, peer, path)?;
+    let staged =
+        stage_file_send(store, staging, peer, &mut r, path, limits, cancel, progress).await?;
+    Ok((r, staged))
 }
 
 /// Send a prepared [`FileRef`] over the session's CHAT channel.
@@ -202,6 +357,18 @@ pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Resul
         .await
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
+    send_decline_on_open_channel(handle, channel, d).await
+}
+
+/// Send one [`FileDecline`] over a channel that has already reached
+/// [`ChannelState::Open`] — the same split as [`send_on_open_channel`], so
+/// [`flush_to_session`] can deliver a *queued* decline down the channel it has
+/// already opened for text rather than opening a second one per entry.
+async fn send_decline_on_open_channel(
+    handle: &SessionHandle,
+    channel: ChannelId,
+    d: &FileDecline,
+) -> Result<(), SendError> {
     let frame = d.to_frame(channel)?;
     handle
         .send_on_channel(
@@ -299,44 +466,85 @@ mod tests {
     use crate::record::{Direction, Kind};
     use peerbeam_appstore_fs::FsAppStore;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
-    use peerbeam_domain::port::EncryptionProvider;
+    use peerbeam_domain::port::{AppStore, EncryptionProvider, StorageProvider};
+    use peerbeam_storage_fs::FsStorage;
     use std::sync::Arc;
 
     fn store() -> (ChatStore, tempfile::TempDir) {
+        let (cs, _raw, dir) = store_with_raw();
+        (cs, dir)
+    }
+
+    /// [`store`] plus the raw `AppStore` behind it, so a test can write an entry
+    /// no `ChatStore` method can produce (e.g. a `Kind::File` entry carrying no
+    /// staged blob).
+    fn store_with_raw() -> (ChatStore, Arc<dyn AppStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
         let key = derive_subkey(&[3u8; 32], b"peerbeam-appstore-v1");
-        let app = Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
-        (ChatStore::new(app), dir)
+        let app: Arc<dyn AppStore> =
+            Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
+        (ChatStore::new(app.clone()), app, dir)
     }
 
-    /// The staging contract the whole send path rests on: one id names both the
-    /// chat row and (later) the transfer, the row is persisted before anything
-    /// is dialed, and it carries the sender's local path so the UI can open it.
-    #[test]
-    fn prepare_file_send_persists_a_transferring_row_keyed_by_the_file_ref_id() {
+    /// A staging store rooted inside `dir`, plus limits nothing in these tests
+    /// can breach (the bounds themselves are `staging.rs`'s to prove).
+    fn staging(dir: &tempfile::TempDir) -> (StagingStore, StagingLimits) {
+        let storage: Arc<dyn StorageProvider> = Arc::new(FsStorage::new());
+        (
+            StagingStore::new(
+                dir.path().join("blobs").to_string_lossy().into_owned(),
+                storage,
+            ),
+            StagingLimits {
+                max_bytes: u64::MAX,
+                min_free_bytes: 0,
+            },
+        )
+    }
+
+    /// `prepare_file_send` without the progress/cancel ceremony a caller needs.
+    async fn prepare(
+        cs: &ChatStore,
+        st: &StagingStore,
+        limits: StagingLimits,
+        peer: &DeviceId,
+        path: &str,
+    ) -> Result<(FileRef, StagedFile), SendError> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        prepare_file_send(cs, st, peer, path, limits, &TransferControl::new(), &tx).await
+    }
+
+    /// The contract the whole send path rests on: one id names the chat row, the
+    /// staged blob and (later) the transfer; the row is persisted before the
+    /// copy starts; and it carries the sender's own path so the UI can open it.
+    #[tokio::test]
+    async fn prepare_file_send_stages_the_bytes_and_queues_a_pending_row() {
         let (cs, dir) = store();
+        let (st, limits) = staging(&dir);
         let peer = DeviceId::from("pb-bob");
         let path = dir.path().join("report.pdf");
         std::fs::write(&path, vec![7u8; 4096]).unwrap();
         let path = path.to_string_lossy().into_owned();
 
-        let (r, rec) = prepare_file_send(&cs, &peer, &path).unwrap();
+        let (r, staged) = prepare(&cs, &st, limits, &peer, &path).await.unwrap();
 
         assert_eq!(r.name, "report.pdf", "name is the path's base component");
-        assert_eq!(r.size, 4096, "size is read from the filesystem");
-        assert_eq!(rec.id, r.id, "the record key IS the FileRef id");
+        assert_eq!(r.size, 4096);
+        assert_eq!(staged.size, 4096);
+        assert!(
+            staged.staged_path.ends_with(&r.id),
+            "the blob is named by the id that names the row: {}",
+            staged.staged_path
+        );
+        assert_eq!(std::fs::read(&staged.staged_path).unwrap(), vec![7u8; 4096]);
 
         let hist = cs.history(&peer).unwrap();
-        assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].id, r.id);
+        assert_eq!(hist.len(), 1, "one file share is one row");
+        assert_eq!(hist[0].id, r.id, "the record key IS the FileRef id");
         assert_eq!(hist[0].kind, Kind::File);
         assert_eq!(hist[0].direction, Direction::Out);
-        assert_eq!(
-            hist[0].status,
-            Status::Transferring,
-            "persisted before the network, so a crash is reconcilable"
-        );
+        assert_eq!(hist[0].status, Status::Pending, "queued, not yet sent");
         let meta = hist[0].file.clone().expect("file meta");
         assert_eq!(meta.name, "report.pdf");
         assert_eq!(meta.size, 4096);
@@ -345,18 +553,126 @@ mod tests {
             Some(path.as_str()),
             "the sender's own path is kept record-side (never on the wire)"
         );
+
+        // And it is genuinely queued, with the blob the outbox owns.
+        let queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message_id, r.id);
+        assert_eq!(queued[0].kind, Kind::File);
+        assert_eq!(queued[0].file.as_ref().unwrap(), &staged);
+    }
+
+    /// The row exists, and says `Staging`, before a single byte is copied — so a
+    /// multi-GB attach reads as work in progress rather than a hung UI.
+    #[test]
+    fn begin_file_send_persists_a_staging_row_before_any_copy() {
+        let (cs, dir) = store();
+        let peer = DeviceId::from("pb-bob");
+        let path = dir.path().join("big.bin");
+        std::fs::write(&path, vec![7u8; 64]).unwrap();
+
+        let r = begin_file_send(&cs, &peer, &path.to_string_lossy()).unwrap();
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].id, r.id);
+        assert_eq!(
+            hist[0].status,
+            Status::Staging,
+            "nothing has been offered to anyone yet"
+        );
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "a file is queued only once its bytes are safely staged"
+        );
+    }
+
+    /// TRAP 4: the `FileRef` on the wire and the bytes on the stream must both
+    /// describe the blob. A source still being written to makes the pre-copy
+    /// metadata wrong, and a prompt that says one size while another number of
+    /// bytes arrives is exactly the mismatch staging exists to remove.
+    #[tokio::test]
+    async fn a_source_that_grew_during_the_copy_is_advertised_at_its_staged_size() {
+        let (cs, dir) = store();
+        let (st, limits) = staging(&dir);
+        let peer = DeviceId::from("pb-bob");
+        let path = dir.path().join("growing.log");
+        std::fs::write(&path, vec![1u8; 64]).unwrap();
+        let mut r = begin_file_send(&cs, &peer, &path.to_string_lossy()).unwrap();
+        assert_eq!(r.size, 64, "the pre-copy metadata size");
+
+        // The file grows between the metadata read and the copy.
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let staged = stage_file_send(
+            &cs,
+            &st,
+            &peer,
+            &mut r,
+            &path.to_string_lossy(),
+            limits,
+            &TransferControl::new(),
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(staged.size, 4096, "the blob holds what was copied");
+        assert_eq!(
+            r.size, 4096,
+            "the wire reference must describe the blob, not the stale metadata"
+        );
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().size,
+            4096,
+            "and so must our own row"
+        );
+    }
+
+    /// A staging failure is immediate failure: nothing queued, and a row that
+    /// says so rather than sitting on `Staging` forever waiting for a delivery
+    /// that was never scheduled.
+    #[tokio::test]
+    async fn a_refused_stage_fails_the_row_and_queues_nothing() {
+        let (cs, dir) = store();
+        let (st, _limits) = staging(&dir);
+        let peer = DeviceId::from("pb-bob");
+        let path = dir.path().join("too-big.bin");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+        let err = prepare(
+            &cs,
+            &st,
+            StagingLimits {
+                max_bytes: 1024,
+                min_free_bytes: 0,
+            },
+            &peer,
+            &path.to_string_lossy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("limit"), "unexpected error: {err}");
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1, "the row written before the copy stays");
+        assert_eq!(hist[0].status, Status::Failed);
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "a refused stage must queue nothing"
+        );
     }
 
     /// A folder is a different wire shape entirely; refusing it here is what
     /// keeps `chat send --file some/dir` from silently sending a 0-byte file.
     #[test]
-    fn prepare_file_send_refuses_a_directory_and_writes_nothing() {
+    fn begin_file_send_refuses_a_directory_and_writes_nothing() {
         let (cs, dir) = store();
         let peer = DeviceId::from("pb-bob");
         let sub = dir.path().join("a-folder");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let err = prepare_file_send(&cs, &peer, &sub.to_string_lossy()).unwrap_err();
+        let err = begin_file_send(&cs, &peer, &sub.to_string_lossy()).unwrap_err();
         assert!(
             err.to_string().contains("folders aren't supported"),
             "unexpected error: {err}"
@@ -368,17 +684,119 @@ mod tests {
     }
 
     #[test]
-    fn prepare_file_send_refuses_a_missing_path_and_writes_nothing() {
+    fn begin_file_send_refuses_a_missing_path_and_writes_nothing() {
         let (cs, dir) = store();
         let peer = DeviceId::from("pb-bob");
         let missing = dir.path().join("nope.bin");
 
-        let err = prepare_file_send(&cs, &peer, &missing.to_string_lossy()).unwrap_err();
+        let err = begin_file_send(&cs, &peer, &missing.to_string_lossy()).unwrap_err();
         assert!(
             err.to_string().contains("cannot read"),
             "unexpected error: {err}"
         );
         assert!(cs.history(&peer).unwrap().is_empty());
+    }
+
+    /// The one-file-at-a-time decision, and the FIFO it decides in: five queued
+    /// videos yield exactly one entry to send, the oldest, over and over until
+    /// that one is dequeued.
+    #[tokio::test]
+    async fn next_file_for_offers_the_oldest_file_one_at_a_time() {
+        let (cs, dir) = store();
+        let (st, limits) = staging(&dir);
+        let peer = DeviceId::from("pb-bob");
+        let other = DeviceId::from("pb-carol");
+
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let path = dir.path().join(format!("v{n}.mp4"));
+            std::fs::write(&path, vec![n as u8; 32]).unwrap();
+            let (r, _) = prepare(&cs, &st, limits, &peer, &path.to_string_lossy())
+                .await
+                .unwrap();
+            ids.push(r.id);
+        }
+        // Another peer's queue must not be offered for this one.
+        let theirs = dir.path().join("theirs.bin");
+        std::fs::write(&theirs, b"x").unwrap();
+        prepare(&cs, &st, limits, &other, &theirs.to_string_lossy())
+            .await
+            .unwrap();
+
+        let first = next_file_for(&cs, &peer).unwrap().expect("one to send");
+        assert_eq!(first.entry.message_id, ids[0], "FIFO: the oldest first");
+        assert_eq!(first.file.size, 32);
+        assert_eq!(
+            next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
+            ids[0],
+            "still the same one until it is dequeued — a caller cannot be handed \
+             a second file merely by asking twice"
+        );
+
+        cs.outbox_remove(&ids[0]).unwrap();
+        assert_eq!(
+            next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
+            ids[1]
+        );
+    }
+
+    /// Neither text nor a queued decline is ever offered as a file to send. Nor
+    /// is a `Kind::File` entry carrying no staged blob: nothing can produce one
+    /// today, but a partially-written or hand-edited row could, and returning it
+    /// would stall every real file behind it forever.
+    #[test]
+    fn next_file_for_ignores_text_a_decline_and_a_file_entry_with_no_blob() {
+        let (cs, raw, _dir) = store_with_raw();
+        let peer = DeviceId::from("pb-bob");
+        cs.enqueue(&peer, &ChatMessage::new("hi").unwrap()).unwrap();
+        cs.enqueue_decline(&peer, &FileDecline::new("0000000000001"))
+            .unwrap();
+        assert!(next_file_for(&cs, &peer).unwrap().is_none());
+
+        let broken = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: "0000000000002".into(),
+            body: String::new(),
+            timestamp: "2026-08-13T10:00:00+00:00".into(),
+            kind: Kind::File,
+            file: None,
+            offers_refused: 0,
+        };
+        raw.put(
+            crate::store::OUTBOX_NS,
+            &broken.message_id,
+            &serde_json::to_vec(&broken).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            next_file_for(&cs, &peer).unwrap().is_none(),
+            "a file entry with nothing to send must be skipped, not returned"
+        );
+
+        // The guard cannot pass by refusing everything: a real queued file, sat
+        // behind all three of those, is still found.
+        let r = FileRef::new("a.bin", 1).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &r,
+            FileMeta::new(&r.name, r.size, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        cs.enqueue_file(
+            &peer,
+            &r,
+            &StagedFile {
+                name: "a.bin".into(),
+                size: 1,
+                staged_path: "/data/blobs/a".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next_file_for(&cs, &peer).unwrap().unwrap().entry.message_id,
+            r.id
+        );
     }
 
     #[test]

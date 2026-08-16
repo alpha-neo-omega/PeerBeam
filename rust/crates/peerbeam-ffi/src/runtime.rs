@@ -359,12 +359,30 @@ pub fn init(config_json: &str) -> OpResult {
     let chat = peerbeam_chat::ChatStore::new(appstore);
     reconcile_chat(&chat);
 
+    // The outbox's own copy of every queued file. A sibling of `appstore`
+    // rather than a directory inside it: `FsAppStore` owns that tree and lists
+    // it by namespace, and a blob is not a record — it is plaintext user
+    // content, written `0600`, deleted the moment its entry settles.
+    let staging = Arc::new(peerbeam_chat::StagingStore::new(
+        std::path::Path::new(&config.storage.data_directory)
+            .join("outbox-blobs")
+            .to_string_lossy()
+            .into_owned(),
+        Arc::new(peerbeam_storage_fs::FsStorage::new()),
+    ));
+    let staging_limits = peerbeam_chat::StagingLimits {
+        max_bytes: config.device.max_queued_file_bytes,
+        min_free_bytes: config.device.min_free_bytes,
+    };
+
     let manager = Arc::new(Manager::new(
         route_manager,
         quic,
         enc,
         trust,
         chat,
+        staging,
+        staging_limits,
         identity,
         config.storage.save_directory.clone(),
         config.device.auto_accept_trusted,

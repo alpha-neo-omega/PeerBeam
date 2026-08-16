@@ -1084,6 +1084,32 @@ pub(crate) fn chat_store(
     peerbeam_chat::ChatStore::new(store)
 }
 
+/// Build the CLI's staging store: the outbox's own copy of every file waiting
+/// to be sent, rooted at `<data_directory>/outbox-blobs` — the same path the
+/// FFI runtime uses, so a single machine running both surfaces has one place
+/// where queued bytes live rather than two.
+///
+/// A sibling of `appstore`, not a directory inside it: `FsAppStore` owns that
+/// tree and enumerates it by namespace, and a staged blob is not a record. It is
+/// plaintext user content, written `0600`, and deleted the moment the entry that
+/// owns it settles.
+pub(crate) fn staging_store(config: &EngineConfig) -> peerbeam_chat::StagingStore {
+    let root = std::path::Path::new(&config.storage.data_directory).join("outbox-blobs");
+    peerbeam_chat::StagingStore::new(
+        root.to_string_lossy().into_owned(),
+        Arc::new(peerbeam_storage_fs::FsStorage::new()),
+    )
+}
+
+/// The two bounds a stage is held to, read from configuration here so nothing
+/// in `peerbeam_chat` has to know what a config is.
+pub(crate) fn staging_limits(config: &EngineConfig) -> peerbeam_chat::StagingLimits {
+    peerbeam_chat::StagingLimits {
+        max_bytes: config.device.max_queued_file_bytes,
+        min_free_bytes: config.device.min_free_bytes,
+    }
+}
+
 /// Select a route (via the RouteManager), authenticate, wrap in `SecureLink`,
 /// and stream one file with progress. The route chosen is the manager's
 /// concern — this function never sees it. `chat`/`sink` are threaded through

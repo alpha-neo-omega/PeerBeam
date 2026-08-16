@@ -4,7 +4,7 @@
 //! background task, controlled by id, reporting progress/stats/history as
 //! events. No file bytes cross FFI — only paths in, metadata/progress out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -15,7 +15,10 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use peerbeam_chat::{ChatStore, Direction as ChatDirection, FileRef, Status as ChatStatus};
+use peerbeam_chat::{
+    ChatStore, Direction as ChatDirection, FileRef, PendingFile, StagingLimits, StagingStore,
+    Status as ChatStatus,
+};
 // Only referenced by the guard test's assertions below; the guard's own
 // kind check now lives solely in `ChatRecord::is_settleable_file_row`.
 #[cfg(test)]
@@ -230,6 +233,53 @@ impl AcceptOutcome {
     }
 }
 
+/// The sender's own path for a queued file, read off its chat row.
+///
+/// Deliberately **not** the staged blob's path, even though that is what the
+/// transfer reads: the blob is deleted the moment the send settles, so a
+/// history row or an "Open" pointing at it would dangle within seconds. What
+/// the user wants to reopen is the file they picked.
+fn sender_path(chat: &ChatStore, peer: &DeviceId, id: &str) -> Option<String> {
+    chat.get(peer, id)
+        .ok()
+        .flatten()
+        .and_then(|rec| rec.file)
+        .and_then(|meta| meta.local_path)
+}
+
+/// How one send leg ended, for a caller with bookkeeping of its own to do
+/// afterwards — the queued-file drain, which must decide between dequeueing,
+/// deleting the staged blob, and counting a refusal against the backstop.
+///
+/// `Failed`'s `bytes_moved` is the entire basis of that counting rule, and it
+/// is exact rather than a heuristic. `stream::send_file` sends `Meta` and then
+/// **waits for the receiver's `Control::ResumeAck`** before it reads or sends a
+/// single chunk; the receiver only reaches the code that sends that ack after
+/// its approval gate has resolved in favour of accepting (`handle_incoming`
+/// calls `receive_on_channel` only on the accepted branch). So:
+///
+/// * **zero bytes** — the receiver never accepted: it refused, or nobody
+///   answered the prompt. That is an offer that *reached* the peer and was
+///   turned down at the gate, which is what the backstop counts;
+/// * **any bytes at all** — the receiver did accept, and something failed
+///   afterwards. An ordinary mid-stream fault, retryable forever, never counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegOutcome {
+    Delivered,
+    Cancelled,
+    Failed { bytes_moved: u64 },
+}
+
+/// How many offers may reach a peer and be refused (or time out) at its
+/// approval gate before a queued file is given up on.
+///
+/// The backstop exists for peers too old to send a `FileDecline`: without it a
+/// refused file is re-offered on every drain tick, re-prompting its receiver
+/// forever. Three is enough that a single missed prompt — someone away from
+/// their desk when the 180 s `ACCEPT_TIMEOUT` elapses — is recoverable, and
+/// small enough that a genuine refusal stops being a nuisance quickly.
+const MAX_OFFERS_REFUSED: u32 = 3;
+
 /// Whether refusing the transfer `id` should put a `FileDecline` on the wire.
 ///
 /// This is the enforcement point for "capability-advertised, not assumed"
@@ -285,6 +335,19 @@ pub struct Manager {
     /// accept path registers a `ChatHandler` against a clone of this store, so
     /// every accepted session persists into the same on-disk conversation log.
     chat: ChatStore,
+    /// The outbox's own copy of every file waiting to be sent. `Arc` because
+    /// `StagingStore` is deliberately not `Clone` (it owns a directory), and
+    /// the background send tasks need it alongside `chat`.
+    staging: Arc<StagingStore>,
+    /// The size cap and free-space floor a stage is held to, resolved from
+    /// configuration once at construction so nothing below reads config.
+    staging_limits: StagingLimits,
+    /// Peers with a queued file transfer running right now, keyed by peer id —
+    /// the one-file-in-flight guard. Queueing five videos must start one
+    /// transfer, not five competing for the same link. Text is never gated by
+    /// this: it rides CHAT while a file's bytes ride TRANSFER, so a message
+    /// never waits behind bytes.
+    chat_file_in_flight: Mutex<HashSet<String>>,
     identity: Identity,
     /// The presented name, split out from `identity` so a live rename
     /// (`set_identity_name`) reaches in-flight/future handshakes without a
@@ -318,6 +381,8 @@ impl Manager {
         enc: Arc<AeadCrypto>,
         trust: Arc<FsTrust>,
         chat: ChatStore,
+        staging: Arc<StagingStore>,
+        staging_limits: StagingLimits,
         identity: Identity,
         save_dir: String,
         auto_accept: bool,
@@ -337,6 +402,9 @@ impl Manager {
             enc,
             trust,
             chat,
+            staging,
+            staging_limits,
+            chat_file_in_flight: Mutex::new(HashSet::new()),
             identity,
             identity_name,
             save_dir: RwLock::new(save_dir),
@@ -835,6 +903,13 @@ impl Manager {
     /// Takes the session **by value** and closes it on the single exit below:
     /// there is no `?` and no early return in this function, so no path can
     /// leak it.
+    ///
+    /// Returns how the leg ended ([`LegOutcome`]) *after* the ordinary terminal
+    /// handling has run, for the one caller that has further bookkeeping —
+    /// [`run_queued_file`](Self::run_queued_file), which must tell a refusal at
+    /// the peer's approval gate apart from a mid-stream fault. Every other
+    /// caller ignores it; the settle, the events and the history row are
+    /// unchanged and still happen here.
     #[allow(clippy::too_many_arguments)]
     async fn run_send_on_session(
         self: &Arc<Self>,
@@ -845,7 +920,7 @@ impl Manager {
         path: String,
         name: String,
         size: u64,
-    ) {
+    ) -> LegOutcome {
         events::transfer(
             id,
             "transfer_started",
@@ -878,7 +953,19 @@ impl Manager {
         )
         .await;
         session.close().await;
+        // Read the leg's shape before `finish` consumes the outcome. The byte
+        // count is the transfer's own progress total, which on this (sending)
+        // side is bytes handed to the wire — and no byte is ever handed to the
+        // wire before the receiver's `ResumeAck`, i.e. before it accepted.
+        let leg = match &outcome {
+            Ok(TransferOutcome::Completed) => LegOutcome::Delivered,
+            Ok(TransferOutcome::Cancelled) => LegOutcome::Cancelled,
+            Err(_) => LegOutcome::Failed {
+                bytes_moved: active.stats.lock().unwrap().transferred,
+            },
+        };
         self.finish(active, outcome);
+        leg
     }
 
     async fn run_send_folder(
@@ -1473,24 +1560,28 @@ impl Manager {
     /// in the background ([`run_chat_file_send`](Self::run_chat_file_send)) and
     /// reports through `chat_status` + the ordinary `transfer_*` events.
     ///
-    /// **Online only (increment 2a).** Unlike [`chat_send`](Self::chat_send),
-    /// there is no outbox: a peer that cannot be reached right now fails with a
-    /// clear message and a `Failed` row rather than queueing. Offline file
-    /// queueing is a separate increment, and quietly reusing the text outbox
-    /// would promise a delivery this build cannot make.
+    /// **The send path is uniform (increment 2b): stage → enqueue → drain now
+    /// if the peer is reachable.** There is no online/offline fork. A peer that
+    /// cannot be reached right now simply leaves the file queued, exactly like
+    /// text, and the online case is that queue draining without delay.
     ///
-    /// The id is also claimed in the `active` registry **synchronously, here**,
-    /// before the background task is even spawned — not later, once the dial has
-    /// succeeded. [`chat_reconcile`](Self::chat_reconcile) treats "a
-    /// `Transferring` row with no entry in `active`" as an orphan and settles it
-    /// `Interrupted`, and `Interrupted` is outside the writable set, so the real
-    /// completion would afterwards be dropped. Claiming after the dial left a
-    /// multi-second window (the dial itself, plus `peerbeam_chat`'s
-    /// `CHANNEL_OPEN_BUDGET`) in which merely leaving the thread and coming back
-    /// — an ordinary gesture, and one the UI performs on every open — marked a
-    /// perfectly healthy transfer `Interrupted` forever, disagreeing with the
-    /// receiver's own row. The claim is what makes the reconcile's skip cover
-    /// that window.
+    /// That is the riskiest choice in this increment and it is deliberate: two
+    /// paths would mean two sets of terminal-state handling, and terminal states
+    /// were already the source of this feature's hardest defects. One path
+    /// cannot drift from itself.
+    ///
+    /// **Why no `active` claim here any more.** 2a claimed the transfer id
+    /// synchronously to protect the dial window: the row was written
+    /// `Transferring` before anything was dialed, and
+    /// [`chat_reconcile`](Self::chat_reconcile) settles a `Transferring` row
+    /// with no entry in `active` as `Interrupted` — a status outside the
+    /// writable set, so the real completion was afterwards dropped. Under 2b the
+    /// row is written `Staging` and then `Pending`, and **neither is in the set
+    /// `chat_reconcile` touches at all**, so the entire stage-and-queue window
+    /// is immune by construction rather than by a claim. The id is claimed at
+    /// the moment it stops being immune — in
+    /// [`run_queued_file`](Self::run_queued_file), before that row is moved to
+    /// `Transferring`.
     pub fn chat_send_file(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
         let path = req
@@ -1498,120 +1589,121 @@ impl Manager {
             .and_then(|v| v.as_str())
             .ok_or((Code::InvalidArgument, "path required".into()))?
             .to_string();
-        // Validate + persist the outgoing row first, so a failure never
-        // half-sends: after this line there is always a row to settle.
-        let (file_ref, _rec) = peerbeam_chat::prepare_file_send(&self.chat, &device.id, &path)
+        // Validate + persist the outgoing row synchronously, so the caller's id
+        // is durable and visible in `chat_history` before this returns and a
+        // refused path (missing, a directory, a bad name) leaves no row at all.
+        // The copy itself cannot happen here: it can run for minutes on a
+        // multi-GB file, and this call must not block a UI thread.
+        let file_ref = peerbeam_chat::begin_file_send(&self.chat, &device.id, &path)
             .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
         let id = file_ref.id.clone();
-        // `register_vacant` refuses rather than overwrites, so a squatted id
-        // fails this share instead of splicing it onto someone else's transfer.
-        let Some(active) = self.register_vacant(
-            &id,
-            "sending",
-            &device.name,
-            &device.id.0,
-            &file_ref.name,
-            Some(path.clone()),
-        ) else {
-            // Report it the way every other failure of this call is reported —
-            // a `Failed` row plus a `chat_status` carrying the reason — rather
-            // than as a call error. The row already exists (persisted a line
-            // above), so an `Err` here would leave the caller's own optimistic
-            // row *and* this one describing the same file. The caller sees what
-            // it saw when this check lived in the spawned task; the peer sees
-            // strictly less, since we no longer dial it or offer it a `FileRef`
-            // for a share that cannot proceed.
-            self.fail_chat_file(
-                &device.id.0,
-                &id,
-                &format!("transfer id already in use: {id}"),
-            );
-            return Ok(json!({ "id": id }));
-        };
+        // The row is `Staging` now: say so, so a surface can show it rather
+        // than an attach that appears to hang.
+        events::chat_status(&device.id.0, &id, chat_status_str(ChatStatus::Staging));
         let me = self.clone();
-        crate::runtime::spawn(async move {
-            me.run_chat_file_send(device, path, file_ref, active).await
-        });
+        crate::runtime::spawn(async move { me.run_chat_file_send(device, path, file_ref).await });
         Ok(json!({ "id": id }))
     }
 
-    /// The network half of [`chat_send_file`](Self::chat_send_file): dial,
-    /// check what the peer can actually receive, publish the `FileRef` on CHAT,
-    /// then move the bytes over TRANSFER under the same id.
+    /// The slow half of [`chat_send_file`](Self::chat_send_file): copy the file
+    /// into the outbox's own storage, queue it, then try to deliver it right
+    /// now.
     ///
-    /// Every early return closes the session it holds, releases the `active`
-    /// claim [`chat_send_file`](Self::chat_send_file) took, and settles the row
-    /// — so the user is never left with a row stuck at `Transferring`, a
-    /// session leaked into the peer, or a phantom entry in
-    /// `pb_transfers_active`:
+    /// Staging is what makes a queued file honest. Between queueing and delivery
+    /// the user may delete, move, rename or rewrite what they picked, and a
+    /// queue that silently sends different bytes than the ones chosen is worse
+    /// than one that fails. It also *deletes* the source-changed problem class
+    /// rather than detecting it: no mtime comparison, no "the file you queued is
+    /// not the file we sent", no Android content-URI instability.
     ///
-    /// | Failure | Session | `active` claim | Row |
-    /// | --- | --- | --- | --- |
-    /// | dial failed | none was established | released | `Failed` + `chat_status` |
-    /// | peer lacks `CHAT_FEAT_FILEREF` | closed here | released | `Failed` + `chat_status` |
-    /// | `FileRef` send failed | closed here | released | `Failed` + `chat_status` |
-    /// | transfer failed/cancelled | closed by `run_send_on_session` | released by `finish` | `Failed` via `finish` |
-    /// | success | closed by `run_send_on_session` | released by `finish` | `Sent` via `finish` |
+    /// The copy streams (I10) — its whole memory footprint is one 64 KiB buffer
+    /// whatever the file's size — and reports progress as it goes, so a
+    /// multi-GB attach shows work rather than looking hung.
     ///
-    /// (The remaining case — the id was already claimed — is now decided
-    /// synchronously in `chat_send_file`, before this task exists.)
-    ///
-    /// Every one of those releases goes through
-    /// [`abandon_chat_file`](Self::abandon_chat_file) rather than being spelled
-    /// out per branch, so a future `?` or a new early return cannot skip it.
-    ///
-    /// **No silent fallback to a plain transfer.** If the negotiated
-    /// capabilities lack the feature bit, the peer's build has no `FileRef`
-    /// handler: it would show the file as an ordinary incoming transfer with no
-    /// row in the conversation. Sending it anyway would tell our user the
-    /// attachment landed in a thread the peer cannot see, which is worse than
-    /// failing. So the refusal is terminal and **no transfer is started**: no
-    /// `transfer_queued`, no bytes, and the `active` claim is released before
-    /// the failure is announced, so a refused share leaves nothing in
-    /// `pb_transfers_active` either.
-    async fn run_chat_file_send(
-        self: Arc<Self>,
-        device: Device,
-        path: String,
-        file_ref: FileRef,
-        active: Arc<Active>,
-    ) {
+    /// A staging failure is immediate failure: nothing is queued, the row says
+    /// `Failed` with the reason, and the user learns now instead of waiting for
+    /// a delivery that was never scheduled.
+    async fn run_chat_file_send(self: Arc<Self>, device: Device, path: String, file_ref: FileRef) {
         let peer_id = device.id.0.clone();
         let id = file_ref.id.clone();
-        let name = file_ref.name.clone();
-        let size = file_ref.size;
+        let mut file_ref = file_ref;
+        let ctrl = TransferControl::new();
+        let (ptx, mut prx) = mpsc::unbounded_channel::<u64>();
 
-        let meta = self.session(&id, device.id.clone(), size);
-        let session = match crate::session_exec::dial(
-            &self.quic,
-            &self.rm,
-            &device,
-            &meta,
-            self.identity(),
-            self.enc.clone(),
-            self.trust.clone(),
-            Some(self.chat_wiring()),
-        )
-        .await
-        {
-            Ok(s) => s,
-            // Increment 2a is online-only: say so plainly instead of implying
-            // the file is queued somewhere.
-            Err((_, msg)) => {
-                return self.abandon_chat_file(
-                    &active,
-                    &format!("cannot reach {} to send {name}: {msg}", device.name),
-                );
-            }
+        // Drain the progress channel alongside the copy rather than after it:
+        // one report per 64 KiB is ~262k reports for a 16 GiB file, and an
+        // unbounded channel nobody reads would hold every one of them.
+        // Task 8 turns these into a determinate bar; here they are consumed so
+        // the queue stays bounded.
+        let stage = async {
+            let r = peerbeam_chat::stage_file_send(
+                &self.chat,
+                &self.staging,
+                &device.id,
+                &mut file_ref,
+                &path,
+                self.staging_limits,
+                &ctrl,
+                &ptx,
+            )
+            .await;
+            drop(ptx);
+            r
         };
+        let pump = async { while prx.recv().await.is_some() {} };
+        let (staged, ()) = tokio::join!(stage, pump);
+        if let Err(e) = staged {
+            return self.fail_chat_file(&peer_id, &id, &e.to_string());
+        }
+
+        // Queued. The online case is this queue draining without delay — and if
+        // the peer is unreachable the file simply waits, exactly like text.
+        let _ = self.chat_flush_peer(device).await;
+    }
+
+    /// Deliver one queued file to `peer` over an already-established session,
+    /// then do the queue's own bookkeeping.
+    ///
+    /// This is 2a's proven online send path with the queue wrapped around it:
+    /// the capability gate, the `FileRef` on CHAT before any byte moves, and
+    /// then the identical `run_send_on_session` body — same events, same close,
+    /// same terminal handling through `finish`.
+    ///
+    /// What is new is what happens *after*, in
+    /// [`settle_queued_file`](Self::settle_queued_file), and one ordering
+    /// detail: the `active` claim and the row's move to `Transferring` are taken
+    /// together, immediately before the transfer starts. `chat_reconcile`
+    /// settles a `Transferring` row with no `active` entry as `Interrupted`, so
+    /// the row must not enter that state before its transfer is registered.
+    ///
+    /// **No silent fallback to a plain transfer.** A peer that never negotiated
+    /// `CHAT_FEAT_FILEREF` has no `FileRef` handler: it would show the file as
+    /// an ordinary incoming transfer with no row in any conversation, while our
+    /// user was told the attachment landed in a thread the peer cannot see. So
+    /// the refusal is announced on the row and **no transfer is started** — but
+    /// the entry stays queued and nothing is counted against the backstop,
+    /// because nobody was ever prompted and the peer may yet upgrade.
+    async fn run_queued_file(
+        self: Arc<Self>,
+        session: crate::session_exec::Session,
+        device: Device,
+        peer: DeviceId,
+        pending: PendingFile,
+    ) {
+        let id = pending.entry.message_id.clone();
+        let staged = pending.file;
+        let name = staged.name.clone();
+        let size = staged.size;
 
         // The gate. Capture the answer, then close on the refusal path — the
         // exact bug this ordering exists to prevent is a `?`-style early return
         // that skips `session.close()`.
         if !session.supports_file_ref() {
             session.close().await;
-            return self.abandon_chat_file(
-                &active,
+            self.release_file_slot(&peer.0);
+            return self.fail_chat_file(
+                &peer.0,
+                &id,
                 &format!(
                     "{} cannot receive chat attachments — its build predates \
                      file sharing in chat. Send {name} as a plain transfer instead.",
@@ -1623,57 +1715,173 @@ impl Manager {
         // The row in the peer's thread. Sent before the bytes so the file has
         // somewhere to land: the receiver's `FileRef` handler persists a
         // `PendingApproval` row keyed by this same id, which the incoming
-        // transfer then settles.
+        // transfer then settles. Its `size` is the staged blob's, so the
+        // approval prompt and the bytes that follow describe one file.
+        let file_ref = FileRef {
+            id: id.clone(),
+            timestamp: pending.entry.timestamp.clone(),
+            name: name.clone(),
+            size,
+        };
         if let Err(e) = peerbeam_chat::send_file_ref(&session.handle, &file_ref).await {
             session.close().await;
-            return self.abandon_chat_file(&active, &format!("could not offer {name}: {e}"));
+            self.release_file_slot(&peer.0);
+            return self.fail_chat_file(&peer.0, &id, &format!("could not offer {name}: {e}"));
+        }
+
+        // Claim the id, then move the row in flight — in that order, so the row
+        // is never `Transferring` with nothing registered under it.
+        let Some(active) = self.register_vacant(
+            &id,
+            "sending",
+            &device.name,
+            &peer.0,
+            &name,
+            // The user's OWN path, read off the row — never the staged blob's,
+            // which is deleted the moment this settles, so a history row
+            // pointing at it would dangle.
+            sender_path(&self.chat, &peer, &id),
+        ) else {
+            // Somebody else holds this id right now. Leave the entry queued and
+            // try again on the next drain rather than splicing this share onto
+            // an unrelated transfer.
+            session.close().await;
+            self.release_file_slot(&peer.0);
+            tracing::warn!(message_id = %id, "queued file deferred: transfer id in use");
+            return;
+        };
+        if let Err(e) = self.chat.reopen_for_retry(&peer, &id) {
+            tracing::warn!(error = %e, message_id = %id, "queued file row not re-opened");
         }
 
         events::transfer(
             &id,
             "transfer_queued",
-            json!({ "peer": device.name, "peer_id": peer_id, "file": name, "size": size }),
+            json!({ "peer": device.name, "peer_id": peer.0, "file": name, "size": size }),
         );
         // From here the ordinary send path owns it: same events, same close,
         // same terminal handling — and `finish` settles the row through
-        // `chat_settle`, so success and failure both land on the record.
-        self.run_send_on_session(session, &id, &active, &device, path, name, size)
+        // `chat_settle`, so success and failure both land on the record. The
+        // bytes come from the STAGED BLOB, never the user's original.
+        let leg = self
+            .run_send_on_session(
+                session,
+                &id,
+                &active,
+                &device,
+                staged.staged_path.clone(),
+                name,
+                size,
+            )
             .await;
+        self.settle_queued_file(&peer, &pending.entry.message_id, &staged.staged_path, leg);
+        self.release_file_slot(&peer.0);
     }
 
-    /// Abandon a chat file share that never became a moving transfer: release
-    /// the `active` claim [`chat_send_file`](Self::chat_send_file) took, then
-    /// settle the row and tell every surface why.
+    /// The queue's terminal decision for one delivery attempt — where the
+    /// keep-forever promise and the bounded backstop are actually implemented.
     ///
-    /// One method rather than two calls repeated at each early return, because
-    /// the release is not optional and is easy to lose. While the id sits in
-    /// `active`, [`chat_reconcile`](Self::chat_reconcile) deliberately skips its
-    /// row — that skip is what protects a genuinely in-flight share — so a
-    /// leaked claim leaves a `Transferring` row that no reconcile will ever
-    /// settle and no transfer event will ever finish: an eternal progress bar,
-    /// surviving every reopen, for a share that failed seconds after it
-    /// started. This feature's history already includes a `?` that skipped a
-    /// cleanup twice; funnelling every path through one method is how that stops
-    /// being possible here.
+    /// | outcome | queue | staged blob |
+    /// | --- | --- | --- |
+    /// | delivered | dequeued | deleted |
+    /// | cancelled by the user | dequeued | deleted |
+    /// | the peer declined (a `FileDecline` settled our row mid-flight) | dequeued | deleted |
+    /// | failed after bytes moved (mid-stream fault) | left queued, nothing counted | kept |
+    /// | failed with no bytes (refused or unanswered at the approval gate) | counted; terminal at [`MAX_OFFERS_REFUSED`] | kept until terminal |
     ///
-    /// The release is [`claim`](Self::claim) — identity-checked — so a late call
-    /// can never tear out a *different* transfer that has since taken this id.
-    fn abandon_chat_file(&self, active: &Arc<Active>, reason: &str) {
-        let _ = self.claim(active);
-        self.fail_chat_file(&active.peer_id, &active.id, reason);
+    /// **A connection failure never reaches this function at all** — it fails
+    /// before a session exists, so nothing is counted and the file waits
+    /// forever, exactly like text. That asymmetry is the point: counting
+    /// attempts rather than refusals would burn the budget during a flapping
+    /// link and drop a file nobody ever declined.
+    ///
+    /// The declined case is read off the row rather than plumbed through,
+    /// because that is where it is already recorded: a `FileDecline` can only
+    /// settle a row the settle guard admits, i.e. one that is still in flight,
+    /// which is precisely the window this leg was running in. Re-reading after
+    /// the leg therefore sees it, and the settle guard stays untouched.
+    fn settle_queued_file(&self, peer: &DeviceId, id: &str, staged_path: &str, leg: LegOutcome) {
+        let declined = matches!(
+            self.chat.get(peer, id),
+            Ok(Some(rec)) if rec.status == ChatStatus::Declined
+        );
+        let terminal = if declined {
+            true
+        } else {
+            match leg {
+                LegOutcome::Delivered | LegOutcome::Cancelled => true,
+                // The receiver accepted and something failed afterwards: an
+                // ordinary fault, retryable forever, never counted as a refusal.
+                LegOutcome::Failed { bytes_moved } if bytes_moved > 0 => false,
+                LegOutcome::Failed { .. } => {
+                    // The offer reached the peer and was refused, or nobody
+                    // answered. Count it, and give up once the budget is spent.
+                    let count = self.chat.outbox_bump_refused(id).unwrap_or(0);
+                    if count >= MAX_OFFERS_REFUSED {
+                        self.fail_chat_file(
+                            &peer.0,
+                            id,
+                            &format!(
+                                "{} did not accept this file after {count} attempts — \
+                                 it will not be offered again",
+                                peer.0
+                            ),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        };
+        if !terminal {
+            return;
+        }
+        if let Err(e) = self.chat.outbox_remove(id) {
+            tracing::warn!(error = %e, message_id = %id, "queued file not dequeued");
+        }
+        self.staging.remove(staged_path);
+    }
+
+    /// Take this peer's one file-in-flight slot, if it is free.
+    ///
+    /// The guard is per peer, not global: two peers may receive files at once,
+    /// but queueing five videos for one peer must start one transfer, not five
+    /// competing for the same link. Text is never gated by it — a message rides
+    /// CHAT while a file's bytes ride TRANSFER, so it never waits behind bytes.
+    fn claim_file_slot(&self, peer_id: &str) -> bool {
+        self.chat_file_in_flight
+            .lock()
+            .unwrap()
+            .insert(peer_id.to_string())
+    }
+
+    /// Release this peer's file-in-flight slot. Called on **every** terminal
+    /// path of [`run_queued_file`](Self::run_queued_file), including the ones
+    /// that never start a transfer: a leaked slot would stop that peer's queue
+    /// from ever draining again for the life of the process.
+    fn release_file_slot(&self, peer_id: &str) {
+        self.chat_file_in_flight.lock().unwrap().remove(peer_id);
     }
 
     /// Settle a chat file-share that never reached the transfer stage: mark the
     /// row `Failed` and tell every surface why.
     ///
     /// Used only where the ordinary terminal paths (`finish`/`finish_failed`)
-    /// do not own the row — i.e. before any bytes moved. Writes directly rather
-    /// than going through [`chat_settle`](Self::chat_settle)'s presence check:
-    /// here the row is *known* to exist, because
-    /// [`chat_send_file`](Self::chat_send_file) persisted it before this task
-    /// was even spawned. Callers that hold an `Active` must go through
-    /// [`abandon_chat_file`](Self::abandon_chat_file) instead, so the claim is
-    /// released too.
+    /// do not own the row — i.e. before any bytes moved, or once the backstop
+    /// gives up on a file the peer keeps refusing. Writes directly rather than
+    /// going through [`chat_settle`](Self::chat_settle)'s guard: that guard
+    /// admits only an in-flight row, and every caller here is precisely the case
+    /// where the row is not in flight. It is reachable **only** from local,
+    /// sender-initiated paths — no peer input can drive it — which is the same
+    /// argument that lets `ChatStore::reopen_for_retry` exist without relaxing
+    /// the guard.
+    ///
+    /// A `Failed` row is not necessarily the end of the queue entry: a peer that
+    /// merely cannot receive attachments today keeps its file queued (it may
+    /// upgrade), and the next drain re-opens the row through `reopen_for_retry`.
+    /// What is terminal is decided in
+    /// [`settle_queued_file`](Self::settle_queued_file), not here.
     fn fail_chat_file(&self, peer_id: &str, id: &str, reason: &str) {
         let peer = DeviceId::from(peer_id.to_string());
         if let Err(e) = self.chat.set_status(&peer, id, ChatStatus::Failed) {
@@ -1697,12 +1905,26 @@ impl Manager {
         self.chat.outbox_peers().unwrap_or_default()
     }
 
-    /// Dial `device` and flush its queued messages over a fresh session,
-    /// emitting `chat_status: "sent"` for each one delivered. Best-effort: an
+    /// Dial `device` and drain its queue over a fresh session, emitting
+    /// `chat_status: "sent"` for each message delivered. Best-effort: an
     /// unreachable peer leaves its queue intact for a later attempt (the next
     /// `chat_send`'s opportunistic flush, a periodic drain, or the peer's own
     /// next flush-on-connect). Returns the flushed message ids.
-    pub async fn chat_flush_peer(&self, device: Device) -> Vec<String> {
+    ///
+    /// Two halves, deliberately asymmetric:
+    ///
+    /// * **Text and declines** go out here, synchronously, over one CHAT
+    ///   channel, and this call does not return until they have — that is what
+    ///   makes the returned ids mean "delivered".
+    /// * **A file** is *started*, not awaited. Its bytes ride the TRANSFER
+    ///   stream channel in a task that takes ownership of the session, so a
+    ///   4 GB upload cannot hold up this peer's next message, the drain loop's
+    ///   other peers, or the caller. At most **one** file per peer is started
+    ///   per flush, and only if that peer has no file transfer running already.
+    ///
+    /// A connection failure here is not a refusal: nothing is counted against
+    /// the backstop, because nobody was offered anything.
+    pub async fn chat_flush_peer(self: &Arc<Self>, device: Device) -> Vec<String> {
         let meta = self.session(&format!("chat-{}", device.id.0), device.id.clone(), 0);
         let session = match crate::session_exec::dial(
             &self.quic,
@@ -1729,7 +1951,23 @@ impl Manager {
         let flushed = peerbeam_chat::flush_to_session(&session.handle, &self.chat, &peer)
             .await
             .unwrap_or_default();
-        session.close().await;
+
+        // The file half. `next_file_for` decides *which* (the oldest queued);
+        // `claim_file_slot` decides *whether* (one per peer at a time). Only if
+        // both say yes does the session survive this call — the send task owns
+        // and closes it from here.
+        match peerbeam_chat::next_file_for(&self.chat, &peer).unwrap_or(None) {
+            Some(pending) if self.claim_file_slot(&peer.0) => {
+                let me = self.clone();
+                let peer_for_task = peer.clone();
+                crate::runtime::spawn(async move {
+                    me.run_queued_file(session, device, peer_for_task, pending)
+                        .await;
+                });
+            }
+            _ => session.close().await,
+        }
+
         for mid in &flushed {
             events::chat_status(&peer.0, mid, "sent");
         }
@@ -1781,6 +2019,13 @@ impl Manager {
     ///   status outside the writable set — and the real `Sent` was then
     ///   silently dropped, leaving a perfectly transferred file reading
     ///   "Interrupted" forever while the receiver's row said `Received`.
+    ///
+    ///   Since 2b that claim is no longer what closes it: a queued file's row
+    ///   is `Staging` and then `Pending`, and neither is a status this function
+    ///   looks at, so the whole stage-and-wait window — which can now last
+    ///   minutes, or days for an offline peer — is immune by construction. The
+    ///   id is claimed in `run_queued_file`, immediately before the row moves
+    ///   to `Transferring`.
     ///
     /// * **The receiver's pre-first-frame window — open, and accepted.** The
     ///   inbound row is written `PendingApproval` by `ChatHandler` the moment
@@ -1943,6 +2188,15 @@ impl Manager {
         // next drain tick), independent of whatever this inbound connection
         // is actually for (a transfer, or nothing at all) — best-effort, so a
         // peer with an empty outbox costs nothing beyond the lookup.
+        //
+        // TEXT AND DECLINES ONLY, deliberately: a queued *file* is not started
+        // here. Sending it would mean running a transfer over a session this
+        // function still owns and is about to close once its own incoming
+        // transfer finishes — two unrelated lifetimes on one session, with the
+        // outgoing file dying whenever the inbound one happens to end. The
+        // queued file goes out on the next drain tick instead, over a session
+        // dialed for it; a peer that just connected to us is, by definition,
+        // one discovery can see.
         {
             let flushed =
                 peerbeam_chat::flush_to_session(&session.handle, &self.chat, &session.peer_device)
@@ -2113,7 +2367,25 @@ impl Manager {
             ) {
                 let d = peerbeam_chat::FileDecline::new(&id);
                 if let Err(e) = peerbeam_chat::send_file_decline(&session.handle, &d).await {
-                    tracing::debug!(error = %e, transfer_id = %id, "file decline not delivered");
+                    // The sender dropped while our prompt was open — the one
+                    // case a decline cannot be delivered live. Queue it in the
+                    // outbox text already uses, so the refusal still reaches
+                    // them when they come back instead of being lost and
+                    // costing this user three more prompts before the sender's
+                    // own backstop gives up. `enqueue_decline` refuses to take
+                    // an occupied key, so a sender that chose the id of a
+                    // message we have queued for it cannot displace it.
+                    tracing::debug!(error = %e, transfer_id = %id, "file decline not delivered live");
+                    match self.chat.enqueue_decline(&session.peer_device, &d) {
+                        Ok(true) => tracing::info!(transfer_id = %id, "file decline queued"),
+                        Ok(false) => tracing::warn!(
+                            transfer_id = %id,
+                            "file decline not queued: id already in the outbox"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(error = %e, transfer_id = %id, "file decline not queued")
+                        }
+                    }
                 }
             }
             session.close().await;
@@ -2638,12 +2910,24 @@ mod tests {
                 enc.clone(),
             ));
         let chat = ChatStore::new(appstore);
+        let staging = Arc::new(StagingStore::new(
+            dir.path()
+                .join("outbox-blobs")
+                .to_string_lossy()
+                .into_owned(),
+            Arc::new(FsStorage::new()),
+        ));
         let mgr = Manager::new(
             rm,
             quic,
             enc,
             trust,
             chat.clone(),
+            staging,
+            StagingLimits {
+                max_bytes: u64::MAX,
+                min_free_bytes: 0,
+            },
             identity,
             dir.path().to_string_lossy().into_owned(),
             false,
@@ -3326,30 +3610,33 @@ mod tests {
         );
     }
 
-    /// **The dial window.** `chat_send_file` persists the row `Transferring`
-    /// before it touches the network, and the dial that follows — plus
-    /// `peerbeam_chat`'s five-second `CHANNEL_OPEN_BUDGET` — can run for
-    /// seconds. While the id was only claimed *after* all of that, this
-    /// reconcile saw a `Transferring` row with nothing in `active` and wrote
-    /// `Interrupted`; since `Interrupted` is outside the writable set, the real
-    /// `Sent` was afterwards dropped, and a file that transferred perfectly read
-    /// "Interrupted" forever while the receiver's row said `Received`. Backing
-    /// out of a thread and re-entering is enough to fire it, and the UI
-    /// reconciles on every open.
+    /// **The dial window, closed structurally.** In 2a `chat_send_file` wrote
+    /// the row `Transferring` before touching the network, so the seconds spent
+    /// staging and dialing were seconds in which this reconcile saw a
+    /// `Transferring` row with nothing in `active` and wrote `Interrupted` — a
+    /// status outside the writable set, so the real `Sent` was afterwards
+    /// dropped and a file that transferred perfectly read "Interrupted" forever
+    /// while the receiver's row said `Received`. Backing out of a thread and
+    /// re-entering was enough to fire it, and the UI reconciles on every open.
+    /// 2a closed it by claiming the id in `active` synchronously.
     ///
-    /// So: the claim is taken synchronously, on this thread, before the network
-    /// task is spawned — which is exactly what this asserts, and why the
-    /// assertion can be made the instant the call returns.
+    /// 2b removes the window instead of guarding it. A queued file's row is
+    /// `Staging` and then `Pending`, and **neither is a status this reconcile
+    /// looks at**, so nothing can settle it while it waits — through a stage
+    /// that may run for minutes on a multi-GB file, a dial, a peer that is
+    /// simply offline, and any number of retries. The row only enters
+    /// `Transferring` in `run_queued_file`, immediately *after* the id is
+    /// claimed.
     #[tokio::test]
-    async fn a_reconcile_inside_the_send_dial_window_leaves_the_row_alone() {
+    async fn a_reconcile_inside_the_stage_and_dial_window_leaves_the_row_alone() {
         let (mgr, chat, dir) = test_manager_full("dial-window", 0);
         let mgr = Arc::new(mgr);
         let src = dir.path().join("report.pdf");
         std::fs::write(&src, vec![7u8; 4096]).expect("write");
 
         // Port 1 on loopback: nothing is listening, so the spawned dial cannot
-        // succeed — the row is in the dial window for as long as that attempt
-        // takes, which is exactly the window under test.
+        // succeed — the row stays in the queued state for as long as that
+        // attempt takes, which is exactly the window under test.
         let out = mgr
             .chat_send_file(&json!({
                 "peer": {
@@ -3359,28 +3646,168 @@ mod tests {
             }))
             .expect("staged");
         let id = out["id"].as_str().expect("id").to_string();
+        let peer = DeviceId::from("pb-bob");
 
-        // The claim is taken before `chat_send_file` returns, so no dial can
-        // have raced it away by here.
+        // The row is durable and visible the instant the call returns, before
+        // any copying or dialing has happened.
+        let before = chat.get(&peer, &id).expect("get").expect("row").status;
         assert!(
-            mgr.active.lock().unwrap().contains_key(&id),
-            "the transfer id must be claimed synchronously, before the dial"
+            matches!(before, ChatStatus::Staging | ChatStatus::Pending),
+            "a share that has not been offered to anyone must read Staging or \
+             Pending, got {before:?}"
         );
 
         // The user backs out of the thread and comes straight back in.
         let out = mgr
             .chat_reconcile(&json!({ "peer_id": "pb-bob" }))
             .expect("reconcile");
-        assert_eq!(out["changed"], 0, "a live share must not be reconciled");
-        assert_eq!(
-            chat.get(&DeviceId::from("pb-bob"), &id)
-                .expect("get")
-                .expect("row")
-                .status,
-            ChatStatus::Transferring,
-            "a share still dialing must not be marked Interrupted — that status \
-             is outside the writable set, so its real outcome would be dropped"
+        assert_eq!(out["changed"], 0, "a queued share must not be reconciled");
+        let after = chat.get(&peer, &id).expect("get").expect("row").status;
+        assert!(
+            matches!(after, ChatStatus::Staging | ChatStatus::Pending),
+            "a queued share must not be marked Interrupted — that status is \
+             outside the writable set, so its real outcome would be dropped; \
+             got {after:?}"
         );
+    }
+
+    /// A queued file with its staged blob on disk, ready for
+    /// `settle_queued_file` to decide about. Returns `(peer, id, blob_path)`.
+    fn queued_file(
+        mgr: &Manager,
+        chat: &ChatStore,
+        dir: &tempfile::TempDir,
+    ) -> (DeviceId, String, String) {
+        let peer = DeviceId::from("pb-bob");
+        let r = peerbeam_chat::FileRef::new("a.bin", 4096).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            peerbeam_chat::FileMeta::new(&r.name, r.size, Some("/home/me/a.bin".into())),
+            ChatStatus::Staging,
+        ))
+        .expect("seed the row");
+        let blobs = dir.path().join("outbox-blobs");
+        std::fs::create_dir_all(&blobs).expect("mkdir");
+        let blob = blobs.join(&r.id);
+        std::fs::write(&blob, vec![7u8; 4096]).expect("write blob");
+        let staged = peerbeam_chat::StagedFile {
+            name: "a.bin".into(),
+            size: 4096,
+            staged_path: blob.to_string_lossy().into_owned(),
+        };
+        chat.enqueue_file(&peer, &r, &staged).expect("queue it");
+        let _ = mgr; // the manager owns the staging store these paths live under
+        (peer, r.id, staged.staged_path)
+    }
+
+    /// **The backstop's counting rule, in one test.** What may be counted
+    /// against a queued file is narrow, and getting it wrong in either
+    /// direction is a real harm: too loose and a flapping link drops a file
+    /// nobody ever declined; too tight and a peer that keeps refusing is
+    /// re-prompted forever.
+    ///
+    /// A mid-stream failure — bytes demonstrably moved, so the receiver had
+    /// already accepted — is not a refusal and must count nothing. Only a
+    /// failure with **zero** bytes is: the receiver's `Control::ResumeAck` is
+    /// the first thing the sender waits for and is sent only once it has
+    /// accepted, so zero bytes means the offer died at the approval gate.
+    #[tokio::test]
+    async fn a_mid_stream_failure_never_counts_against_the_backstop() {
+        let (mgr, chat, dir) = test_manager_full("backstop-bytes", 0);
+        let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
+
+        // Ten failures, all after bytes moved. None may be counted, and the
+        // file must still be queued with its bytes intact.
+        for _ in 0..10 {
+            mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 1 });
+        }
+        let queued = chat.outbox_for(&peer).expect("outbox");
+        assert_eq!(queued.len(), 1, "a mid-stream fault must not dequeue");
+        assert_eq!(
+            queued[0].offers_refused, 0,
+            "a peer that accepted and then lost the link refused nothing"
+        );
+        assert!(
+            std::path::Path::new(&blob).exists(),
+            "and its staged bytes must still be there for the retry"
+        );
+    }
+
+    /// The other half: three offers that died at the approval gate are counted,
+    /// and the third is terminal — dequeued, blob deleted, row `Failed` with a
+    /// reason that names the backstop rather than a network error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn three_gate_refusals_are_terminal_and_evict_the_blob() {
+        let (mgr, chat, dir) = test_manager_full("backstop-count", 0);
+        let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
+        BRIDGE_EVENTS.lock().unwrap().clear();
+        crate::events::set_callback(Some(collect_bridge));
+
+        for expected in 1..=2 {
+            mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 0 });
+            let queued = chat.outbox_for(&peer).expect("outbox");
+            assert_eq!(queued.len(), 1, "still queued after {expected} refusal(s)");
+            assert_eq!(queued[0].offers_refused, expected);
+            assert!(std::path::Path::new(&blob).exists());
+        }
+
+        mgr.settle_queued_file(&peer, &id, &blob, LegOutcome::Failed { bytes_moved: 0 });
+        assert!(
+            chat.outbox_for(&peer).expect("outbox").is_empty(),
+            "the third refusal is terminal"
+        );
+        assert!(
+            !std::path::Path::new(&blob).exists(),
+            "a file the backstop gave up on must not keep its bytes on disk"
+        );
+        assert_eq!(
+            chat.get(&peer, &id).expect("get").expect("row").status,
+            ChatStatus::Failed
+        );
+        crate::events::set_callback(None);
+        let events = BRIDGE_EVENTS.lock().unwrap().clone();
+        let reason = events
+            .iter()
+            .filter(|e| e["type"] == "chat_status" && e["message_id"] == id)
+            .filter_map(|e| e["error"].as_str().map(String::from))
+            .next_back()
+            .expect("the backstop must say why it gave up");
+        assert!(
+            reason.contains("did not accept") && reason.contains("3 attempts"),
+            "the reason must name the backstop, not a network error: {reason}"
+        );
+    }
+
+    /// Delivery and an explicit decline are both terminal, and both must let go
+    /// of the bytes: a queue that keeps a delivered file's blob is a disk leak
+    /// with no upper bound.
+    #[tokio::test]
+    async fn delivery_and_a_decline_both_dequeue_and_evict() {
+        for (leg, decline) in [
+            (LegOutcome::Delivered, false),
+            (LegOutcome::Cancelled, false),
+            (LegOutcome::Failed { bytes_moved: 0 }, true),
+        ] {
+            let (mgr, chat, dir) = test_manager_full("terminal", 0);
+            let (peer, id, blob) = queued_file(&mgr, &chat, &dir);
+            if decline {
+                // What a `FileDecline` arriving mid-flight leaves behind: the
+                // handler settled our row, and the leg then failed.
+                chat.set_status(&peer, &id, ChatStatus::Declined)
+                    .expect("settle declined");
+            }
+            mgr.settle_queued_file(&peer, &id, &blob, leg);
+            assert!(
+                chat.outbox_for(&peer).expect("outbox").is_empty(),
+                "{leg:?} (declined={decline}) must dequeue"
+            );
+            assert!(
+                !std::path::Path::new(&blob).exists(),
+                "{leg:?} (declined={decline}) must delete the staged blob"
+            );
+        }
     }
 
     #[tokio::test]

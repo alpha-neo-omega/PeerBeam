@@ -264,6 +264,183 @@ async fn dial_channels_retrying(
     }
 }
 
+// ── a manual peer that is offered queued files (increment 2b) ───
+
+/// How a manual peer reacts to a file it is offered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OfferPeer {
+    /// Accept the session, take the `FileRef`, and then never receive the
+    /// transfer stream — the sender stays blocked waiting for the receiver's
+    /// `Control::ResumeAck`, so its file leg is genuinely in flight.
+    Stall,
+    /// Take the `FileRef`, then drop the session without receiving. From the
+    /// sending side this is byte-for-byte what a refusal at the approval gate
+    /// looks like: the receiver only sends `ResumeAck` — the very first thing
+    /// the sender waits for — once it has *accepted*, so the transfer fails
+    /// with zero bytes moved.
+    Refuse,
+    /// Refuse, and say so: send a `FileDecline` for the offered id before
+    /// dropping the session, exactly as `handle_incoming` does on an explicit
+    /// rejection.
+    Decline,
+}
+
+/// A manual peer that accepts inbound sessions **repeatedly** (the queue
+/// retries, so one connection is not enough), records every `FileRef` it is
+/// offered — files only, never the text that shares the same channel — and
+/// reacts per `mode`.
+///
+/// One identity and one keypair for the peer's whole lifetime, deliberately:
+/// trust is TOFU-pinned on first contact, so re-generating a keypair per
+/// connection would make the second attempt fail authentication and every
+/// "it retried" assertion would be measuring the wrong thing.
+fn spawn_offer_peer(
+    dir: &std::path::Path,
+    name: &str,
+    port: u16,
+    mode: OfferPeer,
+) -> Arc<Mutex<Vec<ChatRecord>>> {
+    let (enc, trust, identity) = peer_identity(dir, name);
+    let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+    let trust: Arc<dyn TrustStore> = Arc::new(trust);
+    let seen: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let out = seen.clone();
+    let dir = dir.to_path_buf();
+    let name = name.to_string();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let quic = QuicTransport::new().expect("peer quic");
+        let (_addr, mut incoming) = quic
+            .serve_channels_on(format!("127.0.0.1:{port}").parse().expect("addr"))
+            .await
+            .expect("peer listen");
+        let mut conn = 0usize;
+        while let Some(Ok(qc)) = incoming.next().await {
+            // One task per connection: the sender dials a fresh session for
+            // every flush, and a serial accept loop would make each of those
+            // wait out the previous one's refusal window — turning a queue
+            // assertion into a timing assertion.
+            let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+            let seen = seen.clone();
+            // A FRESH chat store per connection, so a RE-offer of the same file
+            // is visible. `ChatHandler` dedups a `FileRef` by id against its
+            // store — correct behaviour, and exactly what would hide the retries
+            // these tests exist to count.
+            let store = peer_chat_store(&dir, &format!("{name}-c{conn}"), 55);
+            conn += 1;
+            let identity = identity.clone();
+            let enc = enc.clone();
+            let trust = trust.clone();
+            tokio::spawn(async move {
+                let seen_cl = seen.clone();
+                // FILE offers only: a text message reaches this same sink, and
+                // every assertion below counts "how many files were offered".
+                let sink: ReceivedSink = Arc::new(move |rec| {
+                    if rec.kind == peerbeam_chat::Kind::File {
+                        seen_cl.lock().unwrap().push(rec);
+                    }
+                });
+                let (handler, peer_slot) = ChatHandler::new(store.clone(), sink);
+                let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+                let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+                // The incoming-stream receiver is kept alive (below, inside the run
+                // task) but never read: dropping it would tear the peer's transfer
+                // channel down, which the sender would see as a failed *transfer*
+                // rather than as a receiver sitting at its approval gate — the one
+                // distinction every assertion in these tests turns on.
+                let (inc, inc_rx) = tokio::sync::mpsc::unbounded_channel();
+                let cfg = SessionConfig::new(chat_and_transfer_caps())
+                    .with_stream_channel_type(ChannelType::TRANSFER)
+                    .with_handlers(HandlerRegistry::new().with(handler as Arc<dyn MessageHandler>));
+                let Ok(mut ps) = PeerSession::open(
+                    transport,
+                    SessionRole::Responder,
+                    cfg,
+                    ev,
+                    ch,
+                    inc,
+                    None,
+                    identity,
+                    enc,
+                    trust,
+                )
+                .await
+                else {
+                    return;
+                };
+                let sender = ps.peer().clone();
+                let _ = peer_slot.set(sender.clone());
+                let handle = ps.handle();
+                tokio::spawn(async move {
+                    let _held = inc_rx;
+                    let _ = ps.run().await;
+                });
+                if mode == OfferPeer::Stall {
+                    return; // hold the session open; the sender's leg stays live
+                }
+                // Wait, briefly, for the offer THIS connection carries — read
+                // from this connection's own store, so a re-offer of the same
+                // file (which is exactly what a retry is) is not mistaken for
+                // another connection's. A connection that carries no offer at
+                // all (an ordinary text flush) just closes; the window is short
+                // so those cost nothing.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut offered: Option<String> = None;
+                while Instant::now() < deadline {
+                    offered = store
+                        .history(&sender)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|r| r.kind == peerbeam_chat::Kind::File)
+                        .map(|r| r.id);
+                    if offered.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if let (OfferPeer::Decline, Some(id)) = (mode, offered.as_deref()) {
+                    let d = peerbeam_chat::FileDecline::new(id);
+                    let _ = peerbeam_chat::send_file_decline(&handle, &d).await;
+                }
+                handle.close();
+            });
+        }
+    });
+    out
+}
+
+/// Poll `pb_chat_history` for one message's current status (any status), up to
+/// `secs`. Distinct from [`wait_chat_status`], which waits for one specific
+/// value — used where the interesting thing is that a status *changed at all*.
+fn chat_row(peer_id: &str, msg_id: &str) -> Option<Value> {
+    let hist = call_json(pb_chat_history, &json!({ "peer_id": peer_id }));
+    hist["data"]["messages"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"] == msg_id)
+        .cloned()
+}
+
+/// How many staged blobs the engine is currently holding for the outbox.
+fn staged_blobs(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("data").join("outbox-blobs"))
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+/// Wait, bounded, for `pred` to hold. Returns whether it did.
+async fn wait_until(secs: u64, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    pred()
+}
+
 // ── driving discovery without real LAN/mDNS hardware ───────────
 
 /// A raw discovery `Announce` datagram in the same wire shape as
@@ -1214,10 +1391,18 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     pb_shutdown();
 }
 
-/// **The send path, end to end.** `pb_chat_send_file` attaches a real file to a
-/// conversation with a real peer that advertises `CHAT_FEAT_FILEREF`: the FFI
-/// engine dials, checks the negotiated feature, publishes a `FileRef` on the
-/// CHAT channel, and streams the bytes over TRANSFER under *the same id*.
+/// **The send path, end to end — and, since 2b, the regression floor for the
+/// uniform send path.** Sending no longer forks on whether the peer is
+/// reachable: it is always stage → enqueue → drain, so this test's route to the
+/// wire now runs through the queue. Every assertion below is 2a's, unchanged
+/// and unweakened, which is precisely what makes it worth keeping: if queueing
+/// changed anything an online send does — the id, the offer, the bytes, the
+/// row, the events, the count of rows — it fails here first.
+///
+/// `pb_chat_send_file` attaches a real file to a conversation with a real peer
+/// that advertises `CHAT_FEAT_FILEREF`: the FFI engine dials, checks the
+/// negotiated feature, publishes a `FileRef` on the CHAT channel, and streams
+/// the bytes over TRANSFER under *the same id*.
 ///
 /// The three things that make this one feature rather than two are all
 /// asserted from the peer's own side of the wire:
@@ -1656,6 +1841,517 @@ async fn undecodable_first_frame_falls_back_to_a_minted_id_and_placeholder() {
     // The peer identity is still known — it comes from the handshake, not the
     // peeked frame — so routing still works even with nothing learned.
     assert_eq!(queued["payload"]["peer_id"], "garbage-sender");
+
+    pb_shutdown();
+}
+
+// ── increment 2b: the queue, the drain, and what is terminal ────
+
+/// **The headline behaviour.** Attaching a file to a peer that is not there
+/// stops failing and starts queueing: the row reads *Queued* (`pending`), the
+/// bytes are already safe in the outbox's own storage, and the file delivers
+/// when the peer next appears — the same keep-forever promise text has had
+/// since 1b.
+///
+/// The queue is crossed over a **process restart** (`pb_shutdown` +
+/// `pb_init` against the same data directory, which is what a real relaunch
+/// is), because that is the case a queue exists for and the one an in-memory
+/// retry would silently fail. Delivery is then driven by the background drain
+/// alone: the peer never dials in, so flush-on-connect cannot be what delivers
+/// it, and the opportunistic flush from the original `chat_send_file` died with
+/// the previous process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49913, dir.path());
+
+    let peer_id = "queue-peer";
+    let peer_port: u16 = 49970;
+    let payload = vec![4u8; 4096];
+    let src = dir.path().join("queued.pdf");
+    std::fs::write(&src, &payload).unwrap();
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    // 1) Attach while nothing is listening. This must NOT fail.
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    assert_eq!(
+        sent["ok"], true,
+        "attaching to an offline peer must queue: {sent}"
+    );
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    // The row reaches `pending` (queued) rather than `failed`.
+    let queued = wait_chat_status(20, peer_id, &id, "pending")
+        .expect("an attach to an offline peer must queue, not fail");
+    assert_eq!(queued["kind"], "file");
+    assert_eq!(queued["direction"], "out");
+    assert_eq!(queued["file"]["size"], 4096);
+    assert_eq!(
+        staged_blobs(dir.path()),
+        1,
+        "the bytes are staged, not referenced"
+    );
+
+    // The user's own file goes away — the whole reason staging exists.
+    std::fs::remove_file(&src).unwrap();
+
+    // 2) Restart the process against the same data directory.
+    pb_shutdown();
+    init_ffi(49913, dir.path());
+    let after_restart = chat_row(peer_id, &id).expect("the row survives a restart");
+    assert_eq!(
+        after_restart["status"], "pending",
+        "a queued file must still be queued after a restart, not reconciled away"
+    );
+
+    // 3) The peer appears. Discovery is driven directly (no LAN in a sandbox),
+    //    and only the periodic drain can deliver from here.
+    let discovery = std::thread::spawn(|| take(pb_discovery_start()))
+        .join()
+        .unwrap();
+    assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+
+    let (enc, trust, identity) = peer_identity(dir.path(), peer_id);
+    let recv_quic = QuicTransport::new().unwrap();
+    let (_addr, mut incoming) = recv_quic
+        .serve_channels_on(format!("127.0.0.1:{peer_port}").parse().unwrap())
+        .await
+        .unwrap();
+    let peer_store = peer_chat_store(dir.path(), peer_id, 88);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler, peer_slot) = ChatHandler::new(peer_store.clone(), sink);
+    let peer_dest = dir.path().join("peer-recv");
+    std::fs::create_dir_all(&peer_dest).unwrap();
+    let peer_dest_str = peer_dest.to_string_lossy().into_owned();
+
+    let peer_task = tokio::spawn(async move {
+        use futures::StreamExt;
+        let qc = incoming.next().await.unwrap().unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, mut inc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_and_transfer_caps())
+            .with_stream_channel_type(ChannelType::TRANSFER)
+            .with_handlers(HandlerRegistry::new().with(handler as Arc<dyn MessageHandler>));
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Responder,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let _ = peer_slot.set(ps.peer().clone());
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+        let stream = inc_rx
+            .recv()
+            .await
+            .expect("the queued file's transfer stream");
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        receive_on_channel(
+            stream,
+            &handle,
+            &FsStorage::new(),
+            &peer_dest_str,
+            &ctrl,
+            &ptx,
+        )
+        .await
+        .expect("peer receives the queued file")
+    });
+    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+
+    // 4) The drain delivers it: same id, same bytes, and the source is gone.
+    let got = tokio::time::timeout(Duration::from_secs(45), peer_task)
+        .await
+        .expect("the drain did not deliver the queued file in time")
+        .expect("peer task panicked");
+    let ChannelReceived::File(file) = got else {
+        panic!("expected a single-file receive");
+    };
+    assert_eq!(file.transfer_id, id, "the queued file keeps its id");
+    assert_eq!(file.name, "queued.pdf");
+    assert_eq!(
+        std::fs::read(peer_dest.join("queued.pdf")).unwrap(),
+        payload,
+        "the bytes delivered are the ones staged at queue time, byte-exact, \
+         even though the user's own file was deleted meanwhile"
+    );
+    let offered = wait_record(5, &received).expect("the FileRef reached the peer");
+    assert_eq!(offered.id, id);
+
+    // 5) Our row settles `sent`, and the queue lets go of the blob.
+    wait_chat_status(15, peer_id, &id, "sent").expect("the row never reached sent");
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        "a delivered file's staged blob must be deleted"
+    );
+
+    announce_task.abort();
+    pb_shutdown();
+}
+
+/// **Five queued videos start one transfer, not five.** The drain starts at
+/// most one file per peer, so a queue does not turn into N transfers competing
+/// for one link. Text is never gated by that guard — it rides CHAT while a
+/// file's bytes ride TRANSFER — which the second half asserts.
+///
+/// The peer here accepts the session and takes the offer but never receives the
+/// stream, so the first file's leg stays genuinely in flight for the whole test
+/// (the sender is blocked waiting for `Control::ResumeAck`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn five_queued_files_start_one_transfer_not_five() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49914, dir.path());
+
+    let peer_id = "stall-peer";
+    let peer_port: u16 = 49971;
+    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    let mut ids = Vec::new();
+    for n in 0..5u8 {
+        let src = dir.path().join(format!("clip-{n}.mp4"));
+        std::fs::write(&src, vec![n; 2048]).unwrap();
+        let sent = call_json(
+            pb_chat_send_file,
+            &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+        );
+        assert_eq!(sent["ok"], true, "chat_send_file: {sent}");
+        ids.push(sent["data"]["id"].as_str().unwrap().to_string());
+    }
+
+    // Exactly one offer reaches the peer, and it is the OLDEST — FIFO, not
+    // whichever attach happened to win a race.
+    assert!(
+        wait_until(20, || !offers.lock().unwrap().is_empty()).await,
+        "the queue must start the first file"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await; // room for a wrong build to start more
+    let seen = offers.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "five queued files must start ONE transfer, not five: {:?}",
+        seen.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(seen[0].id, ids[0], "FIFO: the oldest file goes first");
+
+    let active = take(pb_transfers_active());
+    let list = active["data"]["transfers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        list.len(),
+        1,
+        "and exactly one transfer is registered: {list:?}"
+    );
+
+    // All five are still staged: the four behind it are queued, not lost.
+    assert_eq!(staged_blobs(dir.path()), 5);
+    for id in &ids[1..] {
+        let row = chat_row(peer_id, id).expect("row");
+        assert_eq!(
+            row["status"], "pending",
+            "a file waiting its turn stays queued"
+        );
+    }
+
+    // A text message does NOT wait behind 5 queued files and a live transfer.
+    let text = call_json(
+        pb_chat_send,
+        &json!({ "peer": peer_json, "text": "does this get through?" }),
+    );
+    let text_id = text["data"]["id"].as_str().unwrap().to_string();
+    let delivered = wait_chat_status(20, peer_id, &text_id, "sent");
+    assert!(
+        delivered.is_some(),
+        "a text message must never wait behind a file transfer — its bytes ride \
+         a different channel"
+    );
+    // …and the in-flight guard held while that happened.
+    assert_eq!(
+        offers.lock().unwrap().len(),
+        1,
+        "flushing text must not start a second file for the same peer"
+    );
+
+    pb_shutdown();
+}
+
+/// **A file at the head of the queue does not delay a text message.**
+///
+/// The plan asked for a 4 GB file here, via `peerbeam-transfer`'s synthetic
+/// `gen:<size>` storage, to avoid writing 4 GB to disk. That trick cannot reach
+/// this path: the FFI constructs its own `FsStorage` internally and — since 2b
+/// — sends the *staged blob*, a real file, so a 4 GB case would mean 4 GB
+/// genuinely staged and genuinely read.
+///
+/// Size was never the mechanism, though: a big file delays a message only if
+/// the message is stuck behind it, and what this must prove is that it is not.
+/// So the file leg is made long instead of large — the peer takes the offer and
+/// never receives the stream, leaving the sender blocked on `ResumeAck` for the
+/// whole test, which is a *stronger* stall than any 4 GB copy would produce —
+/// and the text's `sent` is asserted to arrive **while that leg is still
+/// transferring**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_file_at_the_head_of_the_queue_does_not_delay_a_text_message() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49915, dir.path());
+
+    let peer_id = "slow-peer";
+    let peer_port: u16 = 49972;
+    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    let src = dir.path().join("huge.iso");
+    std::fs::write(&src, vec![6u8; 8192]).unwrap();
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    let file_id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    // The file leg is genuinely under way: the peer has the offer and our row
+    // says the bytes are moving.
+    assert!(
+        wait_until(20, || !offers.lock().unwrap().is_empty()).await,
+        "the file must actually be in flight for this test to mean anything"
+    );
+    assert!(
+        wait_until(10, || chat_row(peer_id, &file_id)
+            .map(|r| r["status"] == "transferring")
+            .unwrap_or(false))
+        .await,
+        "the file row must read transferring"
+    );
+
+    // Now the message.
+    let text = call_json(pb_chat_send, &json!({ "peer": peer_json, "text": "hi" }));
+    let text_id = text["data"]["id"].as_str().unwrap().to_string();
+    let delivered = wait_chat_status(20, peer_id, &text_id, "sent")
+        .expect("the text message must be delivered while the file is still transferring");
+    assert_eq!(delivered["body"], "hi");
+
+    // The file is STILL transferring — so the message really did overtake it
+    // rather than waiting for it to finish.
+    assert_eq!(
+        chat_row(peer_id, &file_id).expect("file row")["status"],
+        "transferring",
+        "the message must arrive while the file is still moving, not after"
+    );
+
+    pb_shutdown();
+}
+
+/// **A declined file is terminal and is never offered again.**
+///
+/// The peer takes the offer, sends a `FileDecline` for it, and drops the
+/// session. Our row must read `declined`, the entry must leave the queue, the
+/// staged blob must be deleted — and no later drain may re-offer it, which is
+/// the whole point: without a decline the file is retried keep-forever and
+/// re-prompts its receiver every single time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_declined_file_goes_terminal_and_never_re_offers() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49916, dir.path());
+
+    let peer_id = "declining-peer";
+    let peer_port: u16 = 49973;
+    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Decline);
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    let src = dir.path().join("unwanted.zip");
+    std::fs::write(&src, vec![2u8; 4096]).unwrap();
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    let row = wait_chat_status(30, peer_id, &id, "declined")
+        .expect("a FileDecline must settle our own row as declined");
+    assert_eq!(row["kind"], "file");
+    assert_eq!(row["direction"], "out");
+
+    // Dequeued and evicted: nothing left to re-offer, and no bytes left behind.
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        "a declined file's staged blob must be deleted"
+    );
+
+    // Prod the drain repeatedly. A refused file must not be offered again.
+    for n in 0..3 {
+        let text = call_json(
+            pb_chat_send,
+            &json!({ "peer": peer_json, "text": format!("prod {n}") }),
+        );
+        let tid = text["data"]["id"].as_str().unwrap().to_string();
+        wait_chat_status(20, peer_id, &tid, "sent");
+    }
+    let seen = offers.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter().filter(|r| r.id == id).count(),
+        1,
+        "a declined file must never be offered a second time: {:?}",
+        seen.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        chat_row(peer_id, &id).expect("row")["status"],
+        "declined",
+        "and its row stays declined"
+    );
+
+    pb_shutdown();
+}
+
+/// **The backstop counts refusals, never connection failures.**
+///
+/// A peer too old to send a `FileDecline` cannot say no in words, so a refused
+/// file would re-offer forever and re-prompt its receiver every time. The
+/// backstop bounds that at three offers *that actually reached the peer*.
+///
+/// The peer here takes each offer and drops the session without receiving —
+/// which is exactly what a refusal (or an unanswered prompt) looks like from
+/// the sending side, because the receiver's `Control::ResumeAck` is the first
+/// thing the sender waits for and is only sent once it has accepted. After
+/// three, the file is given up on with a reason naming the backstop.
+///
+/// The second half is the one that matters more: a peer that is merely
+/// **unreachable** must never burn that budget, no matter how many attempts
+/// elapse. Nobody saw the offer, nobody was prompted, and keep-forever is the
+/// promise text already makes — counting attempts instead of refusals would
+/// drop files nobody ever declined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49917, dir.path());
+
+    // ── (a) unreachable, forever ────────────────────────────────────────────
+    let gone_id = "peer-that-is-away";
+    let gone_json = json!({
+        "id": gone_id, "name": gone_id, "addresses": ["127.0.0.1"], "port": 49974,
+    });
+    let away_src = dir.path().join("for-later.bin");
+    std::fs::write(&away_src, vec![1u8; 1024]).unwrap();
+    let away = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": gone_json, "path": away_src.to_string_lossy() }),
+    );
+    let away_id = away["data"]["id"].as_str().unwrap().to_string();
+    wait_chat_status(20, gone_id, &away_id, "pending").expect("queued for an absent peer");
+
+    // ── (b) reachable, and refusing ─────────────────────────────────────────
+    let peer_id = "refusing-peer";
+    let peer_port: u16 = 49975;
+    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Refuse);
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+    let src = dir.path().join("rejected.bin");
+    std::fs::write(&src, vec![3u8; 2048]).unwrap();
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    // Prod the drain until the backstop fires. Each prod is an ordinary text
+    // send, whose opportunistic flush is also a drain — the same path a real
+    // periodic tick takes, without waiting 15s per attempt.
+    let mut backstop: Option<Value> = None;
+    for n in 0..8 {
+        if let Some(row) = chat_row(peer_id, &id) {
+            if row["status"] == "failed" && offers.lock().unwrap().len() >= 3 {
+                backstop = Some(row);
+                break;
+            }
+        }
+        let text = call_json(
+            pb_chat_send,
+            &json!({ "peer": peer_json, "text": format!("prod {n}") }),
+        );
+        let tid = text["data"]["id"].as_str().unwrap().to_string();
+        wait_chat_status(20, peer_id, &tid, "sent");
+        // Let the file leg that this flush started finish failing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let backstop = backstop.unwrap_or_else(|| {
+        panic!(
+            "the backstop never fired: row {:?}, offers {}",
+            chat_row(peer_id, &id),
+            offers.lock().unwrap().len()
+        )
+    });
+    assert_eq!(backstop["status"], "failed");
+    let offered = offers.lock().unwrap().len();
+    assert_eq!(
+        offered, 3,
+        "exactly three offers may reach a peer that keeps refusing, not {offered}"
+    );
+    assert!(
+        wait_until(10, || !std::path::Path::new(
+            &dir.path().join("data").join("outbox-blobs").join(&id)
+        )
+        .exists())
+        .await,
+        "a file the backstop gave up on must have its staged blob deleted"
+    );
+
+    // One more prod: it is terminal, so nothing is re-offered.
+    let text = call_json(pb_chat_send, &json!({ "peer": peer_json, "text": "last" }));
+    let tid = text["data"]["id"].as_str().unwrap().to_string();
+    wait_chat_status(20, peer_id, &tid, "sent");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        offers.lock().unwrap().len(),
+        3,
+        "a file the backstop gave up on is never offered again"
+    );
+
+    // ── …and the unreachable peer's file is untouched by any of it. ─────────
+    let still = chat_row(gone_id, &away_id).expect("the absent peer's row");
+    assert_eq!(
+        still["status"], "pending",
+        "a peer we could never reach must never go terminal: nobody saw the \
+         offer, so nothing may be counted against it"
+    );
+    assert!(
+        std::path::Path::new(&dir.path().join("data").join("outbox-blobs").join(&away_id)).exists(),
+        "and its staged bytes must still be there, waiting"
+    );
 
     pb_shutdown();
 }

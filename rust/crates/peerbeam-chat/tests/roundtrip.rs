@@ -981,3 +981,184 @@ async fn b_persists_a_file_ref_pushed_over_a_real_session() {
 
     assert_eq!(received.lock().unwrap().len(), 1, "sink fired once");
 }
+
+/// **The drain is kind-aware** (increment 2b). Before this, `flush_to_session`
+/// rebuilt *every* queued entry as a `ChatMessage` and sent it as `MSG_TEXT`,
+/// with no branch on `entry.kind`. That made two things wrong at once:
+///
+/// * a queued **file** would have gone out as an empty text message while its
+///   bytes stayed on disk;
+/// * a queued **decline** — the message that makes a refusal terminal for the
+///   sender, queued because the sender dropped while our approval prompt was
+///   open — would have arrived as an empty text message and settled nothing,
+///   so the sender would keep re-offering the file it had already been refused.
+///
+/// So: A queues a text message, a decline, and a file, all for B, and flushes.
+/// The text and the decline go out on CHAT (the decline as a real
+/// `FileDecline`, settling B's own outgoing row); the file is left queued for
+/// the caller's transfer engine to start.
+#[tokio::test]
+async fn a_queued_decline_flushes_as_a_decline_and_a_queued_file_is_left_for_the_transfer() {
+    // B is the side that offered a file and is waiting to hear about it.
+    let store_b = chat_store(31);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    let a_cfg = SessionConfig::new(caps());
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+    let _ = peer_slot_b.set(a_id.clone());
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // B's side of the story: it offered A a file, and its row is in flight.
+    let offered = FileRef::new("holiday.mov", 4096).unwrap();
+    store_b
+        .append(&peerbeam_chat::ChatRecord::file_out(
+            &a_id,
+            &offered,
+            peerbeam_chat::FileMeta::new(&offered.name, offered.size, None),
+            peerbeam_chat::Status::Transferring,
+        ))
+        .unwrap();
+
+    // A's outbox: a text message, the decline for B's offer, and a file of its
+    // own that must NOT go out on the chat channel.
+    let store_a = chat_store(32);
+    let text = ChatMessage::new("no thanks, too big").unwrap();
+    store_a.enqueue(&b_id, &text).unwrap();
+    let decline = peerbeam_chat::FileDecline::new(&offered.id);
+    assert!(store_a.enqueue_decline(&b_id, &decline).unwrap());
+    let mine = FileRef::new("mine.bin", 3).unwrap();
+    store_a
+        .append(&peerbeam_chat::ChatRecord::file_out(
+            &b_id,
+            &mine,
+            peerbeam_chat::FileMeta::new(&mine.name, mine.size, None),
+            peerbeam_chat::Status::Staging,
+        ))
+        .unwrap();
+    store_a
+        .enqueue_file(
+            &b_id,
+            &mine,
+            &peerbeam_chat::StagedFile {
+                name: "mine.bin".into(),
+                size: 3,
+                staged_path: "/data/outbox-blobs/mine".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(store_a.outbox_for(&b_id).unwrap().len(), 3);
+
+    let flushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)
+        .await
+        .expect("flush succeeds");
+
+    // Only the text is reported delivered. The decline's id names B's file —
+    // reporting it would tell A's surface that a file A REFUSED was "sent".
+    assert_eq!(
+        flushed,
+        vec![text.id.clone()],
+        "a decline is delivered but never reported as a sent message"
+    );
+
+    // The decline really landed as a decline: B's own outgoing row is settled.
+    let mut settled = None;
+    for _ in 0..300 {
+        let rec = store_b.get(&a_id, &offered.id).unwrap().expect("B's row");
+        if rec.status != peerbeam_chat::Status::Transferring {
+            settled = Some(rec.status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        settled,
+        Some(peerbeam_chat::Status::Declined),
+        "a queued decline must arrive as a FileDecline and settle the sender's row; \
+         sent as text it would have settled nothing"
+    );
+    // …and it did not arrive as a chat message. The text did, so the sink
+    // firing exactly once — for the text — is what says the decline was
+    // dispatched as a decline rather than delivered as an empty message.
+    let seen = received.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "a decline is a status change, never a new message in the thread: {seen:?}"
+    );
+    assert_eq!(seen[0].body, "no thanks, too big");
+    let hist_b = store_b.history(&a_id).unwrap();
+    assert_eq!(
+        hist_b.len(),
+        2,
+        "B's own file row plus the one text message: {hist_b:?}"
+    );
+    assert_eq!(
+        hist_b
+            .iter()
+            .filter(|r| r.kind == peerbeam_chat::Kind::File)
+            .count(),
+        1,
+        "the decline settled B's existing file row rather than adding one"
+    );
+
+    // A's outbox: text and decline drained, the file still queued for the
+    // caller's transfer engine — which `next_file_for` is what hands over.
+    let left = store_a.outbox_for(&b_id).unwrap();
+    assert_eq!(left.len(), 1, "only the file entry remains: {left:?}");
+    assert_eq!(left[0].message_id, mine.id);
+    assert_eq!(left[0].kind, peerbeam_chat::Kind::File);
+    assert_eq!(
+        peerbeam_chat::next_file_for(&store_a, &b_id)
+            .unwrap()
+            .expect("the file is what the caller must send")
+            .entry
+            .message_id,
+        mine.id
+    );
+}
