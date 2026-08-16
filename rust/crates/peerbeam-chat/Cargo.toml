@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 peerbeam-domain = { workspace = true }
+peerbeam-platform = { workspace = true }
 peerbeam-transfer = { path = "../peerbeam-transfer" }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
@@ -22,6 +24,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
+peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 tempfile = { workspace = true }

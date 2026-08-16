@@ -52,6 +52,16 @@ pub struct DeviceConfig {
     /// accepting a transfer from a newly pinned peer (optional MITM check).
     /// Off by default so zero-config first contact stays frictionless.
     pub require_pairing_confirmation: bool,
+    /// Largest file that may be attached in a chat, in bytes.
+    ///
+    /// Staging is uniform — it runs on every chat send, not only on sends that
+    /// queue — so this is a backstop against the absurd, not a product limit.
+    /// A low value here would be a capability regression: the plain transfer
+    /// path streams a file of any size straight from the source.
+    pub max_queued_file_bytes: u64,
+    /// Refuse to stage if doing so would leave less than this much free.
+    /// Filling the disk to zero can break unrelated applications.
+    pub min_free_bytes: u64,
 }
 
 /// Discovery configuration.
@@ -116,6 +126,12 @@ impl Default for DeviceConfig {
             name: peerbeam_platform::hostname(),
             auto_accept_trusted: false,
             require_pairing_confirmation: false,
+            // 16 GiB — comfortably past any file a person shares in a chat,
+            // and far short of a value that could quietly fill a disk.
+            max_queued_file_bytes: 17_179_869_184,
+            // 512 MiB — enough headroom that the OS and other applications
+            // keep working even if a staged copy lands right at the floor.
+            min_free_bytes: 536_870_912,
         }
     }
 }
@@ -244,6 +260,32 @@ mod compat_tests {
         assert_eq!(cfg.transfer.port, 50000);
         assert_eq!(cfg.transfer.chunk_size, 64 * 1024, "missing -> default");
         assert!(cfg.encryption.required, "missing section -> default");
+    }
+
+    /// Staging duplicates whatever it copies, so both knobs must have safe
+    /// defaults *and* must be absent-tolerant: every config file already on
+    /// disk predates them.
+    #[test]
+    fn staging_limits_default_and_survive_a_config_that_predates_them() {
+        let d = DeviceConfig::default();
+        assert_eq!(d.max_queued_file_bytes, 17_179_869_184, "16 GiB backstop");
+        assert_eq!(d.min_free_bytes, 536_870_912, "512 MiB floor");
+
+        // A config file written before these fields existed must still load.
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"device":{"name":"old-box"},"transfer":{"port":50000}}"#)
+                .expect("a pre-existing config must still parse");
+        assert_eq!(cfg.device.name, "old-box");
+        assert_eq!(cfg.device.max_queued_file_bytes, 17_179_869_184);
+        assert_eq!(cfg.device.min_free_bytes, 536_870_912);
+
+        // And an operator who sets them is honoured.
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"device":{"max_queued_file_bytes":1024,"min_free_bytes":2048}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.device.max_queued_file_bytes, 1024);
+        assert_eq!(cfg.device.min_free_bytes, 2048);
     }
 
     #[test]

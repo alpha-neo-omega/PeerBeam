@@ -10,3 +10,7 @@ license.workspace = true
 peerbeam-domain = { workspace = true }
 dirs = { workspace = true }
 hostname = { workspace = true }
+fs4 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

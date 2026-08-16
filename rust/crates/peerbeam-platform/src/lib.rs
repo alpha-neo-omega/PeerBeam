@@ -57,7 +57,67 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| temp_fallback().join(APP_DIR))
 }
 
+/// Bytes currently available on the filesystem holding `path`, or `None` when
+/// that cannot be determined.
+///
+/// Lives here because this crate is already the one place that touches host
+/// specifics (`hostname`, `config_dir`, `data_dir`, `download_dir`). `fs4`
+/// covers Windows, macOS, Linux and Android behind one safe call — the
+/// alternatives were a Unix-only `statvfs` or a raw Windows FFI binding
+/// needing `unsafe`, and I12 makes every platform first-class.
+///
+/// `None` means "could not measure", never "no space". Callers must treat it
+/// as permission to proceed: refusing an operation because a platform would
+/// not answer is worse than the risk the measurement guards against.
+#[must_use]
+pub fn available_bytes(path: &str) -> Option<u64> {
+    // Walk up to the nearest existing ancestor: the staging directory may not
+    // be created yet the first time this is asked.
+    let mut p = std::path::Path::new(path);
+    loop {
+        if p.exists() {
+            return fs4::available_space(p).ok();
+        }
+        p = p.parent()?;
+    }
+}
+
 /// Last-resort writable location when the OS provides no standard dir.
 fn temp_fallback() -> PathBuf {
     std::env::temp_dir().join(APP_DIR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_bytes_reports_a_real_figure_for_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = available_bytes(&dir.path().to_string_lossy())
+            .expect("a real filesystem must report its free space");
+        assert!(free > 0, "a writable tempdir cannot have zero bytes free");
+    }
+
+    /// The staging directory does not exist yet the first time a send asks
+    /// whether there is room for it, so the answer must come from the nearest
+    /// existing ancestor rather than being `None` (which callers read as
+    /// "could not measure" and proceed on).
+    #[test]
+    fn available_bytes_walks_up_to_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-created-yet/outbox-blobs");
+        assert!(!missing.exists());
+        let free = available_bytes(&missing.to_string_lossy())
+            .expect("a path under an existing root must still measure");
+        assert!(free > 0);
+    }
+
+    /// A path with no existing ancestor at all cannot be measured. `None` is
+    /// the honest answer — callers must proceed rather than refuse a send
+    /// because a platform would not answer.
+    #[test]
+    fn available_bytes_is_none_when_nothing_in_the_path_exists() {
+        assert_eq!(available_bytes(""), None);
+    }
 }
