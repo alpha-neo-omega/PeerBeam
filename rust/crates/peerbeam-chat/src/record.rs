@@ -37,7 +37,7 @@ pub enum Status {
     Staging,
 }
 
-/// What a record holds: a text body, or a reference to a shared file.
+/// What a record holds — or, in the outbox, what a queued entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -46,6 +46,16 @@ pub enum Kind {
     Text,
     /// A shared file; see `ChatRecord::file`.
     File,
+    /// **Outbox only:** "tell this peer I turned their file down", queued
+    /// because the sender dropped before the live `FileDecline` could reach it.
+    ///
+    /// Never the kind of a persisted [`ChatRecord`]: a decline is a *status
+    /// change* on a row that already exists (ours reads `Declined` the moment
+    /// the user refuses, whether or not the signal ever lands), not a row of its
+    /// own. Nothing in this crate constructs a record with it, and
+    /// [`ChatRecord::is_settleable_file_row`] requires `File`, so a record that
+    /// somehow carried it would be inert rather than dangerous.
+    Decline,
 }
 
 /// Whether `c` must never reach a *rendered* file name.

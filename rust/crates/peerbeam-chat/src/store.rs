@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::AppStore;
 
-use crate::message::{ChatError, ChatMessage};
-use crate::record::{ChatRecord, Direction, Kind, Status};
+use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
+use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status};
 
 /// The AppStore namespace for a conversation with `peer`.
 #[must_use]
@@ -173,6 +173,164 @@ impl ChatStore {
             .map_err(|e| ChatError::Serialization(e.to_string()))
     }
 
+    /// Queue an already-staged file for delivery to `peer`, and mark our own
+    /// row `Pending`.
+    ///
+    /// The conversation row already exists — [`begin_file_send`] wrote it
+    /// `Staging` before the copy started, so a multi-GB stage is visible rather
+    /// than looking like a hung attach — which is why this upserts that row
+    /// instead of rebuilding one: a rebuild would drop the `local_path` the
+    /// sender's own "Open" depends on.
+    ///
+    /// The row's size is corrected to the bytes **actually staged**. A source
+    /// being appended to while we copied makes the metadata and the blob
+    /// disagree, and the blob is what will be delivered; showing the other
+    /// number would be a row that lies about its own file.
+    ///
+    /// Entry first, row second, deliberately. A crash between the two leaves a
+    /// queued entry whose row still reads `Staging`, which the drain re-opens
+    /// and sends ([`reopen_for_retry`](Self::reopen_for_retry)). The reverse
+    /// order would leave a `Pending` row with nothing queued to deliver it — a
+    /// file the user is told is waiting that nothing will ever send.
+    ///
+    /// [`begin_file_send`]: crate::begin_file_send
+    pub fn enqueue_file(
+        &self,
+        peer: &DeviceId,
+        r: &FileRef,
+        staged: &StagedFile,
+    ) -> Result<(), ChatError> {
+        let entry = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: r.id.clone(),
+            body: String::new(),
+            timestamp: r.timestamp.clone(),
+            kind: Kind::File,
+            file: Some(staged.clone()),
+            offers_refused: 0,
+        };
+        self.store
+            .put(OUTBOX_NS, &r.id, &entry.encode())
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        let Some(mut rec) = self.get(peer, &r.id)? else {
+            return Ok(());
+        };
+        rec.status = Status::Pending;
+        if let Some(file) = rec.file.as_mut() {
+            file.name = crate::display_name(&staged.name);
+            file.size = staged.size;
+        }
+        self.append(&rec)
+    }
+
+    /// Queue "I turned your file down" for a sender we could not tell live.
+    ///
+    /// A decline is best-effort by design — the sender's own bounded backstop
+    /// is what guarantees a refused file stops being re-offered — so this is
+    /// only the path taken when the direct send failed, i.e. the sender dropped
+    /// while our approval prompt was open. Returns whether it was queued.
+    ///
+    /// **It refuses to overwrite an occupied outbox key.** `d.id` is the
+    /// *sender's* `FileRef.id`: a value the peer chose. The outbox is keyed by
+    /// message id, so a peer that picked the id of a message we already have
+    /// queued for it would otherwise replace that message with this decline and
+    /// we would never deliver it — silent message loss, driven from the wire.
+    pub fn enqueue_decline(&self, peer: &DeviceId, d: &FileDecline) -> Result<bool, ChatError> {
+        let occupied = self
+            .store
+            .get(OUTBOX_NS, &d.id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+            .is_some();
+        if occupied {
+            return Ok(false);
+        }
+        let entry = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: d.id.clone(),
+            body: String::new(),
+            timestamp: d.timestamp.clone(),
+            kind: Kind::Decline,
+            file: None,
+            offers_refused: 0,
+        };
+        self.store
+            .put(OUTBOX_NS, &d.id, &entry.encode())
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Count one offer that **reached** the peer and was refused (or timed out)
+    /// at its approval gate, returning the new total.
+    ///
+    /// The bounded backstop this feeds exists for peers too old to send a
+    /// `FileDecline`: without it a refused file is re-offered on every drain
+    /// tick, re-prompting its receiver forever. What it counts is deliberately
+    /// narrow — see the caller in `peerbeam-ffi`. A connection failure never
+    /// gets here: nobody saw the offer, nobody was prompted, and keep-forever is
+    /// the promise text already makes.
+    ///
+    /// A missing entry counts nothing and returns 0: the file is no longer
+    /// queued, so there is no budget left to spend on it.
+    pub fn outbox_bump_refused(&self, message_id: &str) -> Result<u32, ChatError> {
+        let Some(bytes) = self
+            .store
+            .get(OUTBOX_NS, message_id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        else {
+            return Ok(0);
+        };
+        let mut entry = OutboxEntry::decode(&bytes)?;
+        entry.offers_refused = entry.offers_refused.saturating_add(1);
+        let now = entry.offers_refused;
+        self.store
+            .put(OUTBOX_NS, message_id, &entry.encode())
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(now)
+    }
+
+    /// Re-open our own outgoing file row for another delivery attempt.
+    ///
+    /// Deliberately NOT routed through
+    /// [`settle_file_row`](Self::settle_file_row): that guard admits only
+    /// in-flight rows, which is exactly what makes a wire-driven settle
+    /// once-only, and relaxing it would let a peer resurrect a row it had
+    /// already settled. This is reachable only from the local drain, on a row we
+    /// ourselves queued, under an id we minted — the same shape as
+    /// `Manager::fail_chat_file`, which already writes unguarded for the same
+    /// reason. Returns whether it re-opened.
+    ///
+    /// The states it accepts are every non-final state an outgoing file row can
+    /// be sitting in when its entry is still queued:
+    ///
+    /// * `Pending` — queued, never attempted (the ordinary case);
+    /// * `Failed` — a previous attempt did not deliver;
+    /// * `Staging` — a crash landed between `enqueue_file`'s entry write and its
+    ///   row write; the blob is complete (staging only returns after the copy
+    ///   succeeded), so this is deliverable and must not be stranded;
+    /// * `Interrupted` — a restart's reconcile settled a row whose transfer died
+    ///   with the process, while its entry stayed queued.
+    ///
+    /// `Sent` and `Declined` are final — a delivered file is not re-sent, and a
+    /// refused one is not re-offered — and `Transferring` means an attempt is
+    /// already live.
+    pub fn reopen_for_retry(&self, peer: &DeviceId, id: &str) -> Result<bool, ChatError> {
+        let Some(mut rec) = self.get(peer, id)? else {
+            return Ok(false);
+        };
+        if rec.kind != Kind::File || rec.direction != Direction::Out {
+            return Ok(false);
+        }
+        if !matches!(
+            rec.status,
+            Status::Pending | Status::Failed | Status::Staging | Status::Interrupted
+        ) {
+            return Ok(false);
+        }
+        rec.status = Status::Transferring;
+        self.append(&rec)?;
+        Ok(true)
+    }
+
     /// All queued entries, FIFO (ascending by message id).
     pub fn outbox_pending(&self) -> Result<Vec<OutboxEntry>, ChatError> {
         let raw = self
@@ -224,8 +382,23 @@ impl ChatStore {
     /// Upsert the conversation record for a delivered entry to `Sent`.
     ///
     /// Reads the existing record and flips only its status, so additive fields
-    /// (`kind`, `file`) survive; rebuilding from `OutboxEntry`'s four fields
-    /// would silently drop them.
+    /// (`kind`, `file`) survive; rebuilding from `OutboxEntry`'s four original
+    /// fields would silently drop them.
+    ///
+    /// The fallback below — no record at all under this id — used to hardcode
+    /// `kind: Text, file: None`, which was harmless only while `enqueue` was the
+    /// sole producer of an `OutboxEntry` and therefore every entry really was
+    /// text. `enqueue_file` makes that branch reachable, and a hardcoded text
+    /// rebuild would turn a delivered *file* into a text row with no name, no
+    /// size and no file metadata at all. So the rebuild honours the entry's own
+    /// `kind`/`file`.
+    ///
+    /// The rebuilt file row deliberately carries **no** `local_path`: the only
+    /// path this entry knows is the staged blob's, which is deleted the moment
+    /// the send settles, so recording it would give the row an "Open" that
+    /// points at nothing. The sender's real path lives on the row written at
+    /// `begin_file_send` time — which is why this is a fallback for a row that
+    /// has gone missing, not the normal path.
     pub fn record_sent(&self, entry: &OutboxEntry) -> Result<(), ChatError> {
         let peer = DeviceId::from(entry.peer_id.clone());
         let ns = namespace(&peer);
@@ -238,6 +411,21 @@ impl ChatStore {
             rec.status = Status::Sent;
             return self.append(&rec);
         }
+        let (kind, file) = match (entry.kind, entry.file.as_ref()) {
+            (Kind::File, Some(staged)) => (
+                Kind::File,
+                Some(FileMeta::new(&staged.name, staged.size, None)),
+            ),
+            // A `File` entry with no staged blob cannot describe a file; record
+            // what is certain (that something was delivered under this id)
+            // rather than inventing metadata.
+            (Kind::File, None) => (Kind::Text, None),
+            // A decline is a status change on someone else's row, never a row of
+            // its own — `flush_to_session` never calls this for one. If some
+            // future caller does, writing nothing is the honest outcome.
+            (Kind::Decline, _) => return Ok(()),
+            (Kind::Text, _) => (Kind::Text, None),
+        };
         self.append(&ChatRecord {
             id: entry.message_id.clone(),
             peer_id: entry.peer_id.clone(),
@@ -245,8 +433,8 @@ impl ChatStore {
             timestamp: entry.timestamp.clone(),
             body: entry.body.clone(),
             status: Status::Sent,
-            kind: Kind::Text,
-            file: None,
+            kind,
+            file,
         })
     }
 
@@ -1180,6 +1368,305 @@ mod tests {
         assert_eq!(e.kind, Kind::Text, "an entry with no kind is text");
         assert!(e.file.is_none());
         assert_eq!(e.offers_refused, 0);
+    }
+
+    // ── the queue: enqueue_file / enqueue_decline / the backstop counter /
+    // the retry re-open ─────────────────────────────────────────────────────
+
+    /// The staged file a test queues, plus the row `begin_file_send` would have
+    /// written for it: `Staging`, sized from the source's metadata, carrying the
+    /// sender's own path.
+    fn staged_row(
+        cs: &ChatStore,
+        peer: &DeviceId,
+        source_size: u64,
+        blob_size: u64,
+    ) -> (FileRef, StagedFile) {
+        let r = FileRef::new("report.pdf", source_size).unwrap();
+        cs.append(&ChatRecord::file_out(
+            peer,
+            &r,
+            FileMeta::new(&r.name, source_size, Some("/home/me/report.pdf".into())),
+            Status::Staging,
+        ))
+        .unwrap();
+        let staged = StagedFile {
+            name: "report.pdf".into(),
+            size: blob_size,
+            staged_path: format!("/data/outbox-blobs/{}", r.id),
+        };
+        (r, staged)
+    }
+
+    #[test]
+    fn enqueue_file_queues_the_blob_and_marks_our_row_pending() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let (r, staged) = staged_row(&cs, &peer, 4096, 4096);
+
+        cs.enqueue_file(&peer, &r, &staged).unwrap();
+
+        let queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, Kind::File);
+        assert_eq!(queued[0].message_id, r.id);
+        assert_eq!(queued[0].body, "", "a file entry carries no text body");
+        assert_eq!(queued[0].offers_refused, 0);
+        assert_eq!(queued[0].file.as_ref().unwrap(), &staged);
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist.len(), 1, "upsert, not a second row");
+        assert_eq!(hist[0].status, Status::Pending, "queued, not yet sent");
+        assert_eq!(hist[0].kind, Kind::File);
+        assert_eq!(
+            hist[0].file.as_ref().unwrap().local_path.as_deref(),
+            Some("/home/me/report.pdf"),
+            "a rebuild would drop the path the sender's own Open depends on"
+        );
+    }
+
+    /// The bytes that will be delivered are the blob's, so the row must show the
+    /// blob's size — not the metadata read before the copy, which a source being
+    /// appended to (a log, a download in progress) makes wrong.
+    #[test]
+    fn enqueue_file_corrects_the_rows_size_to_what_was_actually_staged() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let (r, staged) = staged_row(&cs, &peer, 4096, 9001);
+
+        cs.enqueue_file(&peer, &r, &staged).unwrap();
+
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().size,
+            9001,
+            "the row must describe the blob, not the pre-copy metadata"
+        );
+    }
+
+    #[test]
+    fn outbox_bump_refused_counts_only_while_the_entry_is_still_queued() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let (r, staged) = staged_row(&cs, &peer, 1, 1);
+        cs.enqueue_file(&peer, &r, &staged).unwrap();
+
+        assert_eq!(cs.outbox_bump_refused(&r.id).unwrap(), 1);
+        assert_eq!(cs.outbox_bump_refused(&r.id).unwrap(), 2);
+        assert_eq!(
+            cs.outbox_for(&peer).unwrap()[0].offers_refused,
+            2,
+            "the count is persisted, so it survives a restart"
+        );
+
+        // Dequeued (or never queued): nothing to count, and no phantom entry.
+        cs.outbox_remove(&r.id).unwrap();
+        assert_eq!(cs.outbox_bump_refused(&r.id).unwrap(), 0);
+        assert_eq!(cs.outbox_bump_refused("never-existed").unwrap(), 0);
+        assert!(cs.outbox_for(&peer).unwrap().is_empty());
+    }
+
+    /// The queued decline: a refusal the sender never heard, delivered later
+    /// over the machinery text already uses.
+    #[test]
+    fn enqueue_decline_queues_a_decline_and_never_overwrites_a_queued_message() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+
+        let d = FileDecline::new("0000000000009");
+        assert!(cs.enqueue_decline(&peer, &d).unwrap());
+        let queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, Kind::Decline);
+        assert_eq!(queued[0].message_id, "0000000000009");
+        assert_eq!(queued[0].timestamp, d.timestamp);
+        assert!(queued[0].file.is_none());
+
+        // The id is the SENDER's — a value the peer chose. A peer that picks the
+        // id of a message we already have queued must not be able to replace it.
+        let mine = ChatMessage::new("a message of ours awaiting delivery").unwrap();
+        cs.enqueue(&peer, &mine).unwrap();
+        let collide = FileDecline::new(&mine.id);
+        assert!(
+            !cs.enqueue_decline(&peer, &collide).unwrap(),
+            "a decline must never take an occupied outbox key"
+        );
+        let still = cs.outbox_for(&peer).unwrap();
+        let ours = still
+            .iter()
+            .find(|e| e.message_id == mine.id)
+            .expect("our own queued message survives");
+        assert_eq!(ours.kind, Kind::Text);
+        assert_eq!(ours.body, "a message of ours awaiting delivery");
+    }
+
+    /// The brief's crux: a retry must move a `Failed` row back to
+    /// `Transferring`, which the settle guard forbids — correctly, because that
+    /// guard is what stops a peer reusing a known message id as its
+    /// `transfer_id` to rewrite a settled row. The guard is NOT relaxed; the
+    /// retry is a separate, local, sender-only path.
+    #[test]
+    fn a_retry_reopens_a_failed_row_but_a_wire_settle_still_cannot() {
+        let (cs, _store, _tmp) = new_store();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let r = FileRef::new("a.bin", 1).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &r,
+            FileMeta::new(&r.name, r.size, None),
+            Status::Failed,
+        ))
+        .unwrap();
+
+        // The wire cannot touch a settled row — this is the security guard.
+        assert!(!cs
+            .settle_file_row(&peer, &r.id, Direction::Out, Status::Transferring)
+            .unwrap());
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Failed
+        );
+
+        // The local retry path can, and only for our own outgoing file row.
+        assert!(cs.reopen_for_retry(&peer, &r.id).unwrap());
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::Transferring
+        );
+        // A settled-Sent row is never re-opened.
+        cs.settle_file_row(&peer, &r.id, Direction::Out, Status::Sent)
+            .unwrap();
+        assert!(!cs.reopen_for_retry(&peer, &r.id).unwrap());
+        assert_eq!(cs.get(&peer, &r.id).unwrap().unwrap().status, Status::Sent);
+    }
+
+    /// Every state a still-queued outgoing file row can legitimately be found
+    /// in must re-open, and nothing else may.
+    #[test]
+    fn reopen_for_retry_accepts_exactly_the_non_final_outgoing_file_rows() {
+        let (cs, _store, _tmp) = new_store();
+        let peer = DeviceId::from("pb-bob".to_string());
+        let seed = |status: Status| {
+            let r = FileRef::new("a.bin", 1).unwrap();
+            cs.append(&ChatRecord::file_out(
+                &peer,
+                &r,
+                FileMeta::new(&r.name, r.size, None),
+                status,
+            ))
+            .unwrap();
+            r.id
+        };
+
+        // Deliverable: queued, previously failed, crashed mid-enqueue, or
+        // settled `Interrupted` by a restart while its entry stayed queued.
+        for status in [
+            Status::Pending,
+            Status::Failed,
+            Status::Staging,
+            Status::Interrupted,
+        ] {
+            let id = seed(status);
+            assert!(
+                cs.reopen_for_retry(&peer, &id).unwrap(),
+                "{status:?} is still deliverable and must re-open"
+            );
+            assert_eq!(
+                cs.get(&peer, &id).unwrap().unwrap().status,
+                Status::Transferring
+            );
+        }
+        // Final, or already live.
+        for status in [Status::Sent, Status::Declined, Status::Transferring] {
+            let id = seed(status);
+            assert!(
+                !cs.reopen_for_retry(&peer, &id).unwrap(),
+                "{status:?} must not re-open"
+            );
+            assert_eq!(cs.get(&peer, &id).unwrap().unwrap().status, status);
+        }
+
+        // Never another row's business: a text row, an inbound file row, or an
+        // id with no row at all.
+        let text = ChatMessage::new("hi").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &text)).unwrap();
+        assert!(!cs.reopen_for_retry(&peer, &text.id).unwrap());
+        assert_eq!(
+            cs.get(&peer, &text.id).unwrap().unwrap().status,
+            Status::Sent
+        );
+
+        let theirs = FileRef::new("theirs.bin", 1).unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &theirs)).unwrap();
+        assert!(!cs.reopen_for_retry(&peer, &theirs.id).unwrap());
+        assert_eq!(
+            cs.get(&peer, &theirs.id).unwrap().unwrap().status,
+            Status::PendingApproval
+        );
+
+        assert!(!cs.reopen_for_retry(&peer, "never-existed").unwrap());
+    }
+
+    /// TRAP 1, directly. `record_sent`'s fallback fires only when no record
+    /// exists under the entry's id; before `enqueue_file` existed nothing could
+    /// produce a non-text entry, so a hardcoded `Kind::Text, file: None` rebuild
+    /// was unreachable. It is reachable now, and a delivered file rebuilt as
+    /// text would lose its name, its size and its file metadata entirely.
+    #[test]
+    fn record_sents_fallback_rebuilds_a_file_entry_as_a_file_row() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        // A queued file whose conversation row has gone missing (the only way
+        // to reach the fallback at all).
+        let entry = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: "0000000000042".into(),
+            body: String::new(),
+            timestamp: "2026-08-13T10:00:00+00:00".into(),
+            kind: Kind::File,
+            file: Some(StagedFile {
+                name: "report.pdf".into(),
+                size: 4096,
+                staged_path: "/data/outbox-blobs/0000000000042".into(),
+            }),
+            offers_refused: 0,
+        };
+        assert!(
+            cs.get(&peer, &entry.message_id).unwrap().is_none(),
+            "the fallback only fires with no existing row"
+        );
+
+        cs.record_sent(&entry).unwrap();
+
+        let rec = cs.get(&peer, &entry.message_id).unwrap().expect("row");
+        assert_eq!(rec.kind, Kind::File, "a file must not be rebuilt as text");
+        assert_eq!(rec.status, Status::Sent);
+        assert_eq!(rec.direction, Direction::Out);
+        let meta = rec.file.expect("a rebuilt file row carries its metadata");
+        assert_eq!(meta.name, "report.pdf");
+        assert_eq!(meta.size, 4096);
+        assert!(
+            meta.local_path.is_none(),
+            "the staged blob is deleted on settle; an Open pointing at it would dangle"
+        );
+    }
+
+    /// A decline is a status change on a row that already exists, never a row of
+    /// its own — so the fallback must not invent one.
+    #[test]
+    fn record_sents_fallback_never_invents_a_row_for_a_decline() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let entry = OutboxEntry {
+            peer_id: peer.0.clone(),
+            message_id: "0000000000043".into(),
+            body: String::new(),
+            timestamp: "2026-08-13T10:00:00+00:00".into(),
+            kind: Kind::Decline,
+            file: None,
+            offers_refused: 0,
+        };
+        cs.record_sent(&entry).unwrap();
+        assert!(cs.history(&peer).unwrap().is_empty());
     }
 
     #[test]
