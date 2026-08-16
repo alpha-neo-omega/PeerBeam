@@ -59,6 +59,40 @@ Namespace and record-key names are stored in the clear (the directory is
 `identity.json` makes existing AppStore data unreadable**. Clearing a namespace
 deletes its records.
 
+## Staged outbox blobs
+
+Sharing a file in chat with a peer that is currently offline **queues** it, and
+queueing copies the file's bytes into a store the outbox owns:
+`<data_directory>/outbox-blobs/<id>`, one blob per queued file. The copy is what
+makes the queue honest — between queueing and delivery the user may delete, move
+or rewrite what they picked — but it means a second copy of that content sits in
+application storage for as long as the entry stays queued, which under
+keep-forever retry can be indefinitely. Each blob is bounded by
+`device.max_queued_file_bytes`; nothing here writes to, moves or deletes the
+user's own file, which is opened for reading and nothing else.
+
+**These blobs are plaintext.** Unlike an AppStore record, whose value is
+encrypted at rest, a staged blob is stored exactly as it was read. It is created
+owner-only — `0600` on Unix, applied *before* the copy starts, so even a partial
+blob left by a `SIGKILL` mid-copy is protected — and on Windows, where there is
+no comparable one-liner, it inherits the directory's default ACL rather than
+being restricted explicitly.
+
+Plaintext here is a deliberate trade, not an oversight. A staged blob is a
+transient copy of a file the user already holds in plaintext on the same disk,
+under the same account, so encrypting the copy withholds nothing an attacker with
+that access does not already have from the original. It would cost something
+real: attachments can be many gigabytes, and sealing one would force either a
+whole-file buffer — which the streaming invariant forbids (no file is ever fully
+loaded into memory) — or a streaming-crypto layer no other path in the project
+needs.
+
+A blob is deleted automatically as soon as its entry reaches a terminal outcome
+(delivered, declined, or given up on), and `peerbeam chat cancel <peer> <id>`
+drops a still-queued entry and frees its bytes on demand. Blobs no queue entry
+owns — staged by a run that died between the copy and the enqueue — are swept
+when the app next starts.
+
 ## Integrity, confidentiality, replay protection
 
 `SecureLink` wraps the authenticated session. Every frame is sealed with
