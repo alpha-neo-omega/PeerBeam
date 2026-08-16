@@ -16,10 +16,38 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   persistent auto-accept stays a deliberate per-device choice, so there is no
   "Trust all" — and it reaches only inbound transfers still awaiting a
   decision, never an outbound send or one already in flight. It reports a
-  verified tally rather than an assumed one ("Accepted 3 files", "Accepted 3 of
+  verified tally rather than an assumed one ("Accepted 3 items", "Accepted 3 of
   5 — 2 were no longer waiting", "None were still waiting"), because transfers
   can time out or be answered from their own card between the render and the
-  tap.
+  tap. The banner counts **items**, not files: a waiting transfer can be a
+  whole folder.
+- **Answer just the transfers you pick** — the same banner's **Select** hands
+  you a checkbox per waiting card and switches to `N of M selected` with
+  **Decline** / **Accept** / **Cancel**, for the common case where a batch is
+  not all-or-nothing. It is the same accept-once decision as **Accept all**:
+  `accept`, never `acceptTrust`, and **Trust** stays a single per-device action
+  on the card — there is no "Trust selected". A checked transfer that stops
+  waiting drops out of the count and is never handed to the engine; selection
+  mode ends when the batch lands, is cancelled, or when nothing is left waiting.
+
+### Fixed
+- **Deleting a conversation no longer destroys a file that is still being
+  staged.** Attaching a file writes its row immediately and copies the bytes in
+  the background — minutes, for a multi-GB file. A delete landing in that window
+  removed the row, and the finished copy then queued an entry with nothing
+  behind it: the next delivery attempt offered the file to the peer and only
+  then threw the entry and the staged bytes away. The attachment vanished from
+  the thread and the peer was left with an approval prompt for a file that never
+  arrived. A file still being staged is now kept, exactly as the confirmation
+  promises, and the residual race leaves nothing behind rather than an orphan.
+- **A file you declined no longer keeps its conversation undeletable.** A
+  refusal queued for a peer that had already gone offline held the declined
+  message's row alive, so deleting the thread reported it as "1 queued message
+  was kept and will still be sent" and left the thread listed until that peer
+  came back. The refusal itself is still delivered when they do.
+- **The delete report counts every row it kept**, including one written by a
+  newer version this build cannot read — previously reported as nothing kept
+  while the thread stayed listed.
 
 ## [0.3.0] - 2026-08-08 — Beta
 

@@ -151,6 +151,15 @@ Working now:
   While the copy runs the row reads `staging` in `chat history`, a progress bar
   shows on stderr, and `--json` emits `chat_staging` lines (both throttled to
   one report per percent).
+  If that conversation is **deleted while the copy is running** — by a PeerBeam
+  app or a second CLI run sharing the same data directory — the send is
+  abandoned rather than half-completed: nothing is queued, the staged copy is
+  deleted, no offer reaches the peer, and the command exits `1` saying so (*the
+  conversation with `<peer>` was deleted while `<file>` was being staged, so
+  nothing was queued — send it again to retry*). An ordinary delete does **not**
+  do this: a file still being staged is kept, exactly like one already queued.
+  This is the residual race, and it exits cleanly rather than offering the peer
+  a file that would then be dropped.
   **An unreachable peer is queued, not an error** — the row stays `pending`,
   the queue entry and the staged copy stay on disk, and the command exits `0`
   after printing how many bytes it staged and what will deliver them: *a

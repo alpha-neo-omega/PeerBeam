@@ -173,18 +173,27 @@ the app (Trusted Devices).
 ## Bulk approval is accept-once, never trust
 
 The Transfers screen offers **Accept all** / **Decline all** when two or more
-inbound transfers are waiting. It calls the engine's per-id `pb_transfer_accept`
-/ `pb_transfer_reject` once per waiting transfer and **never** `acceptTrust`:
-trusting a device grants it persistent auto-accept for everything it sends from
-then on, which is a materially stronger and longer-lived act than approving the
-batch currently on screen. That stays a deliberate, per-device choice on the
-card ("Trust"), and there is no "Trust all".
+inbound transfers are waiting, plus **Select**, which switches the banner to a
+checkbox per card and answers only the ones the user picked. Both are the same
+decision: they call the engine's per-id `pb_transfer_accept` /
+`pb_transfer_reject` once per transfer and **never** `acceptTrust`. Trusting a
+device grants it persistent auto-accept for everything it sends from then on,
+which is a materially stronger and longer-lived act than approving the batch
+currently on screen. That stays a deliberate, per-device choice on the card
+("Trust"): there is no "Trust all" and no "Trust selected", and while selecting,
+the per-card Trust is hidden rather than left as a second path into a batch.
 
-The batch is also scoped to what was genuinely the user's to answer — **inbound**
-transfers in `pending` only. An outbound send and an already-running, paused,
-completed or failed transfer cannot be reached from it. Nothing about the
-decision is remembered: the next batch asks again (invariant I6 — explicit,
-per-act consent, never inferred).
+Adding a second route to a batch accept adds no second consent rule. Every route
+goes through one loop (`TransferRepository._decideMany`), so the scope cannot
+drift between them: **inbound** transfers in `pending` only. An outbound send and
+an already-running, paused, completed or failed transfer cannot be reached from
+either. A selection is not trusted on faith either — ids are re-checked against
+what is still awaiting approval before anything is asked of the engine, so a
+stale pick is counted as "no longer waiting" rather than sent as a decision, and
+the selection is cleared whenever the banner goes away (inbound transfer ids come
+from the sender, so a stale set could otherwise pre-check a later transfer that
+reused one). Nothing about the decision is remembered: the next batch asks again
+(invariant I6 — explicit, per-act consent, never inferred).
 
 ## Settings & trust over FFI
 
