@@ -431,19 +431,41 @@ mod tests {
     #[test]
     fn namespaces_lists_populated_namespaces_matching_a_prefix() {
         let (store, _tmp) = new_store();
-        store.put("chat-pb-alice", "k", b"v").unwrap();
+        // Inserted out of ascending order, and with enough entries that an
+        // implementation which forgot to sort would be overwhelmingly
+        // unlikely to come out ascending by luck of the filesystem's own
+        // (unspecified, non-insertion-order-guaranteed) directory order.
+        store.put("chat-pb-dave", "k", b"v").unwrap();
         store.put("chat-pb-bob", "k", b"v").unwrap();
+        store.put("chat-pb-erin", "k", b"v").unwrap();
+        store.put("chat-pb-alice", "k", b"v").unwrap();
+        store.put("chat-pb-carol", "k", b"v").unwrap();
         store.put("chat.outbox", "k", b"v").unwrap();
         store.put("clipboard", "k", b"v").unwrap();
 
-        let mut got = store.namespaces("chat-").unwrap();
-        got.sort();
-        assert_eq!(got, vec!["chat-pb-alice", "chat-pb-bob"]);
+        let got = store.namespaces("chat-").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "chat-pb-alice",
+                "chat-pb-bob",
+                "chat-pb-carol",
+                "chat-pb-dave",
+                "chat-pb-erin",
+            ]
+        );
+        // Belt-and-suspenders: this holds regardless of what order the
+        // assertion above assumed, so it still catches a broken sort even if
+        // the hardcoded expectation were ever wrong.
+        assert!(
+            got.windows(2).all(|w| w[0] <= w[1]),
+            "namespaces must be sorted ascending"
+        );
         // The outbox is deliberately `chat.outbox` (a dot, not a dash) so no
         // peer-supplied device id can collide with it — and so a `chat-`
         // prefix scan never picks it up as a conversation.
         assert!(!got.contains(&"chat.outbox".to_string()));
-        assert_eq!(store.namespaces("").unwrap().len(), 4);
+        assert_eq!(store.namespaces("").unwrap().len(), 7);
         assert!(store.namespaces("nothing-").unwrap().is_empty());
     }
 
