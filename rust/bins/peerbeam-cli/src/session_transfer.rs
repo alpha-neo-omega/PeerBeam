@@ -298,10 +298,12 @@ mod tests {
         CapabilitySet::new().with(Capability::new(CHAT))
     }
 
-    /// What this build advertises — the real thing `session_cfg` puts on the
-    /// wire, not a restatement of it.
+    /// What this build advertises, read out of the **actual `SessionConfig`**
+    /// every session is built from — not `advertised_caps()`, and certainly not
+    /// a restatement in this module. Both weaker forms leave a hop where
+    /// `session_cfg` could stop advertising while these tests stayed green.
     fn our_caps() -> CapabilitySet {
-        advertised_caps()
+        session_cfg(None).capabilities
     }
 
     /// Both chat feature bits must be advertised by **this** frontend. The FFI
@@ -311,7 +313,7 @@ mod tests {
     /// impossible to repeat.
     #[test]
     fn both_chat_feature_bits_are_advertised() {
-        let caps = advertised_caps();
+        let caps = session_cfg(None).capabilities;
         let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
         assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
         assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");

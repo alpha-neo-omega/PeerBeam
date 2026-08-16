@@ -68,8 +68,8 @@ pub struct ChatWiring {
 /// change — `Capability.features` is already on the wire and
 /// `CapabilitySet::intersect` ANDs it — so a peer from before either feature
 /// simply advertises `0`, the intersection clears the bit, and
-/// [`Session::supports_file_ref`] / [`Session::supports_file_decline`] report
-/// false for it.
+/// [`Session::supports_file_ref`] / [`caps_support_file_decline`] report false
+/// for it.
 fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
     let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
     if let Some(h) = chat_handler {
@@ -104,9 +104,15 @@ fn caps_support_file_ref(caps: &CapabilitySet) -> bool {
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
-/// chat `FileDecline` feature. Same shape and same reason as
-/// [`caps_support_file_ref`].
-fn caps_support_file_decline(caps: &CapabilitySet) -> bool {
+/// chat `FileDecline` feature, i.e. whether telling this peer "I turned your
+/// file down" would mean anything to it. Same shape and same reason as
+/// [`caps_support_file_ref`]: exactly one place knows how the bit is read, and
+/// it is testable without standing up a session.
+///
+/// Read by `transfer::should_send_decline` (which owns the full send decision),
+/// not by a `Session` accessor — a peer that predates the feature advertises
+/// `features: 0`, the intersection clears the bit, and it is sent nothing.
+pub fn caps_support_file_decline(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_FILEDECLINE != 0)
 }
@@ -149,21 +155,6 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
-    }
-
-    /// Whether the peer negotiated the chat `FileDecline` feature — i.e.
-    /// whether telling it "I turned your file down" would mean anything.
-    ///
-    /// Checked by `Manager::handle_incoming` before it sends a decline. A peer
-    /// from before this feature advertises `features: 0`, so this is false and
-    /// we send nothing: an unknown OPTIONAL type would be skipped harmlessly on
-    /// its side, but putting a message on the wire that the negotiation says
-    /// the peer does not speak is exactly the silent drift capability
-    /// negotiation exists to prevent. Such a sender falls back to its own
-    /// bounded retry backstop instead.
-    #[must_use]
-    pub fn supports_file_decline(&self) -> bool {
-        caps_support_file_decline(&self.capabilities)
     }
 
     /// Await the next incoming transfer channel the peer opens (receiver side).
@@ -329,10 +320,12 @@ mod tests {
         CapabilitySet::new().with(Capability::new(CHAT))
     }
 
-    /// What this build advertises — the real thing `session_cfg` puts on the
-    /// wire, not a restatement of it.
+    /// What this build advertises, read out of the **actual `SessionConfig`**
+    /// every session is built from — not `advertised_caps()`, and certainly not
+    /// a restatement in this module. Both weaker forms leave a hop where
+    /// `session_cfg` could stop advertising while these tests stayed green.
     fn our_caps() -> CapabilitySet {
-        advertised_caps()
+        session_cfg(None).capabilities
     }
 
     /// Both chat feature bits must be advertised by **this** frontend. The CLI
@@ -342,7 +335,7 @@ mod tests {
     /// impossible to repeat.
     #[test]
     fn both_chat_feature_bits_are_advertised() {
-        let caps = advertised_caps();
+        let caps = session_cfg(None).capabilities;
         let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
         assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
         assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");

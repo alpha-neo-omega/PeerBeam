@@ -27,6 +27,7 @@ use peerbeam_domain::entity::{
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::TrustStore;
+use peerbeam_domain::session::CapabilitySet;
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
@@ -187,6 +188,89 @@ enum AcceptDecision {
     Reject,
     AcceptOnce,
     AcceptAndTrust,
+}
+
+/// How an incoming transfer's approval actually resolved.
+///
+/// [`Manager::wait_for_accept`] used to return `bool`, which collapsed three
+/// genuinely different things into one: an explicit refusal, an unanswered
+/// prompt hitting [`ACCEPT_TIMEOUT`] (180 s), and a sender that dropped before
+/// deciding. For the *transfer* they are identical — nothing moves either way,
+/// which is why the `bool` was fine until now — but they are not identical in
+/// what we are entitled to tell the sender.
+///
+/// Only [`Rejected`](Self::Rejected) is the user's decision. Reporting a
+/// three-minute timeout to the peer as "I declined your file" would mean a user
+/// who stepped away from their desk loses the file *and* has the sender's
+/// history assert they refused it — a cross-device, irreversible claim built
+/// from someone simply not being there. It would also short-circuit the bounded
+/// backstop `OutboxEntry.offers_refused` exists to provide: that counter
+/// tolerates N attempts across refusals *and* timeouts, precisely so a single
+/// missed prompt is recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptOutcome {
+    /// The user accepted (`AcceptOnce`/`AcceptAndTrust`), or the transfer was
+    /// auto-accepted from a previously approved device.
+    Accepted,
+    /// The user explicitly refused: `reject()`, or `cancel()` firing the
+    /// pending sender with [`AcceptDecision::Reject`]. The only outcome that
+    /// may be reported to the peer as a decline.
+    Rejected,
+    /// Nobody answered within [`ACCEPT_TIMEOUT`], or the sender dropped before
+    /// a decision arrived. Not a decision at all — the file simply is not
+    /// moving right now, and the sender is free to offer it again.
+    Unanswered,
+}
+
+impl AcceptOutcome {
+    /// Whether the bytes are cleared to move. Every non-accept outcome stops
+    /// the transfer identically; only what is *reported* differs.
+    fn accepted(self) -> bool {
+        matches!(self, AcceptOutcome::Accepted)
+    }
+}
+
+/// Whether refusing the transfer `id` should put a `FileDecline` on the wire.
+///
+/// This is the enforcement point for "capability-advertised, not assumed"
+/// (MESSAGE_REGISTRY.md §7 / I9), extracted from `handle_incoming` as a pure
+/// function of data already in hand — no session, no network — so all three of
+/// its legs are unit-testable and a refactor cannot delete one silently. It
+/// mirrors [`caps_support_file_ref`](crate::session_exec) : the predicate is
+/// the tested unit, the call site is the thin part.
+///
+/// All three must hold:
+///
+/// 1. **`outcome == Rejected`** — the user actually refused. A prompt that
+///    timed out or a sender that dropped must fall through to the retry
+///    backstop instead: see [`AcceptOutcome`] for why turning three minutes of
+///    silence into a permanent cross-device "I declined" is the wrong trade.
+/// 2. **The peer negotiated `CHAT_FEAT_FILEDECLINE`** — a 2a-era peer ANDed
+///    the bit away and must never receive the message. It would skip an
+///    unknown OPTIONAL type harmlessly, but sending a type the negotiation
+///    says the peer does not speak is exactly the silent wire drift capability
+///    negotiation exists to prevent; such a sender uses its own bounded
+///    backstop instead.
+/// 3. **The transfer has a row in this conversation** — only a file shared
+///    *in chat* is declinable. The overwhelming majority of refusals are
+///    ordinary transfers, which must put nothing extra on the wire.
+///
+/// Leg 3 is deliberately `contains`, not the settleable-row guard: by the time
+/// this runs, `chat_settle` has already moved our row to `Declined`, so that
+/// guard reads false by design. The authorization that matters runs on the
+/// **receiving** side, where `ChatStore::settle_file_row` re-checks
+/// kind/direction/in-flight against the sender's own stored record — a decline
+/// is never trusted by the party acting on it.
+fn should_send_decline(
+    outcome: AcceptOutcome,
+    caps: &CapabilitySet,
+    chat: &ChatStore,
+    peer: &DeviceId,
+    id: &str,
+) -> bool {
+    outcome == AcceptOutcome::Rejected
+        && crate::session_exec::caps_support_file_decline(caps)
+        && chat.contains(peer, id).unwrap_or(false)
 }
 
 // ── manager ─────────────────────────────────────────────────────
@@ -1805,22 +1889,33 @@ impl Manager {
     /// by a later `accept`/`accept_trust`/`reject` call. Trust is recorded
     /// only for [`AcceptDecision::AcceptAndTrust`] — a plain one-time accept
     /// never approves the device, so it never gains auto-accept on its own.
-    async fn wait_for_accept(&self, id: &str, peer_id: &DeviceId) -> bool {
+    ///
+    /// Returns an [`AcceptOutcome`] rather than a `bool` so the caller can tell
+    /// an explicit refusal from a prompt nobody answered. Both stop the
+    /// transfer; only the former may be reported to the peer as a decline (see
+    /// [`AcceptOutcome`] for why that distinction is not cosmetic).
+    async fn wait_for_accept(&self, id: &str, peer_id: &DeviceId) -> AcceptOutcome {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.to_string(), tx);
-        let accepted = match tokio::time::timeout(ACCEPT_TIMEOUT, rx).await {
-            Ok(Ok(AcceptDecision::AcceptOnce)) => true,
+        let outcome = match tokio::time::timeout(ACCEPT_TIMEOUT, rx).await {
+            Ok(Ok(AcceptDecision::AcceptOnce)) => AcceptOutcome::Accepted,
             Ok(Ok(AcceptDecision::AcceptAndTrust)) => {
                 // Explicit accept-and-trust: this device is now approved for
                 // auto-accept on future connections. Never set on a plain
                 // accept, a decline, a dropped sender, or a timeout.
                 let _ = self.trust.approve(peer_id);
-                true
+                AcceptOutcome::Accepted
             }
-            _ => false,
+            // The user's own refusal — `reject()`, or `cancel()` firing the
+            // pending sender.
+            Ok(Ok(AcceptDecision::Reject)) => AcceptOutcome::Rejected,
+            // `Ok(Err(_))`: the sending half dropped without ever deciding.
+            // `Err(_)`: ACCEPT_TIMEOUT elapsed with the prompt unanswered.
+            // Neither is the user saying no.
+            Ok(Err(_)) | Err(_) => AcceptOutcome::Unanswered,
         };
         self.pending.lock().unwrap().remove(id);
-        accepted
+        outcome
     }
 
     async fn handle_incoming(self: Arc<Self>, qc: QuicChannels) {
@@ -1970,12 +2065,12 @@ impl Manager {
             .flatten()
             .map(|r| r.approved)
             .unwrap_or(false);
-        let accepted = if auto && approved {
-            true
+        let outcome = if auto && approved {
+            AcceptOutcome::Accepted
         } else {
             self.wait_for_accept(&id, &session.peer_device).await
         };
-        if !accepted {
+        if !outcome.accepted() {
             // Claim before emitting, and emit only if the claim lands. The
             // decision can arrive after `cancel()` already claimed this
             // transfer and announced it (a user cancel fires the pending
@@ -1996,35 +2091,26 @@ impl Manager {
                 // no chat row and settles nothing.
                 self.chat_settle(&active, ChatStatus::Declined, None);
             }
-            // Tell the sender, so the refusal is terminal for them too. Without
-            // this the sender cannot tell "you declined" from "the network
-            // dropped", and a queued file — retried keep-forever like text —
-            // would be re-offered every drain tick, re-prompting this user
-            // every single time.
+            // Tell the sender, so an explicit refusal is terminal for them too.
+            // Without this the sender cannot tell "you declined" from "the
+            // network dropped", and a queued file — retried keep-forever like
+            // text — would be re-offered every drain tick, re-prompting this
+            // user every single time.
             //
-            // Two gates, both deliberate:
-            //  * `supports_file_decline` — a peer that predates the feature
-            //    negotiated the bit away and must never be sent one (a message
-            //    the negotiation says the peer does not speak is silent wire
-            //    drift; it falls back to its own bounded backstop instead);
-            //  * `contains` — only a transfer that really has a row in this
-            //    conversation is a chat file share. The overwhelming majority
-            //    of declines are ordinary transfers, which must put nothing
-            //    extra on the wire. This is deliberately *not* the settleable-
-            //    row guard: `chat_settle` above just moved the row to
-            //    `Declined`, so that guard now reads false by design. The
-            //    authorization that matters runs on the RECEIVING side, where
-            //    `settle_file_row` re-checks kind/direction/in-flight against
-            //    the sender's own stored record.
+            // Every condition on that lives in `should_send_decline`, which is
+            // where all three legs (explicit refusal, negotiated capability,
+            // real chat row) are documented and unit-tested. Notably a prompt
+            // that merely TIMED OUT gets here too, and must send nothing.
             //
-            // Best-effort: our row is already `Declined` locally either way, so
-            // a send failure changes nothing here.
-            if session.supports_file_decline()
-                && self
-                    .chat
-                    .contains(&session.peer_device, &id)
-                    .unwrap_or(false)
-            {
+            // Best-effort: our row is already settled locally either way, so a
+            // send failure changes nothing here.
+            if should_send_decline(
+                outcome,
+                &session.capabilities,
+                &self.chat,
+                &session.peer_device,
+                &id,
+            ) {
                 let d = peerbeam_chat::FileDecline::new(&id);
                 if let Err(e) = peerbeam_chat::send_file_decline(&session.handle, &d).await {
                     tracing::debug!(error = %e, transfer_id = %id, "file decline not delivered");
@@ -2509,6 +2595,9 @@ fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)> {
 mod tests {
     use super::*;
     use peerbeam_domain::port::EncryptionProvider;
+    use peerbeam_domain::session::{
+        Capability, ChannelType, CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF,
+    };
 
     /// A `Manager` with no daemon/history wired up, just enough to exercise
     /// identity/name plumbing in isolation (no network I/O beyond binding an
@@ -3355,7 +3444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_accept_true_on_explicit_accept_and_leaves_trust_unapproved() {
+    async fn wait_for_accept_accepted_on_explicit_accept_and_leaves_trust_unapproved() {
         let mgr = Arc::new(test_manager("Device"));
         let peer_id = DeviceId::from("peer-accept");
         pin(&mgr.trust, &peer_id);
@@ -3367,7 +3456,11 @@ mod tests {
         wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
         mgr.accept(&id).expect("accept should find the pending id");
 
-        assert!(waiter.await.expect("task join"), "explicit accept -> true");
+        assert_eq!(
+            waiter.await.expect("task join"),
+            AcceptOutcome::Accepted,
+            "explicit accept -> Accepted"
+        );
         assert!(
             !mgr.pending.lock().unwrap().contains_key(&id),
             "pending entry must be removed after the decision"
@@ -3379,7 +3472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_accept_true_on_accept_trust_and_approves_trust() {
+    async fn wait_for_accept_accepted_on_accept_trust_and_approves_trust() {
         let mgr = Arc::new(test_manager("Device"));
         let peer_id = DeviceId::from("peer-accept-trust");
         pin(&mgr.trust, &peer_id);
@@ -3392,9 +3485,10 @@ mod tests {
         mgr.accept_trust(&id)
             .expect("accept_trust should find the pending id");
 
-        assert!(
+        assert_eq!(
             waiter.await.expect("task join"),
-            "explicit accept-and-trust -> true"
+            AcceptOutcome::Accepted,
+            "explicit accept-and-trust -> Accepted"
         );
         assert!(
             !mgr.pending.lock().unwrap().contains_key(&id),
@@ -3407,7 +3501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_accept_false_on_explicit_reject_and_leaves_trust_unapproved() {
+    async fn wait_for_accept_rejected_on_explicit_reject_and_leaves_trust_unapproved() {
         let mgr = Arc::new(test_manager("Device"));
         let peer_id = DeviceId::from("peer-reject");
         pin(&mgr.trust, &peer_id);
@@ -3419,9 +3513,10 @@ mod tests {
         wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
         mgr.reject(&id).expect("reject should find the pending id");
 
-        assert!(
-            !waiter.await.expect("task join"),
-            "explicit reject -> false"
+        assert_eq!(
+            waiter.await.expect("task join"),
+            AcceptOutcome::Rejected,
+            "explicit reject -> Rejected, the one outcome we may report to the peer"
         );
         assert!(!mgr.pending.lock().unwrap().contains_key(&id));
         assert!(
@@ -3451,9 +3546,11 @@ mod tests {
         // past the bound instead of actually waiting.
         tokio::time::advance(ACCEPT_TIMEOUT + Duration::from_millis(1)).await;
 
-        assert!(
-            !waiter.await.expect("task join"),
-            "an unanswered prompt must resolve to false, not hang forever"
+        assert_eq!(
+            waiter.await.expect("task join"),
+            AcceptOutcome::Unanswered,
+            "an unanswered prompt must resolve to Unanswered — not hang, and \
+             emphatically not read as the user having declined"
         );
         assert!(
             !mgr.pending.lock().unwrap().contains_key(&id),
@@ -3463,6 +3560,160 @@ mod tests {
             !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
             "a timeout must never approve the device"
         );
+    }
+
+    // ── should_send_decline: the I9 enforcement point ────────────
+    //
+    // `handle_incoming` decides here whether a refusal goes on the wire. The
+    // decision is a pure function of data already in hand, so it is tested
+    // directly — no QUIC, no handshake, no live session. Each of the three
+    // legs gets its own test, because a refactor that drops any one of them
+    // must fail something: the capability leg previously had NO coverage at
+    // all (it could be replaced with `|| true` and the whole FFI suite still
+    // passed), which is exactly the hole these close.
+
+    /// A peer that negotiated the bit, as `CapabilitySet::intersect` would
+    /// leave it.
+    fn negotiated_with_decline() -> CapabilitySet {
+        CapabilitySet::new().with(Capability::with_features(
+            ChannelType::CHAT,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
+        ))
+    }
+
+    /// What a 2a-era peer leaves after intersection: chat file sharing, but no
+    /// decline signalling.
+    fn negotiated_without_decline() -> CapabilitySet {
+        CapabilitySet::new().with(Capability::with_features(
+            ChannelType::CHAT,
+            CHAT_FEAT_FILEREF,
+        ))
+    }
+
+    /// A real on-disk `ChatStore` holding one inbound chat file row, the way a
+    /// peer's `FileRef` would have left it — plus that row's peer, its id, and
+    /// the tempdir backing the store.
+    ///
+    /// Built directly rather than via `test_manager_full`, which stands up a
+    /// `QuicTransport` these tests have no use for (and which needs a tokio
+    /// runtime). The whole point of `should_send_decline` is that the decision
+    /// needs no session, so its tests should not need one either.
+    fn store_with_chat_file_row() -> (ChatStore, DeviceId, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc = Arc::new(AeadCrypto::new());
+        let key = peerbeam_crypto::derive_subkey(&[9u8; 32], b"peerbeam-appstore-v1");
+        let appstore: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+            peerbeam_appstore_fs::FsAppStore::open(dir.path().join("appstore"), key, enc),
+        );
+        let chat = ChatStore::new(appstore);
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &r))
+            .expect("seed row");
+        let id = r.id.clone();
+        (chat, peer, id, dir)
+    }
+
+    /// Leg 1 — only an EXPLICIT refusal is reportable. A prompt that timed out
+    /// looks identical to the transfer (nothing moves) but must put nothing on
+    /// the wire: a user who stepped away for three minutes would otherwise
+    /// lose the file *and* have the sender's history assert they refused it,
+    /// with no way back.
+    #[test]
+    fn a_decline_is_sent_only_for_an_explicit_rejection() {
+        let (chat, peer, id, _dir) = store_with_chat_file_row();
+        let caps = negotiated_with_decline();
+
+        assert!(
+            should_send_decline(AcceptOutcome::Rejected, &caps, &chat, &peer, &id),
+            "the user said no — the sender must be told"
+        );
+        assert!(
+            !should_send_decline(AcceptOutcome::Unanswered, &caps, &chat, &peer, &id),
+            "a 180s timeout is not a decision and must fall through to the \
+             sender's bounded retry backstop"
+        );
+        assert!(
+            !should_send_decline(AcceptOutcome::Accepted, &caps, &chat, &peer, &id),
+            "an accepted transfer obviously sends no decline"
+        );
+    }
+
+    /// Leg 2 — I9 / MESSAGE_REGISTRY §7: capability-advertised, not assumed. A
+    /// 2a-era peer ANDs the bit away and must never receive MessageType 3,
+    /// even though it would skip the OPTIONAL frame harmlessly.
+    #[test]
+    fn a_decline_is_never_sent_to_a_peer_that_did_not_negotiate_the_bit() {
+        let (chat, peer, id, _dir) = store_with_chat_file_row();
+
+        assert!(
+            !should_send_decline(
+                AcceptOutcome::Rejected,
+                &negotiated_without_decline(),
+                &chat,
+                &peer,
+                &id
+            ),
+            "a peer that predates the feature must not be sent one"
+        );
+        assert!(
+            !should_send_decline(
+                AcceptOutcome::Rejected,
+                &CapabilitySet::new(),
+                &chat,
+                &peer,
+                &id
+            ),
+            "a peer with no CHAT capability at all is unsupported, not a panic"
+        );
+        // Same refusal, same store, same peer — only the negotiated set
+        // differs, so this pins the capability leg specifically.
+        assert!(should_send_decline(
+            AcceptOutcome::Rejected,
+            &negotiated_with_decline(),
+            &chat,
+            &peer,
+            &id
+        ));
+    }
+
+    /// Leg 3 — an ordinary (non-chat) transfer has no row in the conversation
+    /// and must put nothing extra on the wire. That is the overwhelming
+    /// majority of refusals.
+    #[test]
+    fn a_decline_is_never_sent_for_a_transfer_with_no_chat_row() {
+        let (chat, peer, id, _dir) = store_with_chat_file_row();
+        let caps = negotiated_with_decline();
+
+        assert!(
+            !should_send_decline(
+                AcceptOutcome::Rejected,
+                &caps,
+                &chat,
+                &peer,
+                "tx-ordinary-transfer"
+            ),
+            "an ordinary transfer has no row in the conversation and must put \
+             nothing extra on the wire"
+        );
+        assert!(
+            !should_send_decline(
+                AcceptOutcome::Rejected,
+                &caps,
+                &chat,
+                &DeviceId::from("pb-someone-else"),
+                &id
+            ),
+            "the row belongs to another conversation — the id alone is not it"
+        );
+        // Positive control: same refusal, same caps, the row's real peer + id.
+        assert!(should_send_decline(
+            AcceptOutcome::Rejected,
+            &caps,
+            &chat,
+            &peer,
+            &id
+        ));
     }
 
     // ── BUG 1: daemon_running must reset when serve() exits on its own ──
