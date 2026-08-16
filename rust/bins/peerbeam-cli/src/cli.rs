@@ -206,11 +206,20 @@ pub enum ChatAction {
         /// Message text. Required unless `--file` is given.
         #[arg(required_unless_present = "file")]
         text: Option<String>,
-        /// Share a file in the conversation instead of text (increment 2a:
-        /// the peer must be reachable now — an unreachable peer fails rather
-        /// than queuing).
+        /// Share a file in the conversation instead of text. The bytes are
+        /// copied into the outbox first (subject to
+        /// `device.max_queued_file_bytes` and `device.min_free_bytes`) and an
+        /// unreachable peer is queued, not an error.
         #[arg(long, value_name = "PATH", conflicts_with = "text")]
         file: Option<String>,
+    },
+    /// Call off a file we are sharing: drop it from the queue and delete the
+    /// copy the outbox made of it.
+    Cancel {
+        /// Peer device id (`pb-…`), or a name that is discoverable right now.
+        peer: String,
+        /// The share's message id, as shown by `chat history --json`.
+        id: String,
     },
     /// Print a conversation's history.
     History {

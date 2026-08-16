@@ -200,6 +200,26 @@ fn chat_send_file_parses_with_text_omitted() {
 }
 
 #[test]
+fn chat_cancel_parses_peer_and_id() {
+    let cli =
+        Cli::try_parse_from(["peerbeam", "chat", "cancel", "pb-abc123", "0000000000001"]).unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::Cancel { peer, id } => {
+                assert_eq!(peer, "pb-abc123");
+                assert_eq!(id, "0000000000001");
+            }
+            _ => panic!("expected cancel"),
+        },
+        _ => panic!("expected chat"),
+    }
+    // Both positionals are required — a cancel that names no file must not
+    // parse into something that could delete the wrong one.
+    assert!(Cli::try_parse_from(["peerbeam", "chat", "cancel", "pb-abc123"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "chat", "cancel"]).is_err());
+}
+
+#[test]
 fn chat_history_and_watch_parse() {
     let cli = Cli::try_parse_from(["peerbeam", "chat", "history", "pb-abc123"]).unwrap();
     match cli.command {

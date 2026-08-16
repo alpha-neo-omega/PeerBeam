@@ -7,12 +7,22 @@
 //! store, and presents the result — the actual send/receive logic lives in
 //! `peerbeam_chat` (`flush_to_session`, `ChatHandler`), reused unchanged.
 //!
-//! **Offline delivery (1b).** `send` always enqueues (`ChatStore::enqueue`)
-//! before touching the network, then makes one opportunistic dial+flush —
-//! an unreachable peer simply stays queued. `watch` and `serve_loop`
+//! **Offline delivery (1b, extended to files in 2b).** `send` always enqueues
+//! (`ChatStore::enqueue`) before touching the network, then makes one
+//! opportunistic dial+flush — an unreachable peer simply stays queued.
+//! [`send_file`] now has the same shape: stage into the outbox's own storage,
+//! enqueue, then one opportunistic dial+send. `watch` and `serve_loop`
 //! (`commands.rs`, shared by `receive`/`daemon start`) each run a periodic
 //! [`drain_tick`] alongside their accept loop, and push a peer's queued
 //! outbox the moment a session with them is accepted (flush-on-connect).
+//!
+//! **That drain is text-and-declines only.** [`flush_to_session`] skips
+//! `Kind::File` by design: a queued file's bytes need a transfer, and
+//! `peerbeam-chat` owns no transfer engine, so the *caller* must run one. This
+//! binary does not yet — a queued file is delivered by a running PeerBeam app
+//! (the FFI runtime's drain, over the same appstore and blob root), or dropped
+//! with [`cancel`]. [`report_queued`] says so rather than letting `chat send
+//! --file` imply otherwise.
 //! Every dial/accept in this file registers the *same* chat wiring
 //! (`store` + [`received_sink`]) regardless of why the session was
 //! established — a session with no `ChatHandler` on one side silently drops
@@ -29,8 +39,9 @@ use futures::StreamExt;
 use serde_json::json;
 
 use peerbeam_chat::{
-    flush_to_session, prepare_file_send, send_file_ref, ChatRecord, ChatStore, Direction, FileMeta,
-    Kind, ReceivedSink, Status,
+    begin_file_send, flush_to_session, send_file_ref, stage_file_send, ChatRecord, ChatStore,
+    Direction, FileMeta, FileRef, Kind, ReceivedSink, SendError, StagedFile, StagingLimits,
+    StagingStore, Status,
 };
 use peerbeam_config::EngineConfig;
 use peerbeam_domain::id::DeviceId;
@@ -68,6 +79,7 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
                 "provide message text or --file <path>".into(),
             )),
         },
+        ChatAction::Cancel { peer, id } => cancel(ctx, peer, id, path_override).await,
         ChatAction::History { peer } => history(ctx, peer, path_override).await,
         ChatAction::Watch { port } => watch(ctx, port, path_override).await,
     }
@@ -424,18 +436,200 @@ async fn send(
     Ok(())
 }
 
+/// How many progress reports one staging copy may produce, at most.
+///
+/// `StagingStore::stage` reports after every 64 KiB — about 262,000 updates for
+/// a file at the 16 GiB cap. Neither consumer gains anything from that
+/// resolution: the human bar is 28 characters wide and prints a whole-number
+/// percentage, so it cannot render more than ~100 distinct states, and an
+/// NDJSON reader would have a quarter of a million `chat_staging` lines to wade
+/// through. Reporting at percent granularity is visually identical and machine-
+/// readable.
+const STAGING_STEPS: u64 = 100;
+
+/// Which reporting step `done`-of-`total` bytes falls in — the throttle behind
+/// [`STAGING_STEPS`]. Pure, so the throttle is testable without a copy.
+///
+/// A `total` of 0 (an empty file) collapses to a single step, and a source that
+/// outgrew its own metadata mid-copy simply carries on past the last step
+/// rather than pinning at 100% — `Bar::update` clamps the display, and a JSON
+/// consumer sees the real byte counts either way.
+fn staging_step(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    done.saturating_mul(STAGING_STEPS) / total
+}
+
+/// Copy the picked file into the outbox's own storage, reporting progress.
+///
+/// Wraps [`stage_file_send`] with the CLI's ordinary progress idiom —
+/// `ctx.bar`, which is already a no-op unless `ctx.progress`, so `--json` and
+/// non-TTY runs stay clean automatically — plus a `chat_staging` NDJSON line
+/// for machine consumers. Both are throttled by [`staging_step`].
+///
+/// The progress channel is drained *alongside* the copy rather than after it
+/// (`tokio::join!`, the same shape the transfer pump below uses): an unbounded
+/// channel nobody reads would hold every one of a multi-GB copy's reports in
+/// memory, which is exactly the allocation streaming exists to avoid.
+#[allow(clippy::too_many_arguments)] // mirrors `stage_file_send`'s own arity, plus `ctx`.
+async fn stage_with_progress(
+    ctx: &Ctx,
+    store: &ChatStore,
+    staging: &StagingStore,
+    peer: &DeviceId,
+    file_ref: &mut FileRef,
+    path: &str,
+    limits: StagingLimits,
+    ctrl: &TransferControl,
+) -> Result<StagedFile, CliError> {
+    // Captured before `copy` borrows `file_ref` mutably; `name` is also what a
+    // refusal has to name, so it must outlive the borrow either way.
+    let id = file_ref.id.clone();
+    let name = file_ref.name.clone();
+    let total = file_ref.size;
+    let peer_id = peer.0.clone();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<u64>();
+    let bar = ctx.bar(total, &name);
+    let copy = async {
+        let staged = stage_file_send(store, staging, peer, file_ref, path, limits, ctrl, &tx).await;
+        drop(tx); // ends `pump` below; without this it would wait forever.
+        staged
+    };
+    let pump = async {
+        let mut last = None;
+        while let Some(done) = rx.recv().await {
+            let step = staging_step(done, total);
+            if last == Some(step) {
+                continue;
+            }
+            last = Some(step);
+            bar.update(done);
+            if ctx.json {
+                ctx.json_line(&json!({
+                    "event": "chat_staging",
+                    "id": id,
+                    "peer": peer_id,
+                    "done": done,
+                    "total": total,
+                }));
+            }
+        }
+        bar.finish();
+    };
+    let (staged, ()) = tokio::join!(copy, pump);
+    staged.map_err(|e| stage_refusal(&name, limits, e))
+}
+
+/// Render a staging refusal honestly.
+///
+/// [`SendError`]'s own `Display` prefixes its `Session` variant with "chat
+/// session error:", which is false for everything that can fail here — nothing
+/// has been dialed and no session exists. What [`stage_file_send`] actually put
+/// in that variant is `StagingError`'s message, which already names the reason
+/// and the measured numbers: "{size} bytes is over the {max}-byte limit for a
+/// chat attachment", or "staging needs {need} bytes but only {free} are free".
+///
+/// The limits clause is not decoration. This surface streamed straight from the
+/// source until increment 2b; it now stages first, so a file that used to send
+/// is refused — and the free-space message alone cannot be acted on, because it
+/// names what the copy needs and what is free but never the floor that the two
+/// are actually judged against. Naming both bounds *and the config keys that
+/// set them* is what turns a refusal into something the user can do something
+/// about.
+fn stage_refusal(name: &str, limits: StagingLimits, e: SendError) -> CliError {
+    match e {
+        SendError::Session(reason) => CliError::Other(format!(
+            "cannot stage {name}: {reason}. A chat attachment may be at most {} bytes \
+             (device.max_queued_file_bytes), and staging refuses to leave less than {} bytes \
+             free (device.min_free_bytes).",
+            limits.max_bytes, limits.min_free_bytes
+        )),
+        // A `Chat` variant (a name or body the wire format rejects) keeps its
+        // own mapping — `ChatError::TooLarge` is a usage error with its own
+        // exit code, which flattening to `Other` here would silently change.
+        other => CliError::from(other),
+    }
+}
+
+/// The same honesty for [`begin_file_send`]'s refusals — a missing path, a
+/// directory, a name with no basename. No session exists on that path either,
+/// so its message must not claim one; unlike [`stage_refusal`] there are no
+/// limits to name, because nothing has been copied or measured yet.
+fn begin_refusal(e: SendError) -> CliError {
+    match e {
+        SendError::Session(reason) => CliError::Other(reason),
+        other => CliError::from(other),
+    }
+}
+
+/// Report a file share that is staged and queued but not yet delivered.
+///
+/// The first line is deliberately word-for-word the one text's [`send`] prints,
+/// so the two read as the same outcome — because they now *are* the same
+/// outcome.
+///
+/// The second line is the part text does not need. `drain_tick` (this binary's
+/// only drain, shared by `chat watch` and `daemon start`/`receive`) delivers
+/// through [`flush_to_session`], which skips `Kind::File` by design — a queued
+/// file's bytes need a transfer, and `peerbeam-chat` owns no transfer engine.
+/// So the generic "a running daemon/watch will deliver" is true of the queued
+/// *text* it was written for and not yet of a queued file on this surface. What
+/// does deliver one is a running PeerBeam app (the FFI runtime's own drain,
+/// over the same `<data_directory>/appstore` and `outbox-blobs` this CLI
+/// writes, keyed by the same identity), and `chat cancel` is what takes the
+/// bytes back. Saying so is the difference between a queue and a promise
+/// nothing keeps.
+fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: &FileRef) {
+    if ctx.json {
+        // The same event and the same keys the delivered case emits — only
+        // `delivered` differs, exactly as text's `chat_sent` already does. No
+        // new key, no changed type: a 2a consumer keeps parsing this.
+        ctx.json_line(&json!({
+            "event": "chat_file_sent",
+            "id": file_ref.id,
+            "peer": target.id.0,
+            "delivered": false,
+        }));
+        return;
+    }
+    ctx.line(&ctx.dim(&format!(
+        "queued for {} (offline — a running daemon/watch will deliver)",
+        target.name
+    )));
+    ctx.line(&ctx.dim(&format!(
+        "note: this CLI's drain covers queued text only — a queued file waits for a running \
+         PeerBeam app, or `chat cancel {} {}` to drop it",
+        target.id.0, file_ref.id
+    )));
+}
+
 /// `chat send --file <path>` — attach a file to a conversation.
 ///
-/// **Still online-only on this surface.** The bytes are now staged into the
-/// outbox's own storage first (`prepare_file_send`), exactly as the desktop and
-/// mobile surfaces do, so both frontends derive the wire `FileRef` and the
-/// transfer from the same blob and cannot disagree about what is being sent.
-/// But an unreachable peer is still a hard failure here, not a queue: this
-/// binary has no drain for a queued *file* yet, so leaving one behind would
-/// promise a delivery nothing in this process will ever make. Every terminal
-/// path therefore dequeues the entry and deletes the blob — `finish` below is
-/// the single place that does it. Queueing (and the CLI-side drain that earns
-/// it) is a separate task.
+/// **Offline-first (2b), like text.** The path is validated and the row
+/// persisted, the bytes are copied into the outbox's own storage
+/// ([`stage_file_send`]) and queued, and only then is one opportunistic dial +
+/// send attempted. An unreachable peer is **not** a failure: the entry simply
+/// stays queued, exactly as `send`'s text does, and this reports `queued`. That
+/// replaces 2a's hard `CliError::Connection`.
+///
+/// Staging is what makes a queued file honest — between queueing and delivery
+/// the user may delete, move or rewrite what they picked, so the blob (never
+/// the path) is what gets sent. It is also why this surface now **refuses**
+/// sends 2a would have streamed: `stage_file_send` enforces
+/// `device.max_queued_file_bytes` and `device.min_free_bytes`, and
+/// [`stage_refusal`] is what names which one, with the numbers, rather than
+/// failing generically.
+///
+/// **A peer without `CHAT_FEAT_FILEREF` stays a hard error**, deliberately not
+/// folded into the queue above: an unreachable peer is one who is merely away,
+/// and waiting helps; a peer whose build predates file-in-chat can never
+/// receive this at all, so queueing would promise a delivery that can never
+/// happen. Same for a failed offer or a failed transfer — a session *was*
+/// established, so these are real failures, and each dequeues the entry and
+/// deletes the blob through `finish` rather than stranding bytes this binary
+/// has no drain to retry (see the caveat printed alongside `queued`).
 ///
 /// The bytes ride the TRANSFER stream channel exactly like a plain `send`; a
 /// small `FileRef` control message rides the CHAT channel so the file gets a row
@@ -446,9 +640,9 @@ async fn send(
 /// Order matters: the row is validated + persisted BEFORE any network work, and
 /// the `FileRef` is sent BEFORE the bytes — so a peer who could see the offer
 /// always sees it before (or never after) the transfer starts. The session is
-/// closed on every exit — dial failure (none established), a
-/// `supports_file_ref` refusal, a `send_file_ref` failure, and the transfer's
-/// own outcome — never via a bare `?` that could skip it.
+/// closed on every exit — a `supports_file_ref` refusal, a `send_file_ref`
+/// failure, and the transfer's own outcome — never via a bare `?` that could
+/// skip it. (A failed dial established nothing, so there is nothing to close.)
 async fn send_file(
     ctx: &Ctx,
     to: Option<String>,
@@ -489,30 +683,36 @@ async fn send_file(
     let sc = SecureCtx::build(&config)?;
     let store = commands::chat_store(&config, &sc.enc, &sc.ident);
     let staging = commands::staging_store(&config);
+    let limits = commands::staging_limits(&config);
     let ctrl = TransferControl::new();
 
-    // Validate the path, persist the row, and copy the bytes into the outbox's
-    // own storage BEFORE any network work — a refused path (missing, a
-    // directory, a bad name) leaves no row and touches no network at all, and
-    // what gets sent from here on is the blob, not a path the user could change
-    // underneath us.
-    let (stage_tx, _stage_rx) = mpsc::unbounded_channel();
-    let (file_ref, staged) = prepare_file_send(
+    // Validate the path and persist the row BEFORE any copy or network work — a
+    // refused path (missing, a directory, a bad name) leaves no row, copies
+    // nothing and touches no network at all. The row reads `Staging` from here
+    // until the copy below finishes, so a multi-GB attach is visible as work in
+    // progress rather than looking hung.
+    let mut file_ref = begin_file_send(&store, &target.id, &path).map_err(begin_refusal)?;
+    let id = file_ref.id.clone();
+
+    // Copy the bytes into the outbox's own storage and queue them. What gets
+    // sent from here on is the blob, not a path the user could change
+    // underneath us — and, being queued, it survives this process exiting.
+    let staged = stage_with_progress(
+        ctx,
         &store,
         &staging,
         &target.id,
+        &mut file_ref,
         &path,
-        commands::staging_limits(&config),
+        limits,
         &ctrl,
-        &stage_tx,
     )
-    .await
-    .map_err(CliError::from)?;
-    let id = file_ref.id.clone();
+    .await?;
 
-    // Every exit below goes through this: the row's final status, the queue
-    // entry gone, and the staged blob deleted. Leaving either behind would
-    // strand bytes on disk that nothing in this process will ever send.
+    // Every terminal exit below goes through this: the row's final status, the
+    // queue entry gone, and the staged blob deleted. Deliberately NOT called on
+    // the unreachable-peer path — that one leaves both in place, which is what
+    // "queued" means.
     let finish = |status: Status| {
         let _ = store.set_status(&target.id, &id, status);
         let _ = store.outbox_remove(&id);
@@ -535,14 +735,15 @@ async fn send_file(
     .await
     {
         Ok(session) => session,
-        Err(e) => {
-            // No session was established — nothing to close. This surface is
-            // online only: an unreachable peer is a hard failure, not a queue.
-            finish(Status::Failed);
-            return Err(CliError::Connection(format!(
-                "cannot reach {} to send {}: {e}",
-                target.name, file_ref.name
-            )));
+        Err(_) => {
+            // Unreachable right now. No session was established — nothing to
+            // close, and nothing to undo: the row stays `Pending` and the entry
+            // stays queued, exactly as text's `send` leaves an undelivered
+            // message. The dial error itself is deliberately swallowed rather
+            // than reported, for the same reason `send` swallows it: "the peer
+            // is not up" is the expected outcome here, not a fault.
+            report_queued(ctx, &target, &file_ref);
+            return Ok(());
         }
     };
 
@@ -631,6 +832,97 @@ async fn send_file(
             Err(CliError::from(e))
         }
     }
+}
+
+/// `chat cancel <peer> <id>` — call off a file we are sharing.
+///
+/// **The authorization is [`ChatRecord::is_cancellable_outgoing_file`], and
+/// only that.** This deletes bytes on the strength of two strings a user typed,
+/// so a key match at `(peer, id)` is not enough: it would let `chat cancel`
+/// name a text row, a file the peer is offering *us* (refusing that is the
+/// approval gate's business — I6 — never this), or a share that already
+/// completed. The rule lives in `peerbeam-chat` precisely so both surfaces
+/// share one copy of it; the FFI's `pb_chat_cancel` passes the same check.
+///
+/// The row is fetched from **`peer`'s own namespace**, which is load-bearing:
+/// scanning conversations for the id instead would leave the direction check as
+/// the only thing between one cancel and another peer's file.
+///
+/// No path is ever built from the arguments. The blob unlinked is the
+/// `staged_path` read back off the queue entry — a string `StagingStore` itself
+/// produced under its own root — and the entry is found through `outbox_for`,
+/// which filters by peer. (The record keys those arguments do reach are
+/// hex-encoded by `FsAppStore` before they touch the filesystem, so neither can
+/// escape its namespace either.)
+///
+/// What this cannot do, unlike the FFI's equivalent, is stop a copy or a
+/// transfer that is *running right now*: those live inside a `chat send --file`
+/// process, and one CLI invocation has no IPC to another. It stops everything
+/// that outlives that process — the queue entry, the bytes, and a row left
+/// stranded by a send that was interrupted (Ctrl-C during a stage leaves
+/// exactly that).
+async fn cancel(ctx: &Ctx, peer: String, id: String, path_override: Option<&str>) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    let staging = commands::staging_store(&config);
+    // Same resolution `chat history` uses, so an id a user read out of
+    // `chat history bob` can be cancelled with the same word `bob`.
+    let peer_id = resolve_history_peer(ctx, &config, &store, peer).await;
+
+    let row = store
+        .get(&peer_id, &id)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    let Some(row) = row.filter(ChatRecord::is_cancellable_outgoing_file) else {
+        return Err(CliError::NotFound(format!(
+            "no file left to cancel under {id} in the conversation with {peer_id} — \
+             it is not an outgoing file share of ours, or it has already been sent or declined"
+        )));
+    };
+
+    // The queue entry and the bytes it owns.
+    let queued = store
+        .outbox_for(&peer_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| e.message_id == id);
+    if let Some(entry) = &queued {
+        if let Some(staged) = &entry.file {
+            staging.remove(&staged.staged_path);
+        }
+        store
+            .outbox_remove(&id)
+            .map_err(|e| CliError::Other(e.to_string()))?;
+    }
+    // The row. `Failed` is where a cancelled share lands — there is no
+    // `Cancelled` status, by the same decision the FFI's `settle_cancelled`
+    // records.
+    store
+        .set_status(&peer_id, &id, Status::Failed)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    let name = row
+        .file
+        .as_ref()
+        .map_or_else(|| id.clone(), |f| f.name.clone());
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "chat_cancelled",
+            "id": id,
+            "peer": peer_id.0,
+            "cancelled": true,
+            // Whether bytes were actually let go, or this only settled a row
+            // whose queue entry had already gone.
+            "dequeued": queued.is_some(),
+        }));
+    } else if queued.is_some() {
+        ctx.line(&ctx.green(&format!("cancelled {name} ({id})")));
+    } else {
+        ctx.line(&ctx.dim(&format!(
+            "cancelled {name} ({id}) — nothing was still queued"
+        )));
+    }
+    Ok(())
 }
 
 /// `chat history <peer>` — print a conversation's persisted history. `peer`
@@ -904,6 +1196,7 @@ mod tests {
         send_file, spawn_single_flight,
     };
     use crate::commands::{self, SecureCtx};
+    use crate::exit::CliError;
     use crate::output::Ctx;
     use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, FileMeta, FileRef, Kind, Status};
     use peerbeam_config::EngineConfig;
@@ -1024,6 +1317,60 @@ mod tests {
                 r.timestamp
             )
         );
+    }
+
+    /// The two states 2b added to this surface. `status_str` is serde-based, so
+    /// both words appear without a per-status match to forget to extend — this
+    /// pins that they read sensibly and, above all, that **neither reads as
+    /// though the file were sent**, which is the one way this line could lie.
+    #[test]
+    fn render_file_line_reads_sensibly_for_a_staging_and_a_queued_row() {
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("movie.mkv", 5_368_709_120).expect("file ref");
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        };
+        for (status, word) in [(Status::Staging, "staging"), (Status::Pending, "pending")] {
+            let rec = ChatRecord::file_out(&peer, &r, meta.clone(), status);
+            let line = render_file_line(&rec, &meta);
+            assert_eq!(
+                line,
+                format!(
+                    "[{}] out file: movie.mkv (5368709120 bytes) — {word}",
+                    r.timestamp
+                )
+            );
+            assert!(
+                !line.contains("sent"),
+                "a share that has not been delivered must never render as sent: {line}"
+            );
+        }
+    }
+
+    /// The same two states through the JSON contract, which a machine consumer
+    /// reads: `status` carries the identical lowercase word, and `kind`/`file`
+    /// are still there. A 2a-era row (no `Staging` in its vocabulary) is
+    /// unaffected — nothing about the shape changed, only which words can
+    /// appear in `status`.
+    #[test]
+    fn render_history_json_carries_the_staging_and_pending_words() {
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("movie.mkv", 64).expect("file ref");
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            local_path: None,
+        };
+        for (status, word) in [(Status::Staging, "staging"), (Status::Pending, "pending")] {
+            let value =
+                render_history_json(&[ChatRecord::file_out(&peer, &r, meta.clone(), status)]);
+            let messages = value["messages"].as_array().expect("messages array");
+            assert_eq!(messages[0]["status"], word);
+            assert_eq!(messages[0]["kind"], "file");
+            assert_eq!(messages[0]["file"]["name"], "movie.mkv");
+        }
     }
 
     // `resolve_history_peer`'s fast paths (offline history already exists, or
@@ -1167,13 +1514,13 @@ mod tests {
         assert_eq!(outbox[0].body, "hello offline");
     }
 
-    // `chat send --file` to an unreachable peer must FAIL — increment 2a has
-    // no file outbox, so (unlike text's queue-and-return-`Ok`) this must
-    // surface as a command error, and the row `prepare_file_send` persisted
-    // up front must be marked `Failed` rather than left `Transferring`
-    // forever (which reconciliation would only later flip to `Interrupted`).
+    // **The 2b behaviour change.** `chat send --file` to an unreachable peer
+    // must QUEUE, exactly as text's `send` does — exit 0, the row `Pending`,
+    // an outbox entry, and the bytes copied into storage the outbox owns. 2a
+    // failed here with `CliError::Connection` and marked the row `Failed`;
+    // that is what this replaces.
     #[tokio::test]
-    async fn send_file_to_unreachable_addr_fails_and_marks_the_record_failed() {
+    async fn send_file_to_unreachable_addr_queues_instead_of_failing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = isolated_config(dir.path());
         let cfg_path = dir.path().join("config.json");
@@ -1192,8 +1539,8 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_err(),
-            "chat send --file to an unreachable peer must fail, not queue: {result:?}"
+            result.is_ok(),
+            "chat send --file to an unreachable peer must queue, not fail: {result:?}"
         );
 
         // Read back through a fresh store, exactly what a real `chat history`
@@ -1211,10 +1558,271 @@ mod tests {
         assert_eq!(hist[0].kind, Kind::File);
         assert_eq!(
             hist[0].status,
-            Status::Failed,
-            "an unreachable peer must mark the row Failed, never leave it Transferring"
+            Status::Pending,
+            "an unreachable peer leaves the share queued, never Failed or Sent"
         );
         assert_eq!(hist[0].file.as_ref().expect("file meta").name, "report.pdf");
+
+        // …and it is genuinely queued, with bytes of its own.
+        let outbox = store.outbox_for(&target_id).expect("outbox_for");
+        assert_eq!(outbox.len(), 1, "the file must still be queued: {outbox:?}");
+        assert_eq!(outbox[0].kind, Kind::File);
+        let staged = outbox[0].file.as_ref().expect("a staged blob");
+        assert_eq!(
+            std::fs::read(&staged.staged_path).expect("read the staged blob"),
+            vec![7u8; 128],
+            "the outbox must own its own copy of the bytes, not a path"
+        );
+    }
+
+    // The refusal 2b introduced on this surface: 2a streamed straight from the
+    // source, so nothing was ever refused for size. A refusal must name the
+    // reason, the measured numbers AND the config key that sets the bound —
+    // and must not claim to be a session failure, since nothing was dialed.
+    #[tokio::test]
+    async fn send_file_over_the_attachment_cap_is_refused_naming_the_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = isolated_config(dir.path());
+        config.device.max_queued_file_bytes = 64;
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+
+        let file_path = dir.path().join("big.bin");
+        std::fs::write(&file_path, vec![7u8; 128]).expect("write file");
+
+        let ctx = quiet_ctx();
+        let err = send_file(
+            &ctx,
+            None,
+            Some("127.0.0.1:1".to_string()),
+            file_path.to_string_lossy().into_owned(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect_err("a file over the cap must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("128 bytes is over the 64-byte limit"),
+            "the refusal must name both numbers, got: {msg}"
+        );
+        assert!(
+            msg.contains("device.max_queued_file_bytes"),
+            "the refusal must name the knob that sets the cap, got: {msg}"
+        );
+        assert!(
+            !msg.contains("chat session error"),
+            "a stage that never dialed anything is not a session failure: {msg}"
+        );
+
+        // Nothing was queued, and the row says so rather than sitting on
+        // `Staging` forever.
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let target_id = DeviceId::from("addr");
+        assert!(store.outbox_for(&target_id).expect("outbox_for").is_empty());
+        let hist = store.history(&target_id).expect("history");
+        assert_eq!(hist[0].status, Status::Failed);
+    }
+
+    // The other bound, and the one whose library message cannot be acted on by
+    // itself: "staging needs N bytes but only M are free" never names the floor
+    // the two are judged against. A floor nothing can satisfy proves the CLI
+    // supplies it.
+    #[tokio::test]
+    async fn send_file_below_the_free_space_floor_is_refused_naming_the_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = isolated_config(dir.path());
+        config.device.min_free_bytes = u64::MAX; // unsatisfiable on any disk
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+
+        let file_path = dir.path().join("report.pdf");
+        std::fs::write(&file_path, vec![7u8; 128]).expect("write file");
+
+        let ctx = quiet_ctx();
+        let err = send_file(
+            &ctx,
+            None,
+            Some("127.0.0.1:1".to_string()),
+            file_path.to_string_lossy().into_owned(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect_err("an unsatisfiable free-space floor must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staging needs 128 bytes but only"),
+            "the refusal must name what the copy needed and what was free, got: {msg}"
+        );
+        assert!(
+            msg.contains("device.min_free_bytes"),
+            "the refusal must name the floor's knob — the library message never does: {msg}"
+        );
+    }
+
+    /// The throttle behind `chat_staging`/the bar: percent granularity, one
+    /// report per step, and no division by zero on an empty file.
+    #[test]
+    fn staging_step_reports_at_percent_granularity() {
+        assert_eq!(super::staging_step(0, 1000), 0);
+        assert_eq!(super::staging_step(5, 1000), 0, "same step: no new report");
+        assert_eq!(super::staging_step(10, 1000), 1);
+        assert_eq!(super::staging_step(1000, 1000), super::STAGING_STEPS);
+        assert_eq!(super::staging_step(0, 0), 0, "an empty file is one step");
+        // A source that outgrew its own metadata mid-copy keeps reporting
+        // rather than pinning at the last step.
+        assert!(super::staging_step(2000, 1000) > super::STAGING_STEPS);
+        // 64 KiB reports across a 16 GiB file collapse to ~100, not ~262_000.
+        let total = 17_179_869_184u64;
+        let steps: std::collections::HashSet<u64> = (0..4096)
+            .map(|n| super::staging_step(n * 65_536, total))
+            .collect();
+        assert!(steps.len() <= 2, "the first 256 MiB is at most 2 steps");
+    }
+
+    /// Queue one file for an unreachable peer and hand back everything a
+    /// cancel test needs: the config path, the store, the message id and the
+    /// blob the outbox owns. Extracted so both cancel tests exercise a queue
+    /// built the way a real `chat send --file` builds one, rather than a
+    /// hand-assembled one that could drift from it.
+    async fn queue_one_file(
+        ctx: &Ctx,
+        dir: &std::path::Path,
+        config: &EngineConfig,
+        cfg_path: &std::path::Path,
+    ) -> (ChatStore, String, String) {
+        let file_path = dir.join("report.pdf");
+        std::fs::write(&file_path, vec![7u8; 128]).expect("write file");
+        send_file(
+            ctx,
+            None,
+            Some("127.0.0.1:1".to_string()),
+            file_path.to_string_lossy().into_owned(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("an unreachable peer must queue");
+
+        let sc = SecureCtx::build(config).expect("secure ctx");
+        let store = commands::chat_store(config, &sc.enc, &sc.ident);
+        let entry = store
+            .outbox_for(&DeviceId::from("addr"))
+            .expect("outbox_for")
+            .pop()
+            .expect("one queued entry");
+        let staged = entry.file.expect("a staged blob").staged_path;
+        (store, entry.message_id, staged)
+    }
+
+    // `chat cancel` on a queued share: the entry goes, the bytes go, and the
+    // row settles. This is the only thing that reclaims a queued file's disk
+    // space on this surface, so all three parts are load-bearing.
+    #[tokio::test]
+    async fn chat_cancel_dequeues_a_queued_file_and_deletes_its_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let (store, id, staged) = queue_one_file(&ctx, dir.path(), &config, &cfg_path).await;
+        assert!(
+            std::path::Path::new(&staged).exists(),
+            "precondition: the blob was staged"
+        );
+
+        super::cancel(
+            &ctx,
+            "addr".to_string(), // `--addr`'s routing placeholder id
+            id.clone(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("a queued outgoing file is ours to cancel");
+
+        let peer = DeviceId::from("addr");
+        assert!(
+            store.outbox_for(&peer).expect("outbox_for").is_empty(),
+            "the queue entry must be gone"
+        );
+        assert!(
+            !std::path::Path::new(&staged).exists(),
+            "the bytes the outbox owned must be gone: {staged}"
+        );
+        assert_eq!(
+            store.get(&peer, &id).expect("get").expect("row").status,
+            Status::Failed,
+            "a cancelled share settles Failed — there is no Cancelled status"
+        );
+    }
+
+    // The authorization, not a key match. `chat cancel` must refuse anything
+    // `ChatRecord::is_cancellable_outgoing_file` refuses — here a text row and
+    // an already-sent file — and must leave it untouched, because the whole
+    // point of routing through that one rule is that this command deletes
+    // bytes. (Direction and the settled states are proved exhaustively by that
+    // rule's own tests in `peerbeam-chat`; this proves the CLI actually asks
+    // it rather than reimplementing it.)
+    #[tokio::test]
+    async fn chat_cancel_refuses_what_the_shared_rule_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let cfg_arg = Some(cfg_path.to_str().expect("utf8 path"));
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("pb-bob");
+
+        // A text row: nothing staged, nothing to stop.
+        let m = ChatMessage::new("hi").expect("msg");
+        store.append(&ChatRecord::sent(&peer, &m)).expect("append");
+        // A file share that already completed.
+        let done = FileRef::new("done.bin", 1).expect("file ref");
+        store
+            .append(&ChatRecord::file_out(
+                &peer,
+                &done,
+                FileMeta::new(&done.name, done.size, None),
+                Status::Sent,
+            ))
+            .expect("append");
+
+        for id in [&m.id, &done.id] {
+            let err = super::cancel(&ctx, "pb-bob".to_string(), id.clone(), cfg_arg)
+                .await
+                .expect_err("the shared rule must refuse this");
+            assert!(
+                matches!(err, CliError::NotFound(_)),
+                "a refusal must be NotFound (exit 3), got: {err:?}"
+            );
+        }
+        // Untouched: neither row was rewritten on the way out.
+        assert_eq!(
+            store.get(&peer, &m.id).expect("get").expect("row").status,
+            Status::Sent,
+            "a refused cancel must not rewrite the row it refused"
+        );
+        assert_eq!(
+            store
+                .get(&peer, &done.id)
+                .expect("get")
+                .expect("row")
+                .status,
+            Status::Sent
+        );
+
+        // An id nobody ever minted is a clean NotFound too, not a panic.
+        let err = super::cancel(
+            &ctx,
+            "pb-bob".to_string(),
+            "0000000000001".to_string(),
+            cfg_arg,
+        )
+        .await
+        .expect_err("an unknown id has nothing to cancel");
+        assert!(matches!(err, CliError::NotFound(_)), "got: {err:?}");
     }
 
     // **The refusal.** A peer whose build predates file-in-chat advertises
