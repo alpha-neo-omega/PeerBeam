@@ -351,6 +351,39 @@ void main() {
       expect(fake.calls, isEmpty);
     });
 
+    // `settled + gone + failed == requested` is what `_bulkReport` reads to
+    // decide what to tell the user, so it has to hold on every return —
+    // including the one taken when there is no engine at all. Counting those
+    // ids as neither settled nor gone nor failed made the report say "None
+    // were still waiting" about a batch on which no attempt was ever made.
+    // `gone` would be just as wrong: nothing here knows anything stopped
+    // waiting. Latent while `AppState.live` always supplies an api; the
+    // invariant is not conditional on that staying true.
+    test('a bulk decision with no engine counts every id as failed, keeping '
+        'the outcome invariant', () async {
+      final repo = TransferRepository(api: null);
+
+      expect(await repo.acceptOnly(['in-1', 'in-2', 'in-3']), (
+        requested: 3,
+        settled: 0,
+        gone: 0,
+        failed: 3,
+      ));
+      expect(await repo.declineOnly(['in-1']), (
+        requested: 1,
+        settled: 0,
+        gone: 0,
+        failed: 1,
+      ));
+      // And an empty batch is still nothing at all, not a failure.
+      expect(await repo.acceptOnly(const []), (
+        requested: 0,
+        settled: 0,
+        gone: 0,
+        failed: 0,
+      ));
+    });
+
     test(
       'a queued folder send is labeled with the folder name, not blank',
       () async {

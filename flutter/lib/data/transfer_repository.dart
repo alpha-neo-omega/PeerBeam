@@ -165,9 +165,19 @@ class TransferRepository extends ChangeNotifier {
     List<String> ids, {
     required bool accepting,
   }) async {
+    if (ids.isEmpty) {
+      return (requested: 0, settled: 0, gone: 0, failed: 0);
+    }
     final api = _api;
-    if (api == null || ids.isEmpty) {
-      return (requested: ids.length, settled: 0, gone: 0, failed: 0);
+    if (api == null) {
+      // No engine to ask, so nothing is known to have stopped waiting —
+      // `gone` would be a claim about transfers nobody looked at. Counting
+      // them `failed` keeps `settled + gone + failed == requested` true, which
+      // `_bulkReport` reads directly: with these ids in neither column it
+      // would have said "None were still waiting" about a batch on which no
+      // attempt was ever made. Unreachable while `AppState.live` always
+      // supplies an api; the invariant is not conditional on that staying so.
+      return (requested: ids.length, settled: 0, gone: 0, failed: ids.length);
     }
     // Which of the requested ids are still actually waiting, snapshotted once
     // up front rather than trusted from whenever the caller built [ids]. A

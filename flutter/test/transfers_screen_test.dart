@@ -548,7 +548,7 @@ void main() {
     });
 
     testWidgets('selection-mode partial batch: the snackbar names the real '
-        'numbers', (tester) async {
+        'numbers, and selection mode is left', (tester) async {
       final fake = FakePeerBeam()..noPendingDecisionIds.add('in-2');
       await _pumpTransfers(tester, fake);
 
@@ -570,6 +570,73 @@ void main() {
         find.text('Accepted 1 of 2 — 1 was no longer waiting'),
         findsOneWidget,
       );
+
+      // The behaviour that actually distinguishes this path from `Accept all`:
+      // a landed selection batch ends selection mode (`if (selecting)
+      // widget.onSettled()`). Asserting only the snackbar would pass just as
+      // well with the screen left in selection mode, checkboxes still on every
+      // card and the per-card Decline/Accept/Trust still gone.
+      expect(find.byType(Checkbox), findsNothing, reason: 'selection is over');
+      expect(find.text('2 items waiting for approval'), findsOneWidget);
+      expect(find.text('Select'), findsOneWidget);
+      expect(
+        find.text('Trust'),
+        findsNWidgets(2),
+        reason: 'the per-card actions are back',
+      );
+    });
+
+    testWidgets('selection mode really ENDS when the banner goes: a later '
+        'batch is back in normal mode with nothing checked', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      await _enterSelectMode(tester);
+      await tester.tap(_checkboxFor('in-1'));
+      await tester.tap(_checkboxFor('in-2'));
+      await tester.pump();
+      expect(find.text('2 of 2 selected'), findsOneWidget);
+
+      // The user walks away. Both prompts are answered elsewhere (or simply
+      // time out), the banner drops below its two-waiting threshold and
+      // disappears — with `_selecting` still set and `_selected` still full.
+      fake.emit(_started('in-1'));
+      fake.emit(_started('in-2'));
+      await tester.pump(); // the banner goes; the exit is scheduled
+      await tester.pump(); // …and lands, after the frame, never during it
+      expect(find.byType(Checkbox), findsNothing);
+
+      // Two more arrive — reusing the same ids, which is not contrived:
+      // inbound transfer ids come from the SENDER, and `register_vacant` keys
+      // them under the peer. A stale selection holding those ids renders both
+      // new cards pre-checked, which is exactly the pre-composed batch
+      // decision `_enterSelecting`'s reset exists to prevent.
+      fake.emit(_queued('in-1', incoming: true));
+      fake.emit(_queued('in-2', incoming: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(find.text('2 items waiting for approval'), findsOneWidget);
+      expect(
+        find.byType(Checkbox),
+        findsNothing,
+        reason: 'the banner must come back in NORMAL mode',
+      );
+      expect(find.text('Select'), findsOneWidget);
+      expect(
+        find.text('Trust'),
+        findsNWidgets(2),
+        reason: 'and the per-card Decline/Accept/Trust must be back',
+      );
+
+      // The clear was real, not merely masked: entering again starts at zero.
+      await _enterSelectMode(tester);
+      expect(find.text('0 of 2 selected'), findsOneWidget);
     });
   });
 }

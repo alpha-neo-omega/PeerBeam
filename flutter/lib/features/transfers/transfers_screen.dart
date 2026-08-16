@@ -49,6 +49,39 @@ class _TransfersScreenState extends State<TransfersScreen> {
     if (!_selected.remove(id)) _selected.add(id);
   });
 
+  /// Leave selection mode for real once the banner has nothing left to show.
+  ///
+  /// `build` only ever *masks* the flag (`_selecting && showBanner`), which is
+  /// not the same as clearing it. Walk away with two of three checked, let them
+  /// all time out, and the banner disappears with `_selecting` still true and
+  /// `_selected` still populated; two new inbound transfers then bring the
+  /// banner back **already in selection mode**, with checkboxes on every card
+  /// and the per-card Decline/Accept/Trust gone until the user finds Cancel.
+  /// This screen lives in an `indexedStack` branch, so that state survives tab
+  /// switches indefinitely. Worse, inbound transfer ids come from the *sender*,
+  /// so a peer reusing an id the stale set still holds renders that card
+  /// pre-checked — exactly the pre-composed batch decision `_enterSelecting`'s
+  /// reset exists to prevent.
+  ///
+  /// Deferred to a post-frame callback because the caller is `build`, and
+  /// mutating state from inside a build is the property this screen already
+  /// keeps (see the derivation comment there). The condition is re-read when
+  /// the callback runs rather than trusted from when it was scheduled: a batch
+  /// can arrive in the gap, and clearing then would drop a selection the user
+  /// had just started composing.
+  void _leaveSelectingAfterFrame(TransferRepository transfers) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_selecting) return;
+      if (transfers.awaitingApproval.map((t) => t.id).toSet().length >= 2) {
+        return;
+      }
+      setState(() {
+        _selecting = false;
+        _selected = {};
+      });
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
@@ -88,6 +121,12 @@ class _TransfersScreenState extends State<TransfersScreen> {
               // pruned by mutating state from inside build.
               final selecting = _selecting && showBanner;
               final effectiveSelected = _selected.intersection(waitingIds);
+              // Masking is not leaving. Once the banner is gone there is no
+              // batch to come back to, so the mode is actually ended — after
+              // this frame, never during it.
+              if (_selecting && !showBanner) {
+                _leaveSelectingAfterFrame(state.transfer);
+              }
               return Column(
                 children: [
                   if (showBanner)
@@ -139,11 +178,13 @@ class _TransfersScreenState extends State<TransfersScreen> {
   }
 }
 
-/// `1 file` / `3 files`. Shared by the banner's heading and its result report
-/// so the two can never describe the same batch differently.
-/// "3 items", not "3 files": a waiting transfer can be a folder, and the
-/// banner counts whatever is queued for a decision rather than assuming.
-String _files(int n) => '$n ${n == 1 ? 'item' : 'items'}';
+/// `1 item` / `3 items` — deliberately not "files". A waiting transfer can be a
+/// whole folder, so the banner counts whatever is queued for a decision rather
+/// than claiming to know what each one holds.
+///
+/// Shared by the banner's heading and its result report so the two can never
+/// describe the same batch differently.
+String _items(int n) => '$n ${n == 1 ? 'item' : 'items'}';
 
 /// A verified report of what a bulk approval actually did.
 ///
@@ -154,7 +195,7 @@ String _files(int n) => '$n ${n == 1 ? 'item' : 'items'}';
 /// of them were already gone would be a claim, not a fact.
 String _bulkReport(String verbPast, BulkDecision d) {
   if (d.requested == 0) return 'Nothing was waiting';
-  if (d.settled == d.requested) return '$verbPast ${_files(d.settled)}';
+  if (d.settled == d.requested) return '$verbPast ${_items(d.settled)}';
   if (d.settled == 0 && d.failed == 0) return 'None were still waiting';
   final why = <String>[
     if (d.gone > 0)
@@ -279,7 +320,7 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
                   child: Text(
                     selecting
                         ? '${widget.selectedIds.length} of ${widget.waiting} selected'
-                        : '${_files(widget.waiting)} waiting for approval',
+                        : '${_items(widget.waiting)} waiting for approval',
                     style: text.titleSmall?.copyWith(
                       fontWeight: FontWeight.w600,
                       color: scheme.onSecondaryContainer,

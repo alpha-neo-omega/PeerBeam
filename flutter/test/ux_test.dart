@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/features/home/home_screen.dart';
 import 'package:peerbeam/main.dart';
 import 'sdk/fake_peerbeam.dart';
 import 'package:peerbeam/widgets/status_dot.dart';
@@ -67,9 +68,12 @@ void main() {
       );
     }
 
-    // And Ctrl+1 comes back to Home, which has no AppBar title of its own.
+    // And Ctrl+1 comes back to Home. Asserted on Home's own widget, not on
+    // Settings' AppBar being absent: that would pass just as well if Ctrl+1
+    // had landed on Chats, Transfers or History — three of the five
+    // destinations — which is no assertion about position 1 at all.
     await press(LogicalKeyboardKey.digit1);
-    expect(find.widgetWithText(AppBar, 'Settings'), findsNothing);
+    expect(find.byType(HomeScreen), findsOneWidget);
   });
 
   // The shortcuts above go through `goBranch(i)`, which indexes the ROUTER's
