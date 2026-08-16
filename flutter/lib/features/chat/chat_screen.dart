@@ -19,9 +19,15 @@ import '../../widgets/processing.dart';
 /// the id is threaded through separately here rather than read off [peer].
 ///
 /// The thread is reachable whether or not the peer is online: history is
-/// local. Sending is not — a text message queues in the engine's outbox, and
-/// a file (increment 2a) fails with a clear reason rather than promising a
-/// delivery this build cannot make.
+/// local, and since increment 2b both a text message and a file *share* queue
+/// in the engine's outbox for an offline peer rather than failing.
+///
+/// One case is genuinely different, and is the reason for [_canSend]: a peer
+/// with no known address at all — a conversation opened from the Conversations
+/// list for a device discovery cannot currently see. The engine refuses such a
+/// send outright (`device_from` requires an address and a port), before
+/// anything is enqueued, so the composer says so instead of accepting messages
+/// that would silently never exist.
 class ChatScreen extends StatefulWidget {
   final String peerId;
   final PeerTarget peer;
@@ -57,6 +63,17 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.dispose();
     super.dispose();
   }
+
+  /// Whether this peer can be sent to at all.
+  ///
+  /// Mirrors the engine's own precondition (`device_from`: at least one address
+  /// and a nonzero port) rather than guessing at reachability — an *offline*
+  /// peer with a known address is perfectly sendable, because the outbox holds
+  /// the message until it returns. What cannot work is a peer we have no
+  /// address for: that send is refused before it is enqueued, and the
+  /// repository would be left holding an optimistic bubble that the next
+  /// refresh silently deletes.
+  bool get _canSend => widget.peer.addresses.isNotEmpty && widget.peer.port > 0;
 
   /// Fire-and-forget: `send` awaits a synchronous dial+handshake under the
   /// hood, so the button handler must not block on it — the optimistic
@@ -151,10 +168,28 @@ class _ChatScreenState extends State<ChatScreen> {
                   },
                 ),
               ),
+              if (!_canSend)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    AppSpace.md,
+                    0,
+                    AppSpace.md,
+                    AppSpace.xxs,
+                  ),
+                  child: Text(
+                    'No address known for ${widget.peer.name} yet — this '
+                    'conversation is readable, and sending works again as soon '
+                    'as the device is discovered.',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
               _Composer(
                 controller: _controller,
                 onSend: _send,
                 onAttach: _attach,
+                enabled: _canSend,
               ),
             ],
           ),
@@ -295,11 +330,14 @@ bool _failedStatus(String status) => const {
 /// The trailing marker on one's OWN row: what happened to it.
 ///
 /// Deliberately not a two-state pending/tick test. Since files share a
-/// conversation, an outgoing row can now be `transferring`, `failed`,
-/// `declined` or `interrupted` — showing the delivered tick for any of those
-/// would tell the user a file arrived when the same bubble says it failed.
-/// The tick means delivered, and nothing else does.
+/// conversation, an outgoing row can now be `staging`, `transferring`,
+/// `failed`, `declined` or `interrupted` — showing the delivered tick for any
+/// of those would tell the user a file arrived when the same bubble says it is
+/// still being copied, or failed. The tick means delivered, and nothing else
+/// does; every new status must be added here rather than left to fall into the
+/// default.
 IconData _deliveryGlyph(String status) => switch (status) {
+  ChatStatusValue.staging ||
   ChatStatusValue.pending ||
   ChatStatusValue.transferring ||
   ChatStatusValue.pendingApproval => Icons.schedule,
@@ -400,6 +438,50 @@ class _FileBody extends StatelessWidget {
             ),
           ],
         ),
+        // The engine is copying the file into the outbox's own storage. That
+        // can run for minutes on a multi-GB pick, so the bar is determinate
+        // wherever possible — an attach that looks hung is a bug report, and a
+        // spinner that never moves is indistinguishable from one. The fraction
+        // comes off the `chat_status` events' `progress` object (~100 of them
+        // over a whole copy); before the first one lands there is genuinely
+        // nothing to say, and an indeterminate bar says exactly that rather
+        // than inventing 0%.
+        //
+        // No `AnimatedBuilder` here: the whole list is already rebuilt by the
+        // screen's own listener on this same repository.
+        if (message.status == ChatStatusValue.staging) ...[
+          const Gap(AppSpace.xs),
+          Builder(
+            builder: (context) {
+              final staged = state.chat.stagingFor(message.id);
+              // Clamped, not trusted: the source can be appended to while it
+              // is copied, so `done` may legitimately overshoot `total`.
+              final value = (staged == null || staged.total <= 0)
+                  ? null
+                  : (staged.done / staged.total).clamp(0.0, 1.0).toDouble();
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+                child: LinearProgressIndicator(
+                  value: value,
+                  minHeight: 4,
+                  backgroundColor: fg.withValues(alpha: 0.15),
+                ),
+              );
+            },
+          ),
+        ],
+        // Staged or queued, the user can still call this off — and must be able
+        // to: waiting out an 8 GiB copy of the wrong file is not a choice.
+        // Wired to the engine's own cancel, whose answer is believed rather
+        // than assumed (see [_cancel]).
+        if (_cancellable(message))
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: () => _cancel(context, message),
+              child: const Text('Cancel'),
+            ),
+          ),
         if (message.status == ChatStatusValue.transferring) ...[
           const Gap(AppSpace.xs),
           // The one place a live transfer is read: purely a progress overlay.
@@ -500,6 +582,49 @@ class _FileBody extends StatelessWidget {
   bool _offersApproval(Transfer? live) =>
       live == null || live.state == TransferState.pending;
 
+  /// Whether the local user may still call this share off here.
+  ///
+  /// A narrowing of the engine's own rule
+  /// (`ChatRecord::is_cancellable_outgoing_file`) to the two states this
+  /// surface offers the action in: **our own outgoing file**, staged or queued.
+  /// A row whose bytes are already moving is cancellable by the engine too, but
+  /// it has a live transfer and is called off from the Transfers screen (the
+  /// chat message id IS the transfer id), so a second control for it here would
+  /// be a second path to the same stop. An inbound offer is never cancelled —
+  /// it is *declined*, at the approval gate.
+  bool _cancellable(ChatMessage m) =>
+      m.isMine &&
+      m.isFile &&
+      (m.status == ChatStatusValue.staging ||
+          m.status == ChatStatusValue.pending);
+
+  /// Ask the engine to call the share off, and say so if it could not.
+  ///
+  /// The row is deliberately NOT removed or relabelled optimistically: the
+  /// engine answers `{cancelled: false}` when the file had already been
+  /// delivered or declined, and pretending otherwise would tell the user they
+  /// stopped something they did not. On a false the repository re-reads the
+  /// conversation, so the row snaps to what it really is, and this says why the
+  /// button appeared to do nothing.
+  Future<void> _cancel(BuildContext context, ChatMessage m) async {
+    // Captured before the await: the bubble can be rebuilt (or gone) by the
+    // time the engine answers.
+    final messenger = ScaffoldMessenger.of(context);
+    final chat = AppScope.of(context).chat;
+    final cancelled = await chat.cancelFile(m.peerId, m.id);
+    if (cancelled) return;
+    final name = m.fileName ?? 'that file';
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            'Could not cancel $name — it is no longer waiting to be sent.',
+          ),
+        ),
+      );
+  }
+
   /// The leading icon: what this row *is*, except when it went wrong — then it
   /// borrows the trailing marker's glyph so the two can never disagree about
   /// which failure state this is.
@@ -511,7 +636,15 @@ class _FileBody extends StatelessWidget {
   }
 
   /// Plain language for a record status, from the row's own point of view.
+  ///
+  /// Only ever called for a FILE row (this is [_FileBody]'s own label), which
+  /// is why `pending` reads "Queued" here: on a file it means the bytes are
+  /// staged and the entry is waiting for the peer, and calling that "Sent"
+  /// — or even "Waiting", text's own word for the same status — would understate
+  /// a file that is sitting on this disk. Text rows carry no status text at all;
+  /// their marker is the trailing glyph.
   String _statusLabel(ChatMessage m) => switch (m.status) {
+    ChatStatusValue.staging => 'Staging…',
     ChatStatusValue.transferring => m.isMine ? 'Sending…' : 'Receiving…',
     ChatStatusValue.sent => 'Sent',
     ChatStatusValue.received => 'Received · tap to open',
@@ -521,20 +654,27 @@ class _FileBody extends StatelessWidget {
     ChatStatusValue.declined => 'Declined',
     ChatStatusValue.failed => 'Failed',
     ChatStatusValue.interrupted => 'Interrupted',
-    ChatStatusValue.pending => 'Waiting',
+    ChatStatusValue.pending => 'Queued',
     _ => m.status,
   };
 }
 
 /// The bottom compose bar: attach, a text field, and a send button.
+///
+/// [enabled] is false only for a peer with no known address, where the engine
+/// would refuse the send before enqueueing it. The bar stays visible (a
+/// vanishing composer reads as a broken screen) but every control is inert, so
+/// nothing can be typed into a message that could not exist.
 class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final VoidCallback onSend;
   final VoidCallback onAttach;
+  final bool enabled;
   const _Composer({
     required this.controller,
     required this.onSend,
     required this.onAttach,
+    this.enabled = true,
   });
 
   @override
@@ -551,7 +691,7 @@ class _Composer extends StatelessWidget {
         child: Row(
           children: [
             IconButton(
-              onPressed: onAttach,
+              onPressed: enabled ? onAttach : null,
               icon: const Icon(Icons.attach_file_rounded),
               tooltip: 'Attach files',
             ),
@@ -559,12 +699,13 @@ class _Composer extends StatelessWidget {
             Expanded(
               child: TextField(
                 controller: controller,
+                enabled: enabled,
                 textInputAction: TextInputAction.send,
                 minLines: 1,
                 maxLines: 5,
-                decoration: const InputDecoration(
-                  hintText: 'Message',
-                  border: OutlineInputBorder(
+                decoration: InputDecoration(
+                  hintText: enabled ? 'Message' : 'Not reachable right now',
+                  border: const OutlineInputBorder(
                     borderRadius: BorderRadius.all(
                       Radius.circular(AppRadius.xl),
                     ),
@@ -576,7 +717,7 @@ class _Composer extends StatelessWidget {
             ),
             const Gap(AppSpace.xs),
             IconButton.filled(
-              onPressed: onSend,
+              onPressed: enabled ? onSend : null,
               icon: const Icon(Icons.send_rounded),
               tooltip: 'Send',
             ),

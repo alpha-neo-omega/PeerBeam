@@ -63,6 +63,8 @@ class Bindings {
   final _ArgRetDart _chatSendFile;
   final _ArgRetDart _chatHistory;
   final _ArgRetDart _chatReconcile;
+  final _ArgRetDart _chatCancel;
+  final _ArgRetDart _chatConversations;
 
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
@@ -111,6 +113,13 @@ class Bindings {
       ),
       _chatReconcile = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_chat_reconcile',
+      ),
+      _chatCancel = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_cancel'),
+      // Takes no arguments (`{}` or null both mean "call"), but is still an
+      // arg-taking C signature — the export reads its pointer with
+      // `read_json_or_empty`.
+      _chatConversations = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_conversations',
       );
 
   /// Load the native library. `overridePath` forces a specific file (tests).
@@ -157,6 +166,8 @@ class Bindings {
   String chatSendFile(String json) => _withArg(json, _chatSendFile);
   String chatHistory(String json) => _withArg(json, _chatHistory);
   String chatReconcile(String json) => _withArg(json, _chatReconcile);
+  String chatCancel(String json) => _withArg(json, _chatCancel);
+  String chatConversations(String json) => _withArg(json, _chatConversations);
 
   /// Read a Rust-owned string and free it (ownership contract).
   String _consume(Pointer<Utf8> ptr) {

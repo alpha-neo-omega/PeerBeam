@@ -154,6 +154,17 @@ String formatBytes(int bytes) {
   return '$rounded ${units[unit]}';
 }
 
+/// How long ago [t] was, in coarse human terms (`just now`, `5m ago`, `3d
+/// ago`). Shared by History and the Conversations list so the two never
+/// describe the same instant differently.
+String formatAgo(DateTime t) {
+  final d = DateTime.now().difference(t);
+  if (d.inMinutes < 1) return 'just now';
+  if (d.inMinutes < 60) return '${d.inMinutes}m ago';
+  if (d.inHours < 24) return '${d.inHours}h ago';
+  return '${d.inDays}d ago';
+}
+
 /// Human-readable transfer speed, e.g. `1.2 MB/s`. Empty when idle/unknown.
 String formatSpeed(double bytesPerSecond) {
   if (bytesPerSecond <= 0) return '';

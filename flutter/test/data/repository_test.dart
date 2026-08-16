@@ -573,7 +573,10 @@ void main() {
       expect(optimistic.isFile, isTrue);
       expect(optimistic.fileName, 'report.pdf');
       expect(optimistic.fileSize, 4096);
-      expect(optimistic.status, ChatStatusValue.transferring);
+      // `staging`, not `transferring`: the engine has not copied a byte yet,
+      // and claiming bytes are moving would render "Sending…" over a file it
+      // has not read — and hide the Cancel this row is entitled to.
+      expect(optimistic.status, ChatStatusValue.staging);
       expect(optimistic.isMine, isTrue);
       // A file row carries no text: rendering `body` would be a blank bubble.
       expect(optimistic.body, isEmpty);
@@ -672,9 +675,11 @@ void main() {
       final refused = rows.singleWhere((m) => m.fileName == 'b.bin');
       expect(refused.status, ChatStatusValue.failed);
       expect(repo.errorFor(refused.id), contains('cannot read'));
-      // The two that were accepted are the engine's own persisted rows.
+      // The two that were accepted are the engine's own persisted rows —
+      // `staging`, because that is the state a share is persisted in before a
+      // byte of it has been copied.
       expect(
-        rows.where((m) => m.status == ChatStatusValue.transferring),
+        rows.where((m) => m.status == ChatStatusValue.staging),
         hasLength(2),
       );
     });
@@ -806,6 +811,334 @@ void main() {
 
       expect(fake.calls.where((c) => c.startsWith('chatHistory:')), isEmpty);
       expect(repo.messagesFor('pb-bob').single.status, ChatStatusValue.sent);
+    });
+
+    // ── 2b: staging, cancel, conversations ──────────────────────
+
+    test('staging progress is kept per message and retired when the row '
+        'leaves staging', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      // Nothing known yet: an indeterminate bar, never a fabricated 0%.
+      expect(repo.stagingFor('fr-1'), isNull);
+
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.staging,
+          progress: (done: 2048, total: 8192),
+        ),
+      );
+      await flush();
+      expect(repo.stagingFor('fr-1')?.done, 2048);
+      expect(repo.stagingFor('fr-1')?.total, 8192);
+
+      // Later ticks replace it.
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.staging,
+          progress: (done: 6144, total: 8192),
+        ),
+      );
+      await flush();
+      expect(repo.stagingFor('fr-1')?.done, 6144);
+
+      // The copy finished and the entry was queued: the bar has nothing left
+      // to say, so it must not linger for the next row to inherit.
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.pending,
+        ),
+      );
+      await flush();
+      expect(repo.stagingFor('fr-1'), isNull);
+    });
+
+    // The engine emits one bare `staging` event before the first byte moves.
+    // Arriving after real progress it must NOT wipe the bar back to
+    // indeterminate — only a status that is not staging retires it.
+    test('a bare staging event never erases progress already known', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.staging,
+          progress: (done: 2048, total: 8192),
+        ),
+      );
+      await flush();
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.staging,
+        ),
+      );
+      await flush();
+
+      expect(repo.stagingFor('fr-1')?.done, 2048);
+    });
+
+    // Progress arrives for the engine's own message id while the conversation
+    // still holds the optimistic row under a local one, so it cannot be
+    // conditional on finding a row.
+    test('progress is kept even for a row this session has not read yet', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+
+      fake.emit(
+        const ChatStatus(
+          messageId: 'file-1',
+          peerId: 'pb-nobody',
+          status: ChatStatusValue.staging,
+          progress: (done: 1, total: 4),
+        ),
+      );
+      await flush();
+
+      expect(repo.messagesFor('pb-nobody'), isEmpty);
+      expect(repo.stagingFor('file-1')?.done, 1);
+    });
+
+    test('cancelFile stops a queued share and the engine settles the row', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-bob',
+          direction: 'out',
+          body: '',
+          at: DateTime.now(),
+          status: ChatStatusValue.pending,
+          kind: ChatMessageKind.file,
+          fileName: 'movie.mkv',
+          fileSize: 7,
+        ),
+      ];
+      await repo.refresh('pb-bob');
+
+      expect(await repo.cancelFile('pb-bob', 'fr-1'), isTrue);
+      await flush();
+
+      expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
+      final row = repo.messagesFor('pb-bob').single;
+      expect(row.status, ChatStatusValue.failed);
+      expect(repo.errorFor('fr-1'), 'cancelled');
+    });
+
+    // The honest false. The engine cancelled nothing because the file had
+    // already gone — so the row must NOT be removed or relabelled as though
+    // the user had stopped it, and the conversation is re-read instead.
+    test('a cancel the engine refuses leaves the row exactly as it is', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-bob',
+          direction: 'out',
+          body: '',
+          at: DateTime.now(),
+          // Already delivered: `is_cancellable_outgoing_file` refuses it.
+          status: ChatStatusValue.sent,
+          kind: ChatMessageKind.file,
+          fileName: 'movie.mkv',
+          fileSize: 7,
+        ),
+      ];
+      await repo.refresh('pb-bob');
+
+      expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
+      await flush();
+
+      final row = repo.messagesFor('pb-bob').single;
+      expect(row.id, 'fr-1', reason: 'the row is not removed');
+      expect(
+        row.status,
+        ChatStatusValue.sent,
+        reason: 'and it still reads sent',
+      );
+      // Re-read, so what is on screen is what the engine actually holds.
+      expect(
+        fake.calls.where((c) => c == 'chatHistory:pb-bob'),
+        hasLength(2),
+      );
+    });
+
+    test('an inbound offer is never cancellable — that is the approval gate\'s '
+        'business', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      fake.chatHistories['pb-bob'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: '',
+          at: DateTime.now(),
+          status: ChatStatusValue.pendingApproval,
+          kind: ChatMessageKind.file,
+          fileName: 'theirs.bin',
+          fileSize: 7,
+        ),
+      ];
+      await repo.refresh('pb-bob');
+
+      expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
+      expect(
+        repo.messagesFor('pb-bob').single.status,
+        ChatStatusValue.pendingApproval,
+      );
+    });
+
+    test('refreshConversations lists every thread, newest first, keyed by the '
+        'peer id', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      final old = DateTime.parse('2026-08-10T09:00:00Z');
+      final recent = DateTime.parse('2026-08-13T09:00:00Z');
+      // A thread whose only row is a queued file for a peer nothing on the
+      // network can currently see — the case this list exists for.
+      fake.chatHistories['pb-quiet'] = [
+        ChatMessage(
+          id: 'fr-1',
+          peerId: 'pb-quiet',
+          direction: 'out',
+          body: '',
+          at: old,
+          status: ChatStatusValue.pending,
+          kind: ChatMessageKind.file,
+          fileName: 'movie.mkv',
+          fileSize: 7,
+        ),
+      ];
+      fake.chatHistories['pb-busy'] = [
+        ChatMessage(
+          id: 'fr-2',
+          peerId: 'pb-busy',
+          direction: 'in',
+          body: '',
+          at: recent,
+          status: ChatStatusValue.pendingApproval,
+          kind: ChatMessageKind.file,
+          fileName: 'theirs.bin',
+          fileSize: 7,
+        ),
+      ];
+
+      expect(repo.conversations, isEmpty);
+      await repo.refreshConversations();
+
+      final list = repo.conversations;
+      expect(list.map((c) => c.peerId), ['pb-busy', 'pb-quiet']);
+      // Only rows genuinely awaiting a decision count — not our own outgoing
+      // file, and never text.
+      expect(list.first.unreadHint, 1);
+      expect(list.first.needsAttention, isTrue);
+      expect(list.last.unreadHint, 0);
+      expect(list.last.needsAttention, isFalse);
+      expect(list.last.lastAt, old);
+    });
+
+    test('an arriving message refreshes the conversation list, and a staging '
+        'tick does not', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      // The engine persists the record before it announces it, so the thread
+      // is already on disk when the event lands.
+      fake.chatHistories['pb-new'] = [
+        ChatMessage(
+          id: 'm1',
+          peerId: 'pb-new',
+          direction: 'in',
+          body: 'hi',
+          at: DateTime.now(),
+          status: ChatStatusValue.received,
+        ),
+      ];
+
+      fake.emit(
+        ChatReceived(
+          ChatMessage(
+            id: 'm1',
+            peerId: 'pb-new',
+            direction: 'in',
+            body: 'hi',
+            at: DateTime.now(),
+            status: ChatStatusValue.received,
+          ),
+        ),
+      );
+      await flush();
+      await flush();
+      expect(fake.calls.where((c) => c == 'chatConversations'), hasLength(1));
+      // A thread that did not exist a moment ago is now reachable.
+      expect(repo.conversations.single.peerId, 'pb-new');
+
+      // ~100 of these arrive per share. Each one costs a full scan of every
+      // conversation on disk, and none of them can change the list.
+      for (var i = 0; i < 5; i++) {
+        fake.emit(
+          ChatStatus(
+            messageId: 'fr-1',
+            peerId: 'pb-new',
+            status: ChatStatusValue.staging,
+            progress: (done: i, total: 5),
+          ),
+        );
+      }
+      await flush();
+      await flush();
+      expect(fake.calls.where((c) => c == 'chatConversations'), hasLength(1));
+
+      // A settled status can change what is waiting on the user, so it does.
+      fake.emit(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-new',
+          status: ChatStatusValue.sent,
+        ),
+      );
+      await flush();
+      await flush();
+      expect(fake.calls.where((c) => c == 'chatConversations'), hasLength(2));
+    });
+
+    // The first message to a peer creates the conversation. An offline peer
+    // sends back no record and settles no status, so nothing else would ever
+    // announce the thread — and it would be missing from the Conversations
+    // list for exactly as long as the peer is unreachable.
+    test('starting a conversation puts it on the list without waiting for the '
+        'peer', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      const target = PeerTarget(
+        id: 'pb-offline',
+        name: 'offline',
+        addresses: ['10.0.0.9'],
+        port: 49600,
+      );
+
+      await repo.send('pb-offline', target, 'are you there');
+      await flush();
+
+      expect(repo.conversations.single.peerId, 'pb-offline');
+      expect(repo.conversations.single.needsAttention, isFalse);
+
+      await repo.sendFile('pb-offline', target, '/tmp/a.bin', name: 'a.bin');
+      await flush();
+
+      expect(repo.conversations.single.peerId, 'pb-offline');
     });
 
     test('messagesFor keeps text and file rows distinct in one thread', () async {

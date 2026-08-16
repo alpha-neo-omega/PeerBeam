@@ -137,4 +137,202 @@ void main() {
     expect(fake.calls, contains('chatHistory:x1'));
     expect(fake.calls, isNot(contains('chatHistory:${saved.id}')));
   });
+
+  // ── 2b: the Conversations list ──────────────────────────────
+  //
+  // Without it, a thread is only reachable through a device tile — so a file
+  // queued for a peer that has since gone offline has no entry point at all,
+  // which is exactly the case 2b exists to serve.
+  testWidgets('a conversation with a peer discovery cannot see is listed, and '
+      'opens under the engine\'s own peer id', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-ghost'] = [
+      ChatMessage(
+        id: 'fr-1',
+        peerId: 'pb-ghost',
+        direction: 'out',
+        body: '',
+        at: DateTime.now(),
+        status: ChatStatusValue.pending,
+        kind: ChatMessageKind.file,
+        fileName: 'movie.mkv',
+        fileSize: 7,
+      ),
+    ];
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Conversations'), findsOneWidget);
+    // Discovery has never heard of this peer, so its id is the only name we
+    // can honestly put to it.
+    expect(find.text('pb-ghost'), findsOneWidget);
+
+    await tester.tap(find.text('pb-ghost'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // Opened under the authenticated id the engine returned — the one both
+    // halves of the conversation already agree on.
+    expect(fake.calls, contains('chatHistory:pb-ghost'));
+    // …and the thread is readable while the composer says why it cannot send.
+    expect(find.text('movie.mkv'), findsOneWidget);
+    expect(find.textContaining('No address known for pb-ghost'), findsOneWidget);
+  });
+
+  testWidgets('a discovered peer\'s conversation shows its live name', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['x1'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'x1',
+        direction: 'in',
+        body: 'hi',
+        at: DateTime.now(),
+        status: ChatStatusValue.received,
+      ),
+    ];
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    fake.emit(const DeviceAdded(_laptop));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // The row carries the live name, not the raw device id. (Counted with
+    // `findsWidgets`, not an exact number: the device tile below renders the
+    // same name, and whether it is laid out at all depends on how much else
+    // is on screen.)
+    expect(find.text('Live Laptop'), findsWidgets);
+    expect(find.text('x1'), findsNothing);
+    expect(find.textContaining('Last message'), findsOneWidget);
+  });
+
+  // `unread_hint` counts INBOUND FILE OFFERS AWAITING A DECISION. PeerBeam has
+  // no read receipts and no local read-state, so a real unread count is not
+  // computable — rendering this as "N unread" would be a guess dressed as a
+  // fact, and a thread full of unread text legitimately reads 0.
+  testWidgets('a waiting offer reads as "needs your attention", never as '
+      'unread', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'fr-1',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: '',
+        at: DateTime.now(),
+        status: ChatStatusValue.pendingApproval,
+        kind: ChatMessageKind.file,
+        fileName: 'theirs.bin',
+        fileSize: 7,
+      ),
+    ];
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('1 file offer needs your attention'), findsOneWidget);
+    expect(find.textContaining('unread'), findsNothing);
+    expect(find.byTooltip('1 file offer is waiting for your decision'),
+        findsOneWidget);
+  });
+
+  // A thread whose only traffic is text — however much of it — is not waiting
+  // on the user for anything, and must not be badged as though it were.
+  testWidgets('a thread full of text shows no attention badge at all', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      for (var i = 0; i < 5; i++)
+        ChatMessage(
+          id: 'm$i',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: 'message $i',
+          at: DateTime.now(),
+          status: ChatStatusValue.received,
+        ),
+    ];
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.textContaining('needs your attention'), findsNothing);
+    expect(find.byIcon(Icons.move_to_inbox_rounded), findsNothing);
+    expect(find.textContaining('Last message'), findsOneWidget);
+  });
+
+  testWidgets('no conversations means no section at all', (tester) async {
+    final state = AppState.live(FakePeerBeam());
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Conversations'), findsNothing);
+  });
+
+  // A message from a peer this session has never seen creates the thread; the
+  // list has to notice without the user leaving and coming back.
+  testWidgets('an arriving message adds its conversation live', (tester) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('Conversations'), findsNothing);
+
+    // The engine persists the record, then announces it.
+    fake.chatHistories['pb-new'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-new',
+        direction: 'in',
+        body: 'hello',
+        at: DateTime.now(),
+        status: ChatStatusValue.received,
+      ),
+    ];
+    fake.emit(
+      ChatReceived(
+        ChatMessage(
+          id: 'm1',
+          peerId: 'pb-new',
+          direction: 'in',
+          body: 'hello',
+          at: DateTime.now(),
+          status: ChatStatusValue.received,
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Conversations'), findsOneWidget);
+    expect(find.text('pb-new'), findsOneWidget);
+  });
 }

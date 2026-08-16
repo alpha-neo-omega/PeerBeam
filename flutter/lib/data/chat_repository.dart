@@ -35,6 +35,21 @@ class ChatRepository extends ChangeNotifier {
   /// message, an incoming file settling, or simply reopening the thread. They
   /// are re-appended by [refresh] and cleared only by [dismiss].
   final Map<String, List<ChatMessage>> _unsent = {};
+
+  /// How far each staging copy has got, keyed by message id.
+  ///
+  /// Session-scoped like [_errors], and for the same reason: the engine
+  /// persists the row's *status*, not its progress, which exists only on the
+  /// `chat_status` events that report it. An entry is retired the moment the
+  /// row leaves `staging` — the bar has nothing left to say once the copy is
+  /// queued, cancelled or failed.
+  final Map<String, ({int done, int total})> _staging = {};
+
+  /// Every conversation on disk, newest first (see [refreshConversations]).
+  List<ChatConversation> _conversations = const [];
+  bool _loadingConversations = false;
+  bool _conversationsStale = false;
+
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
   int _optimisticSeq = 0;
@@ -56,6 +71,17 @@ class ChatRepository extends ChangeNotifier {
   /// Messages for one conversation, oldest first (as returned by the engine).
   List<ChatMessage> messagesFor(String peerId) =>
       List.unmodifiable(_byPeer[peerId] ?? const []);
+
+  /// Every conversation on disk, newest first. Empty until
+  /// [refreshConversations] has run.
+  List<ChatConversation> get conversations =>
+      List.unmodifiable(_conversations);
+
+  /// How far the staging copy behind [messageId] has got, or null when this
+  /// session has seen no progress for it — which is the ordinary state for the
+  /// first moment of a share, and permanently so for one a restart interrupted.
+  /// A surface must render that as an indeterminate bar, never as 0%.
+  ({int done, int total})? stagingFor(String messageId) => _staging[messageId];
 
   /// Why the message with [messageId] failed, when the engine said so. Null
   /// for every message that hasn't failed (and for a failure this session
@@ -119,6 +145,66 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
+  /// Pull the list of conversations from the engine.
+  ///
+  /// This is what makes a thread reachable for a peer discovery cannot see —
+  /// it is derived from what is on disk, not from the network. Overlapping
+  /// calls are coalesced rather than queued: the engine reads every record of
+  /// every conversation to build this, and a burst of arrivals (an outbox
+  /// draining fifty queued messages at once) must not turn into fifty full
+  /// scans. A request that lands mid-flight sets [_conversationsStale] and is
+  /// served by one extra pass at the end.
+  Future<void> refreshConversations() async {
+    final api = _api;
+    if (api == null) return;
+    if (_loadingConversations) {
+      _conversationsStale = true;
+      return;
+    }
+    _loadingConversations = true;
+    try {
+      do {
+        _conversationsStale = false;
+        final list = await api.chatConversations();
+        if (_disposed) return;
+        _conversations = list;
+        notifyListeners();
+      } while (_conversationsStale);
+    } catch (_) {
+      // Keep the current list on transient errors.
+    } finally {
+      _loadingConversations = false;
+    }
+  }
+
+  /// Call off a file we are sharing, and report **honestly** whether anything
+  /// was cancelled.
+  ///
+  /// A `false` is not a failure to handle away: the engine is telling us the
+  /// share had already been delivered or declined, so the row must NOT be
+  /// removed or relabelled as though the user had stopped it. The conversation
+  /// is re-read instead, which replaces whatever the user was looking at with
+  /// what the row actually is; the caller is expected to say so as well.
+  ///
+  /// Nothing is re-read on success: the engine settles the row and emits the
+  /// `chat_status` that [_onStatus] applies, so refreshing here would be a
+  /// second, racier path to the same state.
+  Future<bool> cancelFile(String peerId, String messageId) async {
+    final api = _api;
+    if (api == null) return false;
+    var cancelled = false;
+    try {
+      cancelled = await api.chatCancel(peerId, messageId);
+    } catch (_) {
+      // A refused id (never persisted, so never cancellable) reads exactly
+      // like the engine's own "there was nothing to cancel".
+      cancelled = false;
+    }
+    if (_disposed) return cancelled;
+    if (!cancelled) await refresh(peerId);
+    return cancelled;
+  }
+
   /// Send [text] to [peer], filed under [peerId] in the conversation map.
   ///
   /// `chatSend` enqueues the message durably and returns immediately (1b:
@@ -146,6 +232,12 @@ class ChatRepository extends ChangeNotifier {
     try {
       await _api?.chatSend(peer, body);
       await refresh(peerId);
+      // The first message to a peer CREATES the conversation, and nothing else
+      // will announce it: an offline peer sends back no record and settles no
+      // status, so without this the thread would be missing from the
+      // Conversations list for exactly as long as it is unreachable — which is
+      // when reaching it matters most.
+      unawaited(refreshConversations());
     } catch (_) {
       // chatSend itself only fails on a local/validation error (enqueueing
       // is durable and always attempted) — an unreachable peer is not an
@@ -157,15 +249,16 @@ class ChatRepository extends ChangeNotifier {
 
   /// Share the file at [path] inside the conversation with [peer].
   ///
-  /// Mirrors [send], with one deliberate difference: **there is no outbox**.
-  /// `chatSendFile` is online-only (increment 2a), so a peer that cannot be
-  /// reached fails the row rather than promising a later delivery — and a
-  /// failure is therefore worth showing, not swallowing.
+  /// Mirrors [send], including the outbox: since increment 2b an unreachable
+  /// peer no longer fails the share — the bytes are staged into the engine's
+  /// own storage and the entry waits, exactly like a queued text message. What
+  /// is still worth showing (and is not swallowed) is a refusal of the *path*,
+  /// which happens before anything is persisted.
   ///
   /// [name] and [size] are only used for the optimistic row shown before the
   /// engine answers; the persisted record is authoritative from `refresh` on.
-  /// The engine validates and persists the row synchronously (before it dials
-  /// anything), so that reconcile always finds it.
+  /// The engine validates and persists the row synchronously (before it copies
+  /// or dials anything), so that reconcile always finds it.
   ///
   /// Call this once per picked file. A multi-select fans out here, never at
   /// the engine — sending only the first of several files the user chose is
@@ -187,7 +280,11 @@ class ChatRepository extends ChangeNotifier {
         // A file row carries no text — the engine persists an empty body too.
         body: '',
         at: DateTime.now(),
-        status: ChatStatusValue.transferring,
+        // `staging`, matching what `begin_file_send` persists synchronously:
+        // nothing has been copied yet, let alone sent. Claiming `transferring`
+        // here would render "Sending…" over a file the engine has not read a
+        // byte of, and would hide the Cancel this row is entitled to.
+        status: ChatStatusValue.staging,
         kind: ChatMessageKind.file,
         fileName: name ?? _basename(path),
         fileSize: size,
@@ -198,6 +295,9 @@ class ChatRepository extends ChangeNotifier {
     try {
       await _api?.chatSendFile(peer, path);
       await refresh(peerId);
+      // Same reason as [send]: a file queued for a peer that never turns up
+      // must still put its thread on the Conversations list.
+      unawaited(refreshConversations());
     } on PeerBeamException catch (e) {
       // The engine refused the path itself (missing file, a folder): nothing
       // was persisted and nothing was sent, so a `refresh` here would silently
@@ -236,6 +336,11 @@ class ChatRepository extends ChangeNotifier {
   void _onReceived(ChatMessage m) {
     (_byPeer[m.peerId] ??= <ChatMessage>[]).add(m);
     notifyListeners();
+    // A record can create a conversation that did not exist a moment ago —
+    // which is exactly the thread the Conversations list exists to surface —
+    // and an inbound file offer changes what that list says is waiting on the
+    // user. Both need the summary re-read.
+    unawaited(refreshConversations());
   }
 
   /// Flip a message's status in place: `pending` → `sent` once the engine's
@@ -258,6 +363,25 @@ class ChatRepository extends ChangeNotifier {
       _errors[e.messageId] = reason;
     } else {
       _errors.remove(e.messageId);
+    }
+    // Staging progress, before the row-lookup below: these events arrive for a
+    // share whose optimistic row still carries a local id, so the fraction has
+    // to be kept whether or not a row can be found for it yet. Anything that is
+    // NOT staging retires the bar — a bare `staging` event (the engine emits
+    // one before the first byte) leaves whatever is already known, so the bar
+    // never jumps back to indeterminate mid-copy.
+    final progress = e.progress;
+    if (progress != null) {
+      _staging[e.messageId] = progress;
+    } else if (e.status != ChatStatusValue.staging) {
+      _staging.remove(e.messageId);
+    }
+    // The conversation summary can move here too (an offer accepted or
+    // declined changes what is waiting on the user), but a staging tick cannot
+    // — and there are ~100 of those per share, each of which would otherwise
+    // cost a full scan of every conversation.
+    if (progress == null && e.status != ChatStatusValue.staging) {
+      unawaited(refreshConversations());
     }
     final list = _byPeer[e.peerId];
     if (list == null) return;

@@ -363,6 +363,256 @@ void main() {
     expect(bar().value, closeTo(0.5, 0.001));
   });
 
+  // ── 2b: staging, queued, cancel ─────────────────────────────
+
+  testWidgets('a staging row says so and draws a determinate bar from the '
+      'engine\'s progress', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.staging),
+    ];
+    await _open(tester, fake);
+
+    LinearProgressIndicator bar() => tester.widget<LinearProgressIndicator>(
+      find.byType(LinearProgressIndicator),
+    );
+
+    expect(find.textContaining('Staging…'), findsOneWidget);
+    // Not "Sent", and not the delivered tick: nothing has been copied yet.
+    expect(find.byIcon(Icons.check_rounded), findsNothing);
+    expect(find.byIcon(Icons.schedule), findsOneWidget);
+    // No progress reported yet — indeterminate, never a fabricated 0%.
+    expect(bar().value, isNull);
+
+    fake.emit(
+      const ChatStatus(
+        messageId: 'fr-1',
+        peerId: 'pb-bob',
+        status: ChatStatusValue.staging,
+        progress: (done: 1024, total: 4096),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(bar().value, closeTo(0.25, 0.001));
+  });
+
+  // The source can grow while it is being copied (a log, a download still
+  // running), so `done` can legitimately exceed `total`. The bar clamps.
+  testWidgets('staging progress past 100% is clamped, not thrown', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.staging),
+    ];
+    await _open(tester, fake);
+
+    fake.emit(
+      const ChatStatus(
+        messageId: 'fr-1',
+        peerId: 'pb-bob',
+        status: ChatStatusValue.staging,
+        progress: (done: 9000, total: 4096),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(
+      tester
+          .widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator))
+          .value,
+      1.0,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  // The whole point of 2b: a queued file is NOT a sent file. It is waiting on
+  // this disk for a peer that has not turned up.
+  testWidgets('a queued file row reads Queued, never the delivered tick', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.pending),
+      _file(
+        id: 'fr-2',
+        direction: 'out',
+        status: ChatStatusValue.sent,
+        name: 'delivered.pdf',
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.textContaining('Queued'), findsOneWidget);
+    expect(find.textContaining('Sent'), findsOneWidget);
+    // Exactly one tick, and it belongs to the row that really did arrive.
+    expect(find.byIcon(Icons.check_rounded), findsOneWidget);
+    expect(find.byIcon(Icons.schedule), findsOneWidget);
+  });
+
+  testWidgets('staged and queued rows offer Cancel; a delivered one does not', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.staging),
+      _file(
+        id: 'fr-2',
+        direction: 'out',
+        status: ChatStatusValue.pending,
+        name: 'queued.mkv',
+      ),
+      _file(
+        id: 'fr-3',
+        direction: 'out',
+        status: ChatStatusValue.sent,
+        name: 'delivered.pdf',
+      ),
+    ];
+    await _open(tester, fake);
+
+    // Two cancellable rows, not three.
+    expect(find.text('Cancel'), findsNWidgets(2));
+  });
+
+  testWidgets('an inbound offer is declined, never cancelled', (tester) async {
+    final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'in',
+        status: ChatStatusValue.pendingApproval,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.text('Decline'), findsOneWidget);
+    expect(find.text('Cancel'), findsNothing);
+  });
+
+  testWidgets('cancelling a staging file calls the engine off with the row\'s '
+      'own peer and message ids', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.staging),
+    ];
+    await _open(tester, fake);
+    // Let the staggered entrance animation finish before tapping (the
+    // indeterminate bar animates forever, so pumpAndSettle cannot be used).
+    await tester.pump(const Duration(seconds: 1));
+
+    await tester.tap(find.text('Cancel'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
+    // The engine settles the row failed with its reason, and the row says so
+    // rather than vanishing.
+    expect(find.textContaining('Failed'), findsOneWidget);
+    expect(find.textContaining('cancelled'), findsOneWidget);
+    expect(find.text('Cancel'), findsNothing);
+  });
+
+  // The race the honest boolean exists for: the screen still shows Queued
+  // while the engine has already delivered the file. `{cancelled:false}` must
+  // NOT be dressed up as a cancel.
+  testWidgets('a cancel the engine refuses says so and leaves the row alone', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.pending),
+    ];
+    await _open(tester, fake);
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.text('Cancel'), findsOneWidget);
+
+    // Delivered in the moment between the render and the tap.
+    fake.chatHistories['pb-bob'] = [
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.sent),
+    ];
+
+    await tester.tap(find.text('Cancel'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
+    // Told plainly, and the row snaps to what it actually is.
+    expect(find.byType(SnackBar), findsOneWidget);
+    expect(find.textContaining('Could not cancel'), findsOneWidget);
+    expect(find.textContaining('Sent'), findsOneWidget);
+    expect(find.byIcon(Icons.check_rounded), findsOneWidget);
+  });
+
+  // Opened from the Conversations list for a peer discovery cannot see: the
+  // engine refuses a send with no address before enqueueing it, so the
+  // composer must not accept messages that would silently never exist.
+  testWidgets('a peer with no known address can be read but not sent to', (
+    tester,
+  ) async {
+    final state = AppState.live(FakePeerBeam());
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(
+          home: ChatScreen(
+            peerId: 'pb-bob',
+            peer: PeerTarget(
+              id: 'pb-bob',
+              name: 'Bob',
+              addresses: [],
+              port: 0,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.textContaining('No address known for Bob'), findsOneWidget);
+    expect(
+      tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Send'),
+          matching: find.byType(IconButton),
+        ),
+      ).onPressed,
+      isNull,
+    );
+    expect(
+      tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Attach files'),
+          matching: find.byType(IconButton),
+        ),
+      ).onPressed,
+      isNull,
+    );
+  });
+
+  testWidgets('a peer with an address keeps a working composer even offline', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    expect(find.textContaining('No address known'), findsNothing);
+    expect(
+      tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Send'),
+          matching: find.byType(IconButton),
+        ),
+      ).onPressed,
+      isNotNull,
+    );
+  });
+
   testWidgets('tapping a received file whose recorded copy is gone falls back '
       'to opening it by name through SAF', (tester) async {
     final calls = <MethodCall>[];

@@ -52,11 +52,20 @@ sealed class BridgeEvent {
       case 'chat_received':
         return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
       case 'chat_status':
+        // `progress` rides the ordinary status event (there is deliberately no
+        // second event type for staging), and is absent on every other status.
+        final progress = j['progress'];
         return ChatStatus(
           messageId: j['message_id'] as String? ?? '',
           peerId: j['peer_id'] as String? ?? '',
           status: j['status'] as String? ?? '',
           error: j['error'] as String?,
+          progress: progress is Map
+              ? (
+                  done: (progress['done'] as num?)?.toInt() ?? 0,
+                  total: (progress['total'] as num?)?.toInt() ?? 0,
+                )
+              : null,
         );
       default:
         return null;
@@ -186,10 +195,26 @@ class ChatStatus extends BridgeEvent {
   /// attachments, or a send that failed before any byte moved).
   final String? error;
 
+  /// How far a `staging` row's copy has got, when the engine said so.
+  ///
+  /// Deliberately part of THIS event rather than a new type: staging is a
+  /// status a row is *in*, not a different kind of thing happening to it, so a
+  /// surface that already routes `chat_status` to a row needs no second
+  /// vocabulary to draw its bar. Null on every other status, and null on the
+  /// first `staging` event (emitted before a byte has moved).
+  ///
+  /// The engine throttles these to roughly a hundred over a whole copy — a
+  /// 16 GiB stage does not produce 262,000 of them — so they can be rendered
+  /// directly. `done` may exceed `total` when the source is being appended to
+  /// while it is copied (a log, a download still running), so a bar must clamp
+  /// rather than assume.
+  final ({int done, int total})? progress;
+
   const ChatStatus({
     required this.messageId,
     required this.peerId,
     required this.status,
     this.error,
+    this.progress,
   });
 }

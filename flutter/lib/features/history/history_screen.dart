@@ -184,10 +184,10 @@ class _HistoryRow extends StatelessWidget {
                       Text(
                         message
                             ? '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-                                  '${_ago(item.at)} · tap to view'
+                                  '${formatAgo(item.at)} · tap to view'
                                   '${item.success ? '' : ' · Failed'}'
                             : '${sending ? 'Sent to' : 'Received from'} ${item.peerName} · '
-                                  '${formatBytes(item.bytes)} · ${_ago(item.at)}'
+                                  '${formatBytes(item.bytes)} · ${formatAgo(item.at)}'
                                   '${item.success ? '' : ' · Failed'}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -204,13 +204,5 @@ class _HistoryRow extends StatelessWidget {
         ),
       ),
     );
-  }
-
-  String _ago(DateTime t) {
-    final d = DateTime.now().difference(t);
-    if (d.inMinutes < 1) return 'just now';
-    if (d.inMinutes < 60) return '${d.inMinutes}m ago';
-    if (d.inHours < 24) return '${d.inHours}h ago';
-    return '${d.inDays}d ago';
   }
 }

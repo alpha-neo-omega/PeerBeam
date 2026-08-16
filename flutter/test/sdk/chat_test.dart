@@ -153,6 +153,11 @@ void main() {
       expect(ChatStatusValue.declined, 'declined');
       expect(ChatStatusValue.failed, 'failed');
       expect(ChatStatusValue.interrupted, 'interrupted');
+      // 2b. `Status::Staging` under the same `rename_all = "lowercase"`, so
+      // one word and no separator — pinned by the Rust side's own
+      // `staging_serializes_as_lowercase_and_is_not_settleable`. A wrong
+      // spelling here would silently disable the staging bar and its Cancel.
+      expect(ChatStatusValue.staging, 'staging');
     });
   });
 
@@ -237,6 +242,68 @@ void main() {
       expect(status.error, isNull);
     });
 
+    // Staging progress rides THIS event — there is deliberately no new event
+    // type for it — so a surface that already routes `chat_status` to a row
+    // can draw the bar without learning a second vocabulary.
+    test('a staging event carries its progress object', () {
+      final event = BridgeEvent.fromJson(const {
+        'type': 'chat_status',
+        'timestamp': '2026-08-13T09:00:00Z',
+        'message_id': 'fr-1',
+        'peer_id': 'pb-bob',
+        'status': 'staging',
+        'progress': {'done': 4096, 'total': 8192},
+      });
+
+      final status = event as ChatStatus;
+      expect(status.status, ChatStatusValue.staging);
+      expect(status.progress?.done, 4096);
+      expect(status.progress?.total, 8192);
+    });
+
+    test('every other status carries no progress at all', () {
+      final event =
+          BridgeEvent.fromJson(const {
+                'type': 'chat_status',
+                'message_id': 'fr-1',
+                'peer_id': 'pb-bob',
+                'status': 'pending',
+              })
+              as ChatStatus;
+
+      expect(event.progress, isNull);
+    });
+
+    // The engine emits one bare `staging` event before the first byte moves
+    // (from `chat_send_file` itself), and `done` can exceed `total` when the
+    // source is appended to mid-copy. Neither may crash a consumer.
+    test('a staging event with no progress, and an overshooting one, both '
+        'decode', () {
+      final bare =
+          BridgeEvent.fromJson(const {
+                'type': 'chat_status',
+                'message_id': 'fr-1',
+                'peer_id': 'pb-bob',
+                'status': 'staging',
+              })
+              as ChatStatus;
+      expect(bare.progress, isNull);
+
+      final over =
+          BridgeEvent.fromJson(const {
+                'type': 'chat_status',
+                'message_id': 'fr-1',
+                'peer_id': 'pb-bob',
+                'status': 'staging',
+                'progress': {'done': 9000, 'total': 8192},
+              })
+              as ChatStatus;
+      // Reported as sent, not clamped here: clamping is the renderer's job,
+      // and swallowing it would hide that the source grew.
+      expect(over.progress?.done, 9000);
+      expect(over.progress?.total, 8192);
+    });
+
     test('carries the engine\'s reason when a file share fails', () {
       final event = BridgeEvent.fromJson(const {
         'type': 'chat_status',
@@ -289,6 +356,65 @@ void main() {
 
       expect(event.peerId, isNull);
       expect(event.size, isNull);
+    });
+  });
+
+  // The exact shape `Manager::chat_conversations` emits.
+  group('ChatConversation.fromJson', () {
+    test('decodes a conversation row', () {
+      final c = ChatConversation.fromJson(const {
+        'peer_id': 'pb-bob',
+        'last_timestamp': '2026-08-13T09:00:00Z',
+        'unread_hint': 2,
+      });
+
+      expect(c.peerId, 'pb-bob');
+      expect(c.lastAt, DateTime.parse('2026-08-13T09:00:00Z'));
+      expect(c.unreadHint, 2);
+      expect(c.needsAttention, isTrue);
+    });
+
+    // A thread this build cannot read is still LISTED (dropping it would hide
+    // the very conversation the list exists to reach), with a null timestamp.
+    test('a null last_timestamp decodes as "nothing known", not as now', () {
+      final c = ChatConversation.fromJson(const {
+        'peer_id': 'pb-quiet',
+        'last_timestamp': null,
+        'unread_hint': 0,
+      });
+
+      expect(c.peerId, 'pb-quiet');
+      expect(c.lastAt, isNull);
+      expect(c.unreadHint, 0);
+      expect(c.needsAttention, isFalse);
+    });
+
+    test('missing fields default rather than throw', () {
+      final c = ChatConversation.fromJson(const {});
+
+      expect(c.peerId, '');
+      expect(c.lastAt, isNull);
+      expect(c.unreadHint, 0);
+    });
+
+    // `unread_hint` counts inbound file offers awaiting a decision — nothing
+    // else. Zero therefore means "this thread is not waiting on you", NOT
+    // "you have read everything", and no surface may render it as a count of
+    // unread messages.
+    test('needsAttention is the only claim unreadHint supports', () {
+      const none = ChatConversation(
+        peerId: 'pb-bob',
+        lastAt: null,
+        unreadHint: 0,
+      );
+      const some = ChatConversation(
+        peerId: 'pb-bob',
+        lastAt: null,
+        unreadHint: 3,
+      );
+
+      expect(none.needsAttention, isFalse);
+      expect(some.needsAttention, isTrue);
     });
   });
 
@@ -346,6 +472,55 @@ void main() {
       expect(updated.fileName, 'a.bin');
       expect(updated.fileSize, 7);
       expect(updated.localPath, isNull);
+    });
+
+    // A staging row learns its size (and, from a picker that only gave a path,
+    // its name) after it was created, so `copyWith` has to be able to carry
+    // them — while still leaving every omitted field alone.
+    test('can set kind, name and size on a row that learns them late', () {
+      final original = ChatMessage(
+        id: 'local-1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: '',
+        at: DateTime.parse('2026-08-13T09:00:00Z'),
+        status: ChatStatusValue.staging,
+      );
+
+      final updated = original.copyWith(
+        kind: ChatMessageKind.file,
+        fileName: 'movie.mkv',
+        fileSize: 5368709120,
+      );
+
+      expect(updated.isFile, isTrue);
+      expect(updated.fileName, 'movie.mkv');
+      expect(updated.fileSize, 5368709120);
+      // Untouched.
+      expect(updated.status, ChatStatusValue.staging);
+      expect(updated.id, 'local-1');
+      expect(updated.at, original.at);
+    });
+
+    test('omitting the new fields never clears them', () {
+      final original = ChatMessage(
+        id: 'fr-1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: '',
+        at: DateTime.parse('2026-08-13T09:00:00Z'),
+        status: ChatStatusValue.staging,
+        kind: ChatMessageKind.file,
+        fileName: 'movie.mkv',
+        fileSize: 7,
+      );
+
+      final updated = original.copyWith(status: ChatStatusValue.pending);
+
+      expect(updated.status, ChatStatusValue.pending);
+      expect(updated.kind, ChatMessageKind.file);
+      expect(updated.fileName, 'movie.mkv');
+      expect(updated.fileSize, 7);
     });
 
     test('can set the local path once a receive completes', () {

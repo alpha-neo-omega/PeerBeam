@@ -237,8 +237,23 @@ abstract final class ChatMessageKind {
 /// (Rust pins the two together in `chat_status_str`), so a surface can apply an
 /// event's status straight onto a row it read from `pb_chat_history`.
 abstract final class ChatStatusValue {
-  /// Queued in the engine's offline outbox (text only — 2a never queues files).
+  /// Queued in the engine's offline outbox, waiting for the peer.
+  ///
+  /// A **file** row reads this once its bytes are staged and its queue entry
+  /// written (increment 2b) — the file has not been delivered, and rendering it
+  /// as sent would be a lie. See `_statusLabel` in the chat screen, which spells
+  /// it "Queued" for a file and "Waiting" for text.
   static const pending = 'pending';
+
+  /// A file whose bytes are being copied into the outbox's own storage. Nothing
+  /// has been queued or offered yet, so nothing can settle it.
+  ///
+  /// The first state an outgoing file share is persisted in, and a slow one —
+  /// a multi-GB copy takes real time, and the engine reports how far it has got
+  /// on the same `chat_status` event under a `progress` object (`ChatStatus`
+  /// in `events.dart`). A surface must show that rather than an attach that
+  /// appears to hang.
+  static const staging = 'staging';
 
   /// Delivered to the peer.
   static const sent = 'sent';
@@ -338,16 +353,85 @@ class ChatMessage {
     );
   }
 
-  ChatMessage copyWith({String? status, String? localPath}) => ChatMessage(
+  /// A copy with the named fields replaced; every omitted field is carried
+  /// over unchanged (an omitted argument never *clears* a field).
+  ///
+  /// [kind], [fileName] and [fileSize] are settable because a row can learn
+  /// what it is after it was created: an optimistic staging row is appended
+  /// before the engine has answered, so its size — and, for a share the picker
+  /// only knew a path for, its name — arrive late.
+  ChatMessage copyWith({
+    String? status,
+    String? localPath,
+    String? kind,
+    String? fileName,
+    int? fileSize,
+  }) => ChatMessage(
     id: id,
     peerId: peerId,
     direction: direction,
     body: body,
     at: at,
     status: status ?? this.status,
-    kind: kind,
-    fileName: fileName,
-    fileSize: fileSize,
+    kind: kind ?? this.kind,
+    fileName: fileName ?? this.fileName,
+    fileSize: fileSize ?? this.fileSize,
     localPath: localPath ?? this.localPath,
+  );
+}
+
+/// One conversation this device holds, as `pb_chat_conversations` reports it.
+///
+/// This list is what makes a thread reachable for a peer discovery cannot
+/// currently see — the engine derives it from the conversation namespaces that
+/// exist on disk, not from anything on the network.
+///
+/// [peerId] is the peer's **authenticated device id**, the same id every record
+/// in the thread is filed under. It is the only id a conversation may be opened
+/// by: a locally minted one (a saved device's timestamp id, say) produces a
+/// write-only thread whose replies land somewhere else entirely.
+@immutable
+class ChatConversation {
+  final String peerId;
+
+  /// When the newest record in the thread was stamped, or null for a thread
+  /// this build could not read. Such a thread is still listed — dropping it
+  /// would hide the very conversation this list exists to make reachable.
+  ///
+  /// Best-effort recency only: an inbound record's timestamp came off the
+  /// peer's own clock.
+  final DateTime? lastAt;
+
+  /// How many **inbound file offers in this thread are still awaiting the
+  /// user's decision** — rows with a live Accept button.
+  ///
+  /// It is NOT an unread-message count, and must never be rendered as one.
+  /// PeerBeam has no read receipts and records nothing about when a thread was
+  /// last opened (by charter — no telemetry, no cross-device state), so an
+  /// "N unread" would be a guess presented as a fact: a user who read every
+  /// message and simply did not reply would be badged as having ignored them.
+  /// What this counts is instead something the store actually knows and the
+  /// user can act on — *this thread is waiting on you for n decisions*.
+  ///
+  /// The cost is explicit and accepted: a thread full of unread **text** reads
+  /// 0. See [needsAttention].
+  final int unreadHint;
+
+  const ChatConversation({
+    required this.peerId,
+    required this.lastAt,
+    required this.unreadHint,
+  });
+
+  /// Whether this thread is waiting on the user for a decision — the only
+  /// claim [unreadHint] supports.
+  bool get needsAttention => unreadHint > 0;
+
+  factory ChatConversation.fromJson(Map<String, dynamic> j) => ChatConversation(
+    peerId: j['peer_id'] as String? ?? '',
+    // Absent, explicitly null, or unparseable all mean the same thing here:
+    // nothing is known about when this thread last moved.
+    lastAt: DateTime.tryParse(j['last_timestamp'] as String? ?? ''),
+    unreadHint: (j['unread_hint'] as num?)?.toInt() ?? 0,
   );
 }

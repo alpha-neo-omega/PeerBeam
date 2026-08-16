@@ -72,13 +72,38 @@ abstract class PeerBeamApi {
   /// so progress, approval and cancellation all line up with the chat row
   /// without a second correlation table.
   ///
-  /// Returns as soon as the row is persisted; the dial, the capability check
-  /// and the transfer all run in the background and report through
-  /// `chat_status` + the ordinary `transfer_*` events. **Online only**: an
-  /// unreachable peer settles the row as failed rather than queueing it.
-  /// Throws when the path itself is refused (missing, or a folder), in which
-  /// case nothing is persisted and nothing is sent.
+  /// Returns as soon as the row is persisted, which is **before** any byte has
+  /// been copied: the row starts life as `staging` while the engine streams the
+  /// file into the outbox's own storage, then becomes `pending` (queued) and
+  /// finally `sent`. All three report through `chat_status`, and the staging
+  /// leg carries a `progress` object.
+  ///
+  /// **An unreachable peer is queued, not an error** (increment 2b): the bytes
+  /// are staged and the entry waits for the peer, exactly like text. Throws
+  /// only when the path itself is refused (missing, or a folder), in which case
+  /// nothing is persisted and nothing is sent.
   Future<String> chatSendFile(PeerTarget peer, String path);
+
+  /// Call off a file we are sharing: stop the staging copy, stop the transfer,
+  /// drop the queue entry, delete the staged bytes, and settle the row.
+  ///
+  /// Returns whether anything was actually cancelled. **A `false` is honest and
+  /// must be believed** — it means the share had already been delivered or
+  /// declined (or the id names no row of ours), so a surface that removed the
+  /// row optimistically would be reporting a cancel that never happened. It is
+  /// not an error, and is safe to call in any state.
+  ///
+  /// Only ever reaches this device's own outgoing share in [peerId]'s thread;
+  /// an inbound offer is refused with the approval prompt, never here.
+  Future<bool> chatCancel(String peerId, String messageId);
+
+  /// Every conversation this device holds, newest first.
+  ///
+  /// Derived from what is on disk rather than from the network, so a peer
+  /// discovery cannot currently see still has an openable thread — which is the
+  /// whole point of it. See `ChatConversation.unreadHint` for what that field
+  /// does and does not mean.
+  Future<List<ChatConversation>> chatConversations();
 
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
@@ -281,6 +306,23 @@ class PeerBeam implements PeerBeamApi {
       _req().chatReconcile(jsonEncode({'peer_id': peerId})),
     );
     return (data['changed'] as num?)?.toInt() ?? 0;
+  }
+
+  @override
+  Future<bool> chatCancel(String peerId, String messageId) async {
+    final data = _data(
+      _req().chatCancel(
+        jsonEncode({'peer_id': peerId, 'message_id': messageId}),
+      ),
+    );
+    return data['cancelled'] == true;
+  }
+
+  @override
+  Future<List<ChatConversation>> chatConversations() async {
+    // The export takes no arguments; `{}` is the empty request it expects.
+    final data = _data(_req().chatConversations('{}'));
+    return _list(data['peers']).map(ChatConversation.fromJson).toList();
   }
 
   // ── envelope handling ─────────────────────────────────────────

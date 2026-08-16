@@ -135,9 +135,11 @@ class FakePeerBeam implements PeerBeamApi {
       throw InvalidArgumentException('cannot read $path');
     }
     // Mirrors `Manager::chat_send_file`: the outgoing row is validated and
-    // persisted SYNCHRONOUSLY, before the call returns and before anything is
-    // dialed, and it starts life as `transferring`. Keyed by the peer's real
-    // id — the same id-not-name guard the text path has.
+    // persisted SYNCHRONOUSLY, before the call returns and before a byte is
+    // copied or anything is dialed, and it starts life as `staging` (what
+    // `begin_file_send` writes) — not `transferring`, which would claim bytes
+    // are moving before the copy has begun. Keyed by the peer's real id — the
+    // same id-not-name guard the text path has.
     final id = 'file-${++_chatSeq}';
     final peerId = peer.id ?? peer.name;
     final name = path.split('/').last;
@@ -150,7 +152,7 @@ class FakePeerBeam implements PeerBeamApi {
             direction: 'out',
             body: '',
             at: DateTime.now(),
-            status: ChatStatusValue.transferring,
+            status: ChatStatusValue.staging,
             kind: ChatMessageKind.file,
             fileName: name,
             fileSize: 0,
@@ -210,5 +212,65 @@ class FakePeerBeam implements PeerBeamApi {
       }
     }
     return changed;
+  }
+
+  @override
+  Future<bool> chatCancel(String peerId, String messageId) async {
+    calls.add('chatCancel:$peerId/$messageId');
+    final rows = chatHistories[peerId];
+    final i = rows?.indexWhere((m) => m.id == messageId) ?? -1;
+    if (rows == null || i < 0) return false;
+    // Mirrors `ChatRecord::is_cancellable_outgoing_file`: our OWN OUTGOING
+    // FILE share, not already settled. Anything else — a text row, the peer's
+    // offer to us, a share already delivered or declined — is a clean
+    // `false`, not an error, and must not be pretended into a cancel.
+    final row = rows[i];
+    if (!row.isFile ||
+        !row.isMine ||
+        row.status == ChatStatusValue.sent ||
+        row.status == ChatStatusValue.declined) {
+      return false;
+    }
+    // And, like the engine, settle the row `failed` with the reason and say so
+    // on the event stream rather than only in the store.
+    rows[i] = row.copyWith(status: ChatStatusValue.failed);
+    emit(
+      ChatStatus(
+        messageId: messageId,
+        peerId: peerId,
+        status: ChatStatusValue.failed,
+        error: 'cancelled',
+      ),
+    );
+    return true;
+  }
+
+  @override
+  Future<List<ChatConversation>> chatConversations() async {
+    calls.add('chatConversations');
+    // Derived from the seeded histories, exactly as `Manager` derives it from
+    // the conversation namespaces that exist: one row per thread, newest
+    // first, and `unread_hint` counting only INBOUND rows still awaiting a
+    // decision (never text, never our own outgoing files).
+    final rows = chatHistories.entries.map((e) {
+      final msgs = e.value;
+      return ChatConversation(
+        peerId: e.key,
+        lastAt: msgs.isEmpty ? null : msgs.last.at,
+        unreadHint: msgs
+            .where(
+              (m) => !m.isMine && m.status == ChatStatusValue.pendingApproval,
+            )
+            .length,
+      );
+    }).toList();
+    rows.sort((a, b) {
+      final at = a.lastAt, bt = b.lastAt;
+      if (at == null && bt == null) return a.peerId.compareTo(b.peerId);
+      if (at == null) return 1; // unreadable threads sort last
+      if (bt == null) return -1;
+      return bt.compareTo(at);
+    });
+    return rows;
   }
 }
