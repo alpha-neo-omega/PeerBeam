@@ -81,11 +81,41 @@ impl StagingStore {
         StagingStore { root, storage }
     }
 
-    /// Where the blob for `id` lives. Always `/`-separated; every platform's
-    /// file APIs accept that, and [`sweep`](Self::sweep) never compares these
-    /// strings against a path the OS spelled itself.
-    fn blob_path(&self, id: &str) -> String {
-        format!("{}/{}", self.root.trim_end_matches('/'), id)
+    /// Where the blob for `id` lives, or a refusal when `id` is not a bare
+    /// name.
+    ///
+    /// The validation is not decoration. This builds a path by interpolation
+    /// and `open_write` is `File::create`, so an `id` carrying `..` or a
+    /// separator would truncate and replace a file **outside** the blob root,
+    /// and [`stage`](Self::stage)'s failure path would then delete it — an
+    /// arbitrary write and an arbitrary delete from one string. Outgoing ids
+    /// are minted locally, but `FileRef.id` arrives from the peer *unvalidated*
+    /// (`validate_name` guards only `FileRef.name`) and is already used as the
+    /// transfer id and the record key, so the moment a received id reaches
+    /// `stage` this would be remotely reachable. Rejecting here means no
+    /// caller can get it wrong.
+    ///
+    /// The check is the round-trip through `file_name` that `validate_name`
+    /// already uses for peer-supplied names — it rejects `..`, `.`, `""` and
+    /// any platform separator in one test. `\` is rejected explicitly as well:
+    /// it is a legal filename character on Unix but a separator on Windows, and
+    /// an id must mean the same thing on every platform (I12).
+    ///
+    /// It also closes the last soft spot in [`sweep`](Self::sweep): an id
+    /// containing a separator would land its blob in a subdirectory that sweep
+    /// can neither match nor delete, leaking those bytes permanently.
+    ///
+    /// The result is always `/`-separated; every platform's file APIs accept
+    /// that, and `sweep` never compares these strings against a path the OS
+    /// spelled itself.
+    fn blob_path(&self, id: &str) -> Result<String, StagingError> {
+        let bare = std::path::Path::new(id)
+            .file_name()
+            .is_some_and(|n| n == std::ffi::OsStr::new(id));
+        if !bare || id.contains('\\') {
+            return Err(StagingError::Io(format!("invalid staging id: {id}")));
+        }
+        Ok(format!("{}/{}", self.root.trim_end_matches('/'), id))
     }
 
     /// Stream `source` into the outbox's storage under `id`.
@@ -109,6 +139,9 @@ impl StagingStore {
         cancel: &TransferControl,
         progress: &UnboundedSender<u64>,
     ) -> Result<StagedFile, StagingError> {
+        // First, before a single syscall: `id` decides where we write, so a
+        // malformed one must never reach the filesystem at all.
+        let dest = self.blob_path(id)?;
         let meta = std::fs::metadata(source).map_err(|e| StagingError::Io(e.to_string()))?;
         if !meta.is_file() {
             // A folder has its own send path, and a fifo/socket/device node
@@ -140,7 +173,6 @@ impl StagingStore {
             .map(|n| n.to_string_lossy().to_string())
             .ok_or_else(|| StagingError::Io(format!("no file name in {source}")))?;
 
-        let dest = self.blob_path(id);
         match self
             .copy(source, &dest, limits.max_bytes, cancel, progress)
             .await
@@ -185,7 +217,13 @@ impl StagingStore {
             .await
             .map_err(|e| StagingError::Io(e.to_string()))?;
 
-        let pumped = pump(&mut reader, &mut writer, max_bytes, cancel, progress).await;
+        // Restrict the blob before a byte lands in it, and inside the same
+        // result the close below is sequenced against, so a failure here still
+        // closes the writer before `stage` unlinks the file.
+        let pumped = match restrict(dest) {
+            Ok(()) => pump(&mut reader, &mut writer, max_bytes, cancel, progress).await,
+            Err(e) => Err(e),
+        };
         let closed = writer
             .close()
             .await
@@ -237,6 +275,37 @@ impl StagingStore {
         }
         removed
     }
+}
+
+/// Restrict a freshly-created blob to its owner.
+///
+/// The blob is a **plaintext** copy of a file the user may deliberately keep
+/// private, and it sits in application storage for as long as it stays queued —
+/// under keep-forever, indefinitely. `open_write` creates at `0644 & ~umask`,
+/// which would hand every local account a readable copy of something the
+/// original was protecting. Staging is the first thing in this codebase to
+/// write user file *content* into app storage, and every neighbouring store
+/// already does better: `FsAppStore` writes its records AEAD-encrypted *and*
+/// `0600`, and `FsStorage::finalize` chmods a completed download to `0600`.
+/// Privacy First is a charter commitment, not a default.
+///
+/// Applied before the copy rather than after it, so a partial blob left behind
+/// by a `SIGKILL` mid-copy — which no cleanup path can reach — is protected
+/// too. A failure is propagated rather than swallowed: writing the user's
+/// plaintext where others can read it is not an acceptable degraded mode, and
+/// the caller's cleanup removes the blob. Same `#[cfg(unix)]` scope as
+/// `FsStorage::finalize`; Windows ACLs have no comparable one-liner.
+#[cfg(unix)]
+fn restrict(path: &str) -> Result<(), StagingError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| StagingError::Io(format!("restrict {path}: {e}")))
+}
+
+/// No-op where the platform has no `chmod` equivalent — see the unix version.
+#[cfg(not(unix))]
+fn restrict(_path: &str) -> Result<(), StagingError> {
+    Ok(())
 }
 
 /// Stream reader → writer through one fixed buffer.
@@ -320,8 +389,21 @@ mod tests {
     fn with_storage(storage: Arc<dyn StorageProvider>) -> (StagingStore, TempDir, TempDir) {
         let root = tempfile::tempdir().unwrap();
         let src = tempfile::tempdir().unwrap();
-        let staging = StagingStore::new(root.path().to_string_lossy().into_owned(), storage);
+        let staging = StagingStore::new(
+            root.path().join("blobs").to_string_lossy().into_owned(),
+            storage,
+        );
         (staging, root, src)
+    }
+
+    /// The blob root — deliberately a subdirectory that does **not** exist
+    /// until something opens a blob for writing. That is what makes "nothing
+    /// was copied" observable: an empty directory and a never-created one look
+    /// identical to a file count, so a refusal that reached `open_write` and
+    /// then cleaned up would be indistinguishable from one that refused before
+    /// touching the filesystem at all.
+    fn blob_root(root: &TempDir) -> std::path::PathBuf {
+        root.path().join("blobs")
     }
 
     fn generous() -> StagingLimits {
@@ -333,7 +415,9 @@ mod tests {
 
     /// How many blobs currently sit in the store's root.
     fn blobs(root: &TempDir) -> usize {
-        std::fs::read_dir(root.path()).unwrap().count()
+        std::fs::read_dir(blob_root(root))
+            .map(|d| d.count())
+            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -392,8 +476,8 @@ mod tests {
             }
         ));
         assert!(
-            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
-            "a refused stage leaves no blob behind"
+            !blob_root(&tmp).exists(),
+            "a refusal must not open anything for writing"
         );
         assert!(src.exists(), "the user's own file is never touched");
     }
@@ -420,7 +504,10 @@ mod tests {
             .await
             .expect_err("breaching the floor must refuse");
         assert!(matches!(err, StagingError::NotEnoughSpace { .. }));
-        assert_eq!(blobs(&tmp), 0, "a refused stage leaves no blob behind");
+        assert!(
+            !blob_root(&tmp).exists(),
+            "a refusal must not open anything for writing"
+        );
         assert!(src.exists(), "the user's own file is never touched");
     }
 
@@ -438,7 +525,9 @@ mod tests {
             .await
             .expect_err("a cancelled stage does not produce a blob");
         assert!(matches!(err, StagingError::Cancelled));
-        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+        // The directory legitimately exists here — the writer WAS opened, then
+        // the blob was removed. What must be gone is the blob itself.
+        assert_eq!(blobs(&tmp), 0);
         assert!(src.exists(), "the user's own file is never touched");
     }
 
@@ -597,7 +686,10 @@ mod tests {
             .await
             .expect_err("a folder is not a chat attachment");
         assert!(matches!(err, StagingError::Io(_)));
-        assert_eq!(blobs(&tmp), 0);
+        assert!(
+            !blob_root(&tmp).exists(),
+            "a refusal must not open anything for writing"
+        );
 
         // A source that does not exist at all is an ordinary IO refusal.
         let missing = src_dir.path().join("nope.bin");
@@ -612,7 +704,117 @@ mod tests {
             .await
             .expect_err("a missing source must refuse");
         assert!(matches!(err, StagingError::Io(_)));
-        assert_eq!(blobs(&tmp), 0);
+        assert!(
+            !blob_root(&tmp).exists(),
+            "a refusal must not open anything for writing"
+        );
+    }
+
+    /// `blob_path` interpolates `id` into a path and `open_write` is
+    /// `File::create`, so an id carrying `..` or a separator would truncate and
+    /// replace a file OUTSIDE the blob root — and the failure path's `remove`
+    /// would then delete it. One string, an arbitrary write and an arbitrary
+    /// delete.
+    ///
+    /// Unreachable today (nothing calls `stage`, and outgoing ids come from
+    /// `mint_id`), but `FileRef.id` arrives from the peer UNVALIDATED —
+    /// `validate_name` guards only `FileRef.name` — and is already used as the
+    /// transfer id and the record key. The moment a received id reaches
+    /// `stage`, this is a remote write-anywhere.
+    #[tokio::test]
+    async fn stage_refuses_an_id_that_is_not_a_bare_name() {
+        let (staging, tmp, src_dir) = new_staging();
+        let src = src_dir.path().join("payload.bin");
+        std::fs::write(&src, b"ATTACKER BYTES").unwrap();
+        // A file outside the blob root that must survive every attempt.
+        let victim = src_dir.path().join("important.txt");
+        std::fs::write(&victim, b"ORIGINAL").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for id in [
+            "..",
+            "../escape",
+            "../important.txt",
+            "a/b",
+            "a\\b",
+            ".",
+            "",
+            "/etc/passwd",
+        ] {
+            let err = staging
+                .stage(
+                    id,
+                    src.to_str().unwrap(),
+                    generous(),
+                    &TransferControl::new(),
+                    &tx,
+                )
+                .await
+                .expect_err("an id that is not a bare name must refuse");
+            assert!(matches!(err, StagingError::Io(_)), "id {id:?} -> {err:?}");
+            assert!(
+                !blob_root(&tmp).exists(),
+                "id {id:?} must not open anything for writing"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"ORIGINAL",
+            "no file outside the blob root is ever touched"
+        );
+
+        // The positive case: a normal minted id still works, so the guard
+        // cannot pass merely by refusing everything.
+        let ok = staging
+            .stage(
+                "0000000000001",
+                src.to_str().unwrap(),
+                generous(),
+                &TransferControl::new(),
+                &tx,
+            )
+            .await
+            .expect("a bare, minted id stages normally");
+        assert!(ok.staged_path.ends_with("/0000000000001"));
+        assert_eq!(blobs(&tmp), 1);
+    }
+
+    /// A staged blob is a plaintext copy of a file the user may deliberately
+    /// keep private, parked in app storage for as long as it stays queued —
+    /// indefinitely, under keep-forever. `open_write` creates at `0644 &
+    /// ~umask`; both neighbouring stores already do better (`FsAppStore` writes
+    /// records `0600`, `FsStorage::finalize` chmods downloads to `0600`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_staged_blob_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (staging, tmp, src_dir) = new_staging();
+        let src = src_dir.path().join("private.txt");
+        std::fs::write(&src, b"secret").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let staged = staging
+            .stage(
+                "id-13",
+                src.to_str().unwrap(),
+                generous(),
+                &TransferControl::new(),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&staged.staged_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a staged blob must not be readable by other local accounts"
+        );
+        assert_eq!(std::fs::read(&staged.staged_path).unwrap(), b"secret");
+        assert_eq!(blobs(&tmp), 1);
     }
 
     /// A source whose bytes outrun its own metadata — a log still being
