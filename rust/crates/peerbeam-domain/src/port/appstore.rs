@@ -20,6 +20,14 @@ pub trait AppStore: Send + Sync {
     /// `Ok(vec![])` if the namespace has no records.
     fn list(&self, namespace: &str) -> Result<Vec<(String, Vec<u8>)>>;
 
+    /// Every namespace holding at least one record whose name starts with
+    /// `prefix`, sorted ascending. `Ok(vec![])` when none match.
+    ///
+    /// A namespace that exists but holds no records is not returned: callers
+    /// use this to enumerate real conversations, and an empty directory left
+    /// by a `clear` is not one.
+    fn namespaces(&self, prefix: &str) -> Result<Vec<String>>;
+
     /// Remove (`namespace`, `key`); returns whether it existed.
     fn delete(&self, namespace: &str, key: &str) -> Result<bool>;
 

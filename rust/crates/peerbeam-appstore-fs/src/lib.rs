@@ -130,6 +130,38 @@ impl AppStore for FsAppStore {
         Ok(out)
     }
 
+    fn namespaces(&self, prefix: &str) -> Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            // No root yet means nothing has ever been stored.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(DomainError::Storage(format!("list namespaces: {e}"))),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue; // a non-UTF-8 directory is not one we wrote
+            };
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            // Populated only: `clear` removes the directory, but a crash
+            // between `create_dir_all` and the first write can leave an empty
+            // one, and that is not a conversation.
+            let populated = std::fs::read_dir(entry.path())
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if populated {
+                out.push(name);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn delete(&self, namespace: &str, key: &str) -> Result<bool> {
         let path = self.record_path(namespace, key)?;
         match std::fs::remove_file(&path) {
@@ -234,6 +266,12 @@ mod tests {
     fn store(root: &std::path::Path) -> FsAppStore {
         let key = derive_subkey(&[42u8; 32], b"peerbeam-appstore-v1");
         FsAppStore::open(root, key, Arc::new(AeadCrypto::new()))
+    }
+
+    fn new_store() -> (FsAppStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        (s, dir)
     }
 
     #[test]
@@ -388,5 +426,36 @@ mod tests {
         let path = dir.path().join("chat").join(hex_encode(b"k"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "record must be 0600");
+    }
+
+    #[test]
+    fn namespaces_lists_populated_namespaces_matching_a_prefix() {
+        let (store, _tmp) = new_store();
+        store.put("chat-pb-alice", "k", b"v").unwrap();
+        store.put("chat-pb-bob", "k", b"v").unwrap();
+        store.put("chat.outbox", "k", b"v").unwrap();
+        store.put("clipboard", "k", b"v").unwrap();
+
+        let mut got = store.namespaces("chat-").unwrap();
+        got.sort();
+        assert_eq!(got, vec!["chat-pb-alice", "chat-pb-bob"]);
+        // The outbox is deliberately `chat.outbox` (a dot, not a dash) so no
+        // peer-supplied device id can collide with it — and so a `chat-`
+        // prefix scan never picks it up as a conversation.
+        assert!(!got.contains(&"chat.outbox".to_string()));
+        assert_eq!(store.namespaces("").unwrap().len(), 4);
+        assert!(store.namespaces("nothing-").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_namespace_emptied_by_delete_is_not_listed() {
+        let (store, _tmp) = new_store();
+        store.put("chat-pb-gone", "k", b"v").unwrap();
+        assert_eq!(store.namespaces("chat-").unwrap(), vec!["chat-pb-gone"]);
+        store.delete("chat-pb-gone", "k").unwrap();
+        assert!(
+            store.namespaces("chat-").unwrap().is_empty(),
+            "an empty namespace is not a conversation"
+        );
     }
 }
