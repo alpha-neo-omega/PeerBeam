@@ -949,35 +949,97 @@ async fn cancel(ctx: &Ctx, peer: String, id: String, path_override: Option<&str>
             .outbox_remove(&id)
             .map_err(|e| CliError::Other(e.to_string()))?;
     }
-    // The row. `Failed` is where a cancelled share lands — there is no
-    // `Cancelled` status, by the same decision the FFI's `settle_cancelled`
-    // records.
-    store
-        .set_status(&peer_id, &id, Status::Failed)
-        .map_err(|e| CliError::Other(e.to_string()))?;
+    // The row — but only if it *still* authorizes the write. See
+    // [`settle_cancelled`]: the gate above and this write are far apart, and the
+    // writer that can land between them is in another process.
+    let settled = settle_cancelled(&store, &peer_id, &id)?;
 
     let name = row
         .file
         .as_ref()
         .map_or_else(|| id.clone(), |f| f.name.clone());
+    let dequeued = queued.is_some();
     if ctx.json {
         ctx.json_line(&json!({
             "event": "chat_cancelled",
             "id": id,
             "peer": peer_id.0,
-            "cancelled": true,
+            // True only where this call genuinely undid something: it settled
+            // the row, or it let go of bytes that were still queued. A share
+            // that settled under us is neither.
+            "cancelled": settled || dequeued,
             // Whether bytes were actually let go, or this only settled a row
             // whose queue entry had already gone.
-            "dequeued": queued.is_some(),
+            "dequeued": dequeued,
         }));
-    } else if queued.is_some() {
-        ctx.line(&ctx.green(&format!("cancelled {name} ({id})")));
     } else {
-        ctx.line(&ctx.dim(&format!(
-            "cancelled {name} ({id}) — nothing was still queued"
-        )));
+        ctx.line(&match (settled, dequeued) {
+            (true, true) => ctx.green(&format!("cancelled {name} ({id})")),
+            (true, false) => ctx.dim(&format!(
+                "cancelled {name} ({id}) — nothing was still queued"
+            )),
+            // The row settled under us — another process draining this queue,
+            // or an earlier cancel. The queued bytes are genuinely gone, but
+            // the share itself was not cancelled: never claim it was.
+            (false, true) => ctx.dim(&format!(
+                "dropped the queued copy of {name} ({id}) — its row had already settled"
+            )),
+            (false, false) => ctx.dim(&format!(
+                "nothing left to cancel for {name} ({id}) — it settled before this cancel could"
+            )),
+        });
     }
     Ok(())
+}
+
+/// Move a cancelled share's row to `Failed` — but only if the row *still*
+/// authorizes it. Returns whether this call changed anything, so a cancel that
+/// genuinely only tidied a stranded row still reports honestly, and one that
+/// found the row already settled never claims a cancellation it did not make.
+///
+/// **This re-reads the row and re-applies
+/// [`ChatRecord::is_cancellable_outgoing_file`] — the same single rule
+/// [`cancel`] authorized with, not a weaker one.** The two reads are far apart:
+/// between them sits a whole [`ChatStore::outbox_for`] (an AppStore `list` plus
+/// an AEAD decrypt of every queued record) and the unlink of the blob. Here the
+/// writer that lands inside that window is in another **process**, and that is
+/// not hypothetical — it is the documented delivery mechanism. This binary's
+/// own drain does not deliver queued files (see the module header), so
+/// [`report_queued`] tells the user a running PeerBeam app sharing this data
+/// directory is what will: that app writes `Sent` on completion and `Declined`
+/// when a `FileDecline` arrives, both states the shared rule calls final, and
+/// `FsAppStore` has no cross-process lock. Settling on the *earlier* read would
+/// overwrite a delivered file with `Failed` and print `"cancelled": true`: the
+/// sender's history would permanently claim a file the receiver is holding was
+/// cancelled, and a peer's refusal would be relabelled as our own cancellation.
+/// The row that gets written is the row that was checked.
+///
+/// A row that has vanished (`Ok(None)`) and a store that cannot be read (`Err`)
+/// both settle nothing, for the same reason: neither is a row this call checked.
+///
+/// `Failed` is excluded on top of the shared rule (which permits it, since a
+/// failed row may still have a queue entry a later drain would retry): an
+/// earlier cancel — or the sending process's own failure path — may have landed
+/// it already, and a second identical write is not something this call did.
+///
+/// This mirrors the FFI's `Manager::settle_cancelled` deliberately: both
+/// surfaces settle a cancel against one rule, and it is the same rule.
+///
+/// [`ChatRecord::is_cancellable_outgoing_file`]: peerbeam_chat::ChatRecord::is_cancellable_outgoing_file
+/// [`ChatStore::outbox_for`]: peerbeam_chat::ChatStore::outbox_for
+fn settle_cancelled(store: &ChatStore, peer_id: &DeviceId, id: &str) -> Result<bool, CliError> {
+    let Ok(Some(row)) = store.get(peer_id, id) else {
+        return Ok(false);
+    };
+    if !row.is_cancellable_outgoing_file() || row.status == Status::Failed {
+        return Ok(false);
+    }
+    // `Failed` is where a cancelled share lands — there is no `Cancelled`
+    // status, by the same decision the FFI's `settle_cancelled` records.
+    store
+        .set_status(peer_id, id, Status::Failed)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    Ok(true)
 }
 
 /// `chat history <peer>` — print a conversation's persisted history. `peer`
@@ -1971,6 +2033,99 @@ mod tests {
         .await
         .expect_err("an unknown id has nothing to cancel");
         assert!(matches!(err, CliError::NotFound(_)), "got: {err:?}");
+    }
+
+    // **The second write**, which the two tests above do not reach: they prove
+    // the gate refuses a settled row, single-threaded, and stop there.
+    // `cancel` authorizes on one read and settles on another, and the window
+    // between them is wide — a whole `outbox_for` (an AppStore `list` plus an
+    // AEAD decrypt of every queued record) and an unlink. The writer that lands
+    // inside it is in another *process*, and that is the documented delivery
+    // mechanism, not a hypothetical: this binary's drain does not deliver
+    // queued files, so `report_queued` tells the user a running PeerBeam app
+    // sharing this data directory is what does — and that app writes `Sent` on
+    // completion and `Declined` on an arriving `FileDecline`, over an
+    // `FsAppStore` with no cross-process lock.
+    //
+    // So the settle must re-apply `ChatRecord::is_cancellable_outgoing_file`
+    // rather than write unconditionally. This drives `settle_cancelled`
+    // directly — that IS the second read, and reaching it through `cancel`
+    // would need the row to change mid-call, which no single-threaded test can
+    // stage. Both rows must survive unchanged, and the whole command must
+    // never report a cancellation of either.
+    #[tokio::test]
+    async fn a_cancel_that_lost_the_race_never_overwrites_a_settled_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let cfg_arg = Some(cfg_path.to_str().expect("utf8 path"));
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("pb-bob");
+
+        // Exactly the two states the shared rule calls final, and exactly the
+        // two the draining process can land while this cancel is in flight.
+        let mut seeded = Vec::new();
+        for (name, status, why) in [
+            (
+                "delivered.mp4",
+                Status::Sent,
+                "a delivered file must not be relabelled cancelled",
+            ),
+            (
+                "refused.mp4",
+                Status::Declined,
+                "a peer's refusal must not be relabelled as our cancellation",
+            ),
+        ] {
+            let r = FileRef::new(name, 4).expect("file ref");
+            store
+                .append(&ChatRecord::file_out(
+                    &peer,
+                    &r,
+                    FileMeta::new(&r.name, r.size, None),
+                    status,
+                ))
+                .expect("seed the settled row");
+            seeded.push((r.id, status, why));
+        }
+
+        for (id, status, why) in &seeded {
+            assert!(
+                !super::settle_cancelled(&store, &peer, id).expect("settle_cancelled"),
+                "settle_cancelled must report it changed nothing: {why}"
+            );
+            assert_eq!(
+                store
+                    .get(&peer, id)
+                    .expect("get")
+                    .expect("the row survives")
+                    .status,
+                *status,
+                "{why}"
+            );
+            // …and the whole command agrees: it refuses outright, so nothing
+            // it prints can tell the user a settled share was cancelled.
+            let err = super::cancel(&ctx, "pb-bob".to_string(), id.clone(), cfg_arg)
+                .await
+                .expect_err("a settled row is not ours to cancel");
+            assert!(
+                matches!(err, CliError::NotFound(_)),
+                "a refusal must be NotFound (exit 3), got: {err:?}"
+            );
+            assert_eq!(
+                store
+                    .get(&peer, id)
+                    .expect("get")
+                    .expect("the row survives")
+                    .status,
+                *status,
+                "still untouched after the public call: {why}"
+            );
+        }
     }
 
     // **The refusal.** A peer whose build predates file-in-chat advertises
