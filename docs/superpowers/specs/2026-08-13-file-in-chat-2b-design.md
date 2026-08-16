@@ -47,10 +47,16 @@ once staging has run.
 
 The cost is disk, and it must be bounded:
 
-- **Size cap.** `DeviceConfig::max_queued_file_bytes`, default 2 GiB. Above it,
-  the attach is refused at pick time with a message naming the limit and
-  suggesting sending while the peer is online. A silent failure later is worse
-  than an honest refusal now.
+- **Size cap.** `DeviceConfig::max_queued_file_bytes`, default 16 GiB. Above it,
+  the attach is refused at pick time with a message naming the limit. A silent
+  failure later is worse than an honest refusal now.
+
+  The cap is deliberately high, because staging is uniform: it applies to every
+  chat send, not only to sends that queue. A low cap would therefore be a
+  *capability regression* against 2a, which streams a file of any size straight
+  from the source when the peer is online. 16 GiB is set to be a backstop
+  against the absurd, not a product limit — the free-space check below is what
+  actually protects the disk in practice.
 - **Free-space check.** Staging that would leave less than 512 MiB free is
   refused with the same shape of message. Filling the user's disk to queue a
   file they may never send is not an acceptable trade.
@@ -108,6 +114,25 @@ through the queue, so the existing regression nets around it
 (`peerbeam-ffi tests/chat_ffi.rs`, `peerbeam-cli tests/transfer_e2e.rs`) are
 load-bearing for this increment and must pass unchanged.
 
+### The cost of uniformity, stated plainly
+
+Because staging is uniform, **every** chat file send copies the file before any
+bytes move — including a send to a peer who is online and reachable. Two
+consequences follow, and both are accepted rather than overlooked:
+
+- **Disk.** Sending a 5 GiB file needs 5 GiB free on top of the original, and
+  pays a full extra write the online path did not previously need. The
+  free-space check refuses the send rather than filling the disk.
+- **Time, and therefore UI.** Copying multi-GB takes long enough to be visible.
+  An attach that appears to hang is a bug report. Staging must therefore report
+  progress on every surface: the bubble shows a *Staging* state before *Queued*
+  or *Transferring*, the CLI prints a staging line, and staging is cancellable —
+  a user who picked the wrong 8 GiB file must not have to wait it out.
+
+The alternative — staging lazily, only once an entry has to wait — was
+considered and rejected in favour of a single code path with no unstaged/staged
+entry state to reason about.
+
 ## Decline, retry, and terminal states
 
 A new chat message type, additive exactly as `FileRef` was:
@@ -163,8 +188,27 @@ for exactly this reason. The guard stays as strict as it is today against
 anything arriving from the wire.
 
 Queued rows use the existing `Status::Pending`, matching text's meaning of
-"queued, not yet sent". No new `Status` variant is introduced; a cancelled file
-lands on `Failed` with reason `cancelled`, per 2a's precedent.
+"queued, not yet sent", and a cancelled file lands on `Failed` with reason
+`cancelled`, per 2a's precedent — no `Cancelled` variant is added.
+
+One variant *is* added: `Status::Staging`, for the window in which the file is
+being copied and no bytes have yet been offered to anyone. It earns its place
+because uniform staging makes that window user-visible and multi-GB long;
+folding it into `Pending` would show "Queued" for a file that is not yet safe to
+queue, and folding it into `Transferring` would claim a transfer that has not
+started. Being a new variant, it is exactly the case the forward-compat
+containment below exists for: a 2a binary cannot decode it, and must skip that
+row rather than blank the conversation.
+
+The full outgoing lifecycle is therefore:
+
+```
+Staging -> Pending -> Transferring -> Sent
+   |          |            |
+   |          |            +-> Failed (retryable, or terminal at the backstop)
+   |          +-> Declined (on FileDecline)
+   +-> Failed/cancelled (staging cancelled or refused)
+```
 
 ## Reachability and reconciliation
 
@@ -220,6 +264,10 @@ is a defect this feature has already produced once or is newly reachable:
 - A retry re-opens a `Failed` row, while a wire-driven settle still cannot.
 - A conversation is reachable for a peer discovery cannot see.
 - An undecodable row does not blank the conversation around it.
+- Staging reports progress and can be cancelled mid-copy, leaving no orphan
+  blob and no queue entry behind.
+- A send is refused, with a message naming the reason, when staging would breach
+  the free-space floor — and the original file is untouched.
 
 ## Non-goals
 
