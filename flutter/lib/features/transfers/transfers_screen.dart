@@ -73,7 +73,9 @@ class TransfersScreen extends StatelessWidget {
 
 /// `1 file` / `3 files`. Shared by the banner's heading and its result report
 /// so the two can never describe the same batch differently.
-String _files(int n) => '$n ${n == 1 ? 'file' : 'files'}';
+/// "3 items", not "3 files": a waiting transfer can be a folder, and the
+/// banner counts whatever is queued for a decision rather than assuming.
+String _files(int n) => '$n ${n == 1 ? 'item' : 'items'}';
 
 /// A verified report of what a bulk approval actually did.
 ///

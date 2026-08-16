@@ -116,7 +116,7 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 600));
 
-      expect(find.text('2 files waiting for approval'), findsOneWidget);
+      expect(find.text('2 items waiting for approval'), findsOneWidget);
       expect(find.text('Accept all'), findsOneWidget);
       expect(find.text('Decline all'), findsOneWidget);
       // Each card keeps its own three actions.
@@ -191,7 +191,7 @@ void main() {
 
       expect(_decisions(fake), ['reject:in-1', 'reject:in-2']);
       expect(fake.calls.where((c) => c.contains('out-1')), isEmpty);
-      expect(find.text('Declined 2 files'), findsOneWidget);
+      expect(find.text('Declined 2 items'), findsOneWidget);
     });
   });
 
@@ -211,7 +211,7 @@ void main() {
       await _tapBanner(tester, 'Accept all');
 
       expect(find.byType(SnackBar), findsOneWidget);
-      expect(find.text('Accepted 3 files'), findsOneWidget);
+      expect(find.text('Accepted 3 items'), findsOneWidget);
     });
 
     // The race this feature has to survive. Between the banner rendering and
