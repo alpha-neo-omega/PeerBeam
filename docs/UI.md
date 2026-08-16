@@ -60,6 +60,41 @@ staged-files sheet opens for review (per-file remove, running total). Staging
 lives in a pure `StagingStore` (dedup by path), unit-tested independently of
 any native drag.
 
+## Approving several transfers at once
+
+When **two or more** inbound transfers are awaiting approval, the Transfers
+screen shows a banner above the list — `N files waiting for approval`, with
+**Decline all** and **Accept all**. Below two it stays hidden: over a single
+card its own Accept is already the shortest path, and a banner there is just a
+second button saying the same thing. Every card keeps its own Decline / Accept
+/ Trust; the banner is an addition, never a replacement.
+
+Two properties are load-bearing:
+
+- **Accept-once. The banner never trusts.** `acceptTrust` grants a device
+  persistent auto-accept for everything it sends from then on — materially
+  stronger than approving the batch on screen — so it stays a deliberate,
+  per-device choice on the card. There is no "Trust all", and nothing about a
+  batch decision is remembered for next time (invariant I6: consent is explicit
+  and per-act). The scope is equally narrow: `TransferRepository.awaitingApproval`
+  is **inbound** transfers in `pending` only, so an outbound send (never anyone's
+  to approve) and an already-running, paused, completed or failed transfer are
+  untouchable from here.
+- **It reports what actually happened, not what it assumed.** Between the render
+  and the tap a transfer can time out, its sender can give up, or the user can
+  answer it from its own card — the engine then refuses that decision with
+  `no pending transfer <id>`. `acceptAll`/`declineAll` **await** each decision
+  and return a verified tally (`requested`/`settled`/`gone`/`failed`) instead of
+  pushing each refusal onto the error stream, which would fire one snackbar per
+  casualty and read as breakage. One line comes back: `Accepted 3 files`,
+  `Accepted 3 of 5 — 2 were no longer waiting`, or `None were still waiting`.
+  The per-card `accept`/`reject` are untouched and stay fire-and-forget, so a
+  card tap is still instant.
+
+`test/transfers_screen_test.dart` pins the visibility rule, the accept-not-trust
+call log, the scope, and each report; `test/data/repository_test.dart` pins the
+same at the repository seam.
+
 ## UX polish pass
 
 A dedicated pass over the whole app (no new features — experience only):

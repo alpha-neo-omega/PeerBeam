@@ -6,6 +6,21 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Approve several waiting transfers at once** — when two or more inbound
+  transfers are awaiting approval, the Transfers screen shows a banner with
+  **Accept all** / **Decline all**, so a batch takes one tap instead of one per
+  card. Below two it stays hidden (a single card's own Accept is already the
+  shortest path), and every card keeps its own Decline / Accept / Trust.
+  The bulk action is **accept-once and never trusts** — granting a device
+  persistent auto-accept stays a deliberate per-device choice, so there is no
+  "Trust all" — and it reaches only inbound transfers still awaiting a
+  decision, never an outbound send or one already in flight. It reports a
+  verified tally rather than an assumed one ("Accepted 3 files", "Accepted 3 of
+  5 — 2 were no longer waiting", "None were still waiting"), because transfers
+  can time out or be answered from their own card between the render and the
+  tap.
+
 ## [0.3.0] - 2026-08-08 — Beta
 
 The **PeerSession** release. The transfer stack was rebuilt on a single

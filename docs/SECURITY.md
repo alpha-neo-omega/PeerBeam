@@ -170,6 +170,22 @@ peer (treated as a suspected MITM) and aborts. The code is stable across
 sessions, so it can be re-verified later. Revoking trust later is available in
 the app (Trusted Devices).
 
+## Bulk approval is accept-once, never trust
+
+The Transfers screen offers **Accept all** / **Decline all** when two or more
+inbound transfers are waiting. It calls the engine's per-id `pb_transfer_accept`
+/ `pb_transfer_reject` once per waiting transfer and **never** `acceptTrust`:
+trusting a device grants it persistent auto-accept for everything it sends from
+then on, which is a materially stronger and longer-lived act than approving the
+batch currently on screen. That stays a deliberate, per-device choice on the
+card ("Trust"), and there is no "Trust all".
+
+The batch is also scoped to what was genuinely the user's to answer — **inbound**
+transfers in `pending` only. An outbound send and an already-running, paused,
+completed or failed transfer cannot be reached from it. Nothing about the
+decision is remembered: the next batch asks again (invariant I6 — explicit,
+per-act consent, never inferred).
+
 ## Settings & trust over FFI
 
 The FFI `pb_settings_get` exposes the TOFU trusted-devices list (read from the

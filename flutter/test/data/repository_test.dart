@@ -255,6 +255,102 @@ void main() {
       },
     );
 
+    test('awaitingApproval holds only inbound transfers still awaiting a '
+        'decision', () async {
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+
+      fake.emit(
+        ev('transfer_queued', 'in-1', {'file': 'a.bin', 'incoming': true}),
+      );
+      // Our own send: never anyone's to approve.
+      fake.emit(
+        ev('transfer_queued', 'out-1', {'file': 'b.bin', 'incoming': false}),
+      );
+      // Inbound but already approved and running.
+      fake.emit(
+        ev('transfer_queued', 'in-live', {'file': 'c.bin', 'incoming': true}),
+      );
+      fake.emit(ev('transfer_started', 'in-live'));
+      fake.emit(
+        ev('transfer_queued', 'in-2', {'file': 'd.bin', 'incoming': true}),
+      );
+      await flush();
+
+      expect(repo.transfers, hasLength(4));
+      expect(repo.awaitingApproval.map((t) => t.id), ['in-1', 'in-2']);
+    });
+
+    // The security-relevant one, at the repository seam. `acceptTrust` grants
+    // a device persistent auto-accept for everything it sends from then on;
+    // a bulk action answers only the batch on screen and must never widen
+    // into that.
+    test('acceptAll accepts each waiting inbound transfer exactly once and '
+        'never trusts', () async {
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+
+      fake.emit(
+        ev('transfer_queued', 'in-1', {'file': 'a.bin', 'incoming': true}),
+      );
+      fake.emit(
+        ev('transfer_queued', 'out-1', {'file': 'b.bin', 'incoming': false}),
+      );
+      fake.emit(
+        ev('transfer_queued', 'in-2', {'file': 'c.bin', 'incoming': true}),
+      );
+      await flush();
+
+      final result = await repo.acceptAll();
+
+      expect(fake.calls, ['accept:in-1', 'accept:in-2']);
+      expect(fake.calls.where((c) => c.startsWith('acceptTrust:')), isEmpty);
+      expect(result, (requested: 2, settled: 2, gone: 0, failed: 0));
+    });
+
+    // Aggregate, don't shout: five accepts where two had already settled used
+    // to mean two separate error snackbars, which reads as breakage rather
+    // than as the ordinary race it is.
+    test('a bulk decision counts what the engine actually answered, and keeps '
+        'the per-failure errors off the error stream', () async {
+      final fake = FakePeerBeam()..noPendingDecisionIds.addAll(['in-2', 'in-4']);
+      final repo = TransferRepository(api: fake);
+      final errors = <String>[];
+      repo.errors.listen(errors.add);
+
+      for (final id in ['in-1', 'in-2', 'in-3', 'in-4']) {
+        fake.emit(
+          ev('transfer_queued', id, {'file': '$id.bin', 'incoming': true}),
+        );
+      }
+      await flush();
+
+      final result = await repo.declineAll();
+      await flush();
+
+      expect(fake.calls, [
+        'reject:in-1',
+        'reject:in-2',
+        'reject:in-3',
+        'reject:in-4',
+      ]);
+      expect(result, (requested: 4, settled: 2, gone: 2, failed: 0));
+      expect(errors, isEmpty);
+    });
+
+    test('a bulk decision with nothing waiting asks the engine nothing', () async {
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+
+      expect(await repo.acceptAll(), (
+        requested: 0,
+        settled: 0,
+        gone: 0,
+        failed: 0,
+      ));
+      expect(fake.calls, isEmpty);
+    });
+
     test(
       'a queued folder send is labeled with the folder name, not blank',
       () async {

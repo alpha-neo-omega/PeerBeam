@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../data/transfer_repository.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
@@ -29,20 +30,174 @@ class TransfersScreen extends StatelessWidget {
                   message: 'Files you send or receive will show up here.',
                 );
               }
-              return ListView.builder(
-                padding: const EdgeInsets.all(AppSpace.md),
-                itemCount: items.length,
-                itemBuilder: (context, i) => Appear(
-                  key: ValueKey(items[i].id),
-                  index: i,
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: AppSpace.sm),
-                    child: _TransferCard(transfer: items[i]),
+              // Only worth a banner from two upwards: with a single waiting
+              // transfer its own card's Accept is already the shortest path,
+              // and a banner over one card is just a second button saying the
+              // same thing.
+              final waiting = state.transfer.awaitingApproval.length;
+              return Column(
+                children: [
+                  if (waiting >= 2)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                        AppSpace.md,
+                        AppSpace.md,
+                        AppSpace.md,
+                        0,
+                      ),
+                      child: _BulkApprovalBanner(waiting: waiting),
+                    ),
+                  Expanded(
+                    child: ListView.builder(
+                      padding: const EdgeInsets.all(AppSpace.md),
+                      itemCount: items.length,
+                      itemBuilder: (context, i) => Appear(
+                        key: ValueKey(items[i].id),
+                        index: i,
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: AppSpace.sm),
+                          child: _TransferCard(transfer: items[i]),
+                        ),
+                      ),
+                    ),
                   ),
-                ),
+                ],
               );
             },
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// `1 file` / `3 files`. Shared by the banner's heading and its result report
+/// so the two can never describe the same batch differently.
+String _files(int n) => '$n ${n == 1 ? 'file' : 'files'}';
+
+/// A verified report of what a bulk approval actually did.
+///
+/// Every number here comes from a decision the engine answered — never from
+/// the count that happened to be on screen when the button was tapped. Between
+/// the render and the tap a transfer can time out, its sender can give up, or
+/// the user can answer it from its own card, and saying "Accepted 5" when two
+/// of them were already gone would be a claim, not a fact.
+String _bulkReport(String verbPast, BulkDecision d) {
+  if (d.requested == 0) return 'Nothing was waiting';
+  if (d.settled == d.requested) return '$verbPast ${_files(d.settled)}';
+  if (d.settled == 0 && d.failed == 0) return 'None were still waiting';
+  final why = <String>[
+    if (d.gone > 0)
+      '${d.gone} ${d.gone == 1 ? 'was' : 'were'} no longer waiting',
+    if (d.failed > 0) "${d.failed} couldn't be ${verbPast.toLowerCase()}",
+  ];
+  return '$verbPast ${d.settled} of ${d.requested} — ${why.join(', ')}';
+}
+
+/// Shown above the list when **two or more** inbound transfers are waiting on
+/// the user: one decision for the batch instead of a tap per card. With one
+/// waiting transfer its own card is already the shortest path, so the banner
+/// stays hidden rather than duplicating it.
+///
+/// Deliberately two actions, not three. The cards keep Decline / Accept /
+/// **Trust**; the banner offers accept and decline only. Trusting a device is a
+/// lasting grant of auto-accept for everything it sends from then on — a
+/// materially stronger act than approving the batch on screen — so it stays a
+/// per-device choice made on purpose. There is no "Trust all", and nothing
+/// here is remembered for next time (I6).
+class _BulkApprovalBanner extends StatefulWidget {
+  /// How many inbound transfers are awaiting approval right now.
+  final int waiting;
+  const _BulkApprovalBanner({required this.waiting});
+
+  @override
+  State<_BulkApprovalBanner> createState() => _BulkApprovalBannerState();
+}
+
+class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
+  /// A batch decision is in flight. Both actions are disabled until it lands,
+  /// so a second tap cannot re-answer ids the first has already settled and
+  /// then report them back as "no longer waiting".
+  bool _busy = false;
+
+  Future<void> _decideBatch({required bool accepting}) async {
+    if (_busy) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final transfers = AppScope.of(context).transfer;
+    setState(() => _busy = true);
+    try {
+      // `acceptAll`, never anything that trusts.
+      final result = accepting
+          ? await transfers.acceptAll()
+          : await transfers.declineAll();
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              _bulkReport(accepting ? 'Accepted' : 'Declined', result),
+            ),
+          ),
+        );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    return Card(
+      color: scheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpace.md),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.download_rounded,
+                  size: AppIcons.md,
+                  color: scheme.onSecondaryContainer,
+                ),
+                const Gap(AppSpace.sm),
+                Expanded(
+                  child: Text(
+                    '${_files(widget.waiting)} waiting for approval',
+                    style: text.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: scheme.onSecondaryContainer,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const Gap(AppSpace.xs),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Wrap(
+                alignment: WrapAlignment.end,
+                spacing: AppSpace.xs,
+                runSpacing: AppSpace.xs,
+                children: [
+                  TextButton(
+                    onPressed: _busy
+                        ? null
+                        : () => _decideBatch(accepting: false),
+                    child: const Text('Decline all'),
+                  ),
+                  FilledButton(
+                    onPressed: _busy
+                        ? null
+                        : () => _decideBatch(accepting: true),
+                    child: const Text('Accept all'),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );

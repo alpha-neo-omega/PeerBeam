@@ -4,10 +4,20 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../sdk/events.dart';
+import '../sdk/exceptions.dart';
 import '../sdk/models.dart';
 import '../sdk/error_text.dart';
 import '../sdk/peerbeam.dart';
 import '../state/models.dart';
+
+/// What a bulk approval **actually did** — never what it assumed.
+///
+/// [requested] is how many transfers were waiting when the user tapped;
+/// [settled] how many the engine really accepted or declined; [gone] how many
+/// had stopped waiting in between (the 180s prompt timed out, the sender gave
+/// up, or the user already answered that one from its own card); [failed]
+/// anything else that went wrong. `settled + gone + failed == requested`.
+typedef BulkDecision = ({int requested, int settled, int gone, int failed});
 
 /// Reactive active-transfer list, driven by engine transfer events. Keeps the
 /// UI surface (`transfers`, `activeCount`, `pause`, `resume`, `cancel`) — the
@@ -54,6 +64,22 @@ class TransferRepository extends ChangeNotifier {
   /// Matches the wire-name convention the sender uses for clipboard sends.
   static final _clipboardName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
 
+  /// The inbound transfers this device has not answered yet — exactly the ones
+  /// whose cards show Decline / Accept / Trust, in the order the list renders
+  /// them.
+  ///
+  /// Deliberately narrow: an **outbound** transfer is this device's own send
+  /// and was never anyone's to approve, and a transfer already transferring,
+  /// paused, completed or failed has had its decision made. Both are excluded
+  /// so a bulk action can only ever touch what is genuinely waiting.
+  List<Transfer> get awaitingApproval => _byId.values
+      .where(
+        (t) =>
+            t.direction == TransferDirection.receiving &&
+            t.state == TransferState.pending,
+      )
+      .toList(growable: false);
+
   int get activeCount => _byId.values
       .where(
         (t) =>
@@ -83,6 +109,58 @@ class TransferRepository extends ChangeNotifier {
   void acceptTrust(String id) =>
       _decide(id, 'accept', _api?.acceptTrust(id));
   void reject(String id) => _decide(id, 'decline', _api?.reject(id));
+
+  /// Accept every inbound transfer currently [awaitingApproval] — one engine
+  /// call per transfer — and report what actually happened.
+  ///
+  /// **Accept-once. This never trusts.** [acceptTrust] grants a device
+  /// persistent auto-accept for everything it sends from now on, which is a
+  /// materially stronger and riskier act than approving the batch the user is
+  /// looking at; it stays a deliberate, per-device choice on the card. This
+  /// path calls [PeerBeamApi.accept] and nothing else.
+  ///
+  /// Still explicit consent (I6): one tap answers one batch that is on screen
+  /// right now. Nothing is remembered and nothing is inferred for next time.
+  Future<BulkDecision> acceptAll() => _decideAll(accepting: true);
+
+  /// Decline every inbound transfer currently [awaitingApproval]. Symmetric
+  /// with [acceptAll], including the honest tally.
+  Future<BulkDecision> declineAll() => _decideAll(accepting: false);
+
+  /// The shared body of [acceptAll]/[declineAll].
+  ///
+  /// Unlike the per-card [accept]/[reject] this **awaits** each decision and
+  /// counts the answer instead of pushing every refusal onto [errors]: five
+  /// accepts where two had already settled would otherwise fire two separate
+  /// error snackbars, which reads as breakage rather than as the ordinary race
+  /// it is. The caller gets one verified tally and reports it once.
+  Future<BulkDecision> _decideAll({required bool accepting}) async {
+    final api = _api;
+    // Snapshot the ids first. Engine events keep arriving while the decisions
+    // are in flight, so the set being answered for must be the set the user
+    // saw — not one that shifts under the loop.
+    final ids = awaitingApproval.map((t) => t.id).toList(growable: false);
+    if (api == null || ids.isEmpty) {
+      return (requested: ids.length, settled: 0, gone: 0, failed: 0);
+    }
+    var settled = 0, gone = 0, failed = 0;
+    for (final id in ids) {
+      try {
+        // `accept`, never `acceptTrust` — see acceptAll's contract.
+        await (accepting ? api.accept(id) : api.reject(id));
+        settled++;
+      } on InvalidArgumentException {
+        // `no pending transfer <id>`: it stopped waiting between the render
+        // and the tap. Expected, countable, and not an error to shout about.
+        gone++;
+      } catch (_) {
+        // Something else went wrong. Counted separately so the report can
+        // never claim it "was no longer waiting" when that isn't known.
+        failed++;
+      }
+    }
+    return (requested: ids.length, settled: settled, gone: gone, failed: failed);
+  }
 
   void _decide(String id, String verb, Future<void>? call) {
     if (call == null) return;
