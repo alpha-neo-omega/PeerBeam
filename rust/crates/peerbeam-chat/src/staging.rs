@@ -49,12 +49,23 @@ pub enum StagingError {
         max: u64,
     },
     /// Copying the file would leave the disk below its free-space floor.
-    #[error("staging needs {need} bytes but only {free} are free")]
+    ///
+    /// The message names all three numbers deliberately. The rule is
+    /// `free - need < floor`, so `need` and `free` alone can describe a refusal
+    /// that reads as though it should have succeeded — 5 GiB needed with 5.2 GiB
+    /// free looks fine until you know 512 MiB of that must stay free. Every
+    /// surface renders this string to a user (the CLI's `stage_refusal`, the
+    /// FFI's `chat_status` reason), so the floor belongs here rather than being
+    /// re-attached correctly by each one.
+    #[error("staging {need} bytes would leave less than the {floor} bytes that must stay free (only {free} available)")]
     NotEnoughSpace {
         /// Bytes the copy would consume.
         need: u64,
         /// Bytes currently available.
         free: u64,
+        /// Bytes that must still be free once the copy has landed
+        /// (`StagingLimits::min_free_bytes`).
+        floor: u64,
     },
     /// The stage was cancelled before it finished.
     #[error("staging cancelled")]
@@ -164,7 +175,11 @@ impl StagingStore {
             // send because a platform would not answer.
             if let Some(free) = peerbeam_platform::available_bytes(&self.root) {
                 if free.saturating_sub(size) < limits.min_free_bytes {
-                    return Err(StagingError::NotEnoughSpace { need: size, free });
+                    return Err(StagingError::NotEnoughSpace {
+                        need: size,
+                        free,
+                        floor: limits.min_free_bytes,
+                    });
                 }
             }
         }
@@ -514,6 +529,20 @@ mod tests {
             .await
             .expect_err("breaching the floor must refuse");
         assert!(matches!(err, StagingError::NotEnoughSpace { .. }));
+        // All three numbers, because two of them describe a refusal that reads
+        // as though it should have succeeded: `need` and `free` alone leave out
+        // the only reason this failed. Every surface renders this string
+        // verbatim, so a floor missing here is a floor missing everywhere.
+        let msg = err.to_string();
+        assert!(msg.contains("4096 bytes"), "the bytes needed: {msg}");
+        assert!(
+            msg.contains(&u64::MAX.to_string()),
+            "the floor that was breached: {msg}"
+        );
+        assert!(
+            msg.contains("available"),
+            "and what is actually free: {msg}"
+        );
         assert!(
             !blob_root(&tmp).exists(),
             "a refusal must not open anything for writing"

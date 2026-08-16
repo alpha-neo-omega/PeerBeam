@@ -20,9 +20,11 @@
 //! `Kind::File` by design: a queued file's bytes need a transfer, and
 //! `peerbeam-chat` owns no transfer engine, so the *caller* must run one. This
 //! binary does not yet — a queued file is delivered by a running PeerBeam app
-//! (the FFI runtime's drain, over the same appstore and blob root), or dropped
-//! with [`cancel`]. [`report_queued`] says so rather than letting `chat send
-//! --file` imply otherwise.
+//! (the FFI runtime's drain, over the same appstore and blob root, keyed by the
+//! same identity), or dropped with [`cancel`]. So text and files do **not**
+//! report the same outcome here, and [`report_queued`] deliberately does not
+//! borrow text's wording: it names what actually delivers a queued file.
+//!
 //! Every dial/accept in this file registers the *same* chat wiring
 //! (`store` + [`received_sink`]) regardless of why the session was
 //! established — a session with no `ChatHandler` on one side silently drops
@@ -519,7 +521,7 @@ async fn stage_with_progress(
         bar.finish();
     };
     let (staged, ()) = tokio::join!(copy, pump);
-    staged.map_err(|e| stage_refusal(&name, limits, e))
+    staged.map_err(|e| stage_refusal(&name, e))
 }
 
 /// Render a staging refusal honestly.
@@ -527,24 +529,21 @@ async fn stage_with_progress(
 /// [`SendError`]'s own `Display` prefixes its `Session` variant with "chat
 /// session error:", which is false for everything that can fail here — nothing
 /// has been dialed and no session exists. What [`stage_file_send`] actually put
-/// in that variant is `StagingError`'s message, which already names the reason
-/// and the measured numbers: "{size} bytes is over the {max}-byte limit for a
-/// chat attachment", or "staging needs {need} bytes but only {free} are free".
+/// in that variant is `StagingError`'s message, which names the reason and
+/// every number behind it: "{size} bytes is over the {max}-byte limit for a
+/// chat attachment", or "staging {need} bytes would leave less than the {floor}
+/// bytes that must stay free (only {free} available)".
 ///
-/// The limits clause is not decoration. This surface streamed straight from the
-/// source until increment 2b; it now stages first, so a file that used to send
-/// is refused — and the free-space message alone cannot be acted on, because it
-/// names what the copy needs and what is free but never the floor that the two
-/// are actually judged against. Naming both bounds *and the config keys that
-/// set them* is what turns a refusal into something the user can do something
-/// about.
-fn stage_refusal(name: &str, limits: StagingLimits, e: SendError) -> CliError {
+/// So the numbers are not repeated here. What the library cannot know is that
+/// those two bounds are **configurable and what they are called** — and that is
+/// the part a user needs, because this surface streamed straight from the source
+/// until increment 2b and a file that used to send is now refused. Naming the
+/// keys is what turns a refusal into something they can act on.
+fn stage_refusal(name: &str, e: SendError) -> CliError {
     match e {
         SendError::Session(reason) => CliError::Other(format!(
-            "cannot stage {name}: {reason}. A chat attachment may be at most {} bytes \
-             (device.max_queued_file_bytes), and staging refuses to leave less than {} bytes \
-             free (device.min_free_bytes).",
-            limits.max_bytes, limits.min_free_bytes
+            "cannot stage {name}: {reason}. Both staging bounds are configurable: \
+             device.max_queued_file_bytes and device.min_free_bytes."
         )),
         // A `Chat` variant (a name or body the wire format rejects) keeps its
         // own mapping — `ChatError::TooLarge` is a usage error with its own
@@ -566,26 +565,30 @@ fn begin_refusal(e: SendError) -> CliError {
 
 /// Report a file share that is staged and queued but not yet delivered.
 ///
-/// The first line is deliberately word-for-word the one text's [`send`] prints,
-/// so the two read as the same outcome — because they now *are* the same
-/// outcome.
+/// **This deliberately does NOT reuse text's [`send`] wording.** Text says "a
+/// running daemon/watch will deliver", which is true of a queued *message* and
+/// false of a queued *file* on this surface: `drain_tick` — this binary's only
+/// drain, shared by `chat watch` and `daemon start`/`receive` — delivers
+/// through [`flush_to_session`], which skips `Kind::File` by design, because a
+/// queued file's bytes need a transfer and `peerbeam-chat` owns no transfer
+/// engine. Text and files genuinely differ here, and one accurate sentence
+/// beats a familiar one followed by a correction nobody reads.
 ///
-/// The second line is the part text does not need. `drain_tick` (this binary's
-/// only drain, shared by `chat watch` and `daemon start`/`receive`) delivers
-/// through [`flush_to_session`], which skips `Kind::File` by design — a queued
-/// file's bytes need a transfer, and `peerbeam-chat` owns no transfer engine.
-/// So the generic "a running daemon/watch will deliver" is true of the queued
-/// *text* it was written for and not yet of a queued file on this surface. What
-/// does deliver one is a running PeerBeam app (the FFI runtime's own drain,
-/// over the same `<data_directory>/appstore` and `outbox-blobs` this CLI
-/// writes, keyed by the same identity), and `chat cancel` is what takes the
-/// bytes back. Saying so is the difference between a queue and a promise
-/// nothing keeps.
+/// What does deliver a queued file is a running PeerBeam app: the FFI runtime's
+/// own drain, reading the same `<data_directory>/appstore` and the same
+/// `<data_directory>/outbox-blobs` this CLI just wrote, unlocked by the same
+/// identity-derived key. That is a property of sharing the data directory, not
+/// of the app being on this machine by coincidence — an invocation pointed
+/// elsewhere with `--config` queues somewhere that app cannot see.
+///
+/// The staged size is named because the queue now holds a full copy of the
+/// file, and the second line is the way to get those bytes back.
 fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: &FileRef) {
     if ctx.json {
         // The same event and the same keys the delivered case emits — only
         // `delivered` differs, exactly as text's `chat_sent` already does. No
-        // new key, no changed type: a 2a consumer keeps parsing this.
+        // new key, no changed type: a 2a consumer keeps parsing this. It
+        // carries no prose, so the claim corrected above never appears here.
         ctx.json_line(&json!({
             "event": "chat_file_sent",
             "id": file_ref.id,
@@ -594,33 +597,52 @@ fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: 
         }));
         return;
     }
-    ctx.line(&ctx.dim(&format!(
-        "queued for {} (offline — a running daemon/watch will deliver)",
-        target.name
-    )));
-    ctx.line(&ctx.dim(&format!(
-        "note: this CLI's drain covers queued text only — a queued file waits for a running \
-         PeerBeam app, or `chat cancel {} {}` to drop it",
-        target.id.0, file_ref.id
-    )));
+    for line in queued_lines(&target.name, &target.id.0, file_ref) {
+        ctx.line(&ctx.dim(&line));
+    }
+}
+
+/// The two lines [`report_queued`] prints, as plain strings.
+///
+/// Extracted so the *claim they make* is unit-testable. This wording is
+/// load-bearing rather than cosmetic: the obvious edit is to reach for text's
+/// "a running daemon/watch will deliver", which reads naturally, is one word
+/// shorter, and is false for a file on this surface. A test can catch that; a
+/// comment cannot.
+fn queued_lines(peer_name: &str, peer_id: &str, file_ref: &FileRef) -> [String; 2] {
+    [
+        format!(
+            "queued for {peer_name} — {} bytes staged; a running PeerBeam app sharing this data \
+             directory delivers it (`daemon`/`receive`/`chat watch` drain queued text and \
+             declines, not files)",
+            file_ref.size
+        ),
+        format!(
+            "`chat cancel {peer_id} {}` drops it and frees the staged bytes",
+            file_ref.id
+        ),
+    ]
 }
 
 /// `chat send --file <path>` — attach a file to a conversation.
 ///
-/// **Offline-first (2b), like text.** The path is validated and the row
-/// persisted, the bytes are copied into the outbox's own storage
+/// **Offline-first (2b), the same shape as text.** The path is validated and
+/// the row persisted, the bytes are copied into the outbox's own storage
 /// ([`stage_file_send`]) and queued, and only then is one opportunistic dial +
 /// send attempted. An unreachable peer is **not** a failure: the entry simply
-/// stays queued, exactly as `send`'s text does, and this reports `queued`. That
-/// replaces 2a's hard `CliError::Connection`.
+/// stays queued, exactly as `send`'s text does. That replaces 2a's hard
+/// `CliError::Connection`.
+///
+/// The same *shape*, but not the same *outcome*, and [`report_queued`] says so:
+/// this binary's drain delivers queued text and declines, never a queued file.
 ///
 /// Staging is what makes a queued file honest — between queueing and delivery
 /// the user may delete, move or rewrite what they picked, so the blob (never
 /// the path) is what gets sent. It is also why this surface now **refuses**
 /// sends 2a would have streamed: `stage_file_send` enforces
 /// `device.max_queued_file_bytes` and `device.min_free_bytes`, and
-/// [`stage_refusal`] is what names which one, with the numbers, rather than
-/// failing generically.
+/// [`stage_refusal`] is what carries the reason, its numbers and the key behind
+/// the bound out to the user rather than failing generically.
 ///
 /// **A peer without `CHAT_FEAT_FILEREF` stays a hard error**, deliberately not
 /// folded into the queue above: an unreachable peer is one who is merely away,
@@ -629,7 +651,7 @@ fn report_queued(ctx: &Ctx, target: &peerbeam_domain::entity::Device, file_ref: 
 /// happen. Same for a failed offer or a failed transfer — a session *was*
 /// established, so these are real failures, and each dequeues the entry and
 /// deletes the blob through `finish` rather than stranding bytes this binary
-/// has no drain to retry (see the caveat printed alongside `queued`).
+/// has no drain to retry.
 ///
 /// The bytes ride the TRANSFER stream channel exactly like a plain `send`; a
 /// small `FileRef` control message rides the CHAT channel so the file gets a row
@@ -1624,10 +1646,11 @@ mod tests {
         assert_eq!(hist[0].status, Status::Failed);
     }
 
-    // The other bound, and the one whose library message cannot be acted on by
-    // itself: "staging needs N bytes but only M are free" never names the floor
-    // the two are judged against. A floor nothing can satisfy proves the CLI
-    // supplies it.
+    // The other bound. `StagingError::NotEnoughSpace` now names all three
+    // numbers itself (the floor included — without it the message reads as
+    // though the send should have succeeded), so what this proves at the CLI
+    // layer is that they survive to the user, and that the *knob* behind them
+    // is named too, which only this layer knows.
     #[tokio::test]
     async fn send_file_below_the_free_space_floor_is_refused_naming_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1651,12 +1674,64 @@ mod tests {
         .expect_err("an unsatisfiable free-space floor must refuse");
         let msg = err.to_string();
         assert!(
-            msg.contains("staging needs 128 bytes but only"),
-            "the refusal must name what the copy needed and what was free, got: {msg}"
+            msg.contains("staging 128 bytes would leave less than the"),
+            "the refusal must name what the copy needed, got: {msg}"
+        );
+        assert!(
+            msg.contains(&u64::MAX.to_string()),
+            "…and the floor it would have breached, which is the only reason it failed: {msg}"
+        );
+        assert!(
+            msg.contains("available"),
+            "…and what was actually free: {msg}"
         );
         assert!(
             msg.contains("device.min_free_bytes"),
-            "the refusal must name the floor's knob — the library message never does: {msg}"
+            "the refusal must name the floor's knob — only this layer knows it: {msg}"
+        );
+        assert!(
+            !msg.contains("chat session error"),
+            "a stage that never dialed anything is not a session failure: {msg}"
+        );
+    }
+
+    /// **The queued message must be true on this surface.** `drain_tick` →
+    /// `flush_to_session` skips `Kind::File`, so `daemon`/`receive`/`chat
+    /// watch` deliver queued text and declines and never a queued file — which
+    /// makes text's "a running daemon/watch will deliver" wording false here.
+    /// The tempting edit is to borrow it anyway; this is what stops that being
+    /// invisible.
+    #[test]
+    fn the_queued_message_names_what_actually_delivers_a_queued_file() {
+        let r = FileRef::new("movie.mkv", 5_368_709_120).expect("file ref");
+        let [first, second] = super::queued_lines("bob", "pb-bob", &r);
+
+        assert!(
+            !first.contains("daemon/watch will deliver"),
+            "text's wording is false for a file on this surface: {first}"
+        );
+        assert!(
+            first.contains("5368709120 bytes staged"),
+            "the queue now holds a full copy — say how much: {first}"
+        );
+        assert!(
+            first.contains("a running PeerBeam app"),
+            "the FIRST line must name what actually delivers it: {first}"
+        );
+        assert!(
+            first.contains("drain queued text and declines, not files"),
+            "…and must not leave the reader to assume the CLI's own drain will: {first}"
+        );
+        assert!(first.starts_with("queued for bob"), "{first}");
+
+        // The second line is the way to get the bytes back, and it must be
+        // copy-pasteable: the peer key the row is filed under, and the id.
+        assert_eq!(
+            second,
+            format!(
+                "`chat cancel pb-bob {}` drops it and frees the staged bytes",
+                r.id
+            )
         );
     }
 
