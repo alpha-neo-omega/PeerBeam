@@ -270,6 +270,50 @@ impl ChatRecord {
             && matches!(self.status, Status::Transferring | Status::PendingApproval)
     }
 
+    /// Whether this record is one the local user may still call off — the
+    /// authorization check every surface exposing "cancel this file" must pass
+    /// before deleting a staged blob or dequeueing an outbox entry.
+    ///
+    /// The sibling of [`is_settleable_file_row`](Self::is_settleable_file_row),
+    /// and here for the same reason: cancelling takes a `peer_id` and a
+    /// `message_id` from *outside* — the FFI's `pb_chat_cancel` request JSON,
+    /// the CLI's `chat cancel <peer> <id>` arguments — and then **deletes
+    /// bytes**. A bare key match at those two strings is not authorization: it
+    /// would let a caller name any row in any conversation, including a text
+    /// message, a file the peer is offering *us*, or a share that already
+    /// completed. All three of the following must hold:
+    ///
+    /// 1. **`kind == File`** — there is nothing to cancel about a text row: no
+    ///    staged blob, and its outbox entry is delivered or not;
+    /// 2. **`direction == Out`** — only our *own* outgoing share. An inbound
+    ///    offer is refused with the approval gate (I6), which this must never
+    ///    become a second, unprompted path into;
+    /// 3. **not already settled** — `Sent` and `Declined` are final and
+    ///    exactly the two states [`ChatStore::reopen_for_retry`] refuses, so a
+    ///    cancel could not stop anything that is still going to happen; it
+    ///    could only rewrite history about something that already did.
+    ///
+    /// Everything else an outgoing file row can read — `Staging` (a copy is
+    /// running), `Pending` (queued), `Transferring` (bytes moving), `Failed`
+    /// and `Interrupted` (both of which may still have a live queue entry a
+    /// later drain would retry) — is cancellable, because in every one of them
+    /// there is genuinely something left to stop.
+    ///
+    /// Note what this does **not** decide: which conversation the row was read
+    /// from. That is the caller's `peer_id`, and it is load-bearing — the row
+    /// must be fetched from `peer`'s own namespace
+    /// ([`ChatStore::get`](crate::ChatStore::get)), never scanned for across
+    /// conversations, or the direction check would be the only thing standing
+    /// between one thread's cancel and another thread's file.
+    ///
+    /// [`ChatStore::reopen_for_retry`]: crate::ChatStore::reopen_for_retry
+    #[must_use]
+    pub fn is_cancellable_outgoing_file(&self) -> bool {
+        self.kind == Kind::File
+            && self.direction == Direction::Out
+            && !matches!(self.status, Status::Sent | Status::Declined)
+    }
+
     /// Serialize to opaque bytes for the AppStore.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -460,6 +504,56 @@ mod tests {
             assert!(
                 !file_row(Direction::Out, terminal).is_settleable_file_row(Direction::Out),
                 "{terminal:?} must not be re-settleable"
+            );
+        }
+    }
+
+    /// Every state an outgoing file row can sit in while something is still
+    /// going to happen to it — including the two (`Failed`, `Interrupted`)
+    /// whose queue entry a later drain would retry.
+    #[test]
+    fn is_cancellable_outgoing_file_accepts_every_state_with_work_left() {
+        for status in [
+            Status::Staging,
+            Status::Pending,
+            Status::Transferring,
+            Status::Failed,
+            Status::Interrupted,
+        ] {
+            assert!(
+                file_row(Direction::Out, status).is_cancellable_outgoing_file(),
+                "{status:?} still has something to stop"
+            );
+        }
+    }
+
+    /// The two final states. A cancel here could not stop anything — the file
+    /// was delivered or refused — it could only rewrite history about it.
+    #[test]
+    fn is_cancellable_outgoing_file_rejects_a_settled_row() {
+        for status in [Status::Sent, Status::Declined] {
+            assert!(
+                !file_row(Direction::Out, status).is_cancellable_outgoing_file(),
+                "{status:?} is final"
+            );
+        }
+    }
+
+    /// The two shapes that make this a guard rather than a key lookup: a text
+    /// row (nothing staged, nothing to delete) and the peer's own offer to us
+    /// (refused at the approval gate, never here).
+    #[test]
+    fn is_cancellable_outgoing_file_rejects_text_and_inbound_rows() {
+        let text = ChatRecord::sent(&DeviceId::from("pb-bob"), &ChatMessage::new("hi").unwrap());
+        assert!(!text.is_cancellable_outgoing_file());
+        for status in [
+            Status::PendingApproval,
+            Status::Transferring,
+            Status::Received,
+        ] {
+            assert!(
+                !file_row(Direction::In, status).is_cancellable_outgoing_file(),
+                "an inbound offer in {status:?} is not ours to cancel"
             );
         }
     }

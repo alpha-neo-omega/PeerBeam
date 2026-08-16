@@ -360,6 +360,16 @@ pub struct Manager {
     /// this: it rides CHAT while a file's bytes ride TRANSFER, so a message
     /// never waits behind bytes.
     chat_file_in_flight: Mutex<HashSet<String>>,
+    /// Staging copies running right now, keyed by `(peer_id, message_id)` — the
+    /// handle [`Manager::chat_cancel`] needs to stop an 8 GiB copy that is
+    /// already under way. Without it a cancel could only ever dequeue, leaving
+    /// the copy to run to completion and re-queue the file behind it.
+    ///
+    /// Keyed by the pair, not by the message id alone, so a request naming
+    /// peer B can never reach a stage belonging to peer A even if it guesses
+    /// A's id. `TransferControl` is `Arc`-backed and `Clone`, so the copy task
+    /// and this map hold the same flag.
+    chat_staging: Mutex<HashMap<(String, String), TransferControl>>,
     identity: Identity,
     /// The presented name, split out from `identity` so a live rename
     /// (`set_identity_name`) reaches in-flight/future handshakes without a
@@ -417,6 +427,7 @@ impl Manager {
             staging,
             staging_limits,
             chat_file_in_flight: Mutex::new(HashSet::new()),
+            chat_staging: Mutex::new(HashMap::new()),
             identity,
             identity_name,
             save_dir: RwLock::new(save_dir),
@@ -1639,18 +1650,27 @@ impl Manager {
     /// A staging failure is immediate failure: nothing is queued, the row says
     /// `Failed` with the reason, and the user learns now instead of waiting for
     /// a delivery that was never scheduled.
+    ///
+    /// The copy is **cancellable throughout**: its `TransferControl` is
+    /// published to [`chat_staging`](Self#structfield.chat_staging) before the
+    /// first byte and retired after the last, so
+    /// [`chat_cancel`](Self::chat_cancel) can stop a multi-GB stage inside one
+    /// 64 KiB buffer instead of watching it run to completion.
     async fn run_chat_file_send(self: Arc<Self>, device: Device, path: String, file_ref: FileRef) {
         let peer_id = device.id.0.clone();
         let id = file_ref.id.clone();
+        let total = file_ref.size;
         let mut file_ref = file_ref;
         let ctrl = TransferControl::new();
+        self.register_stage(&peer_id, &id, ctrl.clone());
         let (ptx, mut prx) = mpsc::unbounded_channel::<u64>();
 
         // Drain the progress channel alongside the copy rather than after it:
         // one report per 64 KiB is ~262k reports for a 16 GiB file, and an
-        // unbounded channel nobody reads would hold every one of them.
-        // Task 8 turns these into a determinate bar; here they are consumed so
-        // the queue stays bounded.
+        // unbounded channel nobody reads would hold every one of them. What
+        // reaches the bridge is a throttled fraction of that — see
+        // `StagingThrottle`, which is what stops a determinate bar from
+        // drowning the event channel.
         let stage = async {
             let r = peerbeam_chat::stage_file_send(
                 &self.chat,
@@ -1666,15 +1686,102 @@ impl Manager {
             drop(ptx);
             r
         };
-        let pump = async { while prx.recv().await.is_some() {} };
+        let progress_peer = peer_id.clone();
+        let progress_id = id.clone();
+        let pump = async move {
+            let mut throttle = StagingThrottle::new();
+            while let Some(done) = prx.recv().await {
+                if throttle.due(done, total) {
+                    events::chat_staging(&progress_peer, &progress_id, done, total);
+                }
+            }
+        };
         let (staged, ()) = tokio::join!(stage, pump);
-        if let Err(e) = staged {
-            return self.fail_chat_file(&peer_id, &id, &e.to_string());
+        // Retire the stage and read its cancel flag under one lock, so a cancel
+        // is either seen here or lands while the copy is still running — never
+        // lost between the two.
+        let cancelled = self.finish_stage(&peer_id, &id);
+
+        let staged = match staged {
+            Ok(s) => s,
+            Err(e) => {
+                // A cancelled copy already deleted its own partial blob and
+                // nothing was queued, so there is nothing left to release —
+                // only a row to settle, and it says what the user did rather
+                // than quoting a plumbing error at them.
+                let reason = if cancelled {
+                    "cancelled".to_string()
+                } else {
+                    e.to_string()
+                };
+                return self.fail_chat_file(&peer_id, &id, &reason);
+            }
+        };
+
+        // The race the flag exists for: a cancel that arrived while the copy
+        // was finishing. `stage_file_send` had already queued the entry by
+        // then, so honouring the cancel means letting go of both here — the
+        // cancel path could not, because neither existed when it ran.
+        if cancelled {
+            self.drop_queued_file(&id, &staged.staged_path);
+            return self.fail_chat_file(&peer_id, &id, "cancelled");
         }
 
-        // Queued. The online case is this queue draining without delay — and if
-        // the peer is unreachable the file simply waits, exactly like text.
+        // Queued. Say so — a surface showing a determinate staging bar has no
+        // other way to learn the copy finished, and would sit at 99% until
+        // something re-read history.
+        events::chat_status(&peer_id, &id, chat_status_str(ChatStatus::Pending));
+
+        // The online case is this queue draining without delay — and if the
+        // peer is unreachable the file simply waits, exactly like text.
         let _ = self.chat_flush_peer(device).await;
+    }
+
+    /// Publish the control that stops an in-flight staging copy, so a cancel
+    /// can reach it. Paired with [`finish_stage`](Self::finish_stage), which
+    /// must run on every exit from the copy.
+    fn register_stage(&self, peer_id: &str, id: &str, ctrl: TransferControl) {
+        self.chat_staging
+            .lock()
+            .unwrap()
+            .insert((peer_id.to_string(), id.to_string()), ctrl);
+    }
+
+    /// Retire a finished staging copy, reporting whether it was cancelled.
+    ///
+    /// The removal and the flag read happen under **one** lock acquisition, and
+    /// [`cancel_stage`](Self::cancel_stage) sets the flag under the same lock.
+    /// That is what makes the two total: a cancel either sets the flag before
+    /// this reads it (so the caller cleans up) or finds the entry already gone
+    /// (so it falls through to the queue, where the entry it needs now is).
+    /// There is no interleaving in which the cancel is silently dropped.
+    fn finish_stage(&self, peer_id: &str, id: &str) -> bool {
+        self.chat_staging
+            .lock()
+            .unwrap()
+            .remove(&(peer_id.to_string(), id.to_string()))
+            .is_some_and(|ctrl| ctrl.is_cancelled())
+    }
+
+    /// Stop a staging copy that is running right now, if there is one for this
+    /// exact `(peer, message)`. Returns whether one was found.
+    ///
+    /// The copy checks the flag between 64 KiB buffers and unlinks its own
+    /// partial blob on the way out (`StagingStore::stage`), so an 8 GiB stage
+    /// stops promptly and leaves nothing behind.
+    fn cancel_stage(&self, peer_id: &str, id: &str) -> bool {
+        match self
+            .chat_staging
+            .lock()
+            .unwrap()
+            .get(&(peer_id.to_string(), id.to_string()))
+        {
+            Some(ctrl) => {
+                ctrl.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Deliver one queued file to `peer` over an already-established session,
@@ -1748,6 +1855,19 @@ impl Manager {
                     device.name
                 ),
             );
+        }
+
+        // Still wanted? The queue was read before this session was dialed, and
+        // dialing plus the handshake is exactly when a user watching a row that
+        // reads "Queued" reaches for Cancel. Re-reading here means a cancelled
+        // file is never put in front of the peer at all — without it, cancel
+        // would be honoured in every state except the seconds in which the file
+        // is actually being offered.
+        if !self.still_queued(&peer, &id) {
+            session.close().await;
+            self.release_file_slot(&peer.0);
+            tracing::info!(message_id = %id, "queued file not offered: no longer queued");
+            return;
         }
 
         // The row in the peer's thread. Sent before the bytes so the file has
@@ -1918,6 +2038,23 @@ impl Manager {
             return;
         }
         self.drop_queued_file(id, staged_path);
+    }
+
+    /// Whether `id` is still in `peer`'s queue.
+    ///
+    /// Read immediately before a queued file is offered, to catch a cancel that
+    /// landed after the drain chose this file. An unreadable outbox answers
+    /// **yes**, exactly like [`row_may_still_deliver`](Self::row_may_still_deliver):
+    /// a transient read error must cost one drain tick, never a file the user
+    /// is still waiting to send.
+    fn still_queued(&self, peer: &DeviceId, id: &str) -> bool {
+        match self.chat.outbox_for(peer) {
+            Ok(entries) => entries.iter().any(|e| e.message_id == id),
+            Err(e) => {
+                tracing::warn!(error = %e, message_id = %id, "outbox unreadable; assuming queued");
+                true
+            }
+        }
     }
 
     /// Whether a future drain could still deliver the row at `(peer, id)`.
@@ -2193,6 +2330,201 @@ impl Manager {
             .map_err(|e| (Code::Internal, e.to_string()))?;
         let messages: Vec<Value> = hist.iter().map(events::record_dto).collect();
         Ok(json!({ "messages": messages }))
+    }
+
+    /// Every conversation this device holds:
+    /// `{peers:[{peer_id, last_timestamp, unread_hint}]}`. Takes no arguments.
+    ///
+    /// Derived from the namespaces that actually exist
+    /// ([`ChatStore::conversations`]), not from a separate index: an index can
+    /// drift, and the failure this exists to prevent is precisely a thread
+    /// nothing can name — a peer discovery cannot see right now has no entry in
+    /// the device list, so before this there was no way to *open* the
+    /// conversation you already had with it.
+    ///
+    /// **`unread_hint` is the number of inbound file offers still awaiting your
+    /// decision** in that thread (`direction: in`, `status:
+    /// "pendingapproval"`) — rows with a live Accept button on them.
+    ///
+    /// It is deliberately **not** "messages you have not read", and no such
+    /// number is reported, because PeerBeam cannot compute one honestly: there
+    /// are no read receipts, and nothing records when a thread was last opened,
+    /// so any "N unread" would be a guess dressed as a fact. The usual
+    /// stand-in — counting what arrived since your last reply — is exactly that
+    /// guess: a user who read every message and simply did not answer would be
+    /// badged as having ignored them. What is reported instead is a fact the
+    /// store already holds and a surface can act on: this thread is waiting on
+    /// you for `n` decisions. A thread with unread *text* therefore reads 0,
+    /// which is the honest answer to a question this product cannot yet ask.
+    ///
+    /// `last_timestamp` is the newest row's timestamp, or `null` for a thread
+    /// whose rows this build cannot read. Sorted newest-first (ties broken by
+    /// peer id, so the order is stable), which is what a conversation list
+    /// wants — but note that an inbound row's timestamp came off the peer's own
+    /// clock, so this is best-effort recency and not a trusted ordering.
+    ///
+    /// Cost: one namespace scan plus one full history read per conversation.
+    /// [`AppStore`](peerbeam_domain::port::AppStore) has no "last key" call, so
+    /// there is no cheaper way to learn a thread's newest row today.
+    ///
+    /// [`ChatStore::conversations`]: peerbeam_chat::ChatStore::conversations
+    pub fn chat_conversations(&self, _req: &Value) -> Op {
+        let peers = self
+            .chat
+            .conversations()
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let mut rows: Vec<(String, Option<String>, usize)> = Vec::with_capacity(peers.len());
+        for peer in peers {
+            // A thread whose records cannot be read still exists and must still
+            // be listed — dropping it would hide the very conversation this
+            // call was added to make reachable. It just has nothing to say
+            // about itself.
+            let history = self.chat.history(&peer).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, peer_id = %peer.0, "conversation summary unreadable");
+                Vec::new()
+            });
+            let last = history.last().map(|rec| rec.timestamp.clone());
+            let awaiting = history
+                .iter()
+                .filter(|rec| {
+                    rec.direction == ChatDirection::In && rec.status == ChatStatus::PendingApproval
+                })
+                .count();
+            rows.push((peer.0, last, awaiting));
+        }
+        // Newest first. `None` sorts below every `Some`, so an unreadable
+        // thread lands at the bottom rather than the top.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let peers: Vec<Value> = rows
+            .into_iter()
+            .map(|(peer_id, last_timestamp, unread_hint)| {
+                json!({
+                    "peer_id": peer_id,
+                    "last_timestamp": last_timestamp,
+                    "unread_hint": unread_hint,
+                })
+            })
+            .collect();
+        Ok(json!({ "peers": peers }))
+    }
+
+    /// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
+    ///
+    /// Stops the copy if one is running, stops the transfer if the bytes are
+    /// moving, takes the entry out of the queue, deletes the staged blob, and
+    /// settles the row `Failed`/`cancelled`. Safe in every state a share can be
+    /// in — mid-stage, queued and never offered, in flight, or already settled —
+    /// and `cancelled` says which way it went, so a surface never has to
+    /// special-case an id it was too late for.
+    ///
+    /// **This deletes bytes on the strength of two caller-supplied strings**, so
+    /// both are treated as hostile:
+    ///
+    /// * `message_id` goes through the same [`is_valid_transfer_id`] rule as
+    ///   every other id crossing this boundary — a chat file's message id *is*
+    ///   its transfer id — which is what keeps `..`, separators and NUL out of a
+    ///   value that names a blob;
+    /// * the row is fetched from **`peer_id`'s own namespace** and must pass
+    ///   [`ChatRecord::is_cancellable_outgoing_file`]: our own outgoing file
+    ///   share, not yet settled. Naming another conversation's message finds
+    ///   nothing under that peer, a text row is refused, and an inbound offer is
+    ///   refused — that one stays the approval gate's business (I6), which this
+    ///   must never become a second, unprompted path into;
+    /// * the path unlinked is the one read back off the **queue entry**, which
+    ///   `StagingStore` itself produced under its own blob root, and that entry
+    ///   is found via [`ChatStore::outbox_for`], which filters by peer. No path
+    ///   is ever built from caller input.
+    ///
+    /// Failing any of those is a clean `{cancelled: false}` — not an error a
+    /// surface has to handle — except a malformed `message_id`, which is a
+    /// caller bug and says so.
+    ///
+    /// [`ChatRecord::is_cancellable_outgoing_file`]: peerbeam_chat::ChatRecord::is_cancellable_outgoing_file
+    /// [`ChatStore::outbox_for`]: peerbeam_chat::ChatStore::outbox_for
+    pub fn chat_cancel(&self, req: &Value) -> Op {
+        let peer_id = req
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or((Code::InvalidArgument, "peer_id required".into()))?
+            .to_string();
+        let id = valid_message_id(req.get("message_id"))?;
+        let peer = DeviceId::from(peer_id.clone());
+
+        // The authorization, in one place: this peer's own namespace, our own
+        // outgoing file share, not already settled.
+        let row = self
+            .chat
+            .get(&peer, &id)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        if !row.is_some_and(|rec| rec.is_cancellable_outgoing_file()) {
+            return Ok(json!({ "cancelled": false }));
+        }
+
+        // 1. A copy running right now. Stopping it lands inside one 64 KiB
+        //    buffer and `StagingStore::stage` unlinks its own partial blob, so
+        //    an 8 GiB stage leaves nothing behind. The copy's own task settles
+        //    the row (and handles the race where it finished first), which is
+        //    why nothing below re-settles when this fires.
+        let stopped_stage = self.cancel_stage(&peer_id, &id);
+
+        // 2. A transfer moving the bytes right now — but only ours, and only to
+        //    this peer. `active` is keyed by an id space peers also write into
+        //    (an incoming transfer registers under the id on its first frame),
+        //    so the entry is matched on direction and peer before it is touched,
+        //    never on the id alone.
+        let ours_is_live = self
+            .active
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|a| a.direction == "sending" && a.peer_id == peer_id);
+        let stopped_transfer = ours_is_live && self.cancel(&id).is_ok();
+
+        // 3. The queue entry and the bytes it owns. `outbox_for` filters by
+        //    peer, so an entry found here belongs to this conversation by
+        //    construction, and its `staged_path` is a string `StagingStore`
+        //    wrote — never one derived from the request.
+        let queued = self
+            .chat
+            .outbox_for(&peer)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| e.message_id == id);
+        let dequeued = match queued {
+            Some(entry) => {
+                match entry.file.as_ref() {
+                    Some(staged) => self.drop_queued_file(&id, &staged.staged_path),
+                    // A file entry with no blob owns no bytes; dequeue it alone.
+                    None => {
+                        if let Err(e) = self.chat.outbox_remove(&id) {
+                            tracing::warn!(error = %e, message_id = %id, "cancelled entry not dequeued");
+                        }
+                    }
+                }
+                true
+            }
+            None => false,
+        };
+
+        // 4. The row. Skipped for a cancelled stage — that copy settles its own
+        //    row moments from now, with this same status and reason.
+        let settled = !stopped_stage && self.settle_cancelled(&peer, &peer_id, &id);
+        Ok(json!({ "cancelled": stopped_stage || stopped_transfer || dequeued || settled }))
+    }
+
+    /// Move a cancelled share's row to `Failed`/`cancelled`, unless it already
+    /// reads `Failed` — which it does when the live transfer's own cancel path
+    /// (`Manager::cancel` → `chat_settle`) got there first. Returns whether this
+    /// call changed anything, so a cancel that genuinely only tidied a stranded
+    /// row still reports honestly, and one that found the row already settled
+    /// does not emit a second, identical event.
+    fn settle_cancelled(&self, peer: &DeviceId, peer_id: &str, id: &str) -> bool {
+        if matches!(self.chat.get(peer, id), Ok(Some(rec)) if rec.status == ChatStatus::Failed) {
+            return false;
+        }
+        self.fail_chat_file(peer_id, id, "cancelled");
+        true
     }
 
     // ── receiving ───────────────────────────────────────────────
@@ -2603,6 +2935,87 @@ const STREAM_GRACE: Duration = Duration::from_secs(60);
 /// progress smooth without flooding the event bridge.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Minimum spacing between emitted **staging** progress events (~4/s).
+///
+/// Lower than [`PROGRESS_INTERVAL`] on purpose: a staging copy is local disk
+/// work behind a determinate bar, not a live link whose speed and ETA the user
+/// is watching tick, so four updates a second is already smoother than anyone
+/// can read.
+const STAGING_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Minimum share of the file that must be copied between two emitted staging
+/// events, as a divisor: `total / 100` is one percent.
+const STAGING_PROGRESS_STEP_DIVISOR: u64 = 100;
+
+/// Decides which of a staging copy's byte reports actually reach the event
+/// bridge.
+///
+/// `StagingStore` reports every 64 KiB. That is right for the copy — it is how
+/// cancellation lands within one buffer — and catastrophic for the bridge:
+/// **~262,000 reports for a 16 GiB file**, each one a JSON string allocated,
+/// copied across the FFI boundary and posted to the Dart isolate's port. An
+/// unthrottled bridge would spend more time announcing the copy than doing it,
+/// and would bury every other event (a `chat_received`, a `transfer_progress`)
+/// behind a queue of stale byte counts.
+///
+/// The policy is **both** limits at once, because either alone fails a real
+/// case:
+///
+/// * **time only** (`>= 250 ms` apart) bounds the rate but not the total — a
+///   copy that runs for an hour still emits ~14,000 events;
+/// * **percentage only** (`>= 1%` apart) bounds the total at ~100 but not the
+///   spacing — a fast local copy of a small file emits its whole hundred in a
+///   few milliseconds, which is exactly the flood being prevented.
+///
+/// So an update is emitted only when it is at least 250 ms *and* at least 1%
+/// past the last one — at most ~100 events for a whole copy, never more than
+/// four a second — with two deliberate exceptions that cost one event each:
+/// the **first** report (so a bar appears immediately rather than up to a
+/// second late) and the **first** report that reaches `total` (so the bar
+/// finishes rather than stopping at 99%). Only the first such report: a source
+/// still being appended to keeps reporting past `total`, and treating every
+/// one of those as "final" would restore the flood at the worst moment.
+struct StagingThrottle {
+    /// Elapsed-time floor. A field rather than a constant so a test can set it
+    /// to zero and exercise the percentage leg in isolation.
+    interval: Duration,
+    /// When the last event was emitted; `None` until the first report.
+    last: Option<Instant>,
+    /// The `done` the last emitted event carried.
+    last_done: u64,
+    /// Whether a report has already reached `total`.
+    reached_total: bool,
+}
+
+impl StagingThrottle {
+    fn new() -> StagingThrottle {
+        StagingThrottle {
+            interval: STAGING_PROGRESS_INTERVAL,
+            last: None,
+            last_done: 0,
+            reached_total: false,
+        }
+    }
+
+    /// Whether this report should be emitted — and, when it should, record it
+    /// as the new baseline.
+    fn due(&mut self, done: u64, total: u64) -> bool {
+        let first = self.last.is_none();
+        let finishing = !self.reached_total && total > 0 && done >= total;
+        let spaced = self.last.is_some_and(|t| t.elapsed() >= self.interval);
+        let stepped = done.saturating_sub(self.last_done) >= total / STAGING_PROGRESS_STEP_DIVISOR;
+        if !(first || finishing || (spaced && stepped)) {
+            return false;
+        }
+        if finishing {
+            self.reached_total = true;
+        }
+        self.last = Some(Instant::now());
+        self.last_done = done;
+        true
+    }
+}
+
 /// Run a transfer while pumping its progress into stats + `transfer_progress`
 /// events.
 ///
@@ -2927,6 +3340,25 @@ fn valid_transfer_id(v: &Value) -> Result<String, (Code, String)> {
             format!("transfer_id must be 1-{MAX_TRANSFER_ID} chars of [A-Za-z0-9._-]"),
         )),
     }
+}
+
+/// Read a caller-supplied chat `message_id`, held to **exactly** the
+/// [`valid_transfer_id`] rule — the same function, only the field name in the
+/// error differs.
+///
+/// Not a second, parallel validator, deliberately. A chat file's message id
+/// *is* its transfer id (one identity, two channels), and it is also the name
+/// of its staged blob on disk: `StagingStore::blob_path` refuses anything that
+/// is not a bare file name, and this rule is what guarantees nothing that could
+/// fail there — a separator, `..`, a NUL — ever reaches it. Two rules that were
+/// meant to agree would eventually not.
+fn valid_message_id(v: Option<&Value>) -> Result<String, (Code, String)> {
+    valid_transfer_id(v.unwrap_or(&Value::Null)).map_err(|(code, _)| {
+        (
+            code,
+            format!("message_id must be 1-{MAX_TRANSFER_ID} chars of [A-Za-z0-9._-]"),
+        )
+    })
 }
 
 /// Build a target `Device` from a `peer` JSON object.
@@ -5209,5 +5641,405 @@ mod tests {
             2,
             "two resume edges must send exactly two BACK_RESUME sentinels: {mirrored:?}"
         );
+    }
+
+    // ── staging progress: the throttle ──────────────────────────
+
+    /// The number this exists for. A 16 GiB file reports every 64 KiB — 262,144
+    /// times — and every one of those would otherwise be a JSON string built,
+    /// copied across the FFI boundary and posted to the Dart isolate. The
+    /// throttle must cut that to something a bar can actually use.
+    #[test]
+    fn staging_throttle_cuts_a_16_gib_copy_from_262144_reports_to_about_a_hundred() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let total = 16 * GIB;
+        let chunk = 64 * 1024;
+        let reports = total / chunk;
+        assert_eq!(reports, 262_144, "the flood this throttle exists for");
+
+        // Time is not the binding limit here — a copy this size runs for
+        // minutes — so hold the interval at zero and measure the percentage
+        // leg on its own.
+        let mut throttle = StagingThrottle::new();
+        throttle.interval = Duration::ZERO;
+        let emitted = (1..=reports)
+            .filter(|n| throttle.due(n * chunk, total))
+            .count();
+        assert!(
+            (100..=102).contains(&emitted),
+            "16 GiB must emit ~100 events, not {emitted}"
+        );
+    }
+
+    /// A fast local copy is the case the percentage limit alone gets wrong: 100
+    /// events inside a few milliseconds is still a flood. The time floor is what
+    /// stops it, and the first report is deliberately exempt so a bar appears at
+    /// once rather than up to a quarter-second late.
+    #[test]
+    fn staging_throttle_holds_a_fast_copy_to_its_first_report() {
+        let total = 100 * 1024 * 1024;
+        let chunk = 64 * 1024;
+        let mut throttle = StagingThrottle::new();
+        let emitted = (1..=(total / chunk))
+            .filter(|n| throttle.due(n * chunk, total))
+            .count();
+        assert_eq!(
+            emitted, 2,
+            "a copy that finishes inside one interval emits its first report and \
+             its last, and nothing in between"
+        );
+    }
+
+    /// The completing report always goes out, so the bar reaches 100% instead of
+    /// stopping wherever the throttle last let something through — but only the
+    /// *first* one to reach `total`. A source being appended to while we copy
+    /// (a log, a running download) keeps reporting past its own size, and
+    /// treating each of those as "final" would restore the flood at the worst
+    /// possible moment.
+    #[test]
+    fn staging_throttle_emits_the_completing_report_once_and_not_the_overrun() {
+        let mut throttle = StagingThrottle::new();
+        throttle.interval = Duration::from_secs(3600); // only first/finishing can fire
+        assert!(throttle.due(64, 640), "the first report always goes out");
+        assert!(!throttle.due(128, 640), "throttled");
+        assert!(throttle.due(640, 640), "the completing report goes out");
+        for overrun in [704, 768, 832] {
+            assert!(
+                !throttle.due(overrun, 640),
+                "a growing source must not re-fire 'finished' at {overrun}"
+            );
+        }
+    }
+
+    /// An empty file has no fraction to report. It must not divide by zero and
+    /// must not claim to have finished something it never started.
+    #[test]
+    fn staging_throttle_survives_a_zero_byte_total() {
+        let mut throttle = StagingThrottle::new();
+        throttle.interval = Duration::from_secs(3600);
+        assert!(throttle.due(0, 0), "the first report still goes out");
+        assert!(!throttle.due(0, 0));
+    }
+
+    // ── cancelling a share ──────────────────────────────────────
+
+    /// Seed an outgoing file row plus a queued outbox entry whose staged blob
+    /// really exists on disk, exactly as a completed stage would leave them.
+    /// Returns the message id and the blob's path.
+    fn seed_queued_file(
+        chat: &ChatStore,
+        blob_root: &std::path::Path,
+        peer: &DeviceId,
+        name: &str,
+    ) -> (String, std::path::PathBuf) {
+        let r = peerbeam_chat::FileRef::new(name, 4).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            peer,
+            &r,
+            file_meta(&r),
+            ChatStatus::Staging,
+        ))
+        .expect("seed the row");
+        std::fs::create_dir_all(blob_root).expect("blob root");
+        let blob = blob_root.join(&r.id);
+        std::fs::write(&blob, b"bytes").expect("seed the blob");
+        chat.enqueue_file(
+            peer,
+            &r,
+            &peerbeam_chat::StagedFile {
+                name: name.to_string(),
+                size: 5,
+                staged_path: blob.to_string_lossy().into_owned(),
+            },
+        )
+        .expect("queue it");
+        (r.id, blob)
+    }
+
+    fn cancel(mgr: &Manager, peer_id: &str, message_id: &str) -> Op {
+        mgr.chat_cancel(&json!({ "peer_id": peer_id, "message_id": message_id }))
+    }
+
+    /// The ordinary case: a file queued for a peer that is not there. Cancel
+    /// takes the entry out of the queue, deletes the bytes it owned, and settles
+    /// the row `failed`/`cancelled`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_dequeues_a_queued_file_deletes_its_blob_and_fails_the_row() {
+        let (mgr, chat, dir) = test_manager_full("canceller", 0);
+        let peer = DeviceId::from("pb-bob");
+        let blobs = dir.path().join("outbox-blobs");
+        let (id, blob) = seed_queued_file(&chat, &blobs, &peer, "holiday.mp4");
+
+        let out = cancel(&mgr, &peer.0, &id).expect("cancel");
+        assert_eq!(out["cancelled"], true);
+        assert!(
+            chat.outbox_for(&peer).unwrap().is_empty(),
+            "the entry must leave the queue"
+        );
+        assert!(!blob.exists(), "and its staged bytes must be deleted");
+        let row = chat.get(&peer, &id).unwrap().expect("the row survives");
+        assert_eq!(row.status, ChatStatus::Failed);
+        assert_eq!(row.kind, peerbeam_chat::Kind::File, "still a file row");
+    }
+
+    /// **What stops a cancel reaching outside its own conversation.** Two peers
+    /// each have a file queued under their own id. Cancelling one must leave the
+    /// other's entry *and* its bytes untouched — including when the caller pairs
+    /// a real message id with the wrong peer, which is the shape an attempt to
+    /// reach across threads would actually take.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_cannot_reach_another_conversations_entry_or_blob() {
+        let (mgr, chat, dir) = test_manager_full("canceller", 0);
+        let blobs = dir.path().join("outbox-blobs");
+        let alice = DeviceId::from("pb-alice");
+        let bob = DeviceId::from("pb-bob");
+        let (alice_id, alice_blob) = seed_queued_file(&chat, &blobs, &alice, "alice.bin");
+        let (bob_id, bob_blob) = seed_queued_file(&chat, &blobs, &bob, "bob.bin");
+
+        // Alice's id, claimed as Bob's message. There is no such row in Bob's
+        // namespace, so the guard never gets as far as the queue.
+        let out = cancel(&mgr, &bob.0, &alice_id).expect("cancel");
+        assert_eq!(
+            out["cancelled"], false,
+            "no row for that id under this peer"
+        );
+        assert!(alice_blob.exists(), "alice's bytes are untouched");
+        assert_eq!(chat.outbox_for(&alice).unwrap().len(), 1);
+        assert_eq!(
+            chat.get(&alice, &alice_id).unwrap().unwrap().status,
+            ChatStatus::Pending,
+            "and alice's row is not settled by bob's cancel"
+        );
+
+        // The honest cancel still works, and still only touches its own thread.
+        assert_eq!(cancel(&mgr, &bob.0, &bob_id).unwrap()["cancelled"], true);
+        assert!(!bob_blob.exists());
+        assert!(alice_blob.exists(), "alice is still untouched afterwards");
+        assert_eq!(chat.outbox_for(&alice).unwrap().len(), 1);
+    }
+
+    /// The other three rows a caller could name, all refused without a write: a
+    /// text message (nothing staged), the peer's own offer to *us* (that is the
+    /// approval gate's business, I6), and a share that already completed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_refuses_text_inbound_and_settled_rows() {
+        let (mgr, chat, _dir) = test_manager_full("canceller", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let text = peerbeam_chat::ChatMessage::new("hello").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &text))
+            .expect("seed text");
+        let offered = peerbeam_chat::FileRef::new("theirs.bin", 9).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("seed the inbound offer");
+        let done = peerbeam_chat::FileRef::new("done.bin", 9).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &done,
+            file_meta(&done),
+            ChatStatus::Sent,
+        ))
+        .expect("seed a delivered share");
+
+        for (id, why) in [
+            (&text.id, "a text row has nothing to cancel"),
+            (
+                &offered.id,
+                "an inbound offer is refused at the gate, not here",
+            ),
+            (&done.id, "a delivered file cannot be un-sent"),
+        ] {
+            let out = cancel(&mgr, &peer.0, id).expect("cancel");
+            assert_eq!(out["cancelled"], false, "{why}");
+        }
+        // Not one of them was written to.
+        assert_eq!(
+            chat.get(&peer, &text.id).unwrap().unwrap().status,
+            ChatStatus::Sent
+        );
+        assert_eq!(
+            chat.get(&peer, &offered.id).unwrap().unwrap().status,
+            ChatStatus::PendingApproval
+        );
+        assert_eq!(
+            chat.get(&peer, &done.id).unwrap().unwrap().status,
+            ChatStatus::Sent
+        );
+    }
+
+    /// An id for a message that does not exist is a clean no-op, not an error a
+    /// surface has to special-case — but a *malformed* id is a caller bug and
+    /// says so, because that string would otherwise name a file.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_is_a_no_op_for_an_unknown_id_and_an_error_for_a_malformed_one() {
+        let (mgr, _chat, _dir) = test_manager_full("canceller", 0);
+        assert_eq!(
+            cancel(&mgr, "pb-bob", "1785559080834abcdef0123456789").unwrap()["cancelled"],
+            false
+        );
+        for hostile in ["../../../etc/passwd", "..", "a/b", "a\\b", ""] {
+            let (code, _) = cancel(&mgr, "pb-bob", hostile).expect_err("must be refused");
+            assert!(
+                matches!(code, Code::InvalidArgument),
+                "{hostile:?} must be refused as an argument, not acted on"
+            );
+        }
+        let (code, _) = mgr
+            .chat_cancel(&json!({ "message_id": "1785559080834abcdef0123456789" }))
+            .expect_err("peer_id is required");
+        assert!(matches!(code, Code::InvalidArgument));
+    }
+
+    /// **Cancelling mid-stage cancels the copy.** The control the staging copy
+    /// is holding is reached through the `(peer, message)` registry, so an 8 GiB
+    /// stage stops inside one 64 KiB buffer rather than running to completion.
+    ///
+    /// The row is deliberately left alone here: the copy's own task settles it
+    /// moments later, with this same status and reason, and racing it would emit
+    /// the event twice.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_stops_a_staging_copy_that_is_still_running() {
+        let (mgr, chat, _dir) = test_manager_full("canceller", 0);
+        let peer = DeviceId::from("pb-bob");
+        let r = peerbeam_chat::FileRef::new("huge.iso", 8 * 1024 * 1024 * 1024).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            file_meta(&r),
+            ChatStatus::Staging,
+        ))
+        .expect("seed the staging row");
+        let ctrl = TransferControl::new();
+        mgr.register_stage(&peer.0, &r.id, ctrl.clone());
+
+        assert_eq!(cancel(&mgr, &peer.0, &r.id).unwrap()["cancelled"], true);
+        assert!(ctrl.is_cancelled(), "the copy must be told to stop");
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            ChatStatus::Staging,
+            "the copy's own task settles this row; cancel must not race it"
+        );
+
+        // …and the same control, retired by the copy, reports the cancellation
+        // to it. This handshake is what closes the race where the copy finishes
+        // a moment before the cancel lands.
+        assert!(mgr.finish_stage(&peer.0, &r.id));
+        assert!(
+            !mgr.cancel_stage(&peer.0, &r.id),
+            "a retired stage is no longer cancellable"
+        );
+    }
+
+    /// A stage belonging to one peer must not be reachable through another
+    /// peer's request, even when the caller has the right message id — which is
+    /// why the registry is keyed by the pair.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stage_is_only_cancellable_through_its_own_peer() {
+        let (mgr, _chat, _dir) = test_manager_full("canceller", 0);
+        let ctrl = TransferControl::new();
+        mgr.register_stage("pb-alice", "m-1", ctrl.clone());
+        assert!(!mgr.cancel_stage("pb-bob", "m-1"));
+        assert!(!ctrl.is_cancelled());
+        assert!(mgr.cancel_stage("pb-alice", "m-1"));
+        assert!(ctrl.is_cancelled());
+    }
+
+    /// A row stranded `Staging` by a crash — its copy died with the process, so
+    /// nothing will ever settle it — is still cancellable, and the call reports
+    /// honestly that it did something. Calling again reports that there was
+    /// nothing left to do.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_cancel_settles_a_stranded_row_once_and_then_reports_nothing_to_do() {
+        let (mgr, chat, _dir) = test_manager_full("canceller", 0);
+        let peer = DeviceId::from("pb-bob");
+        let r = peerbeam_chat::FileRef::new("stranded.bin", 7).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &peer,
+            &r,
+            file_meta(&r),
+            ChatStatus::Staging,
+        ))
+        .expect("seed the stranded row");
+
+        assert_eq!(cancel(&mgr, &peer.0, &r.id).unwrap()["cancelled"], true);
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            ChatStatus::Failed
+        );
+        assert_eq!(
+            cancel(&mgr, &peer.0, &r.id).unwrap()["cancelled"],
+            false,
+            "a second cancel stopped nothing and must not pretend otherwise"
+        );
+    }
+
+    // ── the conversation list ───────────────────────────────────
+
+    /// A thread whose only row is a file must be listed — that is the whole
+    /// point: a peer discovery cannot see has no entry in the device list, so
+    /// without this there is no way to open the conversation you already have
+    /// with it. Newest thread first, and `unread_hint` counts only what the
+    /// thread is genuinely waiting on the user for.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_conversations_lists_a_file_only_thread_newest_first() {
+        let (mgr, chat, _dir) = test_manager_full("lister", 0);
+        let quiet = DeviceId::from("pb-quiet");
+        let busy = DeviceId::from("pb-busy");
+
+        // A thread with nothing but an outgoing file share.
+        let file = peerbeam_chat::FileRef::new("only.bin", 3).expect("file ref");
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &quiet,
+            &file,
+            file_meta(&file),
+            ChatStatus::Pending,
+        ))
+        .expect("seed the file-only thread");
+        // A newer thread holding one text message and two offers awaiting us.
+        for name in ["one.bin", "two.bin"] {
+            let offered = peerbeam_chat::FileRef::new(name, 3).expect("file ref");
+            chat.append(&peerbeam_chat::ChatRecord::file_in(&busy, &offered))
+                .expect("seed an inbound offer");
+        }
+        let text = peerbeam_chat::ChatMessage::new("hi").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::received(&busy, &text))
+            .expect("seed the text");
+
+        let out = mgr.chat_conversations(&json!({})).expect("conversations");
+        let peers = out["peers"].as_array().expect("peers array").clone();
+        assert_eq!(peers.len(), 2, "both threads: {peers:?}");
+        assert_eq!(peers[0]["peer_id"], "pb-busy", "newest first");
+        assert_eq!(peers[1]["peer_id"], "pb-quiet");
+        assert!(peers[1]["last_timestamp"].is_string());
+
+        // Only the rows genuinely awaiting a decision are counted — not the
+        // text (which nothing can tell us was read) and not our own outgoing
+        // file.
+        assert_eq!(peers[0]["unread_hint"], 2);
+        assert_eq!(peers[1]["unread_hint"], 0);
+    }
+
+    /// The outbox lives in the same AppStore as the conversations and must never
+    /// appear as one — its namespace is `chat.outbox`, a dot, precisely so a
+    /// `chat-` prefix scan cannot pick it up.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_conversations_never_lists_the_outbox_as_a_peer() {
+        let (mgr, chat, dir) = test_manager_full("lister", 0);
+        let peer = DeviceId::from("pb-bob");
+        seed_queued_file(&chat, &dir.path().join("outbox-blobs"), &peer, "queued.bin");
+
+        let out = mgr.chat_conversations(&json!({})).expect("conversations");
+        let peers = out["peers"].as_array().expect("peers array").clone();
+        assert_eq!(peers.len(), 1, "{peers:?}");
+        assert_eq!(peers[0]["peer_id"], "pb-bob");
     }
 }

@@ -126,6 +126,37 @@ pub fn chat_status_detail(peer_id: &str, message_id: &str, status: &str, error: 
     emit(&ev);
 }
 
+/// How far a file's staging copy has got: the same `chat_status` event, with
+/// `status: "staging"` and one extra `progress` object.
+///
+/// **Deliberately not a new event type.** Staging is a status a row is *in*,
+/// not a different kind of thing happening to it, and a surface already
+/// subscribes to `chat_status` to move that row — a second type would mean
+/// every surface learning a second vocabulary to render the same bubble, and
+/// a surface that had not yet learned it would show a file frozen on
+/// "Staging…" with no bar. `progress` is additive: a consumer that ignores it
+/// sees exactly the `chat_status` event [`chat_status`] already emits.
+///
+/// `total` is the source's size as `begin_file_send` measured it, so
+/// `done`/`total` is a determinate fraction. `done` may exceed it when the
+/// source is being appended to while we copy (a log, a download still
+/// running); a surface should clamp rather than assume, since the truth about
+/// how many bytes exist is only settled when the copy ends.
+///
+/// **Callers must throttle.** Staging reports every 64 KiB — ~262,000 reports
+/// for a 16 GiB file — and this function emits every time it is called. See
+/// `StagingThrottle` in `transfer.rs`, which is what decides.
+pub fn chat_staging(peer_id: &str, message_id: &str, done: u64, total: u64) {
+    emit(&json!({
+        "type": "chat_status",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message_id": message_id,
+        "peer_id": peer_id,
+        "status": "staging",
+        "progress": { "done": done, "total": total },
+    }));
+}
+
 /// Additive PeerSession lifecycle event vocabulary. New `type` strings only —
 /// existing consumers ignore unknown types, so this never breaks the callback
 /// contract. Published so consumers (Dart) can subscribe additively; marked
@@ -216,5 +247,51 @@ mod tests {
         assert_eq!(v["message"]["timestamp"], "2024-01-01T00:00:00Z");
         assert_eq!(v["message"]["body"], "hello");
         assert_eq!(v["message"]["status"], "received");
+    }
+
+    /// Staging progress rides the EXISTING `chat_status` type — a surface that
+    /// already routes those to a row needs no new event kind — and adds the
+    /// `progress` object beside the fields that event always carries.
+    #[test]
+    #[serial_test::serial]
+    fn chat_staging_is_a_chat_status_event_with_an_extra_progress_object() {
+        COLLECTED.lock().unwrap().clear();
+        set_callback(Some(collect));
+        chat_staging("pb-bob", "m9", 4096, 8192);
+        set_callback(None);
+
+        let got: Vec<Value> = COLLECTED
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(got.len(), 1);
+        let v = &got[0];
+        assert_eq!(v["type"], "chat_status", "no new event kind");
+        assert_eq!(v["peer_id"], "pb-bob");
+        assert_eq!(v["message_id"], "m9");
+        assert_eq!(v["status"], "staging");
+        assert_eq!(v["progress"]["done"], 4096);
+        assert_eq!(v["progress"]["total"], 8192);
+        assert!(v["timestamp"].is_string());
+    }
+
+    /// …and the plain status event still carries no `progress`, so a consumer
+    /// can tell "a row is staging, here is how far" from every other status
+    /// change without a second event type.
+    #[test]
+    #[serial_test::serial]
+    fn a_plain_chat_status_carries_no_progress_key() {
+        COLLECTED.lock().unwrap().clear();
+        set_callback(Some(collect));
+        chat_status("pb-bob", "m9", "sent");
+        set_callback(None);
+
+        let v: Value =
+            serde_json::from_str(&COLLECTED.lock().unwrap()[0]).expect("one status event");
+        assert_eq!(v["type"], "chat_status");
+        assert!(v["progress"].is_null(), "additive: absent unless staging");
+        assert!(v["error"].is_null());
     }
 }

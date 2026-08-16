@@ -2364,3 +2364,329 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
 
     pb_shutdown();
 }
+
+/// Every `chat_status` event captured for `msg_id` that carries a `progress`
+/// object — i.e. the staging bar's updates, as distinct from the plain
+/// `staging`/`pending`/terminal status changes riding the same event type.
+fn staging_progress_events(msg_id: &str) -> Vec<Value> {
+    events_snapshot()
+        .into_iter()
+        .filter(|v| {
+            v["type"] == "chat_status" && v["message_id"] == msg_id && !v["progress"].is_null()
+        })
+        .collect()
+}
+
+/// **A staging copy reports its progress, on the event surface that already
+/// exists.** A multi-GB attach must show a determinate bar rather than looking
+/// hung, and the updates must ride the existing `chat_status` type so no
+/// surface needs to learn a second event kind to render the same bubble.
+///
+/// The peer is deliberately absent: staging happens before anything is dialed,
+/// so nothing here depends on a network at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn staging_a_file_reports_growing_progress_on_the_chat_status_event() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49918, dir.path());
+
+    let peer_id = "staging-watcher";
+    // Big enough that the copy takes many 64 KiB buffers (64 of them), so the
+    // reports the throttle sees are a stream rather than a single event.
+    let size = 4 * 1024 * 1024;
+    let src = dir.path().join("recording.mov");
+    std::fs::write(&src, vec![7u8; size]).unwrap();
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": 49978,
+    });
+
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    assert_eq!(sent["ok"], true, "chat_send_file: {sent}");
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    // The row is announced as `staging` the moment the call returns — before
+    // any bytes are copied — so an attach never looks like a hang.
+    assert!(
+        wait_event(10, |v| {
+            v["type"] == "chat_status" && v["message_id"] == id.as_str() && v["status"] == "staging"
+        })
+        .is_some(),
+        "a file being staged must say so"
+    );
+
+    // …and the copy reports how far it has got, on that same event.
+    assert!(
+        wait_until(20, || staging_progress_events(&id).len() >= 2).await,
+        "staging must report progress, not just its start: {:?}",
+        staging_progress_events(&id)
+    );
+    let progress = staging_progress_events(&id);
+    let done: Vec<u64> = progress
+        .iter()
+        .map(|v| v["progress"]["done"].as_u64().expect("done"))
+        .collect();
+    assert!(
+        done.windows(2).all(|w| w[1] > w[0]),
+        "progress must grow, never repeat or go backwards: {done:?}"
+    );
+    for v in &progress {
+        assert_eq!(v["status"], "staging", "progress belongs to a staging row");
+        assert_eq!(v["peer_id"], peer_id);
+        assert_eq!(
+            v["progress"]["total"].as_u64(),
+            Some(size as u64),
+            "the bar is determinate: done out of total"
+        );
+    }
+    assert_eq!(
+        done.last().copied(),
+        Some(size as u64),
+        "the bar must reach 100%, not stop wherever the throttle last fired"
+    );
+    assert!(
+        progress.len() <= 8,
+        "the throttle must not relay all 64 reports: {} emitted",
+        progress.len()
+    );
+
+    // And the row leaves `staging` for the queue with an event of its own —
+    // without it a determinate bar would sit at 100% forever, since the surface
+    // has nothing else to tell it the copy finished.
+    assert!(
+        wait_event(20, |v| {
+            v["type"] == "chat_status" && v["message_id"] == id.as_str() && v["status"] == "pending"
+        })
+        .is_some(),
+        "a staged file must announce that it is queued"
+    );
+    assert_eq!(chat_row(peer_id, &id).expect("row")["status"], "pending");
+
+    pb_shutdown();
+}
+
+/// **Cancelling a queued file lets go of everything it was holding.** The entry
+/// leaves the queue, the staged bytes are deleted, and the row settles `failed`
+/// — a file the user called off must not sit in the outbox waiting for a peer
+/// that may appear days later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn chat_cancel_lets_go_of_a_queued_file_and_leaves_the_others_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49919, dir.path());
+
+    let peer_id = "cancel-peer";
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": 49979,
+    });
+    let mut ids = Vec::new();
+    for n in 0..2u8 {
+        let src = dir.path().join(format!("draft-{n}.zip"));
+        std::fs::write(&src, vec![n; 2048]).unwrap();
+        let sent = call_json(
+            pb_chat_send_file,
+            &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+        );
+        assert_eq!(sent["ok"], true, "chat_send_file: {sent}");
+        ids.push(sent["data"]["id"].as_str().unwrap().to_string());
+    }
+    for id in &ids {
+        wait_chat_status(20, peer_id, id, "pending").expect("both files queue for an absent peer");
+    }
+    assert_eq!(staged_blobs(dir.path()), 2, "both are staged");
+
+    // Cancel the second one only.
+    let out = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": ids[1] }),
+    );
+    assert_eq!(out["ok"], true, "chat_cancel: {out}");
+    assert_eq!(out["data"]["cancelled"], true);
+
+    let row = wait_chat_status(10, peer_id, &ids[1], "failed")
+        .expect("a cancelled file's row must settle failed, not spin");
+    assert_eq!(row["kind"], "file");
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 1).await,
+        "the cancelled file's bytes must be deleted and the other's kept"
+    );
+    assert!(
+        std::path::Path::new(&dir.path().join("data").join("outbox-blobs").join(&ids[0])).exists(),
+        "the file that was not cancelled keeps its bytes"
+    );
+    assert_eq!(
+        chat_row(peer_id, &ids[0]).expect("row")["status"],
+        "pending",
+        "and stays queued"
+    );
+
+    // Cancelling again stopped nothing, and says so rather than reporting a
+    // success it did not earn.
+    let again = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": ids[1] }),
+    );
+    assert_eq!(again["data"]["cancelled"], false);
+
+    // An id that was never a message, and one that could never be a file name,
+    // are treated differently on purpose: the first is a no-op a surface should
+    // not have to handle, the second is a caller bug.
+    let unknown = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": "1785559080834abcdef0123456789" }),
+    );
+    assert_eq!(unknown["ok"], true);
+    assert_eq!(unknown["data"]["cancelled"], false);
+    let hostile = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": "../../../etc/passwd" }),
+    );
+    assert_eq!(hostile["ok"], false, "{hostile}");
+    assert_eq!(hostile["error"]["code"], "invalid_argument");
+
+    pb_shutdown();
+}
+
+/// **Cancelling a file whose bytes are already moving stops the transfer too.**
+///
+/// The peer takes the offer and never receives the stream, so the send leg is
+/// genuinely in flight (blocked on `Control::ResumeAck`) for as long as the test
+/// wants it to be. Cancel must reach *that* — not just the queue — and leave
+/// nothing queued, nothing staged, and a row that says what happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49920, dir.path());
+
+    let peer_id = "cancel-stall-peer";
+    let peer_port: u16 = 49980;
+    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
+    });
+
+    let src = dir.path().join("in-flight.iso");
+    std::fs::write(&src, vec![9u8; 8192]).unwrap();
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+
+    assert!(
+        wait_until(25, || !offers.lock().unwrap().is_empty()).await,
+        "the file must actually be in flight for this test to mean anything"
+    );
+    assert!(
+        wait_until(10, || chat_row(peer_id, &id)
+            .map(|r| r["status"] == "transferring")
+            .unwrap_or(false))
+        .await,
+        "the row must read transferring before we cancel it"
+    );
+
+    let out = call_json(
+        pb_chat_cancel,
+        &json!({ "peer_id": peer_id, "message_id": id }),
+    );
+    assert_eq!(out["ok"], true, "chat_cancel: {out}");
+    assert_eq!(out["data"]["cancelled"], true);
+
+    assert!(
+        wait_until(10, || chat_row(peer_id, &id)
+            .map(|r| r["status"] == "failed")
+            .unwrap_or(false))
+        .await,
+        "a cancelled transfer's row must settle, not spin: {:?}",
+        chat_row(peer_id, &id)
+    );
+    assert!(
+        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        "a cancelled file's staged bytes must be deleted"
+    );
+    // The transfer is gone from the active registry, so nothing is still moving.
+    let active = take(pb_transfers_active());
+    let list = active["data"]["transfers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !list.iter().any(|t| t["id"] == id.as_str()),
+        "the cancelled transfer must not still be registered: {list:?}"
+    );
+
+    // Prod the drain: a cancelled file is never offered again.
+    let text = call_json(
+        pb_chat_send,
+        &json!({ "peer": peer_json, "text": "still here?" }),
+    );
+    let tid = text["data"]["id"].as_str().unwrap().to_string();
+    wait_chat_status(20, peer_id, &tid, "sent");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        offers.lock().unwrap().iter().filter(|r| r.id == id).count(),
+        1,
+        "a cancelled file must never be re-offered"
+    );
+
+    pb_shutdown();
+}
+
+/// **A conversation is reachable even when its peer is not.** The list is built
+/// from the threads that exist on disk, so a peer discovery cannot see right
+/// now — the whole point of an offline queue — still has a thread the user can
+/// open. A file-only thread is the sharp case: before this, a conversation whose
+/// only row was a queued attachment could not be found from anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn chat_conversations_lists_a_peer_whose_only_row_is_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49921, dir.path());
+
+    // Nothing at all yet.
+    let empty = call_json(pb_chat_conversations, &json!({}));
+    assert_eq!(empty["ok"], true, "chat_conversations: {empty}");
+    assert_eq!(
+        empty["data"]["peers"].as_array().map(Vec::len),
+        Some(0),
+        "no conversations yet: {empty}"
+    );
+
+    let peer_id = "listed-peer";
+    let peer_json = json!({
+        "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": 49981,
+    });
+    let src = dir.path().join("only-row.bin");
+    std::fs::write(&src, vec![1u8; 1024]).unwrap();
+    let sent = call_json(
+        pb_chat_send_file,
+        &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
+    );
+    let id = sent["data"]["id"].as_str().unwrap().to_string();
+    wait_chat_status(20, peer_id, &id, "pending").expect("the file queues for an absent peer");
+
+    let listed = call_json(pb_chat_conversations, &json!({}));
+    assert_eq!(listed["ok"], true, "chat_conversations: {listed}");
+    let peers = listed["data"]["peers"].as_array().cloned().unwrap();
+    assert_eq!(peers.len(), 1, "one thread, and not the outbox: {peers:?}");
+    assert_eq!(peers[0]["peer_id"], peer_id);
+    assert!(
+        peers[0]["last_timestamp"].is_string(),
+        "the thread reports when it last had traffic: {:?}",
+        peers[0]
+    );
+    assert_eq!(
+        peers[0]["unread_hint"], 0,
+        "our own outgoing file is not something the thread is waiting on us for"
+    );
+
+    // The call takes no arguments: a null pointer is a call, not a JSON error.
+    let no_args = take(unsafe { pb_chat_conversations(std::ptr::null()) });
+    assert_eq!(no_args["ok"], true, "null argument: {no_args}");
+    assert_eq!(no_args["data"]["peers"].as_array().map(Vec::len), Some(1));
+
+    pb_shutdown();
+}

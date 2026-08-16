@@ -356,6 +356,47 @@ pub unsafe extern "C" fn pb_chat_reconcile(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_reconcile(&read_json(json)?))()))
 }
 
+/// Every conversation this device holds:
+/// `{peers:[{peer_id,last_timestamp,unread_hint}]}`, newest first. Takes no
+/// arguments — pass `{}` or null.
+///
+/// Derived from the conversation namespaces that exist, so a peer discovery
+/// cannot see right now still has an openable thread. `unread_hint` is the
+/// number of inbound file offers still awaiting a decision in that thread —
+/// **not** a count of unread messages, which PeerBeam has no read receipts to
+/// compute (see `Manager::chat_conversations`).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_conversations(json: *const c_char) -> *mut c_char {
+    // `read_json_or_empty`, not `read_json`: this call takes no arguments, so a
+    // null pointer must be a call with no arguments rather than a JSON error
+    // (same as `pb_channels_json` and `pb_logs_get`).
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.chat_conversations(&read_json_or_empty(json))
+        })())
+    })
+}
+
+/// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
+///
+/// Stops the staging copy if one is running, stops the transfer if the bytes
+/// are moving, dequeues the entry, deletes the staged blob, and settles the row
+/// `failed` with reason `cancelled`. Safe in every state, including an
+/// already-settled or unknown id — those are a clean `{cancelled:false}`, not
+/// an error. Only ever reaches this device's **own outgoing** share in the named
+/// peer's thread; an inbound offer is refused with the approval prompt, never
+/// here.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_cancel(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_cancel(&read_json(json)?))()))
+}
+
 // ── clipboard ───────────────────────────────────────────────────
 
 /// Current clipboard item, or `{item:null}`.
