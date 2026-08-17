@@ -2653,6 +2653,134 @@ mod tests {
         assert_eq!(queued[0].message_id, theirs.id);
     }
 
+    /// Seed a conversation for `peer` whose namespace holds a settled INBOUND
+    /// file row keyed by `r` — a row keyed by an id **the peer chose**, since
+    /// an inbound row's key in our own namespace is the sender's `FileRef.id`.
+    ///
+    /// That is what makes an id collision across two conversations ordinary
+    /// rather than exotic, and it is the shape [`KeepRule`]'s peer filter
+    /// exists for.
+    fn seed_inbound_file(cs: &ChatStore, peer: &DeviceId, r: &FileRef) {
+        let mut received = ChatRecord::file_in(peer, r);
+        received.status = Status::Received;
+        cs.append(&received).unwrap();
+    }
+
+    /// **THE PEER FILTER.** The outbox is shared by every conversation, so a
+    /// keep set built without asking whose entry it is looking at keeps the
+    /// wrong rows.
+    ///
+    /// A `message_id` is unique only within the peer that minted it, and an
+    /// inbound row's key in our namespace is the **sender's** id — so two
+    /// conversations naming the same id is a value one of the peers chose, not
+    /// a coincidence worth discounting. Without the filter, Bob's queued entry
+    /// keeps CAROL's row alive: her thread survives every delete, stays listed
+    /// and undeletable until Bob comes back, and the user is told a queued
+    /// message was kept for a conversation with nothing queued in it.
+    ///
+    /// Both peers hold a **decodable** queued entry here, deliberately. A
+    /// second peer with nothing in the outbox — or with nothing the decoder can
+    /// read — leaves the filtered and unfiltered rules indistinguishable, which
+    /// is exactly how this went unpinned.
+    #[test]
+    fn delete_conversation_ignores_another_peers_queued_entry() {
+        let (cs, _store, tmp) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let carol = DeviceId::from("pb-carol");
+
+        // Bob has a file queued, so the outbox holds a decodable entry keyed by
+        // its message id.
+        let shared = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &shared.id);
+        cs.append(&ChatRecord::file_out(
+            &bob,
+            &shared,
+            FileMeta::new(&shared.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(cs
+            .enqueue_file(
+                &bob,
+                &shared,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob,
+                },
+            )
+            .unwrap());
+
+        // Carol sent us a file whose own id happens to be that same value, and
+        // separately has a text of ours queued for her — a decodable entry of
+        // her own, so this is not "one peer has a queue and one does not".
+        seed_inbound_file(&cs, &carol, &shared);
+        let hers = ChatMessage::new("see you soon").unwrap();
+        cs.enqueue(&carol, &hers).unwrap();
+        assert_eq!(cs.history(&carol).unwrap().len(), 2);
+
+        assert_eq!(
+            cs.delete_conversation(&carol).unwrap(),
+            1,
+            "the row Bob's queue happens to name is still Carol's to delete"
+        );
+
+        let left = cs.history(&carol).unwrap();
+        assert_eq!(left.len(), 1, "only her own queued text survives: {left:?}");
+        assert_eq!(left[0].id, hers.id);
+
+        // Bob's conversation is untouched, and so is the entry behind it.
+        assert_eq!(cs.history(&bob).unwrap().len(), 1);
+        assert_eq!(cs.outbox_for(&bob).unwrap().len(), 1);
+    }
+
+    /// The same filter, in selection form — and here it is `kept` that lies.
+    /// Naming Carol's row as kept tells the user a file they turned down is
+    /// still on its way out, and refuses to delete it on that basis.
+    #[test]
+    fn delete_messages_ignores_another_peers_queued_entry() {
+        let (cs, _store, tmp) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let carol = DeviceId::from("pb-carol");
+
+        let shared = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &shared.id);
+        cs.append(&ChatRecord::file_out(
+            &bob,
+            &shared,
+            FileMeta::new(&shared.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(cs
+            .enqueue_file(
+                &bob,
+                &shared,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob,
+                },
+            )
+            .unwrap());
+
+        seed_inbound_file(&cs, &carol, &shared);
+        let hers = ChatMessage::new("see you soon").unwrap();
+        cs.enqueue(&carol, &hers).unwrap();
+
+        let (removed, kept) = cs
+            .delete_messages(&carol, &[shared.id.clone(), hers.id.clone()])
+            .unwrap();
+        assert_eq!(removed, 1, "Bob's queue does not protect Carol's row");
+        assert_eq!(
+            kept,
+            vec![hers.id.clone()],
+            "and only what CAROL's queue backs is reported kept: {kept:?}"
+        );
+        assert!(cs.get(&carol, &shared.id).unwrap().is_none());
+        assert_eq!(cs.outbox_for(&bob).unwrap().len(), 1, "Bob still queued");
+    }
+
     /// THE OTHER TRAP: the keep set must be **complete**. The lenient outbox
     /// readers skip an entry they cannot decode, so a wholly-unreadable outbox
     /// reads back as "nothing is queued" — and a delete driven by that would
@@ -2771,56 +2899,120 @@ mod tests {
         let peer = DeviceId::from("pb-bob");
         let settled = seed_settled(&cs, &peer, 2);
 
-        let queued = FileRef::new("waiting.mkv", 30).unwrap();
-        let (_staging, blob) = staged_blob(tmp.path(), &queued.id);
-        cs.append(&ChatRecord::file_out(
-            &peer,
-            &queued,
-            FileMeta::new(&queued.name, 30, None),
-            Status::Staging,
-        ))
-        .unwrap();
-        assert!(
-            cs.enqueue_file(
+        // TWO queued files, not one. A `kept` that reported only its first id —
+        // and a surface that then said "1 kept" about two — is invisible
+        // against a one-element list, so every id it is asked about is asked
+        // about twice over.
+        let mut queued = Vec::new();
+        let mut blobs = Vec::new();
+        for name in ["waiting.mkv", "also-waiting.iso"] {
+            let r = FileRef::new(name, 30).unwrap();
+            let (_staging, blob) = staged_blob(tmp.path(), &r.id);
+            cs.append(&ChatRecord::file_out(
                 &peer,
-                &queued,
-                &StagedFile {
-                    name: "waiting.mkv".into(),
-                    size: 30,
-                    staged_path: blob.clone(),
-                },
-            )
-            .unwrap(),
-            "the row seeded above is there, so it queues"
-        );
+                &r,
+                FileMeta::new(&r.name, 30, None),
+                Status::Staging,
+            ))
+            .unwrap();
+            assert!(
+                cs.enqueue_file(
+                    &peer,
+                    &r,
+                    &StagedFile {
+                        name: name.into(),
+                        size: 30,
+                        staged_path: blob.clone(),
+                    },
+                )
+                .unwrap(),
+                "the row seeded above is there, so it queues"
+            );
+            queued.push(r);
+            blobs.push(blob);
+        }
 
         let (removed, kept) = cs
-            .delete_messages(&peer, &[settled[0].clone(), queued.id.clone()])
+            .delete_messages(
+                &peer,
+                &[
+                    settled[0].clone(),
+                    queued[0].id.clone(),
+                    queued[1].id.clone(),
+                ],
+            )
             .unwrap();
         assert_eq!(removed, 1, "the settled message, and only that");
         assert_eq!(
             kept,
-            vec![queued.id.clone()],
-            "the queued file is named, not just counted"
+            vec![queued[0].id.clone(), queued[1].id.clone()],
+            "BOTH queued files are named, not just counted and not just the \
+             first: {kept:?}"
         );
 
-        // The consequence, not just the row. `reopen_for_retry` is the exact
+        // The consequence, not just the rows. `reopen_for_retry` is the exact
         // step the drain takes before sending a queued file; a `false` here is
         // the state in which it releases the entry and deletes the bytes.
-        assert!(
-            cs.reopen_for_retry(&peer, &queued.id).unwrap(),
-            "the queue must still be able to deliver the file it kept"
-        );
-        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "still queued");
-        assert!(
-            std::path::Path::new(&blob).exists(),
-            "a queued file's only copy must survive deleting its bubble"
-        );
+        for r in &queued {
+            assert!(
+                cs.reopen_for_retry(&peer, &r.id).unwrap(),
+                "the queue must still be able to deliver every file it kept"
+            );
+        }
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 2, "still queued");
+        for blob in &blobs {
+            assert!(
+                std::path::Path::new(blob).exists(),
+                "a queued file's only copy must survive deleting its bubble"
+            );
+        }
         assert_eq!(
             cs.outbox_owned_blobs().unwrap().len(),
-            1,
-            "and the queue still owns it, so no sweep will collect it either"
+            2,
+            "and the queue still owns them, so no sweep will collect them"
         );
+    }
+
+    /// A queued DECLINE must not be kept here either — and this is where it
+    /// bites hardest, because `delete_messages` reports the ids it kept.
+    ///
+    /// The decline's `message_id` is the **sender's** `FileRef` id, which in
+    /// our own namespace names the INBOUND row we refused. Keeping it puts that
+    /// id in `kept`, so the surface tells the user a file they **turned down**
+    /// is still on its way out, and refuses to delete the bubble on that basis.
+    #[test]
+    fn delete_messages_does_not_keep_an_inbound_row_for_a_queued_decline() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = seed_settled(&cs, &peer, 1);
+
+        // Bob offered a file, we declined, and Bob had already dropped — so the
+        // refusal is queued for whenever he returns.
+        let theirs = FileRef::new("theirs.iso", 900).unwrap();
+        let mut declined = ChatRecord::file_in(&peer, &theirs);
+        declined.status = Status::Declined;
+        cs.append(&declined).unwrap();
+        assert!(cs
+            .enqueue_decline(&peer, &FileDecline::new(&theirs.id))
+            .unwrap());
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[settled[0].clone(), theirs.id.clone()])
+            .unwrap();
+        assert_eq!(removed, 2, "the declined row is the user's to delete");
+        assert!(
+            kept.is_empty(),
+            "nothing the user turned down is 'still being sent': {kept:?}"
+        );
+        assert!(cs.history(&peer).unwrap().is_empty());
+
+        // The decline itself is untouched — still queued, still a decline. It
+        // needs no record: `flush_to_session` builds the `FileDecline` from the
+        // entry alone.
+        let queued = cs.outbox_for(&peer).unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].kind, Kind::Decline);
+        assert_eq!(queued[0].message_id, theirs.id);
     }
 
     /// **THE STAGING WINDOW, in selection form.** `begin_file_send` writes the
@@ -2912,11 +3104,28 @@ mod tests {
 
         // A repeated id is answered once, so a caller that sent the same
         // selection twice over cannot inflate its own report.
+        //
+        // The duplicate is a KEPT id on purpose. Duplicating a removable one
+        // proves nothing: the row is gone by the second pass, so the second
+        // answer is "not there" whether or not anything deduplicates — the
+        // dedup is unobservable and deleting it leaves the suite green. A kept
+        // id is answered from a row that is still there both times, so a
+        // missing dedup shows up directly as the count the user is given:
+        // a double-tapped selection reporting "2 kept" for one file.
+        let queued = ChatMessage::new("not sent yet").unwrap();
+        cs.enqueue(&peer, &queued).unwrap();
         let (removed, kept) = cs
-            .delete_messages(&peer, &[ids[1].clone(), ids[1].clone()])
+            .delete_messages(
+                &peer,
+                &[ids[1].clone(), queued.id.clone(), queued.id.clone()],
+            )
             .unwrap();
         assert_eq!(removed, 1);
-        assert!(kept.is_empty());
+        assert_eq!(
+            kept,
+            vec![queued.id.clone()],
+            "one entry for one file, however many times it was asked for"
+        );
     }
 
     /// A row this build cannot decode is still the user's to delete — and it is

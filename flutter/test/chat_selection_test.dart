@@ -17,6 +17,7 @@ import 'dart:io';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
@@ -581,6 +582,74 @@ void main() {
       findsOneWidget,
       reason:
           'nothing was sent, so the selection is still the user\'s to act on',
+    );
+  });
+
+  // FORWARDING TO A SAVED PICK. The device picker offers saved (by-address)
+  // entries alongside discovered ones, and a saved entry's id is a locally
+  // minted timestamp the peer has never heard of. Filing forwarded rows under
+  // it would create a thread every inbound record misses — replies are keyed by
+  // the authenticated device id — so the pick is resolved back to a discovered
+  // identity by the address it advertises, the same rule the Home screen
+  // applies before it will open a conversation at all.
+  testWidgets('a Saved pick is forwarded under the DISCOVERED device id, never '
+      'the saved entry\'s synthetic one', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [_text('m1', 'first')];
+    final state = await _open(tester, fake);
+    final saved = await state.saved.add(
+      name: 'Server',
+      host: '127.0.0.1',
+      port: 49600,
+    );
+    // The same box turns up on discovery, at the saved address.
+    fake.emit(const DeviceAdded(_laptop));
+    await tester.pumpAndSettle();
+
+    await _longPress(tester, 'first');
+    await _forwardTo(tester, 'Server');
+
+    expect(fake.calls.where((c) => c.startsWith('chatSend')).toList(), [
+      'chatSend:first',
+    ]);
+    expect(
+      fake.chatHistories['x1'],
+      hasLength(1),
+      reason: 'filed under the id the peer will actually write back into',
+    );
+    expect(
+      fake.chatHistories.containsKey(saved.id),
+      isFalse,
+      reason: 'and never under the locally minted one',
+    );
+    expect(find.text('Forwarded 1 message to Server'), findsOneWidget);
+  });
+
+  testWidgets('a Saved pick discovery cannot see is refused, and nothing is '
+      'forwarded', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [_text('m1', 'first')];
+    final state = await _open(tester, fake);
+    // No discovered device at this address — nothing here can name a real
+    // conversation, and guessing one is what the resolution exists to refuse.
+    await state.saved.add(name: 'Headless Box', host: '10.0.0.5', port: 49600);
+    await tester.pumpAndSettle();
+
+    await _longPress(tester, 'first');
+    await _forwardTo(tester, 'Headless Box');
+
+    expect(fake.calls.any((c) => c.startsWith('chatSend')), isFalse);
+    expect(
+      find.textContaining('Cannot forward to Headless Box yet'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('1 selected'),
+      findsOneWidget,
+      reason: 'nothing was sent, so the selection is still the user\'s to act '
+          'on',
     );
   });
 

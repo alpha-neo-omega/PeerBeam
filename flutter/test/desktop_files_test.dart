@@ -53,6 +53,17 @@ void main() {
       return call!;
     }
 
+    tearDown(() {
+      // Cleared, not left behind: the mock handler is registered on the
+      // binding's process-global messenger, so a stale one goes on answering
+      // `peerbeam/android` for every later test in this file and any other.
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('peerbeam/android'),
+            null,
+          );
+    });
+
     testWidgets(
       'any sends no argument at all — an older native build (or a caller '
       'that only understands a bare call) still gets the wildcard picker',
@@ -75,8 +86,10 @@ void main() {
 
   group('Desktop: pickFilesToStage(kind:) builds XTypeGroup filters', () {
     late _FakeFileSelector fake;
+    late FileSelectorPlatform realInstance;
 
     setUp(() {
+      realInstance = FileSelectorPlatform.instance;
       fake = _FakeFileSelector();
       FileSelectorPlatform.instance = fake;
       // file_selector only takes the file_selector_android branch when the
@@ -87,6 +100,11 @@ void main() {
     });
 
     tearDown(() {
+      // Restored, not merely abandoned: `FileSelectorPlatform.instance` is
+      // process-global, so a fake left in place is one every later test picks
+      // up — and one that answers every `openFiles` with an empty list, which
+      // reads as a cancelled picker rather than as a broken fixture.
+      FileSelectorPlatform.instance = realInstance;
       debugDefaultTargetPlatformOverride = null;
     });
 
@@ -107,6 +125,13 @@ void main() {
       expect(group.mimeTypes, ['image/*', 'video/*']);
       expect(group.extensions, contains('jpg'));
       expect(group.extensions, contains('mp4'));
+      // And never the audio list. Asserting only what is present is an
+      // assertion that cannot fail: folding every extension into one group
+      // would satisfy it while offering the user music under "Photos &
+      // videos", which is the mapping this file exists to pin.
+      for (final ext in ['mp3', 'flac', 'wav']) {
+        expect(group.extensions, isNot(contains(ext)));
+      }
     });
 
     test('audio\'s group carries both mimeTypes and extensions', () async {
@@ -115,7 +140,9 @@ void main() {
       expect(group.mimeTypes, ['audio/*']);
       expect(group.extensions, contains('mp3'));
       // Never the video/image list under the audio choice.
-      expect(group.extensions, isNot(contains('mp4')));
+      for (final ext in ['mp4', 'jpg']) {
+        expect(group.extensions, isNot(contains(ext)));
+      }
     });
   });
 }

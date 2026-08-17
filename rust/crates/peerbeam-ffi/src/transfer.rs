@@ -6607,10 +6607,13 @@ mod tests {
             .expect("seed history");
 
         for bad in [json!({}), json!({ "peer_id": "" }), json!({ "peer_id": 7 })] {
-            let err = mgr
-                .chat_delete(&bad)
-                .expect_err("peer_id is required: {bad}");
-            assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());
+            // A `let`-else rather than `expect_err`, whose message is a `&str`:
+            // `expect_err("…: {bad}")` printed the braces literally, so a
+            // regression named none of the cases it was walking through.
+            let Err(err) = mgr.chat_delete(&bad) else {
+                panic!("peer_id is required, but {bad} was accepted");
+            };
+            assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str(), "{bad}");
         }
         assert_eq!(
             chat.history(&peer).expect("history").len(),
@@ -6705,9 +6708,13 @@ mod tests {
     }
 
     /// The JSON in and out, and the one thing that makes the `kept` list worth
-    /// returning: a selection that mixes settled history with a still-queued
-    /// file removes the first, keeps the second, and **names** it — while the
-    /// drain's own predicate still says the queued file can be delivered.
+    /// returning: a selection that mixes settled history with still-queued
+    /// files removes the first, keeps the rest, and **names** them — while the
+    /// drain's own predicate still says each queued file can be delivered.
+    ///
+    /// TWO queued files, deliberately. Against a one-element `kept` a bug that
+    /// reported only the first id is invisible, and the surface built on it
+    /// would tell the user "1 kept" about two files it could not delete.
     #[tokio::test]
     #[serial_test::serial]
     async fn chat_delete_messages_removes_the_settled_and_names_what_it_kept() {
@@ -6721,30 +6728,31 @@ mod tests {
                 .expect("seed history");
             settled.push(m.id);
         }
-        let (queued_id, blob) = seed_queued_file(
-            &chat,
-            &dir.path().join("outbox-blobs"),
-            &peer,
-            "waiting.mkv",
-        );
+        let blob_root = dir.path().join("outbox-blobs");
+        let (first_id, first_blob) = seed_queued_file(&chat, &blob_root, &peer, "waiting.mkv");
+        let (second_id, second_blob) =
+            seed_queued_file(&chat, &blob_root, &peer, "also-waiting.iso");
 
-        let out = delete_messages(&mgr, "pb-bob", &[&settled[0], &queued_id]).expect("delete");
+        let out =
+            delete_messages(&mgr, "pb-bob", &[&settled[0], &first_id, &second_id]).expect("delete");
         assert_eq!(
             out["removed"], 1,
             "the settled message, and only that: {out}"
         );
         assert_eq!(
             out["kept"],
-            json!([queued_id]),
-            "the kept id is named, not counted: {out}"
+            json!([first_id, second_id]),
+            "EVERY kept id is named, not counted and not just the first: {out}"
         );
 
         // The drain's own decision, unchanged by the delete.
-        assert!(
-            mgr.row_may_still_deliver(&peer, &queued_id),
-            "a missing row here is what makes `run_queued_file` throw the bytes away"
-        );
-        assert!(blob.exists(), "and the staged bytes are still on disk");
+        for (id, blob) in [(&first_id, &first_blob), (&second_id, &second_blob)] {
+            assert!(
+                mgr.row_may_still_deliver(&peer, id),
+                "a missing row here is what makes `run_queued_file` throw the bytes away"
+            );
+            assert!(blob.exists(), "and the staged bytes are still on disk");
+        }
 
         // Not a no-op, and not over-broad: the unselected message stays.
         let left: Vec<String> = chat
@@ -6753,9 +6761,10 @@ mod tests {
             .into_iter()
             .map(|r| r.id)
             .collect();
-        assert_eq!(left.len(), 2, "{left:?}");
+        assert_eq!(left.len(), 3, "{left:?}");
         assert!(left.contains(&settled[1]), "the unselected row survives");
-        assert!(left.contains(&queued_id));
+        assert!(left.contains(&first_id));
+        assert!(left.contains(&second_id));
     }
 
     /// An id in no thread at all is neither removed nor kept — a surface must
@@ -6796,9 +6805,12 @@ mod tests {
             json!({ "peer_id": "pb-bob", "message_ids": [7] }),
             json!({ "peer_id": "pb-bob", "message_ids": [""] }),
         ] {
-            let err = mgr
-                .chat_delete_messages(&bad)
-                .expect_err("must be refused: {bad}");
+            // A `let`-else rather than `expect_err`, whose message is a `&str`:
+            // `expect_err("…: {bad}")` printed the braces literally, so a
+            // regression named none of the six cases it was walking through.
+            let Err(err) = mgr.chat_delete_messages(&bad) else {
+                panic!("must be refused, but {bad} was accepted");
+            };
             assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str(), "{bad}");
         }
         assert_eq!(
