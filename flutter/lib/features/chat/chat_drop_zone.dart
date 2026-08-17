@@ -49,39 +49,86 @@ class ChatDropZone extends StatefulWidget {
 class _ChatDropZoneState extends State<ChatDropZone> {
   bool _active = false;
 
-  /// The enclosing [DropZone]'s claim register, and whether this zone is
-  /// currently counted in it.
+  /// The enclosing [DropZone]'s claim register.
   ///
   /// The shell wraps everything in a [DropZone], and `desktop_drop` delivers a
   /// drop to every mounted target rather than only the innermost — so without
   /// claiming, dropping on a conversation both sent the file to the peer and
   /// staged it for the Send flow. Claiming makes this zone the only one that
-  /// answers while the conversation is open.
-  ValueNotifier<int>? _claims;
-  bool _claimed = false;
+  /// answers while the conversation is on screen.
+  ValueNotifier<int>? _register;
+
+  /// The register this zone is actually counted in, or null while it holds no
+  /// claim.
+  ///
+  /// The single source of truth for whether a decrement is owed, and never
+  /// anything but [_register]: a separate boolean beside it could disagree with
+  /// it, and the direction it disagrees in is either an outer zone left
+  /// permanently deaf to drops or a count it can never clear.
+  ValueNotifier<int>? _held;
+
+  /// Whether this conversation is the one the user is actually looking at.
+  bool _visible = true;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_claims != null) return;
-    final claims = DropClaims.maybeOf(context);
-    if (claims == null) return;
-    _claims = claims;
-    // After the frame, never during it: this runs while the screen is being
-    // built, and notifying a listener that rebuilds mid-build is an error.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _claimed = true;
-      claims.value++;
-    });
+    _register ??= DropClaims.maybeOf(context);
+    _visible = _onScreen();
+    _reconcile();
+  }
+
+  /// Whether a drop made right now would land on *this* conversation.
+  ///
+  /// **Mounted is not the same as on screen**, and the gap between the two is
+  /// exactly where a file goes to a peer the user never picked. The app shell
+  /// is a `StatefulShellRoute.indexedStack`, which keeps every navigation
+  /// branch mounted and merely takes the inactive ones offstage — and
+  /// `desktop_drop`'s own gate is `renderBox.paintBounds.contains(…)`, which an
+  /// offstage `IndexedStack` child passes because it is still laid out at full
+  /// size. So a conversation left open on the Chats tab would answer a drop
+  /// made on Home: the file is sent straight to that peer instead of being
+  /// staged for the Send flow, with no prompt and no way back.
+  ///
+  /// Two signals, because there are two ways to stop being on screen:
+  ///
+  ///  * go_router wraps each branch in `Offstage(offstage: !isActive, child:
+  ///    TickerMode(enabled: isActive, …))`, so [TickerMode] reads false for a
+  ///    branch the user has navigated away from;
+  ///  * a route pushed *on top of* this one inside the same branch leaves
+  ///    `TickerMode` true, and is caught by [ModalRoute]'s `isCurrent` instead.
+  ///
+  /// Both are inherited-widget lookups, which is what makes them reactive:
+  /// [didChangeDependencies] runs again the moment either changes. A null route
+  /// counts as visible — a chat shown outside a Navigator (a test, or a future
+  /// secondary window) has nothing on top of it.
+  bool _onScreen() =>
+      TickerMode.valuesOf(context).enabled &&
+      (ModalRoute.of(context)?.isCurrent ?? true);
+
+  /// Hold or release the claim so that it matches what this zone can see right
+  /// now: one path, rather than two mechanisms that could disagree about who
+  /// owns the next drop.
+  ///
+  /// Mutating the register during this screen's own build is deliberate and
+  /// safe: [DropZone] listens to it and defers its own rebuild to after the
+  /// frame, so nothing rebuilds mid-build.
+  void _reconcile() {
+    final wanted = _visible ? _register : null;
+    if (identical(_held, wanted)) return;
+    final held = _held;
+    if (held != null) held.value--;
+    _held = wanted;
+    if (wanted != null) wanted.value++;
   }
 
   @override
   void dispose() {
-    // Only if the claim was actually taken — a screen disposed inside the same
-    // frame it mounted never reached the callback above, and decrementing then
-    // would hand the outer zone a negative count it could never clear.
-    if (_claimed) _claims!.value--;
+    // Only if a claim was actually taken. [_held] is null whenever this zone is
+    // not counted in a register, so this can neither hand the outer zone a
+    // negative count it could never clear nor touch a notifier that has gone.
+    final held = _held;
+    if (held != null) held.value--;
     super.dispose();
   }
 
@@ -94,6 +141,12 @@ class _ChatDropZoneState extends State<ChatDropZone> {
   /// later.
   Future<void> _onDone(DropDoneDetails detail) async {
     setState(() => _active = false);
+    // The second, independent guard on the same question `enable` answers, and
+    // the reason it is worth stating twice: `desktop_drop` chooses which
+    // targets to notify from paint bounds alone, which an offstage branch still
+    // passes, so a claim that failed to be released must not on its own be
+    // enough to make a conversation nobody is looking at answer a drop.
+    if (!_visible) return;
     // Checked before the files are even walked: nothing here can succeed, and
     // saying so once beats staging metadata for a send that cannot be made.
     if (!widget.canSend) {
@@ -146,6 +199,9 @@ class _ChatDropZoneState extends State<ChatDropZone> {
     if (!isDesktop) return widget.child;
 
     return DropTarget(
+      // Off entirely while this conversation is offstage or buried under
+      // another route — see [_onScreen].
+      enable: _visible,
       onDragEntered: (_) => setState(() => _active = true),
       onDragExited: (_) => setState(() => _active = false),
       onDragDone: _onDone,

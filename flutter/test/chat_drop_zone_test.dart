@@ -366,6 +366,175 @@ void main() {
       }
     });
 
+    // THE CASE UNMOUNTING THE CHAT CANNOT REACH. The app shell is a
+    // `StatefulShellRoute.indexedStack`, which keeps EVERY navigation branch
+    // mounted — an inactive one is merely offstage — so "the chat screen is
+    // mounted" and "the user is looking at it" are different questions, and a
+    // drop rides on the second one. go_router mounts each branch as
+    // `Offstage(offstage: !isActive, child: TickerMode(enabled: isActive, …))`
+    // (14.8.1, `lib/src/route.dart`), which is exactly what is built here.
+    //
+    // Replacing the chat with another widget — what the test below does — is a
+    // different scenario entirely and passes either way: it is the
+    // still-mounted-but-offstage case that sent a user's file to whichever
+    // peer's thread happened to be open.
+    group('a branch the user has navigated away from', () {
+      /// One branch of the shell, mounted the way go_router mounts it.
+      Widget branch(bool active, Widget child) => Offstage(
+        offstage: !active,
+        child: TickerMode(enabled: active, child: child),
+      );
+
+      /// The shell at [index]: Home in branch 0, an open conversation in
+      /// branch 1, both mounted, all of it inside the Send flow's `DropZone`.
+      Widget shell(AppState state, int index) => AppScope(
+        state: state,
+        child: MaterialApp(
+          home: DropZone(
+            staging: state.staging,
+            child: IndexedStack(
+              index: index,
+              children: [
+                branch(index == 0, const Scaffold(body: Text('home'))),
+                branch(
+                  index == 1,
+                  const ChatScreen(peerId: 'pb-bob', peer: _peer),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+      DropTarget outerTarget(WidgetTester tester) =>
+          tester.widget<DropTarget>(find.byType(DropTarget).first);
+
+      /// `skipOffstage: false` throughout — the whole point of these tests is
+      /// the branch that is offstage yet still mounted, and the default
+      /// finders would simply not see it, which is a way of missing the bug
+      /// rather than a way of proving it fixed.
+      final chatScreen = find.byType(ChatScreen, skipOffstage: false);
+
+      DropTarget chatTarget(WidgetTester tester) => tester.widget<DropTarget>(
+        find.descendant(
+          of: chatScreen,
+          matching: find.byType(DropTarget, skipOffstage: false),
+          skipOffstage: false,
+        ),
+      );
+
+      /// Settle the shell at [index]: the claim is reconciled during the
+      /// chat's own build, and `DropZone` defers the rebuild that flips
+      /// `enable` to after the frame.
+      Future<void> showBranch(
+        WidgetTester tester,
+        AppState state,
+        int index,
+      ) async {
+        await tester.pumpWidget(shell(state, index));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+      }
+
+      testWidgets('leaves the Send zone owning drops again, and stands its own '
+          'target down', (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        try {
+          final fake = FakePeerBeam();
+          final state = AppState.live(fake);
+          addTearDown(state.dispose);
+
+          await showBranch(tester, state, 1);
+          expect(
+            outerTarget(tester).enable,
+            isFalse,
+            reason: 'the conversation the user is looking at owns drops',
+          );
+
+          // Tap Home. The conversation is not closed — it is merely offstage.
+          await showBranch(tester, state, 0);
+          expect(chatScreen, findsOneWidget, reason: 'still mounted');
+          expect(
+            outerTarget(tester).enable,
+            isTrue,
+            reason: 'a drop on Home belongs to the Send flow again',
+          );
+          expect(
+            chatTarget(tester).enable,
+            isFalse,
+            reason: 'and the offstage conversation answers nothing',
+          );
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+
+      testWidgets('sends nothing when its own handler is driven anyway', (
+        tester,
+      ) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        try {
+          final file = _tempFile(tmp, 'tax-return.pdf', 'private');
+          final fake = FakePeerBeam();
+          final state = AppState.live(fake);
+          addTearDown(state.dispose);
+
+          await showBranch(tester, state, 1);
+          await showBranch(tester, state, 0);
+
+          // The platform would not call a disabled target, but `desktop_drop`
+          // decides who to notify from paint bounds alone — which an offstage
+          // `IndexedStack` child still passes, since it is laid out at full
+          // size. So the handler itself must refuse, not just `enable`.
+          await tester.runAsync(() async {
+            chatTarget(tester).onDragDone!(
+              DropDoneDetails(
+                files: [DropItemFile(file.path)],
+                localPosition: Offset.zero,
+                globalPosition: Offset.zero,
+              ),
+            );
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          });
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(
+            fake.calls.where((c) => c.startsWith('chatSendFile:')),
+            isEmpty,
+            reason: 'a file dropped on Home never goes to an offstage peer',
+          );
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+
+      testWidgets('takes the claim back when the user returns to it', (
+        tester,
+      ) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        try {
+          final fake = FakePeerBeam();
+          final state = AppState.live(fake);
+          addTearDown(state.dispose);
+
+          await showBranch(tester, state, 1);
+          await showBranch(tester, state, 0);
+          expect(outerTarget(tester).enable, isTrue);
+
+          await showBranch(tester, state, 1);
+          expect(
+            outerTarget(tester).enable,
+            isFalse,
+            reason: 'the conversation owns drops again the moment it is back',
+          );
+          expect(chatTarget(tester).enable, isTrue);
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+    });
+
     testWidgets('the Send zone takes drops back once the chat is gone', (
       tester,
     ) async {
