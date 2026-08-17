@@ -15,6 +15,7 @@ mod dto;
 mod error;
 mod events;
 mod logs;
+mod presence;
 mod runtime;
 mod session;
 mod session_exec;
@@ -92,7 +93,7 @@ pub extern "C" fn pb_version_json() -> *mut c_char {
     to_cstring(json!({
         "abi": ABI_VERSION,
         "semver": env!("CARGO_PKG_VERSION"),
-        "features": ["peersession_diagnostics", "transport_diagnostics", "session_events"],
+        "features": ["peersession_diagnostics", "transport_diagnostics", "session_events", "presence"],
     }))
 }
 
@@ -306,6 +307,50 @@ pub extern "C" fn pb_trust_list() -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn pb_trust_remove(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.trust_remove(&read_json(json)?))()))
+}
+
+// ── presence ────────────────────────────────────────────────────
+
+/// Live device presence:
+/// `{sharing:bool, self:{…}, devices:[{device_id, …, received_at, age_seconds}]}`.
+///
+/// A peer that shares nothing appears with its `device_id` and timing only —
+/// the status keys are **omitted**, never `null` or `0`, so a surface can tell
+/// "no battery" from "0% battery". `self` is what this device *would* share, so
+/// a user can see what the opt-in reveals before turning it on; it is not on
+/// the wire while `sharing` is false.
+#[no_mangle]
+pub extern "C" fn pb_presence_json() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.presence_snapshot())()))
+}
+
+/// Push a platform-supplied battery reading: `{percent?, charging?}` → `{ok}`.
+///
+/// For Android, whose `BatteryManager` the Rust platform layer cannot reach —
+/// the Flutter side reads it over the existing `peerbeam/android` method
+/// channel and hands it down here. Omitting `percent` clears the reading, so a
+/// surface that loses battery access stops asserting a stale one. An
+/// out-of-range value is ignored rather than clamped.
+///
+/// This only changes *what* would be shared; it does not share anything. The
+/// opt-in setting and the trusted-only gate are unaffected.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_presence_battery(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            let req = read_json(json)?;
+            let percent = req
+                .get("percent")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|p| u8::try_from(p).ok());
+            let charging = req.get("charging").and_then(serde_json::Value::as_bool);
+            presence::set_battery(percent, charging);
+            Ok(serde_json::json!({ "ok": true }))
+        })())
+    })
 }
 
 // ── chat ────────────────────────────────────────────────────────

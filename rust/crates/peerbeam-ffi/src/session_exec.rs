@@ -11,14 +11,17 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
-use peerbeam_domain::entity::{Device, TransferSession};
+use peerbeam_domain::entity::{Device, RouteKind, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF,
+    CHAT_FEAT_FILEREF, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
+use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
+
+use crate::presence::PresenceWiring;
 use peerbeam_transfer::{
     HandlerRegistry, Identity, IncomingStreamChannel, PeerSession, SessionConfig, SessionHandle,
     SessionRole,
@@ -29,6 +32,7 @@ use crate::error::{from_domain, Code};
 
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
+const PRESENCE: ChannelType = ChannelType::PRESENCE;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
 /// every accept call site in this codebase registers this (built via
@@ -70,10 +74,21 @@ pub struct ChatWiring {
 /// simply advertises `0`, the intersection clears the bit, and
 /// [`Session::supports_file_ref`] / [`caps_support_file_decline`] report false
 /// for it.
-fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
+///
+/// PRESENCE advertises [`PRESENCE_FEAT_STATUS`] on the same terms: this build
+/// understands a device status heartbeat. Advertising it says nothing about
+/// whether this device *sends* one — that is the opt-in setting's business, and
+/// it is off by default. The bit asserts comprehension, so a device sharing
+/// nothing still advertises it truthfully and still shows everyone else's
+/// status.
+fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
     let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
-    if let Some(h) = chat_handler {
-        cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
+    if !handlers.is_empty() {
+        let mut reg = HandlerRegistry::new();
+        for h in handlers {
+            reg = reg.with(h);
+        }
+        cfg = cfg.with_handlers(reg);
     }
     cfg
 }
@@ -90,6 +105,7 @@ fn advertised_caps() -> CapabilitySet {
             CHAT,
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
         ))
+        .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -141,6 +157,14 @@ pub struct Session {
     pub capabilities: CapabilitySet,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
+    /// The presence heartbeat for this session, if presence was wired.
+    ///
+    /// Held so [`close`](Self::close) can stop it: the loop's own exit is a
+    /// liveness probe on the next tick, which for a withheld heartbeat is up to
+    /// a minute away. Aborting is not a shortcut around the gate — the task
+    /// re-checks it on every beat and cannot send after this point anyway, its
+    /// session being closed.
+    presence: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Session {
@@ -165,11 +189,15 @@ impl Session {
     /// Close the session and wait for its pump to finish. The pump task removes
     /// this session from the diagnostics registry when `run` returns.
     pub async fn close(self) {
+        if let Some(p) = self.presence {
+            p.abort();
+        }
         self.handle.close();
         let _ = self.run.await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish(
     transport: Arc<dyn ChannelTransport>,
     role: SessionRole,
@@ -177,17 +205,30 @@ async fn establish(
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
     chat: Option<ChatWiring>,
+    presence: Option<PresenceWiring>,
+    route: Option<RouteKind>,
 ) -> Result<Session, (Code, String)> {
     // Build the optional chat handler + its peer slot. The slot is bound to
     // the authenticated peer right after `PeerSession::open` returns, before
     // the run loop is spawned, so no Chat frame can be dispatched to an
     // unbound handler.
+    let mut handlers: Vec<Arc<dyn MessageHandler>> = Vec::new();
     let mut peer_slot: Option<Arc<OnceLock<DeviceId>>> = None;
-    let chat_handler: Option<Arc<dyn MessageHandler>> = chat.map(|w| {
+    if let Some(w) = chat {
         let (h, slot) = ChatHandler::new(w.store, w.sink);
         peer_slot = Some(slot);
-        h as Arc<dyn MessageHandler>
-    });
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
+    // Presence gets the same treatment for the same reason: an unregistered
+    // handler means an inbound Status is silently dropped, not refused.
+    let mut presence_slot: Option<Arc<OnceLock<DeviceId>>> = None;
+    if let Some(w) = &presence {
+        let sink: PresenceSink =
+            Arc::new(|peer, entry| crate::presence::emit_updated(&peer, &entry));
+        let (h, slot) = PresenceHandler::new(w.registry.clone(), sink);
+        presence_slot = Some(slot);
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
     let (inc, incoming) = unbounded_channel();
@@ -199,19 +240,22 @@ async fn establish(
     let mut ps = PeerSession::open(
         transport,
         role,
-        session_cfg(chat_handler),
+        session_cfg(handlers),
         ev,
         ch,
         inc,
         registry,
         ident,
         enc,
-        trust,
+        trust.clone(),
     )
     .await
     .map_err(|e| (Code::Connection, format!("session establish failed: {e}")))?;
     // Bind the chat peer before the run loop dispatches any frame.
     if let Some(slot) = peer_slot {
+        let _ = slot.set(ps.peer().clone());
+    }
+    if let Some(slot) = presence_slot {
         let _ = slot.set(ps.peer().clone());
     }
     let id = ps.id();
@@ -241,6 +285,24 @@ async fn establish(
             d.unregister_handle(id);
         }
     });
+    // Start the heartbeat only if presence was wired. The task itself decides
+    // whether anything actually goes out: `PresenceSender::beat` consults
+    // `may_share_status` before it opens a channel or sends a frame, re-reading
+    // the opt-in setting and the trust store on every beat. Spawning it for a
+    // peer we may not share with is therefore not a leak — a withheld beat
+    // opens nothing and sends nothing — and it is what lets turning the setting
+    // on take effect on an already-live session.
+    let presence_task = presence.as_ref().map(|w| {
+        let sender = PresenceSender::new(
+            handle.clone(),
+            peer_device.clone(),
+            capabilities.clone(),
+            trust.clone(),
+            Arc::new(crate::presence::sharing_enabled),
+            w.source(route),
+        );
+        crate::runtime::spawn_handle(sender.run(HEARTBEAT_INTERVAL))
+    });
     Ok(Session {
         handle,
         peer_id,
@@ -251,6 +313,7 @@ async fn establish(
         capabilities,
         incoming,
         run,
+        presence: presence_task,
     })
 }
 
@@ -266,6 +329,7 @@ pub async fn dial(
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
     chat: Option<ChatWiring>,
+    presence: Option<PresenceWiring>,
 ) -> Result<Session, (Code, String)> {
     let candidates = routes.candidates(device);
     if candidates.is_empty() {
@@ -273,6 +337,10 @@ pub async fn dial(
     }
     let mut last: Option<(Code, String)> = None;
     for route in candidates {
+        // The route class the RouteManager already assigned this candidate —
+        // reused verbatim rather than reclassified, so presence reports exactly
+        // the class route selection acted on.
+        let kind = route.kind;
         match quic.dial_channels(&route, meta).await {
             Ok(qc) => {
                 let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
@@ -283,6 +351,8 @@ pub async fn dial(
                     enc.clone(),
                     trust.clone(),
                     chat.clone(),
+                    presence.clone(),
+                    Some(kind),
                 )
                 .await
                 {
@@ -300,15 +370,36 @@ pub async fn dial(
 }
 
 /// Accept a responder PeerSession over an inbound channel connection.
+///
+/// `routes` is used only to classify the inbound connection's remote address
+/// for presence — through the RouteManager's own classifier, so an accepted
+/// session reports the same vocabulary a dialled one does instead of leaving
+/// `network` absent on half of all sessions.
+#[allow(clippy::too_many_arguments)]
 pub async fn accept(
     qc: QuicChannels,
+    routes: &RouteManager,
     ident: Identity,
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
     chat: Option<ChatWiring>,
+    presence: Option<PresenceWiring>,
 ) -> Result<Session, (Code, String)> {
+    let route = presence
+        .is_some()
+        .then(|| routes.classify(&qc.remote().ip().to_string()));
     let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
-    establish(transport, SessionRole::Responder, ident, enc, trust, chat).await
+    establish(
+        transport,
+        SessionRole::Responder,
+        ident,
+        enc,
+        trust,
+        chat,
+        presence,
+        route,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -325,7 +416,7 @@ mod tests {
     /// a restatement in this module. Both weaker forms leave a hop where
     /// `session_cfg` could stop advertising while these tests stayed green.
     fn our_caps() -> CapabilitySet {
-        session_cfg(None).capabilities
+        session_cfg(Vec::new()).capabilities
     }
 
     /// Both chat feature bits must be advertised by **this** frontend. The CLI
@@ -335,7 +426,7 @@ mod tests {
     /// impossible to repeat.
     #[test]
     fn both_chat_feature_bits_are_advertised() {
-        let caps = session_cfg(None).capabilities;
+        let caps = session_cfg(Vec::new()).capabilities;
         let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
         assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
         assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");
@@ -389,6 +480,84 @@ mod tests {
     fn two_peers_with_the_feature_bit_negotiate_to_supported() {
         let negotiated = our_caps().intersect(&our_caps());
         assert!(caps_support_file_ref(&negotiated));
+    }
+
+    /// The PRESENCE bit must be advertised by **this** frontend. The other
+    /// surface has the identical test: 2a shipped with only one of the two
+    /// advertising `CHAT_FEAT_FILEREF`, so a peer's behaviour depended on which
+    /// of our own frontends it reached. One test per surface is what makes that
+    /// impossible to repeat — a shared helper would go green for both the
+    /// moment either stopped advertising.
+    #[test]
+    fn the_presence_feature_bit_is_advertised() {
+        let caps = session_cfg(Vec::new()).capabilities;
+        let f = caps
+            .features(ChannelType::PRESENCE)
+            .expect("PRESENCE advertised");
+        assert!(f & PRESENCE_FEAT_STATUS != 0, "device status heartbeats");
+    }
+
+    /// Advertising PRESENCE is a claim about comprehension, not about
+    /// behaviour: this build understands a Status. Whether it ever *sends* one
+    /// is the opt-in setting's business, and that setting is off by default.
+    /// Conflating the two would mean a device could only receive status if it
+    /// also shared its own.
+    #[test]
+    fn advertising_presence_does_not_imply_sharing() {
+        let ours = session_cfg(Vec::new()).capabilities;
+        let negotiated = ours.intersect(&ours);
+        assert!(
+            peerbeam_presence::caps_support_status(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        // ...and the capability alone opens nothing: the two privacy gates are
+        // separate inputs to the same decision.
+        assert!(!peerbeam_presence::may_share_status(
+            false, // sharing off
+            &NeverTrusts,
+            &DeviceId::from("pb-bob"),
+            &negotiated,
+        ));
+    }
+
+    /// A 1b/2a-era peer advertises no PRESENCE at all, so the intersection
+    /// drops it and it is never sent a Status.
+    #[test]
+    fn a_peer_without_presence_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&legacy);
+        assert!(!negotiated.supports(ChannelType::PRESENCE));
+        assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// An unrelated future bit on PRESENCE must not be read as this one.
+    #[test]
+    fn an_unrelated_future_presence_bit_does_not_imply_status() {
+        let future = CapabilitySet::new().with(Capability::with_features(PRESENCE, 1 << 4));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
+        assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// A trust store that trusts nobody, for the gate assertions above.
+    struct NeverTrusts;
+    impl peerbeam_domain::port::TrustStore for NeverTrusts {
+        fn record(
+            &self,
+            _r: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            _d: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(None)
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            false
+        }
     }
 
     /// A peer with no CHAT capability at all is unsupported, not a panic — the

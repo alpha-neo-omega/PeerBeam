@@ -34,9 +34,10 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF,
+    CHAT_FEAT_FILEREF, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
+use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
 use peerbeam_transfer::{
     HandlerRegistry, Identity, IncomingStreamChannel, PeerSession, SessionConfig, SessionHandle,
     SessionRole,
@@ -47,6 +48,7 @@ use crate::exit::CliError;
 
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
+const PRESENCE: ChannelType = ChannelType::PRESENCE;
 
 /// The session config every CLI PeerSession uses: advertise + accept the
 /// Transfer capability as the stream channel, and advertise the Chat
@@ -68,10 +70,25 @@ const CHAT: ChannelType = ChannelType::CHAT;
 /// is already on the wire and `CapabilitySet::intersect` ANDs it — so a peer
 /// from before either feature simply advertises `0`, the intersection clears
 /// the bit, and [`Session::supports_file_ref`] reports false for it.
-fn session_cfg(chat_handler: Option<Arc<dyn MessageHandler>>) -> SessionConfig {
+///
+/// PRESENCE advertises [`PRESENCE_FEAT_STATUS`] on the same terms, and again
+/// identically to the FFI: 2a shipped with only one surface advertising
+/// `CHAT_FEAT_FILEREF`, so a peer's behaviour depended on which of our own
+/// frontends it reached. Each surface has its own test asserting its own
+/// advertisement, which is what makes that impossible to repeat.
+///
+/// Advertising the presence bit says nothing about whether this build *sends*
+/// a status — that is the opt-in setting's business, and it is off by default.
+/// The bit asserts comprehension, so a device sharing nothing still advertises
+/// it truthfully and still displays everyone else's status.
+fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
     let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
-    if let Some(h) = chat_handler {
-        cfg = cfg.with_handlers(HandlerRegistry::new().with(h));
+    if !handlers.is_empty() {
+        let mut reg = HandlerRegistry::new();
+        for h in handlers {
+            reg = reg.with(h);
+        }
+        cfg = cfg.with_handlers(reg);
     }
     cfg
 }
@@ -88,6 +105,7 @@ fn advertised_caps() -> CapabilitySet {
             CHAT,
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
         ))
+        .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -135,6 +153,9 @@ pub struct Session {
     capabilities: CapabilitySet,
     incoming: UnboundedReceiver<IncomingStreamChannel>,
     run: tokio::task::JoinHandle<()>,
+    /// This session's presence heartbeat, if presence was configured. Held so
+    /// `close` can stop it rather than wait out the next tick's liveness probe.
+    presence: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Session {
@@ -154,6 +175,9 @@ impl Session {
 
     /// Close the session and wait for its pump to finish.
     pub async fn close(self) {
+        if let Some(p) = self.presence {
+            p.abort();
+        }
         self.handle.close();
         let _ = self.run.await;
     }
@@ -172,23 +196,35 @@ async fn establish(
     enc: Arc<dyn EncryptionProvider>,
     trust: Arc<dyn TrustStore>,
     chat: Option<(ChatStore, ReceivedSink)>,
+    route: Option<peerbeam_domain::entity::RouteKind>,
 ) -> Result<Session, CliError> {
+    let mut handlers: Vec<Arc<dyn MessageHandler>> = Vec::new();
     let mut peer_slot: Option<Arc<OnceLock<DeviceId>>> = None;
-    let chat_handler: Option<Arc<dyn MessageHandler>> = chat.map(|(store, sink)| {
+    if let Some((store, sink)) = chat {
         let (h, slot) = ChatHandler::new(store, sink);
         peer_slot = Some(slot);
-        h as Arc<dyn MessageHandler>
-    });
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
+    // Presence is wired on EVERY session, unconditionally — receiving a peer's
+    // status is never gated, and an unregistered handler would drop it
+    // silently rather than refuse it. Sending is a separate decision made per
+    // heartbeat below.
+    let (presence_handler, presence_slot) = PresenceHandler::new(
+        crate::presence::registry().clone(),
+        Arc::new(|_peer, _entry| {}),
+    );
+    handlers.push(presence_handler as Arc<dyn MessageHandler>);
 
     // Event/channel-event sinks are unused by the CLI (diagnostics read the
     // engine registry, not these); their receivers drop and emits are ignored.
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
     let (inc, incoming) = unbounded_channel();
+    let trust_for_presence = trust.clone();
     let mut ps = PeerSession::open(
         transport,
         role,
-        session_cfg(chat_handler),
+        session_cfg(handlers),
         ev,
         ch,
         inc,
@@ -203,6 +239,8 @@ async fn establish(
     if let Some(slot) = peer_slot {
         let _ = slot.set(ps.peer().clone());
     }
+    let _ = presence_slot.set(ps.peer().clone());
+    let peer_device = ps.peer().clone();
     let peer_id = ps.peer().0.clone();
     let newly_trusted = ps.newly_trusted();
     let pairing_code = ps.pairing_code().to_string();
@@ -214,6 +252,22 @@ async fn establish(
     let run = tokio::spawn(async move {
         let _ = ps.run().await;
     });
+    // Heartbeat this device's own status, if configured. The task decides on
+    // every beat whether anything may go out — `may_share_status` re-reads the
+    // opt-in setting and the trust store — so spawning it for a peer we do not
+    // share with opens no channel and sends no frame.
+    let presence = crate::presence::sharing().map(|sh| {
+        let dir = sh.save_dir.clone();
+        let sender = PresenceSender::new(
+            handle.clone(),
+            peer_device,
+            capabilities.clone(),
+            trust_for_presence,
+            Arc::new(crate::presence::enabled),
+            Arc::new(move || peerbeam_presence::collect(&dir, route, env!("CARGO_PKG_VERSION"))),
+        );
+        tokio::spawn(sender.run(HEARTBEAT_INTERVAL))
+    });
     Ok(Session {
         handle,
         peer_id,
@@ -222,6 +276,7 @@ async fn establish(
         capabilities,
         incoming,
         run,
+        presence,
     })
 }
 
@@ -246,6 +301,9 @@ pub async fn dial(
     }
     let mut last: Option<CliError> = None;
     for route in candidates {
+        // The class route selection already assigned this candidate, reused
+        // verbatim rather than reclassified.
+        let kind = route.kind;
         match quic.dial_channels(&route, &meta).await {
             Ok(qc) => {
                 let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
@@ -256,6 +314,7 @@ pub async fn dial(
                     sc_enc.clone(),
                     sc_trust.clone(),
                     chat.clone(),
+                    Some(kind),
                 )
                 .await
                 {
@@ -270,13 +329,20 @@ pub async fn dial(
 }
 
 /// Accept a **responder** PeerSession over an inbound channel connection.
+///
+/// `routes` classifies the inbound connection's remote address for presence
+/// through the RouteManager's own classifier, so an accepted session reports
+/// the same vocabulary a dialled one does instead of leaving `network` absent
+/// on every session the peer initiated.
 pub async fn accept(
     qc: QuicChannels,
+    routes: &RouteManager,
     sc_ident: &Identity,
     sc_enc: &Arc<peerbeam_crypto::AeadCrypto>,
     sc_trust: &Arc<peerbeam_trust_fs::FsTrust>,
     chat: Option<(ChatStore, ReceivedSink)>,
 ) -> Result<Session, CliError> {
+    let route = Some(routes.classify(&qc.remote().ip().to_string()));
     let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
     establish(
         transport,
@@ -285,6 +351,7 @@ pub async fn accept(
         sc_enc.clone(),
         sc_trust.clone(),
         chat,
+        route,
     )
     .await
 }
@@ -303,7 +370,7 @@ mod tests {
     /// a restatement in this module. Both weaker forms leave a hop where
     /// `session_cfg` could stop advertising while these tests stayed green.
     fn our_caps() -> CapabilitySet {
-        session_cfg(None).capabilities
+        session_cfg(Vec::new()).capabilities
     }
 
     /// Both chat feature bits must be advertised by **this** frontend. The FFI
@@ -313,7 +380,7 @@ mod tests {
     /// impossible to repeat.
     #[test]
     fn both_chat_feature_bits_are_advertised() {
-        let caps = session_cfg(None).capabilities;
+        let caps = session_cfg(Vec::new()).capabilities;
         let f = caps.features(ChannelType::CHAT).expect("CHAT advertised");
         assert!(f & CHAT_FEAT_FILEREF != 0, "file sharing");
         assert!(f & CHAT_FEAT_FILEDECLINE != 0, "decline signalling");
@@ -340,6 +407,84 @@ mod tests {
     fn two_peers_with_the_feature_bit_negotiate_to_supported() {
         let negotiated = our_caps().intersect(&our_caps());
         assert!(caps_support_file_ref(&negotiated));
+    }
+
+    /// The PRESENCE bit must be advertised by **this** frontend. The other
+    /// surface has the identical test: 2a shipped with only one of the two
+    /// advertising `CHAT_FEAT_FILEREF`, so a peer's behaviour depended on which
+    /// of our own frontends it reached. One test per surface is what makes that
+    /// impossible to repeat — a shared helper would go green for both the
+    /// moment either stopped advertising.
+    #[test]
+    fn the_presence_feature_bit_is_advertised() {
+        let caps = session_cfg(Vec::new()).capabilities;
+        let f = caps
+            .features(ChannelType::PRESENCE)
+            .expect("PRESENCE advertised");
+        assert!(f & PRESENCE_FEAT_STATUS != 0, "device status heartbeats");
+    }
+
+    /// Advertising PRESENCE is a claim about comprehension, not about
+    /// behaviour: this build understands a Status. Whether it ever *sends* one
+    /// is the opt-in setting's business, and that setting is off by default.
+    /// Conflating the two would mean a device could only receive status if it
+    /// also shared its own.
+    #[test]
+    fn advertising_presence_does_not_imply_sharing() {
+        let ours = session_cfg(Vec::new()).capabilities;
+        let negotiated = ours.intersect(&ours);
+        assert!(
+            peerbeam_presence::caps_support_status(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        // ...and the capability alone opens nothing: the two privacy gates are
+        // separate inputs to the same decision.
+        assert!(!peerbeam_presence::may_share_status(
+            false, // sharing off
+            &NeverTrusts,
+            &DeviceId::from("pb-bob"),
+            &negotiated,
+        ));
+    }
+
+    /// A 1b/2a-era peer advertises no PRESENCE at all, so the intersection
+    /// drops it and it is never sent a Status.
+    #[test]
+    fn a_peer_without_presence_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&legacy);
+        assert!(!negotiated.supports(ChannelType::PRESENCE));
+        assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// An unrelated future bit on PRESENCE must not be read as this one.
+    #[test]
+    fn an_unrelated_future_presence_bit_does_not_imply_status() {
+        let future = CapabilitySet::new().with(Capability::with_features(PRESENCE, 1 << 4));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
+        assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// A trust store that trusts nobody, for the gate assertion above.
+    struct NeverTrusts;
+    impl peerbeam_domain::port::TrustStore for NeverTrusts {
+        fn record(
+            &self,
+            _r: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            _d: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(None)
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            false
+        }
     }
 
     /// A peer with no CHAT capability at all is unsupported, not a panic —

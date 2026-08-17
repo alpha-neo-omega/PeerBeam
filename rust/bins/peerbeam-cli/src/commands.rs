@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use clap::CommandFactory;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use peerbeam_config::EngineConfig;
@@ -122,9 +122,23 @@ fn diagnostics_cmd(ctx: &Ctx) -> CliResult {
     present(ctx, &diag.diagnostics_json())
 }
 
+/// Load the effective config — and, as a side effect, publish the presence
+/// opt-in it carries.
+///
+/// Configuring presence here rather than at each command means no command that
+/// can dial or accept is able to forget it: every one of them loads config
+/// first. The alternative — a `configure` call per command — is exactly the
+/// shape of the bug that has already shipped twice in this codebase, where one
+/// of several call sites was missed and behaviour silently depended on which
+/// path a peer reached.
+///
+/// Publishing the value is not consent: `share_presence` defaults to false, and
+/// the trusted-only gate is not configurable at all.
 pub(crate) fn load_config(override_path: Option<&str>) -> Result<EngineConfig, CliError> {
-    EngineConfig::load_or_default(&config_path(override_path))
-        .map_err(|e| CliError::Other(format!("config: {e}")))
+    let config = EngineConfig::load_or_default(&config_path(override_path))
+        .map_err(|e| CliError::Other(format!("config: {e}")))?;
+    crate::presence::configure(&config);
+    Ok(config)
 }
 
 // ── config ──────────────────────────────────────────────────────
@@ -656,6 +670,24 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     // port fails with AddrInUse when the QUIC server holds it.
     let listening = std::net::UdpSocket::bind(("0.0.0.0", port)).is_err();
 
+    // This device's own status — the same collection a heartbeat would send,
+    // so `status` shows exactly what the opt-in would reveal. Computing it is
+    // purely local; nothing here puts anything on the wire.
+    let own = peerbeam_presence::collect(
+        &config.storage.save_directory,
+        None, // a one-shot command has no session, so no route to characterise
+        env!("CARGO_PKG_VERSION"),
+    );
+    // Peers, from the live registry. A one-shot `status` holds no sessions, so
+    // this is normally empty — that is presence working as designed, not a
+    // gap: presence is live state and a fresh process starts with none. It
+    // populates for a long-running command that holds sessions open.
+    let peers: Vec<Value> = crate::presence::registry()
+        .snapshot()
+        .iter()
+        .map(|(id, e)| presence_row(id, e))
+        .collect();
+
     if ctx.json {
         ctx.json_line(&json!({
             "device_id": device_id.to_string(),
@@ -666,6 +698,14 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
             "data_directory": config.storage.data_directory,
             "providers": providers,
             "listening": listening,
+            "share_presence": config.device.share_presence,
+            "presence": {
+                "battery_percent": own.battery_percent,
+                "charging": own.charging,
+                "storage_free_bytes": own.storage_free_bytes,
+                "app_version": own.app_version,
+            },
+            "peers": peers,
         }));
     } else {
         ctx.line(&format!("{}     {}", ctx.bold("Device ID:"), device_id));
@@ -699,8 +739,134 @@ fn status(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
                 ctx.dim("no")
             }
         ));
+        // What this device measures about itself, and whether any of it leaves.
+        // Shown even when sharing is off so the toggle's effect is visible
+        // before it is flipped.
+        ctx.line(&format!("{} {}", ctx.bold("Status:"), own_summary(&own)));
+        ctx.line(&format!(
+            "{} {}",
+            ctx.bold("Sharing:"),
+            if config.device.share_presence {
+                ctx.green("on (trusted devices only)")
+            } else {
+                ctx.dim("off — device status is shared with nobody")
+            }
+        ));
+        if peers.is_empty() {
+            ctx.line(&ctx.dim(
+                "Peers:    no shared status (presence is live; a one-shot command holds no session)",
+            ));
+        } else {
+            ctx.line(&ctx.bold("Peers:"));
+            for p in &peers {
+                ctx.line(&format!("  {}", peer_summary(p)));
+            }
+        }
     }
     Ok(())
+}
+
+/// One peer's shared status as a JSON row.
+///
+/// Absent fields are **omitted**, never `null` or `0`: a desktop with no
+/// battery must be distinguishable from one at 0%, and a script reading this
+/// contract should have to ask whether the key is there.
+fn presence_row(id: &peerbeam_domain::id::DeviceId, e: &peerbeam_presence::PeerStatus) -> Value {
+    let s = &e.status;
+    let mut o = serde_json::Map::new();
+    o.insert("device_id".into(), json!(id.0));
+    if let Some(v) = s.battery_percent {
+        o.insert("battery_percent".into(), json!(v));
+    }
+    if let Some(v) = s.charging {
+        o.insert("charging".into(), json!(v));
+    }
+    if let Some(v) = s.storage_free_bytes {
+        o.insert("storage_free_bytes".into(), json!(v));
+    }
+    if let Some(v) = &s.network {
+        o.insert("network".into(), json!(v));
+    }
+    if let Some(v) = &s.app_version {
+        o.insert("app_version".into(), json!(v));
+    }
+    // `sent_at` is the peer's own clock and is not synchronised with ours;
+    // `age_seconds` counts from OUR receipt time and is what to display.
+    o.insert("sent_at".into(), json!(s.sent_at));
+    o.insert(
+        "age_seconds".into(),
+        json!(e.age_seconds(chrono::Utc::now())),
+    );
+    Value::Object(o)
+}
+
+/// Human-readable bytes, e.g. `12.3 GB`. Decimal units, matching the rest of
+/// the CLI's size rendering.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1000.0 && i < UNITS.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// This device's own measurements, joined for one line. Fields it cannot
+/// measure are left out rather than shown as zero.
+fn own_summary(s: &peerbeam_presence::Status) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = s.battery_percent {
+        parts.push(match s.charging {
+            Some(true) => format!("battery {p}% (charging)"),
+            _ => format!("battery {p}%"),
+        });
+    }
+    if let Some(b) = s.storage_free_bytes {
+        parts.push(format!("{} free", human_bytes(b)));
+    }
+    if let Some(v) = &s.app_version {
+        parts.push(format!("v{v}"));
+    }
+    if parts.is_empty() {
+        "nothing measurable on this platform".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// One peer row, rendered from the JSON so the human and JSON views cannot
+/// disagree about which fields a peer actually shared.
+fn peer_summary(row: &Value) -> String {
+    let id = row["device_id"].as_str().unwrap_or("?");
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = row.get("battery_percent").and_then(Value::as_u64) {
+        parts.push(match row.get("charging").and_then(Value::as_bool) {
+            Some(true) => format!("battery {p}% (charging)"),
+            _ => format!("battery {p}%"),
+        });
+    }
+    if let Some(b) = row.get("storage_free_bytes").and_then(Value::as_u64) {
+        parts.push(format!("{} free", human_bytes(b)));
+    }
+    if let Some(n) = row.get("network").and_then(Value::as_str) {
+        parts.push(n.to_string());
+    }
+    if let Some(v) = row.get("app_version").and_then(Value::as_str) {
+        parts.push(format!("v{v}"));
+    }
+    let age = row.get("age_seconds").and_then(Value::as_u64).unwrap_or(0);
+    if parts.is_empty() {
+        // Identity and reachability, not empty gauges.
+        format!("{id} — status not shared")
+    } else {
+        format!("{id} — {} ({age}s ago)", parts.join(" · "))
+    }
 }
 
 fn completions(shell: clap_complete::Shell) -> CliResult {
@@ -1327,6 +1493,10 @@ async fn serve_loop(
     // `chat_flush_peer`'s dial).
     let chat = chat_store(config, &sc.enc, &sc.ident);
     let sink = crate::chat::received_sink(ctx);
+    // One RouteManager for this serve loop: presence asks it to classify each
+    // inbound connection's remote address, so an accepted session reports the
+    // same route vocabulary a dialled one does.
+    let accept_routes = RouteManager::new(quic.clone());
     let mut drain = tokio::time::interval(crate::chat::DRAIN_EVERY);
     // If a tick is missed (e.g. we were busy serving a long-lived transfer),
     // resume the plain periodic cadence rather than firing a burst of
@@ -1364,6 +1534,7 @@ async fn serve_loop(
                 // errored).
                 let mut session = match crate::session_transfer::accept(
                     qc,
+                    &accept_routes,
                     &sc.ident,
                     &sc.enc,
                     &sc.trust,
@@ -2279,6 +2450,7 @@ mod chat_wiring_dial_regression {
                 .expect("accepted");
             let mut session_b = crate::session_transfer::accept(
                 qc,
+                &RouteManager::new(quic_b.clone()),
                 &sc_b.ident,
                 &sc_b.enc,
                 &sc_b.trust,

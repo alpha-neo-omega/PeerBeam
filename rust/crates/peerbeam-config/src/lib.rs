@@ -62,6 +62,15 @@ pub struct DeviceConfig {
     /// Refuse to stage if doing so would leave less than this much free.
     /// Filling the disk to zero can break unrelated applications.
     pub min_free_bytes: u64,
+    /// *"Share device status with trusted devices"* — the presence opt-in.
+    ///
+    /// **Default off**, and that default is the feature's whole privacy story
+    /// (I11). While it is false this device sends no status at all, to anyone;
+    /// it still receives and displays what its peers share. Turning it on
+    /// shares battery, free storage, network kind and app version — and only
+    /// ever with devices in the trust store, which is not configurable here or
+    /// anywhere else.
+    pub share_presence: bool,
 }
 
 /// Discovery configuration.
@@ -140,6 +149,9 @@ impl Default for DeviceConfig {
             // 512 MiB — enough headroom that the OS and other applications
             // keep working even if a staged copy lands right at the floor.
             min_free_bytes: 536_870_912,
+            // Opt-in. Nothing about this device leaves it until the user says
+            // so; see the field's own doc comment.
+            share_presence: false,
         }
     }
 }
@@ -317,6 +329,33 @@ mod compat_tests {
             serde_json::from_str(r#"{"device":{"name":"x","require_pairing_confirmation":true}}"#)
                 .unwrap();
         assert!(cfg.device.require_pairing_confirmation);
+    }
+
+    /// The presence opt-in defaults **off**, and — the half that matters — a
+    /// config file written before this field existed loads as off rather than
+    /// as on. An upgrade must never start sharing a device's battery level and
+    /// free disk because a key was missing.
+    #[test]
+    fn share_presence_defaults_off_and_an_older_config_stays_off() {
+        assert!(!DeviceConfig::default().share_presence);
+
+        // A config file from before the field existed.
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"device":{"name":"x","auto_accept_trusted":true},"storage":{"save_directory":"/tmp"}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cfg.device.share_presence,
+            "an upgrade must not silently opt a user in"
+        );
+
+        // Present -> honored, and it survives a save/load round trip.
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"device":{"name":"x","share_presence":true}}"#).unwrap();
+        assert!(cfg.device.share_presence);
+        let back: EngineConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.device.share_presence);
     }
 
     /// `DiscoveryConfig::port` must default to the well-known discovery port

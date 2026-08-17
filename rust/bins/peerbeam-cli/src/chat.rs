@@ -1225,6 +1225,11 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
     let bind_port = port.unwrap_or(config.transfer.port);
     let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, bind_port));
     let (local, mut incoming) = quic.serve_channels_on(addr).await.map_err(CliError::from)?;
+    // One RouteManager for this serve loop: presence asks it to classify each
+    // inbound connection's remote address, so an accepted session reports the
+    // same route vocabulary a dialled one does. Same construction the drain
+    // tick uses.
+    let accept_routes = RouteManager::new(quic.clone());
 
     if ctx.json {
         ctx.json_line(&json!({
@@ -1285,6 +1290,7 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
                 };
                 let mut session = match session_transfer::accept(
                     qc,
+                    &accept_routes,
                     &sc.ident,
                     &sc.enc,
                     &sc.trust,

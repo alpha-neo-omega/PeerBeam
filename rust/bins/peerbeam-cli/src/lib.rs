@@ -8,6 +8,7 @@ pub mod engine;
 pub mod exit;
 pub mod history;
 pub mod output;
+pub mod presence;
 pub mod prompt;
 pub mod resolve;
 pub mod session_transfer;

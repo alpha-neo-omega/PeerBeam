@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use peerbeam_domain::entity::{Device, Route, TransferSession};
+use peerbeam_domain::entity::{Device, Route, RouteKind, TransferSession};
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::port::{Link, TransferProvider};
 use peerbeam_transfer::LinkFactory;
@@ -54,6 +54,21 @@ impl RouteManager {
     pub fn with_classifier(mut self, classifier: Arc<dyn RouteClassifier>) -> Self {
         self.classifier = classifier;
         self
+    }
+
+    /// Classify one address into its route class, using this manager's
+    /// injected classifier.
+    ///
+    /// Exposed so callers that already hold an address — an accepted
+    /// connection's remote, say — can ask *the same* classifier
+    /// [`candidates`](Self::candidates) uses, instead of standing up a second
+    /// one that would drift from it the first time either changed. Swapping in
+    /// an interface-aware classifier via
+    /// [`with_classifier`](Self::with_classifier) therefore changes both
+    /// answers together, which is the point.
+    #[must_use]
+    pub fn classify(&self, address: &str) -> RouteKind {
+        self.classifier.classify(address)
     }
 
     /// Add last-resort relay routes, tried only after every direct route.

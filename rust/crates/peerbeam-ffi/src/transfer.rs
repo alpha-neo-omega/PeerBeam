@@ -370,6 +370,12 @@ pub struct Manager {
     /// A's id. `TransferControl` is `Arc`-backed and `Clone`, so the copy task
     /// and this map hold the same flag.
     chat_staging: Mutex<HashMap<(String, String), TransferControl>>,
+    /// Every peer's last shared status — live, in memory, never persisted (I4).
+    ///
+    /// One registry for the whole process, shared (`Clone` is a shared handle)
+    /// with each session's `PresenceHandler`, so `pb_presence_json` reads what
+    /// every session wrote regardless of which side dialed.
+    presence: peerbeam_presence::PresenceRegistry,
     identity: Identity,
     /// The presented name, split out from `identity` so a live rename
     /// (`set_identity_name`) reaches in-flight/future handshakes without a
@@ -428,6 +434,7 @@ impl Manager {
             staging_limits,
             chat_file_in_flight: Mutex::new(HashSet::new()),
             chat_staging: Mutex::new(HashMap::new()),
+            presence: peerbeam_presence::PresenceRegistry::new(),
             identity,
             identity_name,
             save_dir: RwLock::new(save_dir),
@@ -497,6 +504,34 @@ impl Manager {
             store: self.chat.clone(),
             sink: Arc::new(|rec| crate::events::chat(&rec)),
         }
+    }
+
+    /// The presence wiring every session registers, dial or accept — for
+    /// exactly the reason `chat_wiring` above must be registered on both sides.
+    /// A session without a `PresenceHandler` does not refuse an inbound Status;
+    /// the channel dispatch loop drops it silently, so the peer believes it
+    /// shared and this device shows nothing.
+    ///
+    /// Wiring it does **not** mean this device shares anything. The heartbeat
+    /// task re-checks `may_share_status` on every beat, and with the opt-in
+    /// setting off (the default) it opens no channel and sends no frame.
+    fn presence_wiring(&self) -> crate::presence::PresenceWiring {
+        crate::presence::PresenceWiring {
+            registry: self.presence.clone(),
+            save_dir: self.save_dir(),
+        }
+    }
+
+    /// The live presence snapshot for `pb_presence_json`.
+    pub fn presence_snapshot(&self) -> Op {
+        crate::presence::snapshot(&self.presence, &self.save_dir())
+    }
+
+    /// Drop a peer's shared status. Called when its trust is revoked: a device
+    /// the user no longer trusts must leave the dashboard immediately rather
+    /// than linger until restart.
+    pub fn presence_forget(&self, peer: &DeviceId) {
+        self.presence.forget(peer);
     }
 
     pub fn daemon_status(&self) -> Value {
@@ -861,6 +896,7 @@ impl Manager {
                 // silently dropped instead of persisted (see `chat_wiring`'s
                 // doc comment).
                 Some(self.chat_wiring()),
+                Some(self.presence_wiring()),
             )
             .await
             {
@@ -1531,10 +1567,14 @@ impl Manager {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or((Code::InvalidArgument, "id required".into()))?;
-        let removed = self
-            .trust
-            .remove(&DeviceId::from(id))
-            .map_err(from_domain)?;
+        let device = DeviceId::from(id);
+        let removed = self.trust.remove(&device).map_err(from_domain)?;
+        // Revoking trust removes the device from the presence dashboard now,
+        // not at the next restart. The send side is already handled — the
+        // heartbeat re-reads the trust store every beat — but a status this
+        // device *already* holds would otherwise keep being displayed for a
+        // peer the user just said they do not trust.
+        self.presence_forget(&device);
         events::event(&json!({ "type": "trust_changed", "timestamp": timestamp() }));
         Ok(json!({ "removed": removed }))
     }
@@ -2196,6 +2236,7 @@ impl Manager {
             // be able to receive a CHAT frame the peer pushes back (e.g. its
             // own flush-on-connect), not just carry ours out.
             Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
         )
         .await
         {
@@ -2824,10 +2865,12 @@ impl Manager {
         // sink must not re-persist.
         let mut session = match crate::session_exec::accept(
             qc,
+            &self.rm,
             self.identity(),
             self.enc.clone(),
             self.trust.clone(),
             Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
         )
         .await
         {

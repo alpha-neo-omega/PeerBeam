@@ -39,6 +39,13 @@ fn defaults() -> Value {
         "discovery_enabled": c.discovery.enabled,
         "notifications": true,
         "logging": c.log.filter,
+        // "Share device status with trusted devices" — **default off**, and
+        // that default is load-bearing (I11): until the user says otherwise,
+        // this device's battery, free disk and network kind leave for nobody.
+        // `presence::sharing_enabled` also falls back to `false` when the key
+        // is missing or unparseable, so a settings file this build cannot read
+        // is never mistaken for consent.
+        crate::presence::SHARE_KEY: false,
         "experimental": {},
     })
 }
