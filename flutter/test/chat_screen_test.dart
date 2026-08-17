@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/state/staging.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
 
@@ -114,6 +115,41 @@ void main() {
     expect(calls[0].arguments, isNull);
     expect((calls[1].arguments as Map)['mimeTypes'], ['image/*', 'video/*']);
     expect((calls[2].arguments as Map)['mimeTypes'], ['audio/*']);
+  });
+
+  testWidgets('attaching from a chat still names what the Send flow has '
+      'staged, so the picker cannot age it out', (tester) async {
+    // Android prunes the picked-files cache on ANY pick, from any flow. A
+    // chat attachment that did not name the Send flow's staged batch could
+    // therefore discard files the user is still deciding about on Home —
+    // the same class of bug as the wipe this `keep` list exists to fix, just
+    // reached from the other screen.
+    final calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (call) async {
+        if (call.method == 'pickFiles') calls.add(call);
+        return <Map<String, Object?>>[];
+      },
+    );
+    final fake = FakePeerBeam();
+    final state = await _open(tester, fake);
+    state.staging.add([
+      StagedFile(
+        path: '/cache/picked/1/holiday.mp4',
+        name: 'holiday.mp4',
+        size: 9,
+      ),
+      StagedFile(path: '/cache/picked/1/notes.pdf', name: 'notes.pdf', size: 3),
+    ]);
+
+    await _attachVia(tester, 'Photos & videos');
+
+    expect(calls, hasLength(1));
+    expect((calls.single.arguments as Map)['keep'], [
+      '/cache/picked/1/holiday.mp4',
+      '/cache/picked/1/notes.pdf',
+    ]);
   });
 
   testWidgets('the attach button sends EVERY picked file, not just the first', (

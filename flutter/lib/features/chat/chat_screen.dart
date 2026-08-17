@@ -118,13 +118,21 @@ class _ChatScreenState extends State<ChatScreen> {
   /// first while the user watched themselves choose five is silent data loss,
   /// so the loop is the point.
   Future<void> _attach() async {
-    final chat = AppScope.of(context).chat;
+    final scope = AppScope.of(context);
+    final chat = scope.chat;
     final kind = await _pickAttachKind(context);
     if (kind == null || !mounted) return;
+    // `keep` is what the whole app still has staged, not what this screen
+    // does. Android prunes the picked-files cache on any pick, from any flow,
+    // so a chat attachment that did not name the Send flow's staged batch
+    // could age it out from under a decision the user has not made yet. The
+    // chat's own attachments need no keeping — they are handed to the engine
+    // immediately, and the per-batch directory already stops a later pick
+    // reaching into one still being staged.
     final picked = await withProcessing(
       context,
       'Preparing files…',
-      () => pickFilesToStage(kind: kind),
+      () => pickFilesToStage(kind: kind, keep: scope.staging.paths),
     );
     if (picked.isEmpty || !mounted) return;
     for (final file in picked) {
@@ -180,10 +188,9 @@ class _ChatScreenState extends State<ChatScreen> {
   void _pruneSelectionAfterFrame() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _selected.isEmpty) return;
-      final present = AppScope.of(context).chat
-          .messagesFor(widget.peerId)
-          .map((m) => m.id)
-          .toSet();
+      final present = AppScope.of(
+        context,
+      ).chat.messagesFor(widget.peerId).map((m) => m.id).toSet();
       final narrowed = _selected.intersection(present);
       if (narrowed.length == _selected.length) return;
       setState(() => _selected = narrowed);
