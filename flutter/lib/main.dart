@@ -42,6 +42,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   StreamSubscription<({String path, String peer})>? _clipSub;
   StreamSubscription<({String path, String name, String peer})>? _fileSub;
   StreamSubscription<void>? _shareSub;
+  StreamSubscription<String>? _clipNoticeSub;
   bool _sheetOpen = false;
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
@@ -77,6 +78,13 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // up our own sharing flag for the dashboard banner, and any peer that
         // heartbeated while the UI was still booting.
         await _state.presence.refresh();
+        // Trusted devices are loaded, so the clipboard watcher has peers to
+        // offer to. Started only if the opt-in is on and only on desktop —
+        // `applySetting` and `start` both enforce that, so this call is safe
+        // unconditionally.
+        _state.clipboard?.applySetting(
+          enabled: _state.settings.syncClipboard,
+        );
         // No-op off Android; routes share/receive intents and drives the
         // service. Started after history is loaded so the send-notify
         // baseline is seeded from real history, not an empty list — otherwise
@@ -97,6 +105,20 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     // A received clipboard payload gets a one-tap Copy — clipboard-to-
     // clipboard instead of a buried .txt file.
     _clipSub = _state.transfer.clipboardReceived.listen(_offerClipboardCopy);
+
+    // Auto-synced clipboards announce themselves. The clipboard changing under
+    // the user is the kind of thing they must never have to discover by
+    // pasting — but the toast names the sender, never the content, which is on
+    // their clipboard already and may well be a password.
+    _clipNoticeSub = _state.clipboard?.notices.listen((message) {
+      _messengerKey.currentState?.showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    });
+
+    // Follow the opt-in without an app restart: flipping the switch starts or
+    // stops the watcher at once.
+    _state.settings.addListener(_applyClipboardSetting);
 
     // A received file: on Android copy it into the user's chosen folder (the
     // engine's write location is hidden by scoped storage), then drop the copy.
@@ -121,6 +143,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   }
 
   void _persistTheme() => _state.settings.setTheme(_state.theme.mode.name);
+
+  void _applyClipboardSetting() =>
+      _state.clipboard?.applySetting(enabled: _state.settings.syncClipboard);
 
   /// Open the staged-files sheet over the current screen (post-frame so a
   /// cold-start share waits for the first build).
@@ -219,6 +244,8 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   void dispose() {
     _errSub?.cancel();
     _clipSub?.cancel();
+    _clipNoticeSub?.cancel();
+    _state.settings.removeListener(_applyClipboardSetting);
     _fileSub?.cancel();
     _shareSub?.cancel();
     _state.theme.removeListener(_persistTheme);

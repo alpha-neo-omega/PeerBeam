@@ -69,6 +69,7 @@ class Bindings {
   final _ArgRetDart _chatDeleteMessages;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
+  final _ArgRetDart _clipboardSync;
 
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
@@ -132,6 +133,9 @@ class Bindings {
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
+      ),
+      _clipboardSync = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_clipboard_sync',
       );
 
   /// Load the native library. `overridePath` forces a specific file (tests).
@@ -186,6 +190,8 @@ class Bindings {
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);
+
+  String clipboardSync(String json) => _withArg(json, _clipboardSync);
 
   /// Read a Rust-owned string and free it (ownership contract).
   String _consume(Pointer<Utf8> ptr) {

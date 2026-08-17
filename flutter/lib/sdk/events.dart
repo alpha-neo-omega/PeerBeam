@@ -55,6 +55,16 @@ sealed class BridgeEvent {
         return PresenceUpdated(
           SdkPresence.fromJson(_map(_map(j['payload'])['device'])),
         );
+      case 'clipboard_received':
+        // A trusted peer's clipboard. Deliberately NOT `clipboard_updated`,
+        // which is the local slot bridge and means "a surface put this here";
+        // only this one needs announcing to the user.
+        final p = _map(j['payload']);
+        return ClipboardReceived(
+          deviceId: p['device_id'] as String? ?? '',
+          text: p['text'] as String? ?? '',
+          sentAt: p['sent_at'] as String? ?? '',
+        );
       case 'chat_received':
         return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
       case 'chat_status':
@@ -86,6 +96,31 @@ sealed class BridgeEvent {
 class PresenceUpdated extends BridgeEvent {
   final SdkPresence presence;
   const PresenceUpdated(this.presence);
+}
+
+/// A trusted peer synced its clipboard to this device.
+///
+/// The engine has already validated [text]: bounded, non-empty, valid UTF-8.
+/// It is **plain text and must be treated as nothing else** — written to the
+/// system clipboard and rendered as characters, never interpreted as markup,
+/// a path or a command.
+class ClipboardReceived extends BridgeEvent {
+  /// The authenticated sender's device id, so a surface can name who changed
+  /// the clipboard. A clip that could not be attributed is never delivered.
+  final String deviceId;
+
+  /// What the peer copied.
+  final String text;
+
+  /// The sender's clock, RFC3339 — display only. Peer clocks are not
+  /// synchronised, so nothing branches on it.
+  final String sentAt;
+
+  const ClipboardReceived({
+    required this.deviceId,
+    required this.text,
+    required this.sentAt,
+  });
 }
 
 class DeviceAdded extends BridgeEvent {

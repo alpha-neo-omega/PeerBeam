@@ -72,6 +72,18 @@ abstract class PeerBeamApi {
   /// opt-in setting and the trusted-only gate are untouched.
   Future<void> presenceBattery({int? percent, bool? charging});
 
+  /// Offer the clipboard to [peers]. Returns how many pushes were queued.
+  ///
+  /// Naming a peer here does **not** send to it: the engine still decides per
+  /// peer, after the handshake, against the trust store and the peer's
+  /// negotiated capability. A `0` with the opt-in off means nothing was dialed
+  /// at all — off is silent, not merely undelivered.
+  ///
+  /// Throws `invalid_argument` for an empty or over-cap clip, before anything
+  /// is dialed, so a surface can say "too large to sync". An over-cap clip is
+  /// never truncated.
+  Future<int> clipboardSync(String text, List<PeerTarget> peers);
+
   /// Pinned (trusted) devices, newest first.
   Future<List<TrustedDevice>> trustList();
 
@@ -321,6 +333,19 @@ class PeerBeam implements PeerBeamApi {
       jsonEncode({'percent': ?percent, 'charging': ?charging}),
     ),
   );
+
+  @override
+  Future<int> clipboardSync(String text, List<PeerTarget> peers) async {
+    final data = _data(
+      _req().clipboardSync(
+        jsonEncode({
+          'text': text,
+          'peers': peers.map((p) => p.toJson()).toList(),
+        }),
+      ),
+    );
+    return (data['queued'] as num?)?.toInt() ?? 0;
+  }
 
   @override
   Future<List<TrustedDevice>> trustList() async {

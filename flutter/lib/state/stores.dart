@@ -3,12 +3,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../data/chat_repository.dart';
+import '../data/clipboard_sync.dart';
 import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
 import '../data/presence_repository.dart';
 import '../data/saved_devices_repository.dart';
 import '../data/transfer_repository.dart';
 import '../data/trust_repository.dart';
+import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 import 'staging.dart';
 
@@ -47,6 +49,18 @@ class SettingsStore extends ChangeNotifier {
   /// configurable, here or anywhere.
   bool sharePresence;
 
+  /// "Sync clipboard with trusted devices" — the clipboard opt-in.
+  ///
+  /// **Default off.** While it is off this device sends no clip at all, to
+  /// anyone; it still receives and applies what its peers send. When on,
+  /// clipboards go only to devices in the trust store — that half is not
+  /// configurable, here or anywhere.
+  ///
+  /// Only desktop can *send*: Android forbids background clipboard reads. And
+  /// there is no password detection — everything copied while this is on is
+  /// sent. See the Settings copy, which says so in as many words.
+  bool syncClipboard;
+
   /// Theme preference as persisted ('system' | 'light' | 'dark').
   String theme;
 
@@ -65,6 +79,9 @@ class SettingsStore extends ChangeNotifier {
     this.theme = 'system',
     // Opt-in: nothing about this device leaves it until the user says so.
     this.sharePresence = false,
+    // Likewise, and with more at stake — this is the one buffer guaranteed to
+    // sometimes hold a password.
+    this.syncClipboard = false,
   });
 
   /// Load persisted settings from the engine (call once after initialize).
@@ -86,6 +103,9 @@ class SettingsStore extends ChangeNotifier {
       // Absent -> stays false. A settings document written before this feature
       // existed must never be read as consent.
       sharePresence = (s['share_presence'] as bool?) ?? sharePresence;
+      // Absent -> stays false, for the same reason: a settings document
+      // written before this feature existed is not consent.
+      syncClipboard = (s['sync_clipboard'] as bool?) ?? syncClipboard;
       theme = (s['theme'] as String?) ?? theme;
       notifyListeners();
     } catch (_) {
@@ -132,6 +152,17 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Turn clipboard sync on or off.
+  ///
+  /// The engine re-reads this on every push, so turning it off stops the next
+  /// clip rather than waiting for a reconnect; the desktop watcher starts and
+  /// stops with it too, without an app restart.
+  void setSyncClipboard(bool v) {
+    syncClipboard = v;
+    _persist('sync_clipboard', v);
+    notifyListeners();
+  }
+
   void setNotifications(bool v) {
     notifications = v;
     _persist('notifications', v);
@@ -164,6 +195,10 @@ class AppState {
   final SettingsStore settings;
   final StagingStore staging;
 
+  /// The desktop clipboard watcher. Null when there is no engine to push
+  /// through (widget tests that build state without an API).
+  final ClipboardSyncService? clipboard;
+
   AppState({
     required this.theme,
     required this.device,
@@ -175,17 +210,20 @@ class AppState {
     required this.presence,
     required this.settings,
     required this.staging,
+    this.clipboard,
   });
 
   /// Production wiring: repositories driven by the live engine over [api].
   factory AppState.live(PeerBeamApi api) {
+    final device = DiscoveryRepository(api: api);
+    final trust = TrustRepository(api: api);
     return AppState(
       theme: ThemeController(),
-      device: DiscoveryRepository(api: api),
+      device: device,
       transfer: TransferRepository(api: api),
       history: HistoryRepository(api: api),
       saved: SavedDevicesRepository()..load(),
-      trust: TrustRepository(api: api),
+      trust: trust,
       chat: ChatRepository(api: api),
       presence: PresenceRepository(api: api),
       settings: SettingsStore(
@@ -196,6 +234,23 @@ class AppState {
         compression: true,
       ),
       staging: StagingStore(),
+      // Offered only to devices that are pinned AND currently addressable.
+      // The engine's gate is still authoritative and re-checks trust against
+      // the *authenticated* peer after the handshake; narrowing here keeps a
+      // copy from dialing every stranger on the network, which on a shared LAN
+      // would be both wasteful and a signal of its own.
+      clipboard: ClipboardSyncService(
+        api: api,
+        peers: () => trust.items
+            .map((t) => device.peerTarget(t.id))
+            .whereType<PeerTarget>()
+            .toList(),
+        nameOf: (id) => device.devices
+            .where((d) => d.id == id)
+            .map((d) => d.name)
+            .firstOrNull ??
+            id,
+      ),
     );
   }
 
@@ -210,5 +265,6 @@ class AppState {
     saved.dispose();
     settings.dispose();
     staging.dispose();
+    clipboard?.dispose();
   }
 }

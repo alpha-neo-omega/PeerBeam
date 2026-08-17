@@ -116,18 +116,27 @@ class SettingsScreen extends StatelessWidget {
               AnimatedBuilder(
                 animation: state.settings,
                 builder: (context, _) => Card(
-                  child: SwitchListTile.adaptive(
-                    secondary: const Icon(Icons.monitor_heart_rounded),
-                    title: const Text('Share device status with trusted devices'),
-                    // One line, and it must be true: what leaves, and to whom.
-                    // Naming the fields is the point — a vague "share status"
-                    // would not let anyone decide.
-                    subtitle: const Text(
-                      'Sends battery, free storage, network type and app version '
-                      'to your trusted devices only. Off by default.',
-                    ),
-                    value: state.settings.sharePresence,
-                    onChanged: state.settings.setSharePresence,
+                  child: Column(
+                    children: [
+                      SwitchListTile.adaptive(
+                        secondary: const Icon(Icons.monitor_heart_rounded),
+                        title: const Text(
+                          'Share device status with trusted devices',
+                        ),
+                        // One line, and it must be true: what leaves, and to
+                        // whom. Naming the fields is the point — a vague
+                        // "share status" would not let anyone decide.
+                        subtitle: const Text(
+                          'Sends battery, free storage, network type and app '
+                          'version to your trusted devices only. Off by '
+                          'default.',
+                        ),
+                        value: state.settings.sharePresence,
+                        onChanged: state.settings.setSharePresence,
+                      ),
+                      const Divider(height: 1),
+                      const _ClipboardSyncTile(),
+                    ],
                   ),
                 ),
               ),
@@ -349,6 +358,64 @@ class SettingsScreen extends StatelessWidget {
     if (dir != null && dir.isNotEmpty) {
       settings.setSaveDirectory(dir);
     }
+  }
+}
+
+/// The clipboard-sync opt-in, and the two things it must admit.
+///
+/// **This copy is load-bearing and `test/clipboard_sync_test.dart` pins it.**
+///
+/// 1. *Everything copied is sent, passwords included.* There is no password
+///    detection in PeerBeam and there is deliberately not going to be:
+///    `Clipboard.getData` returns plain text with no sensitivity signal, and
+///    X11/Wayland define none, so nothing here can distinguish a password
+///    manager's paste buffer from a shopping list. A heuristic would be wrong
+///    in both directions — dropping clips the user expected to arrive, or
+///    shipping a credential while this screen implies something was checked.
+///    The second is far worse than saying nothing, because the user relaxes on
+///    the strength of a promise nothing is keeping. So the honest warning is
+///    the feature, and softening it would be a security regression, not a
+///    copy-edit.
+/// 2. *A phone can receive but never send.* Android 10+ forbids background
+///    clipboard reads. Stating it here is the difference between a documented
+///    platform limit and a toggle that mysteriously does nothing.
+class _ClipboardSyncTile extends StatelessWidget {
+  const _ClipboardSyncTile();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    // Its own AnimatedBuilder rather than relying on the parent's: this widget
+    // is `const`, so an identical instance is canonicalised and the element is
+    // never rebuilt when the enclosing builder runs. Subscribing here is what
+    // makes the switch actually move when the setting changes.
+    return AnimatedBuilder(
+      animation: state.settings,
+      builder: (context, _) => Column(
+        children: [
+          SwitchListTile.adaptive(
+            secondary: const Icon(Icons.content_paste_rounded),
+            title: const Text('Sync clipboard with trusted devices'),
+            subtitle: const Text(
+              'Everything you copy is sent to your trusted devices, including '
+              'passwords — PeerBeam cannot tell them apart. Off by default.',
+            ),
+            value: state.settings.syncClipboard,
+            onChanged: state.settings.setSyncClipboard,
+          ),
+          if (_isAndroid)
+            const ListTile(
+              dense: true,
+              leading: Icon(Icons.info_outline_rounded, size: 20),
+              title: Text(
+                'This device can receive synced clipboards but cannot send '
+                'them: Android does not let apps read the clipboard in the '
+                'background.',
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 

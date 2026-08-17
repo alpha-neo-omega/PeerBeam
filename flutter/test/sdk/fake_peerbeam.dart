@@ -123,6 +123,23 @@ class FakePeerBeam implements PeerBeamApi {
     pushedBattery = (percent: percent, charging: charging);
   }
 
+  /// Every clipboard push the watcher made, in order. **This list is what the
+  /// echo-guard test reads**: the property is "a clip received from a peer is
+  /// never sent back", and that is only observable as an absence here.
+  final List<({String text, int peers})> clipboardPushes = [];
+
+  /// When set, [clipboardSync] throws it — used to prove an over-cap clip is
+  /// reported to the user once and not retried every second.
+  PeerBeamException? clipboardSyncThrows;
+
+  @override
+  Future<int> clipboardSync(String text, List<PeerTarget> peers) async {
+    final e = clipboardSyncThrows;
+    if (e != null) throw e;
+    clipboardPushes.add((text: text, peers: peers.length));
+    return peers.length;
+  }
+
   List<TrustedDevice> trusted = [];
 
   @override
