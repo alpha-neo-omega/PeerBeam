@@ -1158,6 +1158,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-clipboard"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "peerbeam-transfer",
+ "peerbeam-trust-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "peerbeam-clipboard-mem"
 version = "0.4.1"
 dependencies = [

@@ -21,6 +21,7 @@ members = [
     "crates/peerbeam-identity-fs",
     "crates/peerbeam-appstore-fs",
     "crates/peerbeam-chat",
+    "crates/peerbeam-clipboard",
     "crates/peerbeam-presence",
     "bins/peerbeam-cli",
 ]

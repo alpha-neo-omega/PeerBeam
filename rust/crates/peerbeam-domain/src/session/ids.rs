@@ -101,6 +101,8 @@ impl ChannelType {
     pub const TRANSFER: ChannelType = ChannelType(0x0100);
     /// Text/markdown chat messages (Phase B). See MESSAGE_REGISTRY.md §2.
     pub const CHAT: ChannelType = ChannelType(0x0101);
+    /// Clipboard sync (Phase B). See MESSAGE_REGISTRY.md §2.
+    pub const CLIPBOARD: ChannelType = ChannelType(0x0102);
     /// Device status heartbeats (Phase B). See MESSAGE_REGISTRY.md §2.
     pub const PRESENCE: ChannelType = ChannelType(0x0103);
 
@@ -205,5 +207,19 @@ mod tests {
         assert!(ChannelType::PRESENCE.is_first_party());
         assert!(!ChannelType::PRESENCE.is_control());
         assert_ne!(ChannelType::PRESENCE, ChannelType::CHAT);
+    }
+
+    /// `0x0102` is the id `docs/MESSAGE_REGISTRY.md` §2 reserved for Clipboard,
+    /// pinned for the same reason Presence's is: a renumbering here is a wire
+    /// break. It sits *between* Chat and Presence, which is exactly why it is
+    /// worth asserting the three are distinct — an off-by-one in this table
+    /// would route clips into the presence handler.
+    #[test]
+    fn clipboard_channel_type_is_0x0102_and_first_party() {
+        assert_eq!(ChannelType::CLIPBOARD.get(), 0x0102);
+        assert!(ChannelType::CLIPBOARD.is_first_party());
+        assert!(!ChannelType::CLIPBOARD.is_control());
+        assert_ne!(ChannelType::CLIPBOARD, ChannelType::CHAT);
+        assert_ne!(ChannelType::CLIPBOARD, ChannelType::PRESENCE);
     }
 }

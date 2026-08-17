@@ -104,6 +104,32 @@ pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
 /// [`CapabilitySet::intersect`] ANDs it away against a peer that predates it.
 pub const CHAT_FEAT_FILEDECLINE: u32 = 1 << 1;
 
+/// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
+/// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
+/// something.
+///
+/// **A receive capability, read exactly like the bits above**: the party that
+/// consults it is the one *sending* a `Clip`, asking whether the PEER
+/// negotiated the bit before putting one on the wire. It asserts comprehension,
+/// not behaviour — and here that separation is not a nicety but a platform
+/// fact. Android 10+ forbids reading the clipboard from the background, so a
+/// phone can never auto-*send*; it advertises this bit truthfully all the same,
+/// because it applies an incoming clip perfectly well. Desktop sends, every
+/// platform receives.
+///
+/// It rides the `Capability.features` bitset already on the wire, so
+/// advertising it is not a wire change: a peer that predates Clipboard never
+/// advertises the CLIPBOARD channel at all, `CapabilitySet::intersect` drops
+/// it, and no `Clip` is ever sent to it. A peer that advertises CLIPBOARD with
+/// `features: 0` has the bit ANDed away and is likewise sent nothing — it
+/// simply does not take part in sync, which is not an error.
+///
+/// As with `PRESENCE_FEAT_STATUS`, the feature bit is the *third* of three
+/// independent gates on a send; the other two — the opt-in setting and the
+/// trusted-only rule — are local privacy decisions and are not negotiable by a
+/// peer. See `peerbeam_clipboard::may_share_clip`.
+pub const CLIPBOARD_FEAT_CLIP: u32 = 1 << 0;
+
 /// Feature bit on the PRESENCE capability: this peer understands the `Status`
 /// message (presence MessageType 1) — device status heartbeats sent to it will
 /// mean something.
@@ -342,11 +368,11 @@ mod tests {
         assert!(!common.supports(ChannelType::TRANSFER));
     }
 
-    /// The three feature bits assigned so far live in two *separate* namespaces
-    /// (`Capability.features` is per-channel), so PRESENCE bit 0 and CHAT bit 0
-    /// sharing a value is correct and must not be "fixed". What would be a real
-    /// bug is reading one channel's bits off the other's capability, so this
-    /// pins that `features()` is keyed by channel.
+    /// The four feature bits assigned so far live in three *separate*
+    /// namespaces (`Capability.features` is per-channel), so CHAT, CLIPBOARD
+    /// and PRESENCE all having a bit 0 is correct and must not be "fixed". What
+    /// would be a real bug is reading one channel's bits off another's
+    /// capability, so this pins that `features()` is keyed by channel.
     #[test]
     fn feature_bits_are_scoped_to_their_own_channel() {
         let set = CapabilitySet::new()
@@ -354,6 +380,7 @@ mod tests {
                 ChannelType::CHAT,
                 CHAT_FEAT_FILEREF,
             ))
+            .with(Capability::new(ChannelType::CLIPBOARD)) // CLIPBOARD, no features
             .with(Capability::new(ChannelType::PRESENCE)); // PRESENCE, no features
         assert_eq!(set.features(ChannelType::CHAT), Some(CHAT_FEAT_FILEREF));
         assert_eq!(
@@ -361,6 +388,15 @@ mod tests {
             Some(0),
             "PRESENCE must not inherit CHAT's bits despite the same bit index"
         );
+        assert_eq!(
+            set.features(ChannelType::CLIPBOARD),
+            Some(0),
+            "CLIPBOARD must not inherit CHAT's bits despite the same bit index"
+        );
+        // All three bit-0s are the same value, which is the point: they are
+        // only ever meaningful alongside the channel they were read from.
+        assert_eq!(CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP);
+        assert_eq!(CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS);
     }
 
     #[test]
