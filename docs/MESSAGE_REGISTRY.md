@@ -45,7 +45,8 @@ near-term). Assignments are stable once published.
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
 | `0x0105` | Notes | C | rides Sync; may not need its own channel |
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
-| `0x0107 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
+| `0x0107` | Pipe | B | `peerbeam pipe` — an unbounded stdin↔stdout byte stream; a **stream** channel like Transfer, implemented |
+| `0x0108 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
 
 ## 3. Control channel (0x0000) message set
 
@@ -222,6 +223,47 @@ belonging to each capability's future spec:
   three conditions are decided.
   `Subscribe` / `Unsubscribe` remain **reserved, not implemented** — today's
   model is an unconditional heartbeat to peers that already passed the gates.
+- **Pipe (0x0107):** a **stream** channel, like Transfer (0x0100) and unlike
+  every other entry in this section — so it defines **no MessageTypes of its
+  own, and never will while it stays a stream channel.** A stream channel's
+  frames are not `SessionFrame`s at all: the session hands the sealed link to
+  the caller (`open_stream_channel` / the incoming-streams receiver) and the
+  caller runs a protocol directly over it, so there is no `message_type` field
+  on the wire to allocate from. Its MessageType namespace is therefore
+  **reserved in full**; a future need for typed messages alongside the bytes
+  would be a new channel, not a retrofit of this one.
+  What rides the link is the *transfer* framing, reused unchanged (I2): a run
+  of `Chunk` frames carrying raw bytes, terminated by `Control::Complete
+  { checksum }` and answered with `Control::Verify { ok }` — i.e. exactly
+  [TRANSFER_PROTOCOL.md](TRANSFER_PROTOCOL.md)'s frames minus the ones a pipe
+  has no meaning for. There is **no `Meta`**, because a pipe has no name and no
+  length (that absence *is* the feature — `tar cz . | peerbeam pipe --to x`
+  knows neither), and **no `ResumeAck`**, because stdin is not seekable and a
+  half-consumed pipe cannot be replayed.
+  The terminator is load-bearing and is not merely "the link closed": a
+  receiver that treated a dropped connection as end-of-stream would exit `0`
+  on a truncated file, which for `peerbeam pipe --listen > project.tgz` is
+  silent corruption. So the stream ends **only** on an explicit `Complete`, and
+  the SHA-256 it carries is verified against the bytes actually written; a
+  link that closes first is an error, and a mismatch is an error, in both cases
+  after the bytes are already out (a pipe cannot un-write stdout — the exit
+  code is the report).
+  Sent on a channel gated by the capability's first feature bit,
+  `PIPE_FEAT_STREAM = 1 << 0`
+  (`peerbeam_domain::session::PIPE_FEAT_STREAM`): a peer that does not
+  advertise it is refused **before stdin is read**, with a message naming the
+  peer and the reason, rather than being sent bytes it would drop.
+  Acceptance is gated separately and locally, and neither gate is on the wire.
+  Unlike Clipboard and Presence, the first gate is **not a setting**: an
+  inbound pipe is accepted only by a process the user explicitly started as
+  `peerbeam pipe --listen`, one stream and then exit. A running
+  `receive`/`daemon`/`serve`, and the Flutter GUI, all advertise the capability
+  and all **refuse** every pipe offered to them. The second gate is the
+  familiar one — trusted peers only, not configurable — optionally narrowed to
+  a single named device with `--from`. All of it is decided in one place,
+  `peerbeam_transfer::may_accept_pipe`, and the reasoning for why this consent
+  model differs from file transfer's approval prompt is in
+  [SECURITY.md](SECURITY.md).
 
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).

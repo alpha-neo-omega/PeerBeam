@@ -105,6 +105,15 @@ impl ChannelType {
     pub const CLIPBOARD: ChannelType = ChannelType(0x0102);
     /// Device status heartbeats (Phase B). See MESSAGE_REGISTRY.md §2.
     pub const PRESENCE: ChannelType = ChannelType(0x0103);
+    /// Encrypted byte pipe — `peerbeam pipe` (Phase B). See MESSAGE_REGISTRY.md
+    /// §2/§4.
+    ///
+    /// A **stream** capability, like [`TRANSFER`](ChannelType::TRANSFER) and
+    /// unlike Chat/Clipboard/Presence: its channel carries an unbounded,
+    /// length-unknown byte stream that the caller drives over the sealed link
+    /// itself, rather than typed messages dispatched to a
+    /// [`MessageHandler`](super::MessageHandler).
+    pub const PIPE: ChannelType = ChannelType(0x0107);
 
     /// Construct from a raw registry id.
     #[must_use]
@@ -221,5 +230,36 @@ mod tests {
         assert!(!ChannelType::CLIPBOARD.is_control());
         assert_ne!(ChannelType::CLIPBOARD, ChannelType::CHAT);
         assert_ne!(ChannelType::CLIPBOARD, ChannelType::PRESENCE);
+    }
+
+    /// `0x0107` is the id `docs/MESSAGE_REGISTRY.md` §2 assigns to Pipe — the
+    /// next free first-party slot after the Sync/Notes/Command reservations.
+    /// Pinned for the same reason the others are: these ids are a long-term
+    /// wire contract and are never renumbered, so a change here is a wire
+    /// break rather than a refactor.
+    ///
+    /// The `0x0104..=0x0106` assertions are not padding: those three ids are
+    /// *reserved but unimplemented*, so nothing else in the tree would notice
+    /// if Pipe were quietly moved onto one of them.
+    #[test]
+    fn pipe_channel_type_is_0x0107_and_first_party() {
+        assert_eq!(ChannelType::PIPE.get(), 0x0107);
+        assert!(ChannelType::PIPE.is_first_party());
+        assert!(!ChannelType::PIPE.is_control());
+        for reserved in [0x0104u16, 0x0105, 0x0106] {
+            assert_ne!(
+                ChannelType::PIPE,
+                ChannelType::new(reserved),
+                "Pipe must not squat a reserved id"
+            );
+        }
+        for taken in [
+            ChannelType::TRANSFER,
+            ChannelType::CHAT,
+            ChannelType::CLIPBOARD,
+            ChannelType::PRESENCE,
+        ] {
+            assert_ne!(ChannelType::PIPE, taken);
+        }
     }
 }

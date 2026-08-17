@@ -155,6 +155,33 @@ pub const CLIPBOARD_FEAT_CLIP: u32 = 1 << 0;
 /// `peerbeam_presence::may_share_status`.
 pub const PRESENCE_FEAT_STATUS: u32 = 1 << 0;
 
+/// Feature bit on the PIPE capability: this peer understands an inbound
+/// **byte stream** on the Pipe channel (`0x0107`) — opening one and writing
+/// chunks at it will mean something.
+///
+/// **A receive capability, read exactly like the bits above**: the party that
+/// consults it is the one about to *open* a pipe, asking whether the PEER
+/// negotiated the bit before it starts reading stdin. It asserts comprehension,
+/// not behaviour, and here that split is unusually wide — every PeerBeam build
+/// advertises it, including the Flutter GUI, which understands the channel
+/// perfectly well and then refuses every pipe offered to it because a GUI has
+/// no stdout to write bytes to. Advertising uniformly is deliberate: a peer's
+/// behaviour must not depend on which of PeerBeam's two frontends it reached,
+/// which is exactly the bug 2a shipped with `CHAT_FEAT_FILEREF`.
+///
+/// So this bit answers **"can these bytes be framed and understood?"**, never
+/// **"will they be accepted?"**. Acceptance is a separate, local decision made
+/// per inbound pipe by `peerbeam_transfer::may_accept_pipe`, and a peer has no
+/// say in it. A sender that sees the bit and is then refused has learned only
+/// that the receiver is not running `peerbeam pipe --listen`.
+///
+/// It rides the `Capability.features` bitset already on the wire, so
+/// advertising it is not a wire change: a peer that predates Pipe never
+/// advertises the PIPE channel at all, `CapabilitySet::intersect` drops it, and
+/// `pipe --to` refuses up front — before it reads a byte of stdin — rather than
+/// opening a channel that peer would reject.
+pub const PIPE_FEAT_STREAM: u32 = 1 << 0;
+
 /// One advertised capability: a channel type the peer supports, with a bitset of
 /// optional per-capability feature flags (`0` = base capability, no extras).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,11 +395,12 @@ mod tests {
         assert!(!common.supports(ChannelType::TRANSFER));
     }
 
-    /// The four feature bits assigned so far live in three *separate*
-    /// namespaces (`Capability.features` is per-channel), so CHAT, CLIPBOARD
-    /// and PRESENCE all having a bit 0 is correct and must not be "fixed". What
-    /// would be a real bug is reading one channel's bits off another's
-    /// capability, so this pins that `features()` is keyed by channel.
+    /// The five feature bits assigned so far live in four *separate*
+    /// namespaces (`Capability.features` is per-channel), so CHAT, CLIPBOARD,
+    /// PRESENCE and PIPE all having a bit 0 is correct and must not be
+    /// "fixed". What would be a real bug is reading one channel's bits off
+    /// another's capability, so this pins that `features()` is keyed by
+    /// channel.
     #[test]
     fn feature_bits_are_scoped_to_their_own_channel() {
         let set = CapabilitySet::new()
@@ -381,7 +409,8 @@ mod tests {
                 CHAT_FEAT_FILEREF,
             ))
             .with(Capability::new(ChannelType::CLIPBOARD)) // CLIPBOARD, no features
-            .with(Capability::new(ChannelType::PRESENCE)); // PRESENCE, no features
+            .with(Capability::new(ChannelType::PRESENCE)) // PRESENCE, no features
+            .with(Capability::new(ChannelType::PIPE)); // PIPE, no features
         assert_eq!(set.features(ChannelType::CHAT), Some(CHAT_FEAT_FILEREF));
         assert_eq!(
             set.features(ChannelType::PRESENCE),
@@ -393,10 +422,16 @@ mod tests {
             Some(0),
             "CLIPBOARD must not inherit CHAT's bits despite the same bit index"
         );
-        // All three bit-0s are the same value, which is the point: they are
+        assert_eq!(
+            set.features(ChannelType::PIPE),
+            Some(0),
+            "PIPE must not inherit CHAT's bits despite the same bit index"
+        );
+        // All four bit-0s are the same value, which is the point: they are
         // only ever meaningful alongside the channel they were read from.
         assert_eq!(CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP);
         assert_eq!(CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS);
+        assert_eq!(PRESENCE_FEAT_STATUS, PIPE_FEAT_STREAM);
     }
 
     #[test]

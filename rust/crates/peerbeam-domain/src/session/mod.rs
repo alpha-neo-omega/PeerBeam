@@ -24,6 +24,7 @@ pub use handler::MessageHandler;
 pub use ids::{ChannelId, ChannelType, MessageType, SessionId};
 pub use negotiation::{
     negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation,
-    CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM,
+    PRESENCE_FEAT_STATUS,
 };
 pub use state::SessionState;
