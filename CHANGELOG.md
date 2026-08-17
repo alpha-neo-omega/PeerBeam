@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-18 — Beta
+
 ### Added
 - **`peerbeam pipe` — an encrypted byte pipe between two devices.** stdin on one
   side, stdout on the other, over a new negotiated Pipe channel (`0x0107`):
