@@ -18,6 +18,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/app/theme.dart' show Breakpoints;
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/features/send/drop_zone.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -529,6 +530,235 @@ void main() {
             reason: 'the conversation owns drops again the moment it is back',
           );
           expect(chatTarget(tester).enable, isTrue);
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+    });
+
+    // THE REGISTER IS NOT A CONSTANT. `AppShell` places its `DropZone` in a
+    // different slot below and above `Breakpoints.compact` — the `Scaffold`'s
+    // `body` on a narrow window, inside a `Row` beside the navigation rail on a
+    // wide one — so dragging the window across 600px destroys `_DropZoneState`
+    // and the claim register it owns, while the branch Navigator's GlobalKey
+    // carries the open conversation over into the replacement.
+    //
+    // A zone that bound its register once therefore went on holding a claim on
+    // a notifier nobody reads any more: the new Send zone came up enabled
+    // beside the still-live chat one, a drop was answered TWICE (sent to the
+    // peer and staged for the Send flow), and closing the conversation
+    // afterwards threw `A ValueNotifier<int> was used after being disposed`.
+    group('the shell rebuilding its DropZone into another slot', () {
+      /// `AppShell`'s two layouts, at the real breakpoint, around whichever
+      /// [content] the shell is showing. Only the slot the `DropZone` sits in
+      /// matters here, so the navigation affordances are stand-ins.
+      Widget shell(AppState state, Widget content) => AppScope(
+        state: state,
+        child: MaterialApp(
+          home: Builder(
+            builder: (context) {
+              final body = DropZone(staging: state.staging, child: content);
+              if (MediaQuery.sizeOf(context).width < Breakpoints.compact) {
+                return Scaffold(
+                  body: body,
+                  bottomNavigationBar: const SizedBox(height: 48),
+                );
+              }
+              return Scaffold(
+                body: Row(
+                  children: [
+                    const SizedBox(width: 72),
+                    const VerticalDivider(width: 1, thickness: 1),
+                    Expanded(child: body),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
+
+      Future<void> resizeTo(WidgetTester tester, double width) async {
+        tester.view.physicalSize = Size(width, 900);
+        tester.view.devicePixelRatio = 1.0;
+        // Three frames: the resize rebuilds the shell and the chat reclaims
+        // during its own build, and `DropZone` defers the rebuild that flips
+        // `enable` to after that frame.
+        await tester.pump();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+      }
+
+      testWidgets('leaves exactly one live target, still the chat\'s, and a '
+          'drop is still answered once', (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        addTearDown(tester.view.reset);
+        try {
+          final file = _tempFile(tmp, 'holiday.bin', 'xyz');
+          final fake = FakePeerBeam();
+          final state = AppState.live(fake);
+          addTearDown(state.dispose);
+          // The GlobalKey the branch Navigator plays in production: the chat is
+          // carried into the rebuilt shell rather than mounted afresh, which is
+          // precisely what leaves a State holding a register nobody owns.
+          final chat = GlobalKey();
+          final content = KeyedSubtree(
+            key: chat,
+            child: const ChatScreen(peerId: 'pb-bob', peer: _peer),
+          );
+
+          tester.view.physicalSize = const Size(500, 900);
+          tester.view.devicePixelRatio = 1.0;
+          await tester.pumpWidget(shell(state, content));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          final before = tester.state(find.byType(ChatScreen));
+
+          await resizeTo(tester, 900); // across Breakpoints.compact
+
+          expect(
+            tester.state(find.byType(ChatScreen)),
+            same(before),
+            reason: 'the conversation was carried over, not remounted',
+          );
+          final targets = tester
+              .widgetList<DropTarget>(find.byType(DropTarget))
+              .toList();
+          expect(targets, hasLength(2), reason: 'outer Send zone and the chat');
+          expect(
+            targets.map((t) => t.enable),
+            [false, true],
+            reason: 'the new register was claimed, so the Send zone stood down',
+          );
+
+          // Drive every target, disabled ones included — the handler guards are
+          // what cover the frames before `enable` catches up.
+          await tester.runAsync(() async {
+            for (final t in targets) {
+              t.onDragDone!(
+                DropDoneDetails(
+                  files: [DropItemFile(file.path)],
+                  localPosition: Offset.zero,
+                  globalPosition: Offset.zero,
+                ),
+              );
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          });
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), [
+            'chatSendFile:${file.path}',
+          ]);
+          expect(
+            state.staging.count,
+            0,
+            reason: 'the Send flow must not stage a second copy of it',
+          );
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+
+      // The reconciliation rule the shell harness above cannot see, because a
+      // GlobalKey re-parent always happens inside the frame that disposes the
+      // old zone, so the stale notifier is still alive at that instant. Stated
+      // on the register itself: the claim on a replaced register is DROPPED,
+      // never decremented. The register belongs to a `DropZone` that is being
+      // disposed — touching it is precisely the "used after being disposed"
+      // throw — and the count it would correct is going away with it.
+      testWidgets('a claim on a replaced register is dropped, not released', (
+        tester,
+      ) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        try {
+          final state = AppState.live(FakePeerBeam());
+          addTearDown(state.dispose);
+          final first = ValueNotifier<int>(0);
+          final second = ValueNotifier<int>(0);
+          addTearDown(first.dispose);
+          addTearDown(second.dispose);
+
+          Widget app(ValueNotifier<int> register) => AppScope(
+            state: state,
+            child: MaterialApp(
+              home: DropClaims(
+                claims: register,
+                child: const ChatScreen(peerId: 'pb-bob', peer: _peer),
+              ),
+            ),
+          );
+
+          await tester.pumpWidget(app(first));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+          expect(first.value, 1, reason: 'the open conversation claimed it');
+
+          await tester.pumpWidget(app(second));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(
+            second.value,
+            1,
+            reason: 'claimed afresh on the register that now exists',
+          );
+          expect(
+            first.value,
+            1,
+            reason: 'and the replaced one was never touched again',
+          );
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      });
+
+      testWidgets('and closing the conversation afterwards throws nothing', (
+        tester,
+      ) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        addTearDown(tester.view.reset);
+        try {
+          final fake = FakePeerBeam();
+          final state = AppState.live(fake);
+          addTearDown(state.dispose);
+          final chat = GlobalKey();
+
+          tester.view.physicalSize = const Size(500, 900);
+          tester.view.devicePixelRatio = 1.0;
+          await tester.pumpWidget(
+            shell(
+              state,
+              KeyedSubtree(
+                key: chat,
+                child: const ChatScreen(peerId: 'pb-bob', peer: _peer),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          await resizeTo(tester, 900);
+
+          // Leaving the conversation releases the claim — on the register that
+          // still exists. Releasing the one the resize disposed is the throw.
+          await tester.pumpWidget(
+            shell(state, const Scaffold(body: Text('home'))),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 300));
+
+          expect(tester.takeException(), isNull);
+          final remaining = tester.widgetList<DropTarget>(
+            find.byType(DropTarget),
+          );
+          expect(remaining, hasLength(1));
+          expect(
+            remaining.single.enable,
+            isTrue,
+            reason: 'and the Send flow has its drops back',
+          );
         } finally {
           debugDefaultTargetPlatformOverride = null;
         }

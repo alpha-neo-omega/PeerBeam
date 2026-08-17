@@ -73,7 +73,23 @@ class _ChatDropZoneState extends State<ChatDropZone> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _register ??= DropClaims.maybeOf(context);
+    final register = DropClaims.maybeOf(context);
+    if (!identical(register, _register)) {
+      // A DIFFERENT register means the [DropZone] above has been rebuilt from
+      // scratch rather than merely rebuilt: `AppShell` puts it in the
+      // `Scaffold`'s `body` below `Breakpoints.compact` and inside a `Row`
+      // beside the navigation rail above it, so dragging the window across
+      // 600px destroys `_DropZoneState` and the notifier it owns, while the
+      // branch Navigator's GlobalKey carries this State over into the new one.
+      //
+      // The claim is therefore DROPPED, not released. Decrementing the old
+      // register would be touching a `ValueNotifier` its owner has already
+      // disposed — the "used after being disposed" throw — and the count it
+      // would be correcting is going away with it either way. Claiming afresh
+      // on the register that now exists is the whole of what is owed.
+      _held = null;
+      _register = register;
+    }
     _visible = _onScreen();
     _reconcile();
   }
@@ -107,8 +123,16 @@ class _ChatDropZoneState extends State<ChatDropZone> {
       (ModalRoute.of(context)?.isCurrent ?? true);
 
   /// Hold or release the claim so that it matches what this zone can see right
-  /// now: one path, rather than two mechanisms that could disagree about who
-  /// owns the next drop.
+  /// now — given the register in scope and whether this conversation is on
+  /// screen, either the claim is held or it is not.
+  ///
+  /// Deliberately one path and not two mechanisms, because two could disagree
+  /// about who owns the next drop, and the answer to that question is which
+  /// device a file leaves for.
+  ///
+  /// It only ever decrements [_held], which [didChangeDependencies] has already
+  /// reconciled to the live register — so a stale one is dropped there rather
+  /// than decremented here.
   ///
   /// Mutating the register during this screen's own build is deliberate and
   /// safe: [DropZone] listens to it and defers its own rebuild to after the
