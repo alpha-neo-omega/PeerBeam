@@ -212,6 +212,49 @@ class ChatRepository extends ChangeNotifier {
     return result;
   }
 
+  /// Delete some of a conversation's messages, returning the engine's own
+  /// answer: how many rows were `removed`, and the ids it `kept` because they
+  /// still back a queued outbound message.
+  ///
+  /// **Local only** — nothing goes on the wire, and the peer keeps its copy.
+  ///
+  /// The cache is narrowed to what the engine actually did, never to what was
+  /// asked: a kept row stays exactly where it was, so a file still being sent
+  /// keeps its bubble, its progress bar and its Cancel. Everything else the
+  /// caller named is dropped, along with the session-only state describing it
+  /// ([_errors], [_staging], [_unsent]) — an unsent row in particular, which the
+  /// engine never persisted and [refresh] would otherwise re-append,
+  /// resurrecting a message the user just deleted.
+  ///
+  /// An id the engine reports as neither removed nor kept is one it never
+  /// held — an unsent row is exactly that — and dropping it here is the only
+  /// way it can ever go, which is what [dismiss] already does for the same
+  /// rows.
+  ///
+  /// The conversation list is re-read afterwards because a thread whose last
+  /// row has just gone stops being a thread.
+  Future<({int removed, List<String> kept})> deleteMessages(
+    String peerId,
+    List<String> messageIds,
+  ) async {
+    final api = _api;
+    if (api == null) return (removed: 0, kept: const <String>[]);
+    final result = await api.chatDeleteMessages(peerId, messageIds);
+    if (_disposed) return result;
+    final kept = result.kept.toSet();
+    final gone = messageIds.where((id) => !kept.contains(id)).toSet();
+    for (final id in gone) {
+      _errors.remove(id);
+      _staging.remove(id);
+    }
+    _byPeer[peerId]?.removeWhere((m) => gone.contains(m.id));
+    _unsent[peerId]?.removeWhere((m) => gone.contains(m.id));
+    if (_unsent[peerId]?.isEmpty ?? false) _unsent.remove(peerId);
+    notifyListeners();
+    await refreshConversations();
+    return result;
+  }
+
   /// Call off a file we are sharing, and report **honestly** whether anything
   /// was cancelled.
   ///

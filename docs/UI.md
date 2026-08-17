@@ -122,6 +122,78 @@ flagging directly, and drives `ChatDropZone`'s real `DropTarget` callback
 (found in the widget tree, not simulated through the OS channel) for the
 two-file, folder-only, and mixed-drop cases.
 
+## Selecting messages in a conversation
+
+A **long-press** on a bubble starts a selection with that one message; on
+desktop a **secondary tap** (right-click) does the same, since a long-press
+with a mouse is nobody's idiom. Once one is open a plain tap toggles, the app
+bar becomes a selection bar — × , `N selected`, **Forward**, **Delete** — and
+selection ends via the ×, the system back gesture, or taking the last message
+back.
+
+**Selection is one set, not a set plus a mode flag.** Every way in and out is a
+change to `_selected` in `ChatScreen`, so the two cannot disagree. It is
+narrowed at build time to ids still in the thread and never mutated during a
+build — the shape `TransfersScreen` uses, and for the same reason: incoming
+messages and ~100 staging progress ticks per share rebuild this screen
+constantly, and a selection that a rebuild could drop is not a selection. A
+`_selected` left naming nothing real is cleared **after** the frame, which
+matters because an inbound file's id is the *sender's* `FileRef` id: a peer
+reusing one a stale set still held would render that message pre-selected.
+
+**Back leaves the selection before it leaves the screen** (a `PopScope`). A
+back press that closed the conversation with a selection open throws away work
+the user is in the middle of.
+
+**While selecting there is one action path.** The in-bubble actions — Cancel,
+Dismiss, and an offer's Decline/Accept/Trust — are withheld, exactly as
+`TransfersScreen` withholds its per-card decisions in selection mode: those are
+decisions about one file, and a live Accept sitting where the user is aiming to
+toggle is the wrong tap waiting to happen.
+
+### Delete
+
+Confirmed first, and the confirmation promises only what can honestly be
+promised beforehand: the messages go **from this device**, anything still
+waiting to be sent is kept and still sent, and the other device keeps its own
+copy. No counts of what will survive — what is queued can change up to the
+moment the engine deletes.
+
+The whole selection goes in **one** `chatDeleteMessages` call, and the report is
+the engine's own answer rather than the request: `Deleted 3 messages`, or
+`Deleted 2 messages · 1 kept because it is still being sent`. A kept row is one
+whose record still backs a queued send — deleting it is what makes the drain
+conclude nothing will ever settle that entry, at which point it drops the entry
+and deletes the file's only staged copy — so saying why it is still on screen is
+the point of the engine naming it. A refusal is reported, never swallowed: the
+messages are all still there, and silence would look like it worked.
+
+### Forward
+
+Opens the same `showDevicePicker` sheet the Send flow uses — one device list,
+not a second one. Each selected message is then sent to the chosen peer **in
+thread order**, through the existing send paths: text as text, a file as a
+file. No new engine call, and nothing bypasses `PeerSession`.
+
+**A saved (by-address) pick is resolved to a real device id first.** A saved
+entry's id is a locally minted timestamp the peer has never heard of, and a
+conversation may only be keyed by an authenticated id — the rule Home already
+applies before it will open a chat at all — so an unresolvable pick is refused
+with the reason rather than filing rows into a thread every reply would miss.
+
+**A file whose bytes are gone is excluded before anything is sent**, and named:
+`invoice.pdf isn't on this device any more`. A row's `localPath` records where
+its file *was* — the sender's original can move, and on Android a received
+file's engine-private copy is unlinked once it is published into the user's SAF
+folder — so `localFileExists` asks the filesystem up front instead of letting
+the engine fail one message at a time into a row of failed bubbles in the other
+thread. A selection of only-missing files sends nothing and says so.
+
+`test/chat_selection_test.dart` covers entering/leaving, back ordering,
+survival across an incoming message, the single delete call with exactly the
+selected ids, the engine's `removed`/`kept` rendering, and forwarding's order,
+per-kind routing and exclusion.
+
 ## Approving several transfers at once
 
 When **two or more** inbound transfers are awaiting approval, the Transfers

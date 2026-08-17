@@ -3,6 +3,21 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:open_filex/open_filex.dart';
 
+/// Whether [path] names a file whose bytes are on this device **right now**.
+///
+/// A chat row's `localPath` records where its file was, not where it still is:
+/// the sender's original can be moved, renamed or deleted after the row is
+/// written, and on Android a received file's engine-private copy is unlinked
+/// once it has been published into the user's SAF folder, so that path dangles
+/// by design. Anything that intends to hand the path to the engine — forwarding
+/// a message, for one — has to ask first and say so when the answer is no,
+/// rather than letting the send fail one file at a time.
+///
+/// Deliberately synchronous and deliberately here, beside [openLocalPath],
+/// which asks the same question for the same reason.
+bool localFileExists(String path) =>
+    path.isNotEmpty && FileSystemEntity.isFileSync(path);
+
 /// Open a local file or directory with the OS default handler.
 ///
 /// Desktop launches the platform opener directly (no plugin needed); mobile

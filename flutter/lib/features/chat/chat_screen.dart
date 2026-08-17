@@ -6,12 +6,15 @@ import '../../app/theme.dart';
 import '../../platform/desktop_files.dart';
 import '../../platform/open_path.dart';
 import '../../platform/saf.dart';
+import '../../sdk/error_text.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
+import '../../state/stores.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/processing.dart';
+import '../send/pick_device.dart';
 import 'chat_drop_zone.dart';
 
 /// A one-to-one chat with [peer]. [peerId] is the discovered device's real
@@ -40,6 +43,22 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
+
+  /// Message ids the user has picked out of this thread.
+  ///
+  /// Selection **is** this set being non-empty — there is no separate mode
+  /// flag, because every way in and out of selection here is a change to it:
+  /// a long-press on the first bubble starts it, a tap toggles, and taking the
+  /// last one back ends it. One piece of state cannot disagree with itself.
+  ///
+  /// It can outlive the rows it names — a message can be deleted from another
+  /// surface, or a thread re-read while a selection sits open — so it is never
+  /// rendered directly. `build` narrows it to ids still in the thread first,
+  /// and derives everything from that; a dead id is left to age out rather than
+  /// pruned by mutating state from inside a build. The same shape
+  /// `TransfersScreen` uses for its own selection, and for the same reason:
+  /// incoming messages and staging progress rebuild this screen constantly.
+  Set<String> _selected = {};
 
   @override
   void initState() {
@@ -122,11 +141,281 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Add or remove one message — which is also how selection begins and ends.
+  ///
+  /// A long-press (or a secondary tap, the desktop idiom) on a bubble with
+  /// nothing selected lands here and leaves exactly that message selected; a
+  /// plain tap while selecting toggles; taking the last one back empties the
+  /// set and the selection bar goes with it.
+  void _toggle(String id) => setState(() {
+    final next = Set<String>.from(_selected);
+    if (!next.remove(id)) next.add(id);
+    _selected = next;
+  });
+
+  void _clearSelection() => setState(() => _selected = {});
+
+  /// Leave selection once nothing it named is in the thread any more — after
+  /// the frame, never during one.
+  ///
+  /// `build` only ever *narrows* the set, which is not the same as clearing it:
+  /// select a message, have it deleted from elsewhere, and `_selected` keeps
+  /// naming an id that no longer exists. An inbound file's id is the **sender's**
+  /// `FileRef` id, so a peer reusing one the stale set still holds would render
+  /// that message pre-selected — a selection the user never composed. The
+  /// condition is re-read when the callback runs rather than trusted from when
+  /// it was scheduled, since a rebuild can land in the gap.
+  void _leaveSelectionAfterFrame(Set<String> present) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _selected.isEmpty) return;
+      if (_selected.intersection(present).isNotEmpty) return;
+      setState(() => _selected = {});
+    });
+  }
+
+  void _snack(ScaffoldMessengerState messenger, String message) => messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(message)));
+
+  /// Confirm, then delete the selected messages from this device.
+  ///
+  /// The confirmation promises exactly two things, because two are all this can
+  /// honestly promise beforehand: they go **from this device**, and anything
+  /// still waiting to be sent is kept and still sent. No counts of what will
+  /// survive — what is queued can change up to the moment the engine deletes —
+  /// so those are reported afterwards, from the engine's own answer.
+  Future<void> _deleteSelected(List<String> ids) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final chat = AppScope.of(context).chat;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          ids.length == 1
+              ? 'Delete 1 message?'
+              : 'Delete ${ids.length} messages?',
+        ),
+        content: const Text(
+          'This removes them from this device. Anything still waiting to be '
+          'sent is kept and will still be sent.\n\n'
+          'The other device keeps its own copy — nothing is deleted there.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      final result = await chat.deleteMessages(widget.peerId, ids);
+      if (!mounted) return;
+      _clearSelection();
+      _snack(messenger, _deleteOutcome(result));
+    } catch (e) {
+      // Reported, never swallowed: a refusal here is the engine declining to
+      // delete because it could not establish what is still queued, and the
+      // messages are all still there. Saying nothing would look like it worked.
+      _snack(messenger, 'Could not delete — ${friendlyError(e)}');
+    }
+  }
+
+  /// What actually happened, in the engine's own answer.
+  ///
+  /// Never a restatement of what was asked. A kept row is one still waiting to
+  /// be sent — the engine refused to take it because its record is what will
+  /// deliver the file — so the user is told that in their own terms rather than
+  /// left to wonder why a bubble they deleted is still on screen.
+  static String _deleteOutcome(({int removed, List<String> kept}) r) {
+    final removed = r.removed == 1
+        ? 'Deleted 1 message'
+        : 'Deleted ${r.removed} messages';
+    if (r.kept.isEmpty) return removed;
+    final kept = r.kept.length == 1
+        ? '1 kept because it is still being sent'
+        : '${r.kept.length} kept because they are still being sent';
+    return '$removed · $kept';
+  }
+
+  /// Forward the selected messages to another device.
+  ///
+  /// [chosen] arrives in **thread order** and is sent in that order, one await
+  /// at a time: forwarding a conversation whose messages arrive shuffled is a
+  /// different conversation. Nothing new crosses the engine boundary — a text
+  /// message is sent as text and a file as a file, through the same two calls
+  /// the composer and the attach button already use.
+  Future<void> _forwardSelected(List<ChatMessage> chosen) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final scope = AppScope.of(context);
+    final picked = await showDevicePicker(context);
+    if (picked == null || !mounted) return;
+
+    // A conversation may only be keyed by a peer's **real** device id. A saved
+    // (by-address) entry's id is a locally minted timestamp the peer has never
+    // heard of, so filing rows under it would leave a thread every inbound
+    // record misses — the rule the Home screen already applies before it opens
+    // a chat at all. So the pick is resolved back to a discovered identity, and
+    // refused honestly when there is none.
+    final peerId = _realPeerId(scope, picked.target);
+    final target = peerId == null ? null : scope.device.peerTarget(peerId);
+    if (peerId == null || target == null) {
+      _snack(
+        messenger,
+        'Cannot forward to ${picked.name} yet — PeerBeam has to see the device '
+        'before it knows which conversation to file these under.',
+      );
+      return;
+    }
+
+    // Split before sending anything, never per message. A file whose bytes are
+    // no longer on this device cannot be forwarded at all, and handing the
+    // engine a path that is not there would produce a row of failed bubbles in
+    // the other thread having warned nobody.
+    final sendable = <ChatMessage>[];
+    final missing = <String>[];
+    for (final m in chosen) {
+      final path = m.isFile ? (m.localPath ?? '') : '';
+      if (!m.isFile || localFileExists(path)) {
+        sendable.add(m);
+      } else {
+        missing.add(m.fileName ?? 'That file');
+      }
+    }
+    if (sendable.isEmpty) {
+      _snack(
+        messenger,
+        'Nothing could be forwarded — ${_missingText(missing)}',
+      );
+      return;
+    }
+
+    // Selection ends the moment the batch is committed, so a second tap cannot
+    // send it twice while the first is still going out.
+    _clearSelection();
+    final chat = scope.chat;
+    for (final m in sendable) {
+      if (m.isFile) {
+        await chat.sendFile(
+          peerId,
+          target,
+          m.localPath ?? '',
+          name: m.fileName,
+          size: m.fileSize,
+        );
+      } else {
+        await chat.send(peerId, target, m.body);
+      }
+    }
+    final sent = sendable.length == 1
+        ? 'Forwarded 1 message to ${picked.name}'
+        : 'Forwarded ${sendable.length} messages to ${picked.name}';
+    _snack(
+      messenger,
+      missing.isEmpty ? sent : '$sent · ${_missingText(missing)}',
+    );
+  }
+
+  /// The peer's real device id behind a picked target, or null when discovery
+  /// cannot currently see it. A discovered pick answers itself; a saved one is
+  /// resolved by the address it advertises, exactly as the Home screen does.
+  String? _realPeerId(AppState scope, PeerTarget target) {
+    final id = target.id;
+    if (id != null && scope.device.peerTarget(id) != null) return id;
+    if (target.addresses.isEmpty) return null;
+    return scope.device
+        .deviceAtAddress(target.addresses.first, target.port)
+        ?.id;
+  }
+
+  /// Names the files that could not go, and why — never a bare count, because
+  /// "1 was skipped" tells the user nothing they can act on.
+  static String _missingText(List<String> names) => names.length == 1
+      ? "${names.single} isn't on this device any more"
+      : "${names.join(', ')} aren't on this device any more";
+
+  /// The app bar while messages are selected: leave, the count, and the two
+  /// things that can be done to a selection.
+  ///
+  /// [items] arrives in thread order, so [_forwardSelected] gets its messages
+  /// in the order they appear rather than in whatever order they were tapped.
+  PreferredSizeWidget _selectionBar(
+    List<ChatMessage> items,
+    Set<String> selected,
+  ) {
+    final chosen = items
+        .where((m) => selected.contains(m.id))
+        .toList(growable: false);
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.close_rounded),
+        tooltip: 'Cancel selection',
+        onPressed: _clearSelection,
+      ),
+      title: Text('${selected.length} selected'),
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.forward_rounded),
+          tooltip: 'Forward',
+          onPressed: () => _forwardSelected(chosen),
+        ),
+        IconButton(
+          icon: const Icon(Icons.delete_outline_rounded),
+          tooltip: 'Delete',
+          onPressed: () =>
+              _deleteSelected(chosen.map((m) => m.id).toList(growable: false)),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
+    // The whole screen rebuilds on a chat change, not just the list: the app
+    // bar becomes the selection bar, and both it and the bubbles have to be
+    // reading the same narrowed selection within one frame.
+    return AnimatedBuilder(
+      animation: state.chat,
+      builder: (context, _) {
+        final items = state.chat.messagesFor(widget.peerId);
+        // Derived every build, never written back into state (see [_selected]).
+        final present = items.map((m) => m.id).toSet();
+        final selected = _selected.intersection(present);
+        if (_selected.isNotEmpty && selected.isEmpty) {
+          _leaveSelectionAfterFrame(present);
+        }
+        final selecting = selected.isNotEmpty;
+        return PopScope(
+          // Back leaves the selection before it leaves the conversation. A back
+          // press that closed the whole screen with a selection open would
+          // throw away work the user is in the middle of and land them
+          // somewhere they did not ask to be.
+          canPop: !selecting,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) _clearSelection();
+          },
+          child: _body(state, items, selected, selecting),
+        );
+      },
+    );
+  }
+
+  Widget _body(
+    AppState state,
+    List<ChatMessage> items,
+    Set<String> selected,
+    bool selecting,
+  ) {
     return Scaffold(
-      appBar: AppBar(title: Text(widget.peer.name)),
+      appBar: selecting
+          ? _selectionBar(items, selected)
+          : AppBar(title: Text(widget.peer.name)),
       // Desktop-only drag & drop for this one conversation — a transparent
       // passthrough everywhere else, exactly like the Send flow's own
       // DropZone. Wraps the body (not the AppBar) so a drop anywhere over the
@@ -140,48 +429,44 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Column(
               children: [
                 Expanded(
-                  child: AnimatedBuilder(
-                    animation: state.chat,
-                    builder: (context, _) {
-                      final items = state.chat.messagesFor(widget.peerId);
-                      if (items.isEmpty) {
-                        return const EmptyState(
+                  child: items.isEmpty
+                      ? const EmptyState(
                           icon: Icons.chat_bubble_outline_rounded,
                           title: 'No messages yet',
                           message: 'Send a message to start the conversation.',
-                        );
-                      }
+                        )
                       // Reversed so the latest message stays pinned to the
                       // bottom without a manual scroll controller.
-                      return ListView.builder(
-                        reverse: true,
-                        padding: const EdgeInsets.all(AppSpace.md),
-                        itemCount: items.length,
-                        itemBuilder: (context, i) {
-                          final message = items[items.length - 1 - i];
-                          // A row the engine refused to send exists only here,
-                          // so only the user can clear it.
-                          final unsent = state.chat.isUnsent(
-                            widget.peerId,
-                            message.id,
-                          );
-                          return Appear(
-                            index: i,
-                            child: _ChatBubble(
-                              message: message,
-                              error: state.chat.errorFor(message.id),
-                              onDismiss: unsent
-                                  ? () => state.chat.dismiss(
-                                      widget.peerId,
-                                      message.id,
-                                    )
-                                  : null,
-                            ),
-                          );
-                        },
-                      );
-                    },
-                  ),
+                      : ListView.builder(
+                          reverse: true,
+                          padding: const EdgeInsets.all(AppSpace.md),
+                          itemCount: items.length,
+                          itemBuilder: (context, i) {
+                            final message = items[items.length - 1 - i];
+                            // A row the engine refused to send exists only
+                            // here, so only the user can clear it.
+                            final unsent = state.chat.isUnsent(
+                              widget.peerId,
+                              message.id,
+                            );
+                            return Appear(
+                              index: i,
+                              child: _ChatBubble(
+                                message: message,
+                                error: state.chat.errorFor(message.id),
+                                selecting: selecting,
+                                selected: selected.contains(message.id),
+                                onToggle: () => _toggle(message.id),
+                                onDismiss: unsent
+                                    ? () => state.chat.dismiss(
+                                        widget.peerId,
+                                        message.id,
+                                      )
+                                    : null,
+                              ),
+                            );
+                          },
+                        ),
                 ),
                 if (!_canSend)
                   Padding(
@@ -225,10 +510,32 @@ class _ChatBubble extends StatelessWidget {
   /// Why this row failed, when the engine said so (never persisted).
   final String? error;
 
+  /// Whether the screen is in selection mode. While it is, a plain tap toggles
+  /// this bubble and the in-bubble actions (Cancel, Dismiss, the approval
+  /// buttons) are withheld: the tap is the one action path on screen, and a
+  /// live Accept under a selection bar is a second, unrelated decision sitting
+  /// exactly where the user is aiming. The same rule `TransfersScreen` applies
+  /// to its cards while selecting.
+  final bool selecting;
+
+  /// Whether this message is in the current (thread-narrowed) selection.
+  final bool selected;
+
+  /// Add or remove this message — a long-press or secondary tap starts the
+  /// selection with it, and a tap toggles it once one is open.
+  final VoidCallback onToggle;
+
   /// Non-null only for a row the engine never persisted (a refused share):
   /// nothing else will ever clear it, so the user must be able to.
   final VoidCallback? onDismiss;
-  const _ChatBubble({required this.message, this.error, this.onDismiss});
+  const _ChatBubble({
+    required this.message,
+    required this.selecting,
+    required this.selected,
+    required this.onToggle,
+    this.error,
+    this.onDismiss,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -238,13 +545,26 @@ class _ChatBubble extends StatelessWidget {
     final bg = mine ? scheme.primaryContainer : scheme.surfaceContainerHighest;
     final fg = mine ? scheme.onPrimaryContainer : scheme.onSurface;
 
-    return Padding(
+    return Container(
+      // The tint spans the whole row rather than the bubble, so a one-word
+      // message is as legibly selected as a long one.
+      color: selected ? scheme.primary.withValues(alpha: 0.12) : null,
       padding: const EdgeInsets.only(bottom: AppSpace.xs),
       child: Row(
         mainAxisAlignment: mine
             ? MainAxisAlignment.end
             : MainAxisAlignment.start,
         children: [
+          if (selecting) ...[
+            Icon(
+              selected
+                  ? Icons.check_circle_rounded
+                  : Icons.radio_button_unchecked_rounded,
+              size: AppIcons.md,
+              color: selected ? scheme.primary : scheme.onSurfaceVariant,
+            ),
+            const Gap(AppSpace.xs),
+          ],
           ConstrainedBox(
             constraints: BoxConstraints(
               maxWidth: MediaQuery.sizeOf(context).width * 0.75,
@@ -254,9 +574,17 @@ class _ChatBubble extends StatelessWidget {
               borderRadius: BorderRadius.circular(AppRadius.lg),
               clipBehavior: Clip.antiAlias,
               child: InkWell(
-                onTap: message.isFile && _openablePath(message) != null
-                    ? () => _open(context, message)
-                    : null,
+                onTap: selecting
+                    ? onToggle
+                    : (message.isFile && _openablePath(message) != null
+                          ? () => _open(context, message)
+                          : null),
+                // Long-press is the touch idiom for entering selection; a
+                // long-press with a mouse is not, so desktop gets the
+                // right-click it expects. Both land in the same toggle, so the
+                // first one selects and any later one just adds or removes.
+                onLongPress: onToggle,
+                onSecondaryTap: onToggle,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: AppSpace.sm,
@@ -267,7 +595,11 @@ class _ChatBubble extends StatelessWidget {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (message.isFile)
-                        _FileBody(message: message, fg: fg)
+                        _FileBody(
+                          message: message,
+                          fg: fg,
+                          selecting: selecting,
+                        )
                       else
                         Text(
                           message.body,
@@ -305,8 +637,9 @@ class _ChatBubble extends StatelessWidget {
                       // Nothing else will ever clear this row — it exists only
                       // in this session, because the engine refused to send it
                       // and therefore persisted nothing. A full-size action,
-                      // not a cramped glyph: it is the only way out.
-                      if (onDismiss != null)
+                      // not a cramped glyph: it is the only way out. Withheld
+                      // while selecting, like every other in-bubble action.
+                      if (onDismiss != null && !selecting)
                         Align(
                           alignment: Alignment.centerRight,
                           child: TextButton(
@@ -407,7 +740,17 @@ Future<void> _open(BuildContext context, ChatMessage message) async {
 class _FileBody extends StatelessWidget {
   final ChatMessage message;
   final Color fg;
-  const _FileBody({required this.message, required this.fg});
+
+  /// Whether the screen is in selection mode — see [_ChatBubble.selecting].
+  /// Cancel and the approval buttons are withheld while it is: they are
+  /// decisions about this one file, and a selection bar is about several
+  /// messages, so offering both at once invites the wrong tap.
+  final bool selecting;
+  const _FileBody({
+    required this.message,
+    required this.fg,
+    required this.selecting,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -490,7 +833,7 @@ class _FileBody extends StatelessWidget {
         // to: waiting out an 8 GiB copy of the wrong file is not a choice.
         // Wired to the engine's own cancel, whose answer is believed rather
         // than assumed (see [_cancel]).
-        if (_cancellable(message))
+        if (_cancellable(message) && !selecting)
           Align(
             alignment: Alignment.centerRight,
             child: TextButton(
@@ -537,7 +880,7 @@ class _FileBody extends StatelessWidget {
         // `pending` entry), so Decline would be a no-op from the first frame —
         // a rendered consent control for a decision that was never asked and
         // cannot be revoked here. See [_offersApproval].
-        if (message.awaitingApproval)
+        if (message.awaitingApproval && !selecting)
           AnimatedBuilder(
             animation: state.transfer,
             builder: (context, _) {

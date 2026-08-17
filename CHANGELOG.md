@@ -7,6 +7,21 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Select messages in a conversation, then forward or delete them.** A
+  long-press on a bubble starts a selection (right-click on desktop, where a
+  long-press with a mouse is nobody's idiom); a tap toggles; the app bar becomes
+  × / `N selected` / **Forward** / **Delete**. Back leaves the selection before
+  it leaves the conversation, and the selection survives the rebuilds that
+  incoming messages and staging progress cause constantly.
+  **Delete** is local only and reports the engine's own answer rather than the
+  request — `Deleted 2 messages · 1 kept because it is still being sent` — so a
+  message the engine refused to take (its record is what will deliver a queued
+  file) is explained rather than left mysteriously on screen.
+  **Forward** opens the same device picker the Send flow uses and re-sends each
+  message in thread order through the existing send paths, text as text and a
+  file as a file. A file whose bytes are no longer on this device is excluded
+  *before* anything is sent and named ("`invoice.pdf` isn't on this device any
+  more"), rather than handed to the engine to fail one message at a time.
 - **Delete individual chat messages** (`pb_chat_delete_messages`,
   `{peer_id, message_ids:[…]}` → `{removed, kept:[…]}`). Local only, like
   deleting a whole conversation: nothing goes on the wire and the peer keeps its
