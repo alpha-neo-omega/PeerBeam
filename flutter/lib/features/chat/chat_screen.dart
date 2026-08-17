@@ -53,9 +53,10 @@ class _ChatScreenState extends State<ChatScreen> {
   ///
   /// It can outlive the rows it names — a message can be deleted from another
   /// surface, or a thread re-read while a selection sits open — so it is never
-  /// rendered directly. `build` narrows it to ids still in the thread first,
-  /// and derives everything from that; a dead id is left to age out rather than
-  /// pruned by mutating state from inside a build. The same shape
+  /// rendered directly. `build` narrows it to ids still in the thread first and
+  /// derives everything from that, rather than mutating state from inside a
+  /// build; the ids the narrowing dropped are then taken out for good by
+  /// [_pruneSelectionAfterFrame], once the frame is over. The same shape
   /// `TransfersScreen` uses for its own selection, and for the same reason:
   /// incoming messages and staging progress rebuild this screen constantly.
   Set<String> _selected = {};
@@ -155,21 +156,37 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _clearSelection() => setState(() => _selected = {});
 
-  /// Leave selection once nothing it named is in the thread any more — after
-  /// the frame, never during one.
+  /// Take out every id the thread no longer holds — after the frame, never
+  /// during one.
   ///
-  /// `build` only ever *narrows* the set, which is not the same as clearing it:
-  /// select a message, have it deleted from elsewhere, and `_selected` keeps
-  /// naming an id that no longer exists. An inbound file's id is the **sender's**
-  /// `FileRef` id, so a peer reusing one the stale set still holds would render
-  /// that message pre-selected — a selection the user never composed. The
-  /// condition is re-read when the callback runs rather than trusted from when
-  /// it was scheduled, since a rebuild can land in the gap.
-  void _leaveSelectionAfterFrame(Set<String> present) {
+  /// `build` only ever *narrows* the set for rendering, which is not the same
+  /// as pruning it: select two messages, have one of them deleted from
+  /// elsewhere, and `_selected` goes on naming an id nothing in the thread
+  /// matches, because the other one survived. An inbound file's message id is
+  /// the **sender's** `FileRef` id — a value the peer chooses, not one this
+  /// device mints — so a peer that reuses that id gets a message the user never
+  /// picked rendered as already selected, counted in "2 selected", and carried
+  /// off to a third device by the next Forward.
+  ///
+  /// So every stale id goes, not only the case where the whole set went stale
+  /// at once. Emptying the set is how selection ends, so a thread that lost
+  /// every selected row still leaves selection — by the same path rather than
+  /// by a second one.
+  ///
+  /// **Both** halves are re-read when the callback runs rather than trusted
+  /// from when it was scheduled: a rebuild can land in the gap, and pruning
+  /// against the thread as it was then would take out ids that have since come
+  /// back.
+  void _pruneSelectionAfterFrame() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _selected.isEmpty) return;
-      if (_selected.intersection(present).isNotEmpty) return;
-      setState(() => _selected = {});
+      final present = AppScope.of(context).chat
+          .messagesFor(widget.peerId)
+          .map((m) => m.id)
+          .toSet();
+      final narrowed = _selected.intersection(present);
+      if (narrowed.length == _selected.length) return;
+      setState(() => _selected = narrowed);
     });
   }
 
@@ -387,9 +404,7 @@ class _ChatScreenState extends State<ChatScreen> {
         // Derived every build, never written back into state (see [_selected]).
         final present = items.map((m) => m.id).toSet();
         final selected = _selected.intersection(present);
-        if (_selected.isNotEmpty && selected.isEmpty) {
-          _leaveSelectionAfterFrame(present);
-        }
+        if (selected.length != _selected.length) _pruneSelectionAfterFrame();
         final selecting = selected.isNotEmpty;
         return PopScope(
           // Back leaves the selection before it leaves the conversation. A back

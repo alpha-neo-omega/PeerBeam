@@ -205,14 +205,30 @@ class MainActivity : FlutterActivity() {
     /// picked URI into app cache off the main thread and replies with
     /// `{path, name, size}` per file — never the file's bytes.
     private fun pickFiles(call: MethodCall, result: MethodChannel.Result) {
+        // Extracted and validated BEFORE `result` is taken over, and that order
+        // is the whole point. `call.argument` is an unchecked cast, so a
+        // malformed `mimeTypes` throws below this line; MethodChannel then
+        // error-replies the very Result `pendingFiles` would be pointing at, and
+        // the next pick calls `success(null)` on an already-answered Result —
+        // "Reply already submitted" — after which every pick fails for the life
+        // of the process. Today's Dart cannot send a malformed argument, but the
+        // failure it would cause is unrecoverable, and the order costs nothing.
+        val raw = call.argument<Any?>("mimeTypes")
+        val mimeTypes: List<String>
+        if (raw == null) {
+            mimeTypes = emptyList()
+        } else if (raw is List<*> && raw.all { it is String }) {
+            mimeTypes = raw.filterIsInstance<String>()
+        } else {
+            result.error("args", "mimeTypes must be a list of strings", null)
+            return
+        }
         pendingFiles?.success(null) // abandon any prior
         pendingFiles = result
-        @Suppress("UNCHECKED_CAST")
-        val mimeTypes = call.argument<List<String>>("mimeTypes")
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            if (!mimeTypes.isNullOrEmpty()) {
+            if (mimeTypes.isNotEmpty()) {
                 putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toTypedArray())
             }
             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)

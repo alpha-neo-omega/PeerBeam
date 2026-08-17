@@ -63,10 +63,11 @@ ChatMessage _file(
   String name, {
   String? localPath,
   String status = ChatStatusValue.sent,
+  String direction = 'out',
 }) => ChatMessage(
   id: id,
   peerId: 'pb-bob',
-  direction: 'out',
+  direction: direction,
   body: '',
   at: DateTime.now(),
   status: status,
@@ -269,6 +270,75 @@ void main() {
       find.text('2 selected'),
       findsOneWidget,
       reason: 'the arrival is not a reason to forget what was selected',
+    );
+  });
+
+  // AN ID THE PEER CHOOSES. `build` narrows the selection for rendering, which
+  // is not the same as pruning it — a partially stale set keeps naming its dead
+  // ids because the live ones carried it. And an inbound file's message id is
+  // the SENDER's `FileRef` id, a value the peer picks, so a peer that reuses a
+  // dead id gets a message the user never chose rendered as already selected,
+  // counted, and forwarded to a third device.
+  testWidgets('an id that leaves the thread is pruned, so a peer reusing it '
+      'inherits no selection', (tester) async {
+    final path = _realFile('from-bob.pdf');
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _text('m1', 'first'),
+      _text('m2', 'second'),
+    ];
+    final state = await _open(tester, fake);
+    fake.emit(const DeviceAdded(_laptop));
+    await tester.pumpAndSettle();
+
+    await _longPress(tester, 'first');
+    await tester.tap(find.text('second'));
+    await tester.pumpAndSettle();
+    expect(find.text('2 selected'), findsOneWidget);
+
+    // `m1` goes from another surface and the thread is re-read. `m2` survives,
+    // so the selection is only PARTIALLY stale — the case a rule that only
+    // clears an entirely-dead set walks straight past.
+    fake.chatHistories['pb-bob'] = [_text('m2', 'second')];
+    await state.chat.refresh('pb-bob');
+    await tester.pumpAndSettle();
+    expect(find.text('1 selected'), findsOneWidget);
+
+    // Bob then offers a file whose `FileRef` id happens to be `m1`.
+    fake.emit(
+      ChatReceived(
+        _file(
+          'm1',
+          'from-bob.pdf',
+          localPath: path,
+          direction: 'in',
+          status: ChatStatusValue.received,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('from-bob.pdf'), findsOneWidget);
+    expect(
+      find.text('1 selected'),
+      findsOneWidget,
+      reason: 'the arrival is a different message, not one the user picked',
+    );
+    expect(
+      find.byIcon(Icons.check_circle_rounded),
+      findsOneWidget,
+      reason: 'only `second` is ticked',
+    );
+    expect(find.byIcon(Icons.radio_button_unchecked_rounded), findsOneWidget);
+
+    // And the consequence that actually costs something: a Forward must not
+    // carry Bob's file to a third device off the back of a recycled id.
+    await _forwardTo(tester, 'Live Laptop');
+    expect(
+      fake.calls
+          .where((c) => c.startsWith('chatSend') || c.startsWith('chatSendFile'))
+          .toList(),
+      ['chatSend:second'],
     );
   });
 
