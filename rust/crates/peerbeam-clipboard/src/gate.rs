@@ -62,7 +62,7 @@ pub fn may_share_clip(
     peer: &DeviceId,
     negotiated: &CapabilitySet,
 ) -> bool {
-    sync_enabled && trust.is_trusted(peer) && caps_support_clip(negotiated)
+    sync_enabled && trust.is_approved(peer) && caps_support_clip(negotiated)
 }
 
 #[cfg(test)]
@@ -70,10 +70,18 @@ mod tests {
     use super::*;
     use peerbeam_domain::session::Capability;
 
-    /// A trust store that trusts exactly the ids it was built with. Small
-    /// enough to be obviously correct — the point of these tests is the gate,
-    /// not the store.
-    struct FakeTrust(Vec<String>);
+    /// A trust store that distinguishes the two states a real one has, because
+    /// the gate turns on exactly that distinction.
+    ///
+    /// `approved` — the user explicitly accepted-and-trusted this device.
+    /// `pinned` — the device completed a handshake and had its key recorded,
+    /// which `auth.rs` does for *every* never-seen peer with `approved: false`.
+    /// A store that answered only "trusted / not trusted" could not tell a
+    /// stranger on the LAN from the user's own laptop.
+    struct FakeTrust {
+        approved: Vec<String>,
+        pinned: Vec<String>,
+    }
 
     impl TrustStore for FakeTrust {
         fn record(
@@ -84,21 +92,67 @@ mod tests {
         }
         fn lookup(
             &self,
-            _device: &DeviceId,
+            device: &DeviceId,
         ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
-            Ok(None)
+            let approved = self.approved.iter().any(|d| d == &device.0);
+            if !approved && !self.pinned.iter().any(|d| d == &device.0) {
+                return Ok(None);
+            }
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: device.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved,
+            }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
-            self.0.iter().any(|d| d == &device.0)
+            self.approved
+                .iter()
+                .chain(self.pinned.iter())
+                .any(|d| d == &device.0)
         }
     }
 
     fn trusting() -> FakeTrust {
-        FakeTrust(vec!["pb-bob".to_string()])
+        FakeTrust {
+            approved: vec!["pb-bob".to_string()],
+            pinned: Vec::new(),
+        }
+    }
+
+    /// Bob's key is pinned — he has connected before — but the user never
+    /// accepted him. This is what a stranger on the LAN looks like the instant
+    /// after the handshake.
+    fn pinned_only() -> FakeTrust {
+        FakeTrust {
+            approved: Vec::new(),
+            pinned: vec!["pb-bob".to_string()],
+        }
     }
 
     fn empty_trust() -> FakeTrust {
-        FakeTrust(Vec::new())
+        FakeTrust {
+            approved: Vec::new(),
+            pinned: Vec::new(),
+        }
+    }
+
+    /// **The gate that TOFU nearly gave away.** `is_trusted` is true for any
+    /// peer the handshake pinned, so a stranger who connected once would
+    /// otherwise be sent everything the user copies. The gate asks
+    /// `is_approved`.
+    #[test]
+    fn a_merely_pinned_peer_is_refused_even_with_sync_on() {
+        let trust = pinned_only();
+        assert!(
+            trust.is_trusted(&bob()),
+            "precondition: the handshake pinned him, so `is_trusted` is true"
+        );
+        assert!(
+            !may_share_clip(true, &trust, &bob(), &negotiated()),
+            "a pinned-but-unapproved peer must not receive our clipboard"
+        );
     }
 
     fn bob() -> DeviceId {

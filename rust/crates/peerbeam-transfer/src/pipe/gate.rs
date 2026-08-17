@@ -52,17 +52,19 @@ pub fn caps_support_stream(caps: &CapabilitySet) -> bool {
 ///    stdin — which on the sending side is the payload — and would break the
 ///    headless, scripted use the feature exists for. Consent is expressed once,
 ///    at the shell, by a person who is already there.
-/// 2. **The peer is trusted** — asked of the [`TrustStore`] itself rather than
-///    of a cached bool, so revoking a device stops the next pipe rather than
-///    the next reconnect. **Not configurable**; there is no setting that turns
-///    it off, exactly as for clipboard and presence.
+/// 2. **The user approved the peer** — [`TrustStore::is_approved`], asked of
+///    the store itself rather than of a cached bool, so revoking a device stops
+///    the next pipe rather than the next reconnect. **Not configurable**;
+///    there is no setting that turns it off, exactly as for clipboard and
+///    presence.
 ///
-///    Note what this leg does and does not buy. PeerBeam's handshake is TOFU,
-///    so a peer connecting for the first time is *pinned as it connects* and is
-///    therefore trusted by the time this is asked. Against a stranger on the
-///    LAN the load is carried by legs 1 and 3, not by this one; against a
-///    device the user has explicitly revoked, this is the leg that refuses. See
-///    `docs/SECURITY.md`.
+///    Deliberately **not** [`TrustStore::is_trusted`]. PeerBeam's handshake is
+///    TOFU: a peer connecting for the first time is *pinned as it connects*, so
+///    `is_trusted` is already true for a stranger on the LAN by the time this
+///    is asked — the pin exists to make a later key change detectable, not to
+///    record a decision. Asking `is_approved` is what makes this leg carry
+///    weight against a stranger rather than only against a device the user has
+///    explicitly revoked. See `docs/SECURITY.md`.
 /// 3. **`only_from`, when set, names this peer** — `pipe --listen --from
 ///    laptop` accepts that device and refuses every other, trusted or not. The
 ///    comparison is against the **authenticated** `DeviceId` from the
@@ -93,7 +95,7 @@ pub fn may_accept_pipe(
         Some(want) => want == peer,
         None => true,
     };
-    listening && trust.is_trusted(peer) && from_permitted && caps_support_stream(negotiated)
+    listening && trust.is_approved(peer) && from_permitted && caps_support_stream(negotiated)
 }
 
 #[cfg(test)]
@@ -101,10 +103,11 @@ mod tests {
     use super::*;
     use peerbeam_domain::session::Capability;
 
-    /// A trust store that trusts exactly the ids it was built with. Small
-    /// enough to be obviously correct — the point of these tests is the gate,
-    /// not the store.
-    struct FakeTrust(Vec<String>);
+    /// `.0` = ids the user approved; `.1` = ids merely pinned by a handshake.
+    /// The two are kept apart because that distinction is what the trust leg
+    /// turns on — a store answering only "trusted / not trusted" could not tell
+    /// a stranger who connected once from the user's own laptop.
+    struct FakeTrust(Vec<String>, Vec<String>);
 
     impl TrustStore for FakeTrust {
         fn record(
@@ -115,21 +118,40 @@ mod tests {
         }
         fn lookup(
             &self,
-            _device: &DeviceId,
+            device: &DeviceId,
         ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
-            Ok(None)
+            let approved = self.0.iter().any(|d| d == &device.0);
+            if !approved && !self.1.iter().any(|d| d == &device.0) {
+                return Ok(None);
+            }
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: device.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved,
+            }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
-            self.0.iter().any(|d| d == &device.0)
+            self.0.iter().chain(self.1.iter()).any(|d| d == &device.0)
         }
     }
 
     fn trusting() -> FakeTrust {
-        FakeTrust(vec!["pb-bob".to_string(), "pb-carol".to_string()])
+        FakeTrust(
+            vec!["pb-bob".to_string(), "pb-carol".to_string()],
+            Vec::new(),
+        )
+    }
+
+    /// Pinned by the handshake but never accepted by the user — what a stranger
+    /// on the LAN looks like the instant after connecting.
+    fn pinned_only() -> FakeTrust {
+        FakeTrust(Vec::new(), vec!["pb-bob".to_string()])
     }
 
     fn empty_trust() -> FakeTrust {
-        FakeTrust(Vec::new())
+        FakeTrust(Vec::new(), Vec::new())
     }
 
     fn bob() -> DeviceId {
@@ -146,6 +168,23 @@ mod tests {
             ChannelType::PIPE,
             PIPE_FEAT_STREAM,
         ))
+    }
+
+    /// **The gate that TOFU nearly gave away.** A stranger is pinned by the
+    /// handshake itself, so `is_trusted` is true for them before anyone has
+    /// decided anything. Were this leg asking that, a listening terminal would
+    /// accept a stranger's bytes on its stdout the first time they connected.
+    #[test]
+    fn a_merely_pinned_peer_is_refused_even_while_listening() {
+        let trust = pinned_only();
+        assert!(
+            trust.is_trusted(&bob()),
+            "precondition: the handshake pinned him, so `is_trusted` is true"
+        );
+        assert!(
+            !may_accept_pipe(true, &trust, &bob(), None, &negotiated()),
+            "a pinned-but-unapproved peer must not reach our stdout"
+        );
     }
 
     #[test]
@@ -276,7 +315,7 @@ mod tests {
     /// would take a pipe from everyone.
     #[test]
     fn trust_is_evaluated_for_the_peer_being_accepted() {
-        let trust = FakeTrust(vec!["pb-bob".to_string()]);
+        let trust = FakeTrust(vec!["pb-bob".to_string()], Vec::new());
         assert!(may_accept_pipe(true, &trust, &bob(), None, &negotiated()));
         assert!(
             !may_accept_pipe(
@@ -297,7 +336,7 @@ mod tests {
     #[test]
     fn from_compares_authenticated_ids_not_presented_names() {
         let impostor = DeviceId::from("pb-mallory");
-        let trust = FakeTrust(vec!["pb-mallory".to_string()]);
+        let trust = FakeTrust(vec!["pb-mallory".to_string()], Vec::new());
         assert!(
             !may_accept_pipe(true, &trust, &impostor, Some(&bob()), &negotiated()),
             "only the id `--from` resolved to may pass"

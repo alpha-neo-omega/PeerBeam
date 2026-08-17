@@ -157,10 +157,12 @@ fn refusal(consent: &PipeConsent<'_>, peer: &DeviceId) -> String {
             peer.0
         );
     }
-    if !consent.trust.is_trusted(peer) {
+    if !consent.trust.is_approved(peer) {
         return format!(
-            "refused an inbound pipe from {}: peer is not trusted",
-            peer.0
+            "refused an inbound pipe from {}: this device is not approved. Its key may \
+             well be pinned — the handshake pins every peer it sees, which records no \
+             decision — so run `peerbeam trust approve {}` here to grant it",
+            peer.0, peer.0
         );
     }
     match consent.only_from {
@@ -180,7 +182,39 @@ mod tests {
     use super::*;
     use peerbeam_domain::session::{Capability, PIPE_FEAT_STREAM};
 
-    struct FakeTrust(bool);
+    /// A store in one of the three states a real one can be in for a given
+    /// peer, because the pipe gate asks `is_approved` and the refusal message
+    /// has to tell "pinned but never chosen" apart from "never seen at all".
+    struct FakeTrust {
+        approved: bool,
+        pinned: bool,
+    }
+
+    /// The user chose this device.
+    fn approving() -> FakeTrust {
+        FakeTrust {
+            approved: true,
+            pinned: true,
+        }
+    }
+
+    /// Its key was recorded by the handshake and nobody decided anything — what
+    /// a stranger looks like the instant after connecting.
+    fn pinned_only() -> FakeTrust {
+        FakeTrust {
+            approved: false,
+            pinned: true,
+        }
+    }
+
+    /// No record at all.
+    fn unknown() -> FakeTrust {
+        FakeTrust {
+            approved: false,
+            pinned: false,
+        }
+    }
+
     impl TrustStore for FakeTrust {
         fn record(
             &self,
@@ -190,12 +224,21 @@ mod tests {
         }
         fn lookup(
             &self,
-            _d: &DeviceId,
+            d: &DeviceId,
         ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
-            Ok(None)
+            if !self.pinned {
+                return Ok(None);
+            }
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: d.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: self.approved,
+            }))
         }
         fn is_trusted(&self, _d: &DeviceId) -> bool {
-            self.0
+            self.pinned
         }
     }
 
@@ -214,7 +257,7 @@ mod tests {
     /// tell "run `pipe --listen` over there" from "trust that device first".
     #[test]
     fn the_refusal_names_the_leg_that_shut() {
-        let trust = FakeTrust(true);
+        let trust = approving();
         let caps = caps();
         let not_listening = PipeConsent {
             listening: false,
@@ -224,14 +267,39 @@ mod tests {
         };
         assert!(refusal(&not_listening, &bob()).contains("pipe --listen"));
 
-        let untrusting = FakeTrust(false);
+        let untrusting = unknown();
         let untrusted = PipeConsent {
             listening: true,
             trust: &untrusting,
             only_from: None,
             negotiated: &caps,
         };
-        assert!(refusal(&untrusted, &bob()).contains("not trusted"));
+        assert!(refusal(&untrusted, &bob()).contains("not approved"));
+
+        // **A pinned-but-unapproved peer must be told to approve it.** The
+        // refusal walks the legs in order, so a leg asking a different question
+        // from the gate falls through to the next one and blames it: before this
+        // asked `is_approved`, a peer the handshake had just pinned was refused
+        // by the gate and then told its build "did not negotiate the pipe stream
+        // capability" — an operator acting on that would go looking for a
+        // version mismatch that does not exist.
+        let pinned = pinned_only();
+        let unapproved = PipeConsent {
+            listening: true,
+            trust: &pinned,
+            only_from: None,
+            negotiated: &caps,
+        };
+        assert!(
+            !unapproved.permits(&bob()),
+            "precondition: the gate refuses a merely pinned peer"
+        );
+        let msg = refusal(&unapproved, &bob());
+        assert!(msg.contains("trust approve"), "{msg}");
+        assert!(
+            !msg.contains("negotiate"),
+            "the refusal must not blame the peer's build: {msg}"
+        );
 
         let carol = DeviceId::from("pb-carol");
         let wrong_peer = PipeConsent {
@@ -259,7 +327,7 @@ mod tests {
     /// predicate.
     #[test]
     fn permits_delegates_to_the_gate() {
-        let trust = FakeTrust(true);
+        let trust = approving();
         let caps = caps();
         let listening = PipeConsent {
             listening: true,

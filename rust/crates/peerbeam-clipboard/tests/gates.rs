@@ -168,6 +168,18 @@ async fn pair(a_trusts_b: bool, sync: bool, b_advertises: CapabilitySet) -> Pair
         trust_a.is_trusted(&b_id),
         "the handshake must pin B, or the trusted case proves nothing"
     );
+    // ...but a pin is not approval. The handshake records every never-seen peer
+    // with `approved: false` so a later key change is detectable, and the gate
+    // asks `is_approved` — otherwise any stranger that completed a handshake
+    // would be sent our clipboard. The trusted case must do what the user does.
+    assert!(
+        !trust_a.is_approved(&b_id),
+        "a fresh handshake must not approve anyone by itself"
+    );
+    if a_trusts_b {
+        trust_a.approve(&b_id).expect("the user accepts B");
+        assert!(trust_a.is_approved(&b_id), "approval must stick");
+    }
     if !a_trusts_b {
         assert!(
             trust_a.remove(&b_id).expect("revoke"),

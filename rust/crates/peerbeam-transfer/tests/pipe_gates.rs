@@ -212,6 +212,16 @@ async fn pair(a_advertises: CapabilitySet) -> Pair {
         trust_b.is_trusted(&a_id),
         "the handshake must pin A, or the trusted case proves nothing"
     );
+    // A pin is not approval. Every never-seen peer is recorded by the handshake
+    // with `approved: false` so a later key change is detectable, and the gate
+    // asks `is_approved` — otherwise any stranger that completed a handshake
+    // could write bytes to a listening terminal's stdout. So the fixture does
+    // what the user does: accept the device.
+    assert!(
+        !trust_b.is_approved(&a_id),
+        "a fresh handshake must not approve anyone by itself"
+    );
+    trust_b.approve(&a_id).expect("the user accepts A");
 
     Pair {
         a: a_handle,
@@ -370,10 +380,16 @@ async fn a_daemon_style_session_refuses_a_pipe_and_writes_nothing() {
     );
 }
 
-/// **The trust gate.** A peer whose pin was revoked is refused *even by a real
-/// `pipe --listen`*, and writes nothing.
+/// **The trust gate.** A peer the user has not approved is refused *even by a
+/// real `pipe --listen`*, and writes nothing.
 ///
-/// Mutation target: delete `trust.is_trusted(peer)` from `may_accept_pipe` and
+/// Revoking removes the record outright, so this covers the harder half of the
+/// leg: not merely "unapproved" but "unknown". The pinned-but-unapproved half —
+/// the state TOFU leaves every stranger in, where `is_trusted` is still true —
+/// is covered by `a_merely_pinned_peer_is_refused_even_while_listening` in
+/// `src/pipe/gate.rs` and end to end in `peerbeam-cli/tests/pipe_e2e.rs`.
+///
+/// Mutation target: delete `trust.is_approved(peer)` from `may_accept_pipe` and
 /// this test fails.
 #[tokio::test]
 async fn an_untrusted_peer_is_refused_even_while_listening() {
@@ -383,19 +399,22 @@ async fn an_untrusted_peer_is_refused_even_while_listening() {
         "revoking must actually remove a pin that was there"
     );
     assert!(
-        !p.b_trust.is_trusted(&p.a_id),
-        "A must really be untrusted — a test that cannot tell proves nothing"
+        !p.b_trust.is_trusted(&p.a_id) && !p.b_trust.is_approved(&p.a_id),
+        "A must really be gone from the store — a test that cannot tell proves nothing"
     );
 
     let a = attempt(&mut p, true, None, &hostile_payload(100_000)).await;
     let msg = a
         .received
-        .expect_err("untrusted must be refused")
+        .expect_err("an unapproved peer must be refused")
         .to_string();
-    assert!(msg.contains("not trusted"), "{msg}");
+    // The refusal names the leg that shut *and* what to do about it, because
+    // the operator reading it is the one who can act.
+    assert!(msg.contains("not approved"), "{msg}");
+    assert!(msg.contains("trust approve"), "{msg}");
     assert!(
         a.sink.bytes().is_empty(),
-        "an untrusted peer's bytes must never reach stdout"
+        "an unapproved peer's bytes must never reach stdout"
     );
 }
 
@@ -405,8 +424,8 @@ async fn an_untrusted_peer_is_refused_even_while_listening() {
 async fn from_refuses_a_different_trusted_peer() {
     let mut p = pair(pipe_caps()).await;
     assert!(
-        p.b_trust.is_trusted(&p.a_id),
-        "A is trusted, so only --from can be what refuses it"
+        p.b_trust.is_approved(&p.a_id),
+        "A is approved, so only --from can be what refuses it"
     );
     let someone_else = DeviceId::from("pb-someone-else");
     let a = attempt(&mut p, true, Some(someone_else), &hostile_payload(64_000)).await;

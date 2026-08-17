@@ -38,12 +38,16 @@ pub fn caps_support_status(caps: &CapabilitySet) -> bool {
 ///    on every heartbeat rather than captured once, so turning the setting off
 ///    stops an already-running session's heartbeats at the next tick instead of
 ///    at the next reconnect.
-/// 2. **The peer is trusted** — asked of the [`TrustStore`] itself, not of a
-///    cached bool, for the same reason: revoking trust must stop the next
-///    heartbeat, not the next session. This gate is **not configurable**; there
-///    is no setting that turns it off. Battery level, free disk and network
-///    kind are a device fingerprint and a presence signal, and they go to the
-///    user's own pinned devices or nowhere.
+/// 2. **The user approved the peer** — [`TrustStore::is_approved`], asked of
+///    the store itself rather than a cached bool, so revoking stops the next
+///    heartbeat and not the next session. Deliberately **not**
+///    [`TrustStore::is_trusted`]: that answers "have we pinned this key",
+///    which the authenticated handshake makes true for *every* peer that has
+///    ever connected — including a stranger on the LAN, recorded with
+///    `approved: false` purely so a later key change is detectable. Battery
+///    level, free disk and network kind are a device fingerprint, and they go
+///    to devices the user actually chose or nowhere. This gate is **not
+///    configurable**.
 /// 3. **The peer negotiated [`PRESENCE_FEAT_STATUS`]** — capability-advertised,
 ///    not assumed (MESSAGE_REGISTRY.md §7 / I9). A 1b/2a-era peer never
 ///    advertises the PRESENCE channel, `CapabilitySet::intersect` drops it, and
@@ -60,7 +64,7 @@ pub fn may_share_status(
     peer: &DeviceId,
     negotiated: &CapabilitySet,
 ) -> bool {
-    sharing_enabled && trust.is_trusted(peer) && caps_support_status(negotiated)
+    sharing_enabled && trust.is_approved(peer) && caps_support_status(negotiated)
 }
 
 #[cfg(test)]
@@ -68,10 +72,18 @@ mod tests {
     use super::*;
     use peerbeam_domain::session::Capability;
 
-    /// A trust store that trusts exactly the ids it was built with. Small
-    /// enough to be obviously correct — the point of these tests is the gate,
-    /// not the store.
-    struct FakeTrust(Vec<String>);
+    /// A trust store that distinguishes the two states a real one has, because
+    /// the gate turns on exactly that distinction.
+    ///
+    /// `approved` — the user explicitly accepted-and-trusted this device.
+    /// `pinned` — the device completed a handshake and had its key recorded,
+    /// which `auth.rs` does for *every* never-seen peer with `approved: false`.
+    /// A store that answered only "trusted / not trusted" could not tell a
+    /// stranger on the LAN from the user's own laptop.
+    struct FakeTrust {
+        approved: Vec<String>,
+        pinned: Vec<String>,
+    }
 
     impl TrustStore for FakeTrust {
         fn record(
@@ -82,21 +94,50 @@ mod tests {
         }
         fn lookup(
             &self,
-            _device: &DeviceId,
+            device: &DeviceId,
         ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
-            Ok(None)
+            let approved = self.approved.iter().any(|d| d == &device.0);
+            if !approved && !self.pinned.iter().any(|d| d == &device.0) {
+                return Ok(None);
+            }
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: device.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved,
+            }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
-            self.0.iter().any(|d| d == &device.0)
+            self.approved
+                .iter()
+                .chain(self.pinned.iter())
+                .any(|d| d == &device.0)
         }
     }
 
     fn trusting() -> FakeTrust {
-        FakeTrust(vec!["pb-bob".to_string()])
+        FakeTrust {
+            approved: vec!["pb-bob".to_string()],
+            pinned: Vec::new(),
+        }
+    }
+
+    /// Bob's key is pinned — he has connected before — but the user never
+    /// accepted him. This is what a stranger on the LAN looks like the instant
+    /// after the handshake.
+    fn pinned_only() -> FakeTrust {
+        FakeTrust {
+            approved: Vec::new(),
+            pinned: vec!["pb-bob".to_string()],
+        }
     }
 
     fn empty_trust() -> FakeTrust {
-        FakeTrust(Vec::new())
+        FakeTrust {
+            approved: Vec::new(),
+            pinned: Vec::new(),
+        }
     }
 
     fn bob() -> DeviceId {
@@ -116,8 +157,27 @@ mod tests {
         assert!(may_share_status(true, &trusting(), &bob(), &negotiated()));
     }
 
-    /// **The trust gate.** An untrusted peer is never sent a status *even with
-    /// the setting on* — deleting `trust.is_trusted(peer)` from
+    /// **The gate that TOFU nearly gave away.** A device is pinned by the
+    /// authenticated handshake itself — that pin is what makes a later key
+    /// change detectable — and `is_trusted` answers `true` for it. So a
+    /// stranger who connected once passes "trusted" without the user ever
+    /// having chosen them, which is not a basis for shipping them this
+    /// device's battery level and free disk. The gate asks `is_approved`.
+    #[test]
+    fn a_merely_pinned_peer_is_refused_even_with_sharing_on() {
+        let trust = pinned_only();
+        assert!(
+            trust.is_trusted(&bob()),
+            "precondition: the handshake pinned him, so `is_trusted` is true"
+        );
+        assert!(
+            !may_share_status(true, &trust, &bob(), &negotiated()),
+            "a pinned-but-unapproved peer must not receive our status"
+        );
+    }
+
+    /// **The trust gate.** A peer with no record at all is never sent a status
+    /// *even with the setting on* — deleting `trust.is_approved(peer)` from
     /// [`may_share_status`] must make this fail.
     #[test]
     fn an_untrusted_peer_is_refused_even_with_sharing_on() {
