@@ -12,6 +12,7 @@ import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../../widgets/processing.dart';
+import 'chat_drop_zone.dart';
 
 /// A one-to-one chat with [peer]. [peerId] is the discovered device's real
 /// id — the conversation key. [PeerTarget] does carry its own `id` field
@@ -126,78 +127,86 @@ class _ChatScreenState extends State<ChatScreen> {
     final state = AppScope.of(context);
     return Scaffold(
       appBar: AppBar(title: Text(widget.peer.name)),
-      body: SafeArea(
-        child: ContentPane(
-          child: Column(
-            children: [
-              Expanded(
-                child: AnimatedBuilder(
-                  animation: state.chat,
-                  builder: (context, _) {
-                    final items = state.chat.messagesFor(widget.peerId);
-                    if (items.isEmpty) {
-                      return const EmptyState(
-                        icon: Icons.chat_bubble_outline_rounded,
-                        title: 'No messages yet',
-                        message: 'Send a message to start the conversation.',
+      // Desktop-only drag & drop for this one conversation — a transparent
+      // passthrough everywhere else, exactly like the Send flow's own
+      // DropZone. Wraps the body (not the AppBar) so a drop anywhere over the
+      // thread or composer sends straight to this peer.
+      body: ChatDropZone(
+        peerId: widget.peerId,
+        peer: widget.peer,
+        child: SafeArea(
+          child: ContentPane(
+            child: Column(
+              children: [
+                Expanded(
+                  child: AnimatedBuilder(
+                    animation: state.chat,
+                    builder: (context, _) {
+                      final items = state.chat.messagesFor(widget.peerId);
+                      if (items.isEmpty) {
+                        return const EmptyState(
+                          icon: Icons.chat_bubble_outline_rounded,
+                          title: 'No messages yet',
+                          message: 'Send a message to start the conversation.',
+                        );
+                      }
+                      // Reversed so the latest message stays pinned to the
+                      // bottom without a manual scroll controller.
+                      return ListView.builder(
+                        reverse: true,
+                        padding: const EdgeInsets.all(AppSpace.md),
+                        itemCount: items.length,
+                        itemBuilder: (context, i) {
+                          final message = items[items.length - 1 - i];
+                          // A row the engine refused to send exists only here,
+                          // so only the user can clear it.
+                          final unsent = state.chat.isUnsent(
+                            widget.peerId,
+                            message.id,
+                          );
+                          return Appear(
+                            index: i,
+                            child: _ChatBubble(
+                              message: message,
+                              error: state.chat.errorFor(message.id),
+                              onDismiss: unsent
+                                  ? () => state.chat.dismiss(
+                                      widget.peerId,
+                                      message.id,
+                                    )
+                                  : null,
+                            ),
+                          );
+                        },
                       );
-                    }
-                    // Reversed so the latest message stays pinned to the
-                    // bottom without a manual scroll controller.
-                    return ListView.builder(
-                      reverse: true,
-                      padding: const EdgeInsets.all(AppSpace.md),
-                      itemCount: items.length,
-                      itemBuilder: (context, i) {
-                        final message = items[items.length - 1 - i];
-                        // A row the engine refused to send exists only here,
-                        // so only the user can clear it.
-                        final unsent = state.chat.isUnsent(
-                          widget.peerId,
-                          message.id,
-                        );
-                        return Appear(
-                          index: i,
-                          child: _ChatBubble(
-                            message: message,
-                            error: state.chat.errorFor(message.id),
-                            onDismiss: unsent
-                                ? () => state.chat.dismiss(
-                                    widget.peerId,
-                                    message.id,
-                                  )
-                                : null,
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-              if (!_canSend)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(
-                    AppSpace.md,
-                    0,
-                    AppSpace.md,
-                    AppSpace.xxs,
+                    },
                   ),
-                  child: Text(
-                    'No address known for ${widget.peer.name} yet — this '
-                    'conversation is readable, and sending works again as soon '
-                    'as the device is discovered.',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+                if (!_canSend)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      AppSpace.md,
+                      0,
+                      AppSpace.md,
+                      AppSpace.xxs,
+                    ),
+                    child: Text(
+                      'No address known for ${widget.peer.name} yet — this '
+                      'conversation is readable, and sending works again as soon '
+                      'as the device is discovered.',
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
+                _Composer(
+                  controller: _controller,
+                  onSend: _send,
+                  onAttach: _attach,
+                  enabled: _canSend,
                 ),
-              _Composer(
-                controller: _controller,
-                onSend: _send,
-                onAttach: _attach,
-                enabled: _canSend,
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

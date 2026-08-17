@@ -18,6 +18,14 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   nothing else that calls the native picker needs to change. Everything past
   the choice is unchanged: the picker is still multi-select, and every picked
   file still gets its own message.
+- **Drag & drop into a conversation.** Dropping files onto an open chat sends
+  them straight to that peer, the same per-file fan-out attach uses, with the
+  same dashed drop overlay as the Send flow. Desktop only — a transparent
+  passthrough on mobile. A dropped folder is refused rather than silently
+  dropped or left to surface as a later engine error: a chat file message
+  carries one file, so the folder is named in a message pointing at "Send
+  folder" on Home. A drop mixing files and folders still sends the files and
+  reports every folder it had to skip, in one message.
 - **Approve several waiting transfers at once** — when two or more inbound
   transfers are awaiting approval, the Transfers screen shows a banner with
   **Accept all** / **Decline all**, so a batch takes one tap instead of one per

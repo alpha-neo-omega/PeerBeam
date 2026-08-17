@@ -95,6 +95,33 @@ chat message, exactly as before this menu existed.
 the picker its own kind; `test/desktop_files_test.dart` pins the kind → filter
 mapping on both platforms.
 
+### Drag & drop into a conversation
+
+Dropping files onto an open chat sends them straight to that peer — the same
+per-file fan-out attach already does, with no confirmation step. Desktop only,
+like the Send flow's own drop zone: `ChatDropZone`
+(`features/chat/chat_drop_zone.dart`) is a transparent passthrough on
+mobile, and shows the same dashed `DropOverlay` while dragging.
+
+**Reused, not duplicated.** The `XFile` → staged-entry walk (metadata only —
+never a read — with folder detection and a name fallback) is one shared
+function, `collectDroppedFiles` in `features/send/drop_zone.dart`; the Send
+flow's own `DropZone` and `ChatDropZone` both call it. The only difference is
+what happens with the result: the Send flow opens the staged-files sheet,
+`ChatDropZone` sends into the open conversation.
+
+**Folders are refused, with the reason named.** A chat file message carries
+one file, and the engine's `prepare_file_send` rejects a directory outright —
+so a dropped folder produces a snackbar naming it and pointing at "Send
+folder" on Home, rather than a silent no-op or an engine error surfacing
+later. A drop mixing files and folders sends the files and reports every
+skipped folder in one message; it does not abort the files that came with it.
+
+`test/chat_drop_zone_test.dart` pins `collectDroppedFiles`'s file/folder
+flagging directly, and drives `ChatDropZone`'s real `DropTarget` callback
+(found in the widget tree, not simulated through the OS channel) for the
+two-file, folder-only, and mixed-drop cases.
+
 ## Approving several transfers at once
 
 When **two or more** inbound transfers are awaiting approval, the Transfers
