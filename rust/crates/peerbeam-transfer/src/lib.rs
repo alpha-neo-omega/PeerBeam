@@ -21,6 +21,7 @@ mod control;
 mod folder;
 mod identity;
 mod peek;
+mod pipe;
 mod protocol;
 mod recover;
 mod secure;
@@ -33,16 +34,19 @@ pub use control::TransferControl;
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
 pub use identity::load_or_generate;
 pub use peek::{OwnedPeekLink, PeekLink};
+pub use pipe::{
+    caps_support_stream, may_accept_pipe, receive_pipe, send_pipe, PipeStats, PIPE_CHUNK,
+};
 pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};
 pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
 pub use session::{
-    peek_incoming_meta, receive_file_on_channel, receive_folder_on_channel, receive_on_channel,
-    send_file_on_session, send_folder_on_session, ChannelEvent, ChannelInfo, ChannelReceived,
-    ChannelStats, CloseReason, ControlMessage, HandlerRegistry, IncomingStreamChannel, Keepalive,
-    KeepaliveAction, KeepaliveConfig, PeerSession, PreservedSession, RecoveryConfig,
-    RecoveryManager, RecoveryStats, ResumeBinding, ResumeToken, RunExit, SessionConfig,
-    SessionEvent, SessionHandle, SessionHello, SessionInfo, SessionRegistry, SessionRole,
-    SessionWiring, TransferPreview, TransportFactory,
+    accept_pipe, peek_incoming_meta, receive_file_on_channel, receive_folder_on_channel,
+    receive_on_channel, send_file_on_session, send_folder_on_session, send_pipe_on_session,
+    ChannelEvent, ChannelInfo, ChannelReceived, ChannelStats, CloseReason, ControlMessage,
+    HandlerRegistry, IncomingStreamChannel, Keepalive, KeepaliveAction, KeepaliveConfig,
+    PeerSession, PipeConsent, PreservedSession, RecoveryConfig, RecoveryManager, RecoveryStats,
+    ResumeBinding, ResumeToken, RunExit, SessionConfig, SessionEvent, SessionHandle, SessionHello,
+    SessionInfo, SessionRegistry, SessionRole, SessionWiring, TransferPreview, TransportFactory,
 };
 pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};

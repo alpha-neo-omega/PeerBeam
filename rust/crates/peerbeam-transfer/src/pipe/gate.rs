@@ -1,0 +1,306 @@
+//! The one decision that answers: *may this peer's bytes be written to this
+//! process's stdout, right now?*
+//!
+//! Four legs, all of which must hold, combined in a single pure function rather
+//! than scattered through the accept path — the same shape as
+//! `peerbeam_presence::gate::may_share_status` and
+//! `peerbeam_clipboard::gate::may_share_clip`, for the same reason: one place
+//! to read, one place to test, and no way for a refactor to delete a leg
+//! silently.
+//!
+//! **The direction is the opposite of those two.** Clipboard and Presence gate
+//! what *leaves*; a pipe gates what *arrives*, because what arrives is written
+//! raw to a shell's stdout. Sending a pipe needs no gate at all beyond the
+//! user's own `pipe --to`: the bytes are their own, chosen deliberately, at a
+//! shell prompt.
+
+use peerbeam_domain::id::DeviceId;
+use peerbeam_domain::port::TrustStore;
+use peerbeam_domain::session::{CapabilitySet, ChannelType, PIPE_FEAT_STREAM};
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// pipe stream feature.
+///
+/// Split out so the decision is testable without standing up a session, and so
+/// exactly one place knows how the bit is read (mirrors
+/// `peerbeam_presence::caps_support_status`).
+///
+/// Both ends consult this, for different questions. A sender asks it *before
+/// reading a byte of stdin*, so a peer that predates `peerbeam pipe` is refused
+/// up front with a reason instead of being streamed bytes it would drop. A
+/// receiver asks it as one leg of [`may_accept_pipe`], so it never accepts a
+/// channel its own negotiation says should not exist.
+#[must_use]
+pub fn caps_support_stream(caps: &CapabilitySet) -> bool {
+    caps.features(ChannelType::PIPE)
+        .is_some_and(|f| f & PIPE_FEAT_STREAM != 0)
+}
+
+/// May this process write `peer`'s inbound pipe to its stdout?
+///
+/// All four must hold:
+///
+/// 1. **`listening`** — this process is a `peerbeam pipe --listen`, started by
+///    the user for exactly this. **There is no background acceptance and no
+///    setting that grants one:** a running `receive`, `daemon` or `serve`, and
+///    the Flutter GUI, all pass `false` here and refuse every pipe offered to
+///    them. This is the leg that stops a long-lived daemon from becoming a
+///    remote write to whatever terminal it happens to be attached to.
+///
+///    It is also why there is **no interactive approval prompt**, unlike a file
+///    transfer: running the command *is* the approval. A prompt would read from
+///    stdin — which on the sending side is the payload — and would break the
+///    headless, scripted use the feature exists for. Consent is expressed once,
+///    at the shell, by a person who is already there.
+/// 2. **The peer is trusted** — asked of the [`TrustStore`] itself rather than
+///    of a cached bool, so revoking a device stops the next pipe rather than
+///    the next reconnect. **Not configurable**; there is no setting that turns
+///    it off, exactly as for clipboard and presence.
+///
+///    Note what this leg does and does not buy. PeerBeam's handshake is TOFU,
+///    so a peer connecting for the first time is *pinned as it connects* and is
+///    therefore trusted by the time this is asked. Against a stranger on the
+///    LAN the load is carried by legs 1 and 3, not by this one; against a
+///    device the user has explicitly revoked, this is the leg that refuses. See
+///    `docs/SECURITY.md`.
+/// 3. **`only_from`, when set, names this peer** — `pipe --listen --from
+///    laptop` accepts that device and refuses every other, trusted or not. The
+///    comparison is against the **authenticated** `DeviceId` from the
+///    handshake, never against the human name the peer presented: a name is
+///    peer-supplied and a peer can present any name it likes, so matching on
+///    one would turn the restriction into a suggestion.
+/// 4. **The peer negotiated [`PIPE_FEAT_STREAM`]** — capability-advertised, not
+///    assumed (MESSAGE_REGISTRY.md §7 / I9). A channel from a peer whose
+///    negotiated set lacks the bit should not exist at all; refusing it is
+///    fail-closed rather than trusting the channel type alone.
+///
+/// Legs 1–3 are local decisions and a peer has no say in them. Leg 4 is the
+/// peer's own statement about what it understands. Keeping that distinction
+/// visible is why this is one function with four named legs rather than a
+/// single `bool` computed somewhere upstream.
+#[must_use]
+pub fn may_accept_pipe(
+    listening: bool,
+    trust: &dyn TrustStore,
+    peer: &DeviceId,
+    only_from: Option<&DeviceId>,
+    negotiated: &CapabilitySet,
+) -> bool {
+    // Written as an explicit `match` rather than `Option::is_none_or` so it
+    // compiles on the workspace MSRV (1.80) — and, for a security predicate,
+    // reads as the two cases it actually is.
+    let from_permitted = match only_from {
+        Some(want) => want == peer,
+        None => true,
+    };
+    listening && trust.is_trusted(peer) && from_permitted && caps_support_stream(negotiated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerbeam_domain::session::Capability;
+
+    /// A trust store that trusts exactly the ids it was built with. Small
+    /// enough to be obviously correct — the point of these tests is the gate,
+    /// not the store.
+    struct FakeTrust(Vec<String>);
+
+    impl TrustStore for FakeTrust {
+        fn record(
+            &self,
+            _record: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            _device: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(None)
+        }
+        fn is_trusted(&self, device: &DeviceId) -> bool {
+            self.0.iter().any(|d| d == &device.0)
+        }
+    }
+
+    fn trusting() -> FakeTrust {
+        FakeTrust(vec!["pb-bob".to_string(), "pb-carol".to_string()])
+    }
+
+    fn empty_trust() -> FakeTrust {
+        FakeTrust(Vec::new())
+    }
+
+    fn bob() -> DeviceId {
+        DeviceId::from("pb-bob")
+    }
+
+    fn carol() -> DeviceId {
+        DeviceId::from("pb-carol")
+    }
+
+    /// A peer that negotiated the pipe capability properly.
+    fn negotiated() -> CapabilitySet {
+        CapabilitySet::new().with(Capability::with_features(
+            ChannelType::PIPE,
+            PIPE_FEAT_STREAM,
+        ))
+    }
+
+    #[test]
+    fn all_four_gates_open_permits_an_accept() {
+        assert!(may_accept_pipe(
+            true,
+            &trusting(),
+            &bob(),
+            None,
+            &negotiated()
+        ));
+    }
+
+    /// **The listen gate.** A process that is not `pipe --listen` refuses even a
+    /// trusted, fully capable peer — deleting `listening` from
+    /// [`may_accept_pipe`] must make this fail.
+    #[test]
+    fn a_process_that_is_not_listening_refuses_a_trusted_capable_peer() {
+        assert!(
+            !may_accept_pipe(false, &trusting(), &bob(), None, &negotiated()),
+            "only a `pipe --listen` may take an inbound pipe"
+        );
+    }
+
+    /// **The trust gate.** A revoked peer is refused even by a listener —
+    /// deleting `trust.is_trusted(peer)` must make this fail.
+    #[test]
+    fn an_untrusted_peer_is_refused_even_while_listening() {
+        assert!(
+            !may_accept_pipe(true, &empty_trust(), &bob(), None, &negotiated()),
+            "an untrusted peer must never reach stdout"
+        );
+    }
+
+    /// **The `--from` gate.** Another *trusted* peer is refused when the
+    /// listener named a device — the interesting case, since an untrusted one
+    /// was already refused by leg 2.
+    #[test]
+    fn from_refuses_a_different_trusted_peer() {
+        assert!(
+            may_accept_pipe(true, &trusting(), &bob(), Some(&bob()), &negotiated()),
+            "the named device is accepted"
+        );
+        assert!(
+            !may_accept_pipe(true, &trusting(), &carol(), Some(&bob()), &negotiated()),
+            "carol is trusted and still refused: --from named bob"
+        );
+    }
+
+    /// Every leg refuses on its own, so a test that only ever flipped several
+    /// at once would not distinguish them.
+    #[test]
+    fn the_gates_are_independent() {
+        assert!(!may_accept_pipe(
+            false,
+            &trusting(),
+            &bob(),
+            None,
+            &negotiated()
+        ));
+        assert!(!may_accept_pipe(
+            true,
+            &empty_trust(),
+            &bob(),
+            None,
+            &negotiated()
+        ));
+        assert!(!may_accept_pipe(
+            true,
+            &trusting(),
+            &bob(),
+            Some(&carol()),
+            &negotiated()
+        ));
+        assert!(!may_accept_pipe(
+            true,
+            &trusting(),
+            &bob(),
+            None,
+            &CapabilitySet::new()
+        ));
+        assert!(may_accept_pipe(
+            true,
+            &trusting(),
+            &bob(),
+            None,
+            &negotiated()
+        ));
+    }
+
+    /// A peer that predates `peerbeam pipe` advertises no PIPE capability at
+    /// all, so the intersection drops it and no pipe is exchanged in either
+    /// direction.
+    #[test]
+    fn a_peer_that_does_not_advertise_pipe_is_refused() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(ChannelType::TRANSFER))
+            .with(Capability::new(ChannelType::CHAT));
+        let n = negotiated().intersect(&legacy);
+        assert!(!n.supports(ChannelType::PIPE));
+        assert!(!caps_support_stream(&n));
+        assert!(!may_accept_pipe(true, &trusting(), &bob(), None, &n));
+    }
+
+    /// A peer advertising the channel with `features: 0` has the bit ANDed away
+    /// and is likewise refused.
+    #[test]
+    fn a_peer_advertising_pipe_without_the_feature_bit_is_refused() {
+        let bare = CapabilitySet::new().with(Capability::new(ChannelType::PIPE));
+        let n = negotiated().intersect(&bare);
+        assert!(n.supports(ChannelType::PIPE), "the channel negotiates");
+        assert_eq!(n.features(ChannelType::PIPE), Some(0), "the bit is ANDed");
+        assert!(!caps_support_stream(&n));
+        assert!(!may_accept_pipe(true, &trusting(), &bob(), None, &n));
+    }
+
+    /// Unknown future bits from a newer peer must not be mistaken for this one.
+    #[test]
+    fn an_unrelated_future_feature_bit_does_not_imply_stream() {
+        let future =
+            CapabilitySet::new().with(Capability::with_features(ChannelType::PIPE, 1 << 6));
+        let n = negotiated().intersect(&future);
+        assert!(!caps_support_stream(&n));
+    }
+
+    /// The gate is asked about *this* peer, not about "some trusted peer".
+    /// Without the `peer` argument being used, a device trusting anyone at all
+    /// would take a pipe from everyone.
+    #[test]
+    fn trust_is_evaluated_for_the_peer_being_accepted() {
+        let trust = FakeTrust(vec!["pb-bob".to_string()]);
+        assert!(may_accept_pipe(true, &trust, &bob(), None, &negotiated()));
+        assert!(
+            !may_accept_pipe(
+                true,
+                &trust,
+                &DeviceId::from("pb-mallory"),
+                None,
+                &negotiated()
+            ),
+            "trusting one device must not open the gate for another"
+        );
+    }
+
+    /// `--from` is matched against the authenticated device id. A peer that
+    /// merely *calls itself* the named device is a different id and is refused;
+    /// this pins that the comparison is on ids, since a name-based one would
+    /// make the restriction spoofable by anyone on the network.
+    #[test]
+    fn from_compares_authenticated_ids_not_presented_names() {
+        let impostor = DeviceId::from("pb-mallory");
+        let trust = FakeTrust(vec!["pb-mallory".to_string()]);
+        assert!(
+            !may_accept_pipe(true, &trust, &impostor, Some(&bob()), &negotiated()),
+            "only the id `--from` resolved to may pass"
+        );
+    }
+}

@@ -21,6 +21,7 @@ mod channel_manager;
 mod control;
 mod crypto;
 mod event;
+mod pipe;
 mod recovery;
 mod registry;
 mod resume;
@@ -34,6 +35,7 @@ pub(crate) use crypto::{ChannelCrypto, SessionCrypto};
 pub use event::{
     CloseReason, Keepalive, KeepaliveAction, KeepaliveConfig, SessionEvent, SessionRole,
 };
+pub use pipe::{accept_pipe, send_pipe_on_session, PipeConsent};
 pub use recovery::{
     PreservedSession, RecoveryConfig, RecoveryManager, RecoveryStats, RunExit, SessionWiring,
     TransportFactory,

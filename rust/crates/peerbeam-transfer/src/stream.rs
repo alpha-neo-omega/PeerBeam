@@ -503,7 +503,11 @@ async fn recv_resume_ack(link: &mut dyn Link) -> Result<u64> {
     }
 }
 
-async fn recv_verify(link: &mut dyn Link) -> Result<bool> {
+/// Await the peer's `Verify` verdict on a `Complete` we sent, skipping any
+/// frame that is not one. Shared with [`crate::pipe`], whose stream ends with
+/// the same `Complete`/`Verify` exchange — a pipe having no second
+/// implementation of this handshake is the point (I2).
+pub(crate) async fn recv_verify(link: &mut dyn Link) -> Result<bool> {
     loop {
         match link.recv_frame().await? {
             Some(frame) if frame.kind == FrameKind::Control => match parse_control(&frame)? {
