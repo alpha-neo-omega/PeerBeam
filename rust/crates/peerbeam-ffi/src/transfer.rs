@@ -3026,6 +3026,52 @@ impl Manager {
             }
         };
 
+        // **An inbound pipe is refused here, in the handler — deliberately not
+        // by omitting the advertisement.**
+        //
+        // This build advertises `PIPE_FEAT_STREAM` exactly as the CLI does
+        // (`session_exec::advertised_caps`), because a peer must not behave
+        // differently depending on which of PeerBeam's two frontends it
+        // reached — the bug 2a shipped with `CHAT_FEAT_FILEREF`. The bit
+        // asserts *comprehension*, and this build genuinely comprehends the
+        // channel; what it has no way to honour is the destination. A pipe
+        // writes raw bytes to a shell's stdout, and a GUI has no stdout: there
+        // is nothing here for the bytes to be, and no `peerbeam pipe --listen`
+        // for the user to have started, which is the only consent that admits
+        // one. So the refusal belongs at the point of acceptance, where the
+        // reason is knowable, rather than hidden in a silently different
+        // advertisement.
+        //
+        // It goes through the same `accept_pipe` funnel every other refusing
+        // process uses, with `listening: false` and an `out` that discards, so
+        // the decision stays in one place and even a broken gate would have
+        // nowhere to put the bytes.
+        if incoming_ch.channel_type == peerbeam_domain::session::ChannelType::PIPE {
+            let consent = peerbeam_transfer::PipeConsent {
+                listening: false,
+                trust: self.trust.as_ref(),
+                only_from: None,
+                negotiated: &session.capabilities,
+            };
+            let mut nowhere = futures::io::sink();
+            let outcome = peerbeam_transfer::accept_pipe(
+                incoming_ch,
+                &session.handle,
+                &session.peer_device,
+                &consent,
+                &mut nowhere,
+            )
+            .await;
+            match outcome {
+                Ok(_) => {
+                    tracing::error!("a pipe was accepted by the GUI, which must never accept one")
+                }
+                Err(e) => tracing::info!(error = %e, "refused an inbound pipe"),
+            }
+            session.close().await;
+            return;
+        }
+
         // Read the transfer's opening frame WITHOUT consuming it: the sender's
         // own transfer id, the file/folder name, and the size. The returned
         // channel replays that frame, so `receive_on_channel` below runs

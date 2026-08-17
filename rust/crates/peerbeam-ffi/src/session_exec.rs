@@ -17,7 +17,7 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
@@ -35,6 +35,7 @@ const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
 const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
+const PIPE: ChannelType = ChannelType::PIPE;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
 /// every accept call site in this codebase registers this (built via
@@ -89,8 +90,21 @@ pub struct ChatWiring {
 /// background clipboard reads, so a phone can never auto-send a clip and yet
 /// advertises this bit truthfully, because it applies an incoming one in full.
 /// Desktop sends, every platform receives.
+///
+/// PIPE advertises [`PIPE_FEAT_STREAM`] and is registered as a **stream**
+/// channel type, and this is the widest comprehension/behaviour gap of the
+/// four: **the GUI offers no pipe UI and refuses every pipe offered to it**,
+/// because a pipe writes raw bytes to a shell's stdout and a GUI has none. The
+/// refusal lives in `transfer::handle_incoming`, at the point of acceptance —
+/// *not* in a quietly narrower advertisement — so that a peer's behaviour does
+/// not depend on which of PeerBeam's frontends it reached, and so the refusal
+/// can state a reason. Registering the stream type is what routes an inbound
+/// pipe there to be refused, rather than leaving it to pair as a handler-less
+/// message channel whose frames vanish in silence.
 fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
-    let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
+    let mut cfg = SessionConfig::new(advertised_caps())
+        .with_stream_channel_type(TRANSFER)
+        .with_stream_channel_type(PIPE);
     if !handlers.is_empty() {
         let mut reg = HandlerRegistry::new();
         for h in handlers {
@@ -115,6 +129,7 @@ fn advertised_caps() -> CapabilitySet {
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
+        .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -613,6 +628,96 @@ mod tests {
         let future = CapabilitySet::new().with(Capability::with_features(CLIPBOARD, 1 << 4));
         let negotiated = our_caps().intersect(&future);
         assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
+    }
+
+    /// The PIPE bit must be advertised by **this** frontend. The CLI has the
+    /// identical test against its own `session_cfg`, for the reason spelled out
+    /// on `the_presence_feature_bit_is_advertised`: a shared helper would go
+    /// green for both surfaces the moment either stopped advertising.
+    #[test]
+    fn the_pipe_feature_bit_is_advertised() {
+        let f = our_caps().features(PIPE).expect("PIPE advertised");
+        assert!(f & PIPE_FEAT_STREAM != 0, "byte pipes");
+    }
+
+    /// PIPE must be a **stream** channel type here too. Unregistered, an
+    /// inbound pipe would pair as a handler-less message channel and its frames
+    /// would be decoded, counted and dropped in silence — the sender would hang
+    /// rather than be refused. Registered, it reaches `handle_incoming`, which
+    /// refuses it with a reason.
+    #[test]
+    fn pipe_is_a_stream_channel_type() {
+        let cfg = session_cfg(Vec::new());
+        assert!(cfg.stream_channel_types.contains(&PIPE));
+        assert!(
+            cfg.stream_channel_types.contains(&TRANSFER),
+            "and transfer still is"
+        );
+    }
+
+    /// **The GUI advertises the capability and accepts no pipe**, which is the
+    /// whole point of putting the refusal in the handler rather than in a
+    /// narrower advertisement: comprehension is claimed truthfully, acceptance
+    /// is refused locally, and a peer's behaviour does not depend on which of
+    /// our frontends it reached.
+    #[test]
+    fn advertising_pipe_does_not_imply_accepting_one() {
+        let negotiated = our_caps().intersect(&our_caps());
+        assert!(
+            peerbeam_transfer::caps_support_stream(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        assert!(
+            !peerbeam_transfer::may_accept_pipe(
+                false, // the GUI is never `pipe --listen`
+                &AlwaysTrusts,
+                &DeviceId::from("pb-bob"),
+                None,
+                &negotiated,
+            ),
+            "the GUI must refuse even a trusted, fully capable peer"
+        );
+    }
+
+    /// A peer from before `peerbeam pipe` advertises no PIPE at all, so the
+    /// intersection drops it.
+    #[test]
+    fn a_peer_without_pipe_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = our_caps().intersect(&legacy);
+        assert!(!negotiated.supports(PIPE));
+        assert!(!peerbeam_transfer::caps_support_stream(&negotiated));
+    }
+
+    /// An unrelated future bit on PIPE must not be read as this one.
+    #[test]
+    fn an_unrelated_future_pipe_bit_does_not_imply_stream() {
+        let future = CapabilitySet::new().with(Capability::with_features(PIPE, 1 << 4));
+        let negotiated = our_caps().intersect(&future);
+        assert!(!peerbeam_transfer::caps_support_stream(&negotiated));
+    }
+
+    /// A trust store that trusts everyone, so the GUI assertion above can only
+    /// be failing on the listen leg.
+    struct AlwaysTrusts;
+    impl peerbeam_domain::port::TrustStore for AlwaysTrusts {
+        fn record(
+            &self,
+            _r: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            _d: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(None)
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            true
+        }
     }
 
     /// A trust store that trusts nobody, for the gate assertions above.
