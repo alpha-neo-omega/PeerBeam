@@ -125,6 +125,14 @@ extension on AttachKind {
 /// afterwards. Defaults to [AttachKind.any] — every existing caller that
 /// wants today's unfiltered picker needs no change.
 ///
+/// [keep] is the set of paths the caller currently holds staged elsewhere
+/// (typically a [StagingStore]'s own paths). On Android the native side
+/// streams every pick into its own cache and prunes that cache by age on
+/// each new pick; passing the paths still staged is what stops it pruning a
+/// batch the app has not finished with yet, however long ago it was picked.
+/// Desktop ignores it: file_selector hands back the user's own filesystem
+/// path directly, with no intermediate cache copy for anything to prune.
+///
 /// On Android this goes through a native `ACTION_OPEN_DOCUMENT` picker
 /// (`peerbeam/android`'s `pickFiles`) instead of file_selector: the
 /// file_selector_android plugin reads the entire picked file into a Java
@@ -134,17 +142,22 @@ extension on AttachKind {
 /// a real filesystem path with no byte copy.
 Future<List<StagedFile>> pickFilesToStage({
   AttachKind kind = AttachKind.any,
+  List<String> keep = const [],
 }) async {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     const channel = MethodChannel('peerbeam/android');
     final mimeTypes = kind.androidMimeTypes;
-    // No argument at all for `any`, not an empty list — an older native
-    // build (or a test stub) that only understands a bare `pickFiles` call
-    // must keep behaving exactly as it does today.
+    // No argument at all when neither is needed, not an empty map — an
+    // older native build (or a test stub) that only understands a bare
+    // `pickFiles` call must keep behaving exactly as it does today.
+    final args = <String, Object?>{
+      if (mimeTypes.isNotEmpty) 'mimeTypes': mimeTypes,
+      if (keep.isNotEmpty) 'keep': keep,
+    };
     final raw =
         await channel.invokeListMethod<Object?>(
           'pickFiles',
-          mimeTypes.isEmpty ? null : {'mimeTypes': mimeTypes},
+          args.isEmpty ? null : args,
         ) ??
         const [];
     return raw.map((e) {

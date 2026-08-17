@@ -86,6 +86,89 @@ void main() {
     });
   });
 
+  // The picked-cache bug this group guards against: `preparePickedDir` on the
+  // native side prunes its cache on every call, so a caller that still holds
+  // an earlier batch staged must say so, or that batch is deleted out from
+  // under it while still in use. `keep` is how it says so — these tests
+  // assert the actual argument the channel receives, not merely that some
+  // call was made.
+  group('Android: pickFilesToStage(keep:) tells the picker what is already '
+      'staged', () {
+    // Same shape as the `kind:` group's own pickWith above, but this group's
+    // tests care about `keep` too, so it takes that as well rather than
+    // reaching across to the other group's narrower helper.
+    Future<MethodCall> pickWith(
+      WidgetTester tester, {
+      AttachKind kind = AttachKind.any,
+      List<String> keep = const [],
+    }) async {
+      MethodCall? call;
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('peerbeam/android'),
+        (c) async {
+          if (c.method == 'pickFiles') call = c;
+          return <Map<String, Object?>>[];
+        },
+      );
+      await pickFilesToStage(kind: kind, keep: keep);
+      return call!;
+    }
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('peerbeam/android'),
+            null,
+          );
+    });
+
+    testWidgets('the currently-staged paths are sent verbatim as keep', (
+      tester,
+    ) async {
+      final call = await pickWith(
+        tester,
+        keep: const ['/cache/picked/1/a.bin', '/cache/picked/1/b.bin'],
+      );
+      expect((call.arguments as Map)['keep'], [
+        '/cache/picked/1/a.bin',
+        '/cache/picked/1/b.bin',
+      ]);
+    });
+
+    testWidgets(
+      'nothing staged and the default kind together send no argument at all '
+      '— the call still works exactly as it does today',
+      (tester) async {
+        final call = await pickWith(tester);
+        expect(call.arguments, isNull);
+      },
+    );
+
+    testWidgets(
+      'keep is threaded independently of mimeTypes — a narrowed kind still '
+      'carries keep alongside it',
+      (tester) async {
+        final call = await pickWith(
+          tester,
+          kind: AttachKind.media,
+          keep: const ['/cache/picked/1/a.bin'],
+        );
+        final args = call.arguments as Map;
+        expect(args['mimeTypes'], ['image/*', 'video/*']);
+        expect(args['keep'], ['/cache/picked/1/a.bin']);
+      },
+    );
+
+    testWidgets(
+      'an empty keep sends no keep key at all, even when mimeTypes is '
+      'present',
+      (tester) async {
+        final call = await pickWith(tester, kind: AttachKind.audio);
+        expect((call.arguments as Map).containsKey('keep'), isFalse);
+      },
+    );
+  });
+
   group('Desktop: pickFilesToStage(kind:) builds XTypeGroup filters', () {
     late _FakeFileSelector fake;
     late FileSelectorPlatform realInstance;

@@ -34,7 +34,7 @@ Future<void> _addFiles(BuildContext context, StagingStore staging) async {
   final picked = await withProcessing(
     context,
     'Preparing files…',
-    pickFilesToStage,
+    () => pickFilesToStage(keep: staging.paths),
   );
   if (picked.isNotEmpty) staging.add(picked);
 }

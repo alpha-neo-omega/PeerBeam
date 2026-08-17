@@ -94,7 +94,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final picked = await withProcessing(
       context,
       'Preparing files…',
-      pickFilesToStage,
+      () => pickFilesToStage(keep: staging.paths),
     );
     if (picked.isEmpty || !context.mounted) return;
     final added = staging.add(picked);
@@ -131,7 +131,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final picked = await withProcessing(
       context,
       'Preparing files…',
-      pickFilesToStage,
+      () => pickFilesToStage(keep: scope.staging.paths),
     );
     if (picked.isEmpty || !context.mounted) return;
     try {

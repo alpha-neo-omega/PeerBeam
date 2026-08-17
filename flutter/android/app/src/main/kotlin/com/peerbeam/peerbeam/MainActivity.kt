@@ -47,6 +47,12 @@ class MainActivity : FlutterActivity() {
     private val reqPickFiles = 4212
     private var pendingFiles: MethodChannel.Result? = null
 
+    // The `keep` argument validated alongside `pendingFiles` in [pickFiles],
+    // carried across to the [onActivityResult] callback the same way
+    // `pendingFiles` itself is — there is no other way to get a value from
+    // the call that launched the picker to the callback that resolves it.
+    private var pendingKeep: List<String> = emptyList()
+
     // Runtime POST_NOTIFICATIONS request (Android 13+). Fire-and-forget: we
     // don't need the grant result, the OS just silently drops notifications
     // (see Notifications.show's SecurityException catch) if denied.
@@ -204,6 +210,11 @@ class MainActivity : FlutterActivity() {
     /// picker. The result is handled in onActivityResult, which streams each
     /// picked URI into app cache off the main thread and replies with
     /// `{path, name, size}` per file — never the file's bytes.
+    ///
+    /// [call] may also carry `keep`: the paths the caller currently holds
+    /// staged elsewhere. [preparePickedDir] never prunes a batch containing
+    /// one of them, however old it is. Optional with an empty default, same
+    /// as `mimeTypes`, so an older Dart caller that sends none is unaffected.
     private fun pickFiles(call: MethodCall, result: MethodChannel.Result) {
         // Extracted and validated BEFORE `result` is taken over, and that order
         // is the whole point. `call.argument` is an unchecked cast, so a
@@ -223,8 +234,21 @@ class MainActivity : FlutterActivity() {
             result.error("args", "mimeTypes must be a list of strings", null)
             return
         }
+        // Same reasoning, same ordering, as `mimeTypes` above: validated
+        // before `pendingFiles`/`pendingKeep` take over `result`.
+        val rawKeep = call.argument<Any?>("keep")
+        val keep: List<String>
+        if (rawKeep == null) {
+            keep = emptyList()
+        } else if (rawKeep is List<*> && rawKeep.all { it is String }) {
+            keep = rawKeep.filterIsInstance<String>()
+        } else {
+            result.error("args", "keep must be a list of strings", null)
+            return
+        }
         pendingFiles?.success(null) // abandon any prior
         pendingFiles = result
+        pendingKeep = keep
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
@@ -238,6 +262,7 @@ class MainActivity : FlutterActivity() {
             startActivityForResult(intent, reqPickFiles)
         } catch (e: Exception) {
             pendingFiles = null
+            pendingKeep = emptyList()
             result.error("no_picker", e.message, null)
         }
     }
@@ -290,7 +315,9 @@ class MainActivity : FlutterActivity() {
         }
         if (requestCode == reqPickFiles) {
             val reply = pendingFiles
+            val keep = pendingKeep
             pendingFiles = null
+            pendingKeep = emptyList()
             if (resultCode != RESULT_OK || data == null) {
                 reply?.success(emptyList<Map<String, Any?>>())
                 return
@@ -306,7 +333,7 @@ class MainActivity : FlutterActivity() {
             // copy here would ANR, and this is exactly the byte[]-in-RAM
             // pattern we're replacing, just moved to the wrong thread.
             Thread {
-                val dir = preparePickedDir()
+                val dir = preparePickedDir(keep)
                 val out = ArrayList<Map<String, Any?>>()
                 for (uri in uris) {
                     try {
@@ -663,37 +690,51 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /// Cache subdirectory that share-in copies are materialized into. Each
-    /// share/view batch gets its own fresh, uniquely-named subdirectory
-    /// (rather than wiping a single shared dir), so a new share can never
-    /// delete a prior batch's file while it's still mid-transfer. Batches
-    /// older than an hour — well past any plausible transfer duration — are
-    /// pruned here so the cache doesn't grow unbounded across repeated shares.
-    private fun prepareSharedDir(): File {
-        val root = File(cacheDir, "shared")
+    /// Cache subdirectory `name` holding one fresh, uniquely-named batch per
+    /// call, rather than a single directory reused (and wiped) every time —
+    /// so a new batch can never delete a previous one while it is still in
+    /// use. A batch is pruned once it is older than `maxAgeMs`, UNLESS one of
+    /// its files is named in `keep` (paths the caller says it still needs),
+    /// in which case it survives regardless of age: age alone would still
+    /// discard a batch the app is deliberately holding onto longer than the
+    /// cutoff.
+    private fun prepareBatchDir(name: String, maxAgeMs: Long, keep: List<String> = emptyList()): File {
+        val root = File(cacheDir, name)
         root.mkdirs()
-        val cutoff = System.currentTimeMillis() - 60 * 60 * 1000L
+        val cutoff = System.currentTimeMillis() - maxAgeMs
+        val keptDirs = keep.mapNotNull { File(it).parentFile?.absolutePath }.toHashSet()
         root.listFiles()?.forEach { child ->
-            if (child.lastModified() < cutoff) child.deleteRecursively()
+            if (child.absolutePath !in keptDirs && child.lastModified() < cutoff) {
+                child.deleteRecursively()
+            }
         }
         val batch = File(root, System.nanoTime().toString())
         batch.mkdirs()
         return batch
     }
 
+    /// Cache subdirectory that share-in copies are materialized into. No
+    /// [keep] list is needed here: unlike a pick, a share-in copy happens
+    /// synchronously on the UI thread in [resolveToRealPath], so by the time
+    /// its path is handed to Dart the copy is already complete — an hour is
+    /// well past any plausible time for that path to still be in use.
+    private fun prepareSharedDir(): File = prepareBatchDir("shared", 60 * 60 * 1000L)
+
     /// Cache subdirectory that the native file picker streams picked files
-    /// into, cleared at the start of every NEW pick batch so it doesn't grow
-    /// unbounded across repeated picks. Safe because a prior pick's files
-    /// were already handed off to the transfer engine before the next pick
-    /// begins — unlike share-in, a picked batch is never still in flight
-    /// when the next pick starts, so a blanket wipe (rather than
-    /// [prepareSharedDir]'s per-batch subdir) is fine here.
-    private fun preparePickedDir(): File {
-        val dir = File(cacheDir, "picked")
-        dir.listFiles()?.forEach { it.deleteRecursively() }
-        dir.mkdirs()
-        return dir
-    }
+    /// into. A picked batch's bytes may still be needed long after the pick
+    /// itself returns — the false assumption a blanket wipe-on-every-pick
+    /// used to make here, which deleted files still in use. The Send flow
+    /// only reads a staged file's path back when the user finally taps Send,
+    /// which they may put off as long as they like; a chat attachment's
+    /// staging copy keeps reading its source for as long as the copy takes,
+    /// unawaited, in the background, which for a large file is minutes. The
+    /// cutoff is a day rather than [prepareSharedDir]'s hour because a picked
+    /// batch waits on the user where a share-in goes straight into a
+    /// transfer, and [keep] — the paths [pickFiles]'s caller says it still
+    /// holds staged — covers what even that cutoff cannot: a batch left
+    /// staged past it still survives.
+    private fun preparePickedDir(keep: List<String>): File =
+        prepareBatchDir("picked", 24 * 60 * 60 * 1000L, keep)
 
     /// Strips path separators from a display name so it can't escape
     /// [prepareSharedDir]'s directory or collide with it structurally.

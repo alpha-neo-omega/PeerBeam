@@ -82,6 +82,13 @@ class StagingStore extends ChangeNotifier {
   bool get isNotEmpty => _items.isNotEmpty;
   int get totalBytes => _items.fold(0, (sum, f) => sum + f.size);
 
+  /// Every staged file/folder's path (text items, whose [StagedFile.path] is
+  /// empty, are excluded). For a caller that hands files to a picker whose
+  /// own cache it does not control, this is what tells that picker which
+  /// paths are still needed so its cache upkeep does not discard them.
+  List<String> get paths =>
+      _items.where((f) => f.path.isNotEmpty).map((f) => f.path).toList();
+
   /// Add files/folders, ignoring any whose path is already staged. Returns how
   /// many were newly added.
   int add(Iterable<StagedFile> files) {

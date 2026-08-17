@@ -6,6 +6,24 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **Android: picking a second batch of files no longer destroys the first
+  batch's bytes while they were still in use.** The native picker streams
+  every pick into `cacheDir/picked`, and `preparePickedDir` wiped that whole
+  directory at the start of each new pick on the (false) assumption that a
+  prior batch was always already handed off by then. It wasn't: the Send
+  flow only reads a staged file's path back when the user finally taps
+  Send, which they may put off indefinitely, and a chat attachment's staging
+  copy keeps reading its source for as long as the copy takes — minutes, for
+  a large file — unawaited in the background. Picking again from inside the
+  staged sheet, or attaching again mid-copy, deleted the earlier batch out
+  from under whichever of those was still reading it. `preparePickedDir` now
+  gives each pick batch its own subdirectory and prunes only by age (a day,
+  not the hour share-in uses, since a pick can sit staged far longer than a
+  share ever does), and the Dart side additionally tells it which paths are
+  still staged (`keep`) so a batch left in the sheet past that cutoff is
+  never pruned regardless of age.
+
 ## [0.4.1] - 2026-08-17 — Beta
 
 ### Fixed
