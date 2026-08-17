@@ -231,5 +231,50 @@ void main() {
         expect(find.textContaining('notes'), findsOneWidget);
       },
     );
+
+    desktopTest(
+      'dropping onto a peer with no known address sends nothing and says so',
+      (tester) async {
+        // The composer already disables attach for this peer because the
+        // engine refuses the send before anything is enqueued. A drop is the
+        // same act by a different gesture, so it must refuse the same way —
+        // otherwise the user gets a row of failed bubbles to dismiss, having
+        // been told nothing beforehand.
+        const addressless = PeerTarget(
+          id: 'pb-bob',
+          name: 'Bob',
+          addresses: [],
+          port: 0,
+        );
+        final file = _tempFile(tmp, 'a.bin', 'x');
+        final fake = FakePeerBeam();
+        final state = AppState.live(fake);
+        addTearDown(state.dispose);
+        await tester.pumpWidget(
+          AppScope(
+            state: state,
+            child: const MaterialApp(
+              home: ChatScreen(peerId: 'pb-bob', peer: addressless),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        await drop(tester, [file.path]);
+
+        expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), isEmpty);
+        // Scoped to the SnackBar: the composer already shows its own
+        // "No address known for Bob" notice for this peer, so an unscoped
+        // finder would pass on that alone and prove nothing about the drop.
+        expect(
+          find.descendant(
+            of: find.byType(SnackBar),
+            matching: find.textContaining('No address known for Bob'),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
   });
 }

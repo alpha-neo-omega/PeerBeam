@@ -134,6 +134,7 @@ class _ChatScreenState extends State<ChatScreen> {
       body: ChatDropZone(
         peerId: widget.peerId,
         peer: widget.peer,
+        canSend: _canSend,
         child: SafeArea(
           child: ContentPane(
             child: Column(

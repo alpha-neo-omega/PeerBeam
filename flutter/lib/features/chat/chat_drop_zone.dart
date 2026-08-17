@@ -22,11 +22,23 @@ import '../send/drop_zone.dart' show collectDroppedFiles, isDesktop;
 class ChatDropZone extends StatefulWidget {
   final String peerId;
   final PeerTarget peer;
+
+  /// Whether this peer can be sent to at all — the composer's own `_canSend`.
+  ///
+  /// A peer with no known address is refused by the engine before anything is
+  /// enqueued, which is why the composer disables its attach button rather
+  /// than accepting files that would never exist. A drop is the same act by a
+  /// different gesture, so it must answer the same way: dropping onto a
+  /// conversation whose composer is disabled would otherwise fan out one
+  /// doomed send per file and leave the user a row of failed bubbles to
+  /// dismiss, having been told nothing up front.
+  final bool canSend;
   final Widget child;
   const ChatDropZone({
     super.key,
     required this.peerId,
     required this.peer,
+    required this.canSend,
     required this.child,
   });
 
@@ -46,6 +58,22 @@ class _ChatDropZoneState extends State<ChatDropZone> {
   /// later.
   Future<void> _onDone(DropDoneDetails detail) async {
     setState(() => _active = false);
+    // Checked before the files are even walked: nothing here can succeed, and
+    // saying so once beats staging metadata for a send that cannot be made.
+    if (!widget.canSend) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              'No address known for ${widget.peer.name} yet — files can be '
+              'sent again as soon as the device is discovered.',
+            ),
+          ),
+        );
+      return;
+    }
     final staged = await collectDroppedFiles(detail);
     if (!mounted) return;
     final chat = AppScope.of(context).chat;
