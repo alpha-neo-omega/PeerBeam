@@ -272,12 +272,28 @@ mod tests {
         assert_eq!(s.charging, Some(true));
         assert_eq!(s.network.as_deref(), Some("lan"), "route still classified");
 
+        // What this host reports with nothing pushed — the answer an absurd
+        // reading must fall back to. Captured rather than assumed: asserting
+        // "not 100" would be testing the machine, and fails outright on a
+        // laptop sitting at a full charge.
+        set_battery(None, None);
+        let native = collect_status(&path, Some(RouteKind::Lan)).battery_percent;
+
         // Absurd: ignored rather than clamped, and it must never leave a status
         // this build's own encoder would refuse.
         set_battery(Some(250), Some(true));
         let s = collect_status(&path, Some(RouteKind::Lan));
         assert_ne!(s.battery_percent, Some(250));
-        assert_ne!(s.battery_percent, Some(100), "ignored, not clamped");
+        assert_eq!(
+            s.battery_percent, native,
+            "an absurd push is dropped, leaving the native collector's answer"
+        );
+        // That it is *ignored rather than clamped* is pinned where the decision
+        // lives, against a fixed baseline:
+        // `peerbeam_presence::collect::tests::
+        //  an_out_of_range_battery_override_is_ignored_not_clamped`.
+        // Re-asserting it here against the host's real battery is what made
+        // this test fail on a laptop at a full charge.
         assert!(
             s.to_frame(peerbeam_domain::session::ChannelId::new(1))
                 .is_ok(),
