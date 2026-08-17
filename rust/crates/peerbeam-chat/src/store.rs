@@ -743,38 +743,19 @@ impl ChatStore {
     /// mysteriously return days later — whatever survives is queued *right
     /// now*, and is visible immediately.
     ///
-    /// # A file still being staged is "still waiting to be sent" too
+    /// # Which records survive, and why that rule lives elsewhere
     ///
-    /// The keep set from [`queued_message_ids`](Self::queued_message_ids) reads
-    /// the outbox, and a file the user attached seconds ago has no outbox entry
-    /// yet: `begin_file_send` writes the row `Staging` synchronously and the
-    /// copy — minutes, for a multi-GB file — runs before `enqueue_file` queues
-    /// anything. For that whole window an outbox-only keep set does not name
-    /// the row, so the delete would take it, and the copy would then finish
-    /// into the orphaned state above: a queued entry with no record, which the
-    /// next drain offers to the peer and then throws away along with the bytes.
-    /// So a row still reading [`Status::Staging`] is kept as well. That is what
-    /// makes the confirmation's promise true in the sense the user means it —
-    /// they attached a file, it is being copied, it is waiting to be sent.
-    ///
-    /// # An unreadable outbox refuses, rather than under-report
-    ///
-    /// The keep set is read strictly, hard-failing on any entry that will not
-    /// decode — the same asymmetry, and for the same reason, as
-    /// [`outbox_owned_blobs`](Self::outbox_owned_blobs), whose doc has the long
-    /// form. Every *other* outbox reader exists to deliver, where skipping one
-    /// unreadable row saves every row queued behind it. This one decides what
-    /// to **delete**: a keep set that is merely incomplete does not cost a row,
-    /// it takes the record out from under a queue entry and hands the next
-    /// drain tick the "nothing will ever settle this" verdict above. The sharp
-    /// case is a wholly-unreadable outbox, which the lenient readers report as
-    /// `Ok(vec![])` — indistinguishable from a queue that is genuinely empty,
-    /// and enough to strand every queued file on the device. Refusing costs the
-    /// user a delete they can retry; guessing costs them a file.
+    /// [`KeepRule`] decides, and its doc carries the long form: what a queued
+    /// send loses when its record goes, why a file still being *staged* counts
+    /// as queued even though no outbox entry names it yet, and why the set is
+    /// established strictly or not at all. It is deliberately not spelled out
+    /// again here — [`delete_messages`](Self::delete_messages) answers to the
+    /// same rule, and a second copy of it is how the original defect would come
+    /// back.
     ///
     /// [`AppStore::clear`]: peerbeam_domain::port::AppStore::clear
     pub fn delete_conversation(&self, peer: &DeviceId) -> Result<usize, ChatError> {
-        let keep = self.queued_message_ids(peer)?;
+        let keep = KeepRule::establish(self.store.as_ref(), peer)?;
         let ns = namespace(peer);
         let rows = self
             .store
@@ -782,25 +763,16 @@ impl ChatStore {
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
         let mut removed = 0;
         for (key, value) in rows {
-            if keep.contains(&key) {
-                continue;
-            }
-            // A file whose bytes are still being copied into the outbox: no
-            // entry names it yet, and destroying its row is what turns the
-            // finished copy into a queued entry with nothing behind it. Read
-            // from the value we already have in hand, so this costs no extra
+            // Asked of the value already in hand, so the rule costs no extra
             // store round trip.
-            if is_staging(&value) {
+            if keep.keeps(&key, &value) {
                 continue;
             }
             // Deliberately keyed off the STORED KEY, not off a decoded record:
             // a row this build cannot read is still the user's to delete, and
             // `history` would silently skip it — leaving a thread that
             // reappears at the next namespace scan with nothing in it the user
-            // can see or remove. The `Staging` check above is the one exception
-            // and it is not a relaxation of this: a row that will not decode is
-            // removed exactly as before, because whether it was staging is
-            // precisely what could not be read.
+            // can see or remove.
             if self
                 .store
                 .delete(&ns, &key)
@@ -812,16 +784,150 @@ impl ChatStore {
         Ok(removed)
     }
 
-    /// Message ids queued for `peer` — or an error when that set cannot be
-    /// established **completely**. See
-    /// [`delete_conversation`](Self::delete_conversation), the only caller, for
-    /// why an incomplete answer is not usable here.
-    fn queued_message_ids(&self, peer: &DeviceId) -> Result<HashSet<String>, ChatError> {
-        let raw = self
-            .store
+    /// Delete the named messages from this conversation's local history.
+    ///
+    /// Returns `(removed, kept)`: `kept` are the ids that were asked for but
+    /// must survive, because a queued send still depends on them.
+    ///
+    /// **Local only**, exactly like
+    /// [`delete_conversation`](Self::delete_conversation): nothing goes on the
+    /// wire, and the peer keeps its own copy. This is "forget these messages
+    /// here", never "unsend".
+    ///
+    /// # The same rule, not a similar one
+    ///
+    /// Both deletes answer to [`KeepRule`], and must. Selecting every message
+    /// in a thread *is* a conversation delete by another name, so two rules
+    /// that could disagree would be the same data-loss bug arriving through
+    /// whichever one was written second — and the one that costs a file is
+    /// silent for minutes afterwards, in a background drain tick, with nothing
+    /// on screen connecting it to the delete that caused it.
+    ///
+    /// # What the caller gets back
+    ///
+    /// `kept` is the *ids*, not a count: the user pointed at particular
+    /// messages, so the surface can name the ones it could not take and say
+    /// why. A conversation delete has no such list to give — it asked for
+    /// everything — which is why that one answers with a count instead.
+    ///
+    /// An id the namespace does not hold is neither removed nor kept. It is
+    /// simply not there, and calling it kept would tell the user something is
+    /// still waiting to send a message that does not exist. An id repeated in
+    /// the request is answered once.
+    ///
+    /// Deletion is by **stored key**, decodable or not, exactly as
+    /// `delete_conversation` does it: a row this build cannot read is still the
+    /// user's to delete, and is in fact the one they can see nothing of.
+    pub fn delete_messages(
+        &self,
+        peer: &DeviceId,
+        ids: &[String],
+    ) -> Result<(usize, Vec<String>), ChatError> {
+        // Established before anything is deleted, and for the whole request:
+        // a rule read halfway through would let the rows deleted before it
+        // failed stay deleted, which is precisely the outcome the strict read
+        // exists to refuse.
+        let keep = KeepRule::establish(self.store.as_ref(), peer)?;
+        let ns = namespace(peer);
+        let mut removed = 0;
+        let mut kept = Vec::new();
+        let mut seen = HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            // Fetched one key at a time rather than listed: a selection is a
+            // handful of rows out of a thread that may hold thousands, and the
+            // "not there at all" case falls out of the same read that hands the
+            // keep rule its value.
+            let Some(value) = self
+                .store
+                .get(&ns, id)
+                .map_err(|e| ChatError::Serialization(e.to_string()))?
+            else {
+                continue;
+            };
+            if keep.keeps(id, &value) {
+                kept.push(id.clone());
+                continue;
+            }
+            if self
+                .store
+                .delete(&ns, id)
+                .map_err(|e| ChatError::Serialization(e.to_string()))?
+            {
+                removed += 1;
+            }
+        }
+        Ok((removed, kept))
+    }
+}
+
+/// The one rule deciding which of a conversation's stored rows a local delete
+/// must leave behind, shared by [`ChatStore::delete_conversation`] and
+/// [`ChatStore::delete_messages`].
+///
+/// It exists as a type rather than as a helper each of them calls because a
+/// *second* implementation of it is exactly how the data loss below comes
+/// back, and the two legs in [`keeps`](Self::keeps) are answered together so
+/// that a caller cannot honour one and forget the other.
+///
+/// # What it protects, and from what
+///
+/// A queued outbound message is delivered by the FFI's drain, which re-opens
+/// the conversation record its outbox entry is named after
+/// ([`reopen_for_retry`](ChatStore::reopen_for_retry)). A **missing** record is
+/// read there — correctly — as "nothing will ever settle this", so the entry is
+/// released and its staged blob deleted (`row_may_still_deliver` and
+/// `drop_queued_file` in `peerbeam_ffi::transfer`). Staging holds the only copy
+/// the queue owns and the user's own file may well be gone by then, so the
+/// bytes do not come back. Deleting such a row therefore destroys a file some
+/// minutes later, from a background tick, with nothing on screen connecting the
+/// two.
+///
+/// # Two legs, and why they travel together
+///
+/// 1. **An outbox entry names it** — the ordinary case: a message queued for a
+///    peer that is not there.
+/// 2. **It still reads [`Status::Staging`]** — `begin_file_send` writes the row
+///    synchronously and the copy (minutes, for a multi-GB file) runs before
+///    `enqueue_file` queues anything, so for that whole window the outbox
+///    cannot vouch for a row that is nonetheless waiting to be sent. Delete it
+///    and the finished copy queues an entry with no record behind it: leg 1's
+///    disaster, reached by another road. It is also what makes the promise the
+///    surface shows true in the sense the user means it — they attached a file,
+///    it is being copied, it is waiting to be sent.
+///
+/// A rule that answered only leg 1 would look correct against every settled
+/// thread a test is likely to build. That is the shape the original defect had.
+///
+/// # The set is established completely, or not at all
+///
+/// [`establish`](Self::establish) hard-fails on any outbox entry that will not
+/// decode — the same asymmetry, and for the same reason, as
+/// [`outbox_owned_blobs`](ChatStore::outbox_owned_blobs), whose doc has the
+/// long form. Every *other* outbox reader exists to deliver, where skipping one
+/// unreadable row costs that message and saves every message queued behind it.
+/// This one decides what to **delete**: a keep set that is merely incomplete
+/// does not lose a row, it takes the record out from under a queue entry and
+/// hands the next drain tick the verdict above. The sharp case is a
+/// wholly-unreadable outbox, which the lenient readers report as `Ok(vec![])` —
+/// indistinguishable from a queue that is genuinely empty, and enough to strand
+/// every queued file on the device. Refusing costs the user a delete they can
+/// retry; guessing costs them a file.
+struct KeepRule {
+    /// Message ids the shared outbox holds for this one peer.
+    queued: HashSet<String>,
+}
+
+impl KeepRule {
+    /// Read the shared outbox and establish the rule for `peer`'s conversation,
+    /// or refuse with [`ChatError::QueueUnreadable`].
+    fn establish(store: &dyn AppStore, peer: &DeviceId) -> Result<Self, ChatError> {
+        let raw = store
             .list(OUTBOX_NS)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
-        let mut ids = HashSet::new();
+        let mut queued = HashSet::new();
         for (key, value) in raw {
             let entry = OutboxEntry::decode(&value).map_err(|e| {
                 ChatError::QueueUnreadable(format!(
@@ -846,21 +952,29 @@ impl ChatStore {
             // from the entry alone. That rebuild is exactly the problem: the
             // row would vanish now and REAPPEAR when the message is finally
             // delivered, which is the "thread that mysteriously returns days
-            // later" this whole method exists to rule out.
+            // later" a delete exists to rule out.
             if entry.peer_id == peer.0 && entry.kind != Kind::Decline {
-                ids.insert(entry.message_id);
+                queued.insert(entry.message_id);
             }
         }
-        Ok(ids)
+        Ok(KeepRule { queued })
     }
-}
 
-/// Whether a stored row is a file this device is still copying into the
-/// outbox — the one status a conversation delete must step over even though no
-/// outbox entry names it yet. A value that will not decode is not staging as
-/// far as anyone here can tell, and says so.
-fn is_staging(value: &[u8]) -> bool {
-    matches!(ChatRecord::decode(value), Ok(rec) if rec.status == Status::Staging)
+    /// Whether the stored row `(key, value)` must survive the delete — both
+    /// legs, in one answer.
+    ///
+    /// Takes the raw stored value rather than a decoded record so it can be
+    /// answered from whatever the caller already holds (a `list` pair, or a
+    /// `get` for one key) at no extra store round trip, and so a row this build
+    /// cannot read is judged by the same call as one it can. Such a row is not
+    /// staging as far as anyone here can tell, and says so: whether it *was*
+    /// staging is precisely what could not be read, and keeping every
+    /// unreadable row instead would leave the user a thread they can neither
+    /// see into nor delete.
+    fn keeps(&self, key: &str, value: &[u8]) -> bool {
+        self.queued.contains(key)
+            || matches!(ChatRecord::decode(value), Ok(rec) if rec.status == Status::Staging)
+    }
 }
 
 #[cfg(test)]
@@ -2600,5 +2714,332 @@ mod tests {
             cs.outbox_for(&peer).unwrap().is_empty(),
             "the lenient reader cannot tell this from an empty queue"
         );
+    }
+
+    // ── delete_messages — the same keep rule, applied to a selection ────────
+
+    /// Seed `n` settled outgoing text rows and return their ids, oldest first.
+    fn seed_settled(cs: &ChatStore, peer: &DeviceId, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let m = ChatMessage::new(&format!("message {i}")).unwrap();
+                cs.append(&ChatRecord::sent(peer, &m)).unwrap();
+                m.id
+            })
+            .collect()
+    }
+
+    /// The ordinary case: some of the thread goes, the rest stays exactly as it
+    /// was, and nothing is kept because nothing is waiting to be sent.
+    #[test]
+    fn delete_messages_removes_only_the_named_rows() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let ids = seed_settled(&cs, &peer, 5);
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[ids[1].clone(), ids[3].clone()])
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert!(kept.is_empty(), "nothing was queued, so nothing is kept");
+
+        let left: Vec<String> = cs
+            .history(&peer)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left, vec![ids[0].clone(), ids[2].clone(), ids[4].clone()]);
+        // The survivors are untouched, not merely present: a delete does not
+        // rewrite what it leaves.
+        assert_eq!(
+            cs.get(&peer, &ids[0]).unwrap().unwrap().body,
+            "message 0",
+            "the rows around the selection are left whole"
+        );
+    }
+
+    /// **THE TRAP, in selection form.** Picking the bubble of a file that is
+    /// still queued must not take the record out from under its outbox entry:
+    /// the drain reads a missing record as "nothing will ever settle this" and
+    /// throws the only staged copy away. So it is kept, the caller is *told*
+    /// which id was kept — that is what lets the surface say why — and the
+    /// queue is left able to deliver it.
+    #[test]
+    fn delete_messages_keeps_a_queued_file_and_reports_it_by_id() {
+        let (cs, _store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = seed_settled(&cs, &peer, 2);
+
+        let queued = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &queued.id);
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &queued,
+            FileMeta::new(&queued.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &queued,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob.clone(),
+                },
+            )
+            .unwrap(),
+            "the row seeded above is there, so it queues"
+        );
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[settled[0].clone(), queued.id.clone()])
+            .unwrap();
+        assert_eq!(removed, 1, "the settled message, and only that");
+        assert_eq!(
+            kept,
+            vec![queued.id.clone()],
+            "the queued file is named, not just counted"
+        );
+
+        // The consequence, not just the row. `reopen_for_retry` is the exact
+        // step the drain takes before sending a queued file; a `false` here is
+        // the state in which it releases the entry and deletes the bytes.
+        assert!(
+            cs.reopen_for_retry(&peer, &queued.id).unwrap(),
+            "the queue must still be able to deliver the file it kept"
+        );
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "still queued");
+        assert!(
+            std::path::Path::new(&blob).exists(),
+            "a queued file's only copy must survive deleting its bubble"
+        );
+        assert_eq!(
+            cs.outbox_owned_blobs().unwrap().len(),
+            1,
+            "and the queue still owns it, so no sweep will collect it either"
+        );
+    }
+
+    /// **THE STAGING WINDOW, in selection form.** `begin_file_send` writes the
+    /// row `Staging` synchronously and the copy — minutes, for a multi-GB
+    /// file — runs before `enqueue_file` puts anything in the outbox. For that
+    /// whole window an outbox-only keep rule does not name the row, so deleting
+    /// its bubble would leave the finished copy to queue an entry with no
+    /// record behind it: the trap above, reached by another road.
+    #[test]
+    fn delete_messages_keeps_a_file_that_is_still_being_staged() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = seed_settled(&cs, &peer, 1);
+
+        let staging = FileRef::new("holiday.mp4", 8_000_000_000).unwrap();
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &staging,
+            FileMeta::new(
+                &staging.name,
+                staging.size,
+                Some("/home/me/holiday.mp4".into()),
+            ),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "nothing is queued until the copy finishes — that IS the window"
+        );
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[settled[0].clone(), staging.id.clone()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(kept, vec![staging.id.clone()]);
+
+        let row = cs.get(&peer, &staging.id).unwrap().expect("the row stays");
+        assert_eq!(row.status, Status::Staging);
+        assert_eq!(
+            row.file.as_ref().unwrap().local_path.as_deref(),
+            Some("/home/me/holiday.mp4"),
+            "kept whole — the delete does not rewrite what it keeps"
+        );
+        // And the copy can still finish into it, which is the only reason
+        // keeping it matters.
+        assert!(
+            cs.enqueue_file(
+                &peer,
+                &staging,
+                &StagedFile {
+                    name: "holiday.mp4".into(),
+                    size: 8_000_000_000,
+                    staged_path: format!("/data/outbox-blobs/{}", staging.id),
+                },
+            )
+            .unwrap(),
+            "the finished copy queues normally, exactly as if nothing happened"
+        );
+    }
+
+    /// An id in no namespace at all is neither removed nor kept. `kept` means
+    /// "refused because something still needs it" — reporting an id that was
+    /// never there would tell the user a message they cannot see is still on
+    /// its way out.
+    #[test]
+    fn delete_messages_ignores_an_id_that_is_not_there() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let ids = seed_settled(&cs, &peer, 2);
+        // A real row, but in someone else's thread: naming it here must not
+        // reach across conversations either.
+        let other = DeviceId::from("pb-carol");
+        let elsewhere = seed_settled(&cs, &other, 1);
+
+        let (removed, kept) = cs
+            .delete_messages(
+                &peer,
+                &[
+                    ids[0].clone(),
+                    "0000000000000-never-existed".to_string(),
+                    elsewhere[0].clone(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(removed, 1, "only the one row that was actually there");
+        assert!(kept.is_empty(), "an absent id is not 'kept': {kept:?}");
+        assert_eq!(cs.history(&other).unwrap().len(), 1, "blast radius is one");
+
+        // A repeated id is answered once, so a caller that sent the same
+        // selection twice over cannot inflate its own report.
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[ids[1].clone(), ids[1].clone()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(kept.is_empty());
+    }
+
+    /// A row this build cannot decode is still the user's to delete — and it is
+    /// the one they can see nothing of, since `history` skips it. Keying the
+    /// delete off decoded records would leave it behind for good.
+    #[test]
+    fn delete_messages_removes_a_selected_row_this_build_cannot_read() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let readable = seed_settled(&cs, &peer, 1);
+        store
+            .put(
+                &namespace(&peer),
+                "0000000000009",
+                b"{\"from\":\"the-future\"}",
+            )
+            .unwrap();
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &["0000000000009".to_string()])
+            .unwrap();
+        assert_eq!(removed, 1, "the unreadable row goes when it is named");
+        assert!(
+            kept.is_empty(),
+            "it is not staging as far as anyone can tell: {kept:?}"
+        );
+        assert!(
+            store
+                .get(&namespace(&peer), "0000000000009")
+                .unwrap()
+                .is_none(),
+            "read back through the RAW store, which no decode can hide"
+        );
+        assert_eq!(
+            cs.history(&peer).unwrap().len(),
+            1,
+            "and the readable row beside it is untouched"
+        );
+        assert_eq!(cs.history(&peer).unwrap()[0].id, readable[0]);
+    }
+
+    /// **THE OTHER TRAP.** The keep rule must be **complete**. The lenient
+    /// outbox readers skip an entry they cannot decode, so a wholly-unreadable
+    /// outbox reads back as "nothing is queued" — and a delete driven by that
+    /// removes the record under a queued file, which is precisely the state the
+    /// drain reads as "nothing will ever settle this" before deleting the
+    /// staged bytes.
+    ///
+    /// So the whole call refuses, exactly as `delete_conversation` does, and
+    /// **nothing is deleted on the way to refusing** — including the plain
+    /// settled message in the same selection, which is why the rule is
+    /// established before the first delete rather than per row.
+    #[test]
+    fn delete_messages_refuses_when_the_outbox_cannot_be_read_completely() {
+        let (cs, store, tmp) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = seed_settled(&cs, &peer, 1);
+
+        let queued = FileRef::new("waiting.mkv", 30).unwrap();
+        let (_staging, blob) = staged_blob(tmp.path(), &queued.id);
+        cs.append(&ChatRecord::file_out(
+            &peer,
+            &queued,
+            FileMeta::new(&queued.name, 30, None),
+            Status::Staging,
+        ))
+        .unwrap();
+        assert!(cs
+            .enqueue_file(
+                &peer,
+                &queued,
+                &StagedFile {
+                    name: "waiting.mkv".into(),
+                    size: 30,
+                    staged_path: blob,
+                },
+            )
+            .unwrap());
+
+        // Every outbox row becomes undecodable — a newer schema, as seen by an
+        // older binary, applied to the whole namespace.
+        for (key, _) in store.list(OUTBOX_NS).unwrap() {
+            store
+                .put(OUTBOX_NS, &key, b"{\"from\":\"the-future\"}")
+                .unwrap();
+        }
+
+        let err = cs
+            .delete_messages(&peer, &[settled[0].clone(), queued.id.clone()])
+            .expect_err("an incomplete keep rule must not authorise a delete");
+        assert!(matches!(err, ChatError::QueueUnreadable(_)), "{err:?}");
+        assert_eq!(
+            cs.history(&peer).unwrap().len(),
+            2,
+            "and nothing was deleted on the way to refusing"
+        );
+
+        // Not vacuous: the lenient reader — the one every delivery path uses —
+        // reports an empty queue here, which would have let the record go.
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "the lenient reader cannot tell this from an empty queue"
+        );
+    }
+
+    /// A queued TEXT message is kept just like a queued file. Nothing would
+    /// lose bytes here — `record_sent` can rebuild a text row from its entry
+    /// alone — but the row would vanish now and REAPPEAR when the message is
+    /// finally delivered, which is the message that comes back from the dead a
+    /// delete exists to rule out.
+    #[test]
+    fn delete_messages_keeps_a_queued_text_message() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let settled = seed_settled(&cs, &peer, 1);
+        let pending = ChatMessage::new("not sent yet").unwrap();
+        cs.enqueue(&peer, &pending).unwrap();
+
+        let (removed, kept) = cs
+            .delete_messages(&peer, &[settled[0].clone(), pending.id.clone()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(kept, vec![pending.id.clone()]);
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "still queued");
     }
 }

@@ -7,6 +7,18 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Delete individual chat messages** (`pb_chat_delete_messages`,
+  `{peer_id, message_ids:[…]}` → `{removed, kept:[…]}`). Local only, like
+  deleting a whole conversation: nothing goes on the wire and the peer keeps its
+  own copy — this is not "unsend". Anything still waiting to be sent survives,
+  queue entry and staged bytes included, because the engine's drain reads a
+  *missing* record as "nothing will ever settle this" and would throw the queued
+  file away; the reply **names** the ids it kept, so a surface can say which of
+  the picked messages are still on their way out instead of claiming to have
+  deleted them. Deleting a conversation and deleting a selection now answer to
+  one shared implementation of that keep rule, rather than two that could drift
+  apart. An unreadable outbox entry refuses the whole call with
+  `queue_unreadable`, exactly as a conversation delete does.
 - **A typed attach menu in chat.** The composer's attach button now opens a
   menu of **Document**, **Photos & videos**, or **Audio** instead of one
   undifferentiated picker — matching the shape WhatsApp and every other chat

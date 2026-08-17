@@ -2503,6 +2503,91 @@ impl Manager {
         Ok(json!({ "removed": removed, "kept": kept }))
     }
 
+    /// Delete some of one conversation's messages:
+    /// `{peer_id, message_ids:[…]}` → `{removed, kept:[…]}`.
+    ///
+    /// **Local only**, exactly like [`chat_delete`](Self::chat_delete): nothing
+    /// goes on the wire and the peer keeps its own copy — this is "forget these
+    /// messages here", never "unsend".
+    ///
+    /// `removed` is how many rows were deleted; `kept` names the ids that were
+    /// asked for and deliberately left behind, because a **queued** outbound
+    /// send still depends on them. That list is the point of the call answering
+    /// at all: the user pointed at particular bubbles, so the surface can say
+    /// which ones it could not take and why, rather than reporting the request
+    /// back as though it had been carried out.
+    ///
+    /// [`ChatStore::delete_messages`] shares its keep rule with
+    /// [`ChatStore::delete_conversation`] — the same one implementation, not a
+    /// second copy of it — and that rule's doc carries the long form of why a
+    /// row backing a queued send must survive: the drain reads a **missing**
+    /// record as "nothing will ever settle this"
+    /// ([`row_may_still_deliver`](Self::row_may_still_deliver)) and releases the
+    /// entry along with the staged bytes it owns.
+    ///
+    /// No event is emitted, for the same reason as `chat_delete`: nothing else
+    /// in this process holds conversation rows, and the surface that asked
+    /// already knows. It re-reads the thread it is looking at.
+    ///
+    /// **A refusal carries its own code**, again exactly as `chat_delete`:
+    /// [`Code::QueueUnreadable`] when the shared outbox holds an entry that will
+    /// not decode, told apart on the [`ChatError`] variant rather than by
+    /// matching message text, and [`Code::Internal`] for any genuine store
+    /// failure.
+    ///
+    /// [`ChatStore::delete_messages`]: peerbeam_chat::ChatStore::delete_messages
+    /// [`ChatStore::delete_conversation`]: peerbeam_chat::ChatStore::delete_conversation
+    pub fn chat_delete_messages(&self, req: &Value) -> Op {
+        // The same peer_id rule as `chat_delete` — non-empty and required — so
+        // the two destructive chat calls cannot disagree about what names a
+        // conversation.
+        let peer_id = req
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or((Code::InvalidArgument, "peer_id required".into()))?
+            .to_string();
+        // Required, and every element a non-empty string. A malformed element
+        // silently dropped would make `removed`/`kept` a report about a request
+        // the caller never made; a missing field entirely would delete nothing
+        // and say so, which reads exactly like a selection that was already
+        // gone. An EMPTY array is not an error, though: it asks for nothing,
+        // deletes nothing, and answers `{removed: 0, kept: []}` — which is what
+        // a surface whose selection emptied itself between the render and the
+        // tap should get, rather than a failure to explain.
+        let ids = req
+            .get("message_ids")
+            .and_then(|v| v.as_array())
+            .ok_or((Code::InvalidArgument, "message_ids required".into()))?;
+        let mut message_ids = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = id
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or((
+                    Code::InvalidArgument,
+                    "message_ids must be non-empty strings".into(),
+                ))?
+                .to_string();
+            message_ids.push(id);
+        }
+        let peer = DeviceId::from(peer_id);
+        let (removed, kept) = self
+            .chat
+            .delete_messages(&peer, &message_ids)
+            .map_err(|e| {
+                // `QueueUnreadable` is the one refusal a retry cannot clear by
+                // itself, so it earns its own code; everything else (a genuine
+                // store failure) reports `Internal`.
+                let code = match &e {
+                    ChatError::QueueUnreadable(_) => Code::QueueUnreadable,
+                    _ => Code::Internal,
+                };
+                (code, e.to_string())
+            })?;
+        Ok(json!({ "removed": removed, "kept": kept }))
+    }
+
     /// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
     ///
     /// Stops the copy if one is running, stops the transfer if the bytes are
@@ -6609,6 +6694,173 @@ mod tests {
 
         let err = mgr
             .chat_delete(&json!({ "peer_id": "pb/bob" }))
+            .expect_err("an invalid conversation namespace must fail the delete");
+        assert_eq!(err.0.as_str(), Code::Internal.as_str());
+    }
+
+    // ── deleting selected messages ──────────────────────────────
+
+    fn delete_messages(mgr: &Manager, peer_id: &str, ids: &[&str]) -> Op {
+        mgr.chat_delete_messages(&json!({ "peer_id": peer_id, "message_ids": ids }))
+    }
+
+    /// The JSON in and out, and the one thing that makes the `kept` list worth
+    /// returning: a selection that mixes settled history with a still-queued
+    /// file removes the first, keeps the second, and **names** it — while the
+    /// drain's own predicate still says the queued file can be delivered.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_messages_removes_the_settled_and_names_what_it_kept() {
+        let (mgr, chat, dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let mut settled = Vec::new();
+        for body in ["one", "two"] {
+            let m = peerbeam_chat::ChatMessage::new(body).expect("message");
+            chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+                .expect("seed history");
+            settled.push(m.id);
+        }
+        let (queued_id, blob) = seed_queued_file(
+            &chat,
+            &dir.path().join("outbox-blobs"),
+            &peer,
+            "waiting.mkv",
+        );
+
+        let out = delete_messages(&mgr, "pb-bob", &[&settled[0], &queued_id]).expect("delete");
+        assert_eq!(
+            out["removed"], 1,
+            "the settled message, and only that: {out}"
+        );
+        assert_eq!(
+            out["kept"],
+            json!([queued_id]),
+            "the kept id is named, not counted: {out}"
+        );
+
+        // The drain's own decision, unchanged by the delete.
+        assert!(
+            mgr.row_may_still_deliver(&peer, &queued_id),
+            "a missing row here is what makes `run_queued_file` throw the bytes away"
+        );
+        assert!(blob.exists(), "and the staged bytes are still on disk");
+
+        // Not a no-op, and not over-broad: the unselected message stays.
+        let left: Vec<String> = chat
+            .history(&peer)
+            .expect("history")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.contains(&settled[1]), "the unselected row survives");
+        assert!(left.contains(&queued_id));
+    }
+
+    /// An id in no thread at all is neither removed nor kept — a surface must
+    /// not be told a message it can no longer see is still on its way out.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_messages_ignores_an_unknown_id() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+        let m = peerbeam_chat::ChatMessage::new("here").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+
+        let out = delete_messages(&mgr, "pb-bob", &[&m.id, "0000000000000-nope"]).expect("delete");
+        assert_eq!(out["removed"], 1, "{out}");
+        assert_eq!(out["kept"], json!([]), "{out}");
+        assert!(chat.history(&peer).expect("history").is_empty());
+    }
+
+    /// Both arguments are required, and `message_ids` must be an array of
+    /// non-empty strings. An empty array is deliberately NOT an error: it asks
+    /// for nothing and gets nothing, which is what a surface whose selection
+    /// emptied itself between the render and the tap should be handed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_messages_validates_its_arguments() {
+        let (mgr, chat, _dir) = test_manager_full("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+        let m = peerbeam_chat::ChatMessage::new("still here").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+
+        for bad in [
+            json!({ "message_ids": ["x"] }),
+            json!({ "peer_id": "", "message_ids": ["x"] }),
+            json!({ "peer_id": "pb-bob" }),
+            json!({ "peer_id": "pb-bob", "message_ids": "x" }),
+            json!({ "peer_id": "pb-bob", "message_ids": [7] }),
+            json!({ "peer_id": "pb-bob", "message_ids": [""] }),
+        ] {
+            let err = mgr
+                .chat_delete_messages(&bad)
+                .expect_err("must be refused: {bad}");
+            assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str(), "{bad}");
+        }
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            1,
+            "and nothing was deleted on the way to refusing"
+        );
+
+        let empty = mgr
+            .chat_delete_messages(&json!({ "peer_id": "pb-bob", "message_ids": [] }))
+            .expect("an empty selection is a no-op, not a failure");
+        assert_eq!(empty["removed"], 0);
+        assert_eq!(empty["kept"], json!([]));
+        assert_eq!(chat.history(&peer).expect("history").len(), 1);
+    }
+
+    /// **The refusal for an unreadable outbox entry carries its own code**, the
+    /// same way `chat_delete`'s does — and for the same reason: retrying will
+    /// not clear it, since the offending entry need not even belong to the
+    /// conversation being deleted. The corrupted entry here belongs to a
+    /// different peer, which is the actual failure mode.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_messages_reports_queue_unreadable_for_an_undecodable_entry() {
+        let (mgr, chat, raw, dir) = test_manager_parts("deleter", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        let m = peerbeam_chat::ChatMessage::new("settled").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed history");
+        seed_queued_file(
+            &chat,
+            &dir.path().join("outbox-blobs"),
+            &peer,
+            "waiting.mkv",
+        );
+
+        let other = peerbeam_chat::FileRef::new("unrelated.bin", 4).expect("file ref");
+        raw.put(
+            peerbeam_chat::OUTBOX_NS,
+            &other.id,
+            b"{\"from\":\"the-future\"}",
+        )
+        .expect("corrupt an unrelated peer's outbox entry");
+
+        let err = delete_messages(&mgr, "pb-bob", &[&m.id])
+            .expect_err("an unreadable outbox entry anywhere must refuse the delete");
+        assert_eq!(err.0.as_str(), Code::QueueUnreadable.as_str());
+        assert_eq!(
+            chat.history(&peer).expect("history").len(),
+            2,
+            "and nothing was deleted on the way to refusing"
+        );
+    }
+
+    /// A genuine store failure still reports `Internal`, so the two are told
+    /// apart by the `ChatError` variant rather than by whatever went wrong.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_delete_messages_still_reports_internal_for_a_genuine_store_failure() {
+        let (mgr, _chat, _dir) = test_manager_full("deleter", 0);
+        let err = delete_messages(&mgr, "pb/bob", &["anything"])
             .expect_err("an invalid conversation namespace must fail the delete");
         assert_eq!(err.0.as_str(), Code::Internal.as_str());
     }

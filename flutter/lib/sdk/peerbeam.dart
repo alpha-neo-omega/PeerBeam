@@ -124,6 +124,29 @@ abstract class PeerBeamApi {
   /// rather than guess at it.
   Future<({int removed, int kept})> chatDelete(String peerId);
 
+  /// Delete [messageIds] from the conversation with [peerId], returning what
+  /// actually happened: how many rows were `removed`, and the ids that were
+  /// `kept` because a **queued** outbound send still depends on them.
+  ///
+  /// **Local only**, exactly like [chatDelete]: nothing goes on the wire and the
+  /// peer keeps its own copy — this is "forget these messages here", never
+  /// "unsend".
+  ///
+  /// `kept` is a list of ids rather than a count because the user pointed at
+  /// particular messages: a surface can name the ones it could not take and say
+  /// why. They are kept for the same reason a conversation delete keeps them —
+  /// the engine's drain reads a *missing* record as "nothing will ever settle
+  /// this" and throws the queued file away — and both deletes share one
+  /// implementation of that rule, so they cannot drift apart.
+  ///
+  /// An id the conversation does not hold is neither removed nor kept; it is
+  /// simply not there. An empty [messageIds] deletes nothing and reports
+  /// nothing, rather than failing.
+  Future<({int removed, List<String> kept})> chatDeleteMessages(
+    String peerId,
+    List<String> messageIds,
+  );
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -350,6 +373,23 @@ class PeerBeam implements PeerBeamApi {
     return (
       removed: (data['removed'] as num?)?.toInt() ?? 0,
       kept: (data['kept'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  @override
+  Future<({int removed, List<String> kept})> chatDeleteMessages(
+    String peerId,
+    List<String> messageIds,
+  ) async {
+    final data = _data(
+      _req().chatDeleteMessages(
+        jsonEncode({'peer_id': peerId, 'message_ids': messageIds}),
+      ),
+    );
+    final kept = data['kept'];
+    return (
+      removed: (data['removed'] as num?)?.toInt() ?? 0,
+      kept: kept is List ? kept.whereType<String>().toList() : <String>[],
     );
   }
 

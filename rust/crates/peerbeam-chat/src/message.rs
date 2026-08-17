@@ -45,9 +45,9 @@ pub enum ChatError {
     /// [`Serialization`](Self::Serialization): that variant means the *store*
     /// failed (I/O, or a validation error at the storage layer); this one
     /// means the store answered fine and handed back bytes this build simply
-    /// cannot parse. `ChatStore::queued_message_ids` (reached only through
-    /// `ChatStore::delete_conversation`) raises this when it cannot account
-    /// for every queued message and must refuse rather than guess.
+    /// cannot parse. The keep rule shared by `ChatStore::delete_conversation`
+    /// and `ChatStore::delete_messages` raises this when it cannot account for
+    /// every queued message and must refuse rather than guess.
     ///
     /// The distinction matters one layer up: a caller across the FFI boundary
     /// needs to tell "retrying changes nothing until the queue clears" apart

@@ -401,6 +401,31 @@ pub unsafe extern "C" fn pb_chat_delete(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_delete(&read_json(json)?))()))
 }
 
+/// Delete some of one conversation's messages:
+/// `{peer_id, message_ids:[…]}` → `{removed, kept:[…]}`.
+///
+/// **Local only** — nothing goes on the wire, and the peer keeps its own copy.
+///
+/// The named rows are removed **except those still backing queued outbound
+/// messages**, which are kept along with their queue entries and staged bytes:
+/// the drain reads a missing record as "nothing will ever settle this" and would
+/// throw the queued file away. `kept` names those ids rather than counting them,
+/// so a surface can tell the user which of the messages they picked are still on
+/// their way out. An id the conversation does not hold is neither removed nor
+/// kept. Shares its keep rule with `pb_chat_delete` — one implementation, not
+/// two. See `Manager::chat_delete_messages`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_delete_messages(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.chat_delete_messages(&read_json(json)?)
+        })())
+    })
+}
+
 /// Call off a file we are sharing: `{peer_id, message_id}` → `{cancelled}`.
 ///
 /// Stops the staging copy if one is running, stops the transfer if the bytes

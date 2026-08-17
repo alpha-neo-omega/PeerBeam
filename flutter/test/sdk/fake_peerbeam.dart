@@ -215,17 +215,27 @@ class FakePeerBeam implements PeerBeamApi {
   }
 
   /// Message ids the engine still has **queued** for delivery, across all
-  /// peers — the fake's stand-in for the outbox. `chatDelete` keeps exactly the
-  /// records these name, mirroring `ChatStore::delete_conversation`: a record
-  /// taken out from under a queue entry is one the real drain reads as "nothing
-  /// will ever settle this" before throwing the file away.
+  /// peers — the fake's stand-in for the outbox. See [_mustKeep].
   final Set<String> queuedMessageIds = {};
 
-  /// When true, [chatDelete] throws instead of deleting — the engine refuses a
-  /// delete it cannot make safely (an outbox it cannot read completely, so the
-  /// set of records backing queued messages is unknown), and a surface must not
-  /// present that as a thread that went away.
+  /// When true, [chatDelete] and [chatDeleteMessages] throw instead of
+  /// deleting — the engine refuses a delete it cannot make safely (an outbox it
+  /// cannot read completely, so the set of records backing queued messages is
+  /// unknown), and a surface must not present that as history that went away.
   bool failChatDelete = false;
+
+  /// The one rule both deletes answer to, mirroring the engine's own
+  /// `KeepRule`: a row survives a local delete when an outbox entry still names
+  /// it, **or** when its bytes are still being staged — no entry names those
+  /// yet, and taking the row is what leaves the finished copy queued with
+  /// nothing behind it. The real drain reads such a record as "nothing will
+  /// ever settle this" and deletes the file's only staged copy.
+  ///
+  /// Deliberately one predicate here too: the engine's two deletes share one
+  /// implementation precisely so they cannot drift, and a fake that let them
+  /// drift would happily pass tests the engine could not.
+  bool _mustKeep(ChatMessage m) =>
+      queuedMessageIds.contains(m.id) || m.status == ChatStatusValue.staging;
 
   @override
   Future<({int removed, int kept})> chatDelete(String peerId) async {
@@ -233,7 +243,7 @@ class FakePeerBeam implements PeerBeamApi {
     if (failChatDelete) throw InternalException('outbox unreadable');
     final rows = chatHistories[peerId];
     if (rows == null) return (removed: 0, kept: 0);
-    final keep = rows.where((m) => queuedMessageIds.contains(m.id)).toList();
+    final keep = rows.where(_mustKeep).toList();
     final removed = rows.length - keep.length;
     // An emptied thread stops existing, exactly as the engine derives its
     // conversation list from the namespaces that still hold records — so the
@@ -244,6 +254,35 @@ class FakePeerBeam implements PeerBeamApi {
       chatHistories[peerId] = keep;
     }
     return (removed: removed, kept: keep.length);
+  }
+
+  @override
+  Future<({int removed, List<String> kept})> chatDeleteMessages(
+    String peerId,
+    List<String> messageIds,
+  ) async {
+    calls.add('chatDeleteMessages:$peerId/${messageIds.join(",")}');
+    if (failChatDelete) throw InternalException('outbox unreadable');
+    final rows = chatHistories[peerId];
+    if (rows == null) return (removed: 0, kept: const <String>[]);
+    final asked = messageIds.toSet();
+    // An id the thread does not hold is neither removed nor kept — it is
+    // simply not there, which is why this is derived from the ROWS rather than
+    // from what was asked for.
+    final kept = rows
+        .where((m) => asked.contains(m.id) && _mustKeep(m))
+        .map((m) => m.id)
+        .toList();
+    final survivors = rows
+        .where((m) => !asked.contains(m.id) || _mustKeep(m))
+        .toList();
+    final removed = rows.length - survivors.length;
+    if (survivors.isEmpty) {
+      chatHistories.remove(peerId);
+    } else {
+      chatHistories[peerId] = survivors;
+    }
+    return (removed: removed, kept: kept);
   }
 
   @override

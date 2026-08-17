@@ -42,13 +42,14 @@ envelope/DTO shape. Error codes: `not_initialised`, `invalid_argument`,
 `connection`, `integrity`, `cancelled`, `storage`, `transfer`, `encryption`,
 `unimplemented`, `queue_unreadable`, `internal`.
 
-`queue_unreadable` is narrower than the rest: `pb_chat_delete` returns it when
-the shared outbox holds an entry it cannot decode, so the delete is refused
-rather than risking a queued file's only staged copy (see
-`ChatStore::delete_conversation`). Unlike every other code, retrying the exact
-same call will not clear it on its own — the offending entry may not even
-belong to the conversation being deleted, since the outbox is shared across
-every peer. Any other failure of the same call still reports `internal`.
+`queue_unreadable` is narrower than the rest: `pb_chat_delete` and
+`pb_chat_delete_messages` return it when the shared outbox holds an entry they
+cannot decode, so the delete is refused rather than risking a queued file's only
+staged copy (see `ChatStore::delete_conversation`). Unlike every other code,
+retrying the exact same call will not clear it on its own — the offending entry
+may not even belong to the conversation being deleted, since the outbox is
+shared across every peer. Any other failure of the same calls still reports
+`internal`.
 
 ### Transfer (M2, additive — ABI still v1)
 
@@ -139,6 +140,35 @@ Flutter        FFI (Rust)
   │ pb_transfer_pause({id}) ─▶ TransferControl.pause()  →  ◀ transfer_paused
   │ pb_transfer_resume({id})─▶ TransferControl.resume() →  ◀ transfer_resumed
 ```
+
+### Chat (additive — ABI still v1)
+
+```c
+char* pb_chat_send(const char* json);           // {peer, text} → {id}
+char* pb_chat_send_file(const char* json);      // {peer, path} → {id}  (id is also the transfer id)
+char* pb_chat_history(const char* json);        // {peer_id} → {messages:[…]}
+char* pb_chat_reconcile(const char* json);      // {peer_id} → {changed}
+char* pb_chat_conversations(const char* json);  // {} or null → {peers:[{peer_id,last_timestamp,unread_hint}]}
+char* pb_chat_cancel(const char* json);         // {peer_id, message_id} → {cancelled}
+char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
+char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
+```
+
+Both deletes are **local only**: nothing goes on the wire and the peer keeps its
+own copy. Neither is "unsend". Both leave behind every record that still backs a
+**queued** outbound message — a queued file's record is what the drain re-opens
+to deliver it, and a *missing* one is read as "nothing will ever settle this",
+releasing the entry and deleting the only staged copy of the bytes. The rule
+deciding that has exactly one implementation, shared by the two
+(`ChatStore`'s `KeepRule`), and covers a file still being staged as well as one
+already queued.
+
+They differ only in what they report, because they were asked different
+questions: `pb_chat_delete` answers with counts (`kept` is how many records
+survived), while `pb_chat_delete_messages` **names** the kept ids, so a surface
+can tell the user which of the messages they picked are still on their way out.
+An id the conversation does not hold is neither removed nor kept, and an empty
+`message_ids` deletes nothing rather than failing.
 
 ## Events (no polling)
 
