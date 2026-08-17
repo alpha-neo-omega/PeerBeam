@@ -154,6 +154,7 @@ class DiscoveryRepository extends ChangeNotifier {
     online: d.online,
     reach: _reach(d),
     latencyMs: d.latencyMs,
+    platform: d.platform,
   );
 
   static DeviceKind _kind(String k) => switch (k) {
@@ -172,21 +173,9 @@ class DiscoveryRepository extends ChangeNotifier {
     return r;
   }
 
-  static Device _withOnline(Device d, bool online) => Device(
-    id: d.id,
-    name: d.name,
-    kind: d.kind,
-    online: online,
-    reach: d.reach,
-    latencyMs: d.latencyMs,
-  );
+  static Device _withOnline(Device d, bool online) =>
+      d.copyWith(online: online);
 
-  static Device _withLatency(Device d, int? latencyMs) => Device(
-    id: d.id,
-    name: d.name,
-    kind: d.kind,
-    online: d.online,
-    reach: d.reach,
-    latencyMs: latencyMs,
-  );
+  static Device _withLatency(Device d, int? latencyMs) =>
+      d.copyWith(latencyMs: latencyMs);
 }

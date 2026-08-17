@@ -29,11 +29,12 @@ void main() {
   });
 
   // The shortcuts are Ctrl/⌘ + N **by position**, so they follow the nav order
-  // rather than naming screens. Inserting Chats at position 2 therefore moved
-  // Transfers to Ctrl+3, History to Ctrl+4 and Settings to Ctrl+5 — a real
-  // behaviour change, asserted here as the whole mapping rather than one digit
-  // so the next insertion cannot quietly renumber half of it.
-  testWidgets('Ctrl+N switches destinations by position, Chats at 2', (
+  // rather than naming screens. Inserting Chats at position 2 moved Transfers
+  // to Ctrl+3, History to Ctrl+4 and Settings to Ctrl+5; inserting Devices at
+  // position 2 has now shifted each of those one further again. Asserted as the
+  // whole mapping rather than one digit, so an insertion cannot quietly
+  // renumber half of it — which is exactly what this insertion did.
+  testWidgets('Ctrl+N switches destinations by position, Devices at 2', (
     tester,
   ) async {
     await tester.pumpWidget(PeerBeamApp(api: FakePeerBeam()));
@@ -49,15 +50,25 @@ void main() {
     }
 
     // Start on Home — none of the other destinations' AppBars are up yet.
-    for (final title in ['Chats', 'Transfers', 'History', 'Settings']) {
+    for (final title in [
+      'Devices',
+      'Chats',
+      'Transfers',
+      'History',
+      'Settings',
+    ]) {
       expect(find.widgetWithText(AppBar, title), findsNothing);
     }
 
     final order = <LogicalKeyboardKey, String>{
-      LogicalKeyboardKey.digit2: 'Chats',
-      LogicalKeyboardKey.digit3: 'Transfers',
-      LogicalKeyboardKey.digit4: 'History',
-      LogicalKeyboardKey.digit5: 'Settings',
+      LogicalKeyboardKey.digit2: 'Devices',
+      LogicalKeyboardKey.digit3: 'Chats',
+      LogicalKeyboardKey.digit4: 'Transfers',
+      LogicalKeyboardKey.digit5: 'History',
+      // digit6 exists only because Devices was inserted. Without it the new
+      // destination would be mouse-reachable and keyboard-unreachable, and the
+      // shell's bounds guard would drop the binding silently.
+      LogicalKeyboardKey.digit6: 'Settings',
     };
     for (final entry in order.entries) {
       await press(entry.key);
@@ -70,7 +81,7 @@ void main() {
 
     // And Ctrl+1 comes back to Home. Asserted on Home's own widget, not on
     // Settings' AppBar being absent: that would pass just as well if Ctrl+1
-    // had landed on Chats, Transfers or History — three of the five
+    // had landed on Devices, Chats, Transfers or History — four of the six
     // destinations — which is no assertion about position 1 at all.
     await press(LogicalKeyboardKey.digit1);
     expect(find.byType(HomeScreen), findsOneWidget);
@@ -93,7 +104,13 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    for (final title in ['Chats', 'Transfers', 'History', 'Settings']) {
+    for (final title in [
+      'Devices',
+      'Chats',
+      'Transfers',
+      'History',
+      'Settings',
+    ]) {
       await tester.tap(
         find.descendant(
           of: find.byType(NavigationRail),

@@ -45,6 +45,11 @@ class Device {
   final Set<Reach> reach;
   final int? latencyMs;
 
+  /// OS as the engine reports it ('linux' | 'macos' | 'windows' | 'android' |
+  /// 'ios' | 'web'). Distinct from [kind], which is the form factor: a laptop
+  /// and a server can both be Linux.
+  final String platform;
+
   const Device({
     required this.id,
     required this.name,
@@ -52,7 +57,24 @@ class Device {
     required this.online,
     required this.reach,
     this.latencyMs,
+    this.platform = 'linux',
   });
+
+  /// Copy with selected fields replaced.
+  ///
+  /// Exists so the repository's update paths cannot silently drop a field:
+  /// they used to re-list every one by hand, which meant every field added to
+  /// this class had to be remembered in two more places or it would vanish the
+  /// first time a device went offline.
+  Device copyWith({bool? online, int? latencyMs}) => Device(
+    id: id,
+    name: name,
+    kind: kind,
+    online: online ?? this.online,
+    reach: reach,
+    latencyMs: latencyMs ?? this.latencyMs,
+    platform: platform,
+  );
 }
 
 enum TransferDirection { sending, receiving }

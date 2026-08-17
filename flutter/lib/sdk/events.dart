@@ -49,6 +49,12 @@ sealed class BridgeEvent {
         return const TrustChanged();
       case 'device_resync':
         return const DeviceResync();
+      case 'presence_updated':
+        // Live device status from a trusted peer. Payload mirrors one entry of
+        // `pb_presence_json`'s `devices` array.
+        return PresenceUpdated(
+          SdkPresence.fromJson(_map(_map(j['payload'])['device'])),
+        );
       case 'chat_received':
         return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
       case 'chat_status':
@@ -74,6 +80,12 @@ sealed class BridgeEvent {
 
   static Map<String, dynamic> _map(dynamic v) =>
       v is Map ? Map<String, dynamic>.from(v) : <String, dynamic>{};
+}
+
+/// A trusted peer shared (or refreshed) its device status.
+class PresenceUpdated extends BridgeEvent {
+  final SdkPresence presence;
+  const PresenceUpdated(this.presence);
 }
 
 class DeviceAdded extends BridgeEvent {

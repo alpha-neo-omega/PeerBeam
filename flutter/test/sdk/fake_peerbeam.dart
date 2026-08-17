@@ -60,6 +60,7 @@ class FakePeerBeam implements PeerBeamApi {
   Future<void> resume(String id) async => calls.add('resume:$id');
   @override
   Future<void> cancel(String id) async => calls.add('cancel:$id');
+
   /// Transfer ids for which the engine holds no open decision, so
   /// `accept`/`acceptTrust`/`reject` fail the way the real engine does
   /// (`no pending transfer <id>` → `invalid_argument`). That happens whenever
@@ -83,7 +84,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<TransferSnapshot>> activeTransfers() async => const [];
-    Map<String, dynamic> settings = {};
+  Map<String, dynamic> settings = {};
 
   @override
   Future<void> historyClear() async {
@@ -96,6 +97,30 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<void> settingsSet(Map<String, dynamic> partial) async {
     settings.addAll(partial);
+  }
+
+  /// The presence snapshot `presence()` returns. Tests set it directly, or
+  /// emit `PresenceUpdated` events to drive the repository instead.
+  PresenceSnapshot presenceSnapshot = PresenceSnapshot.empty;
+
+  /// When true, [presence] throws instead of answering — used to prove a
+  /// transient engine error leaves an accurate dashboard standing rather than
+  /// blanking it.
+  bool presenceThrows = false;
+
+  /// The last battery reading pushed down, so a test can assert the Android
+  /// path actually reached the engine.
+  ({int? percent, bool? charging})? pushedBattery;
+
+  @override
+  Future<PresenceSnapshot> presence() async {
+    if (presenceThrows) throw Exception('presence unavailable');
+    return presenceSnapshot;
+  }
+
+  @override
+  Future<void> presenceBattery({int? percent, bool? charging}) async {
+    pushedBattery = (percent: percent, charging: charging);
   }
 
   List<TrustedDevice> trusted = [];

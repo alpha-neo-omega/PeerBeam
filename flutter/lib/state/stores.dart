@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../data/chat_repository.dart';
 import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
+import '../data/presence_repository.dart';
 import '../data/saved_devices_repository.dart';
 import '../data/transfer_repository.dart';
 import '../data/trust_repository.dart';
@@ -38,6 +39,14 @@ class SettingsStore extends ChangeNotifier {
   /// Keep a foreground service running to receive files while backgrounded.
   bool backgroundReceive;
 
+  /// "Share device status with trusted devices" — the presence opt-in.
+  ///
+  /// **Default off.** While it is off this device sends no status at all, to
+  /// anyone; it still receives and displays what its peers share. When on,
+  /// status goes only to devices in the trust store — that half is not
+  /// configurable, here or anywhere.
+  bool sharePresence;
+
   /// Theme preference as persisted ('system' | 'light' | 'dark').
   String theme;
 
@@ -54,6 +63,8 @@ class SettingsStore extends ChangeNotifier {
     // a persistent notification; users can turn it off in Settings.
     this.backgroundReceive = true,
     this.theme = 'system',
+    // Opt-in: nothing about this device leaves it until the user says so.
+    this.sharePresence = false,
   });
 
   /// Load persisted settings from the engine (call once after initialize).
@@ -72,6 +83,9 @@ class SettingsStore extends ChangeNotifier {
       compression = (s['compression'] as bool?) ?? compression;
       backgroundReceive =
           (s['background_receive'] as bool?) ?? backgroundReceive;
+      // Absent -> stays false. A settings document written before this feature
+      // existed must never be read as consent.
+      sharePresence = (s['share_presence'] as bool?) ?? sharePresence;
       theme = (s['theme'] as String?) ?? theme;
       notifyListeners();
     } catch (_) {
@@ -107,6 +121,17 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Turn status sharing on or off.
+  ///
+  /// The engine re-reads this on every heartbeat, so turning it off stops an
+  /// already-connected session's next beat rather than waiting for a
+  /// reconnect. Turning it on likewise starts sharing without one.
+  void setSharePresence(bool v) {
+    sharePresence = v;
+    _persist('share_presence', v);
+    notifyListeners();
+  }
+
   void setNotifications(bool v) {
     notifications = v;
     _persist('notifications', v);
@@ -135,6 +160,7 @@ class AppState {
   final SavedDevicesRepository saved;
   final TrustRepository trust;
   final ChatRepository chat;
+  final PresenceRepository presence;
   final SettingsStore settings;
   final StagingStore staging;
 
@@ -146,6 +172,7 @@ class AppState {
     required this.saved,
     required this.trust,
     required this.chat,
+    required this.presence,
     required this.settings,
     required this.staging,
   });
@@ -160,6 +187,7 @@ class AppState {
       saved: SavedDevicesRepository()..load(),
       trust: TrustRepository(api: api),
       chat: ChatRepository(api: api),
+      presence: PresenceRepository(api: api),
       settings: SettingsStore(
         deviceName: 'This Device',
         saveDirectory: '~/Downloads/PeerBeam',
@@ -176,6 +204,7 @@ class AppState {
     device.dispose();
     trust.dispose();
     chat.dispose();
+    presence.dispose();
     transfer.dispose();
     history.dispose();
     saved.dispose();

@@ -43,6 +43,116 @@ class SdkDevice {
   );
 }
 
+/// One device's shared status, as `pb_presence_json` reports it.
+///
+/// **Every status field is nullable and null means "not shared"**, never zero.
+/// A desktop has no battery, and rendering that as `0%` would be a lie the
+/// whole optional-field design exists to prevent. Widgets must branch on null,
+/// not on a sentinel.
+@immutable
+class SdkPresence {
+  final String deviceId;
+
+  /// 0-100, or null when the device has no battery / did not share one.
+  final int? batteryPercent;
+  final bool? charging;
+  final int? storageFreeBytes;
+
+  /// One of `lan` / `wifi` / `ethernet` / `tailscale` / `unknown`. Already
+  /// validated against that set by Rust — an unknown word from a peer arrives
+  /// here as null, never verbatim — so it is safe to display.
+  final String? network;
+  final String? appVersion;
+
+  /// Seconds since **we** received this, not since the peer says it sent it.
+  /// Peer clocks are not synchronised.
+  final int ageSeconds;
+
+  const SdkPresence({
+    required this.deviceId,
+    required this.batteryPercent,
+    required this.charging,
+    required this.storageFreeBytes,
+    required this.network,
+    required this.appVersion,
+    required this.ageSeconds,
+  });
+
+  /// Whether this device shared any status at all. False means the tile shows
+  /// identity and reachability only — not empty gauges.
+  bool get hasAny =>
+      batteryPercent != null ||
+      storageFreeBytes != null ||
+      network != null ||
+      appVersion != null;
+
+  factory SdkPresence.fromJson(Map<String, dynamic> j) => SdkPresence(
+    deviceId: j['device_id'] as String? ?? '',
+    batteryPercent: (j['battery_percent'] as num?)?.toInt(),
+    charging: j['charging'] as bool?,
+    storageFreeBytes: (j['storage_free_bytes'] as num?)?.toInt(),
+    network: j['network'] as String?,
+    appVersion: j['app_version'] as String?,
+    ageSeconds: (j['age_seconds'] as num?)?.toInt() ?? 0,
+  );
+}
+
+/// What `pb_presence_json` returns: our own sharing state and every peer's
+/// shared status.
+@immutable
+class PresenceSnapshot {
+  /// Whether **this** device is currently sharing its status. Default off.
+  final bool sharing;
+
+  /// What this device would share if `sharing` were on — a local preview, so a
+  /// user can see what the toggle reveals before flipping it. Never on the wire
+  /// while `sharing` is false.
+  final SdkPresence self;
+
+  /// Each peer that has shared a status, keyed by device id.
+  final Map<String, SdkPresence> devices;
+
+  const PresenceSnapshot({
+    required this.sharing,
+    required this.self,
+    required this.devices,
+  });
+
+  static const empty = PresenceSnapshot(
+    sharing: false,
+    self: SdkPresence(
+      deviceId: '',
+      batteryPercent: null,
+      charging: null,
+      storageFreeBytes: null,
+      network: null,
+      appVersion: null,
+      ageSeconds: 0,
+    ),
+    devices: {},
+  );
+
+  factory PresenceSnapshot.fromJson(Map<String, dynamic> j) {
+    final list = (j['devices'] as List?) ?? const [];
+    final devices = <String, SdkPresence>{};
+    for (final e in list) {
+      if (e is Map) {
+        final p = SdkPresence.fromJson(Map<String, dynamic>.from(e));
+        devices[p.deviceId] = p;
+      }
+    }
+    return PresenceSnapshot(
+      sharing: j['sharing'] as bool? ?? false,
+      self: SdkPresence.fromJson(
+        j['self'] is Map
+            ? Map<String, dynamic>.from(j['self'] as Map)
+            : <String, dynamic>{},
+      ),
+      devices: devices,
+    );
+  }
+}
+
 @immutable
 class TransferStats {
   final int transferredBytes;

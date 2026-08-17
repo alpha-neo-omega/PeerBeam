@@ -112,6 +112,27 @@ class SettingsScreen extends StatelessWidget {
               ),
               const Gap(AppSpace.md),
 
+              const _GroupLabel('Privacy'),
+              AnimatedBuilder(
+                animation: state.settings,
+                builder: (context, _) => Card(
+                  child: SwitchListTile.adaptive(
+                    secondary: const Icon(Icons.monitor_heart_rounded),
+                    title: const Text('Share device status with trusted devices'),
+                    // One line, and it must be true: what leaves, and to whom.
+                    // Naming the fields is the point — a vague "share status"
+                    // would not let anyone decide.
+                    subtitle: const Text(
+                      'Sends battery, free storage, network type and app version '
+                      'to your trusted devices only. Off by default.',
+                    ),
+                    value: state.settings.sharePresence,
+                    onChanged: state.settings.setSharePresence,
+                  ),
+                ),
+              ),
+              const Gap(AppSpace.md),
+
               const _GroupLabel('Transfers'),
               AnimatedBuilder(
                 animation: state.settings,

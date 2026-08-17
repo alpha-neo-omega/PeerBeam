@@ -19,6 +19,7 @@ class AppShell extends StatelessWidget {
   /// `buildRouter` — the three are index-for-index and must stay that way.
   static const _destinations = [
     _Dest(Icons.home_outlined, Icons.home_rounded, 'Home'),
+    _Dest(Icons.devices_other_outlined, Icons.devices_other_rounded, 'Devices'),
     _Dest(Icons.forum_outlined, Icons.forum_rounded, 'Chats'),
     _Dest(Icons.swap_horiz_outlined, Icons.swap_horiz_rounded, 'Transfers'),
     _Dest(Icons.history_outlined, Icons.history_rounded, 'History'),
@@ -126,8 +127,12 @@ class AppShell extends StatelessWidget {
 
   /// Desktop keyboard navigation: Ctrl/⌘ + 1..N jumps to a destination, by
   /// position — so the digits follow [_destinations] rather than naming
-  /// screens. Inserting Chats at position 2 therefore moved Transfers to
-  /// Ctrl+3, History to Ctrl+4 and Settings to Ctrl+5.
+  /// screens. Inserting Chats at position 2 moved Transfers to Ctrl+3, History
+  /// to Ctrl+4 and Settings to Ctrl+5; inserting Devices at position 2 has now
+  /// shifted each of those one further, to Ctrl+3..6. `digit6` is added here at
+  /// the same time — the guard below silently drops any destination past the
+  /// end of this list, so a forgotten digit would leave the new tab reachable
+  /// by mouse and not by keyboard, with nothing failing to say so.
   Widget _withShortcuts(Widget child) {
     const keys = [
       LogicalKeyboardKey.digit1,
@@ -135,6 +140,7 @@ class AppShell extends StatelessWidget {
       LogicalKeyboardKey.digit3,
       LogicalKeyboardKey.digit4,
       LogicalKeyboardKey.digit5,
+      LogicalKeyboardKey.digit6,
     ];
     // Never bind past the end of either list: a digit with no destination
     // would jump to a branch `goBranch` does not have.

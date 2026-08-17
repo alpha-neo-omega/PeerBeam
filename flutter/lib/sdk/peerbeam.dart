@@ -58,6 +58,20 @@ abstract class PeerBeamApi {
   /// Merge a partial settings object into the persisted document.
   Future<void> settingsSet(Map<String, dynamic> partial);
 
+  /// Live device presence: what each trusted peer has shared, plus whether
+  /// *this* device is sharing anything.
+  ///
+  /// Nothing here is persisted — presence is live state, so a fresh engine
+  /// starts empty rather than showing stale numbers as current.
+  Future<PresenceSnapshot> presence();
+
+  /// Push a platform-supplied battery reading down to the engine (Android,
+  /// whose `BatteryManager` the Rust platform layer cannot reach).
+  ///
+  /// Changes only *what* would be shared. It does not share anything: the
+  /// opt-in setting and the trusted-only gate are untouched.
+  Future<void> presenceBattery({int? percent, bool? charging});
+
   /// Pinned (trusted) devices, newest first.
   Future<List<TrustedDevice>> trustList();
 
@@ -296,6 +310,17 @@ class PeerBeam implements PeerBeamApi {
   @override
   Future<void> settingsSet(Map<String, dynamic> partial) async =>
       _data(_req().settingsSet(jsonEncode(partial)));
+
+  @override
+  Future<PresenceSnapshot> presence() async =>
+      PresenceSnapshot.fromJson(_data(_req().presence()));
+
+  @override
+  Future<void> presenceBattery({int? percent, bool? charging}) async => _data(
+    _req().presenceBattery(
+      jsonEncode({'percent': ?percent, 'charging': ?charging}),
+    ),
+  );
 
   @override
   Future<List<TrustedDevice>> trustList() async {

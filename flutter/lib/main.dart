@@ -72,6 +72,11 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // and is swallowed, leaving cold start looking empty).
         await _state.history.refresh();
         await _state.trust.refresh();
+        // Presence is live state, so this fetch is only ever "what has already
+        // arrived" — normally nothing on a cold start. Refreshing anyway picks
+        // up our own sharing flag for the dashboard banner, and any peer that
+        // heartbeated while the UI was still booting.
+        await _state.presence.refresh();
         // No-op off Android; routes share/receive intents and drives the
         // service. Started after history is loaded so the send-notify
         // baseline is seeded from real history, not an empty list — otherwise
