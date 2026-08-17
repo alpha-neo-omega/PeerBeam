@@ -60,6 +60,41 @@ staged-files sheet opens for review (per-file remove, running total). Staging
 lives in a pure `StagingStore` (dedup by path), unit-tested independently of
 any native drag.
 
+## Chat attachments
+
+### A typed attach menu
+
+The chat composer's attach button opens a bottom sheet offering **Document**
+(no filter — today's picker, kept), **Photos & videos**, or **Audio**, instead
+of one undifferentiated "any file" picker. No camera capture: there is no
+camera dependency in this project.
+
+The chosen kind is a small platform-layer enum (`AttachKind`, in
+`platform/desktop_files.dart`) rather than a raw MIME string threaded down
+from the UI — the composer names *what* the user wants, and the platform
+layer owns *how* that becomes an OS filter:
+
+- **Desktop** (`file_selector`): each kind maps to an `XTypeGroup` carrying
+  **both** `mimeTypes` and `extensions`. Extensions are required alongside
+  MIME types because a Linux GTK picker filters by extension and ignores MIME
+  — a mimeTypes-only group silently shows nothing there.
+- **Android**: the kind's MIME types (e.g. `image/*, video/*`) are passed
+  through the `pickFiles` method channel and set as `EXTRA_MIME_TYPES` on the
+  `ACTION_OPEN_DOCUMENT` intent (`type` stays the wildcard alongside it —
+  `EXTRA_MIME_TYPES` is what actually filters when present). The channel
+  argument is optional with a wildcard default, so no other caller of the
+  native picker needed to change.
+
+A file the filter excludes is never offered in the first place — never picked
+and then rejected afterwards. Everything past the choice is unchanged: the
+picker is still multi-select, the Android path still streams into cache and
+returns paths only (never bytes), and every picked file still becomes its own
+chat message, exactly as before this menu existed.
+
+`test/chat_screen_test.dart` pins the menu's three choices and that each hands
+the picker its own kind; `test/desktop_files_test.dart` pins the kind → filter
+mapping on both platforms.
+
 ## Approving several transfers at once
 
 When **two or more** inbound transfers are awaiting approval, the Transfers

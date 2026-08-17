@@ -11,8 +11,105 @@ bool get isDesktop =>
         defaultTargetPlatform == TargetPlatform.macOS ||
         defaultTargetPlatform == TargetPlatform.windows);
 
+/// What kind of file the attach menu is asking for.
+///
+/// This is the platform layer's own vocabulary: the UI names *what the user
+/// wants* (a menu choice), and only this file knows how that turns into an
+/// actual OS-level filter — a `file_selector` `XTypeGroup` on desktop, an
+/// `EXTRA_MIME_TYPES` list on Android. Neither caller passes a raw MIME
+/// string down; that mapping lives in exactly one place, below.
+enum AttachKind {
+  /// Any file, no filter — today's behaviour, kept for the "Document" choice.
+  any,
+
+  /// Images and video, for the "Photos & videos" choice.
+  media,
+
+  /// Audio only.
+  audio,
+}
+
+/// Extensions `file_selector` shows for [AttachKind.media]/[AttachKind.audio]
+/// on desktop, alongside the MIME types below. Both are required: a Linux GTK
+/// picker filters by extension and ignores MIME entirely, so a mimeTypes-only
+/// group silently shows nothing there, while other platforms lean on the MIME
+/// list. Neither list claims to be exhaustive — just the formats people
+/// actually send.
+const _imageExtensions = [
+  'jpg',
+  'jpeg',
+  'png',
+  'gif',
+  'webp',
+  'bmp',
+  'heic',
+  'heif',
+  'svg',
+  'tif',
+  'tiff',
+];
+const _videoExtensions = [
+  'mp4',
+  'mov',
+  'mkv',
+  'avi',
+  'webm',
+  'm4v',
+  'wmv',
+  'flv',
+  '3gp',
+];
+const _audioExtensions = [
+  'mp3',
+  'wav',
+  'flac',
+  'aac',
+  'ogg',
+  'm4a',
+  'wma',
+  'opus',
+  'aiff',
+];
+
+extension on AttachKind {
+  /// MIME types to pass through the `pickFiles` method channel as
+  /// `EXTRA_MIME_TYPES`, or empty for [AttachKind.any] — sent as no argument
+  /// at all (see [pickFilesToStage]), which is the wildcard default an older
+  /// native side already implements.
+  List<String> get androidMimeTypes => switch (this) {
+    AttachKind.any => const [],
+    AttachKind.media => const ['image/*', 'video/*'],
+    AttachKind.audio => const ['audio/*'],
+  };
+
+  /// `file_selector` filter groups for desktop, or null for [AttachKind.any]
+  /// (no `acceptedTypeGroups` — every file is offered, today's behaviour).
+  List<XTypeGroup>? get desktopTypeGroups => switch (this) {
+    AttachKind.any => null,
+    AttachKind.media => const [
+      XTypeGroup(
+        label: 'Photos & videos',
+        mimeTypes: ['image/*', 'video/*'],
+        extensions: [..._imageExtensions, ..._videoExtensions],
+      ),
+    ],
+    AttachKind.audio => const [
+      XTypeGroup(
+        label: 'Audio',
+        mimeTypes: ['audio/*'],
+        extensions: _audioExtensions,
+      ),
+    ],
+  };
+}
+
 /// Open the native file picker and return the chosen files as staged entries
 /// (path + size only — never read into memory). Empty if cancelled.
+///
+/// [kind] narrows what the picker offers (see [AttachKind]); a file the
+/// filter excludes is simply never shown, rather than picked and rejected
+/// afterwards. Defaults to [AttachKind.any] — every existing caller that
+/// wants today's unfiltered picker needs no change.
 ///
 /// On Android this goes through a native `ACTION_OPEN_DOCUMENT` picker
 /// (`peerbeam/android`'s `pickFiles`) instead of file_selector: the
@@ -21,11 +118,21 @@ bool get isDesktop =>
 /// 256MB heap cap. The native side streams each pick into app cache and
 /// returns paths only. Desktop keeps file_selector, which already hands back
 /// a real filesystem path with no byte copy.
-Future<List<StagedFile>> pickFilesToStage() async {
+Future<List<StagedFile>> pickFilesToStage({
+  AttachKind kind = AttachKind.any,
+}) async {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     const channel = MethodChannel('peerbeam/android');
+    final mimeTypes = kind.androidMimeTypes;
+    // No argument at all for `any`, not an empty list — an older native
+    // build (or a test stub) that only understands a bare `pickFiles` call
+    // must keep behaving exactly as it does today.
     final raw =
-        await channel.invokeListMethod<Object?>('pickFiles') ?? const [];
+        await channel.invokeListMethod<Object?>(
+          'pickFiles',
+          mimeTypes.isEmpty ? null : {'mimeTypes': mimeTypes},
+        ) ??
+        const [];
     return raw.map((e) {
       final m = Map<Object?, Object?>.from(e as Map);
       return StagedFile(
@@ -38,7 +145,8 @@ Future<List<StagedFile>> pickFilesToStage() async {
 
   // Desktop: file_selector already returns a real filesystem path — no byte
   // copy involved, so no OOM risk regardless of file size.
-  final files = await openFiles();
+  final groups = kind.desktopTypeGroups;
+  final files = await openFiles(acceptedTypeGroups: groups ?? const []);
   final staged = <StagedFile>[];
   for (final f in files) {
     int size = 0;

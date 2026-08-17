@@ -2,6 +2,10 @@
 // the attach button's fan-out over a multi-select, the file bubble rendered
 // from the PERSISTED record, inline approval on an incoming offer, and the
 // Android SAF fallback when a received file's recorded path no longer exists.
+//
+// Also the typed attach menu (Document / Photos & videos / Audio) that now
+// sits in front of that picker: the menu itself, and that each choice hands
+// the platform layer the kind it claims to.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +18,17 @@ import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
+
+/// Open the attach menu and choose [label] — every test that drives a pick
+/// through the composer goes through this now that attach opens a menu
+/// first, rather than calling the picker directly.
+Future<void> _attachVia(WidgetTester tester, String label) async {
+  await tester.tap(find.byIcon(Icons.attach_file_rounded));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+}
 
 const _peer = PeerTarget(
   id: 'pb-bob',
@@ -60,6 +75,47 @@ ChatMessage _file({
 );
 
 void main() {
+  testWidgets('the attach button opens a menu of exactly three choices', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.attach_file_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Document'), findsOneWidget);
+    expect(find.text('Photos & videos'), findsOneWidget);
+    expect(find.text('Audio'), findsOneWidget);
+    expect(find.byType(ListTile), findsNWidgets(3));
+  });
+
+  testWidgets('each attach choice hands the picker its own kind, not just '
+      'that some picker ran', (tester) async {
+    final calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (call) async {
+        if (call.method == 'pickFiles') calls.add(call);
+        return <Map<String, Object?>>[]; // an empty pick is enough here
+      },
+    );
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    await _attachVia(tester, 'Document');
+    await _attachVia(tester, 'Photos & videos');
+    await _attachVia(tester, 'Audio');
+
+    expect(calls, hasLength(3));
+    // Document is today's unfiltered picker: no argument at all, not an
+    // empty map — see pickFilesToStage's own doc comment for why that
+    // distinction matters to an older native build.
+    expect(calls[0].arguments, isNull);
+    expect((calls[1].arguments as Map)['mimeTypes'], ['image/*', 'video/*']);
+    expect((calls[2].arguments as Map)['mimeTypes'], ['audio/*']);
+  });
+
   testWidgets('the attach button sends EVERY picked file, not just the first', (
     tester,
   ) async {
@@ -78,9 +134,7 @@ void main() {
     final fake = FakePeerBeam();
     await _open(tester, fake);
 
-    await tester.tap(find.byIcon(Icons.attach_file_rounded));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
+    await _attachVia(tester, 'Document');
 
     expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), [
       'chatSendFile:/tmp/a.bin',
@@ -107,9 +161,7 @@ void main() {
     final fake = FakePeerBeam()..refusedFilePaths.add('/tmp/gone.bin');
     await _open(tester, fake);
 
-    await tester.tap(find.byIcon(Icons.attach_file_rounded));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
+    await _attachVia(tester, 'Document');
 
     // The accepted sibling's own reconcile has already run by now; the
     // refused row must have survived it.
@@ -149,11 +201,7 @@ void main() {
   ) async {
     final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
-      _file(
-        id: 'fr-1',
-        direction: 'out',
-        status: ChatStatusValue.transferring,
-      ),
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.transferring),
     ];
     await _open(tester, fake);
 
@@ -261,7 +309,11 @@ void main() {
       'the decision was never open', (tester) async {
     final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
-      _file(id: 'fr-1', direction: 'in', status: ChatStatusValue.pendingApproval),
+      _file(
+        id: 'fr-1',
+        direction: 'in',
+        status: ChatStatusValue.pendingApproval,
+      ),
     ];
     await _open(tester, fake);
 
@@ -321,20 +373,15 @@ void main() {
     // flight — but this process has not seen a progress event for it yet.
     final fake = FakePeerBeam()..liveTransferIds.add('fr-1');
     fake.chatHistories['pb-bob'] = [
-      _file(
-        id: 'fr-1',
-        direction: 'out',
-        status: ChatStatusValue.transferring,
-      ),
+      _file(id: 'fr-1', direction: 'out', status: ChatStatusValue.transferring),
     ];
     await _open(tester, fake);
 
     // Nothing in TransferRepository yet: an indeterminate bar, not a crash
     // and not a fake 0%.
-    LinearProgressIndicator bar() =>
-        tester.widget<LinearProgressIndicator>(
-          find.byType(LinearProgressIndicator),
-        );
+    LinearProgressIndicator bar() => tester.widget<LinearProgressIndicator>(
+      find.byType(LinearProgressIndicator),
+    );
     expect(bar().value, isNull);
 
     // The transfer registers and reports progress under the SAME id.
@@ -561,12 +608,7 @@ void main() {
         child: const MaterialApp(
           home: ChatScreen(
             peerId: 'pb-bob',
-            peer: PeerTarget(
-              id: 'pb-bob',
-              name: 'Bob',
-              addresses: [],
-              port: 0,
-            ),
+            peer: PeerTarget(id: 'pb-bob', name: 'Bob', addresses: [], port: 0),
           ),
         ),
       ),
@@ -576,21 +618,25 @@ void main() {
 
     expect(find.textContaining('No address known for Bob'), findsOneWidget);
     expect(
-      tester.widget<IconButton>(
-        find.ancestor(
-          of: find.byTooltip('Send'),
-          matching: find.byType(IconButton),
-        ),
-      ).onPressed,
+      tester
+          .widget<IconButton>(
+            find.ancestor(
+              of: find.byTooltip('Send'),
+              matching: find.byType(IconButton),
+            ),
+          )
+          .onPressed,
       isNull,
     );
     expect(
-      tester.widget<IconButton>(
-        find.ancestor(
-          of: find.byTooltip('Attach files'),
-          matching: find.byType(IconButton),
-        ),
-      ).onPressed,
+      tester
+          .widget<IconButton>(
+            find.ancestor(
+              of: find.byTooltip('Attach files'),
+              matching: find.byType(IconButton),
+            ),
+          )
+          .onPressed,
       isNull,
     );
   });
@@ -603,12 +649,14 @@ void main() {
 
     expect(find.textContaining('No address known'), findsNothing);
     expect(
-      tester.widget<IconButton>(
-        find.ancestor(
-          of: find.byTooltip('Send'),
-          matching: find.byType(IconButton),
-        ),
-      ).onPressed,
+      tester
+          .widget<IconButton>(
+            find.ancestor(
+              of: find.byTooltip('Send'),
+              matching: find.byType(IconButton),
+            ),
+          )
+          .onPressed,
       isNotNull,
     );
   });

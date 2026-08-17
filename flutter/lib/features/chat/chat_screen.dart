@@ -89,15 +89,21 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Attach files to the conversation.
   ///
-  /// [pickFilesToStage] is a MULTI-select: every file it returns gets its own
-  /// row and its own transfer. Sending only the first while the user watched
-  /// themselves choose five is silent data loss, so the loop is the point.
+  /// Asks *what kind* first (Document / Photos & videos / Audio — see
+  /// [_pickAttachKind]), then hands that straight to [pickFilesToStage] so
+  /// the platform layer applies the matching OS filter. Everything past that
+  /// is unchanged: [pickFilesToStage] is still a MULTI-select, and every file
+  /// it returns still gets its own row and its own transfer. Sending only the
+  /// first while the user watched themselves choose five is silent data loss,
+  /// so the loop is the point.
   Future<void> _attach() async {
     final chat = AppScope.of(context).chat;
+    final kind = await _pickAttachKind(context);
+    if (kind == null || !mounted) return;
     final picked = await withProcessing(
       context,
       'Preparing files…',
-      pickFilesToStage,
+      () => pickFilesToStage(kind: kind),
     );
     if (picked.isEmpty || !mounted) return;
     for (final file in picked) {
@@ -648,15 +654,90 @@ class _FileBody extends StatelessWidget {
     ChatStatusValue.transferring => m.isMine ? 'Sending…' : 'Receiving…',
     ChatStatusValue.sent => 'Sent',
     ChatStatusValue.received => 'Received · tap to open',
-    ChatStatusValue.pendingApproval => m.isMine
-        ? 'Waiting for approval'
-        : 'Wants to send you this',
+    ChatStatusValue.pendingApproval =>
+      m.isMine ? 'Waiting for approval' : 'Wants to send you this',
     ChatStatusValue.declined => 'Declined',
     ChatStatusValue.failed => 'Failed',
     ChatStatusValue.interrupted => 'Interrupted',
     ChatStatusValue.pending => 'Queued',
     _ => m.status,
   };
+}
+
+/// Ask what kind of file to attach, in the shape WhatsApp uses: **Document**
+/// (no filter — today's picker, unchanged), **Photos & videos**, or **Audio**.
+/// Returns null if the sheet is dismissed without a choice.
+///
+/// Deliberately three choices and no more: there is no camera capture here,
+/// because there is no camera dependency in this project — adding one is a
+/// separate feature, not a fourth row bolted on here.
+Future<AttachKind?> _pickAttachKind(BuildContext context) {
+  return showModalBottomSheet<AttachKind>(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) {
+      final text = Theme.of(ctx).textTheme;
+      return SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppSpace.lg,
+                AppSpace.xxs,
+                AppSpace.lg,
+                AppSpace.xs,
+              ),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Attach',
+                  style: text.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
+            _AttachOption(
+              icon: Icons.insert_drive_file_rounded,
+              label: 'Document',
+              onTap: () => Navigator.pop(ctx, AttachKind.any),
+            ),
+            _AttachOption(
+              icon: Icons.perm_media_rounded,
+              label: 'Photos & videos',
+              onTap: () => Navigator.pop(ctx, AttachKind.media),
+            ),
+            _AttachOption(
+              icon: Icons.audiotrack_rounded,
+              label: 'Audio',
+              onTap: () => Navigator.pop(ctx, AttachKind.audio),
+            ),
+            const Gap(AppSpace.xs),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+/// One row in the attach menu.
+class _AttachOption extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  const _AttachOption({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(icon, color: Theme.of(context).colorScheme.primary),
+      title: Text(label),
+      onTap: onTap,
+    );
+  }
 }
 
 /// The bottom compose bar: attach, a text field, and a send button.

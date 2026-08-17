@@ -145,7 +145,7 @@ class MainActivity : FlutterActivity() {
                 setMulticast(call.argument<Boolean>("enabled") ?: false)
                 result.success(null)
             }
-            "pickFiles" -> pickFiles(result)
+            "pickFiles" -> pickFiles(call, result)
             "safCurrentFolder" -> result.success(currentFolder())
             "safPickFolder" -> pickTree(result)
             "safSave" -> {
@@ -195,16 +195,26 @@ class MainActivity : FlutterActivity() {
 
     // ── Native multi-file picker (streamed to cache; never loaded into RAM) ──
 
-    /// Launch ACTION_OPEN_DOCUMENT to pick one or more files. The result is
-    /// handled in onActivityResult, which streams each picked URI into app
-    /// cache off the main thread and replies with `{path, name, size}` per
-    /// file — never the file's bytes.
-    private fun pickFiles(result: MethodChannel.Result) {
+    /// Launch ACTION_OPEN_DOCUMENT to pick one or more files, optionally
+    /// narrowed to [call]'s `mimeTypes` list (e.g. `["image/*", "video/*"]`
+    /// for the composer's "Photos & videos" choice). `type` stays the
+    /// wildcard either way — EXTRA_MIME_TYPES is what Android actually
+    /// filters on when it is present, and the argument is optional precisely
+    /// so an older Dart caller that sends none still gets today's unfiltered
+    /// picker. The result is handled in onActivityResult, which streams each
+    /// picked URI into app cache off the main thread and replies with
+    /// `{path, name, size}` per file — never the file's bytes.
+    private fun pickFiles(call: MethodCall, result: MethodChannel.Result) {
         pendingFiles?.success(null) // abandon any prior
         pendingFiles = result
+        @Suppress("UNCHECKED_CAST")
+        val mimeTypes = call.argument<List<String>>("mimeTypes")
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
+            if (!mimeTypes.isNullOrEmpty()) {
+                putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toTypedArray())
+            }
             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }

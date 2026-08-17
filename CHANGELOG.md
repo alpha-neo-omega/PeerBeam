@@ -7,6 +7,17 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **A typed attach menu in chat.** The composer's attach button now opens a
+  menu of **Document**, **Photos & videos**, or **Audio** instead of one
+  undifferentiated picker — matching the shape WhatsApp and every other chat
+  app use. Choosing a kind filters what the picker even offers: a file the
+  filter excludes is never shown, rather than picked and then rejected.
+  Desktop filters by both MIME type and extension (a Linux GTK picker ignores
+  MIME-only filters and would otherwise show nothing); Android sets
+  `EXTRA_MIME_TYPES` on the picker intent, with the argument optional so
+  nothing else that calls the native picker needs to change. Everything past
+  the choice is unchanged: the picker is still multi-select, and every picked
+  file still gets its own message.
 - **Approve several waiting transfers at once** — when two or more inbound
   transfers are awaiting approval, the Transfers screen shows a banner with
   **Accept all** / **Decline all**, so a batch takes one tap instead of one per
