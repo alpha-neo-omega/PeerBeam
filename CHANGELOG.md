@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-17 — Beta
+
 ### Fixed
 - **A conversation you had navigated away from no longer owns drag & drop.**
   Two drop targets contend for every drop on desktop — `desktop_drop` delivers
