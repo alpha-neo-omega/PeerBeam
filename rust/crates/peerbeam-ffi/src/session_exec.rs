@@ -11,12 +11,13 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
+use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, RouteKind, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
@@ -32,6 +33,7 @@ use crate::error::{from_domain, Code};
 
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
+const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
@@ -81,6 +83,12 @@ pub struct ChatWiring {
 /// it is off by default. The bit asserts comprehension, so a device sharing
 /// nothing still advertises it truthfully and still shows everyone else's
 /// status.
+///
+/// CLIPBOARD advertises [`CLIPBOARD_FEAT_CLIP`] on those same terms, and here
+/// the comprehension/behaviour split carries real weight: Android 10+ forbids
+/// background clipboard reads, so a phone can never auto-send a clip and yet
+/// advertises this bit truthfully, because it applies an incoming one in full.
+/// Desktop sends, every platform receives.
 fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
     let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
     if !handlers.is_empty() {
@@ -105,6 +113,7 @@ fn advertised_caps() -> CapabilitySet {
             CHAT,
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
         ))
+        .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
 }
 
@@ -229,6 +238,18 @@ async fn establish(
         presence_slot = Some(slot);
         handlers.push(h as Arc<dyn MessageHandler>);
     }
+    // Clipboard is registered **unconditionally** — there is no `Option`, no
+    // wiring struct and therefore no call site that can forget it. It needs no
+    // per-session state (no store, no registry), so the shape `ChatWiring` and
+    // `PresenceWiring` exist to make explicit has nothing to carry here, and
+    // the missed-call-site bug they guard against cannot occur.
+    //
+    // Registering it is not sharing. This side only *receives* through the
+    // handler; whether anything leaves is decided per push by
+    // `may_share_clip`, and with the opt-in off (the default) no clipboard
+    // channel is ever opened.
+    let (clipboard_handler, clipboard_slot) = ClipboardHandler::new(crate::clipboard::sink());
+    handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
     let (inc, incoming) = unbounded_channel();
@@ -258,6 +279,7 @@ async fn establish(
     if let Some(slot) = presence_slot {
         let _ = slot.set(ps.peer().clone());
     }
+    let _ = clipboard_slot.set(ps.peer().clone());
     let id = ps.id();
     let peer_device = ps.peer().clone();
     let peer_id = peer_device.0.clone();
@@ -538,6 +560,59 @@ mod tests {
         let future = CapabilitySet::new().with(Capability::with_features(PRESENCE, 1 << 4));
         let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
         assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// The CLIPBOARD bit must be advertised by **this** frontend. The CLI has
+    /// the identical test against its own `session_cfg`, for the reason spelled
+    /// out on `the_presence_feature_bit_is_advertised`: a shared helper would go
+    /// green for both surfaces the moment either stopped advertising.
+    #[test]
+    fn the_clipboard_feature_bit_is_advertised() {
+        let f = our_caps()
+            .features(ChannelType::CLIPBOARD)
+            .expect("CLIPBOARD advertised");
+        assert!(f & CLIPBOARD_FEAT_CLIP != 0, "clipboard sync");
+    }
+
+    /// Advertising CLIPBOARD is a claim about comprehension, not about
+    /// behaviour: this build understands a `Clip`. Whether it ever *sends* one
+    /// is the opt-in setting's business, and that setting is off by default.
+    /// Conflating the two would mean a device could only receive a clip if it
+    /// also synced its own — which on Android, where auto-send is impossible,
+    /// would mean never receiving one at all.
+    #[test]
+    fn advertising_clipboard_does_not_imply_syncing() {
+        let negotiated = our_caps().intersect(&our_caps());
+        assert!(
+            peerbeam_clipboard::caps_support_clip(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        assert!(!peerbeam_clipboard::may_share_clip(
+            false, // sync off
+            &NeverTrusts,
+            &DeviceId::from("pb-bob"),
+            &negotiated,
+        ));
+    }
+
+    /// A peer from before clipboard sync advertises no CLIPBOARD at all, so the
+    /// intersection drops it and it is never sent a Clip.
+    #[test]
+    fn a_peer_without_clipboard_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = our_caps().intersect(&legacy);
+        assert!(!negotiated.supports(ChannelType::CLIPBOARD));
+        assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
+    }
+
+    /// An unrelated future bit on CLIPBOARD must not be read as this one.
+    #[test]
+    fn an_unrelated_future_clipboard_bit_does_not_imply_clip() {
+        let future = CapabilitySet::new().with(Capability::with_features(CLIPBOARD, 1 << 4));
+        let negotiated = our_caps().intersect(&future);
+        assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
     }
 
     /// A trust store that trusts nobody, for the gate assertions above.

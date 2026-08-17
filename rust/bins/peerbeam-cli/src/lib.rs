@@ -3,6 +3,7 @@
 
 pub mod chat;
 pub mod cli;
+pub(crate) mod clipboard;
 pub mod commands;
 pub mod engine;
 pub mod exit;

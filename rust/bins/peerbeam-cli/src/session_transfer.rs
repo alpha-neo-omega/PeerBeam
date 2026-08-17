@@ -29,12 +29,13 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
+use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
@@ -48,6 +49,7 @@ use crate::exit::CliError;
 
 const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
+const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
 
 /// The session config every CLI PeerSession uses: advertise + accept the
@@ -81,6 +83,16 @@ const PRESENCE: ChannelType = ChannelType::PRESENCE;
 /// a status — that is the opt-in setting's business, and it is off by default.
 /// The bit asserts comprehension, so a device sharing nothing still advertises
 /// it truthfully and still displays everyone else's status.
+///
+/// CLIPBOARD advertises [`CLIPBOARD_FEAT_CLIP`] on those same terms, and the
+/// gap between comprehension and behaviour is widest here: the CLI never
+/// *sends* a clip at all. Auto-sync needs a clipboard watcher, watching needs a
+/// system-clipboard adapter this workspace does not have, and so the watcher
+/// lives in the Flutter surface (`docs/CLI.md`); `send --clipboard` is
+/// unchanged. The bit is still advertised truthfully because this build does
+/// understand an inbound `Clip` and acknowledges it (`crate::clipboard`) —
+/// and because a peer must not behave differently depending on which of our
+/// own two frontends it reached.
 fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
     let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
     if !handlers.is_empty() {
@@ -105,6 +117,7 @@ fn advertised_caps() -> CapabilitySet {
             CHAT,
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
         ))
+        .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
 }
 
@@ -214,6 +227,14 @@ async fn establish(
         Arc::new(|_peer, _entry| {}),
     );
     handlers.push(presence_handler as Arc<dyn MessageHandler>);
+    // Clipboard, for the same reason and on the same unconditional terms: this
+    // build advertises `CLIPBOARD_FEAT_CLIP`, and an unregistered handler would
+    // make that advertisement a lie — the dispatch loop drops an inbound frame
+    // silently rather than refusing it, so the peer would believe it synced.
+    // Receiving is never gated; the CLI simply has no system clipboard to apply
+    // the clip to, and says so.
+    let (clipboard_handler, clipboard_slot) = ClipboardHandler::new(crate::clipboard::sink());
+    handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
 
     // Event/channel-event sinks are unused by the CLI (diagnostics read the
     // engine registry, not these); their receivers drop and emits are ignored.
@@ -240,6 +261,7 @@ async fn establish(
         let _ = slot.set(ps.peer().clone());
     }
     let _ = presence_slot.set(ps.peer().clone());
+    let _ = clipboard_slot.set(ps.peer().clone());
     let peer_device = ps.peer().clone();
     let peer_id = ps.peer().0.clone();
     let newly_trusted = ps.newly_trusted();
@@ -465,6 +487,60 @@ mod tests {
         let future = CapabilitySet::new().with(Capability::with_features(PRESENCE, 1 << 4));
         let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
         assert!(!peerbeam_presence::caps_support_status(&negotiated));
+    }
+
+    /// The CLIPBOARD bit must be advertised by **this** frontend, for exactly
+    /// the reason spelled out on `the_presence_feature_bit_is_advertised`: the
+    /// other surface has its own copy of this test, and a shared helper would
+    /// go green for both the moment either stopped advertising.
+    #[test]
+    fn the_clipboard_feature_bit_is_advertised() {
+        let caps = session_cfg(Vec::new()).capabilities;
+        let f = caps
+            .features(ChannelType::CLIPBOARD)
+            .expect("CLIPBOARD advertised");
+        assert!(f & CLIPBOARD_FEAT_CLIP != 0, "clipboard sync");
+    }
+
+    /// Advertising CLIPBOARD is a claim about comprehension, not behaviour —
+    /// and here the gap is total: the CLI understands an inbound `Clip` and
+    /// never sends one. Whether anything leaves is the opt-in setting's and the
+    /// trust store's business, and this asserts the capability alone opens
+    /// nothing.
+    #[test]
+    fn advertising_clipboard_does_not_imply_syncing() {
+        let ours = session_cfg(Vec::new()).capabilities;
+        let negotiated = ours.intersect(&ours);
+        assert!(
+            peerbeam_clipboard::caps_support_clip(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        assert!(!peerbeam_clipboard::may_share_clip(
+            false, // sync off
+            &NeverTrusts,
+            &DeviceId::from("pb-bob"),
+            &negotiated,
+        ));
+    }
+
+    /// A peer from before clipboard sync advertises no CLIPBOARD at all, so the
+    /// intersection drops it and it is never sent a Clip.
+    #[test]
+    fn a_peer_without_clipboard_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&legacy);
+        assert!(!negotiated.supports(ChannelType::CLIPBOARD));
+        assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
+    }
+
+    /// An unrelated future bit on CLIPBOARD must not be read as this one.
+    #[test]
+    fn an_unrelated_future_clipboard_bit_does_not_imply_clip() {
+        let future = CapabilitySet::new().with(Capability::with_features(CLIPBOARD, 1 << 4));
+        let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
+        assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
     }
 
     /// A trust store that trusts nobody, for the gate assertion above.

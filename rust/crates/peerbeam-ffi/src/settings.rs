@@ -46,6 +46,14 @@ fn defaults() -> Value {
         // is missing or unparseable, so a settings file this build cannot read
         // is never mistaken for consent.
         crate::presence::SHARE_KEY: false,
+        // "Sync clipboard with trusted devices" — **default off**, and that
+        // default carries even more weight than presence's (I11): the
+        // clipboard is the one buffer guaranteed to sometimes hold a password,
+        // and this build cannot tell when. `clipboard::sync_enabled` also falls
+        // back to `false` when the key is missing or unparseable, so a settings
+        // document written before this feature existed is never mistaken for
+        // consent.
+        crate::clipboard::SYNC_KEY: false,
         "experimental": {},
     })
 }

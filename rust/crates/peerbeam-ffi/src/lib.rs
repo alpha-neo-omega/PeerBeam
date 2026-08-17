@@ -353,6 +353,32 @@ pub unsafe extern "C" fn pb_presence_battery(json: *const c_char) -> *mut c_char
     })
 }
 
+// ── clipboard sync ──────────────────────────────────────────────
+
+/// Push the clipboard to trusted peers: `{text, peers:[{name,addresses[],port}]}`
+/// → `{queued, sync}`.
+///
+/// Called by the desktop watcher when the user copies something. `sync: false`
+/// with `queued: 0` means the opt-in setting is off, and nothing was dialed —
+/// off is silent, not merely undelivered.
+///
+/// Refuses an empty or over-cap clip with `invalid_argument` **before**
+/// dialing anything, so a surface can say "too large to sync" rather than
+/// leaving the user to wonder. An over-cap clip is never truncated: a
+/// shortened clipboard silently corrupts what the user believes they copied.
+///
+/// Naming a peer here does not send to it. The trusted-only rule and the
+/// peer's negotiated capability are still checked per peer, after the
+/// handshake, by `peerbeam_clipboard::may_share_clip` — an untrusted device
+/// listed here is sent nothing.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_clipboard_sync(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.clipboard_sync(&read_json(json)?))()))
+}
+
 // ── chat ────────────────────────────────────────────────────────
 
 /// Send a chat message: `{peer:{name,addresses[],port},text}` → `{id}`.

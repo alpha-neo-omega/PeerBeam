@@ -28,6 +28,7 @@ peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 peerbeam-identity-fs = { path = "../peerbeam-identity-fs" }
 peerbeam-storage-fs = { path = "../peerbeam-storage-fs" }
 peerbeam-chat = { path = "../peerbeam-chat" }
+peerbeam-clipboard = { path = "../peerbeam-clipboard" }
 peerbeam-presence = { path = "../peerbeam-presence" }
 peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
 tokio = { workspace = true }

@@ -527,6 +527,112 @@ impl Manager {
         crate::presence::snapshot(&self.presence, &self.save_dir())
     }
 
+    /// Push the clipboard to every named peer: `{text, peers:[…]}` → `{queued}`.
+    ///
+    /// Called by the desktop watcher when the user copies something. The two
+    /// decisions that can be made **without touching the network** are made
+    /// here, synchronously, and both refuse before anything is dialed:
+    ///
+    /// * **The opt-in.** With the setting off this returns `queued: 0` having
+    ///   done nothing at all — no dial, no handshake, no packet. "Off" must be
+    ///   observably silent, not merely undelivered.
+    /// * **The cap.** An over-cap clip is refused *here* rather than after N
+    ///   dials, because `ClipboardSender::send` would refuse it against every
+    ///   peer anyway. It is an error, not a silent skip, so the surface can
+    ///   tell the user their copy was too large instead of leaving them to
+    ///   wonder why one machine never got it. It is never truncated.
+    ///
+    /// The third gate — trust — and the fourth — the peer's negotiated
+    /// capability — are per-peer and cannot be decided until a session exists,
+    /// so they stay where they belong: in `may_share_clip`, consulted by
+    /// `ClipboardSender::send` on the far side of the dial. This method must
+    /// never pre-empt them; a peer named here that turns out to be untrusted is
+    /// simply sent nothing.
+    ///
+    /// Delivery runs in the background, one task per peer, and this returns as
+    /// soon as they are spawned — a clipboard watcher must not block on a
+    /// handshake, and one unreachable device must not delay the rest. A push
+    /// that fails is dropped rather than queued: the clipboard is live state,
+    /// and delivering what the user copied ten minutes ago on top of what they
+    /// copied since would be worse than not delivering it.
+    pub fn clipboard_sync(self: &Arc<Self>, req: &Value) -> Op {
+        let text = req
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "text required".into()))?;
+        // Validated against the same constant the wire encoder uses, so this
+        // check and `Clip::new`'s can never disagree about what fits.
+        if text.is_empty() {
+            return Err((Code::InvalidArgument, "clipboard is empty".into()));
+        }
+        if text.len() > peerbeam_clipboard::MAX_CLIP {
+            return Err((
+                Code::InvalidArgument,
+                format!(
+                    "clipboard too large to sync: {} bytes (max {})",
+                    text.len(),
+                    peerbeam_clipboard::MAX_CLIP
+                ),
+            ));
+        }
+        if !crate::clipboard::sync_enabled() {
+            return Ok(json!({ "queued": 0, "sync": false }));
+        }
+        let peers: Vec<Device> = req
+            .get("peers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|d| device_from(Some(d)).ok()).collect())
+            .unwrap_or_default();
+
+        let mut queued = 0usize;
+        for device in peers {
+            let me = self.clone();
+            let text = text.to_string();
+            crate::runtime::spawn(async move {
+                me.clipboard_push_peer(device, &text).await;
+            });
+            queued += 1;
+        }
+        Ok(json!({ "queued": queued, "sync": true }))
+    }
+
+    /// Dial one peer and offer it the clip. Best-effort and silent on failure:
+    /// an unreachable device simply does not get this clip, and nothing is
+    /// retried or stored.
+    async fn clipboard_push_peer(self: &Arc<Self>, device: Device, text: &str) {
+        let meta = self.session(&format!("clip-{}", device.id.0), device.id.clone(), 0);
+        let Ok(session) = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            // Same rationale as every other dial site: this session must be
+            // able to receive what the peer pushes back over it, not just
+            // carry ours out.
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        else {
+            return; // unreachable; the clipboard is live state, so nothing queues
+        };
+        // The **authenticated** peer, not the pre-dial `device.id`: the gate
+        // asks the trust store about who actually answered, so a device
+        // impersonating a trusted id in discovery is refused here.
+        let mut sender = peerbeam_clipboard::ClipboardSender::new(
+            session.handle.clone(),
+            session.peer_device.clone(),
+            session.capabilities.clone(),
+            self.trust.clone(),
+            Arc::new(crate::clipboard::sync_enabled),
+        );
+        let _ = sender.send(text).await;
+        session.close().await;
+    }
+
     /// Drop a peer's shared status. Called when its trust is revoked: a device
     /// the user no longer trusts must leave the dashboard immediately rather
     /// than linger until restart.
