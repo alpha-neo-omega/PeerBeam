@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../send/drop_overlay.dart';
-import '../send/drop_zone.dart' show collectDroppedFiles, isDesktop;
+import '../send/drop_zone.dart' show DropClaims, collectDroppedFiles, isDesktop;
 
 /// Wraps [child] with desktop file drag & drop for one open conversation:
 /// a drop sends straight to [peer], the same as picking files with attach.
@@ -48,6 +48,42 @@ class ChatDropZone extends StatefulWidget {
 
 class _ChatDropZoneState extends State<ChatDropZone> {
   bool _active = false;
+
+  /// The enclosing [DropZone]'s claim register, and whether this zone is
+  /// currently counted in it.
+  ///
+  /// The shell wraps everything in a [DropZone], and `desktop_drop` delivers a
+  /// drop to every mounted target rather than only the innermost — so without
+  /// claiming, dropping on a conversation both sent the file to the peer and
+  /// staged it for the Send flow. Claiming makes this zone the only one that
+  /// answers while the conversation is open.
+  ValueNotifier<int>? _claims;
+  bool _claimed = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_claims != null) return;
+    final claims = DropClaims.maybeOf(context);
+    if (claims == null) return;
+    _claims = claims;
+    // After the frame, never during it: this runs while the screen is being
+    // built, and notifying a listener that rebuilds mid-build is an error.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _claimed = true;
+      claims.value++;
+    });
+  }
+
+  @override
+  void dispose() {
+    // Only if the claim was actually taken — a screen disposed inside the same
+    // frame it mounted never reached the callback above, and decrementing then
+    // would hand the outer zone a negative count it could never clear.
+    if (_claimed) _claims!.value--;
+    super.dispose();
+  }
 
   /// A chat file message carries exactly one file, and the engine's
   /// `prepare_file_send` rejects a directory outright — so a dropped folder

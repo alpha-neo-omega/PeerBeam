@@ -277,4 +277,139 @@ void main() {
       },
     );
   });
+
+  // The shell wraps the whole app in the Send flow's `DropZone`, so an open
+  // conversation always has TWO drop targets stacked over it. `desktop_drop`
+  // delivers to every mounted target rather than only the innermost, which is
+  // why the inner one claims ownership and the outer stands down.
+  group('a conversation inside the shell owns the drop', () {
+    /// The chat screen as the shell really mounts it: inside `DropZone`.
+    Future<AppState> openNested(WidgetTester tester, FakePeerBeam fake) async {
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: MaterialApp(
+            home: DropZone(
+              staging: state.staging,
+              child: const ChatScreen(peerId: 'pb-bob', peer: _peer),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      return state;
+    }
+
+    testWidgets('the outer Send zone stands down while a chat is open', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      try {
+        final fake = FakePeerBeam();
+        await openNested(tester, fake);
+
+        // Both targets are mounted; only the inner one is live.
+        final targets = tester.widgetList<DropTarget>(find.byType(DropTarget));
+        expect(targets, hasLength(2));
+        expect(
+          targets.map((t) => t.enable),
+          [false, true],
+          reason: 'outer (Send) disabled, inner (chat) enabled',
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('a drop is answered once: sent to the peer, never staged', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      try {
+        final file = _tempFile(tmp, 'holiday.bin', 'xyz');
+        final fake = FakePeerBeam();
+        final state = await openNested(tester, fake);
+
+        // Drive EVERY mounted target with the same drop — including the
+        // disabled outer one. The platform would not call a disabled target,
+        // but invoking it anyway is what proves the handler's own claim guard,
+        // which is what covers the two frames between a chat claiming drops
+        // and the deferred rebuild actually flipping `enable`.
+        await tester.runAsync(() async {
+          for (final t in tester.widgetList<DropTarget>(
+            find.byType(DropTarget),
+          )) {
+            t.onDragDone!(
+              DropDoneDetails(
+                files: [DropItemFile(file.path)],
+                localPosition: Offset.zero,
+                globalPosition: Offset.zero,
+              ),
+            );
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), [
+          'chatSendFile:${file.path}',
+        ]);
+        // The Send flow neither staged a second copy nor opened its sheet.
+        expect(state.staging.count, 0);
+        expect(find.text('Send files'), findsNothing);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('the Send zone takes drops back once the chat is gone', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      try {
+        final fake = FakePeerBeam();
+        final state = AppState.live(fake);
+        addTearDown(state.dispose);
+        Widget app(bool chatOpen) => AppScope(
+          state: state,
+          child: MaterialApp(
+            home: DropZone(
+              staging: state.staging,
+              child: chatOpen
+                  ? const ChatScreen(peerId: 'pb-bob', peer: _peer)
+                  : const Scaffold(body: Text('home')),
+            ),
+          ),
+        );
+        await tester.pumpWidget(app(true));
+        // Three frames: the claim is taken after the first, the rebuild that
+        // flips `enable` is deferred once more so it never runs mid-build.
+        await tester.pump();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(
+          tester.widget<DropTarget>(find.byType(DropTarget).first).enable,
+          isFalse,
+        );
+
+        // Leaving the conversation releases the claim: a release that leaked
+        // would leave the Send flow permanently deaf to drops.
+        await tester.pumpWidget(app(false));
+        await tester.pump();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        final remaining = tester.widgetList<DropTarget>(
+          find.byType(DropTarget),
+        );
+        expect(remaining, hasLength(1));
+        expect(remaining.single.enable, isTrue);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+  });
 }
