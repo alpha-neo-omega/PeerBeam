@@ -41,7 +41,7 @@ near-term). Assignments are stable once published.
 | `0x0100` | Transfer | A | today's file/folder transfer, reframed as a channel |
 | `0x0101` | Chat | B | text/markdown messages; file references (2a) + file declines (2b), implemented |
 | `0x0102` | Clipboard | B | clipboard payloads / sync |
-| `0x0103` | Presence | B | device status heartbeats |
+| `0x0103` | Presence | B | device status heartbeats; `Status` (implemented), opt-in and trusted-only |
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
 | `0x0105` | Notes | C | rides Sync; may not need its own channel |
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
@@ -153,7 +153,34 @@ belonging to each capability's future spec:
   still on the old cap (an older peer's decoder would reject an over-cap
   frame as `ChatError::TooLarge`, closing that channel), so it requires
   capability negotiation, not a silent bump.
-- **Presence (0x0103):** `Heartbeat`, `Subscribe`, `Unsubscribe`.
+- **Presence (0x0103):** `Status = 1` (implemented) — one heartbeat describing
+  the sender: `battery_percent`, `charging`, `storage_free_bytes`, `network`,
+  `app_version`, `sent_at`. Every field except `sent_at` is optional and
+  `#[serde(default)]`, because *absent* is the normal answer for most of them
+  — a desktop has no battery, and the Windows/macOS battery collector is
+  deliberately not implemented. A receiver must render absence as absence; a
+  missing reading is not a zero. Sent on channel open and every 60s while the
+  channel stays open; nothing is persisted, so a restart shows no status
+  rather than presenting a stale reading as current.
+  Sent `OPTIONAL` (§6/§7) and gated on the capability's first feature bit,
+  `PRESENCE_FEAT_STATUS = 1 << 0`
+  (`peerbeam_domain::session::PRESENCE_FEAT_STATUS`): a peer that does not
+  advertise it is sent nothing and shows as "status not shared", never as an
+  error.
+  **Two receiver-side validations are binding**, because every field is
+  peer-supplied: `battery_percent > 100` rejects the whole message rather than
+  clamping it (a device that cannot count to 100 has not earned belief in its
+  other readings), and a `network` word outside the closed vocabulary
+  (`lan` · `wifi` · `ethernet` · `tailscale` · `unknown`) is dropped to `None`
+  on decode rather than reaching a surface verbatim.
+  Sending is additionally gated locally, and neither gate is on the wire: the
+  sender must have opted in (default **off**), and the peer must be
+  **trusted**. Battery, free disk and network kind are a device fingerprint;
+  they go to the user's own pinned devices or nowhere. See
+  `peerbeam_presence::gate::may_share_status`, which is the single place all
+  three conditions are decided.
+  `Subscribe` / `Unsubscribe` remain **reserved, not implemented** — today's
+  model is an unconditional heartbeat to peers that already passed the gates.
 
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).

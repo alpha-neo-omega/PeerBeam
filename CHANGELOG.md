@@ -6,6 +6,33 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Device presence and a Devices dashboard.** Trusted devices can share a live
+  status — battery, charging, free storage, network kind, app version — over a
+  new negotiated Presence channel (`0x0103`, `Status`), sent when the channel
+  opens and every 60s while it stays open. A new **Devices** destination lists
+  every discovered device with whatever it chose to share.
+
+  **Sharing is opt-in and off by default**, and status is **never sent to a
+  device that is not trusted** — that second gate is not configurable. Battery
+  level, free disk and network kind are a device fingerprint, so they go to the
+  user's own pinned devices or nowhere. Turning the setting off, or revoking
+  trust, stops the next heartbeat rather than the next reconnect. A device with
+  sharing off still receives and displays everyone else's status, which is what
+  makes it an opt-in rather than a mutual requirement.
+
+  Absence is rendered as absence. A device that shared nothing, a field it
+  could not measure, and a reading that has not arrived yet are three different
+  things and none of them is zero — a desktop has no battery, and the
+  Windows/macOS battery collector is deliberately not implemented rather than
+  pulling in a dependency for it. Nothing is persisted: presence is live state,
+  so a cold start says "status not shared" instead of presenting yesterday's
+  battery level as current.
+
+  Peer-supplied values are validated, not trusted: a `battery_percent` over 100
+  discards the whole message rather than clamping it, and a `network` word
+  outside the closed vocabulary is dropped rather than reaching the UI verbatim.
+
 ### Fixed
 - **A sandboxed FFI test no longer fights other PeerBeam processes for the
   discovery port.** `peerbeam-discovery-udp`'s socket binds with

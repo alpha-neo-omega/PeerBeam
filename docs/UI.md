@@ -19,8 +19,28 @@ lib/
     stores.dart             per-domain ChangeNotifiers + sample data
     app_scope.dart          InheritedWidget exposing AppState
   widgets/                  StatusDot, DeviceTile, QuickAction, EmptyState, Appear, …
-  features/{home,chats,transfers,history,settings}/
+  features/{home,chats,devices,transfers,history,settings}/
 ```
+
+## Devices
+
+A dashboard of every discovered device, with whatever status each one chose to
+share: battery and charging, free storage, network kind, app version, and how
+long ago the reading arrived (measured from **our** receipt, never from the
+peer's clock — peer clocks are not synchronised).
+
+Sharing is opt-in in Settings and **off by default**, and a device's status is
+only ever sent to peers it trusts. A device that shares nothing still appears,
+showing its identity and reachability under a plain "Status not shared" — it is
+not an error state, and it is the honest default for any peer that has not
+opted in or is running an older build.
+
+The card renders only the fields that actually arrived. Absence is not zero: a
+desktop has no battery at all, and the Windows/macOS battery collector is
+deliberately unimplemented, so a card that filled those in as `0%` would be
+inventing a dead battery. `test/presence_test.dart` pins this from both sides —
+a missing reading must not render as zero, and a genuine `0%` must not be
+swallowed as missing.
 
 ## How the audit findings were addressed
 
