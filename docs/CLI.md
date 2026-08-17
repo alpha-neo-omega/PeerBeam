@@ -71,6 +71,35 @@ Working now:
 - `discover [--timeout N] [--watch]` — scans via all providers; table or live
   NDJSON stream (Ctrl-C to stop).
 - `list [--online]`, `status` — device snapshot / identity + providers.
+
+  `status` also reports **this device's own presence** — the same reading a
+  heartbeat would carry, so it shows exactly what the opt-in would reveal
+  before you turn it on. Computing it is purely local; nothing is put on the
+  wire:
+
+  ```
+  Status: battery 21% (charging) · 4.0 GB free · v0.4.1
+  Sharing: off — device status is shared with nobody
+  Peers:    no shared status (presence is live; a one-shot command holds no session)
+  ```
+
+  Battery is read on Linux (sysfs) and Android; Windows and macOS report none
+  by design, and an absent reading is simply omitted rather than shown as `0%`.
+  Free space is measured on the volume holding the save directory.
+
+  The empty `Peers` line is not a failure: presence is **live** state carried
+  on open sessions and nothing is persisted, so a one-shot command that holds
+  no session has nothing to show. It populates for a long-running command
+  (`receive`, `daemon`, `chat watch`) that keeps sessions open.
+
+  Under `--json` the same data appears as `presence` (this device),
+  `share_presence` (the opt-in, default `false`), and `peers` (an array, one
+  row per peer that has shared). Additive — every pre-existing key is
+  unchanged.
+
+  Sharing is off by default, and status is only ever sent to **trusted** peers;
+  that second gate is not configurable. Set `device.share_presence` in the
+  config to opt in.
 - `completions <shell>`.
 - `send <PATH>… [--to <device>] [--addr IP:PORT]` — send file(s) over QUIC with
   mutual authentication. `--to` resolves a peer via discovery (id / name /

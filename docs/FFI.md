@@ -159,7 +159,30 @@ char* pb_chat_conversations(const char* json);  // {} or null → {peers:[{peer_
 char* pb_chat_cancel(const char* json);         // {peer_id, message_id} → {cancelled}
 char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
 char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
+
+char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
+char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
 ```
+
+`pb_presence_json` is a snapshot of live state: what this device would share
+(`self`), whether it is currently sharing at all (`sharing`, default **false**),
+and the last heartbeat received from each peer (`devices`). Nothing here is
+persisted — a fresh process reports no peers, which is presence working as
+designed rather than a gap. Every field inside a status is optional; a caller
+must render an absent one as absent, never as `0`. `ageSeconds` counts from
+**our** receipt, not the peer's `sent_at`, because peer clocks are not
+synchronised.
+
+`pb_presence_battery` exists because only the platform layer can read a battery
+on Android; the Rust collector handles Linux via sysfs and reports `None` on
+Windows and macOS by design. It pushes a reading down for the next heartbeat to
+carry; it never puts anything on the wire by itself.
+
+Neither call can leak status. Sending is gated by
+`peerbeam_presence::gate::may_share_status`, which requires all of: the user's
+opt-in (default off), the peer being **trusted** (not configurable), and the
+peer having negotiated `PRESENCE_FEAT_STATUS`. A device with sharing off still
+receives and displays other devices' status.
 
 Both deletes are **local only**: nothing goes on the wire and the peer keeps its
 own copy. Neither is "unsend". Both leave behind every record that still backs a
