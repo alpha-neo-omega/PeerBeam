@@ -2,8 +2,10 @@
 // runs on. `chat_screen_test.dart` proves the composer's menu wires each
 // choice to this function; this file proves the function itself turns that
 // choice into the right native filter — the piece the brief calls load
-// bearing, since a wrong mapping either hides files that should be offered or
-// (on Linux) silently offers everything.
+// bearing, since a wrong mapping either hides files that should be offered
+// (a MIME-only group offers nothing at all on Windows, and drops its wildcards
+// on macOS) or offers everything under a choice the user deliberately
+// narrowed.
 
 // Not a new dependency: file_selector_platform_interface is already resolved
 // transitively through file_selector itself (see pubspec.lock) — this just
@@ -117,9 +119,9 @@ void main() {
       },
     );
 
-    test('media\'s group carries BOTH mimeTypes and extensions — a Linux GTK '
-        'picker filters by extension and ignores MIME, so a mimeTypes-only '
-        'group would silently show nothing there', () async {
+    test('media\'s group carries BOTH mimeTypes and extensions — Windows reads '
+        'extensions only and macOS drops a wildcard MIME, so either list alone '
+        'offers nothing on one of them', () async {
       await pickFilesToStage(kind: AttachKind.media);
       final group = fake.lastGroups!.single;
       expect(group.mimeTypes, ['image/*', 'video/*']);

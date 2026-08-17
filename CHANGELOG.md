@@ -6,6 +6,34 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **A conversation you had navigated away from no longer owns drag & drop.**
+  Two drop targets contend for every drop on desktop — `desktop_drop` delivers
+  one drop to *every* mounted target, and the Send flow's `DropZone` wraps the
+  whole shell — which is arbitrated by a claim register the open conversation
+  holds while the Send zone stands down. That claim was scoped to the chat
+  screen being *mounted*, but the shell keeps every navigation branch mounted
+  and merely takes the inactive ones offstage. So opening a conversation and
+  then tapping **Home** left the conversation owning drops: a file dropped on
+  Home was sent straight to that peer instead of being staged for the Send
+  flow, with no prompt and no route to the Send sheet. The claim is now scoped
+  to **visible**, and the conversation's own drop target is disabled and its
+  handler refuses independently of the claim.
+- **Resizing the window across 600px no longer strands the drop claim.** The
+  shell puts its `DropZone` in a different slot on either side of that width,
+  so crossing it destroys the claim register while the open conversation
+  survives. The conversation went on holding a register nobody read: a drop was
+  then answered twice — sent to the peer *and* staged for the Send flow — and
+  closing the conversation afterwards threw. The register is now re-resolved on
+  every reconcile, and one that has been replaced is dropped rather than
+  released.
+- **A selection that partly went stale no longer resurrects on an id reuse.**
+  The chat screen narrowed its selection for rendering but never pruned it, so
+  a set that lost only *some* of its messages kept naming the dead ids. An
+  inbound file's message id is the sender's own `FileRef` id — a value the peer
+  chooses — so a peer reusing one had its message rendered as already selected,
+  counted, and forwarded to a third device. Stale ids are now pruned.
+
 ## [0.4.0] - 2026-08-17 — Beta
 
 ### Added
@@ -41,8 +69,9 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   undifferentiated picker — matching the shape WhatsApp and every other chat
   app use. Choosing a kind filters what the picker even offers: a file the
   filter excludes is never shown, rather than picked and then rejected.
-  Desktop filters by both MIME type and extension (a Linux GTK picker ignores
-  MIME-only filters and would otherwise show nothing); Android sets
+  Desktop filters by both MIME type and extension (Windows reads extensions
+  only, and macOS drops a wildcard MIME, so either list alone offers nothing on
+  one of them — Linux honours both); Android sets
   `EXTRA_MIME_TYPES` on the picker intent, with the argument optional so
   nothing else that calls the native picker needs to change. Everything past
   the choice is unchanged: the picker is still multi-select, and every picked

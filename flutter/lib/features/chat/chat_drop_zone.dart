@@ -75,12 +75,12 @@ class _ChatDropZoneState extends State<ChatDropZone> {
     super.didChangeDependencies();
     final register = DropClaims.maybeOf(context);
     if (!identical(register, _register)) {
-      // A DIFFERENT register means the [DropZone] above has been rebuilt from
-      // scratch rather than merely rebuilt: `AppShell` puts it in the
-      // `Scaffold`'s `body` below `Breakpoints.compact` and inside a `Row`
-      // beside the navigation rail above it, so dragging the window across
-      // 600px destroys `_DropZoneState` and the notifier it owns, while the
-      // branch Navigator's GlobalKey carries this State over into the new one.
+      // A DIFFERENT register means the [DropZone] above was not merely rebuilt
+      // but REPLACED. `AppShell` puts it in the `Scaffold`'s `body` below
+      // `Breakpoints.compact` and inside a `Row` beside the navigation rail
+      // above it, so dragging the window across 600px destroys
+      // `_DropZoneState` and the notifier it owns, while the branch
+      // Navigator's GlobalKey carries this State over into its replacement.
       //
       // The claim is therefore DROPPED, not released. Decrementing the old
       // register would be touching a `ValueNotifier` its owner has already

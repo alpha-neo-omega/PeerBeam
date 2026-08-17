@@ -30,11 +30,25 @@ enum AttachKind {
 }
 
 /// Extensions `file_selector` shows for [AttachKind.media]/[AttachKind.audio]
-/// on desktop, alongside the MIME types below. Both are required: a Linux GTK
-/// picker filters by extension and ignores MIME entirely, so a mimeTypes-only
-/// group silently shows nothing there, while other platforms lean on the MIME
-/// list. Neither list claims to be exhaustive — just the formats people
-/// actually send.
+/// on desktop, alongside the MIME types below.
+///
+/// **Both lists are required**, because the three desktop backends do not
+/// agree on which one they read:
+///
+///  * **Windows** — `file_selector_windows` builds its filter spec from
+///    `extensions` alone and never looks at `mimeTypes`, so a MIME-only group
+///    offers nothing at all;
+///  * **macOS** — `file_selector_macos` maps each MIME through
+///    `UTType(mimeType:)` and `compactMap`s the nils away, and
+///    `UTType(mimeType: "image/*")` *is* nil, so a wildcard silently drops and
+///    only the extensions survive;
+///  * **Linux** — `file_selector_linux` adds both
+///    `gtk_file_filter_add_pattern` and `gtk_file_filter_add_mime_type`, so it
+///    honours `image/*` and is the one backend either list alone would satisfy.
+///
+/// So the platforms that need the extensions are Windows and macOS, not Linux.
+/// Neither list claims to be exhaustive — just the formats people actually
+/// send.
 const _imageExtensions = [
   'jpg',
   'jpeg',

@@ -2551,10 +2551,19 @@ impl Manager {
         // silently dropped would make `removed`/`kept` a report about a request
         // the caller never made; a missing field entirely would delete nothing
         // and say so, which reads exactly like a selection that was already
-        // gone. An EMPTY array is not an error, though: it asks for nothing,
-        // deletes nothing, and answers `{removed: 0, kept: []}` — which is what
-        // a surface whose selection emptied itself between the render and the
-        // tap should get, rather than a failure to explain.
+        // gone. An EMPTY array is not a validation error, though: it asks for
+        // nothing, deletes nothing, and answers `{removed: 0, kept: []}` —
+        // which is what a surface whose selection emptied itself between the
+        // render and the tap should get, rather than a failure to explain.
+        //
+        // "Not a validation error" is deliberately not "always `Ok`", and the
+        // doc says so because the code means it. `ChatStore::delete_messages`
+        // establishes the keep rule before it looks at a single id, so an empty
+        // request against an outbox this build cannot read completely still
+        // refuses with `QueueUnreadable`. That refusal is about the store's
+        // state and not about the size of the request, and short-circuiting an
+        // empty list past the one rule both deletes share is precisely the kind
+        // of divergence that rule exists as a type to prevent.
         let ids = req
             .get("message_ids")
             .and_then(|v| v.as_array())
@@ -6785,9 +6794,17 @@ mod tests {
     }
 
     /// Both arguments are required, and `message_ids` must be an array of
-    /// non-empty strings. An empty array is deliberately NOT an error: it asks
-    /// for nothing and gets nothing, which is what a surface whose selection
-    /// emptied itself between the render and the tap should be handed.
+    /// non-empty strings. An empty array is deliberately NOT a validation
+    /// error: it asks for nothing and gets nothing, which is what a surface
+    /// whose selection emptied itself between the render and the tap should be
+    /// handed.
+    ///
+    /// Not a validation error is not the same as always `Ok`, and the case
+    /// below is asserted from the healthy store this test builds. The keep rule
+    /// is established before a single id is looked at, so an empty request
+    /// against an outbox that cannot be read completely still refuses with
+    /// `QueueUnreadable` — see `chat_delete_messages`'s own comment on why that
+    /// is left alone rather than special-cased.
     #[tokio::test]
     #[serial_test::serial]
     async fn chat_delete_messages_validates_its_arguments() {

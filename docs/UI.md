@@ -60,6 +60,19 @@ staged-files sheet opens for review (per-file remove, running total). Staging
 lives in a pure `StagingStore` (dedup by path), unit-tested independently of
 any native drag.
 
+**Two targets, one drop.** `desktop_drop` registers every mounted `DropTarget`
+against the same native window and delivers a drop to *all* of them — a nested
+target does **not** shadow the one above it. Since `DropZone` wraps the whole
+navigation shell, an open conversation always has two targets stacked over it,
+and without arbitration one drop was answered twice: sent to the peer *and*
+staged for the Send flow, with two overlays lit at once. So `DropZone`
+publishes a claim register (`DropClaims`) to everything below it, and stands
+down entirely — no handler, no overlay — for as long as a claim is held. It is
+a counted `ValueNotifier<int>` rather than a flag, so two claimants overlapping
+for a frame (one screen mounting as another releases) cannot re-enable the
+outer zone early. What may claim it, and when, is
+[Who owns a drop](#who-owns-a-drop).
+
 ## Chat attachments
 
 ### A typed attach menu
@@ -75,9 +88,14 @@ from the UI — the composer names *what* the user wants, and the platform
 layer owns *how* that becomes an OS filter:
 
 - **Desktop** (`file_selector`): each kind maps to an `XTypeGroup` carrying
-  **both** `mimeTypes` and `extensions`. Extensions are required alongside
-  MIME types because a Linux GTK picker filters by extension and ignores MIME
-  — a mimeTypes-only group silently shows nothing there.
+  **both** `mimeTypes` and `extensions`, because the three backends disagree
+  about which one they read. `file_selector_windows` builds its filter spec
+  from `extensions` alone and never looks at `mimeTypes`; `file_selector_macos`
+  maps each MIME through `UTType(mimeType:)` and `compactMap`s away the nils,
+  and `UTType(mimeType: "image/*")` *is* nil, so a wildcard silently drops.
+  Linux is the one that needs neither list on its own —
+  `file_selector_linux` adds both `add_pattern` and `add_mime_type`, so it
+  honours `image/*`. So the extensions exist for **Windows and macOS**.
 - **Android**: the kind's MIME types (e.g. `image/*, video/*`) are passed
   through the `pickFiles` method channel and set as `EXTRA_MIME_TYPES` on the
   `ACTION_OPEN_DOCUMENT` intent (`type` stays the wildcard alongside it —
@@ -117,10 +135,49 @@ folder" on Home, rather than a silent no-op or an engine error surfacing
 later. A drop mixing files and folders sends the files and reports every
 skipped folder in one message; it does not abort the files that came with it.
 
+#### Who owns a drop
+
+`ChatDropZone` claims the shell's [drop register](#drag--drop-desktop-only)
+while its conversation is **visible** — and visible is not the same as mounted.
+The shell is a `StatefulShellRoute.indexedStack`, which keeps every navigation
+branch mounted and merely takes the inactive ones offstage, while
+`desktop_drop` decides who to notify from `renderBox.paintBounds.contains(…)`
+alone — a gate an offstage `IndexedStack` child still passes, because it is
+laid out at full size. A claim scoped to *mounted* therefore let a conversation
+left open on Chats answer a drop made on Home: the file went straight to that
+peer instead of being staged for the Send flow, with no prompt and no way back.
+
+Visibility is two signals, because there are two ways to stop being on screen.
+go_router mounts each branch as `Offstage(offstage: !isActive, child:
+TickerMode(enabled: isActive, …))`, so `TickerMode` answers the branch
+question; a route pushed *on top of* the conversation inside the same branch
+leaves `TickerMode` true and is caught by `ModalRoute`'s `isCurrent` instead.
+Both are inherited-widget lookups, which is what makes them reactive — the zone
+reconciles again the moment either changes.
+
+**The register is re-resolved on every reconcile, not bound once.** `AppShell`
+places `DropZone` in a different slot below and above `Breakpoints.compact`, so
+dragging the window across 600px destroys `_DropZoneState` and the notifier it
+owns, while the branch Navigator's GlobalKey carries the open conversation into
+the replacement. A register that has been **replaced** is dropped rather than
+released: decrementing it is a use-after-dispose, and the count it would
+correct is going away with its owner. Only a claim on the register still in
+scope is ever released — visibility going false, or the screen being disposed.
+
+**Ownership is asserted twice, deliberately.** The chat's own `DropTarget`
+takes `enable: visible` *and* its `onDragDone` refuses when it is not visible,
+so a claim that failed to be released is not on its own enough to make an
+offstage conversation answer a drop. Given what a mistake here costs — a file
+leaving for a peer the user never picked — one mechanism is not enough.
+
 `test/chat_drop_zone_test.dart` pins `collectDroppedFiles`'s file/folder
 flagging directly, and drives `ChatDropZone`'s real `DropTarget` callback
 (found in the widget tree, not simulated through the OS channel) for the
-two-file, folder-only, and mixed-drop cases.
+two-file, folder-only, and mixed-drop cases. It also mounts the chat offstage
+exactly as go_router does — `IndexedStack` + `Offstage` + `TickerMode`, with
+`skipOffstage: false` finders, since the default ones cannot see the case at
+all — rather than unmounting it, which is a different scenario that passes
+either way.
 
 ## Selecting messages in a conversation
 
