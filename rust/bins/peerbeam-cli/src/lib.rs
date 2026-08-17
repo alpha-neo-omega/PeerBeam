@@ -9,6 +9,7 @@ pub mod engine;
 pub mod exit;
 pub mod history;
 pub mod output;
+pub mod pipe;
 pub mod presence;
 pub mod prompt;
 pub mod resolve;

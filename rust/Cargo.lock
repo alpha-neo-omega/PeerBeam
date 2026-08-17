@@ -1156,6 +1156,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

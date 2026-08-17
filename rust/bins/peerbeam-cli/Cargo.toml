@@ -33,7 +33,17 @@ peerbeam-appstore-fs = { path = "../../crates/peerbeam-appstore-fs" }
 peerbeam-chat = { path = "../../crates/peerbeam-chat" }
 peerbeam-clipboard = { path = "../../crates/peerbeam-clipboard" }
 peerbeam-presence = { path = "../../crates/peerbeam-presence" }
-tokio = { workspace = true }
+# `io-std` on top of the workspace feature set: `peerbeam pipe` is the only
+# thing in the project that reads stdin or writes stdout asynchronously, so the
+# feature is enabled here rather than workspace-wide. It pulls in no new crate —
+# tokio's async stdio rides the blocking pool the runtime already has.
+tokio = { workspace = true, features = ["io-std"] }
+# Bridges tokio's stdin/stdout to the `futures` IO traits the transfer engine
+# (and the domain's StorageProvider port) speak, so `pipe` reuses that engine's
+# chunk loop verbatim instead of growing a second one for tokio-flavoured IO.
+# Not a new dependency for the project: `peerbeam-storage-fs`, which this crate
+# already pulls in, builds it for exactly the same reason.
+tokio-util = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

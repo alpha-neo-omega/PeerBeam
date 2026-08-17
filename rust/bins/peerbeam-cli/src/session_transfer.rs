@@ -35,7 +35,7 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
@@ -51,6 +51,7 @@ const TRANSFER: ChannelType = ChannelType::TRANSFER;
 const CHAT: ChannelType = ChannelType::CHAT;
 const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
+const PIPE: ChannelType = ChannelType::PIPE;
 
 /// The session config every CLI PeerSession uses: advertise + accept the
 /// Transfer capability as the stream channel, and advertise the Chat
@@ -93,8 +94,22 @@ const PRESENCE: ChannelType = ChannelType::PRESENCE;
 /// understand an inbound `Clip` and acknowledges it (`crate::clipboard`) —
 /// and because a peer must not behave differently depending on which of our
 /// own two frontends it reached.
+///
+/// PIPE advertises [`PIPE_FEAT_STREAM`] on those same terms and is registered
+/// as a **stream** channel type alongside TRANSFER, on **every** session this
+/// process builds — including `receive`, `daemon start` and `chat watch`, none
+/// of which will accept a pipe. That is deliberate and is what makes the
+/// refusal a refusal: registering the type routes an inbound pipe to the
+/// caller's incoming-streams receiver, where it is dispatched on
+/// `channel_type` and closed with a reason. Leaving it unregistered would
+/// instead pair it as a message channel with no handler, and its frames would
+/// be decoded, counted and dropped in silence — a hang for the sender, not a
+/// refusal. Advertising uniformly is what stops a peer's behaviour depending
+/// on which of our frontends (or which of our commands) it reached.
 fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
-    let mut cfg = SessionConfig::new(advertised_caps()).with_stream_channel_type(TRANSFER);
+    let mut cfg = SessionConfig::new(advertised_caps())
+        .with_stream_channel_type(TRANSFER)
+        .with_stream_channel_type(PIPE);
     if !handlers.is_empty() {
         let mut reg = HandlerRegistry::new();
         for h in handlers {
@@ -119,6 +134,7 @@ fn advertised_caps() -> CapabilitySet {
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
+        .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -179,6 +195,23 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
+    }
+
+    /// Whether the peer negotiated the pipe stream capability. A peer from
+    /// before `peerbeam pipe` advertises no PIPE at all, so this is false and
+    /// `pipe --to` must refuse **before reading stdin** rather than streaming
+    /// bytes into a channel that peer would reject.
+    #[must_use]
+    pub fn supports_pipe(&self) -> bool {
+        peerbeam_transfer::caps_support_stream(&self.capabilities)
+    }
+
+    /// The negotiated (already intersected) capability set — the set a gate
+    /// must be asked about, since it reflects what the *peer* advertised and
+    /// not merely what this build asked for.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.capabilities
     }
 
     /// Await the next incoming transfer channel the peer opens (receiver side).
@@ -541,6 +574,98 @@ mod tests {
         let future = CapabilitySet::new().with(Capability::with_features(CLIPBOARD, 1 << 4));
         let negotiated = session_cfg(Vec::new()).capabilities.intersect(&future);
         assert!(!peerbeam_clipboard::caps_support_clip(&negotiated));
+    }
+
+    /// The PIPE bit must be advertised by **this** frontend, for the reason
+    /// spelled out on `the_presence_feature_bit_is_advertised`: the other
+    /// surface has its own copy of this test, and a shared helper would go
+    /// green for both the moment either stopped advertising.
+    #[test]
+    fn the_pipe_feature_bit_is_advertised() {
+        let f = our_caps().features(PIPE).expect("PIPE advertised");
+        assert!(f & PIPE_FEAT_STREAM != 0, "byte pipes");
+    }
+
+    /// PIPE must be a **stream** channel type on every session this process
+    /// builds, not only on a `pipe --listen` one.
+    ///
+    /// This is what makes a refusal a refusal. An unregistered stream type
+    /// pairs an inbound pipe as a *message* channel with no handler, whose
+    /// frames are decoded, counted and dropped in silence — the sender hangs
+    /// instead of failing. Registered, the channel is delivered to the caller,
+    /// which dispatches on its type and closes it with a reason.
+    #[test]
+    fn pipe_is_a_stream_channel_type_on_every_session() {
+        let cfg = session_cfg(Vec::new());
+        assert!(cfg.stream_channel_types.contains(&PIPE));
+        assert!(
+            cfg.stream_channel_types.contains(&TRANSFER),
+            "and transfer still is"
+        );
+    }
+
+    /// Advertising PIPE is a claim about comprehension, not about behaviour,
+    /// and here the gap is at its widest: `receive`, `daemon start` and `chat
+    /// watch` all advertise it and all refuse every pipe. The capability alone
+    /// opens nothing — the listen gate is a separate, local input.
+    #[test]
+    fn advertising_pipe_does_not_imply_accepting_one() {
+        let negotiated = our_caps().intersect(&our_caps());
+        assert!(
+            peerbeam_transfer::caps_support_stream(&negotiated),
+            "two of our builds negotiate the capability"
+        );
+        assert!(
+            !peerbeam_transfer::may_accept_pipe(
+                false, // not `pipe --listen` — a daemon, say
+                &AlwaysTrusts,
+                &DeviceId::from("pb-bob"),
+                None,
+                &negotiated,
+            ),
+            "a non-listening process must refuse even a trusted, capable peer"
+        );
+    }
+
+    /// A peer from before `peerbeam pipe` advertises no PIPE at all, so the
+    /// intersection drops it and `pipe --to` refuses before reading stdin.
+    #[test]
+    fn a_peer_without_pipe_negotiates_to_unsupported() {
+        let legacy = CapabilitySet::new()
+            .with(Capability::new(TRANSFER))
+            .with(Capability::new(CHAT));
+        let negotiated = our_caps().intersect(&legacy);
+        assert!(!negotiated.supports(PIPE));
+        assert!(!peerbeam_transfer::caps_support_stream(&negotiated));
+    }
+
+    /// An unrelated future bit on PIPE must not be read as this one.
+    #[test]
+    fn an_unrelated_future_pipe_bit_does_not_imply_stream() {
+        let future = CapabilitySet::new().with(Capability::with_features(PIPE, 1 << 4));
+        let negotiated = our_caps().intersect(&future);
+        assert!(!peerbeam_transfer::caps_support_stream(&negotiated));
+    }
+
+    /// A trust store that trusts everyone, so the assertion above can only be
+    /// failing on the listen leg.
+    struct AlwaysTrusts;
+    impl peerbeam_domain::port::TrustStore for AlwaysTrusts {
+        fn record(
+            &self,
+            _r: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            _d: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(None)
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            true
+        }
     }
 
     /// A trust store that trusts nobody, for the gate assertion above.

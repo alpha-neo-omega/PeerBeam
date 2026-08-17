@@ -47,9 +47,12 @@ use peerbeam_chat::{
 };
 use peerbeam_config::EngineConfig;
 use peerbeam_domain::id::DeviceId;
+use peerbeam_domain::session::ChannelType;
 use peerbeam_engine::{Engine, ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
-use peerbeam_transfer::{send_file_on_session, SendRequest, TransferControl};
+use peerbeam_transfer::{
+    accept_pipe, send_file_on_session, PipeConsent, SendRequest, TransferControl,
+};
 use peerbeam_transfer_quic::QuicTransport;
 use tokio::sync::mpsc;
 
@@ -135,6 +138,25 @@ pub(crate) fn received_sink(ctx: &Ctx) -> ReceivedSink {
             }
         }
     })
+}
+
+/// The `ReceivedSink` for a command whose **stdout is data**, not a report:
+/// `peerbeam pipe`, in both directions.
+///
+/// It persists and displays nothing, and that is not the same as passing no
+/// chat wiring at all. The `ChatHandler` this is handed to still decodes,
+/// dedups and **stores** every inbound message — a `chat history` after the
+/// pipe shows it — so nothing is lost. What is suppressed is only the display,
+/// because [`received_sink`] writes to stdout, and on a `pipe --listen` stdout
+/// is the byte stream the user redirected into a file. A chat message printed
+/// there would land *inside* their archive.
+///
+/// Registering the handler at all is deliberate: a session with none does not
+/// error on an inbound CHAT frame, it silently drops it (see this module's top
+/// doc), so `None` here would reintroduce that bug class on two new call sites
+/// to avoid a display problem this solves properly.
+pub(crate) fn silent_sink() -> ReceivedSink {
+    Arc::new(|_rec: ChatRecord| {})
 }
 
 /// Human-readable direction label, matching `history`'s existing text
@@ -1322,7 +1344,38 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
                 // peer closes its side — a `chat send` always closes right after
                 // sending — which is the signal to close our side too and move on to
                 // the next inbound connection.
-                while session.next_incoming().await.is_some() {}
+                //
+                // **The listen gate**, for the same reason `serve_loop` has one:
+                // `chat watch` is a long-lived background process and is not
+                // `peerbeam pipe --listen`, so an inbound pipe is refused
+                // explicitly rather than left to the bare discard below. A
+                // silent discard would already deny the peer its bytes, but it
+                // would say nothing to this side's operator and nothing about
+                // *why* — and an unexplained discard is exactly the kind of
+                // thing a later change "tidies up" into an accept.
+                while let Some(incoming_ch) = session.next_incoming().await {
+                    if incoming_ch.channel_type != ChannelType::PIPE {
+                        continue; // a transfer stream: discarded unread, as before
+                    }
+                    let consent = PipeConsent {
+                        listening: false,
+                        trust: sc.trust.as_ref(),
+                        only_from: None,
+                        negotiated: session.capabilities(),
+                    };
+                    let peer = DeviceId::from(session.peer_id.clone());
+                    // `listening: false` refuses before a byte is read, and the
+                    // sink is where those bytes would go if it ever did not.
+                    let mut nowhere = futures::io::sink();
+                    if let Err(e) =
+                        accept_pipe(incoming_ch, &session.handle, &peer, &consent, &mut nowhere)
+                            .await
+                    {
+                        if !ctx.json {
+                            ctx.line(&ctx.dim(&e.to_string()));
+                        }
+                    }
+                }
                 session.close().await;
             }
         }

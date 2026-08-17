@@ -1,6 +1,6 @@
 //! Command-line surface (clap derive).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
@@ -59,6 +59,8 @@ pub enum Command {
     Clipboard(ClipboardArgs),
     /// Chat with a peer.
     Chat(ChatArgs),
+    /// Pipe stdin to a peer, or a peer's stream to stdout.
+    Pipe(PipeArgs),
     /// Show transfer history.
     History(HistoryArgs),
     /// Run the background daemon.
@@ -232,6 +234,47 @@ pub enum ChatAction {
         #[arg(long)]
         port: Option<u16>,
     },
+}
+
+/// `peerbeam pipe` — an encrypted byte stream between two devices.
+///
+/// ```text
+/// $ tar cz ./project | peerbeam pipe --to laptop
+/// $ peerbeam pipe --listen > project.tgz
+/// ```
+///
+/// Exactly one of `--to`, `--addr` or `--listen` is required: without a
+/// direction there is nothing to do, and a default would have to guess which of
+/// stdin and stdout the user meant to be the payload.
+///
+/// **`stdout` carries piped bytes and nothing else.** Every human-facing line
+/// this command emits — the listening address, the peer's name, progress,
+/// errors, and `--json` events — goes to **stderr**, in both directions, or
+/// `peerbeam pipe --listen > project.tgz` would write status text into the
+/// archive.
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("direction")
+        .args(["to", "addr", "listen"])
+        .required(true)
+))]
+pub struct PipeArgs {
+    /// Send stdin to this device (id, name, or name prefix).
+    #[arg(long, conflicts_with_all = ["listen", "from", "port"])]
+    pub to: Option<String>,
+    /// Send stdin to a peer dialled directly at `IP:PORT`, skipping discovery.
+    #[arg(long, value_name = "IP:PORT", conflicts_with_all = ["to", "listen", "from", "port"])]
+    pub addr: Option<String>,
+    /// Accept **one** incoming stream, write it to stdout, and exit.
+    #[arg(long)]
+    pub listen: bool,
+    /// With `--listen`: accept only this device (`pb-…` id, or a discoverable
+    /// name). Any other peer is refused, trusted or not.
+    #[arg(long, requires = "listen", value_name = "DEVICE")]
+    pub from: Option<String>,
+    /// With `--listen`: port to listen on (overrides `transfer.port`).
+    #[arg(long, requires = "listen")]
+    pub port: Option<u16>,
 }
 
 #[derive(Args)]

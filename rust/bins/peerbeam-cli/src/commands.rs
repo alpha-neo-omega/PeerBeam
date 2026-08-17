@@ -17,9 +17,9 @@ use peerbeam_domain::port::{EncryptionProvider, Frame, Link, Nonce};
 use peerbeam_engine::{ManagedDevice, RouteManager};
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    peek_incoming_meta, receive_file, receive_on_channel, send_file, send_file_on_session,
-    send_folder_on_session, ChannelReceived, FolderSendRequest, Identity, SendRequest,
-    TransferControl, TransferOutcome,
+    accept_pipe, peek_incoming_meta, receive_file, receive_on_channel, send_file,
+    send_file_on_session, send_folder_on_session, ChannelReceived, FolderSendRequest, Identity,
+    SendRequest, TransferControl, TransferOutcome,
 };
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
@@ -43,6 +43,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Receive(a) => receive(ctx, a, cfg_override.as_deref()).await,
         Command::Clipboard(a) => clipboard(ctx, a, cfg_override.as_deref()).await,
         Command::Chat(a) => crate::chat::chat(ctx, a.action, cfg_override.as_deref()).await,
+        Command::Pipe(a) => crate::pipe::pipe(ctx, a, cfg_override.as_deref()).await,
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
@@ -802,7 +803,7 @@ fn presence_row(id: &peerbeam_domain::id::DeviceId, e: &peerbeam_presence::PeerS
 
 /// Human-readable bytes, e.g. `12.3 GB`. Decimal units, matching the rest of
 /// the CLI's size rendering.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
     let mut i = 0;
@@ -1674,6 +1675,52 @@ async fn serve_loop(
                         continue;
                     }
                 };
+
+                // **The listen gate.** This is a `receive`/`daemon`, not a
+                // `peerbeam pipe --listen`, so an inbound pipe is refused here
+                // — the one place a long-lived background process could
+                // otherwise become a remote write to whatever terminal it was
+                // started from. The capability is still advertised and the
+                // channel type still registered as a stream (see
+                // `session_transfer::session_cfg`): that is what routes the
+                // pipe here to be refused with a reason, instead of leaving it
+                // to hang as an unhandled message channel.
+                //
+                // `accept_pipe` is the single funnel that decides — this side
+                // passes `listening: false` and an `out` that discards, so
+                // even a broken gate could not write the peer's bytes
+                // anywhere. Refusing does not end the loop: a stranger must not
+                // be able to stop a receiver by dialling it.
+                if incoming_ch.channel_type == peerbeam_domain::session::ChannelType::PIPE {
+                    let consent = peerbeam_transfer::PipeConsent {
+                        listening: false,
+                        trust: sc.trust.as_ref(),
+                        only_from: None,
+                        negotiated: session.capabilities(),
+                    };
+                    let peer = DeviceId::from(peer_id.clone());
+                    let mut nowhere = futures::io::sink();
+                    let refused = accept_pipe(
+                        incoming_ch,
+                        &session.handle,
+                        &peer,
+                        &consent,
+                        &mut nowhere,
+                    )
+                    .await;
+                    let msg = match refused {
+                        Ok(_) => "a pipe was accepted by a process that must never accept one"
+                            .to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if ctx.json {
+                        ctx.json_line(&json!({"event": "error", "message": msg}));
+                    } else {
+                        ctx.line(&ctx.dim(&msg));
+                    }
+                    session.close().await;
+                    continue;
+                }
 
                 // Peek the sender's transfer id before consuming any bytes, so
                 // the chat bridge below can correlate this receive with a

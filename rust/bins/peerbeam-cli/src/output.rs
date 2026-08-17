@@ -74,6 +74,41 @@ impl Ctx {
         println!("{}", serde_json::to_string(value).unwrap_or_default());
     }
 
+    /// A human line on **stderr**, for a command whose stdout is data.
+    ///
+    /// `peerbeam pipe --listen > project.tgz` puts the peer's bytes on stdout,
+    /// so anything it has to say about the transfer — the listening address, the
+    /// peer's name, a refusal — must go here or it lands *inside* the archive.
+    /// Honours `--quiet` exactly as [`line`](Ctx::line) does; colour follows
+    /// stderr's own TTY-ness, not stdout's.
+    pub fn note(&self, s: &str) {
+        if !self.quiet {
+            eprintln!("{s}");
+        }
+    }
+
+    /// A `--json` event on **stderr**, for the same reason as [`note`](Ctx::note).
+    ///
+    /// This is the one place the CLI's usual rule — machine output on stdout —
+    /// is deliberately inverted, because for `pipe` stdout is already spoken
+    /// for. A script reads pipe events from stderr and the payload from stdout,
+    /// which is the only split that lets it have both.
+    pub fn json_note(&self, value: &serde_json::Value) {
+        eprintln!("{}", serde_json::to_string(value).unwrap_or_default());
+    }
+
+    /// Paint for **stderr**, so a `pipe` notice is coloured by whether stderr is
+    /// a terminal rather than by whether stdout is (which, for `pipe`, is a
+    /// file or another process by construction).
+    pub fn err_dim(&self, s: &str) -> String {
+        Self::wrap(self.color_err, s, "2")
+    }
+
+    /// Paint for stderr; see [`err_dim`](Ctx::err_dim).
+    pub fn err_bold(&self, s: &str) -> String {
+        Self::wrap(self.color_err, s, "1")
+    }
+
     pub fn error(&self, e: &CliError) {
         let msg = format!("error: {e}");
         eprintln!("{}", Self::wrap(self.color_err, &msg, "31"));

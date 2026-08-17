@@ -245,3 +245,58 @@ fn completions_accepts_a_shell() {
     assert!(Cli::try_parse_from(["peerbeam", "completions", "bash"]).is_ok());
     assert!(Cli::try_parse_from(["peerbeam", "completions", "notashell"]).is_err());
 }
+
+// ── pipe ────────────────────────────────────────────────────────────────────
+
+/// A direction is required: without one there is nothing to do, and a default
+/// would have to guess which of stdin and stdout is the payload.
+#[test]
+fn pipe_requires_exactly_one_direction() {
+    assert!(Cli::try_parse_from(["peerbeam", "pipe"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--listen", "--to", "laptop"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--to", "a", "--addr", "1.2.3.4:1"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--listen", "--addr", "1.2.3.4:1"]).is_err());
+}
+
+#[test]
+fn pipe_to_and_addr_parse() {
+    let cli = Cli::try_parse_from(["peerbeam", "pipe", "--to", "laptop"]).unwrap();
+    match cli.command {
+        Command::Pipe(a) => {
+            assert_eq!(a.to.as_deref(), Some("laptop"));
+            assert!(!a.listen);
+        }
+        _ => panic!("expected pipe"),
+    }
+
+    let cli = Cli::try_parse_from(["peerbeam", "pipe", "--addr", "192.168.1.5:49600"]).unwrap();
+    match cli.command {
+        Command::Pipe(a) => assert_eq!(a.addr.as_deref(), Some("192.168.1.5:49600")),
+        _ => panic!("expected pipe"),
+    }
+}
+
+#[test]
+fn pipe_listen_takes_from_and_port() {
+    let cli = Cli::try_parse_from([
+        "peerbeam", "pipe", "--listen", "--from", "pb-abc", "--port", "50101",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Pipe(a) => {
+            assert!(a.listen);
+            assert_eq!(a.from.as_deref(), Some("pb-abc"));
+            assert_eq!(a.port, Some(50101));
+        }
+        _ => panic!("expected pipe"),
+    }
+}
+
+/// `--from` and `--port` only mean anything to a listener; attaching them to a
+/// send is a usage error rather than a silently ignored flag.
+#[test]
+fn pipe_from_and_port_require_listen() {
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--to", "a", "--from", "pb-b"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--to", "a", "--port", "1"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "pipe", "--from", "pb-b"]).is_err());
+}
