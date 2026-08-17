@@ -263,6 +263,69 @@ Working now:
   still appears here (with a note that `watch` cannot receive its bytes — see
   `chat send --file` above); run `peerbeam receive`/`daemon start` instead to
   actually accept the file.
+- `pipe --to <device> | --addr IP:PORT` / `pipe --listen [--from <device>]
+  [--port N]` — an **encrypted byte pipe** between two devices: stdin on one
+  side, stdout on the other.
+
+  ```bash
+  tar cz ./project | peerbeam pipe --to laptop     # on the sending machine
+  peerbeam pipe --listen > project.tgz             # on the receiving one
+  ```
+
+  Exactly one direction is required (`--to`, `--addr` or `--listen`); giving
+  none, or two, is a usage error (exit `2`). `--to` resolves a peer through
+  discovery, `--addr` dials directly.
+
+  **Binary-safe and unbounded.** The stream has no length and no filename —
+  that absence is the point — and nothing inspects, decodes or line-buffers
+  the bytes, so `tar`, `gzip`, `dd` and arbitrary binary survive intact.
+  Neither end ever holds more than one chunk, so a 40 GB pipe runs at flat
+  memory. **EOF is the terminator**: the sender closing stdin ends the
+  stream, and the receiver flushes stdout and exits `0`.
+
+  **`stdout` carries piped bytes and nothing else.** Every human-facing line
+  — the listening address, the peer's name, refusals, and `--json` events —
+  goes to **stderr**, in *both* directions. That is what makes
+  `peerbeam pipe --listen > project.tgz` produce a correct archive, and it
+  means a script reads pipe events from stderr and the payload from stdout:
+
+  ```bash
+  peerbeam --json pipe --listen --port 0 > out.bin 2> events.ndjson
+  ```
+
+  emits `{"event":"pipe_listening","addr","port","from"}` on start and
+  `{"event":"piped","direction","bytes","chunks","peer"}` at the end, both on
+  stderr. There is deliberately **no progress bar**: a pipe has no total to
+  measure against.
+
+  **The consent model is not file transfer's, and the difference is the
+  point.** Two gates, neither optional:
+
+  1. **Only a `peerbeam pipe --listen` accepts a pipe.** A running `receive`,
+     `daemon start` or `chat watch` refuses every one, as does the PeerBeam
+     desktop app — all of them advertise the capability and none of them
+     accepts. **Running the command is the approval**, which is why there is
+     no prompt and must not be one: a prompt reads stdin, stdin is the
+     payload on the sending side, and a prompt would break the scripted,
+     headless use this exists for.
+  2. **Trusted peers only**, not configurable, narrowed to a single device
+     with `--from <device>` (a `pb-…` id, or a name resolved through
+     discovery — the match is always against the authenticated id, never
+     against the name a peer presents). See [Security](SECURITY.md) for the
+     reasoning and the limits.
+
+  **One stream, then exit.** A listener takes one stream and stops; there is
+  no `--keep-open`. A *refused* attempt is not that stream — the listener
+  keeps waiting, so a stranger cannot end it with a single dial.
+
+  Exit codes: `0` piped; `2` no direction or two; `3` peer/route not found;
+  `4` the stream failed or was refused (the message names `pipe --listen`, the
+  only thing that accepts one, since a refusal and an unreachable peer look
+  identical from the sending side); `5` the receiver's bytes did not match the
+  sender's checksum — **the bytes are already on stdout by then**, so this
+  exit code is the only report a truncated or corrupt stream gets, and a
+  script that ignores it will trust a bad file; `8` the peer's build predates
+  `peerbeam pipe` (nothing is read from stdin in that case).
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
@@ -305,6 +368,16 @@ fi
 
 # Live stream of discovery changes (NDJSON, Ctrl-C to stop)
 peerbeam discover --watch --json
+
+# Encrypted pipe: a directory across the network without a temp file
+peerbeam pipe --listen > project.tgz          # on the receiving machine
+tar cz ./project | peerbeam pipe --to laptop  # on the sending one
+
+# ...or straight into a command, since stdout is only ever the bytes
+peerbeam pipe --listen --from pb-a1b2c3 | tar xz
+# Check the exit code: the bytes are already out when a truncated or corrupt
+# stream is detected, so this is the only thing that says the file is sound.
+peerbeam pipe --listen > backup.img || echo "incomplete — do not use it"
 
 # Shell completion (bash; also zsh/fish/powershell)
 peerbeam completions bash > /etc/bash_completion.d/peerbeam

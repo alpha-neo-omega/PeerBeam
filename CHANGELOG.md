@@ -7,6 +7,46 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **`peerbeam pipe` — an encrypted byte pipe between two devices.** stdin on one
+  side, stdout on the other, over a new negotiated Pipe channel (`0x0107`):
+
+  ```bash
+  tar cz ./project | peerbeam pipe --to laptop
+  peerbeam pipe --listen > project.tgz
+  ```
+
+  No temp file, no filename, no length. The stream is **binary-safe** —
+  nothing inspects, decodes or line-buffers the bytes, so `tar`, `gzip`, `dd`
+  and arbitrary binary survive intact — and **never held whole**: one chunk
+  per direction at a time, so a 40 GB pipe runs at flat memory on both ends.
+  EOF is the terminator: closing stdin ends the stream, the receiver flushes
+  stdout and exits `0`.
+
+  **stdout carries the piped bytes and nothing else.** Every human-facing
+  line — the listening address, the peer, refusals, `--json` events — goes to
+  stderr, in both directions, or `peerbeam pipe --listen > project.tgz` would
+  write status text into the archive.
+
+  **The consent model is deliberately not file transfer's.** A pipe is
+  accepted **only** by a process the user explicitly started with `peerbeam
+  pipe --listen` — a running `receive`, `daemon start` or `chat watch`, and
+  the desktop app, all refuse every pipe offered to them. Running the command
+  *is* the approval, which is why there is no prompt and must not be one: a
+  prompt reads stdin, stdin is the payload, and it would break the scripted
+  headless use the feature exists for. The second gate is the familiar one —
+  **trusted peers only, not configurable** — narrowable to a single device
+  with `--from`, matched against the authenticated device id and never
+  against the name a peer presents. **One stream, then exit**; a refused
+  attempt does not count, so a stranger cannot end a listener by dialling it.
+  See `docs/SECURITY.md` for why this differs from the transfer prompt.
+
+  A peer whose build predates the feature is refused **before a byte of stdin
+  is read**, naming the peer and the reason, rather than being streamed bytes
+  it would drop. A truncated or corrupt stream is an **error, not a clean
+  end** — the bytes are already on stdout by then, so the non-zero exit code
+  is the only report, and a script that ignores it will trust a bad file.
+
+  CLI-first: there is no pipe UI in the app.
 - **Automatic clipboard sync between trusted devices.** Copy on one desktop and
   it is on your other devices, over a new negotiated Clipboard channel
   (`0x0102`, `Clip`). No pairing step, no button — the desktop watcher notices

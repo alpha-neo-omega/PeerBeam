@@ -174,6 +174,84 @@ because a durable log of everything a user ever copied is exactly the artefact
 this feature must not create. The CLI's arrival notice prints the sender and the
 byte count and never the contents, for the same reason.
 
+## The pipe's consent model, and why it is not the transfer prompt
+
+`peerbeam pipe` (ChannelType `0x0107`) writes a peer's bytes straight to a
+shell's stdout. That destination is what makes its consent model different from
+every other inbound thing in PeerBeam, and the difference is deliberate. It is
+written down here because an unexplained inconsistency in a consent model reads
+as an oversight and invites someone to "fix" it — and the obvious fix, letting a
+daemon accept pipes, is the one thing that must never happen.
+
+**A file transfer prompts. A pipe does not, and must not.**
+
+An inbound file is approved *per transfer*, by name and size, in a prompt raised
+by a receiver that was already running. That works because a file lands in a
+directory: it can be described before it is accepted, and refusing it costs
+nothing. None of that is true of a pipe. There is no name and no size to show —
+a pipe is an unbounded stream by definition — so a prompt could only ask "accept
+some bytes from this device?", which is a question with no information in it.
+And the prompt would have to be answered *on the receiving side*, in a session
+whose stdin is either absent (a headless server, an SSH command, a `cron` line)
+or, on the sending side, the payload itself. A pipe exists to be used from a
+script; a prompt would make it unusable exactly where it is worth having.
+
+So consent is expressed the other way round: **the user starts the receiver
+themselves, for this one purpose.** Running `peerbeam pipe --listen` *is* the
+approval. It is a stronger act than answering a prompt, not a weaker one — a
+prompt is answered by whoever happens to be at the machine when it appears,
+while starting a listener is a deliberate command typed by someone who knows
+what they are about to receive and where they are pointing it.
+
+Two gates enforce that, both decided in one place
+(`peerbeam_transfer::may_accept_pipe`) and reached through one funnel
+(`accept_pipe`), which is the only code that can put a peer's bytes into a
+process's `out`:
+
+1. **Only a `pipe --listen` accepts a pipe.** There is no background acceptance
+   and no setting that grants one. A running `receive`, `daemon start` or `chat
+   watch`, and the Flutter app, all advertise the Pipe capability and all refuse
+   every pipe offered to them. This is the gate that matters most: a long-lived
+   daemon that accepted pipes would be a remote write to whatever terminal it
+   was started from, and the user who started it consented to receiving *files*.
+2. **Trusted peers only**, not configurable — the same rule as clipboard sync
+   and presence — and narrowable to one device with `--from`, which matches the
+   **authenticated** device id from the handshake and never the human name a
+   peer presents (a peer chooses its own name, so a name-based restriction would
+   be a suggestion).
+
+**One stream, then exit.** A listener takes a single stream and stops. There is
+no `--keep-open`: a listener that stayed up accepting stream after stream is a
+much larger surface than the one the user consented to. A *refused* attempt does
+not count as that stream, so a stranger cannot end someone's listener by
+dialling it.
+
+Every leg is mutation-proved over a real two-PeerSession round trip in
+`peerbeam-transfer/tests/pipe_gates.rs`: delete the `listening` leg and a
+daemon-shaped session writes the peer's bytes into its sink; delete the trust
+leg and a revoked peer's arrive. The tests fail because the bytes really do
+land, not because a predicate returned the wrong bool.
+
+**What the trust gate does and does not buy.** PeerBeam's handshake is
+trust-on-first-use, so a peer connecting for the first time is *pinned as it
+connects* and is therefore trusted by the time the gate is asked. Against a
+device the user has explicitly revoked, gate 2 is what refuses. Against a
+stranger on the LAN who has never connected before, the work is done by gate 1
+(they must find a listener running at all, in the seconds it is up, for one
+stream) and by `--from` (which refuses anyone but the named device outright).
+`--from` is the right tool when the listener will be up for a while or the
+network is not trusted; `device.require_pairing_confirmation` remains the
+general answer to first-contact verification.
+
+**A pipe cannot un-write stdout.** Bytes are written and flushed as they arrive
+— that is what makes a 40 GB stream possible — so by the time the stream turns
+out to be truncated or corrupt, they are already in the user's file. The stream
+therefore ends only on an explicit `Complete{checksum}`, which is verified
+against what was actually written: a dropped connection is an **error**, never a
+clean end, and a mismatch is an error too. Both exit non-zero. That exit code is
+the only signal a script gets, and `peerbeam pipe --listen > f` without checking
+it will happily trust a bad `f`.
+
 ## Threat notes / scope
 
 - The handshake authenticates *keys*; binding a key to a human-meaningful
