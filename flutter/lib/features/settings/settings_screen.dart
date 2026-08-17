@@ -193,16 +193,49 @@ class SettingsScreen extends StatelessWidget {
                         for (var i = 0; i < pins.length; i++) ...[
                           if (i > 0) const Divider(height: 1),
                           ListTile(
-                            leading: const Icon(Icons.verified_user_rounded),
+                            // A pinned-but-unapproved device is a stranger that
+                            // reached this machine once and had its key
+                            // recorded, not a device the user chose. Only an
+                            // approved one is sent presence, clipboard contents
+                            // or an accepted pipe, so the two must not look
+                            // alike here — the shield is what says "you chose
+                            // this".
+                            leading: Icon(
+                              pins[i].approved
+                                  ? Icons.verified_user_rounded
+                                  : Icons.help_outline_rounded,
+                              color: pins[i].approved
+                                  ? null
+                                  : Theme.of(context).colorScheme.outline,
+                            ),
                             title: Text(
                               pins[i].name.isEmpty ? pins[i].id : pins[i].name,
                             ),
-                            subtitle: Text(
-                              _shortFingerprint(pins[i].fingerprint),
-                              style: const TextStyle(
-                                fontFeatures: [FontFeature.tabularFigures()],
-                              ),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _shortFingerprint(pins[i].fingerprint),
+                                  style: const TextStyle(
+                                    fontFeatures: [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                  ),
+                                ),
+                                if (!pins[i].approved)
+                                  Text(
+                                    'Seen once — not approved. Accept a '
+                                    'transfer from it to approve.',
+                                    style: Theme.of(context).textTheme.bodySmall
+                                        ?.copyWith(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                        ),
+                                  ),
+                              ],
                             ),
+                            isThreeLine: !pins[i].approved,
                             trailing: IconButton(
                               tooltip: 'Revoke trust',
                               icon: const Icon(Icons.link_off_rounded),

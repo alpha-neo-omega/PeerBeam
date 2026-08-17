@@ -310,11 +310,25 @@ class TrustedDevice {
   final String fingerprint;
   final DateTime trustedAt;
 
+  /// Whether the **user** chose this device, as opposed to the handshake
+  /// having pinned its key.
+  ///
+  /// Every never-seen peer is pinned as it connects — that pin is what makes a
+  /// later key change detectable — so this list includes strangers that merely
+  /// reached this device once. Only an approved device may be sent presence,
+  /// clipboard contents, or an accepted pipe, so rendering the two alike would
+  /// tell the user a stranger is trusted.
+  ///
+  /// Defaults to `false` for an engine that predates the field: unknown is not
+  /// approval.
+  final bool approved;
+
   const TrustedDevice({
     required this.id,
     required this.name,
     required this.fingerprint,
     required this.trustedAt,
+    this.approved = false,
   });
 
   factory TrustedDevice.fromJson(Map<String, dynamic> j) => TrustedDevice(
@@ -323,6 +337,7 @@ class TrustedDevice {
     fingerprint: j['fingerprint'] as String? ?? '',
     trustedAt:
         DateTime.tryParse(j['trusted_at'] as String? ?? '') ?? DateTime.now(),
+    approved: j['approved'] as bool? ?? false,
   );
 }
 

@@ -1649,7 +1649,15 @@ impl Manager {
         Ok(json!({ "history": *self.history.lock().unwrap() }))
     }
 
-    /// Pinned (trusted) devices, newest first.
+    /// Pinned devices, newest first.
+    ///
+    /// `approved` is the difference between "this key was pinned when the
+    /// device connected" and "the user chose this device". Every never-seen
+    /// peer is pinned by the authenticated handshake so a later key change is
+    /// detectable, so this list contains strangers as well as the user's own
+    /// machines — and only the approved ones may be sent presence, clipboard
+    /// contents, or an accepted pipe. A surface that renders the two alike
+    /// tells the user a stranger is trusted.
     pub fn trust_list(&self) -> Op {
         let devices: Vec<Value> = self
             .trust
@@ -1661,6 +1669,7 @@ impl Manager {
                     "name": r.name,
                     "fingerprint": r.fingerprint,
                     "trusted_at": r.trusted_at.to_rfc3339(),
+                    "approved": r.approved,
                 })
             })
             .collect();
