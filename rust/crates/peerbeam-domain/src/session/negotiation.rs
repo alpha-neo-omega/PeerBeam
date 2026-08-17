@@ -104,6 +104,31 @@ pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
 /// [`CapabilitySet::intersect`] ANDs it away against a peer that predates it.
 pub const CHAT_FEAT_FILEDECLINE: u32 = 1 << 1;
 
+/// Feature bit on the PRESENCE capability: this peer understands the `Status`
+/// message (presence MessageType 1) — device status heartbeats sent to it will
+/// mean something.
+///
+/// **A receive capability, read exactly like the two CHAT bits above**: the
+/// party that consults it is the one *sending* a `Status`, asking whether the
+/// PEER negotiated the bit before putting one on the wire. It asserts
+/// comprehension, not behaviour — a device with the opt-in setting off still
+/// advertises this truthfully, because it can display an incoming status
+/// perfectly well while sending none of its own. That separation is the whole
+/// point: receiving is unconditional, sending is gated.
+///
+/// It rides the `Capability.features` bitset already on the wire, so
+/// advertising it is not a wire change: a peer that predates Presence never
+/// advertises the PRESENCE channel at all, `CapabilitySet::intersect` drops it,
+/// and no `Status` is ever sent to it. A peer that advertises PRESENCE with
+/// `features: 0` has the bit ANDed away and is likewise sent nothing — it shows
+/// as "status not shared" rather than as an error.
+///
+/// Note the feature bit is the *third* of three independent gates on a send;
+/// the other two — the opt-in setting and the trusted-only rule — are local
+/// privacy decisions and are not negotiable by a peer. See
+/// `peerbeam_presence::may_share_status`.
+pub const PRESENCE_FEAT_STATUS: u32 = 1 << 0;
+
 /// One advertised capability: a channel type the peer supports, with a bitset of
 /// optional per-capability feature flags (`0` = base capability, no extras).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +340,27 @@ mod tests {
         assert_eq!(common.len(), 1);
         assert_eq!(common.features(ChannelType::CONTROL), Some(0b101));
         assert!(!common.supports(ChannelType::TRANSFER));
+    }
+
+    /// The three feature bits assigned so far live in two *separate* namespaces
+    /// (`Capability.features` is per-channel), so PRESENCE bit 0 and CHAT bit 0
+    /// sharing a value is correct and must not be "fixed". What would be a real
+    /// bug is reading one channel's bits off the other's capability, so this
+    /// pins that `features()` is keyed by channel.
+    #[test]
+    fn feature_bits_are_scoped_to_their_own_channel() {
+        let set = CapabilitySet::new()
+            .with(Capability::with_features(
+                ChannelType::CHAT,
+                CHAT_FEAT_FILEREF,
+            ))
+            .with(Capability::new(ChannelType::PRESENCE)); // PRESENCE, no features
+        assert_eq!(set.features(ChannelType::CHAT), Some(CHAT_FEAT_FILEREF));
+        assert_eq!(
+            set.features(ChannelType::PRESENCE),
+            Some(0),
+            "PRESENCE must not inherit CHAT's bits despite the same bit index"
+        );
     }
 
     #[test]

@@ -82,6 +82,90 @@ pub fn available_bytes(path: &str) -> Option<u64> {
     }
 }
 
+/// This device's battery reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Battery {
+    /// Charge level, 0-100.
+    pub percent: u8,
+    /// Whether it is charging right now; `None` when the state is unreadable or
+    /// the kernel reports `Unknown`. Deliberately separate from `percent`:
+    /// knowing the level says nothing about the direction it is moving.
+    pub charging: Option<bool>,
+}
+
+/// This device's battery, or `None` when it has none or cannot read one.
+///
+/// Lives here for the same reason [`available_bytes`] does: this crate is the
+/// one place that touches host specifics.
+///
+/// **Coverage is deliberately partial.** Linux reads `/sys/class/power_supply`,
+/// which is already present and costs one small file read. Every other platform
+/// returns `None` — Windows and macOS would each need a new dependency or a
+/// hand-rolled `unsafe` FFI binding for a number that is a nicety, and Android
+/// is served from above by the Flutter layer's `BatteryManager` access. `None`
+/// is a first-class answer here, not a gap: a desktop with no battery is the
+/// case the presence schema was built around.
+#[must_use]
+pub fn battery() -> Option<Battery> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_battery()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Read the first system battery under `/sys/class/power_supply`.
+///
+/// Entries are filtered to `type == "Battery"`, which excludes the AC adapter
+/// (`Mains`) that sits beside it and has no capacity at all. Among batteries,
+/// a `BAT*`-named one wins: that is the kernel's convention for the machine's
+/// own pack, and it keeps a connected game controller or wireless mouse — which
+/// also registers as a `Battery` — from being reported as this laptop's charge.
+#[cfg(target_os = "linux")]
+fn linux_battery() -> Option<Battery> {
+    let read = |dir: &std::path::Path, file: &str| -> Option<String> {
+        std::fs::read_to_string(dir.join(file))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+
+    let mut fallback: Option<Battery> = None;
+    for entry in std::fs::read_dir("/sys/class/power_supply").ok()?.flatten() {
+        let path = entry.path();
+        if read(&path, "type").as_deref() != Some("Battery") {
+            continue;
+        }
+        let Some(percent) = read(&path, "capacity").and_then(|c| c.parse::<u8>().ok()) else {
+            continue;
+        };
+        if percent > 100 {
+            // A kernel that reports an impossible level has not measured
+            // anything; skip it rather than pass it on to be rejected on the
+            // wire (peerbeam_presence::Status::to_frame would refuse it).
+            continue;
+        }
+        let charging = match read(&path, "status").as_deref() {
+            Some("Charging") => Some(true),
+            // "Full" is not charging: the pack is done taking current.
+            Some("Discharging" | "Full" | "Not charging") => Some(false),
+            _ => None,
+        };
+        let battery = Battery { percent, charging };
+        let is_system_pack = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("BAT"));
+        if is_system_pack {
+            return Some(battery);
+        }
+        fallback.get_or_insert(battery);
+    }
+    fallback
+}
+
 /// Last-resort writable location when the OS provides no standard dir.
 fn temp_fallback() -> PathBuf {
     std::env::temp_dir().join(APP_DIR)
@@ -119,5 +203,32 @@ mod tests {
     #[test]
     fn available_bytes_is_none_when_nothing_in_the_path_exists() {
         assert_eq!(available_bytes(""), None);
+    }
+
+    /// Whatever this host is, the answer must be *expressible*: either no
+    /// battery (a desktop, a CI box, a non-Linux target) or a reading inside
+    /// the range the presence wire type accepts. A collector that could emit
+    /// 137% would have its own status refused by `Status::to_frame`.
+    #[test]
+    fn battery_is_either_absent_or_a_reading_in_range() {
+        match battery() {
+            None => {}
+            Some(b) => assert!(
+                b.percent <= 100,
+                "a battery reading outside 0-100 is not a measurement: {b:?}"
+            ),
+        }
+    }
+
+    /// Calling it must never panic or block, on any host — it runs on a
+    /// 60-second timer inside a live session.
+    #[test]
+    fn battery_is_cheap_and_repeatable() {
+        let first = battery();
+        let second = battery();
+        // Not asserting equality: a real battery may tick between calls. What
+        // matters is that both calls answer at all, consistently about whether
+        // this machine HAS one.
+        assert_eq!(first.is_some(), second.is_some());
     }
 }

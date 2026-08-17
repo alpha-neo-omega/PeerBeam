@@ -1325,6 +1325,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-presence"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "peerbeam-platform",
+ "peerbeam-transfer",
+ "peerbeam-trust-fs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "peerbeam-reliability-fs"
 version = "0.4.1"
 dependencies = [

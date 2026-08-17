@@ -101,6 +101,8 @@ impl ChannelType {
     pub const TRANSFER: ChannelType = ChannelType(0x0100);
     /// Text/markdown chat messages (Phase B). See MESSAGE_REGISTRY.md §2.
     pub const CHAT: ChannelType = ChannelType(0x0101);
+    /// Device status heartbeats (Phase B). See MESSAGE_REGISTRY.md §2.
+    pub const PRESENCE: ChannelType = ChannelType(0x0103);
 
     /// Construct from a raw registry id.
     #[must_use]
@@ -192,5 +194,16 @@ mod tests {
         assert_eq!(ChannelType::CHAT.get(), 0x0101);
         assert!(ChannelType::CHAT.is_first_party());
         assert!(!ChannelType::CHAT.is_control());
+    }
+
+    /// `0x0103` is the id `docs/MESSAGE_REGISTRY.md` §2 reserved for Presence.
+    /// Pinned because the registry ids are a long-term wire contract: they are
+    /// never renumbered, so a change here is a wire break, not a refactor.
+    #[test]
+    fn presence_channel_type_is_0x0103_and_first_party() {
+        assert_eq!(ChannelType::PRESENCE.get(), 0x0103);
+        assert!(ChannelType::PRESENCE.is_first_party());
+        assert!(!ChannelType::PRESENCE.is_control());
+        assert_ne!(ChannelType::PRESENCE, ChannelType::CHAT);
     }
 }

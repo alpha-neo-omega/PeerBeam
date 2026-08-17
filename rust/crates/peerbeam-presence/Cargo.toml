@@ -1,0 +1,24 @@
+[package]
+name = "peerbeam-presence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+peerbeam-platform = { workspace = true }
+peerbeam-transfer = { path = "../peerbeam-transfer" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+tempfile = { workspace = true }
