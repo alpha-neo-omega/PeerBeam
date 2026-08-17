@@ -32,7 +32,7 @@ char*    pb_init(const char* config_json);     // "" → defaults
 void     pb_shutdown(void);
 void     pb_set_event_callback(void (*cb)(const char*));  // null clears
 void     pb_free_string(char*);
-char*    pb_discovery_start(void);
+char*    pb_discovery_start(void);             // {"discovering":true,"port"?}
 char*    pb_discovery_stop(void);
 char*    pb_devices_json(void);                // {"devices":[…]}
 ```
@@ -50,6 +50,13 @@ retrying the exact same call will not clear it on its own — the offending entr
 may not even belong to the conversation being deleted, since the outbox is
 shared across every peer. Any other failure of the same calls still reports
 `internal`.
+
+`pb_discovery_start`'s result additionally carries `port`: the UDP discovery
+port actually bound (`peerbeam_config::DiscoveryConfig::port`, default
+`DEFAULT_DISCOVERY_PORT`; `0` requests an OS-assigned one — see
+[DISCOVERY.md](DISCOVERY.md)), read back via `UdpDiscovery::bound_port()` once
+`start_discovery` has returned. Purely additive: `discovering` keeps its
+existing key and a caller that ignores `port` is unaffected.
 
 ### Transfer (M2, additive — ABI still v1)
 

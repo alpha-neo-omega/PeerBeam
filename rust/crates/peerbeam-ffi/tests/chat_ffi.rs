@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use peerbeam_chat::{ChatHandler, ChatRecord, ChatStore, FileRef, ReceivedSink};
 use peerbeam_config::EngineConfig;
 use peerbeam_crypto::{derive_subkey, AeadCrypto};
-use peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT;
 use peerbeam_domain::entity::{Direction, Route, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, Frame, FrameKind, TrustStore};
@@ -181,15 +180,43 @@ fn call_json(f: unsafe extern "C" fn(*const c_char) -> *mut c_char, v: &Value) -
     take(unsafe { f(c.as_ptr()) })
 }
 
-fn init_ffi(port: u16, dir: &std::path::Path) {
-    pb_set_event_callback(Some(on_event));
-    EVENTS.lock().unwrap().clear();
+/// The `EngineConfig` both `init_ffi` variants below send to `pb_init`,
+/// pulled out so the discovery-port override doesn't duplicate the rest of
+/// the setup.
+fn ffi_config(port: u16, dir: &std::path::Path) -> EngineConfig {
     let mut cfg = EngineConfig::default();
     cfg.transfer.port = port;
     cfg.storage.save_directory = dir.join("recv").to_string_lossy().into_owned();
     cfg.storage.data_directory = dir.join("data").to_string_lossy().into_owned();
     cfg.device.auto_accept_trusted = false;
     std::fs::create_dir_all(dir.join("recv")).unwrap();
+    cfg
+}
+
+fn init_ffi(port: u16, dir: &std::path::Path) {
+    pb_set_event_callback(Some(on_event));
+    EVENTS.lock().unwrap().clear();
+    let cfg = ffi_config(port, dir);
+    let c = CString::new(serde_json::to_string(&cfg).unwrap()).unwrap();
+    let v = take(unsafe { pb_init(c.as_ptr()) });
+    assert_eq!(v["ok"], true, "init: {v}");
+}
+
+/// Like `init_ffi`, but also requests an OS-assigned UDP discovery port
+/// (`0`) instead of the well-known default. For the tests that actually call
+/// `pb_discovery_start`: `build_socket` sets `SO_REUSEPORT`, so any other
+/// PeerBeam process on the machine can also be bound to
+/// `DEFAULT_DISCOVERY_PORT`, and this test's `Announce` is unicast (not real
+/// LAN broadcast) — the kernel load-balances a unicast datagram aimed at a
+/// SO_REUSEPORT group across every bound socket by hash, so it would land on
+/// this engine only about half the time. Binding an ephemeral port instead
+/// makes the test immune to that: nothing else on the machine can be bound to
+/// a port this process just asked the OS to assign.
+fn init_ffi_ephemeral_discovery(port: u16, dir: &std::path::Path) {
+    pb_set_event_callback(Some(on_event));
+    EVENTS.lock().unwrap().clear();
+    let mut cfg = ffi_config(port, dir);
+    cfg.discovery.port = 0;
     let c = CString::new(serde_json::to_string(&cfg).unwrap()).unwrap();
     let v = take(unsafe { pb_init(c.as_ptr()) });
     assert_eq!(v["ok"], true, "init: {v}");
@@ -464,12 +491,18 @@ fn announce_json(id: &str, port: u16) -> Vec<u8> {
 }
 
 /// Repeatedly announce `id`/`port` to the FFI engine's UDP discovery port
-/// (bound by `pb_discovery_start`) every 750ms — comfortably inside
+/// (bound by `pb_discovery_start` — `discovery_port` is the value read back
+/// from its result, not the well-known default: see
+/// `init_ffi_ephemeral_discovery`) every 750ms — comfortably inside
 /// `peerbeam_discovery_udp`'s default 6s liveness TTL — so the peer stays
 /// visible (and `online`) in `engine.devices()` for as long as the returned
 /// task keeps running. Abort it once the test no longer needs the peer to
 /// look reachable.
-fn spawn_periodic_announce(id: &str, port: u16) -> tokio::task::JoinHandle<()> {
+fn spawn_periodic_announce(
+    id: &str,
+    port: u16,
+    discovery_port: u16,
+) -> tokio::task::JoinHandle<()> {
     let id = id.to_string();
     tokio::spawn(async move {
         let sock = UdpSocket::bind("127.0.0.1:0")
@@ -477,10 +510,7 @@ fn spawn_periodic_announce(id: &str, port: u16) -> tokio::task::JoinHandle<()> {
             .expect("bind announce socket");
         loop {
             let _ = sock
-                .send_to(
-                    &announce_json(&id, port),
-                    ("127.0.0.1", DEFAULT_DISCOVERY_PORT),
-                )
+                .send_to(&announce_json(&id, port), ("127.0.0.1", discovery_port))
                 .await;
             tokio::time::sleep(Duration::from_millis(750)).await;
         }
@@ -791,16 +821,20 @@ async fn chat_only_dial_does_not_register_phantom_transfer() {
 ///
 /// Real LAN/mDNS/Tailscale broadcast hardware isn't available in a test
 /// sandbox, so "discovery reports the peer online" is driven directly: a raw
-/// UDP `Announce` datagram is sent straight at the FFI engine's own
-/// discovery socket (`pb_discovery_start` binds
-/// `peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT`), re-sent periodically so
-/// the peer doesn't age out of the provider's liveness TTL before the
-/// drain's 15s tick fires.
+/// UDP `Announce` datagram is sent straight at the FFI engine's own discovery
+/// socket. That socket is bound to an OS-assigned port (`init_ffi_ephemeral_discovery`
+/// requests port `0`; `pb_discovery_start`'s result reports which one it got),
+/// not `peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT` — the well-known port
+/// is a `SO_REUSEPORT` group any other PeerBeam process on the machine may
+/// share, and this datagram is unicast, not real broadcast, so it would
+/// otherwise land on this engine only about half the time. Re-sent
+/// periodically so the peer doesn't age out of the provider's liveness TTL
+/// before the drain's 15s tick fires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
     let dir = tempfile::tempdir().unwrap();
-    init_ffi(49902, dir.path());
+    init_ffi_ephemeral_discovery(49902, dir.path());
 
     // `runtime::discovery_start` blocks on the shared runtime directly (no
     // `Handle::try_current` fallback like `shutdown`/`init` have) — calling
@@ -812,6 +846,9 @@ async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
         .join()
         .unwrap();
     assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+    let discovery_port = discovery["data"]["port"]
+        .as_u64()
+        .expect("discovery_start must report the bound port") as u16;
 
     let peer_id = "drain-peer";
     let peer_port: u16 = 49964;
@@ -905,7 +942,7 @@ async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
     // The manual peer never dials the FFI engine, so `handle_incoming`'s own
     // flush-on-connect cannot be what delivers this message — only the new
     // periodic drain tick can, since it dials out on the FFI's own schedule.
-    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+    let announce_task = spawn_periodic_announce(peer_id, peer_port, discovery_port);
 
     // 3) Wait (bounded, generous enough for one ~15s `DRAIN_EVERY` tick
     // measured from `pb_init`, of which ~9s has already elapsed above) for the
@@ -1901,9 +1938,13 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
     // The user's own file goes away — the whole reason staging exists.
     std::fs::remove_file(&src).unwrap();
 
-    // 2) Restart the process against the same data directory.
+    // 2) Restart the process against the same data directory. Ephemeral
+    // discovery port: this run goes on to call `pb_discovery_start` below,
+    // and a well-known-port datagram would land on this engine only about
+    // half the time if another PeerBeam process on the machine also holds it
+    // (see `init_ffi_ephemeral_discovery`).
     pb_shutdown();
-    init_ffi(49913, dir.path());
+    init_ffi_ephemeral_discovery(49913, dir.path());
     let after_restart = chat_row(peer_id, &id).expect("the row survives a restart");
     assert_eq!(
         after_restart["status"], "pending",
@@ -1916,6 +1957,9 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
         .join()
         .unwrap();
     assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+    let discovery_port = discovery["data"]["port"]
+        .as_u64()
+        .expect("discovery_start must report the bound port") as u16;
 
     let (enc, trust, identity) = peer_identity(dir.path(), peer_id);
     let recv_quic = QuicTransport::new().unwrap();
@@ -1980,7 +2024,7 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
         .await
         .expect("peer receives the queued file")
     });
-    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+    let announce_task = spawn_periodic_announce(peer_id, peer_port, discovery_port);
 
     // 4) The drain delivers it: same id, same bytes, and the source is gone.
     let got = tokio::time::timeout(Duration::from_secs(45), peer_task)
@@ -2715,7 +2759,11 @@ async fn chat_conversations_lists_a_peer_whose_only_row_is_a_file() {
 #[serial_test::serial]
 async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_delivers_it() {
     let dir = tempfile::tempdir().unwrap();
-    init_ffi(49922, dir.path());
+    // Ephemeral discovery port: this test calls `pb_discovery_start` below,
+    // and a well-known-port datagram would land on this engine only about
+    // half the time if another PeerBeam process on the machine also holds it
+    // (see `init_ffi_ephemeral_discovery`).
+    init_ffi_ephemeral_discovery(49922, dir.path());
 
     let peer_id = "delete-peer";
     let peer_port: u16 = 49982;
@@ -2799,6 +2847,9 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
         .join()
         .unwrap();
     assert_eq!(discovery["ok"], true, "discovery_start: {discovery}");
+    let discovery_port = discovery["data"]["port"]
+        .as_u64()
+        .expect("discovery_start must report the bound port") as u16;
 
     let (enc, trust, identity) = peer_identity(dir.path(), peer_id);
     let recv_quic = QuicTransport::new().unwrap();
@@ -2863,7 +2914,7 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
         .await
         .expect("peer receives the queued file")
     });
-    let announce_task = spawn_periodic_announce(peer_id, peer_port);
+    let announce_task = spawn_periodic_announce(peer_id, peer_port, discovery_port);
 
     // The drain delivers it — after the delete, from the staged copy.
     let got = tokio::time::timeout(Duration::from_secs(45), peer_task)

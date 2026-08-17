@@ -7,6 +7,24 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Fixed
+- **A sandboxed FFI test no longer fights other PeerBeam processes for the
+  discovery port.** `peerbeam-discovery-udp`'s socket binds with
+  `SO_REUSEPORT`, so more than one PeerBeam process on the same machine can
+  bind the well-known discovery port (`49500`) at once; for a **unicast**
+  datagram the kernel then load-balances by hash across every bound socket,
+  delivering it to whichever process the hash happens to pick. Three tests in
+  `rust/crates/peerbeam-ffi/tests/chat_ffi.rs` simulate a peer coming online
+  by firing such a datagram straight at that port (no real LAN broadcast in a
+  sandbox), so on a machine already running a PeerBeam GUI or CLI it landed on
+  the wrong process roughly half the time and the drain never fired — a
+  genuinely broken test and this flake were indistinguishable. `UdpDiscovery`
+  already supported a configurable port (`Config::port` / `bound_port()`);
+  the gap was `peerbeam-ffi`, which hardcoded the default. `peerbeam-config`'s
+  `DiscoveryConfig` gains a `port` field (default unchanged), the FFI runtime
+  now constructs `UdpDiscovery` with it via `with_config`, and
+  `pb_discovery_start`'s result additively carries the port actually bound.
+  The affected tests now request an OS-assigned port and send their announce
+  there instead, making them immune to whatever else is running on the host.
 - **Android: picking a second batch of files no longer destroys the first
   batch's bytes while they were still in use.** The native picker streams
   every pick into `cacheDir/picked`, and `preparePickedDir` wiped that whole

@@ -14,7 +14,7 @@ use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_discovery_mdns::MdnsDiscovery;
 use peerbeam_discovery_tailscale::{Config as TsConfig, TailscaleDiscovery};
-use peerbeam_discovery_udp::UdpDiscovery;
+use peerbeam_discovery_udp::{Config as UdpConfig, UdpDiscovery};
 use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::event::DeviceChange;
 use peerbeam_domain::id::DeviceId;
@@ -37,6 +37,13 @@ static MANAGER: Mutex<Option<Arc<Manager>>> = Mutex::new(None);
 /// `pb_diagnostics_json` calls read. Reuses the engine's `SessionDiagnostics` —
 /// no duplicated state.
 static DIAGNOSTICS: Mutex<Option<Arc<SessionDiagnostics>>> = Mutex::new(None);
+/// The concrete UDP discovery provider, held alongside the `Arc<dyn
+/// DiscoveryProvider>` clone registered with the engine. `DiscoveryProvider`
+/// has no `bound_port()` of its own (only `UdpDiscovery` does — it is
+/// meaningless for e.g. Tailscale), and the bound port can only be read
+/// *after* the socket exists, i.e. after `start_discovery` has run — so
+/// `discovery_start` reaches through this static rather than the engine.
+static UDP_DISCOVERY: Mutex<Option<Arc<UdpDiscovery>>> = Mutex::new(None);
 /// Tracks whether discovery is currently running, so a live rename knows
 /// whether to re-announce (no equivalent query exists on `Engine` itself).
 static DISCOVERING: AtomicBool = AtomicBool::new(false);
@@ -329,8 +336,21 @@ pub fn init(config_json: &str) -> OpResult {
     .map_err(crate::error::from_domain)?;
     let device_id = identity.device_id.clone();
 
-    let mut builder = EngineBuilder::new(config.clone())
-        .with_discovery(Arc::new(UdpDiscovery::new(device_id.clone())));
+    // `with_config`, not `new`: the port is configurable
+    // (`config.discovery.port`, default `DEFAULT_DISCOVERY_PORT`) so a
+    // caller — namely our own test suite — can ask for an OS-assigned one
+    // instead of the well-known port another process on the machine may
+    // already hold. The concrete `Arc<UdpDiscovery>` is kept in `UDP_DISCOVERY`
+    // (alongside the `Arc<dyn DiscoveryProvider>` clone handed to the engine
+    // below) so `discovery_start` can read back the port actually bound.
+    let udp_discovery = Arc::new(UdpDiscovery::with_config(
+        device_id.clone(),
+        UdpConfig {
+            port: config.discovery.port,
+            ..UdpConfig::default()
+        },
+    ));
+    let mut builder = EngineBuilder::new(config.clone()).with_discovery(udp_discovery.clone());
     if let Ok(mdns) = MdnsDiscovery::new(device_id.clone()) {
         builder = builder.with_discovery(Arc::new(mdns));
     }
@@ -445,6 +465,7 @@ pub fn init(config_json: &str) -> OpResult {
     *lock(&MANAGER) = Some(manager);
     *lock(&DIAGNOSTICS) = Some(diagnostics);
     *lock(&CHAT_DRAIN) = Some(drain_handle);
+    *lock(&UDP_DISCOVERY) = Some(udp_discovery);
     Ok(json!({ "initialised": true }))
 }
 
@@ -502,6 +523,7 @@ pub fn shutdown() {
     *lock(&ME) = None;
     *lock(&MANAGER) = None;
     *lock(&DIAGNOSTICS) = None;
+    *lock(&UDP_DISCOVERY) = None;
     // Drain any in-flight emit() before returning: set_callback(None) takes
     // an exclusive lock that blocks until every emitter's shared (read) guard
     // has released, so once this returns no emitter can still be holding the
@@ -517,7 +539,17 @@ pub fn discovery_start() -> OpResult {
     rt().block_on(engine.start_discovery(me))
         .map_err(crate::error::from_engine)?;
     DISCOVERING.store(true, Ordering::SeqCst);
-    Ok(json!({ "discovering": true }))
+
+    // Additive: `bound_port()` only resolves once `start_discovery` has bound
+    // the socket (above), which is why this reads it here rather than at
+    // construction. Lets a caller that requested port `0` (an OS-assigned
+    // port — e.g. our own test suite) learn what it actually got; existing
+    // callers that only look at `discovering` are unaffected.
+    let mut result = json!({ "discovering": true });
+    if let Some(port) = lock(&UDP_DISCOVERY).as_ref().and_then(|d| d.bound_port()) {
+        result["port"] = json!(port);
+    }
+    Ok(result)
 }
 
 pub fn discovery_stop() -> OpResult {
@@ -538,6 +570,22 @@ pub fn devices() -> OpResult {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// `peerbeam-config` declares its default discovery port as a bare literal
+    /// (`49500`) rather than depending on `peerbeam-discovery-udp` just to
+    /// name the constant — see that field's `Default` impl for why. This
+    /// crate already depends on both, so it is where the two are guarded from
+    /// drifting apart: if either default ever changes without the other, this
+    /// fails loudly instead of the two quietly disagreeing at runtime (an
+    /// existing config's "default" port silently no longer matching the
+    /// provider's own default).
+    #[test]
+    fn discovery_config_default_port_matches_udp_default() {
+        assert_eq!(
+            EngineConfig::default().discovery.port,
+            peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT
+        );
+    }
 
     /// A burst larger than the broadcast channel's capacity must not kill the
     /// forwarder: `recv()` returns `Err(Lagged(_))` once the receiver falls

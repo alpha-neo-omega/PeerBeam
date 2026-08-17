@@ -72,6 +72,14 @@ pub struct DiscoveryConfig {
     pub enabled: bool,
     /// How often to re-scan, in milliseconds.
     pub scan_interval_ms: u64,
+    /// UDP discovery port to bind and broadcast on
+    /// (`peerbeam_discovery_udp::Config::port`). `0` lets the OS assign an
+    /// ephemeral port — useful in tests, meaningless in production since
+    /// peers only find each other by announcing on a shared, known port.
+    /// A non-default value only makes sense when something else on the LAN
+    /// already occupies the well-known port: peers configured with
+    /// different discovery ports will not discover one another.
+    pub port: u16,
 }
 
 /// Transfer configuration.
@@ -141,6 +149,13 @@ impl Default for DiscoveryConfig {
         Self {
             enabled: true,
             scan_interval_ms: 2000,
+            // Kept as a literal rather than a dependency on
+            // peerbeam-discovery-udp (this crate stays a dependency leaf).
+            // Source of truth: `peerbeam_discovery_udp::DEFAULT_DISCOVERY_PORT`.
+            // `peerbeam-ffi` already depends on both crates, so its test
+            // suite (`runtime.rs`'s `discovery_config_default_port_matches_udp_default`)
+            // asserts the two agree so they cannot silently drift apart.
+            port: 49500,
         }
     }
 }
@@ -302,5 +317,25 @@ mod compat_tests {
             serde_json::from_str(r#"{"device":{"name":"x","require_pairing_confirmation":true}}"#)
                 .unwrap();
         assert!(cfg.device.require_pairing_confirmation);
+    }
+
+    /// `DiscoveryConfig::port` must default to the well-known discovery port
+    /// (kept here as a literal — see the `Default` impl's comment for why —
+    /// and cross-checked against the real constant by
+    /// `peerbeam-ffi`'s `discovery_config_default_port_matches_udp_default`,
+    /// the one crate that already depends on both), and every config file
+    /// written before this field existed must still load.
+    #[test]
+    fn discovery_port_defaults_and_survives_a_config_that_predates_it() {
+        assert_eq!(DiscoveryConfig::default().port, 49500);
+
+        // Absent in JSON -> the default, via serde(default).
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"device":{"name":"old-box"}}"#).expect("pre-existing config");
+        assert_eq!(cfg.discovery.port, 49500);
+
+        // Present -> honored (e.g. `0` for an OS-assigned port in tests).
+        let cfg: EngineConfig = serde_json::from_str(r#"{"discovery":{"port":0}}"#).unwrap();
+        assert_eq!(cfg.discovery.port, 0);
     }
 }
