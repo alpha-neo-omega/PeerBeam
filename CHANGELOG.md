@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-17 — Beta
+
 ### Added
 - **Select messages in a conversation, then forward or delete them.** A
   long-press on a bubble starts a selection (right-click on desktop, where a
