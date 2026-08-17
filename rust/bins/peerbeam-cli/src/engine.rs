@@ -7,7 +7,7 @@ use peerbeam_config::EngineConfig;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_discovery_mdns::MdnsDiscovery;
 use peerbeam_discovery_tailscale::{Config as TsConfig, TailscaleDiscovery};
-use peerbeam_discovery_udp::UdpDiscovery;
+use peerbeam_discovery_udp::{Config as UdpConfig, UdpDiscovery};
 use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::DeviceId;
@@ -62,8 +62,16 @@ pub fn build_engine(config: EngineConfig) -> DResult<Engine> {
         peer_port: config.transfer.port,
         ..TsConfig::default()
     };
-    let mut builder =
-        EngineBuilder::new(config).with_discovery(Arc::new(UdpDiscovery::new(id.clone())));
+    // `with_config`, not `new`, for the same reason the FFI runtime uses it:
+    // `discovery.port` is a real setting now, and a binary that quietly ignored
+    // it would be worse than one that never offered it — the user would set the
+    // key, see no error, and get the well-known port anyway.
+    let udp = UdpConfig {
+        port: config.discovery.port,
+        ..UdpConfig::default()
+    };
+    let mut builder = EngineBuilder::new(config)
+        .with_discovery(Arc::new(UdpDiscovery::with_config(id.clone(), udp)));
 
     if let Ok(mdns) = MdnsDiscovery::new(id.clone()) {
         builder = builder.with_discovery(Arc::new(mdns));

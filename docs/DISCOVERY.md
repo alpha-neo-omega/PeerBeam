@@ -30,9 +30,12 @@ The bind/broadcast port is configurable (`Config::port`, default
 `UdpDiscovery::bound_port()` reports back which one was actually bound once
 the socket exists. `peerbeam-config`'s `DiscoveryConfig::port` mirrors this
 default (as a literal, so the config crate stays dependency-free of this
-one) and is what `peerbeam-ffi` passes to `UdpDiscovery::with_config`,
-surfacing the bound port additively in `pb_discovery_start`'s result — see
-[FFI.md](FFI.md). A non-default value only makes sense when something else
+one) and is what **both** surfaces pass to `UdpDiscovery::with_config` — the
+FFI runtime and the CLI's engine builder. The FFI additionally surfaces the
+bound port in `pb_discovery_start`'s result — see [FFI.md](FFI.md). Both
+honour the setting deliberately: a binary that read the key and ignored it
+would be worse than one that never offered it, because the user would set it,
+see no error, and still get the well-known port. A non-default value only makes sense when something else
 on the LAN already occupies the well-known port: peers configured with
 different discovery ports will not find each other, since discovery is a
 broadcast rendezvous on one shared port.
