@@ -52,6 +52,7 @@ src/resolve.rs    pure peer resolution (id → name → prefix)
 src/engine.rs     build the engine with all discovery providers
 src/exit.rs       typed CliError → stable exit codes
 src/commands.rs   one fn per command + dispatch
+src/trust.rs      trust list/approve/revoke (pinned vs approved)
 ```
 
 ## Commands
@@ -97,9 +98,9 @@ Working now:
   row per peer that has shared). Additive — every pre-existing key is
   unchanged.
 
-  Sharing is off by default, and status is only ever sent to **trusted** peers;
-  that second gate is not configurable. Set `device.share_presence` in the
-  config to opt in.
+  Sharing is off by default, and status is only ever sent to **approved**
+  devices (`peerbeam trust approve`); that second gate is not configurable. Set
+  `device.share_presence` in the config to opt in.
 
   **Clipboard auto-sync is a GUI feature and the CLI does not gain it.**
   `send --clipboard` is unchanged and remains the CLI's manual path. This is a
@@ -308,11 +309,14 @@ Working now:
      no prompt and must not be one: a prompt reads stdin, stdin is the
      payload on the sending side, and a prompt would break the scripted,
      headless use this exists for.
-  2. **Trusted peers only**, not configurable, narrowed to a single device
+  2. **Approved devices only**, not configurable, narrowed to a single device
      with `--from <device>` (a `pb-…` id, or a name resolved through
      discovery — the match is always against the authenticated id, never
-     against the name a peer presents). See [Security](SECURITY.md) for the
-     reasoning and the limits.
+     against the name a peer presents). *Approved*, not merely pinned: a peer
+     is pinned by the handshake as it connects, so a listener that accepted
+     every pinned device would accept every first-contact stranger. Run
+     `peerbeam trust approve <device>` on the listening machine first. See
+     [Security](SECURITY.md) for the reasoning and the limits.
 
   **One stream, then exit.** A listener takes one stream and stops; there is
   no `--keep-open`. A *refused* attempt is not that stream — the listener
@@ -329,6 +333,58 @@ Working now:
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
+- `trust list` / `trust approve <device>` / `trust revoke <device>` — the
+  devices this machine trusts, and **which of them the user actually chose**.
+
+  ```
+  STATUS    DEVICE           NAME          FINGERPRINT          PINNED
+  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11
+  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30
+  ```
+
+  Two states, and the difference is the point. A device is **pinned** by the
+  authenticated handshake the first time it connects — that records its key so
+  a later change is detectable as a possible MITM, and nothing more, so every
+  stranger that has ever reached this machine is pinned. A device is
+  **approved** only when a person says so, and approval is what lets it receive
+  this machine's **presence status, clipboard, and a `pipe --listen`**. Those
+  three gates are not configurable and ask for approval, not for a pin; see
+  [Security](SECURITY.md#pinned-is-not-approved).
+
+  Until this command existed, approving was reachable only from the desktop
+  app's accept-and-trust prompt, so a headless server or a container could not
+  use any of the three at all. Approving needs no daemon, no network and no
+  peer online — it edits this machine's own store:
+
+  ```bash
+  peerbeam trust list --json | jq -r 'select(.approved | not) | .id'
+  peerbeam trust approve pb-f4e4d56fce98 --yes    # scripted: no prompt
+  ```
+
+  `<device>` resolves exactly as `send --to` does — exact id, exact name, then
+  unique name prefix — and an ambiguous prefix is an error listing the
+  candidates (exit `2`), never a guess. A device that matches nothing is exit
+  `3`.
+
+  **`approve` shows the fingerprint it is approving and asks.** On a terminal
+  the prompt carries the full 64-character fingerprint and says what approval
+  grants, so it cannot be answered blind; `--yes` (or `--json`, which is
+  non-interactive by definition) proceeds without prompting, which is what
+  makes it scriptable. Without either, and with no terminal to ask at, it
+  refuses (exit `6`) rather than approving unasked. Approving an
+  already-approved device is a no-op that says so and exits `0`, so a
+  provisioning script is safe to re-run.
+
+  `revoke` removes the **whole record**, not just the approval, so the next
+  connection is a fresh first contact: re-pinned, and unapproved until someone
+  says otherwise. That is what the app's Trusted Devices revoke does too.
+  Revoking a device that is not pinned is exit `3`. There is deliberately no
+  confirmation on `revoke` — it only ever removes standing.
+
+  Under `--json`, `list` emits one object per line
+  (`{"id","name","fingerprint","trusted_at","approved"}`, `approved` an
+  explicit bool and the fingerprint in full); `approve` and `revoke` emit one
+  `trust_approved` / `trust_revoked` event.
 
 Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
 application-layer X25519 mutual-auth handshake with TOFU trust pinning and
@@ -379,6 +435,12 @@ peerbeam pipe --listen --from pb-a1b2c3 | tar xz
 # stream is detected, so this is the only thing that says the file is sound.
 peerbeam pipe --listen > backup.img || echo "incomplete — do not use it"
 
+# Approve a device on a headless box — required before it can be sent this
+# machine's presence status or clipboard, or pipe into a `pipe --listen`.
+peerbeam trust list                                # who is approved, who is only pinned
+peerbeam trust approve pb-f4e4d56fce98 --yes       # scripted: no prompt
+peerbeam trust revoke laptop                       # forget it entirely
+
 # Shell completion (bash; also zsh/fish/powershell)
 peerbeam completions bash > /etc/bash_completion.d/peerbeam
 ```
@@ -415,6 +477,13 @@ emits machine-readable JSON (NDJSON for streaming/long-running commands):
 - `chat history --json` is not a stream: one `{"messages":[…]}` object, each
   message carrying `status` (`staging`/`pending`/`sent`/…) and, for a file,
   `kind:"file"` plus `{"name","size","local_path"}`.
+- `trust list --json` → one object per line:
+  `{"id","name","fingerprint","trusted_at","approved"}`. **`approved` is a
+  bool**, and it is the field to filter on — the presence of a row means only
+  that the device's key was pinned when it connected.
+  `trust approve --json` → one `{"event":"trust_approved",…,"changed":bool}`
+  (`changed:false` when it was already approved, still exit `0`);
+  `trust revoke --json` → one `{"event":"trust_revoked",…,"removed":true}`.
 
 Branch on the exit code for success/failure; parse the JSON for details.
 
@@ -431,9 +500,13 @@ peerbeam --json status | jq -e '.listening' >/dev/null && echo "listening"
 ## Verification
 
 `cargo clippy -D warnings` clean; `cargo test` green (parse + resolver +
-prompt + config round-trip); an **end-to-end test spawns two `peerbeam`
-processes** and transfers a file over QUIC (`tests/transfer_e2e.rs`). Binary
-smoke-tested incl. `send`/`receive` over both discovery and `--addr`.
+prompt + config round-trip + `trust` against a throwaway store,
+`tests/trust_cli.rs`); **end-to-end tests spawn two `peerbeam` processes** and
+transfer a file over QUIC (`tests/transfer_e2e.rs`) or a byte stream
+(`tests/pipe_e2e.rs`) — the latter walking the real approval path: first
+contact pins the sender and is refused, `peerbeam trust approve` grants it, and
+only then does the pipe succeed. Binary smoke-tested incl. `send`/`receive`
+over both discovery and `--addr`.
 
 ## Not yet
 

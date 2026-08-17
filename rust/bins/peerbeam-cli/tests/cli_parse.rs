@@ -1,7 +1,7 @@
 //! Argument-parsing tests for the CLI surface.
 
 use clap::{CommandFactory, Parser};
-use peerbeam_cli::cli::{BenchTarget, ChatAction, Cli, Command, ConfigAction};
+use peerbeam_cli::cli::{BenchTarget, ChatAction, Cli, Command, ConfigAction, TrustAction};
 
 #[test]
 fn command_definition_is_valid() {
@@ -299,4 +299,57 @@ fn pipe_from_and_port_require_listen() {
     assert!(Cli::try_parse_from(["peerbeam", "pipe", "--to", "a", "--from", "pb-b"]).is_err());
     assert!(Cli::try_parse_from(["peerbeam", "pipe", "--to", "a", "--port", "1"]).is_err());
     assert!(Cli::try_parse_from(["peerbeam", "pipe", "--from", "pb-b"]).is_err());
+}
+
+// ── trust ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn trust_subcommands_parse() {
+    let cli = Cli::try_parse_from(["peerbeam", "trust", "list"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Trust(a) if matches!(a.action, TrustAction::List)
+    ));
+
+    let cli = Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop"]).unwrap();
+    match cli.command {
+        Command::Trust(a) => match a.action {
+            TrustAction::Approve { device } => assert_eq!(device, "laptop"),
+            _ => panic!("expected approve"),
+        },
+        _ => panic!("expected trust"),
+    }
+
+    let cli = Cli::try_parse_from(["peerbeam", "trust", "revoke", "pb-abc"]).unwrap();
+    match cli.command {
+        Command::Trust(a) => match a.action {
+            TrustAction::Revoke { device } => assert_eq!(device, "pb-abc"),
+            _ => panic!("expected revoke"),
+        },
+        _ => panic!("expected trust"),
+    }
+}
+
+/// Both mutating actions name a device. Defaulting to "all", or prompting for
+/// a pick, would make a mistyped command approve or revoke something nobody
+/// named — and on `approve` that is a stranger gaining this machine's clipboard.
+#[test]
+fn trust_approve_and_revoke_require_a_device() {
+    assert!(Cli::try_parse_from(["peerbeam", "trust", "approve"]).is_err());
+    assert!(Cli::try_parse_from(["peerbeam", "trust", "revoke"]).is_err());
+    // `list` takes none.
+    assert!(Cli::try_parse_from(["peerbeam", "trust", "list", "extra"]).is_err());
+}
+
+/// `--yes` is what makes approval scriptable on a headless box; it is a global
+/// flag, so it parses on either side of the subcommand.
+#[test]
+fn trust_approve_accepts_yes_on_either_side() {
+    for args in [
+        ["peerbeam", "--yes", "trust", "approve", "laptop"],
+        ["peerbeam", "trust", "approve", "laptop", "--yes"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.global.yes);
+    }
 }

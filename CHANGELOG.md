@@ -118,6 +118,60 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   Peer-supplied values are validated, not trusted: a `battery_percent` over 100
   discards the whole message rather than clamping it, and a `network` word
   outside the closed vocabulary is dropped rather than reaching the UI verbatim.
+- **`peerbeam trust list|approve|revoke` — approving a device from a shell.**
+
+  ```
+  STATUS    DEVICE           NAME          FINGERPRINT          PINNED
+  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11
+  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30
+  ```
+
+  The listing's first column is the point. A device is **pinned** by the
+  handshake the first time it connects — that records its key so a later change
+  is detectable, and nothing more — while **approved** is set only by a person,
+  and is what lets a device receive this machine's presence status, clipboard,
+  or a `pipe --listen`. Approving had been reachable only from the desktop app,
+  so a headless server or a container could not use any of the three at all.
+
+  `approve` prints the full fingerprint it is approving and asks; `--yes` (or
+  `--json`) proceeds without prompting, and without either — with no terminal
+  to ask at — it refuses rather than approving unasked. Approving something
+  already approved is a no-op that says so and exits `0`, so a provisioning
+  script is safe to re-run. `revoke` removes the whole record, not just the
+  flag, so the next connection is a fresh first contact.
+
+  `<device>` resolves the way `send --to` does (exact id, exact name, unique
+  name prefix); an ambiguous prefix lists the candidates and exits `2` instead
+  of guessing. `--json` emits one object per line, `approved` an explicit bool.
+
+### Security
+- **Presence, clipboard sync and `pipe --listen` now require an *approved*
+  device, not merely a pinned one.** All three asked `TrustStore::is_trusted`,
+  which is "is there a record" — and PeerBeam's handshake is TOFU, so it
+  records *every* never-seen peer as it connects, with `approved: false`, purely
+  so that a later key change is detectable. `is_trusted` was therefore already
+  true for any stranger on the LAN by the time the gate was asked, which made
+  "trusted devices only" — the leg that is deliberately not configurable on any
+  of the three — very nearly vacuous.
+
+  In practice a stranger who completed one handshake was sent this device's
+  battery level and free disk on every heartbeat, was sent the contents of
+  every clipboard copy, and could write arbitrary bytes onto a listening
+  terminal's stdout. Only `pipe`'s "you must be running `--listen`" gate and
+  `--from` carried any weight against a first-contact peer; presence and
+  clipboard had no second leg at all.
+
+  The three gates now ask a new `TrustStore::is_approved`, which only the user's
+  explicit accept-and-trust sets, and which fails **closed**. `is_trusted` keeps
+  its meaning and its callers — "is this the key I saw before?" is a real and
+  separate question. Each gate has a test in which the peer is pinned and the
+  gate is still shut, and `peerbeam-cli/tests/pipe_e2e.rs` proves it across two
+  real processes.
+
+  **Upgrade note:** a device that was working over presence, clipboard or pipe
+  purely on the strength of a pin will stop until it is approved — in the app's
+  Trusted Devices, or with `peerbeam trust approve <device>`. That is the fix
+  working. Devices already approved through an accept-and-trust are unaffected.
 
 ### Fixed
 - **A sandboxed FFI test no longer fights other PeerBeam processes for the

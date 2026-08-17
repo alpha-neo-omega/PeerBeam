@@ -1,7 +1,7 @@
 //! End-to-end `peerbeam pipe`: two real processes, a real QUIC connection, and
 //! a payload that is deliberately not text.
 //!
-//! Three things are checked here that no in-process test can check:
+//! Four things are checked here that no in-process test can check:
 //!
 //! * **stdout really is only the payload.** The listener's stdout is captured
 //!   into a buffer and compared byte-for-byte with what was piped in — so a
@@ -11,15 +11,34 @@
 //! * **The listen gate holds across a process boundary.** A running `peerbeam
 //!   receive` is offered a pipe and refuses it, with nothing of the payload
 //!   reaching its output.
+//! * **A pin is not approval**, likewise across processes: a first-contact
+//!   sender is pinned by the handshake and *still* refused, and only a real
+//!   `peerbeam trust approve` at the listener lets the pipe through.
 //! * **The exit code says what happened**, which is all a script has.
+//!
+//! # The two-stage shape of the happy path
+//!
+//! The successful pipe below needs two connections, and that is not test
+//! scaffolding — it is the feature. Two fresh processes have never met, so the
+//! first connection can only *pin* the sender (`approved: false`, recorded so a
+//! later key change is detectable) and the pipe gate, which asks
+//! `TrustStore::is_approved`, correctly refuses it. An operator then approves
+//! the device, and the second connection succeeds.
+//!
+//! The approval is driven through the real `peerbeam trust approve` command
+//! rather than by writing `trust.json`, and that is load-bearing: a hand-written
+//! record would carry a fingerprint the sender cannot present, so the next
+//! handshake would reject it as a key change — correctly — and a test built that
+//! way would prove the opposite of what it claims.
 
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use peerbeam_config::EngineConfig;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_peerbeam");
 
@@ -90,8 +109,190 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
     }
 }
 
-/// The whole feature, end to end: `pipe --listen > out` on one side, `pipe
-/// --addr … < in` on the other, and `out` must equal `in` exactly.
+/// What a first-contact attempt left behind: the sender is now pinned at the
+/// listener, and was refused.
+struct FirstContact {
+    /// The sender's authenticated device id, as the listener recorded it.
+    device: String,
+    /// The refused sender's exit status and streams.
+    sender: Output,
+    /// Everything the listener put on stdout, which must be nothing.
+    listener_stdout: Vec<u8>,
+    /// Whether the listener was still running when it was stopped.
+    listener_survived: bool,
+}
+
+/// Let `sender_cfg` connect to a listener once, so the handshake pins it, and
+/// hand back what happened.
+///
+/// This is the only way to obtain a *real* pin. The pinned fingerprint has to be
+/// one the sender can present again on its next connection, and only a genuine
+/// handshake produces one — see this module's header for why a hand-written
+/// `trust.json` would make the test prove the opposite of its claim.
+///
+/// The attempt is refused (pinned is not approved), and a refusal does not end a
+/// listener, so the listener is stopped here.
+fn pin_sender(listener_cfg: &Path, sender_cfg: &Path, src: &Path) -> FirstContact {
+    let mut listener = Command::new(BIN)
+        .args([
+            "--config",
+            listener_cfg.to_str().unwrap(),
+            "--json",
+            "pipe",
+            "--listen",
+            "--port",
+            "0",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn listener");
+    let port = listening_port(&mut listener);
+
+    let mut out_pipe = listener.stdout.take().expect("stdout piped");
+    let (otx, orx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        let _ = otx.send(buf);
+    });
+
+    let sender = Command::new(BIN)
+        .args([
+            "--config",
+            sender_cfg.to_str().unwrap(),
+            "--no-color",
+            "pipe",
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdin(Stdio::from(std::fs::File::open(src).unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run sender");
+
+    // Read liveness and stop the listener BEFORE any assertion, so a failing
+    // caller cannot orphan the process.
+    let listener_survived = listener.try_wait().expect("try_wait").is_none();
+    let _ = listener.kill();
+    let _ = listener.wait();
+    let listener_stdout = orx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("listener stdout");
+
+    let pinned = trust_rows(listener_cfg);
+    assert_eq!(
+        pinned.len(),
+        1,
+        "the handshake must have pinned exactly the sender: {pinned:?}"
+    );
+    let device = pinned[0]["id"]
+        .as_str()
+        .expect("the pinned row carries an id")
+        .to_string();
+
+    FirstContact {
+        device,
+        sender,
+        listener_stdout,
+        listener_survived,
+    }
+}
+
+/// `peerbeam trust list --json` against a config — one object per line.
+fn trust_rows(cfg: &Path) -> Vec<Value> {
+    let o = Command::new(BIN)
+        .args(["--config", cfg.to_str().unwrap(), "--json", "trust", "list"])
+        .output()
+        .expect("run trust list");
+    assert!(
+        o.status.success(),
+        "trust list failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+        .collect()
+}
+
+/// What an operator types at the listener's shell. `--yes` because there is no
+/// terminal here to answer the fingerprint prompt — the same reason a headless
+/// box needs the flag.
+fn trust_approve(cfg: &Path, device: &str) -> Output {
+    Command::new(BIN)
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "--no-color",
+            "--yes",
+            "trust",
+            "approve",
+            device,
+        ])
+        .output()
+        .expect("run trust approve")
+}
+
+/// **A pin is not approval, across a process boundary.**
+///
+/// Two fresh processes: the sender completes a real handshake, so the listener
+/// pins its key — and `TrustStore::is_trusted` is true for it from that instant.
+/// The pipe gate asks `is_approved` instead, so the stream is refused, nothing
+/// reaches the listener's stdout, and the listener keeps listening.
+///
+/// This is the regression the whole approval change exists to prevent, and it
+/// had no coverage at the process level. A gate that went back to `is_trusted`
+/// would pass every other test in this file and fail this one.
+#[test]
+fn a_merely_pinned_sender_is_refused_and_nothing_reaches_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (listener_cfg, sender_cfg) = configs(dir.path());
+    let marker = b"PAYLOAD-MARKER-THAT-MUST-NOT-BE-PRINTED";
+    let src = dir.path().join("payload.bin");
+    let mut payload = marker.to_vec();
+    payload.extend_from_slice(&hostile_payload(50_000));
+    std::fs::write(&src, &payload).unwrap();
+
+    let contact = pin_sender(&listener_cfg, &sender_cfg, &src);
+
+    assert!(
+        !contact.sender.status.success(),
+        "a pinned-but-unapproved sender must be refused, not piped: {}",
+        String::from_utf8_lossy(&contact.sender.stderr)
+    );
+    assert!(
+        contact.listener_stdout.is_empty(),
+        "the refused payload reached the listener's stdout ({} bytes)",
+        contact.listener_stdout.len()
+    );
+    assert!(
+        contact.sender.stdout.is_empty(),
+        "the sender's stdout stays clean even on refusal"
+    );
+    assert!(
+        contact.listener_survived,
+        "a refused peer must not be able to end the listener with one dial"
+    );
+
+    // And the store says exactly why: the key was recorded, nobody chose it.
+    let rows = trust_rows(&listener_cfg);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], json!(contact.device));
+    assert_eq!(
+        rows[0]["approved"],
+        json!(false),
+        "the handshake must pin without approving — a store that approved on \
+         first contact would make the gate vacuous again"
+    );
+}
+
+/// The whole feature, end to end, along the path a person actually walks: first
+/// contact pins and is refused, `peerbeam trust approve` grants the device
+/// standing, and only then does `pipe --listen > out` receive `in` exactly.
 ///
 /// The byte-for-byte comparison is simultaneously the binary-safety test and
 /// the stdout-cleanliness test: any human-facing text on the listener's stdout
@@ -104,6 +305,34 @@ fn pipes_a_binary_stream_between_two_processes_and_stdout_carries_only_bytes() {
     let src = dir.path().join("payload.bin");
     std::fs::write(&src, &payload).unwrap();
 
+    // 1. First contact: pinned, and refused for it. A tiny payload — this
+    //    connection exists to produce a real fingerprint, not to move bytes.
+    let hello = dir.path().join("first-contact.bin");
+    std::fs::write(&hello, b"first contact").unwrap();
+    let contact = pin_sender(&listener_cfg, &sender_cfg, &hello);
+    assert!(
+        !contact.sender.status.success(),
+        "a merely pinned sender must not be piped through"
+    );
+
+    // 2. The operator approves the device, at the listener's own shell.
+    let approved = trust_approve(&listener_cfg, &contact.device);
+    assert!(
+        approved.status.success(),
+        "trust approve failed: {}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&approved.stdout).contains(&contact.device),
+        "approve must name the device it approved"
+    );
+    assert_eq!(
+        trust_rows(&listener_cfg)[0]["approved"],
+        json!(true),
+        "approval must be on disk before the second listener reads it"
+    );
+
+    // 3. Now — and only now — the pipe works.
     let mut listener = Command::new(BIN)
         .args([
             "--config",

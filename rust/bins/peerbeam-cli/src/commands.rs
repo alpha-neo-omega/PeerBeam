@@ -45,6 +45,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Chat(a) => crate::chat::chat(ctx, a.action, cfg_override.as_deref()).await,
         Command::Pipe(a) => crate::pipe::pipe(ctx, a, cfg_override.as_deref()).await,
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
+        Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -1235,14 +1236,24 @@ impl SecureCtx {
             &enc,
             config.device.name.clone(),
         )?;
-        let trust_path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
-        let trust = FsTrust::open(trust_path).map_err(CliError::from)?;
         Ok(Self {
             enc: Arc::new(enc),
-            trust: Arc::new(trust),
+            trust: Arc::new(open_trust(config)?),
             ident,
         })
     }
+}
+
+/// Open this device's trust store — `<data_directory>/trust.json`.
+///
+/// The one place that path is written. [`SecureCtx::build`] needs the store for
+/// the handshake; `peerbeam trust` needs *only* the store, and must not build a
+/// `SecureCtx` to get at it — that would generate an identity keypair as a side
+/// effect of listing devices. A second literal of this path would be a store one
+/// command writes and another never reads.
+pub(crate) fn open_trust(config: &EngineConfig) -> Result<FsTrust, CliError> {
+    let path = std::path::Path::new(&config.storage.data_directory).join("trust.json");
+    FsTrust::open(path).map_err(CliError::from)
 }
 
 /// Build the CLI's chat store: an encrypted [`peerbeam_appstore_fs::FsAppStore`]

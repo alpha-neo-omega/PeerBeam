@@ -63,6 +63,8 @@ pub enum Command {
     Pipe(PipeArgs),
     /// Show transfer history.
     History(HistoryArgs),
+    /// List, approve or revoke the devices this machine trusts.
+    Trust(TrustArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -285,6 +287,44 @@ pub struct HistoryArgs {
     /// Clear history.
     #[arg(long)]
     pub clear: bool,
+}
+
+/// `peerbeam trust` — the devices this machine has pinned, and the ones the
+/// user actually chose.
+///
+/// Two states, and the difference is the whole command. A device is **pinned**
+/// by the authenticated handshake the first time it connects: that records its
+/// key so a later change is detectable, and nothing more — every stranger that
+/// has ever reached this machine is pinned. A device is **approved** only when
+/// a person says so, here or in the app, and that is what lets it receive this
+/// machine's presence status, its clipboard, and a `pipe --listen`.
+///
+/// Without this command those three features are unusable on a CLI-only or
+/// headless box, because approval was reachable from the GUI alone.
+#[derive(Args)]
+pub struct TrustArgs {
+    #[command(subcommand)]
+    pub action: TrustAction,
+}
+
+#[derive(Subcommand)]
+pub enum TrustAction {
+    /// List every pinned device, and whether it is approved or only pinned.
+    List,
+    /// Approve a device: let it receive this machine's status, clipboard and
+    /// pipes. Prints the fingerprint being approved and asks, unless `--yes`.
+    Approve {
+        /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Forget a device entirely: its pin and its approval. The next connection
+    /// from it is a fresh first contact.
+    Revoke {
+        /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
 }
 
 #[derive(Args)]

@@ -39,6 +39,48 @@ On later connections a changed fingerprint (a new device reusing an id, or a
 man-in-the-middle) is rejected. Fingerprints are meant to be compared
 out-of-band for stronger assurance.
 
+## Pinned is not approved
+
+The trust store holds two states, and conflating them is the mistake this
+section exists to prevent.
+
+| | Set by | Answers | Predicate |
+|---|---|---|---|
+| **Pinned** | the handshake, automatically, on first contact | "is this the same key I saw last time?" | `TrustStore::is_trusted` |
+| **Approved** | a person, explicitly | "did the user choose this device?" | `TrustStore::is_approved` |
+
+A pin is a **memory, not a decision**. `auth.rs` records *every* never-seen peer
+as it completes the handshake, with `approved: false`, because that recorded
+fingerprint is the only thing that makes a later key change detectable. It
+follows that every stranger who has ever reached this machine is pinned, and
+nobody chose any of them — so `is_trusted`, which is "is there a record", is
+**not a permission**. It is the MITM question, and only that.
+
+Approval is set by an act of a person: accept-and-trust in the app, or
+`peerbeam trust approve <device>` at a shell. It is what the three features that
+send something outward on the user's behalf, without asking again, gate on:
+
+- **presence** — battery level, free disk and network kind, on every heartbeat;
+- **clipboard sync** — whatever the user last copied;
+- **`pipe --listen`** — raw bytes onto a terminal's stdout.
+
+Each of those is defensible only as "my own devices", and a key pinned by the
+handshake is not that. All three ask `is_approved`, which fails **closed**: a
+store that cannot answer is not permission. Each has a unit test in which
+`is_trusted` is true and the gate is still shut, so a change back to the weaker
+predicate cannot pass silently, and `peerbeam-cli/tests/pipe_e2e.rs` proves the
+same thing across two real processes.
+
+Revoking (`peerbeam trust revoke`, or Trusted Devices in the app) removes the
+whole record rather than just the flag, so the next connection is a fresh first
+contact: re-pinned, and unapproved until someone says otherwise. Both the CLI
+and the app mean the same thing by the word.
+
+Approval had been reachable only from the app's accept-and-trust prompt, which
+left a headless or CLI-only machine — a first-class target for this project —
+unable to use any of the three features at all. `peerbeam trust` closes that;
+see [CLI](CLI.md).
+
 ## Device identity
 
 Each device has a long-term X25519 identity keypair, generated on first run and
@@ -134,7 +176,7 @@ This is the one honest limit of clipboard sync (ChannelType `0x0102`), and it is
 stated here, on the Settings toggle, and in `peerbeam_clipboard`'s crate docs
 because a user cannot make a sound decision without it.
 
-**While the opt-in is on, everything copied is sent to trusted devices —
+**While the opt-in is on, everything copied is sent to approved devices —
 passwords included.** PeerBeam does not attempt to detect secrets, and this is a
 decision rather than an omission. A clipboard read returns plain text and
 nothing else: Flutter's `Clipboard.getData` carries no sensitivity flag, X11 and
@@ -156,10 +198,13 @@ same three the presence feature uses:
 1. **Opt-in, default off** (I11). Nothing is synced until the user says so, and
    a settings document written before the feature existed loads as off — an
    upgrade never silently opts anyone in.
-2. **Trusted-only, and not configurable.** A clip goes to devices in the trust
-   store or nowhere. Revoking trust stops the next clip, not the next reconnect,
-   because the gate re-reads the trust store per push and asks about the
-   **authenticated** peer rather than the id discovery advertised.
+2. **Approved devices only, and not configurable.** A clip goes to a device the
+   user explicitly approved or nowhere — *not* merely to one the handshake
+   pinned, which would be every stranger that ever connected (see [Pinned is
+   not approved](#pinned-is-not-approved)). Revoking stops the next clip, not
+   the next reconnect, because the gate re-reads the trust store per push and
+   asks about the **authenticated** peer rather than the id discovery
+   advertised.
 3. **One tap to stop.** Turning the setting off stops the next clip and the
    watcher immediately, with no restart.
 
@@ -214,7 +259,7 @@ process's `out`:
    every pipe offered to them. This is the gate that matters most: a long-lived
    daemon that accepted pipes would be a remote write to whatever terminal it
    was started from, and the user who started it consented to receiving *files*.
-2. **Trusted peers only**, not configurable — the same rule as clipboard sync
+2. **Approved devices only**, not configurable — the same rule as clipboard sync
    and presence — and narrowable to one device with `--from`, which matches the
    **authenticated** device id from the handshake and never the human name a
    peer presents (a peer chooses its own name, so a name-based restriction would
@@ -229,19 +274,28 @@ dialling it.
 Every leg is mutation-proved over a real two-PeerSession round trip in
 `peerbeam-transfer/tests/pipe_gates.rs`: delete the `listening` leg and a
 daemon-shaped session writes the peer's bytes into its sink; delete the trust
-leg and a revoked peer's arrive. The tests fail because the bytes really do
+leg and an unapproved peer's arrive. The tests fail because the bytes really do
 land, not because a predicate returned the wrong bool.
+`peerbeam-cli/tests/pipe_e2e.rs` repeats the trust leg across two real
+processes: a first-contact sender is pinned by a genuine handshake and still
+refused, and only a real `peerbeam trust approve` at the listener lets the
+second attempt through.
 
-**What the trust gate does and does not buy.** PeerBeam's handshake is
-trust-on-first-use, so a peer connecting for the first time is *pinned as it
-connects* and is therefore trusted by the time the gate is asked. Against a
-device the user has explicitly revoked, gate 2 is what refuses. Against a
-stranger on the LAN who has never connected before, the work is done by gate 1
-(they must find a listener running at all, in the seconds it is up, for one
-stream) and by `--from` (which refuses anyone but the named device outright).
-`--from` is the right tool when the listener will be up for a while or the
-network is not trusted; `device.require_pairing_confirmation` remains the
-general answer to first-contact verification.
+**What the trust gate does and does not buy.** It asks `is_approved`, not
+`is_trusted`, and the difference is exactly what makes it load-bearing against a
+stranger. PeerBeam's handshake is trust-on-first-use, so a peer connecting for
+the first time is *pinned as it connects* — had this leg asked "is there a
+record", it would already have been satisfied by the connection it was supposed
+to judge, and would only ever have refused a device the user had explicitly
+revoked. Asking for approval means a first-contact peer is refused too, and
+someone has to have said yes. See [Pinned is not approved](#pinned-is-not-approved).
+
+Gate 1 still carries most of the load in practice, because a stranger must find
+a listener running at all, in the seconds it is up, for one stream. `--from`
+narrows it further to a single device and is the right tool when the listener
+will be up for a while or the network is not trusted;
+`device.require_pairing_confirmation` remains the general answer to
+first-contact verification.
 
 **A pipe cannot un-write stdout.** Bytes are written and flushed as they arrive
 — that is what makes a 40 GB stream possible — so by the time the stream turns
@@ -267,7 +321,7 @@ it will happily trust a bad `f`.
 
 - **Unit**: crypto (ECDH agreement + directionality, seal/open round-trip,
   tamper/wrong-key/short-input rejection, fingerprint stability); trust store
-  (pin/lookup/trust, persistence, overwrite); `finalize` (rename, no-clobber,
+  (pin/lookup/trust, approve, persistence, overwrite); `finalize` (rename, no-clobber,
   `0600`).
 - **Integration**: mutual auth + real transfer over `SecureLink`; TOFU
   pin → trust → reject-on-key-change; `SecureLink` rejects replayed and
@@ -291,8 +345,10 @@ It is **optional and off by default** (`device.require_pairing_confirmation`).
 When enabled, the receiver must confirm the codes match before accepting a
 transfer from a newly pinned peer; a mismatch (or a decline) **un-pins** the
 peer (treated as a suspected MITM) and aborts. The code is stable across
-sessions, so it can be re-verified later. Revoking trust later is available in
-the app (Trusted Devices).
+sessions, so it can be re-verified later. Revoking later is available in the app
+(Trusted Devices) and at a shell (`peerbeam trust revoke`); `peerbeam trust
+list` prints each pinned fingerprint, which is what an out-of-band comparison
+needs on a headless box.
 
 ## Bulk approval is accept-once, never trust
 

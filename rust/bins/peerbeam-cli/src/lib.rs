@@ -14,3 +14,4 @@ pub mod presence;
 pub mod prompt;
 pub mod resolve;
 pub mod session_transfer;
+pub mod trust;
