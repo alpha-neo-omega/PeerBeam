@@ -100,6 +100,33 @@ Working now:
   Sharing is off by default, and status is only ever sent to **trusted** peers;
   that second gate is not configurable. Set `device.share_presence` in the
   config to opt in.
+
+  **Clipboard auto-sync is a GUI feature and the CLI does not gain it.**
+  `send --clipboard` is unchanged and remains the CLI's manual path. This is a
+  deliberate boundary, not a gap: auto-sync needs a *watcher*, watching needs
+  to read the system clipboard, and there is no system-clipboard adapter in
+  the Rust workspace — only an in-memory double for tests and headless
+  servers. Flutter's clipboard API already works on every desktop target, so
+  the watcher lives there (`docs/UI.md`) and adding a Rust one would mean a
+  new dependency for a feature the desktop app already has. A headless server
+  has no clipboard to sync in the first place.
+
+  The CLI does take part on the **receiving** side, because it advertises
+  `CLIPBOARD_FEAT_CLIP` exactly as the Flutter frontend does — a peer must not
+  behave differently depending on which of PeerBeam's two frontends it
+  reached, and advertising a bit whose frames were then dropped on the floor
+  would make the advertisement a lie. A clip arriving during a long-running
+  command (`receive`, `daemon`, `chat watch`) prints one line on **stderr**:
+
+  ```
+  clipboard received from pb-alice (57 bytes) — the CLI does not apply it to a system clipboard
+  ```
+
+  The sender and the size, and **never the contents**. A clip is not a chat
+  message: it is whatever the user last copied, captured automatically, and
+  nothing can tell a shopping list from a password — so printing it would
+  write secrets into terminal scrollback, `script` captures and CI logs. It
+  goes to stderr so it can never interleave into `--json` output on stdout.
 - `completions <shell>`.
 - `send <PATH>… [--to <device>] [--addr IP:PORT]` — send file(s) over QUIC with
   mutual authentication. `--to` resolves a peer via discovery (id / name /

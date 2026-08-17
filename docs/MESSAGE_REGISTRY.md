@@ -40,7 +40,7 @@ near-term). Assignments are stable once published.
 | `0x0000` | Control | A | session protocol; always present |
 | `0x0100` | Transfer | A | today's file/folder transfer, reframed as a channel |
 | `0x0101` | Chat | B | text/markdown messages; file references (2a) + file declines (2b), implemented |
-| `0x0102` | Clipboard | B | clipboard payloads / sync |
+| `0x0102` | Clipboard | B | clipboard sync; `Clip` (implemented), opt-in and trusted-only |
 | `0x0103` | Presence | B | device status heartbeats; `Status` (implemented), opt-in and trusted-only |
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
 | `0x0105` | Notes | C | rides Sync; may not need its own channel |
@@ -153,6 +153,47 @@ belonging to each capability's future spec:
   still on the old cap (an older peer's decoder would reject an over-cap
   frame as `ChatError::TooLarge`, closing that channel), so it requires
   capability negotiation, not a silent bump.
+- **Clipboard (0x0102):** `Clip = 1` (implemented) — one clipboard payload:
+  `text` (UTF-8, the only kind carried today) and `sent_at` (RFC3339, the
+  sender's clock, display and ordering only — never trusted as absolute, since
+  peer clocks are not synchronised). Images and files are **not** in scope and
+  must not be smuggled through `text`; a receiver writes it to the system
+  clipboard as plain text and nothing else, so carrying another kind needs a
+  new MessageType and a new feature bit. There is deliberately **no** source
+  application, window title or device-local path here: what was copied is the
+  payload, where it came from is not.
+  Sent `OPTIONAL` (§6/§7) and gated on the capability's first feature bit,
+  `CLIPBOARD_FEAT_CLIP = 1 << 0`
+  (`peerbeam_domain::session::CLIPBOARD_FEAT_CLIP`): a peer that does not
+  advertise it is sent nothing and simply does not take part in sync, which is
+  not an error.
+  `text` is capped at `MAX_CLIP = 65536` bytes
+  (`peerbeam-clipboard::message::MAX_CLIP`, pinned by a unit test) — a **frozen
+  wire constant** on the same terms as Chat's `MAX_BODY`: raising it is a
+  breaking change for any peer still on the old cap (that peer's decoder
+  refuses the over-cap frame as `ClipboardError::TooLarge`, closing the
+  Clipboard channel per §6), so it requires capability negotiation, not a
+  silent bump. It is four times Chat's cap because a clipboard routinely holds
+  a whole file's worth of code, and it is bounded at all because nothing here
+  is a deliberate send: the watcher pushes whatever was copied, to every
+  trusted device, with no button press.
+  **Two validations are binding and symmetric on encode and decode** (§7), and
+  both **reject rather than repair**: an over-cap clip is **skipped, never
+  truncated** (a truncated clipboard silently corrupts what the user believes
+  they copied, which is worse than not syncing), and an **empty** `text` is
+  refused outright (applying one would *erase* the peer's clipboard, a
+  destructive act with no user intent behind it). A non-UTF-8 payload is
+  likewise rejected rather than lossily replaced.
+  Sending is additionally gated locally, and neither gate is on the wire: the
+  sender must have opted in (default **off**), and the peer must be
+  **trusted**. The clipboard is the single most sensitive buffer on a desktop
+  and nothing can tell which clips are secrets, so it goes to the user's own
+  pinned devices or nowhere. See `peerbeam_clipboard::gate::may_share_clip`,
+  which is the single place all three conditions are decided.
+  Receiving is **ungated**, which is what lets a phone take part: Android 10+
+  forbids background clipboard reads, so a phone can never auto-send, yet it
+  advertises `CLIPBOARD_FEAT_CLIP` truthfully and applies an incoming clip in
+  full. Desktop sends, every platform receives.
 - **Presence (0x0103):** `Status = 1` (implemented) — one heartbeat describing
   the sender: `battery_percent`, `charging`, `storage_free_bytes`, `network`,
   `app_version`, `sent_at`. Every field except `sent_at` is optional and

@@ -42,6 +42,38 @@ inventing a dead battery. `test/presence_test.dart` pins this from both sides �
 a missing reading must not render as zero, and a genuine `0%` must not be
 swallowed as missing.
 
+## Clipboard sync
+
+Opt-in in Settings and **off by default**. While it is on, anything copied on a
+desktop is pushed to that device's **trusted** peers; the trusted-only half is
+not configurable. A received clip is written to the local clipboard and
+announced with a snackbar naming the sending device — *"Clipboard from Bob"* —
+because a clipboard changing underneath someone is not a thing they should have
+to discover by pasting. The toast never repeats the clip: it is on their
+clipboard already, and a toast is a poor place for something that may be a
+password.
+
+**The toggle admits that everything copied is sent, passwords included.** There
+is no password detection in PeerBeam and there is deliberately not going to be
+— see `docs/SECURITY.md`. That sentence is the whole of what a user has to
+decide with, so `test/clipboard_sync_test.dart` pins it verbatim; a change that
+softens it should be treated as a security regression, not a copy-edit.
+
+**Desktop sends, every platform receives.** Android 10+ forbids reading the
+clipboard from the background, so a phone can never auto-send. The watcher
+refuses to start off desktop — the setting cannot turn on what the platform
+forbids — and the Android build shows a note saying so, rather than leaving a
+toggle that mysteriously only works one way.
+
+The watcher polls once a second and pushes only what **changed**, and the echo
+guard is the load-bearing part: a clip that arrived from a peer is accounted
+for *before* it is written to the clipboard, so the next poll does not mistake
+it for a local copy and send it back. Without that, two devices ping-pong a
+single copy forever. Whatever is already on the clipboard when the toggle is
+flipped is adopted without being sent — that is not something the user just
+copied, and may well be a password they pasted earlier. A clip over the 64 KiB
+wire cap is skipped, not truncated, and the user is told once.
+
 ## How the audit findings were addressed
 
 | Audit finding | Resolution |

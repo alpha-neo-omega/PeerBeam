@@ -7,6 +7,52 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Automatic clipboard sync between trusted devices.** Copy on one desktop and
+  it is on your other devices, over a new negotiated Clipboard channel
+  (`0x0102`, `Clip`). No pairing step, no button — the desktop watcher notices
+  the change and pushes it.
+
+  **Opt-in and off by default**, and a clip is **never sent to a device that is
+  not trusted** — that second gate is not configurable. Turning the setting off,
+  or revoking trust, stops the *next* clip rather than the next reconnect. A
+  device with sync off still receives and applies what its peers send, which is
+  what makes it an opt-in rather than a mutual requirement.
+
+  **Everything you copy is sent, passwords included, and the toggle says so.**
+  There is deliberately no password detection: a clipboard read carries no
+  sensitivity signal on any platform PeerBeam supports — Flutter's API has none
+  and X11/Wayland define none — so a heuristic would be a guess, and wrong in
+  either direction is bad. Guessing "secret" drops clips you expected; guessing
+  "safe" ships a credential while the UI implies something was checked, which is
+  worse than never claiming to check. The honest warning is the feature. See
+  `docs/SECURITY.md`.
+
+  **Desktop sends, every platform receives.** Android 10+ forbids reading the
+  clipboard from the background, so a phone can never auto-send; it says so
+  rather than offering a toggle that mysteriously works one way. The watcher
+  refuses to run off desktop.
+
+  A clip received from a peer is **never sent back** — without that guard two
+  devices ping-pong a single copy forever — and unchanged content is never
+  re-sent. Whatever is already on the clipboard when you flip the toggle is not
+  synced: that is not something you just copied, and may well be a password you
+  pasted earlier. Sync starts with the next copy.
+
+  A received clip is written to the clipboard and announced with a toast naming
+  the device that sent it, never repeating the content. Nothing is persisted:
+  there is no clipboard history, because a durable log of everything you ever
+  copied is precisely what this feature must not create.
+
+  `Clip.text` is capped at 64 KiB, a frozen wire constant. An over-cap clip is
+  **skipped and reported, never truncated** — a shortened clipboard silently
+  corrupts what you believe you copied. An empty clip is refused too: applying
+  one would erase the peer's clipboard.
+
+  The CLI is deliberately unchanged: `send --clipboard` remains its manual path
+  and it gains no watcher, because watching needs a system-clipboard adapter the
+  Rust workspace does not have (and a headless server has no clipboard to sync).
+  It still receives, printing one line naming the sender and the size — never
+  the contents. See `docs/CLI.md`.
 - **Device presence and a Devices dashboard.** Trusted devices can share a live
   status — battery, charging, free storage, network kind, app version — over a
   new negotiated Presence channel (`0x0103`, `Status`), sent when the channel

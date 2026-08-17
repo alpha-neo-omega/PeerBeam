@@ -128,6 +128,52 @@ complete transfer is it **atomically** promoted:
 Path names from peers are sanitized to a single base component (no `..`, no
 absolute paths).
 
+## Clipboard sync sends passwords, and nothing detects them
+
+This is the one honest limit of clipboard sync (ChannelType `0x0102`), and it is
+stated here, on the Settings toggle, and in `peerbeam_clipboard`'s crate docs
+because a user cannot make a sound decision without it.
+
+**While the opt-in is on, everything copied is sent to trusted devices —
+passwords included.** PeerBeam does not attempt to detect secrets, and this is a
+decision rather than an omission. A clipboard read returns plain text and
+nothing else: Flutter's `Clipboard.getData` carries no sensitivity flag, X11 and
+Wayland define no standard one, and password managers on these platforms have no
+portable way to mark a paste buffer as confidential. There is simply no signal
+to branch on.
+
+A heuristic would therefore be a guess, and it would be wrong in both directions:
+
+- **Guessing "secret" on ordinary text** silently drops clips the user expected
+  to arrive, teaching them the feature is unreliable.
+- **Guessing "safe" on a real credential** ships it *while the UI implies
+  something was checked*. That is strictly worse than never claiming to check,
+  because the user relaxes on the strength of a promise nothing is keeping.
+
+So the mitigations are the ones that are actually enforceable, and they are the
+same three the presence feature uses:
+
+1. **Opt-in, default off** (I11). Nothing is synced until the user says so, and
+   a settings document written before the feature existed loads as off — an
+   upgrade never silently opts anyone in.
+2. **Trusted-only, and not configurable.** A clip goes to devices in the trust
+   store or nowhere. Revoking trust stops the next clip, not the next reconnect,
+   because the gate re-reads the trust store per push and asks about the
+   **authenticated** peer rather than the id discovery advertised.
+3. **One tap to stop.** Turning the setting off stops the next clip and the
+   watcher immediately, with no restart.
+
+All three are decided in one place, `peerbeam_clipboard::gate::may_share_clip`,
+alongside the peer's negotiated `CLIPBOARD_FEAT_CLIP`. Each leg is
+mutation-proved over a real two-PeerSession round trip in
+`peerbeam-clipboard/tests/gates.rs` — deleting any one of them makes a clipboard
+arrive on the other side and fails the suite.
+
+Nothing is persisted (I4): there is no clipboard history anywhere in PeerBeam,
+because a durable log of everything a user ever copied is exactly the artefact
+this feature must not create. The CLI's arrival notice prints the sender and the
+byte count and never the contents, for the same reason.
+
 ## Threat notes / scope
 
 - The handshake authenticates *keys*; binding a key to a human-meaningful

@@ -162,6 +162,8 @@ char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} 
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
+
+char* pb_clipboard_sync(const char* json);      // {text, peers:[{name,addresses[],port}]} → {queued, sync}
 ```
 
 `pb_presence_json` is a snapshot of live state: what this device would share
@@ -183,6 +185,33 @@ Neither call can leak status. Sending is gated by
 opt-in (default off), the peer being **trusted** (not configurable), and the
 peer having negotiated `PRESENCE_FEAT_STATUS`. A device with sharing off still
 receives and displays other devices' status.
+
+`pb_clipboard_sync` is called by the desktop watcher when the user copies
+something. It is the *only* way a clip leaves, and the two decisions that need
+no network are made synchronously before anything is dialed: with the opt-in
+off it returns `{queued: 0, sync: false}` having done nothing at all — no dial,
+no handshake, no packet, because "off" must be observably silent rather than
+merely undelivered — and an empty or over-cap clip is refused with
+`invalid_argument` naming the size and the limit, so a surface can say "too
+large to sync" instead of leaving the user wondering. An over-cap clip is
+**never truncated**: a shortened clipboard silently corrupts what the user
+believes they copied.
+
+**Naming a peer does not send to it.** The remaining gates are per-peer and
+cannot be decided until a session exists, so they stay in
+`peerbeam_clipboard::gate::may_share_clip`, consulted after the handshake
+against the **authenticated** peer rather than the id discovery offered: the
+peer must be **trusted** (not configurable) and must have negotiated
+`CLIPBOARD_FEAT_CLIP`. Delivery runs one background task per peer, so the call
+returns without blocking a watcher on a handshake; a push that fails is dropped
+rather than queued, because the clipboard is live state and delivering what was
+copied ten minutes ago on top of what has been copied since would be worse than
+not delivering it.
+
+There is no receive call: an inbound clip arrives as a `clipboard_received`
+event. Receiving is **ungated** — a device with sync off still applies what its
+trusted peers send, which is also the only half that can run on Android, where
+background clipboard reads are forbidden.
 
 Both deletes are **local only**: nothing goes on the wire and the peer keeps its
 own copy. Neither is "unsend". Both leave behind every record that still backs a
@@ -208,7 +237,15 @@ that callback with `NativeCallable.listener` (safe cross-isolate delivery) and
 republishes to a broadcast `Stream`. Event types (growing per milestone):
 `device_added`, `device_updated`, `status_changed`, `latency_changed`,
 `device_removed`; (M2) `transfer_started/progress/paused/resumed/finished/
-failed`; (M3) `clipboard_received`, `settings_changed`, `connection_changed`.
+failed`; (M3) `clipboard_updated`, `settings_changed`, `connection_changed`;
+(Phase B) `presence_updated`, `clipboard_received`.
+
+The two clipboard events are **not** the same thing and a surface must not
+conflate them. `clipboard_updated` is the local slot bridge behind
+`pb_clipboard_get`/`set` — "a surface put this here". `clipboard_received`
+carries a trusted peer's synced clip (`{device_id, text, sent_at}`) and means
+"another machine put this here", which is the only one that needs announcing to
+the user.
 
 ## Threading
 
