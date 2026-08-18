@@ -138,6 +138,15 @@ pub fn apply_live_settings(partial: &Value) {
     if let Some(a) = partial.get("auto_accept").and_then(|v| v.as_bool()) {
         m.set_auto_accept(a);
     }
+    // Turning the pairing check on must protect the very next connection, not
+    // the next launch — a user reaches for this setting because of a device
+    // that is about to connect.
+    if let Some(p) = partial
+        .get("require_pairing_confirmation")
+        .and_then(|v| v.as_bool())
+    {
+        m.set_require_pairing_confirmation(p);
+    }
     if let Some(name) = partial.get("device_name").and_then(|v| v.as_str()) {
         let name = name.trim();
         if !name.is_empty() {
@@ -446,6 +455,9 @@ pub fn init(config_json: &str) -> OpResult {
         // that shipped before rules existed.
         config.storage.rules.clone(),
         config.device.auto_accept_trusted,
+        // The first-contact pairing check, overlaid from the persisted settings
+        // document above. Off unless the user turned it on.
+        config.device.require_pairing_confirmation,
         // Clamp BEFORE the u32 cast: a configured chunk_size >= 2^32 would
         // otherwise truncate (e.g. 2^32 -> 0), and Manager::new's max(1) guard
         // runs after the cast, yielding a 1-byte chunk size. Mirrors the CLI's

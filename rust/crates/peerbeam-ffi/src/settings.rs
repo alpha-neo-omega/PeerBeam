@@ -35,6 +35,14 @@ fn defaults() -> Value {
         "device_name": c.device.name,
         "transfer_directory": c.storage.save_directory,
         "auto_accept": c.device.auto_accept_trusted,
+        // "Verify new devices with a pairing code" — **default off**, and the
+        // default is the compatibility contract: off means an accept behaves
+        // exactly as it did before this gate existed. On, a transfer from a
+        // device pinned by this very handshake cannot be accepted until the
+        // user confirms both screens show the same code. The key name is the
+        // config field the CLI already reads, so one setting means one thing in
+        // both frontends (I7).
+        "require_pairing_confirmation": c.device.require_pairing_confirmation,
         "theme": "system",
         "discovery_enabled": c.discovery.enabled,
         "notifications": true,
@@ -99,6 +107,16 @@ pub fn overlay(config: &mut EngineConfig) {
     }
     if let Some(auto) = s.get("auto_accept").and_then(|v| v.as_bool()) {
         config.device.auto_accept_trusted = auto;
+    }
+    // Absent -> the config's own value (off by default). A settings document
+    // written before this gate existed must not be read as *disabling* a check
+    // the user never saw, nor as enabling one they never asked for; leaving the
+    // config value alone does both.
+    if let Some(require) = s
+        .get("require_pairing_confirmation")
+        .and_then(|v| v.as_bool())
+    {
+        config.device.require_pairing_confirmation = require;
     }
     // Auto-save rules travel the same road as the save directory: persisted in
     // this document, copied onto the engine's config here, read from there by

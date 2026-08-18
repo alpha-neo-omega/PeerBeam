@@ -254,6 +254,130 @@ async fn receive_into_ffi_with_accept() {
     pb_shutdown();
 }
 
+/// The first-contact pairing gate, end to end over a real handshake.
+///
+/// This is the one test that exercises the whole chain rather than a piece of
+/// it: the settings toggle reaching the running engine, the handshake reporting
+/// `newly_trusted`, that flag becoming a first-contact record, an unconfirmed
+/// accept being refused, and the same accept succeeding once it carries the
+/// user's confirmation. Everything else about the gate is unit-tested; only
+/// here is the sending peer genuinely a stranger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn receive_into_ffi_is_gated_until_the_pairing_code_is_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49826;
+    init_ffi(port, dir.path());
+    // Turn the check on the way Settings does. `pb_settings_set` persists it
+    // and pushes it into the live engine, so it must apply to the very next
+    // connection — this test would pass trivially if it only took effect on
+    // the next launch.
+    let v = call_json(
+        pb_settings_set,
+        &json!({ "require_pairing_confirmation": true }),
+    );
+    assert_eq!(v["ok"], true, "settings set: {v}");
+    tokio::time::sleep(Duration::from_millis(300)).await; // let the server bind
+
+    let payload = pattern(64 * 1024);
+    let src = dir.path().join("gated.bin");
+    std::fs::write(&src, &payload).unwrap();
+    let (enc, trust, identity) = peer_identity(dir.path(), "stranger");
+    let quic = QuicTransport::new().unwrap();
+    let route = direct_route("127.0.0.1", port);
+
+    let send_fut = async {
+        let qc = quic.dial_channels(&route, &session()).await.unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            peer_cfg(),
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        .unwrap();
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let _ = ps.run().await;
+        });
+        let (ptx, _p) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = TransferControl::new();
+        let req = SendRequest {
+            transfer_id: "stranger-send".into(),
+            name: "gated.bin".into(),
+            path: src.to_string_lossy().into(),
+            size: payload.len() as u64,
+            chunk_size: 64 * 1024,
+        };
+        send_file_on_session(&handle, &FsStorage::new(), req, &ctrl, &ptx, 3).await
+    };
+
+    let driver = async {
+        let queued = tokio::task::spawn_blocking(|| {
+            wait_event(5, |e| {
+                e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
+            })
+        })
+        .await
+        .unwrap()
+        .expect("incoming queued event");
+        let payload = &queued["payload"];
+        assert_eq!(
+            payload["newly_trusted"], true,
+            "a peer this engine has never seen is first contact: {payload}"
+        );
+        let code = payload["pairing_code"].as_str().expect("pairing code");
+        assert_eq!(code.len(), 39, "all 128 bits, in the engine's grouping");
+        let id = queued["transfer_id"].as_str().unwrap().to_string();
+
+        // Unconfirmed: refused, and the transfer must survive the refusal.
+        let blocked = call_json(pb_transfer_accept, &json!({ "id": id }));
+        assert_eq!(blocked["ok"], false, "unconfirmed accept: {blocked}");
+        // Nor does a non-boolean satisfy it.
+        let fake = call_json(
+            pb_transfer_accept,
+            &json!({ "id": id, "confirmed": "true" }),
+        );
+        assert_eq!(fake["ok"], false, "a string is not a confirmation: {fake}");
+
+        // Confirmed: the same call, now carrying the user's answer.
+        let ok = call_json(pb_transfer_accept, &json!({ "id": id, "confirmed": true }));
+        assert_eq!(ok["ok"], true, "confirmed accept: {ok}");
+        id
+    };
+
+    let (send_res, recv_id) = tokio::join!(send_fut, driver);
+    assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
+    let done = tokio::task::spawn_blocking(move || {
+        wait_event(5, |e| {
+            e["type"] == "transfer_completed" && e["transfer_id"] == recv_id
+        })
+    })
+    .await
+    .unwrap();
+    assert!(done.is_some(), "the confirmed transfer completes normally");
+    // Leave the process-global setting as it was found: these tests are
+    // serialised, not isolated.
+    let v = call_json(
+        pb_settings_set,
+        &json!({ "require_pairing_confirmation": false }),
+    );
+    assert_eq!(v["ok"], true, "settings reset: {v}");
+    pb_shutdown();
+}
+
 /// FFI engine sends OUT to a real peer receiver; checks events, stats, control.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]

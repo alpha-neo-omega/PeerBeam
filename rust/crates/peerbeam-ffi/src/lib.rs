@@ -179,6 +179,17 @@ fn id_of(v: &Value) -> Result<String, (Code, String)> {
         .ok_or((Code::InvalidArgument, "id required".into()))
 }
 
+/// The optional `confirmed` flag on an accept — the user's explicit "the two
+/// pairing codes match".
+///
+/// **Only a literal `true` counts.** Absent, `null`, `false`, `"true"`, `1` —
+/// all confirm nothing. A caller that has not been taught this prompt cannot
+/// accidentally satisfy it, which is the same reason the CLI's gate treats
+/// everything that is not an explicit `y` as a decline.
+fn confirmed_of(v: &Value) -> bool {
+    v.get("confirmed") == Some(&Value::Bool(true))
+}
+
 /// Queue file(s) to a peer: `{peer:{name,addresses[],port}, paths:[…]}` → `{ids}`.
 ///
 /// # Safety
@@ -234,18 +245,34 @@ pub unsafe extern "C" fn pb_transfer_cancel(json: *const c_char) -> *mut c_char 
     guard(|| error::envelope((|| runtime::manager()?.cancel(&id_of(&read_json(json)?)?))()))
 }
 
-/// Accept an incoming transfer: `{id}`. One-time only — does not trust the
-/// sending device.
+/// Accept an incoming transfer: `{id, confirmed?}`. One-time only — does not
+/// trust the sending device.
+///
+/// `confirmed` is the optional first-contact pairing answer: `true` means the
+/// user compared this session's pairing code against the other device's screen
+/// and they match. It matters only when the sending device was pinned by this
+/// very handshake *and* `require_pairing_confirmation` is on; absent or `false`
+/// then refuses the accept and leaves the transfer pending, so the user can
+/// verify and accept again. Everywhere else it is ignored.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn pb_transfer_accept(json: *const c_char) -> *mut c_char {
-    guard(|| error::envelope((|| runtime::manager()?.accept(&id_of(&read_json(json)?)?))()))
+    guard(|| {
+        error::envelope((|| {
+            let v = read_json(json)?;
+            runtime::manager()?.accept(&id_of(&v)?, confirmed_of(&v))
+        })())
+    })
 }
 
-/// Accept an incoming transfer AND trust the sending device: `{id}`. Future
-/// transfers from it are auto-accepted whenever auto-accept is enabled.
+/// Accept an incoming transfer AND trust the sending device:
+/// `{id, confirmed?}`. Future transfers from it are auto-accepted whenever
+/// auto-accept is enabled.
+///
+/// `confirmed` means what it does on [`pb_transfer_accept`], and is gated the
+/// same way.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
@@ -253,7 +280,8 @@ pub unsafe extern "C" fn pb_transfer_accept(json: *const c_char) -> *mut c_char 
 pub unsafe extern "C" fn pb_transfer_accept_trust(json: *const c_char) -> *mut c_char {
     guard(|| {
         error::envelope((|| {
-            runtime::manager()?.accept_trust(&id_of(&read_json(json)?)?)
+            let v = read_json(json)?;
+            runtime::manager()?.accept_trust(&id_of(&v)?, confirmed_of(&v))
         })())
     })
 }

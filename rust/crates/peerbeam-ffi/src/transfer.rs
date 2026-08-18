@@ -234,6 +234,51 @@ impl AcceptOutcome {
     }
 }
 
+/// Outcome of the optional first-contact pairing check, as applied to an
+/// **accept**.
+///
+/// The deliberate twin of the CLI's `PairingGate` (`peerbeam-cli`'s
+/// `commands::pairing_gate`), which this must not drift from: the same three
+/// inputs decide the same three outcomes, so a device that would be let
+/// through at a shell is let through in the app and vice versa. The CLI asks
+/// its question on stdin and answers it in the same breath; the FFI cannot —
+/// the surface holding the prompt is a separate process — so here the answer
+/// arrives as the `confirmed` flag on the accept call itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingGate {
+    /// Not first contact, or the toggle is off — accept without blocking.
+    /// This is every transfer on a default install (the toggle ships off).
+    Proceed,
+    /// First contact + toggle on + the caller confirmed the codes match.
+    Confirmed,
+    /// First contact + toggle on + no explicit confirmation — refuse the
+    /// accept. The transfer stays pending, so this is recoverable: the user
+    /// can compare the codes and accept again. It is *not* a decline, and it
+    /// must never be turned into one silently.
+    Blocked,
+}
+
+/// Decide whether an accept may proceed at first contact.
+///
+/// `confirmed` is the caller's explicit "I compared the two codes and they
+/// match". Anything that is not an explicit `true` blocks, which is the same
+/// safe default the CLI's gate applies to a missing answer: a surface that has
+/// no way to ask (a script driving the FFI, a UI that has not been taught the
+/// prompt) confirms nothing and therefore gets nothing through.
+///
+/// Pure and total, so the policy is testable without a session, a socket or a
+/// settings file — the wiring around it is thin on purpose.
+pub(crate) fn pairing_gate(first_contact: bool, require: bool, confirmed: bool) -> PairingGate {
+    if !first_contact || !require {
+        return PairingGate::Proceed;
+    }
+    if confirmed {
+        PairingGate::Confirmed
+    } else {
+        PairingGate::Blocked
+    }
+}
+
 /// The sender's own path for a queued file, read off its chat row.
 ///
 /// Deliberately **not** the staged blob's path, even though that is what the
@@ -393,10 +438,33 @@ pub struct Manager {
     save_rules: RwLock<Vec<peerbeam_config::SaveRule>>,
     /// Approval policy. Interior-mutable so toggling auto-accept applies live.
     auto_accept: AtomicBool,
+    /// The optional first-contact pairing check
+    /// (`device.require_pairing_confirmation`). Interior-mutable for the same
+    /// reason `auto_accept` is: turning it on in Settings must protect the very
+    /// next connection, not the next launch.
+    ///
+    /// **Off by default**, and that default is the whole compatibility story —
+    /// off means every accept behaves exactly as it did before this gate
+    /// existed.
+    require_pairing_confirmation: AtomicBool,
     chunk_size: u32,
     daemon_port: u16,
     active: Mutex<HashMap<String, Arc<Active>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<AcceptDecision>>>,
+    /// Transfers whose session pinned its peer **during this very handshake**,
+    /// mapped to that peer — i.e. the ones for which this is genuinely first
+    /// contact. Populated when the transfer is queued, removed when its
+    /// decision resolves.
+    ///
+    /// One record, read by both halves of this feature (the accept gate and
+    /// the refusal un-pin), so the two can never disagree about which
+    /// transfers are first contact. It is deliberately *not* re-derived from
+    /// the trust store at decision time: by then the peer is pinned either way
+    /// — the handshake pinned it — and a lookup could no longer tell a peer
+    /// this session pinned from one the user approved last week. That
+    /// distinction is exactly what must not be lost, because it is what keeps
+    /// a refusal from un-pinning a long-trusted device.
+    first_contact: Mutex<HashMap<String, DeviceId>>,
     history: Mutex<Vec<Value>>,
     /// Where history persists across restarts (None = in-memory only, tests).
     history_path: Option<std::path::PathBuf>,
@@ -428,6 +496,7 @@ impl Manager {
         save_dir: String,
         save_rules: Vec<peerbeam_config::SaveRule>,
         auto_accept: bool,
+        require_pairing_confirmation: bool,
         chunk_size: u32,
         daemon_port: u16,
         history_path: Option<std::path::PathBuf>,
@@ -455,10 +524,12 @@ impl Manager {
             save_dir: RwLock::new(save_dir),
             save_rules: RwLock::new(save_rules),
             auto_accept: AtomicBool::new(auto_accept),
+            require_pairing_confirmation: AtomicBool::new(require_pairing_confirmation),
             chunk_size: chunk_size.max(1),
             daemon_port,
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            first_contact: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
             history_path,
             reliability,
@@ -506,6 +577,37 @@ impl Manager {
     /// Apply the auto-accept policy live (persisted settings change; no restart).
     pub fn set_auto_accept(&self, v: bool) {
         self.auto_accept.store(v, Ordering::SeqCst);
+    }
+
+    /// Turn the optional first-contact pairing check on or off, live.
+    pub fn set_require_pairing_confirmation(&self, v: bool) {
+        self.require_pairing_confirmation.store(v, Ordering::SeqCst);
+    }
+
+    /// Whether the first-contact pairing check is currently on.
+    #[must_use]
+    pub fn require_pairing_confirmation(&self) -> bool {
+        self.require_pairing_confirmation.load(Ordering::SeqCst)
+    }
+
+    /// Record that `id`'s session pinned `peer` during its own handshake.
+    fn mark_first_contact(&self, id: &str, peer: &DeviceId) {
+        self.first_contact
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), peer.clone());
+    }
+
+    /// Whether `id` is still an open first-contact decision.
+    fn is_first_contact(&self, id: &str) -> bool {
+        self.first_contact.lock().unwrap().contains_key(id)
+    }
+
+    /// Take `id`'s first-contact record, if it has one. Removing on the way out
+    /// is what keeps the map bounded by *open* decisions rather than by every
+    /// transfer this process has ever seen.
+    fn take_first_contact(&self, id: &str) -> Option<DeviceId> {
+        self.first_contact.lock().unwrap().remove(id)
     }
 
     /// The identity presented in handshakes: same device id + keypair as
@@ -1715,10 +1817,41 @@ impl Manager {
         Ok(json!({ "cancelled": true }))
     }
 
+    /// Apply the optional first-contact pairing check to an accept.
+    ///
+    /// Runs **before** the pending decision is taken, so a blocked accept
+    /// leaves the transfer exactly as it found it: still pending, still
+    /// answerable. The user compares the two codes and accepts again — being
+    /// asked to verify must never cost them the file.
+    fn check_pairing(&self, id: &str, confirmed: bool) -> Result<(), (Code, String)> {
+        match pairing_gate(
+            self.is_first_contact(id),
+            self.require_pairing_confirmation(),
+            confirmed,
+        ) {
+            PairingGate::Proceed | PairingGate::Confirmed => Ok(()),
+            PairingGate::Blocked => Err((
+                Code::InvalidArgument,
+                format!(
+                    "transfer {id} is from a device seen for the first time; \
+                     confirm the pairing code matches the other device before accepting"
+                ),
+            )),
+        }
+    }
+
     /// Accept an incoming transfer this one time only. Does not trust the
     /// sending device — the next incoming transfer from it still needs a
     /// decision. See [`accept_trust`](Self::accept_trust) to also trust it.
-    pub fn accept(&self, id: &str) -> Op {
+    ///
+    /// `confirmed` answers the first-contact pairing check: it means "the user
+    /// compared this session's pairing code against the other device's screen
+    /// and they match". It is consulted **only** when the peer was pinned by
+    /// this very handshake and the check is switched on; on a default install
+    /// it is dead weight and every accept proceeds as it always has. It is
+    /// never inferred — a caller that does not pass it has confirmed nothing.
+    pub fn accept(&self, id: &str, confirmed: bool) -> Op {
+        self.check_pairing(id, confirmed)?;
         match self.pending.lock().unwrap().remove(id) {
             // The receiver may already have timed out (`ACCEPT_TIMEOUT`) and
             // dropped its end of the channel in the moment between us
@@ -1737,7 +1870,14 @@ impl Manager {
     /// transfers from it are auto-accepted whenever auto-accept is enabled.
     /// The only path that ever approves a device — a plain [`accept`](Self::accept)
     /// never does.
-    pub fn accept_trust(&self, id: &str) -> Op {
+    ///
+    /// `confirmed` carries the same meaning as on [`accept`](Self::accept), and
+    /// is gated identically. If anything this path needs it more: it is the one
+    /// call that grants a device standing auto-accept, so letting it skip the
+    /// check while the weaker accept honoured it would leave the gate guarding
+    /// only the lesser act.
+    pub fn accept_trust(&self, id: &str, confirmed: bool) -> Op {
+        self.check_pairing(id, confirmed)?;
         match self.pending.lock().unwrap().remove(id) {
             // Same rationale as `accept`: a failed send means the timeout
             // already declined this transfer out from under us.
@@ -1749,15 +1889,53 @@ impl Manager {
         }
     }
 
+    /// Refuse an incoming transfer.
+    ///
+    /// At **first contact** this is also the app's `PairingGate::Revoke`: the
+    /// peer was pinned by the handshake that offered this file, the user has
+    /// just said no to it, and the pin goes with it. Refusing a device the user
+    /// has met before does not touch its pin — only the peer *this session
+    /// pinned* is un-pinned, which is why the decision is read from
+    /// [`first_contact`](Self::first_contact) and not from the trust store (by
+    /// now the store cannot tell the two apart).
     pub fn reject(&self, id: &str) -> Op {
+        // Answer the decision first, so the refusal is in effect no matter what
+        // the un-pin below does. Nothing lands on disk either way.
         match self.pending.lock().unwrap().remove(id) {
             // Same rationale as `accept`: a failed send means the timeout
             // already declined this transfer out from under us.
-            Some(tx) => match tx.send(AcceptDecision::Reject) {
-                Ok(()) => Ok(json!({ "rejected": true })),
-                Err(_) => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
-            },
-            None => Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+            Some(tx) => {
+                if tx.send(AcceptDecision::Reject).is_err() {
+                    return Err((Code::InvalidArgument, format!("no pending transfer {id}")));
+                }
+            }
+            None => return Err((Code::InvalidArgument, format!("no pending transfer {id}"))),
+        }
+        let Some(peer) = self.take_first_contact(id) else {
+            return Ok(json!({ "rejected": true }));
+        };
+        // A security-relevant un-pin, and the one place in this feature where a
+        // swallowed error would be worse than an outage. Reporting success on a
+        // failed removal would leave the peer trusted on disk while the app
+        // told the user it had been un-pinned — and the *next* connection from
+        // it would then not be first contact at all: no `newly_trusted`, no
+        // pairing code shown, no gate, silently. The user would never be asked
+        // to verify the device they had just refused as a suspected MITM.
+        //
+        // So the result is checked and the failure is reported, on the same
+        // channel every other transfer failure uses. The refusal itself already
+        // stands (above), so this cannot fall through to receiving data; what
+        // the error buys is that the user finds out the pin is still there and
+        // can remove it themselves in Trusted Devices.
+        match self.trust.remove(&peer) {
+            Ok(_) => Ok(json!({ "rejected": true, "unpinned": true })),
+            Err(e) => Err((
+                Code::Storage,
+                format!(
+                    "transfer {id} was declined, but this device could NOT be un-pinned ({e}); \
+                     remove it in Trusted Devices — until then it will not be treated as new"
+                ),
+            )),
         }
     }
 
@@ -3308,6 +3486,14 @@ impl Manager {
                 "pairing_code": session.pairing_code.clone(),
             }),
         );
+        // Record first contact before any decision can be taken, so the accept
+        // gate and the refusal un-pin both see it. `newly_trusted` is the only
+        // moment this is knowable: the handshake has already pinned the peer,
+        // so from here on the trust store reads the same for a stranger met
+        // seconds ago and a device approved last week.
+        if session.newly_trusted {
+            self.mark_first_contact(&id, &session.peer_device);
+        }
 
         // Approval: auto-accept only peers explicitly approved by the user on
         // a prior transfer, else wait for a decision. A pinned key alone
@@ -3340,6 +3526,14 @@ impl Manager {
         } else {
             self.wait_for_accept(&id, &session.peer_device).await
         };
+        // The decision is settled, so this transfer is no longer an open
+        // first-contact question — drop the record however it resolved. A
+        // decline already consumed it in `reject`, which is the only path that
+        // un-pins; this is the cleanup for every other ending (accepted,
+        // cancelled, or nobody answered), and it deliberately un-pins nothing.
+        // An unanswered prompt is not the user refusing, and this project does
+        // not convert absence into a decision.
+        self.take_first_contact(&id);
         if !outcome.accepted() {
             // Claim before emitting, and emit only if the claim lands. The
             // decision can arrive after `cancel()` already claimed this
@@ -4244,6 +4438,11 @@ mod tests {
             // No rules: these tests are about the transfer → chat bridge, and
             // the save destination is not the variable under study.
             Vec::new(),
+            // auto_accept off.
+            false,
+            // require_pairing_confirmation off — the shipped default, so every
+            // existing test keeps exercising the unchanged accept path. The
+            // pairing-gate tests turn it on explicitly.
             false,
             1024,
             daemon_port,
@@ -5352,7 +5551,8 @@ mod tests {
         let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
 
         wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
-        mgr.accept(&id).expect("accept should find the pending id");
+        mgr.accept(&id, false)
+            .expect("accept should find the pending id");
 
         assert_eq!(
             waiter.await.expect("task join"),
@@ -5380,7 +5580,7 @@ mod tests {
         let waiter = tokio::spawn(async move { mgr2.wait_for_accept(&id2, &peer2).await });
 
         wait_until(|| mgr.pending.lock().unwrap().contains_key(&id)).await;
-        mgr.accept_trust(&id)
+        mgr.accept_trust(&id, false)
             .expect("accept_trust should find the pending id");
 
         assert_eq!(
@@ -5457,6 +5657,270 @@ mod tests {
         assert!(
             !mgr.trust.lookup(&peer_id).unwrap().unwrap().approved,
             "a timeout must never approve the device"
+        );
+    }
+
+    // ── the first-contact pairing gate ───────────────────────────
+    //
+    // Two halves, tested apart: `pairing_gate` decides *whether an accept may
+    // proceed*, and `reject` decides *what a refusal costs the peer*. Both act
+    // only on a peer this session pinned, which is the fact `first_contact`
+    // records — the trust store cannot supply it, because by decision time a
+    // stranger and a device approved last week are both simply "pinned".
+
+    /// The policy itself, exhaustively. Eight rows, no session, no socket, no
+    /// settings file — a change in what this gate lets through has to break
+    /// here first.
+    #[test]
+    fn pairing_gate_only_lets_first_contact_through_on_an_explicit_confirmation() {
+        // Not first contact: the check never applies, whatever the toggle says.
+        // This is every transfer from a device the user has met before.
+        for require in [false, true] {
+            for confirmed in [false, true] {
+                assert_eq!(
+                    pairing_gate(false, require, confirmed),
+                    PairingGate::Proceed,
+                    "a known device is never gated (require={require}, confirmed={confirmed})"
+                );
+            }
+        }
+        // First contact with the check off — the shipped default, and exactly
+        // the behaviour that existed before this gate.
+        assert_eq!(pairing_gate(true, false, false), PairingGate::Proceed);
+        assert_eq!(pairing_gate(true, false, true), PairingGate::Proceed);
+        // First contact with the check on: an explicit yes, and nothing else.
+        assert_eq!(
+            pairing_gate(true, true, false),
+            PairingGate::Blocked,
+            "no confirmation is not a confirmation — it must never default to yes"
+        );
+        assert_eq!(pairing_gate(true, true, true), PairingGate::Confirmed);
+    }
+
+    /// Park a decision for `id` the way `handle_incoming` does, so `accept`/
+    /// `reject` have something real to answer. Returns the waiter.
+    fn park_decision(
+        mgr: &Arc<Manager>,
+        id: &str,
+        peer: &DeviceId,
+    ) -> tokio::task::JoinHandle<AcceptOutcome> {
+        let (m, i, p) = (mgr.clone(), id.to_string(), peer.clone());
+        tokio::spawn(async move { m.wait_for_accept(&i, &p).await })
+    }
+
+    #[tokio::test]
+    async fn accept_at_first_contact_is_refused_until_the_codes_are_confirmed() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-stranger");
+        pin(&mgr.trust, &peer);
+        let id = "tx-first-contact";
+        mgr.set_require_pairing_confirmation(true);
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        let blocked = mgr.accept(id, false);
+        assert!(
+            blocked.is_err(),
+            "an unconfirmed accept at first contact must be refused"
+        );
+        assert!(
+            mgr.pending.lock().unwrap().contains_key(id),
+            "a blocked accept must leave the transfer PENDING — being asked to \
+             verify a device must not cost the user the file"
+        );
+
+        // The same call, now carrying the user's explicit confirmation.
+        mgr.accept(id, true)
+            .expect("a confirmed accept goes through");
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Accepted);
+    }
+
+    /// The stronger of the two accepts — the one that grants standing
+    /// auto-accept — is gated identically. A gate on the weaker act only would
+    /// be no gate at all.
+    #[tokio::test]
+    async fn accept_trust_at_first_contact_is_refused_until_the_codes_are_confirmed() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-stranger-trust");
+        pin(&mgr.trust, &peer);
+        let id = "tx-first-contact-trust";
+        mgr.set_require_pairing_confirmation(true);
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        assert!(
+            mgr.accept_trust(id, false).is_err(),
+            "an unconfirmed accept-and-trust at first contact must be refused"
+        );
+        assert!(
+            !mgr.trust.lookup(&peer).unwrap().unwrap().approved,
+            "a blocked accept-and-trust must not have approved the device"
+        );
+
+        mgr.accept_trust(id, true)
+            .expect("a confirmed accept-and-trust goes through");
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Accepted);
+    }
+
+    /// With the toggle off — the default every install ships with — a
+    /// first-contact transfer accepts exactly as it always has, confirmation
+    /// flag or no confirmation flag.
+    #[tokio::test]
+    async fn accept_at_first_contact_is_unchanged_while_the_check_is_off() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-default-install");
+        pin(&mgr.trust, &peer);
+        let id = "tx-check-off";
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        mgr.accept(id, false)
+            .expect("with the check off, an unconfirmed accept is just an accept");
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Accepted);
+    }
+
+    /// The check is *first contact* only. A device the user has met before is
+    /// never re-gated, however loudly the toggle is set.
+    #[tokio::test]
+    async fn accept_from_a_known_device_is_never_gated() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-known");
+        pin(&mgr.trust, &peer);
+        let id = "tx-known-device";
+        mgr.set_require_pairing_confirmation(true);
+        // Deliberately NOT marked first contact: this session did not pin it.
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        mgr.accept(id, false)
+            .expect("a device the user has met before needs no pairing confirmation");
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Accepted);
+    }
+
+    /// The app's `PairingGate::Revoke`: refusing a device this session pinned
+    /// takes the pin with it.
+    #[tokio::test]
+    async fn refusing_a_first_contact_un_pins_the_peer() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-refused");
+        pin(&mgr.trust, &peer);
+        let id = "tx-refuse-first-contact";
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        let out = mgr.reject(id).expect("reject should find the pending id");
+        assert_eq!(out["unpinned"], json!(true));
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Rejected);
+        assert!(
+            mgr.trust.lookup(&peer).unwrap().is_none(),
+            "a refused first contact must leave NO pin behind — otherwise the \
+             next connection is not 'new', skips the gate, and the user is \
+             never again asked to verify the device they just refused"
+        );
+    }
+
+    /// The exclusion that keeps the un-pin honest. Declining a file from a
+    /// device the user approved long ago is an ordinary "no thanks"; it must
+    /// not quietly revoke a standing trust relationship.
+    #[tokio::test]
+    async fn refusing_a_previously_known_device_leaves_its_pin_alone() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-old-friend");
+        pin(&mgr.trust, &peer);
+        let id = "tx-refuse-known";
+        // No `mark_first_contact`: this session did not pin this device.
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        let out = mgr.reject(id).expect("reject should find the pending id");
+        assert!(
+            out.get("unpinned").is_none(),
+            "nothing was un-pinned, so nothing may claim to have been"
+        );
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Rejected);
+        assert!(
+            mgr.trust.lookup(&peer).unwrap().is_some(),
+            "declining one file must never revoke a device the user already trusts"
+        );
+    }
+
+    /// The trap the CLI's un-pin site documents, guarded here too: a removal
+    /// that failed must never be reported as a removal that worked. If it
+    /// were, the peer would stay trusted on disk while the app said otherwise
+    /// — and the next connection from it would not be first contact, so no
+    /// code, no gate, no second chance to catch the MITM.
+    #[tokio::test]
+    async fn a_failed_un_pin_is_reported_as_a_failure_not_as_success() {
+        let (mgr, _chat, dir) = test_manager_full("Device", 0);
+        let mgr = Arc::new(mgr);
+        let peer = DeviceId::from("peer-unremovable");
+        pin(&mgr.trust, &peer);
+        let id = "tx-unpin-fails";
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+
+        // Break the store's ability to write itself back: the file the trust
+        // store persists through becomes a directory, so the read-merge-write
+        // cycle inside `remove` cannot complete.
+        let trust_path = dir.path().join("trust.json");
+        std::fs::remove_file(&trust_path).expect("remove trust file");
+        std::fs::create_dir(&trust_path).expect("put a directory in its place");
+
+        let err = mgr
+            .reject(id)
+            .expect_err("a failed un-pin must not report success");
+        assert!(
+            matches!(err.0, Code::Storage),
+            "a storage failure, reported"
+        );
+        assert!(
+            err.1.contains("could NOT be un-pinned"),
+            "the message must say the pin is still there: {}",
+            err.1
+        );
+        assert_eq!(
+            waiter.await.expect("task join"),
+            AcceptOutcome::Rejected,
+            "the refusal itself still stands — a failed un-pin must never fall \
+             through to receiving the file"
+        );
+    }
+
+    /// Scope, pinned deliberately: an *unanswered* prompt is not a refusal.
+    /// `AcceptOutcome` exists precisely so this project never converts absence
+    /// into the user's decision, and un-pinning on a timeout would do exactly
+    /// that. The peer stays pinned; it is still not `approved`, so it gains
+    /// nothing (I6).
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_first_contact_prompt_un_pins_nothing() {
+        let mgr = Arc::new(test_manager("Device"));
+        let peer = DeviceId::from("peer-nobody-home");
+        pin(&mgr.trust, &peer);
+        let id = "tx-unanswered-first-contact";
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+        tokio::time::advance(ACCEPT_TIMEOUT + Duration::from_millis(1)).await;
+
+        assert_eq!(waiter.await.expect("task join"), AcceptOutcome::Unanswered);
+        let record = mgr.trust.lookup(&peer).unwrap();
+        assert!(record.is_some(), "a timeout is not the user saying no");
+        assert!(
+            !record.unwrap().approved,
+            "and it grants the device nothing either"
         );
     }
 
