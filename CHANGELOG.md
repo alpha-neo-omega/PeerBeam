@@ -6,6 +6,33 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-18 — Beta
+
+### Added
+- **A native `arm64` CLI for Linux** (`peerbeam-linux-arm64`) — Raspberry Pi 4/5
+  on 64-bit Raspberry Pi OS, Ampere and Graviton servers, Asahi Linux. Built on
+  a native arm64 runner rather than cross-compiled.
+
+### Fixed
+- **Linux packaging derives the architecture instead of hardcoding it.** Four
+  ecosystems spell it four ways — Flutter `x64`/`arm64`, dpkg `amd64`/`arm64`,
+  rpm and AppImage `x86_64`/`aarch64` — so it is mapped once and every filename,
+  the deb's `Architecture`, the spec's `BuildArch` and appimagetool's `ARCH`
+  follow. x86_64 output is unchanged; an unrecognised architecture now fails
+  loudly rather than producing a mislabelled package.
+- **A templated artifact name no longer breaks the whole workflow.**
+  `with: { name: ${{ matrix.artifact }}, … }` is invalid YAML — the expression's
+  braces close the flow mapping — so the release workflow silently stopped
+  parsing and GitHub stopped seeing its triggers. It would have simply not run
+  on the next tag.
+
+### Known limits
+- **The Linux desktop app remains x86_64 only.** Google publishes no Linux
+  arm64 Flutter SDK: all 730 Linux releases in its manifest are `x64` or
+  unspecified, and an arm64 build fails at SDK setup. The CLI is plain Rust and
+  has no such constraint. See [GUIDE.md](docs/GUIDE.md).
+
+
 ## [0.8.1] - 2026-08-18 — Beta
 
 ### Fixed
