@@ -258,7 +258,8 @@ void main() {
     expect(
       tester.widget<SwitchListTile>(_switchFor('pb-mine', 'Pipes')).value,
       isTrue,
-      reason: 'a switch must never be left showing something that did not happen',
+      reason:
+          'a switch must never be left showing something that did not happen',
     );
   });
 
@@ -328,5 +329,28 @@ void main() {
     });
     expect(future.may('browse'), isTrue, reason: 'it decodes');
     expect(PeerBeamPermission.all, isNot(contains('browse')));
+  });
+
+  testWidgets('About reports the engine version, not a number written in Dart', (
+    tester,
+  ) async {
+    // This screen said "Version 0.3.0" for three releases, under a comment
+    // asking whoever bumped the version to keep it in sync. A hand-maintained
+    // duplicate of a fact the engine already knows is a claim nobody re-checks,
+    // so the test asserts the value came from the engine by giving the engine
+    // an unmistakable one.
+    final fake = FakePeerBeam()..engineVersionValue = '4.5.6';
+    await _open(tester, fake, scrollTo: 'PeerBeam');
+
+    expect(find.text('Version 4.5.6 · AGPL-3.0'), findsOneWidget);
+  });
+
+  testWidgets('About admits an unknown version rather than inventing one', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()..engineVersionValue = null;
+    await _open(tester, fake, scrollTo: 'PeerBeam');
+
+    expect(find.text('Version unknown · AGPL-3.0'), findsOneWidget);
   });
 }

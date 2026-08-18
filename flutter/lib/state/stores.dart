@@ -279,6 +279,11 @@ class AppState {
   /// through (widget tests that build state without an API).
   final ClipboardSyncService? clipboard;
 
+  /// The engine itself, for the few things that are questions about the engine
+  /// rather than about any one repository — its version, for instance. Null in
+  /// widget tests that build state without one.
+  final PeerBeamApi? api;
+
   AppState({
     required this.theme,
     required this.device,
@@ -291,6 +296,7 @@ class AppState {
     required this.settings,
     required this.staging,
     this.clipboard,
+    this.api,
   });
 
   /// Production wiring: repositories driven by the live engine over [api].
@@ -308,6 +314,7 @@ class AppState {
       compression: true,
     );
     return AppState(
+      api: api,
       theme: ThemeController(),
       device: device,
       transfer: TransferRepository(
@@ -332,10 +339,11 @@ class AppState {
             .map((t) => device.peerTarget(t.id))
             .whereType<PeerTarget>()
             .toList(),
-        nameOf: (id) => device.devices
-            .where((d) => d.id == id)
-            .map((d) => d.name)
-            .firstOrNull ??
+        nameOf: (id) =>
+            device.devices
+                .where((d) => d.id == id)
+                .map((d) => d.name)
+                .firstOrNull ??
             id,
       ),
     );

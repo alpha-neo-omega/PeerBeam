@@ -9,8 +9,7 @@ import '../../platform/saf.dart';
 import '../../platform/services.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/exceptions.dart';
-import '../../sdk/models.dart'
-    show PeerBeamPermission, SaveRule, TrustedDevice;
+import '../../sdk/models.dart' show PeerBeamPermission, SaveRule, TrustedDevice;
 import '../../state/app_scope.dart';
 import '../../state/stores.dart' show SettingsStore;
 import '../../widgets/common.dart';
@@ -305,12 +304,15 @@ class SettingsScreen extends StatelessWidget {
               ],
 
               const _GroupLabel('About'),
-              const Card(
+              Card(
                 child: ListTile(
-                  leading: Icon(Icons.info_outline_rounded),
-                  title: Text('PeerBeam'),
-                  // Keep in sync with pubspec.yaml / workspace version.
-                  subtitle: Text('Version 0.3.0 · AGPL-3.0'),
+                  leading: const Icon(Icons.info_outline_rounded),
+                  title: const Text('PeerBeam'),
+                  // Asked of the engine, never written down here. The previous
+                  // hardcoded string sat under a comment asking whoever bumped
+                  // the version to keep it in sync, and it was three releases
+                  // stale by the time anyone noticed.
+                  subtitle: Text(_aboutLine(state.api?.engineVersion)),
                 ),
               ),
             ],
@@ -379,6 +381,12 @@ class SettingsScreen extends StatelessWidget {
     );
     if (confirmed == true) await state.trust.remove(d.id);
   }
+
+  /// The About line. The version is whatever the engine reports; with no engine
+  /// to ask, it says so rather than inventing a number — an app stating a
+  /// version it cannot know is worse than one admitting it does not.
+  static String _aboutLine(String? engineVersion) =>
+      'Version ${engineVersion ?? 'unknown'} · AGPL-3.0';
 
   /// First 16 hex chars of the fingerprint, grouped for readability.
   static String _shortFingerprint(String fp) {
@@ -651,7 +659,9 @@ class _SaveRulesCard extends StatelessWidget {
                 const ListTile(
                   leading: Icon(Icons.rule_folder_outlined),
                   title: Text('No rules'),
-                  subtitle: Text('Every received file goes to the folder above.'),
+                  subtitle: Text(
+                    'Every received file goes to the folder above.',
+                  ),
                 )
               else
                 ReorderableListView.builder(
@@ -913,7 +923,9 @@ class _AddRuleDialogState extends State<_AddRuleDialog> {
         FilledButton(
           // Disabled until a folder is chosen: a rule with no destination has
           // nowhere to put anything, and the engine would refuse it anyway.
-          onPressed: dir == null ? null : () => Navigator.pop(context, _build(dir)),
+          onPressed: dir == null
+              ? null
+              : () => Navigator.pop(context, _build(dir)),
           child: const Text('Add'),
         ),
       ],

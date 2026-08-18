@@ -23,6 +23,15 @@ abstract class PeerBeamApi {
   /// True when the native engine is loaded and usable.
   bool get available;
 
+  /// The engine's own semantic version, or null when no engine is loaded.
+  ///
+  /// Read from the engine rather than duplicated in Dart: the app and the
+  /// engine ship together, and a hand-maintained copy in the UI is a claim
+  /// nobody re-checks. The About screen showed `0.3.0` for three releases
+  /// because of exactly that, under a comment asking the next person to keep
+  /// it in sync.
+  String? get engineVersion;
+
   /// All engine events, decoded and typed. Broadcast; never polls.
   Stream<BridgeEvent> get events;
 
@@ -38,6 +47,7 @@ abstract class PeerBeamApi {
   Future<void> pause(String id);
   Future<void> resume(String id);
   Future<void> cancel(String id);
+
   /// Accept an incoming transfer, this once.
   ///
   /// [confirmed] answers the engine's first-contact pairing check: it means the
@@ -277,6 +287,22 @@ class PeerBeam implements PeerBeamApi {
   bool get available => _b != null;
 
   @override
+  String? get engineVersion {
+    final b = _b;
+    if (b == null) return null;
+    try {
+      final decoded = jsonDecode(b.versionJson());
+      if (decoded is! Map) return null;
+      final data = decoded['data'];
+      final semver = (data is Map ? data['semver'] : null) ?? decoded['semver'];
+      return semver is String && semver.isNotEmpty ? semver : null;
+    } catch (_) {
+      // A version string is never worth failing a screen over.
+      return null;
+    }
+  }
+
+  @override
   Stream<BridgeEvent> get events => _events.stream;
 
   Bindings _req() {
@@ -392,10 +418,7 @@ class PeerBeam implements PeerBeamApi {
   @override
   Future<void> resumeInterrupted(String id, {PeerTarget? peer}) async => _data(
     _req().resumeInterrupted(
-      jsonEncode({
-        'id': id,
-        if (peer != null) 'peer': peer.toJson(),
-      }),
+      jsonEncode({'id': id, if (peer != null) 'peer': peer.toJson()}),
     ),
   );
 
@@ -498,17 +521,13 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<List<ChatMessage>> chatHistory(String peerId) async {
-    final data = _data(
-      _req().chatHistory(jsonEncode({'peer_id': peerId})),
-    );
+    final data = _data(_req().chatHistory(jsonEncode({'peer_id': peerId})));
     return _list(data['messages']).map(ChatMessage.fromJson).toList();
   }
 
   @override
   Future<int> chatReconcile(String peerId) async {
-    final data = _data(
-      _req().chatReconcile(jsonEncode({'peer_id': peerId})),
-    );
+    final data = _data(_req().chatReconcile(jsonEncode({'peer_id': peerId})));
     return (data['changed'] as num?)?.toInt() ?? 0;
   }
 
@@ -584,8 +603,6 @@ class PeerBeam implements PeerBeamApi {
   /// same thing to it — and sending the key only when there is something to say
   /// keeps every ordinary accept byte-identical to what it was before this
   /// check existed.
-  String _decision(String id, bool confirmed) => jsonEncode({
-    'id': id,
-    if (confirmed) 'confirmed': true,
-  });
+  String _decision(String id, bool confirmed) =>
+      jsonEncode({'id': id, if (confirmed) 'confirmed': true});
 }

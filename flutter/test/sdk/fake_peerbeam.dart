@@ -20,6 +20,13 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   bool get available => true;
+
+  /// What the engine would report. Tests override it to prove the About screen
+  /// renders whatever the engine says rather than a constant of its own.
+  String? engineVersionValue = '9.9.9';
+
+  @override
+  String? get engineVersion => engineVersionValue;
   @override
   Stream<BridgeEvent> get events => _ctrl.stream;
 
@@ -133,6 +140,7 @@ class FakePeerBeam implements PeerBeamApi {
     calls.add('discardInterrupted:$id');
     interrupted = interrupted.where((t) => t.id != id).toList();
   }
+
   Map<String, dynamic> settings = {};
 
   @override
