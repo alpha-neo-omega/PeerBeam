@@ -325,10 +325,13 @@ void main() {
       'fingerprint': 'ff',
       'trusted_at': '2026-08-18T00:00:00Z',
       'approved': true,
-      'permissions': ['files', 'browse'],
+      // Deliberately not a plausible future permission: this test used
+      // 'browse', which was hypothetical right up until shared folders
+      // shipped — at which point it silently stopped testing anything.
+      'permissions': ['files', 'xyzzy-not-a-permission'],
     });
-    expect(future.may('browse'), isTrue, reason: 'it decodes');
-    expect(PeerBeamPermission.all, isNot(contains('browse')));
+    expect(future.may('xyzzy-not-a-permission'), isTrue, reason: 'it decodes');
+    expect(PeerBeamPermission.all, isNot(contains('xyzzy-not-a-permission')));
   });
 
   testWidgets('About reports the engine version, not a number written in Dart', (

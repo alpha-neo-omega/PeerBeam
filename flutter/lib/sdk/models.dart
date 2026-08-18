@@ -285,13 +285,17 @@ class InterruptedTransfer {
         peerId: j['peer_id'] as String? ?? '',
         file: j['file'] as String? ?? '',
         path: j['path'] as String? ?? '',
-        transferredBytes: (j['stats'] is Map
-            ? (j['stats'] as Map)['transferred_bytes']
-            : j['transferred_bytes']) as int? ??
+        transferredBytes:
+            (j['stats'] is Map
+                    ? (j['stats'] as Map)['transferred_bytes']
+                    : j['transferred_bytes'])
+                as int? ??
             0,
-        totalBytes: (j['stats'] is Map
-            ? (j['stats'] as Map)['total_bytes']
-            : j['total_bytes']) as int? ??
+        totalBytes:
+            (j['stats'] is Map
+                    ? (j['stats'] as Map)['total_bytes']
+                    : j['total_bytes'])
+                as int? ??
             0,
         startedAt: j['started_at'] as String? ?? '',
         // Absent means "not resumable": offering a button that cannot work is
@@ -457,8 +461,19 @@ abstract final class PeerBeamPermission {
   /// Exchange notes with this device.
   static const notes = 'notes';
 
+  /// Let this device list the folders you share, read-only.
+  static const browse = 'browse';
+
   /// Every permission this build can render, in the engine's slot order.
-  static const all = <String>[files, chat, clipboard, presence, pipe, notes];
+  static const all = <String>[
+    files,
+    chat,
+    clipboard,
+    presence,
+    pipe,
+    notes,
+    browse,
+  ];
 
   /// The switch label for `permission`.
   static String label(String permission) => switch (permission) {
@@ -468,6 +483,7 @@ abstract final class PeerBeamPermission {
     presence => 'Device status',
     pipe => 'Pipes',
     notes => 'Notes',
+    browse => 'Shared folders',
     _ => permission,
   };
 
@@ -480,6 +496,9 @@ abstract final class PeerBeamPermission {
     presence => 'Send this device your battery, disk and network status',
     pipe => 'Let it pipe data into a listening terminal here',
     notes => 'Keep your notes in sync with this device',
+    browse =>
+      'Let it list the folders you share (it still needs Files to '
+          'receive anything)',
     _ => '',
   };
 }
@@ -653,7 +672,8 @@ class ChatMessage {
       fileName: file?['name'] as String?,
       fileSize: (file?['size'] as num?)?.toInt(),
       localPath: file?['local_path'] as String?,
-      reactions: (j['reactions'] as List?)
+      reactions:
+          (j['reactions'] as List?)
               ?.whereType<Map>()
               .map((r) => ChatReaction.fromJson(Map<String, dynamic>.from(r)))
               .toList() ??
@@ -979,11 +999,7 @@ class ChatSearchResults {
     required this.limit,
   });
 
-  static const empty = ChatSearchResults(
-    hits: [],
-    truncated: false,
-    limit: 0,
-  );
+  static const empty = ChatSearchResults(hits: [], truncated: false, limit: 0);
 
   bool get isEmpty => hits.isEmpty;
 }
