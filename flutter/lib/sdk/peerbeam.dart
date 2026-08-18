@@ -329,6 +329,12 @@ abstract class PeerBeamApi {
   /// "refused" could map which devices are listening.
   Future<bool> presenceRing(PeerTarget peer, {int seconds = 15});
 
+  /// Ask [peer] what is in one of its shared folders.
+  ///
+  /// [path] is share-relative — `photos/2026`, never absolute. Empty asks what
+  /// the device shares at all.
+  Future<BrowseListing> browse(PeerTarget peer, {String path = ''});
+
   /// This device's activity, newest first. A pure local read.
   Future<List<TimelineEvent>> timeline({int? limit});
 
@@ -705,6 +711,14 @@ class PeerBeam implements PeerBeamApi {
       ),
     );
     return data['sent'] == true;
+  }
+
+  @override
+  Future<BrowseListing> browse(PeerTarget peer, {String path = ''}) async {
+    final data = _data(
+      _req().browseList(jsonEncode({'peer': peer.toJson(), 'path': path})),
+    );
+    return BrowseListing.fromJson(data);
   }
 
   @override

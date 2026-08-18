@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../browse/browse_screen.dart';
 import '../notes/notes_screen.dart';
 import '../timeline/timeline_screen.dart';
 
@@ -724,6 +725,18 @@ class _HomeScreenState extends State<HomeScreen> {
                                   null => null,
                                 },
                                 onRing: () => _ringSaved(context, saved[i]),
+                                onBrowse: () => Navigator.of(context).push(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => BrowseScreen(
+                                      peer: PeerTarget(
+                                        id: saved[i].id,
+                                        name: saved[i].name,
+                                        addresses: [saved[i].host],
+                                        port: saved[i].port,
+                                      ),
+                                    ),
+                                  ),
+                                ),
                                 onShare: () => _shareSaved(context, saved[i]),
                                 onEdit: () =>
                                     _editSavedDevice(context, saved[i]),
@@ -901,6 +914,9 @@ class _SavedDeviceCard extends StatelessWidget {
 
   /// Ask this device to make itself findable.
   final VoidCallback onRing;
+
+  /// Look at what this device shares.
+  final VoidCallback onBrowse;
   final VoidCallback onEdit;
   final VoidCallback onRemove;
   const _SavedDeviceCard({
@@ -908,6 +924,7 @@ class _SavedDeviceCard extends StatelessWidget {
     required this.onTap,
     required this.onChat,
     required this.onRing,
+    required this.onBrowse,
     required this.onShare,
     required this.onEdit,
     required this.onRemove,
@@ -972,12 +989,21 @@ class _SavedDeviceCard extends StatelessWidget {
               PopupMenuButton<String>(
                 tooltip: 'Device actions',
                 onSelected: (v) => switch (v) {
+                  'browse' => onBrowse(),
                   'ring' => onRing(),
                   'share' => onShare(),
                   'edit' => onEdit(),
                   _ => onRemove(),
                 },
                 itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'browse',
+                    child: ListTile(
+                      leading: Icon(Icons.folder_shared_outlined),
+                      title: Text('Browse'),
+                      subtitle: Text('See what it shares'),
+                    ),
+                  ),
                   PopupMenuItem(
                     value: 'ring',
                     child: ListTile(

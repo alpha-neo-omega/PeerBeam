@@ -563,6 +563,32 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// What each share-relative path contains, for the browse tests.
+  final Map<String, List<BrowseEntry>> shared = {};
+
+  /// When true, every browse answers denied — the shape a device that shares
+  /// nothing, or has not granted permission, actually sends.
+  bool browseDenied = false;
+
+  @override
+  Future<BrowseListing> browse(PeerTarget peer, {String path = ''}) async {
+    calls.add('browse:${peer.id}:$path');
+    if (browseDenied) {
+      return BrowseListing(
+        path: path,
+        entries: const [],
+        truncated: false,
+        denied: true,
+      );
+    }
+    return BrowseListing(
+      path: path,
+      entries: shared[path] ?? const [],
+      truncated: false,
+      denied: false,
+    );
+  }
+
   /// The activity this fake reports, newest first.
   final List<TimelineEvent> timelineEvents = [];
 

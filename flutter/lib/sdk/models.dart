@@ -844,6 +844,55 @@ class Note {
   );
 }
 
+/// One entry in a remote device's shared folder.
+class BrowseEntry {
+  final String name;
+  final bool isDir;
+  final int size;
+
+  const BrowseEntry({
+    required this.name,
+    required this.isDir,
+    required this.size,
+  });
+
+  factory BrowseEntry.fromJson(Map<String, dynamic> j) => BrowseEntry(
+    name: j['name'] as String? ?? '',
+    isDir: j['is_dir'] as bool? ?? false,
+    size: (j['size'] as num?)?.toInt() ?? 0,
+  );
+}
+
+/// A device's answer about one folder.
+///
+/// [denied] with no entries means the device is not showing this — it may share
+/// nothing here, may not have granted this device permission, or the path may
+/// not exist. **Those are deliberately indistinguishable**, so a surface must
+/// say all three rather than guess.
+class BrowseListing {
+  final String path;
+  final List<BrowseEntry> entries;
+  final bool truncated;
+  final bool denied;
+
+  const BrowseListing({
+    required this.path,
+    required this.entries,
+    required this.truncated,
+    required this.denied,
+  });
+
+  factory BrowseListing.fromJson(Map<String, dynamic> j) => BrowseListing(
+    path: j['path'] as String? ?? '',
+    entries: (j['entries'] as List? ?? const [])
+        .whereType<Map>()
+        .map((e) => BrowseEntry.fromJson(Map<String, dynamic>.from(e)))
+        .toList(),
+    truncated: j['truncated'] as bool? ?? false,
+    denied: j['denied'] as bool? ?? false,
+  );
+}
+
 /// One thing this device did.
 ///
 /// Carries no message body and no clip text: the timeline says *that* something
