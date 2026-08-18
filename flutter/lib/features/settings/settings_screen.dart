@@ -138,6 +138,21 @@ class SettingsScreen extends StatelessWidget {
                         onChanged: state.settings.setSharePresence,
                       ),
                       const Divider(height: 1),
+                      SwitchListTile(
+                        secondary: const Icon(Icons.done_all_rounded),
+                        title: const Text('Read receipts'),
+                        // Says what is disclosed and about whom. "Read
+                        // receipts" alone would not let anyone decide: the
+                        // thing shared is a time you looked at something.
+                        subtitle: const Text(
+                          'Tells people when you have read their messages. '
+                          'Off by default. Turning it off never stops you '
+                          'seeing when others have read yours.',
+                        ),
+                        value: state.settings.shareReadReceipts,
+                        onChanged: state.settings.setShareReadReceipts,
+                      ),
+                      const Divider(height: 1),
                       const _ClipboardSyncTile(),
                     ],
                   ),

@@ -278,6 +278,13 @@ pub enum ChatAction {
     History {
         /// Peer device id.
         peer: String,
+        /// Also tell the peer you have read it, up to the newest message shown.
+        ///
+        /// Never implied by printing: reading a conversation is not consent to
+        /// report having read it. Sends nothing unless
+        /// `device.share_read_receipts` is on.
+        #[arg(long)]
+        mark_read: bool,
     },
     /// Search this device's stored conversations.
     ///

@@ -514,6 +514,15 @@ class FakePeerBeam implements PeerBeamApi {
     return (applied: true, delivered: reactDelivered);
   }
 
+  /// What the engine would report. False models the default: receipts off.
+  bool markReadSent = false;
+
+  @override
+  Future<bool> chatMarkRead(String peerId, String readThrough) async {
+    calls.add('chatMarkRead:$peerId:$readThrough');
+    return markReadSent;
+  }
+
   @override
   Future<ChatSearchResults> chatSearch(String query, {int? limit}) async {
     calls.add('chatSearch:$query');

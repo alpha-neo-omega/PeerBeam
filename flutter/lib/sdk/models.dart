@@ -598,6 +598,14 @@ class ChatMessage {
   /// surface never has to distinguish "none" from "not reported".
   final List<ChatReaction> reactions;
 
+  /// When the peer told us it read this message, if it did.
+  ///
+  /// Only ever set on our own outgoing rows. Null means "not read **or** this
+  /// peer does not send receipts" — deliberately indistinguishable, because a
+  /// peer that opted out owes no explanation and showing "unread" for it would
+  /// be a claim we cannot support.
+  final DateTime? readAt;
+
   const ChatMessage({
     required this.id,
     required this.peerId,
@@ -610,6 +618,7 @@ class ChatMessage {
     this.fileSize,
     this.localPath,
     this.reactions = const [],
+    this.readAt,
   });
 
   bool get isMine => direction == 'out';
@@ -644,6 +653,7 @@ class ChatMessage {
               .map((r) => ChatReaction.fromJson(Map<String, dynamic>.from(r)))
               .toList() ??
           const [],
+      readAt: DateTime.tryParse(j['read_at'] as String? ?? ''),
     );
   }
 
@@ -661,6 +671,7 @@ class ChatMessage {
     String? fileName,
     int? fileSize,
     List<ChatReaction>? reactions,
+    DateTime? readAt,
   }) => ChatMessage(
     id: id,
     peerId: peerId,
@@ -673,6 +684,7 @@ class ChatMessage {
     fileSize: fileSize ?? this.fileSize,
     localPath: localPath ?? this.localPath,
     reactions: reactions ?? this.reactions,
+    readAt: readAt ?? this.readAt,
   );
 }
 

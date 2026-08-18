@@ -292,6 +292,15 @@ abstract class PeerBeamApi {
     bool remove = false,
   });
 
+  /// Tell [peerId] we have read its messages up to and including
+  /// [readThrough], and report whether anything was actually sent.
+  ///
+  /// `false` is the ordinary answer, not a failure: this device sends no
+  /// receipts at all unless the user has opted in (**default off**), and the
+  /// peer may be offline or too old to understand them. Reading a conversation
+  /// is never, by itself, consent to report having read it.
+  Future<bool> chatMarkRead(String peerId, String readThrough);
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -599,6 +608,16 @@ class PeerBeam implements PeerBeamApi {
       applied: data['applied'] == true,
       delivered: data['delivered'] == true,
     );
+  }
+
+  @override
+  Future<bool> chatMarkRead(String peerId, String readThrough) async {
+    final data = _data(
+      _req().chatMarkRead(
+        jsonEncode({'peer': peerId, 'read_through': readThrough}),
+      ),
+    );
+    return data['sent'] == true;
   }
 
   @override

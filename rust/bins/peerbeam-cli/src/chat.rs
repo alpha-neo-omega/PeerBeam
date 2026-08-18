@@ -91,7 +91,9 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
             emoji,
             remove,
         } => react(ctx, peer, id, &emoji, remove, path_override).await,
-        ChatAction::History { peer } => history(ctx, peer, path_override).await,
+        ChatAction::History { peer, mark_read } => {
+            history(ctx, peer, mark_read, path_override).await
+        }
         ChatAction::Search { query, limit } => search(ctx, &query, limit, path_override),
         ChatAction::Watch { port } => watch(ctx, port, path_override).await,
     }
@@ -1249,7 +1251,12 @@ fn settle_cancelled(store: &ChatStore, peer_id: &DeviceId, id: &str) -> Result<b
 /// `chat history <peer>` — print a conversation's persisted history. `peer`
 /// may be a raw device id (`pb-<fingerprint>`) or a friendly name; see
 /// [`resolve_history_peer`] for how the two are told apart.
-async fn history(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliResult {
+async fn history(
+    ctx: &Ctx,
+    peer: String,
+    mark_read: bool,
+    path_override: Option<&str>,
+) -> CliResult {
     let config = commands::load_config(path_override)?;
     let sc = SecureCtx::build(&config)?;
     let store = commands::chat_store(&config, &sc.enc, &sc.ident);
@@ -1258,8 +1265,21 @@ async fn history(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliRes
         .history(&peer_id)
         .map_err(|e| CliError::Other(e.to_string()))?;
 
+    // The watermark is the newest message the peer sent us: telling it "I read
+    // up to here" is only meaningful about its own messages.
+    let newest_theirs = records
+        .iter()
+        .rev()
+        .find(|r| r.direction == peerbeam_chat::Direction::In)
+        .map(|r| r.id.clone());
+
     if ctx.json {
         ctx.json_line(&render_history_json(&records));
+        if mark_read {
+            if let Some(id) = &newest_theirs {
+                let _ = send_read_receipt(&config, &sc, &store, ctx, &peer_id, id).await;
+            }
+        }
         return Ok(());
     }
     if records.is_empty() {
@@ -1271,11 +1291,80 @@ async fn history(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliRes
             (Kind::File, Some(file)) => ctx.line(&render_file_line(r, file)),
             _ => {
                 let dir = dir_str(r.direction);
-                ctx.line(&format!("[{}] {}: {}", r.timestamp, dir, r.body));
+                // A read marker only on our own messages: it is the peer
+                // reporting on what we sent. Absent is the norm, since
+                // receipts are opt-in on the *other* device.
+                let read = if r.read_at.is_some() { " (read)" } else { "" };
+                ctx.line(&format!("[{}] {}: {}{}", r.timestamp, dir, r.body, read));
+            }
+        }
+    }
+    if mark_read {
+        if let Some(id) = &newest_theirs {
+            let sent = send_read_receipt(&config, &sc, &store, ctx, &peer_id, id).await;
+            if !sent {
+                ctx.line(&ctx.dim(
+                    "read receipt not sent — turn on device.share_read_receipts, \
+                     or the peer is offline or too old for receipts",
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Send one read watermark, if the user has opted in and the peer can take it.
+///
+/// The opt-in is checked here rather than by the caller so there is one place
+/// that decides whether this device discloses read times at all.
+async fn send_read_receipt(
+    config: &EngineConfig,
+    sc: &SecureCtx,
+    store: &ChatStore,
+    ctx: &Ctx,
+    peer_id: &DeviceId,
+    read_through: &str,
+) -> bool {
+    if !config.device.share_read_receipts {
+        return false;
+    }
+    let devices = commands::snapshot(config.clone(), 2).await;
+    let Some(meta) = devices.iter().find(|m| m.device.id == *peer_id) else {
+        return false;
+    };
+    let Ok(quic) = QuicTransport::new() else {
+        return false;
+    };
+    let quic = Arc::new(quic);
+    let routes = RouteManager::new(quic.clone());
+    let sink = received_sink(ctx);
+    let Ok(session) = session_transfer::dial(
+        &quic,
+        &routes,
+        &meta.device,
+        "receipt",
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        Some((store.clone(), sink)),
+    )
+    .await
+    else {
+        return false;
+    };
+    let peer = DeviceId::from(session.peer_id.clone());
+    let ok = if peerbeam_chat::may_exchange_chat(sc.trust.as_ref(), &peer)
+        && session.supports_receipt()
+    {
+        let r = peerbeam_chat::Receipt::read_through(read_through);
+        peerbeam_chat::send_receipt(&session.handle, &r)
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    session.close().await;
+    ok
 }
 
 /// `chat search <query>` — find messages in this device's stored conversations.
@@ -1435,6 +1524,11 @@ fn render_history_json(records: &[ChatRecord]) -> serde_json::Value {
                 "status": r.status,
                 "kind": r.kind,
                 "file": r.file,
+                "reactions": r.reactions,
+                // Null both when unread and when the peer does not send
+                // receipts — the two are not distinguishable, and a script
+                // must not read the absence of a time as a refusal.
+                "read_at": r.read_at,
             })
         })
         .collect();

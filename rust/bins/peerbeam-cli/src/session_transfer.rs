@@ -35,8 +35,8 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM,
-    PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP,
+    PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
@@ -131,7 +131,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::new(TRANSFER))
         .with(Capability::with_features(
             CHAT,
-            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION | CHAT_FEAT_RECEIPT,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
@@ -197,6 +197,15 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
+    }
+
+    /// Whether the peer negotiated the chat `Receipt` feature — whether telling
+    /// it "I have read your messages up to here" would mean anything.
+    #[must_use]
+    pub fn supports_receipt(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::CHAT)
+            .is_some_and(|f| f & CHAT_FEAT_RECEIPT != 0)
     }
 
     /// Whether the peer negotiated the chat `Reaction` feature. A peer from

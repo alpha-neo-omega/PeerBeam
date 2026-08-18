@@ -226,7 +226,12 @@ fn chat_history_and_watch_parse() {
     let cli = Cli::try_parse_from(["peerbeam", "chat", "history", "pb-abc123"]).unwrap();
     match cli.command {
         Command::Chat(a) => match a.action {
-            ChatAction::History { peer } => assert_eq!(peer, "pb-abc123"),
+            ChatAction::History { peer, mark_read } => {
+                assert_eq!(peer, "pb-abc123");
+                // Printing a conversation is not consent to report having read
+                // it, so the flag must default off.
+                assert!(!mark_read, "history marked read without being asked");
+            }
             _ => panic!("expected history"),
         },
         _ => panic!("expected chat"),

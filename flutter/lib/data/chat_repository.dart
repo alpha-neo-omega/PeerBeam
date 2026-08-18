@@ -281,6 +281,27 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
+  /// Tell the peer we have read its messages, up to the newest one we hold.
+  ///
+  /// Sends nothing unless the user opted in — the engine decides that, not this
+  /// class — so calling it on every thread open is safe and is *not* a
+  /// disclosure by itself. Nothing is stored locally: whether we have read a
+  /// peer's messages is the surface's business, and persisting it here would
+  /// invent a second read-state no wire message maintains.
+  Future<void> markRead(String peerId) async {
+    final api = _api;
+    if (api == null) return;
+    // The watermark is the newest message *they* sent: telling a peer we read
+    // our own messages would be nonsense.
+    final theirs = _byPeer[peerId]?.where((m) => !m.isMine).toList();
+    if (theirs == null || theirs.isEmpty) return;
+    try {
+      await api.chatMarkRead(peerId, theirs.last.id);
+    } catch (_) {
+      // A receipt is a courtesy; failing to send one is never worth surfacing.
+    }
+  }
+
   /// React to a message, or withdraw that reaction.
   ///
   /// Returns whether the peer was told. The local half is applied by the

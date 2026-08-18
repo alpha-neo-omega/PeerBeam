@@ -49,6 +49,15 @@ class SettingsStore extends ChangeNotifier {
   /// configurable, here or anywhere.
   bool sharePresence;
 
+  /// "Tell people when you have read their messages" — the read-receipt opt-in.
+  ///
+  /// **Default off**, for the same reason [sharePresence] is: a read receipt
+  /// discloses when *you* looked, which is a fact about your attention rather
+  /// than about the message. While it is off this device sends no receipts at
+  /// all; it still applies receipts its peers send, so opting out never costs
+  /// you what others choose to tell you.
+  bool shareReadReceipts;
+
   /// "Sync clipboard with trusted devices" — the clipboard opt-in.
   ///
   /// **Default off.** While it is off this device sends no clip at all, to
@@ -112,6 +121,7 @@ class SettingsStore extends ChangeNotifier {
     this.theme = 'system',
     // Opt-in: nothing about this device leaves it until the user says so.
     this.sharePresence = false,
+    this.shareReadReceipts = false,
     // Likewise, and with more at stake — this is the one buffer guaranteed to
     // sometimes hold a password.
     this.syncClipboard = false,
@@ -143,6 +153,8 @@ class SettingsStore extends ChangeNotifier {
       // Absent -> stays false. A settings document written before this feature
       // existed must never be read as consent.
       sharePresence = (s['share_presence'] as bool?) ?? sharePresence;
+      shareReadReceipts =
+          (s['share_read_receipts'] as bool?) ?? shareReadReceipts;
       // Absent -> stays false, for the same reason: a settings document
       // written before this feature existed is not consent.
       syncClipboard = (s['sync_clipboard'] as bool?) ?? syncClipboard;
@@ -202,6 +214,18 @@ class SettingsStore extends ChangeNotifier {
   void setSharePresence(bool v) {
     sharePresence = v;
     _persist('share_presence', v);
+    notifyListeners();
+  }
+
+  /// Turn read receipts on or off.
+  ///
+  /// The engine re-reads this every time a receipt would be sent, so turning it
+  /// off stops the next one rather than waiting for a reconnect. It governs
+  /// sending only — receipts already applied stay applied, and receipts peers
+  /// send keep arriving.
+  void setShareReadReceipts(bool v) {
+    shareReadReceipts = v;
+    _persist('share_read_receipts', v);
     notifyListeners();
   }
 

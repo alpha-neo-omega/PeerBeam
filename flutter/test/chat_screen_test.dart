@@ -806,4 +806,80 @@ void main() {
 
     expect(fake.calls, contains('chatReact:pb-bob:m1:\u{1F44D}:true'));
   });
+
+  testWidgets('a message the peer has read shows a distinct marker', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'delivered only',
+        at: DateTime.now(),
+        status: ChatStatusValue.sent,
+      ),
+      ChatMessage(
+        id: 'm2',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'read',
+        at: DateTime.now(),
+        status: ChatStatusValue.sent,
+        readAt: DateTime.now(),
+      ),
+    ];
+    await _open(tester, fake);
+
+    // Read earns its own glyph: "delivered" and "read" are different claims,
+    // and only one is something the peer chose to tell us.
+    expect(find.byIcon(Icons.done_all_rounded), findsOneWidget);
+    expect(find.byIcon(Icons.check_rounded), findsOneWidget);
+  });
+
+  testWidgets('opening a thread offers a read receipt, which stays off by '
+      'default', (tester) async {
+    // The call is made unconditionally — the engine decides whether anything
+    // leaves — so what this pins is that the *engine* is asked, and that with
+    // the opt-in off nothing is reported as sent.
+    final fake = FakePeerBeam()..markReadSent = false;
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: 'from bob',
+        at: DateTime.now(),
+        status: ChatStatusValue.received,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(fake.calls, contains('chatMarkRead:pb-bob:m1'));
+  });
+
+  testWidgets('a thread with only our own messages sends no watermark', (
+    tester,
+  ) async {
+    // Telling a peer we read our own messages would be nonsense.
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'ours',
+        at: DateTime.now(),
+        status: ChatStatusValue.sent,
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(
+      fake.calls.where((c) => c.startsWith('chatMarkRead')),
+      isEmpty,
+      reason: 'a watermark was sent for a thread the peer never wrote in',
+    );
+  });
 }

@@ -85,6 +85,11 @@ pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
         // reactions without distinguishing "no reactions" from "this build
         // does not report them".
         "reactions": rec.reactions,
+        // Null unless the peer told us it read this message. Null covers both
+        // "not read" and "this peer does not send receipts" — deliberately
+        // indistinguishable, because a peer that opted out owes no explanation
+        // and a surface must not imply one was withheld.
+        "read_at": rec.read_at,
     })
 }
 
@@ -217,6 +222,10 @@ mod tests {
         };
         let dto = record_dto(&rec);
         assert_eq!(dto["reactions"], serde_json::json!([]));
+        assert!(
+            dto["read_at"].is_null(),
+            "unread must report null, not absent"
+        );
 
         let rec = peerbeam_chat::ChatRecord {
             reactions: vec![peerbeam_chat::StoredReaction {

@@ -74,9 +74,15 @@ class _ChatScreenState extends State<ChatScreen> {
     // mid-flight gets settled, and that has to happen before the thread is
     // rendered or a dead Accept button is offered for a transfer that no
     // longer exists.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      AppScope.of(context).chat.openThread(widget.peerId);
+      final chat = AppScope.of(context).chat;
+      await chat.openThread(widget.peerId);
+      // Opening the thread is the moment it has been read. This sends nothing
+      // unless the user opted into read receipts (default off), so calling it
+      // unconditionally is not a disclosure — the engine owns that decision,
+      // and duplicating it here would be a second place to get it wrong.
+      await chat.markRead(widget.peerId);
     });
   }
 
@@ -790,11 +796,19 @@ class _ChatBubble extends StatelessWidget {
                           if (mine) ...[
                             const Gap(AppSpace.xxs),
                             Icon(
-                              _deliveryGlyph(message.status),
+                              // A read message earns its own glyph rather than
+                              // a second tick: "delivered" and "read" are
+                              // different claims, and only one of them is
+                              // something the peer chose to tell us.
+                              message.readAt != null
+                                  ? Icons.done_all_rounded
+                                  : _deliveryGlyph(message.status),
                               size: 14,
-                              color: _failedStatus(message.status)
-                                  ? scheme.error
-                                  : fg.withValues(alpha: 0.7),
+                              color: message.readAt != null
+                                  ? scheme.primary
+                                  : (_failedStatus(message.status)
+                                        ? scheme.error
+                                        : fg.withValues(alpha: 0.7)),
                             ),
                           ],
                           // An explicit control rather than a gesture. A
