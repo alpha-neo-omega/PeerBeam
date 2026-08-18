@@ -20,6 +20,7 @@ members = [
     "crates/peerbeam-trust-fs",
     "crates/peerbeam-identity-fs",
     "crates/peerbeam-appstore-fs",
+    "crates/peerbeam-browse",
     "crates/peerbeam-chat",
     "crates/peerbeam-notes",
     "crates/peerbeam-clipboard",

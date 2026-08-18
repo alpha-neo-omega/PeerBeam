@@ -149,6 +149,14 @@ pub const CHAT_FEAT_RECEIPT: u32 = 1 << 3;
 /// checked on both sides of every exchange.
 pub const NOTES_FEAT_SYNC: u32 = 1 << 0;
 
+/// Feature bit on the BROWSE capability: this peer understands `ListRequest`
+/// and answers with `ListResponse`.
+///
+/// Comprehension, not consent. Whether a device answers is `Permission::Browse`
+/// **and** whether it has actually shared any folder — with no shares
+/// configured, a permitted peer still sees nothing, which is the default state.
+pub const BROWSE_FEAT_LIST: u32 = 1 << 0;
+
 /// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
 /// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
 /// something.

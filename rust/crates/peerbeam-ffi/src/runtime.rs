@@ -400,6 +400,9 @@ pub fn init(config_json: &str) -> OpResult {
     // "future capabilities share the same store" note above, cashed in.
     let notes = peerbeam_notes::NoteStore::new(appstore.clone());
     let clip_history = peerbeam_clipboard::ClipHistory::new(appstore.clone());
+    // Browsing serves nothing until this is configured, and the default config
+    // shares no directories at all.
+    crate::browse::configure(&config.device.shared_directories);
     let chat = peerbeam_chat::ChatStore::new(appstore);
     reconcile_chat(&chat);
 

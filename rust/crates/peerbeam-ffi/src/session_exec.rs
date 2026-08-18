@@ -15,6 +15,7 @@ use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, RouteKind, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
+use peerbeam_domain::session::BROWSE_FEAT_LIST;
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
@@ -38,6 +39,7 @@ const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
 const PIPE: ChannelType = ChannelType::PIPE;
 const NOTES: ChannelType = ChannelType::NOTES;
+const BROWSE: ChannelType = ChannelType::BROWSE;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
 /// every accept call site in this codebase registers this (built via
@@ -151,6 +153,7 @@ fn advertised_caps() -> CapabilitySet {
         ))
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
         .with(Capability::with_features(NOTES, NOTES_FEAT_SYNC))
+        .with(Capability::with_features(BROWSE, BROWSE_FEAT_LIST))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -212,6 +215,51 @@ pub fn caps_support_ring(caps: &CapabilitySet) -> bool {
         .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
 }
 
+/// Send one `ListRequest` and wait for the answer, bounded.
+///
+/// Bounded because a peer that never answers must not hold a caller forever:
+/// browsing is interactive, and a UI waiting on a silent device is worse than
+/// one told the device did not answer.
+pub async fn request_listing(
+    session: &Session,
+    path: &str,
+) -> Option<peerbeam_browse::ListResponse> {
+    use tokio::time::{timeout, Duration};
+
+    let channel = session.handle.open_channel(BROWSE).await.ok()?;
+    let req = peerbeam_browse::ListRequest::new(path);
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_browse::ListRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .ok()?;
+
+    // The answer arrives through this session's own Browse handler, which
+    // pushes it onto the answers channel; `browse_answers` is drained by the
+    // reply pump on the *serving* side, so an asker reads it here instead.
+    let rx = session.browse_rx.clone();
+    timeout(Duration::from_secs(10), async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries
+/// browsing.
+pub fn caps_support_browse(caps: &CapabilitySet) -> bool {
+    caps.features(BROWSE)
+        .is_some_and(|f| f & BROWSE_FEAT_LIST != 0)
+}
+
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
 /// notes sync feature, i.e. whether sending this peer notes would mean
 /// anything. A peer that predates notes advertises `features: 0` for the
@@ -257,6 +305,10 @@ pub async fn send_note_batches(
 pub struct Session {
     /// Control handle for opening channels / closing.
     pub handle: SessionHandle,
+    /// Answers to listings **this side asked for**, delivered by the Browse
+    /// handler. Behind a lock because a session is shared and only one caller
+    /// waits on an answer at a time.
+    pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
     /// The authenticated peer's device id.
     pub peer_id: String,
     /// The peer's presented human name (may be empty).
@@ -365,6 +417,36 @@ async fn establish(
         notes_replies = Some(rx);
         handlers.push(h as Arc<dyn MessageHandler>);
     }
+    // Browse, wired from the running engine for the same reason notes are: a
+    // session with no `BrowseHandler` drops a request silently, leaving the
+    // asker waiting rather than told "nothing". Registering it shares nothing —
+    // the handler re-reads `Permission::Browse` per request, and the share list
+    // is empty until the user configures one.
+    // Registered unconditionally, so these are always set — unlike chat and
+    // notes, which are optional wirings.
+    let browse_slot: Arc<OnceLock<DeviceId>>;
+    let browse_answers: UnboundedReceiver<peerbeam_browse::ListResponse>;
+    let browse_incoming: UnboundedReceiver<peerbeam_browse::ListResponse>;
+    {
+        let (tx, rx) = unbounded_channel();
+        let sink: peerbeam_browse::AnswerSink = Arc::new(move |r| {
+            let _ = tx.send(r);
+        });
+        let (itx, irx) = unbounded_channel();
+        let incoming: peerbeam_browse::IncomingSink = Arc::new(move |r| {
+            let _ = itx.send(r);
+        });
+        let (h, slot) = peerbeam_browse::BrowseHandler::new(
+            crate::browse::shares(),
+            trust.clone(),
+            sink,
+            incoming,
+        );
+        browse_slot = slot;
+        browse_answers = rx;
+        browse_incoming = irx;
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
     // Presence gets the same treatment for the same reason: an unregistered
     // handler means an inbound Status is silently dropped, not refused.
     let mut presence_slot: Option<Arc<OnceLock<DeviceId>>> = None;
@@ -420,6 +502,7 @@ async fn establish(
     if let Some(slot) = notes_slot {
         let _ = slot.set(ps.peer().clone());
     }
+    let _ = browse_slot.set(ps.peer().clone());
     if let Some(slot) = presence_slot {
         let _ = slot.set(ps.peer().clone());
     }
@@ -438,6 +521,32 @@ async fn establish(
     // Drain the notes handler's replies onto this session. Spawned rather than
     // awaited: an answer is owed *after* frames start arriving, which is long
     // after this function returns.
+    {
+        let mut rx = browse_answers;
+        let reply_handle = handle.clone();
+        crate::runtime::spawn(async move {
+            while let Some(answer) = rx.recv().await {
+                let Ok(channel) = reply_handle.open_channel(BROWSE).await else {
+                    break;
+                };
+                let Ok(frame) = answer.to_frame(channel) else {
+                    continue;
+                };
+                if reply_handle
+                    .send_on_channel(
+                        channel,
+                        peerbeam_browse::ListResponse::message_type(),
+                        frame.flags,
+                        frame.payload,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     if let Some(mut rx) = notes_replies {
         let reply_handle = handle.clone();
         crate::runtime::spawn(async move {
@@ -487,6 +596,7 @@ async fn establish(
     });
     Ok(Session {
         handle,
+        browse_rx: Arc::new(tokio::sync::Mutex::new(browse_incoming)),
         peer_id,
         peer_name,
         peer_device,

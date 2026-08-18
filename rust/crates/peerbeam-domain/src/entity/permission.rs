@@ -60,6 +60,14 @@ pub enum Permission {
     Presence,
     /// Have an inbound `peerbeam pipe` accepted by a listening terminal.
     Pipe,
+    /// Browse the folders this device has chosen to share, read-only.
+    ///
+    /// Separate from [`Files`](Permission::Files) because it is a different
+    /// question. Receiving a file means someone chose to send it; browsing
+    /// means seeing what exists — names, sizes and structure the user never
+    /// picked out — and a device allowed to accept a photo has not thereby been
+    /// allowed to read the shape of a filesystem.
+    Browse,
     /// Exchange notes with this device.
     ///
     /// The roadmap calls notes *"synced to your own devices"*, and PeerBeam has
@@ -77,13 +85,14 @@ impl Permission {
     /// Used to render a device's grants and to drive the "each permission gates
     /// its own feature" tests. It is **not** the legacy default and must never
     /// be used as one — see [`PermissionSet::granted_on_approval`].
-    pub const ALL: [Permission; 6] = [
+    pub const ALL: [Permission; 7] = [
         Permission::Files,
         Permission::Chat,
         Permission::Clipboard,
         Permission::Presence,
         Permission::Pipe,
         Permission::Notes,
+        Permission::Browse,
     ];
 
     /// This permission's permanent bit position.
@@ -104,6 +113,7 @@ impl Permission {
             // until the user grants it, by construction rather than by a
             // version check.
             Permission::Notes => 5,
+            Permission::Browse => 6,
         }
     }
 
@@ -127,6 +137,7 @@ impl Permission {
             Permission::Presence => "presence",
             Permission::Pipe => "pipe",
             Permission::Notes => "notes",
+            Permission::Browse => "browse",
         }
     }
 
@@ -396,10 +407,20 @@ mod tests {
     /// A store written by a newer build carries a name this one cannot enforce.
     /// It must load — failing to parse would take every pin on the machine with
     /// it — and the unknown grant must not be honoured.
+    ///
+    /// The placeholder is deliberately **not** a plausible future permission.
+    /// This test used `"browse"`, which was hypothetical right up until browsing
+    /// shipped — at which point it silently stopped testing anything, because
+    /// the "unknown" name was suddenly honoured. A name from another problem
+    /// domain entirely cannot be quietly promoted into reality.
     #[test]
     fn an_unknown_permission_name_loads_and_is_not_honoured() {
-        let set: PermissionSet =
-            serde_json::from_value(serde_json::json!(["files", "browse", "chat"])).unwrap();
+        let set: PermissionSet = serde_json::from_value(serde_json::json!([
+            "files",
+            "xyzzy-not-a-permission",
+            "chat"
+        ]))
+        .unwrap();
         assert!(set.grants(Permission::Files));
         assert!(set.grants(Permission::Chat));
         assert_eq!(

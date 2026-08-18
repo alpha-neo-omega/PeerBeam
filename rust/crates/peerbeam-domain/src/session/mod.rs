@@ -23,7 +23,7 @@ pub use frame::{MessageFlags, SessionFrame};
 pub use handler::MessageHandler;
 pub use ids::{ChannelId, ChannelType, MessageType, SessionId};
 pub use negotiation::{
-    negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation,
+    negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation, BROWSE_FEAT_LIST,
     CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
     CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
     PRESENCE_FEAT_STATUS,

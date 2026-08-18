@@ -1098,6 +1098,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-browse"
+version = "0.8.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "peerbeam-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "peerbeam-chat"
 version = "0.8.2"
 dependencies = [
@@ -1305,6 +1320,7 @@ dependencies = [
  "libloading",
  "peerbeam-app",
  "peerbeam-appstore-fs",
+ "peerbeam-browse",
  "peerbeam-chat",
  "peerbeam-clipboard",
  "peerbeam-config",

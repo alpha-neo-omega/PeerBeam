@@ -100,6 +100,17 @@ pub struct DeviceConfig {
     ///
     /// History is bounded, kept only on this device, and never put on the wire.
     pub clipboard_history: bool,
+    /// Folders this device offers for read-only browsing.
+    ///
+    /// **Empty by default, and that is the whole safety story.** Granting a
+    /// device the `browse` permission decides *who* may look; this decides
+    /// *what there is to look at*, and with nothing listed a permitted peer
+    /// still sees nothing. Sharing a folder is a deliberate act, never a
+    /// consequence of trusting someone.
+    ///
+    /// A path that cannot be resolved is dropped rather than kept: an
+    /// unresolvable root cannot be compared against safely.
+    pub shared_directories: Vec<String>,
 }
 
 /// Discovery configuration.
@@ -195,6 +206,7 @@ impl Default for DeviceConfig {
             share_presence: false,
             share_read_receipts: false,
             clipboard_history: false,
+            shared_directories: Vec::new(),
         }
     }
 }

@@ -684,7 +684,7 @@ mod tests {
             &path,
             r#"[{"device":"pb-future0001","fingerprint":"ab","name":"Future",
                  "trusted_at":"2026-08-18T02:11:00Z","approved":true,
-                 "permissions":["files","browse","chat"]}]"#,
+                 "permissions":["files","xyzzy-not-a-permission","chat"]}]"#,
         );
         let id = DeviceId::from("pb-future0001");
         assert!(store.may(&id, Permission::Files));

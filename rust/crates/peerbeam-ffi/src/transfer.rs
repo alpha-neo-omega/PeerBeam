@@ -3277,6 +3277,68 @@ impl Manager {
         sender.ring(seconds).await.is_ok()
     }
 
+    /// Ask a device what is in one of its shared folders:
+    /// `{peer, path?}` → `{path, entries:[…], truncated, denied}`.
+    ///
+    /// `path` is **share-relative** — `photos/2026`, never an absolute path.
+    /// Empty asks what the device shares at all.
+    ///
+    /// An empty answer with `denied: true` means the device is not showing
+    /// this: it may not have granted us `browse`, may share nothing, or the
+    /// path may not exist. **Those are deliberately indistinguishable** — a
+    /// caller able to tell them apart could map a filesystem it may not see,
+    /// one refused request at a time.
+    pub fn browse_list(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let path = req
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if path.len() > peerbeam_browse::MAX_PATH {
+            return Err((
+                Code::InvalidArgument,
+                format!("path must be at most {} bytes", peerbeam_browse::MAX_PATH),
+            ));
+        }
+        let me = self.clone();
+        let answer =
+            crate::runtime::block_on(async move { me.ask_browse(device, path.clone()).await });
+        match answer {
+            Some(r) => Ok(crate::browse::response_dto(&r)),
+            None => Err(crate::browse::unreachable(
+                req.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+            )),
+        }
+    }
+
+    /// Dial, ask, and wait for the one answer. `None` when the device cannot be
+    /// reached or does not implement browsing.
+    async fn ask_browse(
+        self: &Arc<Self>,
+        device: Device,
+        path: String,
+    ) -> Option<peerbeam_browse::ListResponse> {
+        let meta = self.session(&format!("browse-{}", device.id.0), device.id.clone(), 0);
+        let session = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        .ok()?;
+        if !crate::session_exec::caps_support_browse(&session.capabilities) {
+            return None;
+        }
+        crate::session_exec::request_listing(&session, &path).await
+    }
+
     /// Sync notes with a peer: `{peer}` → `{sent}`.
     ///
     /// Sends this device's whole note set — tombstones included, because a

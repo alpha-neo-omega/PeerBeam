@@ -10,6 +10,7 @@
 //!   [`pb_free_string`]. Dart allocates argument strings and frees them itself.
 //! - **No bytes cross.** Files are referred to by path; streaming stays in Rust.
 
+mod browse;
 mod chat_receipts;
 mod clipboard;
 mod dto;
@@ -556,6 +557,38 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
+}
+
+/// Ask a device what is in one of its shared folders:
+/// `{peer, path?}` → `{path, entries:[…], truncated, denied}`.
+///
+/// `path` is **share-relative** — `photos/2026`, never absolute. Empty asks
+/// what the device shares at all.
+///
+/// `denied: true` with no entries means the device is not showing this. It may
+/// not have granted this machine `browse`, may share nothing, or the path may
+/// not exist — **deliberately indistinguishable**, because a caller able to
+/// tell them apart could map a filesystem it may not see, one request at a
+/// time.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_browse_list(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.browse_list(&read_json(json)?))()))
+}
+
+/// What this device shares for browsing: `{}` → `{shares:[…]}`.
+///
+/// Names only, the same view a peer gets. **Empty by default** — sharing a
+/// folder is a deliberate act, not a consequence of trusting someone.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_browse_shares(json: *const c_char) -> *mut c_char {
+    let _ = json;
+    guard(|| error::envelope(browse::list_shares()))
 }
 
 /// One chronological view of this device's activity: `{limit?}` →

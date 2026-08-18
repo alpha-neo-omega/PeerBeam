@@ -114,6 +114,13 @@ impl ChannelType {
     /// conflict rule, so they get the id already set aside for them rather than
     /// waiting on a channel built for something else.
     pub const NOTES: ChannelType = ChannelType(0x0105);
+    /// Read-only browsing of folders a device chose to share (Phase C).
+    ///
+    /// Allocated from the reserved first-party range rather than folded into
+    /// Sync (`0x0104`) or Command (`0x0106`): Sync reconciles folders in both
+    /// directions and Command is for consented *actions*, while browsing is a
+    /// read that changes nothing and needs neither's machinery.
+    pub const BROWSE: ChannelType = ChannelType(0x0108);
     /// Encrypted byte pipe — `peerbeam pipe` (Phase B). See MESSAGE_REGISTRY.md
     /// §2/§4.
     ///

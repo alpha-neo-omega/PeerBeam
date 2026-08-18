@@ -46,7 +46,8 @@ near-term). Assignments are stable once published.
 | `0x0105` | Notes | C | **implemented** — note sync (`NoteBatch`) |
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
 | `0x0107` | Pipe | B | `peerbeam pipe` — an unbounded stdin↔stdout byte stream; a **stream** channel like Transfer, implemented |
-| `0x0108 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
+| `0x0108` | Browse | C | **implemented** — read-only listing of shared folders |
+| `0x0109 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
 
 ## 3. Control channel (0x0000) message set
 
@@ -303,6 +304,39 @@ belonging to each capability's future spec:
 
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).
+
+### Browse (`0x0108`)
+
+`ListRequest = 1` / `ListResponse = 2` (implemented) — "what is in this
+folder?" and its answer. Allocated from the reserved first-party range rather
+than folded into Sync (`0x0104`) or Command (`0x0106`): Sync reconciles folders
+in both directions and Command is for consented *actions*, while browsing is a
+read that changes nothing.
+
+Paths are **share-relative** — `photos/2026`, never `/home/someone/photos`. A
+device's filesystem layout is not the asker's business, and answering with
+absolute paths would leak a home directory's name to anyone allowed to browse.
+
+**Two independent gates, and the default of each is closed.**
+`Permission::Browse` decides *who* may look; `device.shared_directories`
+decides *what there is to look at*, and it is **empty by default**. A device
+that grants the permission and shares nothing still answers with nothing.
+Sharing a folder is a deliberate act, never a consequence of trusting someone.
+
+**Every reason for "nothing" is the same answer.** A peer that may not browse,
+a path outside every share, a path that does not exist, and a file where a
+directory was expected all receive an empty `denied` response carrying no
+explanation. Distinguishing them would let an asker map a filesystem it may
+never see, one refused request at a time.
+
+Containment is `Shares::resolve`, which **canonicalises before comparing**. A
+textual check against `..` is not enough: a symlink inside a share pointing at
+`/` passes every string test ever written. Both escapes are covered by tests
+that fail if the order is reversed.
+
+Responses are capped at `MAX_ENTRIES` and say when they were truncated — a
+directory can hold a million files, and silently answering with the first 500
+reads as "that is all there is".
 
 ### Presence — `Ring = 2` (implemented)
 
