@@ -1344,6 +1344,8 @@ dependencies = [
 name = "peerbeam-notes"
 version = "0.8.2"
 dependencies = [
+ "async-trait",
+ "bytes",
  "chrono",
  "peerbeam-appstore-fs",
  "peerbeam-crypto",
@@ -1353,6 +1355,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

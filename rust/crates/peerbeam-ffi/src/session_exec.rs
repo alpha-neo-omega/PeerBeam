@@ -17,7 +17,7 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
     PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
@@ -37,6 +37,7 @@ const CHAT: ChannelType = ChannelType::CHAT;
 const CLIPBOARD: ChannelType = ChannelType::CLIPBOARD;
 const PRESENCE: ChannelType = ChannelType::PRESENCE;
 const PIPE: ChannelType = ChannelType::PIPE;
+const NOTES: ChannelType = ChannelType::NOTES;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
 /// every accept call site in this codebase registers this (built via
@@ -56,6 +57,21 @@ const PIPE: ChannelType = ChannelType::PIPE;
 pub struct ChatWiring {
     pub store: ChatStore,
     pub sink: ReceivedSink,
+}
+
+/// What a session needs to serve the Notes channel: the note store and the
+/// trust store the permission is read from.
+///
+/// Registered on every dial and accept, for the reason `ChatWiring` documents:
+/// a session with no `NotesHandler` does not refuse an inbound batch, it drops
+/// it silently, so the peer believes it synced and nothing arrived.
+///
+/// Registering it is not sharing. `NotesHandler` re-reads
+/// `Permission::Notes` per batch, and a peer that was never granted it writes
+/// nothing and learns nothing.
+pub struct NotesWiring {
+    pub store: peerbeam_notes::NoteStore,
+    pub trust: Arc<dyn TrustStore>,
 }
 
 /// A session config advertising both the TRANSFER (stream) and CHAT (message)
@@ -131,6 +147,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
+        .with(Capability::with_features(NOTES, NOTES_FEAT_SYNC))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -182,6 +199,46 @@ pub fn caps_support_reaction(caps: &CapabilitySet) -> bool {
 pub fn caps_support_receipt(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_RECEIPT != 0)
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// notes sync feature, i.e. whether sending this peer notes would mean
+/// anything. A peer that predates notes advertises `features: 0` for the
+/// channel it does not have, so this is false and nothing is sent.
+pub fn caps_support_notes(caps: &CapabilitySet) -> bool {
+    caps.features(NOTES)
+        .is_some_and(|f| f & NOTES_FEAT_SYNC != 0)
+}
+
+/// Send a sequence of note batches over one Notes channel.
+///
+/// Opens the channel once for the whole sequence rather than once per batch: a
+/// sync of a large set is several frames of the same conversation, and a
+/// channel per frame would make the peer's side reassemble an exchange that was
+/// never meant to be split.
+pub async fn send_note_batches(
+    handle: &SessionHandle,
+    batches: &[peerbeam_notes::NoteBatch],
+) -> Result<(), (Code, String)> {
+    let channel = handle
+        .open_channel(NOTES)
+        .await
+        .map_err(|e| (Code::Connection, e.to_string()))?;
+    for b in batches {
+        let frame = b
+            .to_frame(channel)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        handle
+            .send_on_channel(
+                channel,
+                peerbeam_notes::NoteBatch::message_type(),
+                frame.flags,
+                frame.payload,
+            )
+            .await
+            .map_err(|e| (Code::Connection, e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
@@ -270,6 +327,33 @@ async fn establish(
         peer_slot = Some(slot);
         handlers.push(h as Arc<dyn MessageHandler>);
     }
+    // Notes are wired from the running engine rather than passed in, for the
+    // reason clipboard is registered unconditionally: a wiring argument is one
+    // more thing a new dial or accept call site can forget, and a session
+    // without a `NotesHandler` does not refuse an inbound batch — it drops it
+    // silently, so the peer believes it synced and nothing arrived.
+    //
+    // Registering it is not sharing: `NotesHandler` re-reads
+    // `Permission::Notes` per batch, so a device the user never granted it
+    // writes nothing here and learns nothing about what is here.
+    //
+    // The handler's replies cannot be sent at construction time — there is no
+    // session yet — so they are queued and drained by a pump spawned once the
+    // handshake has completed and the handle exists.
+    let mut notes_slot: Option<Arc<OnceLock<DeviceId>>> = None;
+    let mut notes_replies: Option<UnboundedReceiver<Vec<peerbeam_notes::NoteBatch>>> = None;
+    if let Some(w) = crate::notes_sync::wiring() {
+        let (tx, rx) = unbounded_channel();
+        let sink: peerbeam_notes::ReplySink = Arc::new(move |batches| {
+            // A closed receiver means the session is gone; the reply is simply
+            // not sent, which is what an unreachable peer looks like anyway.
+            let _ = tx.send(batches);
+        });
+        let (h, slot) = peerbeam_notes::NotesHandler::new(w.store, w.trust, sink);
+        notes_slot = Some(slot);
+        notes_replies = Some(rx);
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
     // Presence gets the same treatment for the same reason: an unregistered
     // handler means an inbound Status is silently dropped, not refused.
     let mut presence_slot: Option<Arc<OnceLock<DeviceId>>> = None;
@@ -318,6 +402,9 @@ async fn establish(
     if let Some(slot) = peer_slot {
         let _ = slot.set(ps.peer().clone());
     }
+    if let Some(slot) = notes_slot {
+        let _ = slot.set(ps.peer().clone());
+    }
     if let Some(slot) = presence_slot {
         let _ = slot.set(ps.peer().clone());
     }
@@ -333,6 +420,22 @@ async fn establish(
     // already reflects what the *peer* advertised, not just what we asked for.
     let capabilities = ps.capabilities().clone();
     let handle = ps.handle();
+    // Drain the notes handler's replies onto this session. Spawned rather than
+    // awaited: an answer is owed *after* frames start arriving, which is long
+    // after this function returns.
+    if let Some(mut rx) = notes_replies {
+        let reply_handle = handle.clone();
+        crate::runtime::spawn(async move {
+            while let Some(batches) = rx.recv().await {
+                if send_note_batches(&reply_handle, &batches).await.is_err() {
+                    // The session is gone. A reply that cannot be delivered is
+                    // exactly what an unreachable peer looks like, and the next
+                    // sync starts from both sides' stored sets anyway.
+                    break;
+                }
+            }
+        });
+    }
     if let Some(d) = &diag {
         d.register_handle(id, handle.clone());
     }

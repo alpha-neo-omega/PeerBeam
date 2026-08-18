@@ -16,6 +16,7 @@ mod dto;
 mod error;
 mod events;
 mod logs;
+mod notes_sync;
 mod presence;
 mod resume;
 mod rules;
@@ -555,6 +556,20 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
+}
+
+/// Sync notes with a peer: `{peer}` → `{sent}`.
+///
+/// Sends this device's whole set (tombstones included) and merges what the peer
+/// answers with. `sent: false` is normal, not a failure: the peer may not have
+/// been granted the `notes` permission, may be unreachable, or may predate
+/// notes.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_notes_sync(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.notes_sync(&read_json(json)?))()))
 }
 
 /// Every live note, newest edit first: `{}` → `{notes: [...]}`.

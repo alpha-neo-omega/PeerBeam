@@ -750,6 +750,19 @@ impl Manager {
     /// channel actor: `if let Some(h) = &handler { h.handle(sf) }`, no
     /// `else`) — so every session, dial or accept, needs this wired or a
     /// pushed message is lost even though the sender marks it delivered.
+    /// The note store, for the session wiring that serves the Notes channel.
+    #[must_use]
+    pub fn notes_store(&self) -> peerbeam_notes::NoteStore {
+        self.notes.clone()
+    }
+
+    /// The trust store, for the same wiring — the notes permission is read from
+    /// it per batch.
+    #[must_use]
+    pub fn trust_store(&self) -> Arc<FsTrust> {
+        self.trust.clone()
+    }
+
     fn chat_wiring(&self) -> crate::session_exec::ChatWiring {
         crate::session_exec::ChatWiring {
             store: self.chat.clone(),
@@ -3063,6 +3076,70 @@ impl Manager {
     /// conversation it was read from, so tapping it opens the right thread.
     ///
     /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    /// Sync notes with a peer: `{peer}` → `{sent}`.
+    ///
+    /// Sends this device's whole note set — tombstones included, because a
+    /// deletion is a fact about the set — and the peer answers with its own,
+    /// which the handler merges. Two passes, then done.
+    ///
+    /// `sent: false` is a normal answer, not a failure: the user may not have
+    /// granted this device the `notes` permission, the peer may be unreachable,
+    /// or its build may predate notes entirely.
+    ///
+    /// The permission is checked here *and* on the way in on both sides. This
+    /// check is about what leaves; the handler's is about what may be written.
+    pub fn notes_sync(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        if !peerbeam_notes::may_sync_notes(self.trust.as_ref(), &device.id) {
+            return Ok(json!({ "sent": false }));
+        }
+        let mine = self
+            .notes
+            .all()
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let batches = peerbeam_notes::NoteBatch::split(mine, false);
+        let me = self.clone();
+        let sent = crate::runtime::block_on(async move { me.deliver_notes(device, batches).await });
+        Ok(json!({ "sent": sent }))
+    }
+
+    /// Dial the peer and push a note exchange. Never fails the caller: every
+    /// negative answer is "not sent".
+    async fn deliver_notes(
+        self: &Arc<Self>,
+        device: Device,
+        batches: Vec<peerbeam_notes::NoteBatch>,
+    ) -> bool {
+        let meta = self.session(&format!("notes-{}", device.id.0), device.id.clone(), 0);
+        let Ok(session) = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        else {
+            return false;
+        };
+        if !crate::session_exec::caps_support_notes(&session.capabilities) {
+            return false;
+        }
+        // Re-asked of the **authenticated** identity, which is the device the
+        // permission is actually about: the pre-dial id is whatever the caller
+        // named, and for an address-dialled peer it is a placeholder.
+        if !peerbeam_notes::may_sync_notes(self.trust.as_ref(), &session.peer_device) {
+            return false;
+        }
+        crate::session_exec::send_note_batches(&session.handle, &batches)
+            .await
+            .is_ok()
+    }
+
     /// Every live note, newest edit first: `{}` → `{notes: [...]}`.
     ///
     /// Tombstones are not included. They exist so a deletion can reach a peer,
@@ -7928,6 +8005,22 @@ mod tests {
             .chat_cancel(&json!({ "message_id": "1785559080834abcdef0123456789" }))
             .expect_err("peer_id is required");
         assert!(matches!(code, Code::InvalidArgument));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn notes_sync_sends_nothing_to_a_device_that_was_never_granted_notes() {
+        // The default state of the feature. `Notes` is slot 5, assigned after
+        // `granted_on_approval` was frozen, so even an approved device does not
+        // have it until someone says so — and `sent: false` is the ordinary
+        // answer rather than an error.
+        let (mgr, _chat, _dir) = test_manager_full("syncer", 0);
+        let mgr = Arc::new(mgr);
+        let out = mgr
+            .notes_sync(&json!({ "peer": { "id": "pb-bob", "name": "Bob",
+                                           "addresses": ["127.0.0.1"], "port": 49600 } }))
+            .expect("a peer without the permission is not an error");
+        assert_eq!(out["sent"], false);
     }
 
     #[tokio::test]
