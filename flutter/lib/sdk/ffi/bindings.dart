@@ -73,6 +73,7 @@ class Bindings {
   final _ArgRetDart _chatDelete;
   final _ArgRetDart _chatDeleteMessages;
   final _ArgRetDart _chatSearch;
+  final _ArgRetDart _chatReact;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -152,6 +153,7 @@ class Bindings {
         'pb_chat_delete_messages',
       ),
       _chatSearch = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_search'),
+      _chatReact = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_react'),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -217,6 +219,7 @@ class Bindings {
   String chatDeleteMessages(String json) =>
       _withArg(json, _chatDeleteMessages);
   String chatSearch(String json) => _withArg(json, _chatSearch);
+  String chatReact(String json) => _withArg(json, _chatReact);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);

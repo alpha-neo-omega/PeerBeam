@@ -153,6 +153,71 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Add or remove one message — which is also how selection begins and ends.
   ///
+  /// The reactions offered by the picker. Six, because the point is one tap on
+  /// something already visible; anything longer is a search, and a message
+  /// worth a rarer emoji is worth typing a reply.
+  static const _quickReactions = ['\u{1F44D}', '\u{2764}', '\u{1F602}', '\u{1F389}', '\u{1F440}', '\u{1F622}'];
+
+  /// Apply a reaction and say so only when it did **not** reach the peer.
+  ///
+  /// Silence on success is deliberate: a reaction is a small gesture and a
+  /// toast for every one would be louder than the thing it reports. But a
+  /// reaction the peer never saw — offline, or a build too old to have
+  /// negotiated them — would otherwise look identical to one that landed, and
+  /// that is the case the user cannot recover from without being told.
+  Future<void> _react(
+    String messageId,
+    String emoji, {
+    required bool remove,
+  }) async {
+    final state = AppScope.of(context);
+    final delivered = await state.chat.react(
+      widget.peerId,
+      messageId,
+      emoji,
+      remove: remove,
+    );
+    if (!mounted || delivered) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Saved here, but not delivered — the device is offline or its '
+          'app is too old for reactions.',
+        ),
+      ),
+    );
+  }
+
+  /// Offer the quick reactions for [messageId]. Opened by a double-tap: a tap
+  /// already opens a file and a long-press already starts a selection, so this
+  /// is the gesture left that costs neither.
+  Future<void> _pickReaction(ChatMessage message) async {
+    final chosen = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpace.md),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              for (final e in _quickReactions)
+                IconButton(
+                  onPressed: () => Navigator.of(sheetContext).pop(e),
+                  icon: Text(e, style: const TextStyle(fontSize: 24)),
+                  tooltip: 'React with $e',
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (chosen == null) return;
+    // Tapping an emoji this side already used withdraws it, matching what the
+    // chip under the bubble does — one meaning per gesture.
+    final mine = message.reactions.any((r) => r.emoji == chosen && r.isMine);
+    await _react(message.id, chosen, remove: mine);
+  }
+
   /// A long-press (or a secondary tap, the desktop idiom) on a bubble with
   /// nothing selected lands here and leaves exactly that message selected; a
   /// plain tap while selecting toggles; taking the last one back empties the
@@ -486,6 +551,9 @@ class _ChatScreenState extends State<ChatScreen> {
                                         message.id,
                                       )
                                     : null,
+                                onReact: (emoji, {required remove}) =>
+                                    _react(message.id, emoji, remove: remove),
+                                onPickReaction: () => _pickReaction(message),
                               ),
                             );
                           },
@@ -523,6 +591,70 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
+/// The reactions on one message, grouped by emoji with a count.
+///
+/// Grouped rather than listed one-per-reaction because a conversation has two
+/// participants: the interesting facts are *which* emoji and *whether I am one
+/// of the people who used it*, and a row of identical glyphs says neither
+/// clearly. A chip this side has reacted with is outlined, so tapping to
+/// withdraw is aimed at something visible rather than remembered.
+class _Reactions extends StatelessWidget {
+  final List<ChatReaction> reactions;
+  final Color fg;
+  final void Function(String emoji, {required bool remove})? onTap;
+
+  const _Reactions({
+    required this.reactions,
+    required this.fg,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    // Insertion-ordered, so the chips do not reshuffle when one is added.
+    final groups = <String, ({int count, bool mine})>{};
+    for (final r in reactions) {
+      final g = groups[r.emoji];
+      groups[r.emoji] = (
+        count: (g?.count ?? 0) + 1,
+        mine: (g?.mine ?? false) || r.isMine,
+      );
+    }
+    return Wrap(
+      spacing: AppSpace.xxs,
+      runSpacing: AppSpace.xxs,
+      children: [
+        for (final e in groups.entries)
+          InkWell(
+            onTap: onTap == null
+                ? null
+                : () => onTap!(e.key, remove: e.value.mine),
+            borderRadius: BorderRadius.circular(AppRadius.sm),
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpace.xs,
+                vertical: 1,
+              ),
+              decoration: BoxDecoration(
+                color: fg.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+                border: e.value.mine
+                    ? Border.all(color: scheme.primary, width: 1)
+                    : null,
+              ),
+              child: Text(
+                e.value.count > 1 ? '${e.key} ${e.value.count}' : e.key,
+                style: text.labelSmall?.copyWith(color: fg),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
 /// One message bubble: own messages lean right in `primaryContainer`, the
 /// peer's lean left in `surfaceContainerHighest`. A file row renders its own
 /// body ([_FileBody]) instead of the message text — a file record's `body` is
@@ -551,6 +683,14 @@ class _ChatBubble extends StatelessWidget {
   /// Non-null only for a row the engine never persisted (a refused share):
   /// nothing else will ever clear it, so the user must be able to.
   final VoidCallback? onDismiss;
+
+  /// React to this message with the given emoji, or withdraw it if this side
+  /// has already reacted with it. Null while selecting — a tap is the one
+  /// action path on screen then.
+  final void Function(String emoji, {required bool remove})? onReact;
+
+  /// Open the quick-reaction picker for this message. Null while selecting.
+  final VoidCallback? onPickReaction;
   const _ChatBubble({
     required this.message,
     required this.selecting,
@@ -558,6 +698,8 @@ class _ChatBubble extends StatelessWidget {
     required this.onToggle,
     this.error,
     this.onDismiss,
+    this.onReact,
+    this.onPickReaction,
   });
 
   @override
@@ -655,8 +797,37 @@ class _ChatBubble extends StatelessWidget {
                                   : fg.withValues(alpha: 0.7),
                             ),
                           ],
+                          // An explicit control rather than a gesture. A
+                          // double-tap here would put a double-tap recognizer
+                          // in the arena around the whole bubble, which delays
+                          // every tap inside it — including this row's Accept
+                          // and Decline — by the double-tap timeout. A visible
+                          // button costs a few pixels and no latency.
+                          if (onPickReaction != null && !selecting) ...[
+                            const Gap(AppSpace.xxs),
+                            InkWell(
+                              onTap: onPickReaction,
+                              borderRadius: BorderRadius.circular(AppRadius.sm),
+                              child: Padding(
+                                padding: const EdgeInsets.all(2),
+                                child: Icon(
+                                  Icons.add_reaction_outlined,
+                                  size: 14,
+                                  color: fg.withValues(alpha: 0.7),
+                                ),
+                              ),
+                            ),
+                          ],
                         ],
                       ),
+                      if (message.reactions.isNotEmpty) ...[
+                        const Gap(AppSpace.xxs),
+                        _Reactions(
+                          reactions: message.reactions,
+                          fg: fg,
+                          onTap: selecting ? null : onReact,
+                        ),
+                      ],
                       // Nothing else will ever clear this row — it exists only
                       // in this session, because the engine refused to send it
                       // and therefore persisted nothing. A full-size action,

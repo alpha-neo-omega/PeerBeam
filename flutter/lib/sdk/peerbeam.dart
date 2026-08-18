@@ -276,6 +276,22 @@ abstract class PeerBeamApi {
   /// answer one query.
   Future<ChatSearchResults> chatSearch(String query, {int? limit});
 
+  /// React to a message with [emoji], or withdraw that reaction.
+  ///
+  /// Returns `(applied, delivered)`. They are separate answers on purpose:
+  /// `applied` says this device's own history changed, `delivered` says the
+  /// peer was told. A peer that is offline — or too old to have negotiated
+  /// reactions — leaves `delivered` false rather than failing the call, so a
+  /// surface must read `delivered` before showing the gesture as seen.
+  ///
+  /// Reactions are not queued for later delivery.
+  Future<({bool applied, bool delivered})> chatReact(
+    String peerId,
+    String messageId,
+    String emoji, {
+    bool remove = false,
+  });
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -559,6 +575,29 @@ class PeerBeam implements PeerBeamApi {
       hits: _list(data['hits']).map(ChatSearchHit.fromJson).toList(),
       truncated: data['truncated'] == true,
       limit: (data['limit'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  @override
+  Future<({bool applied, bool delivered})> chatReact(
+    String peerId,
+    String messageId,
+    String emoji, {
+    bool remove = false,
+  }) async {
+    final data = _data(
+      _req().chatReact(
+        jsonEncode({
+          'peer': peerId,
+          'id': messageId,
+          'emoji': emoji,
+          'remove': remove,
+        }),
+      ),
+    );
+    return (
+      applied: data['applied'] == true,
+      delivered: data['delivered'] == true,
     );
   }
 

@@ -81,6 +81,10 @@ pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
         "status": rec.status,
         "kind": rec.kind,
         "file": rec.file,
+        // Always present, `[]` when there are none, so a surface can render
+        // reactions without distinguishing "no reactions" from "this build
+        // does not report them".
+        "reactions": rec.reactions,
     })
 }
 
@@ -194,6 +198,38 @@ pub fn session(session_id: &str, ty: &str, payload: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_dto_always_reports_reactions_even_when_there_are_none() {
+        // The key must be present and empty rather than absent: a surface
+        // reading it cannot otherwise tell "nobody reacted" from "this build
+        // does not send reactions", and would have to guess.
+        let rec = peerbeam_chat::ChatRecord {
+            id: "m1".to_string(),
+            peer_id: "pb-bob".to_string(),
+            direction: peerbeam_chat::Direction::In,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            body: "hello".to_string(),
+            status: peerbeam_chat::Status::Received,
+            kind: peerbeam_chat::Kind::Text,
+            file: None,
+            reactions: Vec::new(),
+        };
+        let dto = record_dto(&rec);
+        assert_eq!(dto["reactions"], serde_json::json!([]));
+
+        let rec = peerbeam_chat::ChatRecord {
+            reactions: vec![peerbeam_chat::StoredReaction {
+                emoji: "\u{1F44D}".to_string(),
+                by: peerbeam_chat::Direction::Out,
+                timestamp: "2024-01-01T00:00:01Z".to_string(),
+            }],
+            ..rec
+        };
+        let dto = record_dto(&rec);
+        assert_eq!(dto["reactions"][0]["emoji"], "\u{1F44D}");
+        assert_eq!(dto["reactions"][0]["by"], "out");
+    }
+
     use super::*;
     use peerbeam_chat::{ChatRecord, Direction, Kind, Status};
     use std::ffi::CStr;

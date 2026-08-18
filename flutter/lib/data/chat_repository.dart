@@ -281,6 +281,29 @@ class ChatRepository extends ChangeNotifier {
     }
   }
 
+  /// React to a message, or withdraw that reaction.
+  ///
+  /// Returns whether the peer was told. The local half is applied by the
+  /// engine either way and re-read here, so the reaction appears on this
+  /// device even when the peer is unreachable — but the caller is handed the
+  /// delivery answer so it can say so rather than implying the gesture landed.
+  Future<bool> react(
+    String peerId,
+    String messageId,
+    String emoji, {
+    bool remove = false,
+  }) async {
+    final api = _api;
+    if (api == null) return false;
+    try {
+      final r = await api.chatReact(peerId, messageId, emoji, remove: remove);
+      if (r.applied) await refresh(peerId);
+      return r.delivered;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Call off a file we are sharing, and report **honestly** whether anything
   /// was cancelled.
   ///

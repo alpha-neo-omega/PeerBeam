@@ -481,6 +481,39 @@ class FakePeerBeam implements PeerBeamApi {
   /// engine bounds it — including reporting truncation.
   static const searchDefaultLimit = 50;
 
+  /// What the engine would report for delivery. Tests set it false to prove a
+  /// surface distinguishes "applied here" from "the peer saw it".
+  bool reactDelivered = true;
+
+  @override
+  Future<({bool applied, bool delivered})> chatReact(
+    String peerId,
+    String messageId,
+    String emoji, {
+    bool remove = false,
+  }) async {
+    calls.add('chatReact:$peerId:$messageId:$emoji:$remove');
+    final history = chatHistories[peerId];
+    final i = history?.indexWhere((m) => m.id == messageId) ?? -1;
+    if (history == null || i < 0) {
+      return (applied: false, delivered: false);
+    }
+    final existing = history[i].reactions;
+    final at = existing.indexWhere((r) => r.emoji == emoji && r.isMine);
+    // Mirrors `ChatStore::apply_reaction`: stating the end state, so applying
+    // the same thing twice is applying it once.
+    if (remove && at < 0) return (applied: false, delivered: reactDelivered);
+    if (!remove && at >= 0) return (applied: false, delivered: reactDelivered);
+    final next = [...existing];
+    if (remove) {
+      next.removeAt(at);
+    } else {
+      next.add(ChatReaction(emoji: emoji, by: 'out', at: DateTime.now()));
+    }
+    history[i] = history[i].copyWith(reactions: next);
+    return (applied: true, delivered: reactDelivered);
+  }
+
   @override
   Future<ChatSearchResults> chatSearch(String query, {int? limit}) async {
     calls.add('chatSearch:$query');

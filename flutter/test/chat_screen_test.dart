@@ -729,4 +729,81 @@ void main() {
     // The fallback worked, so the user is not told it failed.
     expect(find.byType(SnackBar), findsNothing);
   });
+
+  testWidgets('a reaction on a message is shown, grouped with its count', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final now = DateTime.now();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'ship it',
+        at: now,
+        status: ChatStatusValue.sent,
+        reactions: [
+          ChatReaction(emoji: '\u{1F44D}', by: 'in', at: now),
+          ChatReaction(emoji: '\u{1F44D}', by: 'out', at: now),
+          ChatReaction(emoji: '\u{1F389}', by: 'in', at: now),
+        ],
+      ),
+    ];
+    await _open(tester, fake);
+
+    // Both sides used the same emoji: one chip carrying the count, not two
+    // identical glyphs.
+    expect(find.text('\u{1F44D} 2'), findsOneWidget);
+    expect(find.text('\u{1F389}'), findsOneWidget);
+  });
+
+  testWidgets('a reaction that did not reach the peer says so', (tester) async {
+    // The case a user cannot recover from unaided: applied here, never seen
+    // there. It must not look identical to one that landed.
+    final fake = FakePeerBeam()..reactDelivered = false;
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'ship it',
+        at: DateTime.now(),
+        status: ChatStatusValue.sent,
+      ),
+    ];
+    final state = await _open(tester, fake);
+
+    await state.chat.react('pb-bob', 'm1', '\u{1F44D}');
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(fake.calls, contains('chatReact:pb-bob:m1:\u{1F44D}:false'));
+  });
+
+  testWidgets('reacting again with the same emoji withdraws it', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final now = DateTime.now();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'ship it',
+        at: now,
+        status: ChatStatusValue.sent,
+        reactions: [ChatReaction(emoji: '\u{1F44D}', by: 'out', at: now)],
+      ),
+    ];
+    await _open(tester, fake);
+
+    // The chip is outlined because this side reacted; tapping it withdraws.
+    await tester.tap(find.text('\u{1F44D}'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(fake.calls, contains('chatReact:pb-bob:m1:\u{1F44D}:true'));
+  });
 }

@@ -547,6 +547,27 @@ abstract final class ChatStatusValue {
 /// **empty** — rendering it as text produces a blank bubble — and its metadata
 /// arrives under the record's `file` object.
 @immutable
+/// One reaction on a message: which emoji, and which side of the conversation
+/// put it there.
+///
+/// `by` is a direction rather than a device id because a conversation has
+/// exactly two participants — "mine" and "theirs" is the whole set.
+class ChatReaction {
+  final String emoji;
+  final String by; // 'out' (mine) | 'in' (theirs)
+  final DateTime at;
+
+  const ChatReaction({required this.emoji, required this.by, required this.at});
+
+  bool get isMine => by == 'out';
+
+  factory ChatReaction.fromJson(Map<String, dynamic> j) => ChatReaction(
+    emoji: j['emoji'] as String? ?? '',
+    by: j['by'] as String? ?? 'in',
+    at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
+  );
+}
+
 class ChatMessage {
   final String id;
   final String peerId;
@@ -573,6 +594,10 @@ class ChatMessage {
   /// prepared to fall back to opening it by [fileName].
   final String? localPath;
 
+  /// Reactions on this message, oldest first. Empty — never null — so a
+  /// surface never has to distinguish "none" from "not reported".
+  final List<ChatReaction> reactions;
+
   const ChatMessage({
     required this.id,
     required this.peerId,
@@ -584,6 +609,7 @@ class ChatMessage {
     this.fileName,
     this.fileSize,
     this.localPath,
+    this.reactions = const [],
   });
 
   bool get isMine => direction == 'out';
@@ -613,6 +639,11 @@ class ChatMessage {
       fileName: file?['name'] as String?,
       fileSize: (file?['size'] as num?)?.toInt(),
       localPath: file?['local_path'] as String?,
+      reactions: (j['reactions'] as List?)
+              ?.whereType<Map>()
+              .map((r) => ChatReaction.fromJson(Map<String, dynamic>.from(r)))
+              .toList() ??
+          const [],
     );
   }
 
@@ -629,6 +660,7 @@ class ChatMessage {
     String? kind,
     String? fileName,
     int? fileSize,
+    List<ChatReaction>? reactions,
   }) => ChatMessage(
     id: id,
     peerId: peerId,
@@ -640,6 +672,7 @@ class ChatMessage {
     fileName: fileName ?? this.fileName,
     fileSize: fileSize ?? this.fileSize,
     localPath: localPath ?? this.localPath,
+    reactions: reactions ?? this.reactions,
   );
 }
 
