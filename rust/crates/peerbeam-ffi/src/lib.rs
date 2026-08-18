@@ -531,6 +531,31 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_history(&read_json(json)?))()))
 }
 
+/// Search this device's stored chat history:
+/// `{query, limit?}` → `{hits:[{peer_id,message_id,timestamp,direction,kind,snippet}], truncated, limit}`.
+///
+/// **A pure local read.** Nothing goes on the wire, no peer is dialled, and no
+/// peer can observe that it happened — it reads the same conversation
+/// namespaces `pb_chat_history` reads. A thread whose device is long gone is
+/// searchable; one the user deleted is not.
+///
+/// `query` matches **case-insensitively** as a plain substring of a message's
+/// text body or a file message's *name*. A file's `local_path` is never
+/// searched: that is this device's filesystem layout, not conversation content.
+/// An empty or whitespace-only query finds nothing rather than everything.
+///
+/// `limit` is optional (default 50, max 500). **`truncated` says there were
+/// more matches than it allowed**, and a surface must show it — silently
+/// returning the first `n` reads as "that is all there is", which for a search
+/// over your own history is a wrong answer rather than a partial one.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
+}
+
 /// Settle one conversation's rows that no event will ever finish — a file left
 /// mid-flight by a crash or a hard restart: `{peer_id}` → `{changed}`. Emits a
 /// `chat_status` per settled row.

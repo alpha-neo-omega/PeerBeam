@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use peerbeam_chat::{
-    ChatError, ChatStore, Direction as ChatDirection, FileRef, PendingFile, StagingLimits,
-    StagingStore, Status as ChatStatus,
+    ChatError, ChatStore, Direction as ChatDirection, FileRef, PendingFile, SearchHit,
+    StagingLimits, StagingStore, Status as ChatStatus, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
 };
 // Only referenced by the guard test's assertions below; the guard's own
 // kind check now lives solely in `ChatRecord::is_settleable_file_row`.
@@ -3023,6 +3023,69 @@ impl Manager {
         Ok(json!({ "messages": messages }))
     }
 
+    /// Search this device's stored chat history:
+    /// `{query, limit?}` → `{hits:[…], truncated, limit}`.
+    ///
+    /// **A pure local read.** It walks the conversation namespaces already on
+    /// disk ([`ChatStore::search`]) and does nothing else: no channel is
+    /// opened, no peer is dialled, nothing goes on the wire and nothing a peer
+    /// could observe happens. A thread whose device is long gone is searchable;
+    /// one the user deleted is not, because its rows are gone.
+    ///
+    /// `query` is a **case-insensitive substring** of a message's text body or
+    /// a file message's name — never of a file's `local_path`, which is this
+    /// device's filesystem layout rather than conversation content. It is not a
+    /// regex. A missing or non-string `query` is `invalid_argument`; an *empty*
+    /// or whitespace-only one is not — it finds nothing and says so, which is
+    /// what a search box that has just been cleared should get rather than an
+    /// error to render.
+    ///
+    /// `limit` is optional and defaults to [`DEFAULT_SEARCH_LIMIT`]. When given
+    /// it must be an integer in `1..=MAX_SEARCH_LIMIT`; anything else is
+    /// `invalid_argument` naming the bound. Deliberately not clamped: a caller
+    /// asking for 10 000 has misunderstood something, and silently answering a
+    /// different question than the one asked is how a surface comes to believe
+    /// it is showing everything.
+    ///
+    /// **`truncated` is the field that matters.** It says there were more
+    /// matches than `limit` allowed. A surface must show it: a bounded search
+    /// that silently returns its first `n` reads as "that is all there is",
+    /// which for a search over the user's own history is a wrong answer rather
+    /// than a partial one. `limit` is echoed back so a surface can say how many
+    /// it is showing without having to know whether it passed one.
+    ///
+    /// Hits are newest first, tie-broken by peer id then message id (see
+    /// [`SearchHit`]), so paging and tests are stable. Each carries the
+    /// conversation it was read from, so tapping it opens the right thread.
+    ///
+    /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    pub fn chat_search(&self, req: &Value) -> Op {
+        let query = req
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "query required".into()))?;
+        let limit = match req.get("limit") {
+            None | Some(Value::Null) => DEFAULT_SEARCH_LIMIT,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=MAX_SEARCH_LIMIT as u64).contains(n))
+                .ok_or((
+                    Code::InvalidArgument,
+                    format!("limit must be an integer between 1 and {MAX_SEARCH_LIMIT}"),
+                ))? as usize,
+        };
+        let found = self
+            .chat
+            .search(query, limit)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let hits: Vec<Value> = found.hits.iter().map(search_hit_dto).collect();
+        Ok(json!({
+            "hits": hits,
+            "truncated": found.truncated,
+            "limit": limit,
+        }))
+    }
+
     /// Every conversation this device holds:
     /// `{peers:[{peer_id, last_timestamp, unread_hint}]}`. Takes no arguments.
     ///
@@ -4458,6 +4521,29 @@ fn daemon_event(kind: &str, port: u16) {
         "timestamp": timestamp(),
         "payload": { "port": port },
     }));
+}
+
+/// The JSON projection of one [`SearchHit`], for `pb_chat_search`.
+///
+/// Deliberately **not** `events::record_dto`: a hit is not a record. It carries
+/// the snippet rather than the whole body (the point of a bounded search), it
+/// has no `status` and no `file` object, and — most importantly — its `peer_id`
+/// is the conversation the row was read from rather than a field copied out of
+/// the row. Reusing the record projection would mean either shipping every
+/// matched message in full or quietly filling the missing fields in with
+/// plausible values.
+///
+/// `direction` and `kind` serialize exactly as they do on a history row, so a
+/// surface applies one vocabulary to both.
+fn search_hit_dto(hit: &SearchHit) -> Value {
+    json!({
+        "peer_id": hit.peer_id,
+        "message_id": hit.message_id,
+        "timestamp": hit.timestamp,
+        "direction": hit.direction,
+        "kind": hit.kind,
+        "snippet": hit.snippet,
+    })
 }
 
 /// The wire spelling of a chat [`ChatStatus`] for a `chat_status` event.
@@ -7824,6 +7910,210 @@ mod tests {
         // file.
         assert_eq!(peers[0]["unread_hint"], 2);
         assert_eq!(peers[1]["unread_hint"], 0);
+    }
+
+    // ── searching stored history ────────────────────────────────
+
+    /// The call in one pass: a text body and a file name both match, across two
+    /// conversations, each hit attributed to the thread it actually lives in
+    /// and newest first. A `local_path` is not searched.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_search_finds_text_and_file_names_across_conversations() {
+        let (mgr, chat, _dir) = test_manager_full("searcher", 0);
+        let alice = DeviceId::from("pb-alice");
+        let bob = DeviceId::from("pb-bob");
+
+        let msg = peerbeam_chat::ChatMessage::new("the quarterly invoice").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&alice, &msg))
+            .expect("seed alice");
+        let file = peerbeam_chat::FileRef::new("invoice-2026.pdf", 9).expect("file ref");
+        let mut meta = file_meta(&file);
+        // The one field a search must never look at.
+        meta.local_path = Some("/home/someone/Downloads/never-searched/x.bin".into());
+        chat.append(&peerbeam_chat::ChatRecord::file_out(
+            &bob,
+            &file,
+            meta,
+            ChatStatus::Sent,
+        ))
+        .expect("seed bob");
+
+        let out = mgr
+            .chat_search(&json!({ "query": "INVOICE" }))
+            .expect("search");
+        let hits = out["hits"].as_array().expect("hits array").clone();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        let peers: Vec<&str> = hits
+            .iter()
+            .map(|h| h["peer_id"].as_str().unwrap())
+            .collect();
+        assert!(
+            peers.contains(&"pb-alice") && peers.contains(&"pb-bob"),
+            "each thread is represented, and by its own id: {hits:?}"
+        );
+        // Newest first. Both rows were stamped by the clock rather than by the
+        // test, so this asserts the ordering property rather than a fixed
+        // sequence (the deterministic tie-break is pinned in `peerbeam-chat`).
+        let stamps: Vec<&str> = hits
+            .iter()
+            .map(|h| h["timestamp"].as_str().unwrap())
+            .collect();
+        assert!(stamps[0] >= stamps[1], "not newest-first: {stamps:?}");
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["limit"], DEFAULT_SEARCH_LIMIT as u64);
+
+        // Every hit carries what a surface needs to navigate to it.
+        for hit in &hits {
+            assert!(hit["message_id"].as_str().is_some_and(|s| !s.is_empty()));
+            assert!(hit["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+            assert!(matches!(hit["direction"].as_str(), Some("out")));
+            assert!(hit["snippet"]
+                .as_str()
+                .is_some_and(|s| s.to_lowercase().contains("invoice")));
+        }
+
+        // The path is not conversation content and is not matched.
+        let none = mgr
+            .chat_search(&json!({ "query": "never-searched" }))
+            .expect("search");
+        assert!(none["hits"].as_array().expect("hits").is_empty());
+    }
+
+    /// The field the whole call exists to get right: a surface must be told
+    /// there was more, and must be told how many it is looking at.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_search_reports_truncation_and_echoes_the_limit() {
+        let (mgr, chat, _dir) = test_manager_full("searcher", 0);
+        let peer = DeviceId::from("pb-bob");
+        for _ in 0..6 {
+            let m = peerbeam_chat::ChatMessage::new("invoice").expect("message");
+            chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+                .expect("seed");
+        }
+
+        let cut = mgr
+            .chat_search(&json!({ "query": "invoice", "limit": 2 }))
+            .expect("search");
+        assert_eq!(cut["hits"].as_array().expect("hits").len(), 2);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["limit"], 2);
+
+        let whole = mgr
+            .chat_search(&json!({ "query": "invoice", "limit": 6 }))
+            .expect("search");
+        assert_eq!(whole["hits"].as_array().expect("hits").len(), 6);
+        assert_eq!(
+            whole["truncated"], false,
+            "an exact fit is complete, not truncated"
+        );
+    }
+
+    /// An empty query is a cleared search box, not a mistake — and must not be
+    /// answered with the entire history either.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_search_validates_its_arguments() {
+        let (mgr, chat, _dir) = test_manager_full("searcher", 0);
+        let peer = DeviceId::from("pb-bob");
+        let m = peerbeam_chat::ChatMessage::new("invoice").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed");
+
+        // Missing or wrongly-typed `query`: a caller error.
+        for bad in [json!({}), json!({ "query": 7 }), json!({ "query": null })] {
+            let err = mgr.chat_search(&bad).expect_err("query required");
+            assert!(matches!(err.0, Code::InvalidArgument), "{bad}: {err:?}");
+        }
+        // Empty or whitespace-only: not an error, and not everything.
+        for empty in ["", "   ", "\t\n"] {
+            let out = mgr
+                .chat_search(&json!({ "query": empty }))
+                .expect("empty query is answerable");
+            assert!(
+                out["hits"].as_array().expect("hits").is_empty(),
+                "{empty:?}"
+            );
+            assert_eq!(out["truncated"], false);
+        }
+        // A limit outside the contract is refused rather than clamped: a
+        // surface silently answered a different question would believe it is
+        // showing everything.
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("50"),
+            json!(MAX_SEARCH_LIMIT as u64 + 1),
+        ] {
+            let err = mgr
+                .chat_search(&json!({ "query": "invoice", "limit": bad }))
+                .expect_err("limit out of range");
+            assert!(matches!(err.0, Code::InvalidArgument), "{bad}: {err:?}");
+        }
+        // Absent or explicitly null takes the default.
+        for ok in [
+            json!({ "query": "invoice" }),
+            json!({ "query": "invoice", "limit": null }),
+        ] {
+            let out = mgr.chat_search(&ok).expect("search");
+            assert_eq!(out["limit"], DEFAULT_SEARCH_LIMIT as u64);
+            assert_eq!(out["hits"].as_array().expect("hits").len(), 1);
+        }
+    }
+
+    /// One row this build cannot decode must not take its conversation — or
+    /// the search across every other conversation — down with it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_search_skips_an_undecodable_row_and_keeps_going() {
+        let (mgr, chat, raw, _dir) = test_manager_parts("searcher", 0);
+        let peer = DeviceId::from("pb-bob");
+        let other = DeviceId::from("pb-carol");
+        let m = peerbeam_chat::ChatMessage::new("readable invoice").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed");
+        raw.put("chat-pb-bob", "zzz-newer-schema", b"{\"kind\":")
+            .expect("seed an unreadable row");
+        let n = peerbeam_chat::ChatMessage::new("another invoice").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&other, &n))
+            .expect("seed");
+
+        let out = mgr
+            .chat_search(&json!({ "query": "invoice" }))
+            .expect("search survives an unreadable row");
+        let hits = out["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    /// Deleted history is gone, and search must not resurrect it from
+    /// anywhere — including the shared outbox, where a queued message's body
+    /// also lives.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_search_cannot_reach_a_deleted_conversation() {
+        let (mgr, chat, _dir) = test_manager_full("searcher", 0);
+        let peer = DeviceId::from("pb-bob");
+        let m = peerbeam_chat::ChatMessage::new("deleted invoice").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+            .expect("seed");
+        assert_eq!(
+            mgr.chat_search(&json!({ "query": "invoice" }))
+                .expect("search")["hits"]
+                .as_array()
+                .expect("hits")
+                .len(),
+            1
+        );
+
+        mgr.chat_delete(&json!({ "peer_id": "pb-bob" }))
+            .expect("delete");
+
+        let out = mgr
+            .chat_search(&json!({ "query": "invoice" }))
+            .expect("search");
+        assert!(out["hits"].as_array().expect("hits").is_empty());
     }
 
     /// The outbox lives in the same AppStore as the conversations and must never
