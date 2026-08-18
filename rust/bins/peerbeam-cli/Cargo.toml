@@ -29,6 +29,7 @@ peerbeam-identity-fs = { path = "../../crates/peerbeam-identity-fs" }
 peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
 peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }
 peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
+peerbeam-reliability-fs = { path = "../../crates/peerbeam-reliability-fs" }
 peerbeam-appstore-fs = { path = "../../crates/peerbeam-appstore-fs" }
 peerbeam-chat = { path = "../../crates/peerbeam-chat" }
 peerbeam-clipboard = { path = "../../crates/peerbeam-clipboard" }

@@ -15,4 +15,5 @@ pub mod prompt;
 pub mod resolve;
 pub mod rules;
 pub mod session_transfer;
+pub mod transfers;
 pub mod trust;

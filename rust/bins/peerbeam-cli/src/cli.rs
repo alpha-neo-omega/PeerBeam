@@ -81,8 +81,8 @@ pub enum Command {
     Session(SessionArgs),
     /// Inspect PeerSession channels.
     Channels(ChannelsArgs),
-    /// Show active transfers and their transport (PeerSession).
-    Transfers,
+    /// Show active transfers, and the ones that were interrupted.
+    Transfers(TransfersArgs),
     /// Show the transport summary (PeerSession runtime).
     Migration,
     /// Show reconnect / resume (recovery) state.
@@ -93,6 +93,36 @@ pub enum Command {
     Completions {
         /// Target shell.
         shell: Shell,
+    },
+}
+
+/// `peerbeam transfers` — what is moving, and what stopped moving.
+///
+/// With no subcommand it prints the live-session/transport snapshot it always
+/// has, plus an `interrupted` array. The subcommands act on that array: a
+/// transfer whose checkpoint outlived it can be resumed (outgoing only — the
+/// protocol is sender-driven) or discarded along with its partial file.
+#[derive(Args)]
+pub struct TransfersArgs {
+    #[command(subcommand)]
+    pub action: Option<TransfersAction>,
+}
+
+#[derive(Subcommand)]
+pub enum TransfersAction {
+    /// List the transfers that were interrupted, newest first.
+    List,
+    /// Resume an interrupted outgoing transfer from where it stopped.
+    Resume {
+        /// Transfer id, as shown by `transfers list`.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Forget an interrupted transfer and the partial file it was holding.
+    Discard {
+        /// Transfer id, as shown by `transfers list`.
+        #[arg(value_name = "ID")]
+        id: String,
     },
 }
 

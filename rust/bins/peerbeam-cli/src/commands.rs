@@ -50,7 +50,9 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
-        Command::Transfers => transfers_cmd(ctx),
+        Command::Transfers(a) => {
+            crate::transfers::transfers(ctx, a.action, cfg_override.as_deref()).await
+        }
         Command::Migration => migration_cmd(ctx),
         Command::Recovery => recovery_cmd(ctx),
         Command::Diagnostics => diagnostics_cmd(ctx),
@@ -66,7 +68,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
 // its live sessions. No engine state is duplicated here.
 
 /// Print a diagnostics value as JSON (always machine-readable, pretty in a TTY).
-fn present(ctx: &Ctx, value: &serde_json::Value) -> CliResult {
+pub(crate) fn present(ctx: &Ctx, value: &serde_json::Value) -> CliResult {
     if ctx.json {
         ctx.json_line(value);
     } else {
@@ -96,17 +98,6 @@ async fn channels_cmd(ctx: &Ctx, args: ChannelsArgs) -> CliResult {
         Some(id) => diag.channels_json(&id).await,
         None => diag.all_channels_json().await,
     };
-    present(ctx, &value)
-}
-
-fn transfers_cmd(ctx: &Ctx) -> CliResult {
-    let diag = peerbeam_engine::SessionDiagnostics::new();
-    // Transfers ride PeerSession channels; present the live sessions and the
-    // transport summary.
-    let value = json!({
-        "sessions": diag.sessions_json(),
-        "transport": diag.transport_json(),
-    });
     present(ctx, &value)
 }
 
@@ -984,6 +975,7 @@ async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResu
             let size = std::fs::metadata(path)?.len();
             let r = secure_send_file(
                 ctx, &quic, &routes, &target, &sc, &chat, &sink, &storage, p, &name, size, chunk,
+                None,
             )
             .await;
             history::record(
@@ -1319,7 +1311,7 @@ pub(crate) fn staging_limits(config: &EngineConfig) -> peerbeam_chat::StagingLim
 /// peer pushes back over it (see `send`'s call site doc for the full bug this
 /// avoids).
 #[allow(clippy::too_many_arguments)]
-async fn secure_send_file(
+pub(crate) async fn secure_send_file(
     ctx: &Ctx,
     quic: &Arc<QuicTransport>,
     routes: &RouteManager,
@@ -1332,6 +1324,11 @@ async fn secure_send_file(
     name: &str,
     size: u64,
     chunk: u32,
+    // `transfer_id`: the wire transfer id, when the caller needs a specific
+    // one. `None` keeps the historical behaviour of using the file name;
+    // `transfers resume` passes the checkpoint's id, because that is the id
+    // the checkpoint — and the surface showing it — is keyed by.
+    transfer_id: Option<&str>,
 ) -> CliResult {
     let session = crate::session_transfer::dial(
         quic,
@@ -1359,7 +1356,7 @@ async fn secure_send_file(
     let bar = ctx.bar(size, name);
     let ctrl = TransferControl::new();
     let req = SendRequest {
-        transfer_id: name.to_string(),
+        transfer_id: transfer_id.unwrap_or(name).to_string(),
         name: name.to_string(),
         path: path.to_string(),
         size,
@@ -2273,7 +2270,9 @@ mod config_key_tests {
 #[cfg(test)]
 mod session_cli_tests {
     use super::dispatch;
-    use crate::cli::{ChannelsArgs, Cli, Command, SessionAction, SessionArgs};
+    use crate::cli::{
+        ChannelsArgs, Cli, Command, SessionAction, SessionArgs, TransfersAction, TransfersArgs,
+    };
     use crate::output::Ctx;
 
     fn quiet_ctx() -> Ctx {
@@ -2310,7 +2309,10 @@ mod session_cli_tests {
                 session: Some("deadbeefdeadbeefdeadbeefdeadbeef".into()),
                 watch: false,
             }),
-            Command::Transfers,
+            Command::Transfers(TransfersArgs { action: None }),
+            Command::Transfers(TransfersArgs {
+                action: Some(TransfersAction::List),
+            }),
             Command::Migration,
             Command::Recovery,
             Command::Diagnostics,
@@ -2554,6 +2556,7 @@ mod chat_wiring_dial_regression {
                 "report.pdf",
                 content.len() as u64,
                 64 * 1024,
+                None,
             )
             .await
         };
