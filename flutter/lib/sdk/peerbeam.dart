@@ -329,6 +329,16 @@ abstract class PeerBeamApi {
   /// "refused" could map which devices are listening.
   Future<bool> presenceRing(PeerTarget peer, {int seconds = 15});
 
+  /// Every remembered clip, newest first.
+  ///
+  /// Empty unless clipboard history is on. Reading is never gated — an empty
+  /// list is the honest answer for a device that records nothing.
+  Future<List<ClipEntry>> clipboardHistory();
+
+  /// Forget every remembered clip, returning how many were removed. Works
+  /// whether or not the setting is on.
+  Future<int> clipboardHistoryClear();
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -692,6 +702,18 @@ class PeerBeam implements PeerBeamApi {
       ),
     );
     return data['sent'] == true;
+  }
+
+  @override
+  Future<List<ClipEntry>> clipboardHistory() async {
+    final data = _data(_req().clipHistory('{}'));
+    return _list(data['entries']).map(ClipEntry.fromJson).toList();
+  }
+
+  @override
+  Future<int> clipboardHistoryClear() async {
+    final data = _data(_req().clipHistoryClear('{}'));
+    return (data['cleared'] as num?)?.toInt() ?? 0;
   }
 
   @override

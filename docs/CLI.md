@@ -259,6 +259,11 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `clipboard history [--clear]` — show or erase what this device remembers
+  copying. Empty unless `device.clipboard_history` is on (default off, and
+  separate from clipboard sync). The listing abbreviates each clip to one
+  capped line — it prints into terminal scrollback, and dumping fifty
+  remembered clips there would defeat the point of bounding the log.
 - `ring <peer> [--seconds N]` — *find my device*: ask one of your devices to
   make itself findable. It rings only if it has granted this machine the
   `presence` permission, and never reports back either way.

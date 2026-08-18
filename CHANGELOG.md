@@ -7,6 +7,21 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Clipboard history — off by default, and a separate switch from sync.**
+  Remembers your last 50 clips **on this device only**; nothing about history is
+  ever sent to a peer. View or erase it in Settings → Clipboard history, or with
+  `peerbeam clipboard history [--clear]`.
+
+  When clipboard sync shipped it said there would be no history, "because a
+  durable log of everything you ever copied is precisely what this feature must
+  not create". That was about a log created as a *side effect of syncing* —
+  automatic, unbounded, unasked — and it still holds: with this switch off,
+  sync stores nothing. Turning sync on is explicitly not consent to record.
+
+  Turning history off stops new entries but does not erase what was saved, so
+  the erase action is separate and always available. Listings show one
+  abbreviated line per clip: rendering fifty in full would put every remembered
+  password on one screen.
 - **Find my device.** Ring a device you trust from Home, or with
   `peerbeam ring <peer>`. The device shows a banner naming who is looking,
   wherever you are in the app — the reason it is being rung is that you cannot

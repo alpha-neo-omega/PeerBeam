@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../clipboard/clipboard_history_screen.dart';
+
 import '../../app/theme.dart';
 import '../../platform/bridge.dart';
 import '../../platform/desktop_files.dart';
@@ -585,6 +587,32 @@ class _ClipboardSyncTile extends StatelessWidget {
             ),
             value: state.settings.syncClipboard,
             onChanged: state.settings.setSyncClipboard,
+          ),
+          const Divider(height: 1),
+          SwitchListTile.adaptive(
+            secondary: const Icon(Icons.history_rounded),
+            title: const Text('Keep clipboard history'),
+            // Says what is stored, where, how much, and what it is not. A
+            // toggle called "history" with no scope attached is one people
+            // agree to without knowing what they agreed to.
+            subtitle: const Text(
+              'Remembers your last 50 clips on this device only — never sent '
+              'to anyone. Off by default. Turning it off stops new entries '
+              'but keeps what was already saved.',
+            ),
+            value: state.settings.clipboardHistory,
+            onChanged: state.settings.setClipboardHistory,
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete_sweep_outlined),
+            title: const Text('Clipboard history'),
+            subtitle: const Text('View or erase what this device remembers'),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const ClipboardHistoryScreen(),
+              ),
+            ),
           ),
           if (_isAndroid)
             const ListTile(

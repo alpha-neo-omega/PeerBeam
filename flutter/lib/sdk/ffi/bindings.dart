@@ -81,6 +81,8 @@ class Bindings {
   final _ArgRetDart _notesDelete;
   final _ArgRetDart _notesSync;
   final _ArgRetDart _presenceRing;
+  final _ArgRetDart _clipHistory;
+  final _ArgRetDart _clipHistoryClear;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -168,6 +170,12 @@ class Bindings {
       _notesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_delete'),
       _notesSync = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_sync'),
       _presenceRing = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_presence_ring'),
+      _clipHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_clipboard_history',
+      ),
+      _clipHistoryClear = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_clipboard_history_clear',
+      ),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -241,6 +249,8 @@ class Bindings {
   String notesDelete(String json) => _withArg(json, _notesDelete);
   String notesSync(String json) => _withArg(json, _notesSync);
   String presenceRing(String json) => _withArg(json, _presenceRing);
+  String clipHistory(String json) => _withArg(json, _clipHistory);
+  String clipHistoryClear(String json) => _withArg(json, _clipHistoryClear);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);

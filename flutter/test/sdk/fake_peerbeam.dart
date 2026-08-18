@@ -563,6 +563,23 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// The clips this fake remembers, newest first.
+  final List<ClipEntry> clipHistory = [];
+
+  @override
+  Future<List<ClipEntry>> clipboardHistory() async {
+    calls.add('clipboardHistory');
+    return List.of(clipHistory);
+  }
+
+  @override
+  Future<int> clipboardHistoryClear() async {
+    calls.add('clipboardHistoryClear');
+    final n = clipHistory.length;
+    clipHistory.clear();
+    return n;
+  }
+
   /// What the engine would report for a ring request.
   bool ringSent = true;
 

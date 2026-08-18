@@ -256,6 +256,8 @@ char* pb_notes_edit(const char* json);          // {id, title?, body} → {updat
 char* pb_notes_delete(const char* json);        // {id} → {deleted}
 char* pb_notes_sync(const char* json);          // {peer} → {sent}
 char* pb_presence_ring(const char* json);       // {peer, seconds?} → {sent}
+char* pb_clipboard_history(const char* json);   // {} → {entries:[…]}
+char* pb_clipboard_history_clear(const char* json); // {} → {cleared:n}
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)

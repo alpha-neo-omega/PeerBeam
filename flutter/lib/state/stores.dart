@@ -60,6 +60,15 @@ class SettingsStore extends ChangeNotifier {
   /// you what others choose to tell you.
   bool shareReadReceipts;
 
+  /// "Keep a short clipboard history on this device" — the history opt-in.
+  ///
+  /// **Default off, and separate from [syncClipboard]**: syncing your clipboard
+  /// and keeping a record of it are different decisions. Bundling them would
+  /// hand a stored log to someone who only wanted two machines to share a
+  /// clipboard, which is exactly what sync promised not to create. History is
+  /// bounded, kept only on this device, and never sent to a peer.
+  bool clipboardHistory;
+
   /// "Sync clipboard with trusted devices" — the clipboard opt-in.
   ///
   /// **Default off.** While it is off this device sends no clip at all, to
@@ -124,6 +133,7 @@ class SettingsStore extends ChangeNotifier {
     // Opt-in: nothing about this device leaves it until the user says so.
     this.sharePresence = false,
     this.shareReadReceipts = false,
+    this.clipboardHistory = false,
     // Likewise, and with more at stake — this is the one buffer guaranteed to
     // sometimes hold a password.
     this.syncClipboard = false,
@@ -157,6 +167,7 @@ class SettingsStore extends ChangeNotifier {
       sharePresence = (s['share_presence'] as bool?) ?? sharePresence;
       shareReadReceipts =
           (s['share_read_receipts'] as bool?) ?? shareReadReceipts;
+      clipboardHistory = (s['clipboard_history'] as bool?) ?? clipboardHistory;
       // Absent -> stays false, for the same reason: a settings document
       // written before this feature existed is not consent.
       syncClipboard = (s['sync_clipboard'] as bool?) ?? syncClipboard;
@@ -225,6 +236,16 @@ class SettingsStore extends ChangeNotifier {
   /// off stops the next one rather than waiting for a reconnect. It governs
   /// sending only — receipts already applied stay applied, and receipts peers
   /// send keep arriving.
+  /// Turn clipboard history on or off.
+  ///
+  /// Turning it off stops new entries; it does **not** erase what was already
+  /// recorded, which is why the settings tile offers a separate Clear.
+  void setClipboardHistory(bool v) {
+    clipboardHistory = v;
+    _persist('clipboard_history', v);
+    notifyListeners();
+  }
+
   void setShareReadReceipts(bool v) {
     shareReadReceipts = v;
     _persist('share_read_receipts', v);

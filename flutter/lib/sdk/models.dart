@@ -844,6 +844,32 @@ class Note {
   );
 }
 
+/// One remembered clip.
+class ClipEntry {
+  final String id;
+  final String text;
+
+  /// The device that sent it, or null when this device copied it.
+  final String? from;
+  final DateTime at;
+
+  const ClipEntry({
+    required this.id,
+    required this.text,
+    required this.from,
+    required this.at,
+  });
+
+  bool get isMine => from == null;
+
+  factory ClipEntry.fromJson(Map<String, dynamic> j) => ClipEntry(
+    id: j['id'] as String? ?? '',
+    text: j['text'] as String? ?? '',
+    from: j['from'] as String?,
+    at: DateTime.tryParse(j['at'] as String? ?? '') ?? DateTime.now(),
+  );
+}
+
 class ChatSearchResults {
   /// Newest first, tie-broken by peer id then message id so the order is stable
   /// between runs.
