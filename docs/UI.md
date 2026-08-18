@@ -408,6 +408,64 @@ survival across an incoming message, the single delete call with exactly the
 selected ids, the engine's `removed`/`kept` rendering, and forwarding's order,
 per-kind routing and exclusion.
 
+## Searching your own chat history
+
+The **Chats** destination carries a search field above the conversation list.
+Typing filters nothing on this side: the query goes to the engine
+(`pb_chat_search`), which walks the stored conversations and returns the newest
+matches. A filter in Dart would mean pulling every message of every conversation
+across the FFI to answer one query, which is the wrong shape at any size worth
+searching.
+
+It matches the **text of messages** and the **names of shared files**,
+case-insensitively. It does not match a file's path on this device: that is
+where the file happens to sit on disk, not anything anyone said, so searching it
+would surface a thread for the name of a folder. Nothing leaves the machine —
+no peer is contacted, and a thread whose device is long gone is searchable
+exactly like one that is online.
+
+**Truncation is shown, and shown first.** When the engine reports that there
+were more matches than the limit allowed, a notice sits *above* the first hit —
+not under the last — saying how many are being shown and that there are more.
+That placement is the point: it is the one thing the user has to read before
+concluding the message they want does not exist, and a footer below fifty rows
+is read after that conclusion has already been drawn. There is no threshold and
+no dismissing it. A bounded search whose bound is invisible reads as "that is
+all there is", which for a search over your own history is a wrong answer rather
+than a partial one.
+
+**Results are grouped by conversation**, in the order their newest hit appeared,
+each group headed by the peer's name (discovery's, then the trust store's, then
+the device id — the same resolution the conversation list uses) and its match
+count.
+
+**Tapping a hit opens that conversation — not that message.** The thread is a
+lazily-built, variable-height, reversed `ListView` with no scroll controller, so
+scrolling to an arbitrary row means either a positioned-list dependency or
+measuring every bubble above it. Neither is a small change, and half of one is a
+jump that lands in the wrong place, which is worse than not jumping. This is a
+deliberate limit, not an oversight.
+
+Two smaller decisions that are load-bearing:
+
+- **Queries are debounced (250 ms) and answered in order.** Every keystroke
+  would otherwise be a full walk of every conversation in the engine, and a
+  broad query dispatched first routinely lands *after* the narrower one typed on
+  top of it. Every dispatch takes a sequence number and only the newest may
+  write to the screen; clearing the field strands whatever is in flight, so its
+  answer cannot repopulate a search the user has just cleared.
+- **"No messages match X" is never shown while a newer search is still out.**
+  The answer on screen belongs to a query the user has already replaced, and
+  telling them the message does not exist is the one wrong thing a search can
+  say. Previous results stay readable under a thin progress bar instead, rather
+  than the list blanking on every keystroke.
+
+`test/chats_screen_test.dart` covers finding a body and a file name grouped by
+conversation, the path exclusion, the truncation notice and its position above
+the first hit, tapping a hit opening the thread the message is actually in, an
+empty query not searching at all, and a cleared field returning to an untouched
+conversation list.
+
 ## A device that has never connected before
 
 An approval prompt for a device this one has never spoken to no longer looks

@@ -247,6 +247,7 @@ char* pb_chat_conversations(const char* json);  // {} or null → {peers:[{peer_
 char* pb_chat_cancel(const char* json);         // {peer_id, message_id} → {cancelled}
 char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
 char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
+char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
@@ -316,6 +317,44 @@ survived), while `pb_chat_delete_messages` **names** the kept ids, so a surface
 can tell the user which of the messages they picked are still on their way out.
 An id the conversation does not hold is neither removed nor kept, and an empty
 `message_ids` deletes nothing rather than failing.
+
+`pb_chat_search` is a **pure local read** of the same conversation namespaces
+`pb_chat_history` reads. Nothing goes on the wire, no peer is dialled, and there
+is no way for a peer to observe that it happened — a thread whose device is long
+gone is searchable exactly like one that is online, and a conversation the user
+deleted is not searchable at all because its rows are gone.
+
+It lives in the engine (`peerbeam_chat`'s `ChatStore::search`) rather than in a
+surface filter, because a filter in the surface means loading every message of
+every conversation across this boundary to answer one query — the wrong shape at
+any size worth searching, and three implementations of it.
+
+`query` matches **case-insensitively** as a plain substring of a message's text
+body or a file message's **name**. Not a regex: a user-supplied pattern is
+unbounded work over unbounded history and nothing here needs one. Never a file's
+`local_path`, which is this device's filesystem layout rather than conversation
+content — matching it would surface a thread because of where a file happens to
+sit on disk. Folding is Unicode per-character lowercase *mapping* (what Rust's
+`char::to_lowercase` gives), not full case folding: `ПРИВЕТ` finds `привет`, but
+`ß` does not match `ss`. An empty or whitespace-only `query` finds **nothing**
+rather than everything; a missing or non-string one is `invalid_argument`.
+
+`limit` is optional (default 50, max 500) and, when given, must be an integer in
+`1..=500` — refused rather than clamped, because a surface silently answered a
+different question than the one it asked is how it comes to believe it is
+showing everything. **`truncated` says there were more matches than `limit`
+allowed, and a surface must show it**: silently returning the first `n` reads as
+"that is all there is", which for a search over the user's own history is a
+wrong answer rather than a partial one. `limit` is echoed back so a surface can
+say how many it is showing without knowing whether it passed one.
+
+Hits are newest first, ties broken by peer id then message id — a total order,
+so paging and tests are stable. Each carries the **conversation it was read
+from** (not a `peer_id` copied out of the row), the message id, its timestamp,
+`direction`/`kind` in the same spellings a history row uses, and a `snippet`
+that is a substring of the stored text, never re-rendered. A row this build
+cannot decode is skipped exactly as `pb_chat_history` skips it; a genuine store
+failure is reported rather than quietly dropping that thread's matches.
 
 ## Events (no polling)
 

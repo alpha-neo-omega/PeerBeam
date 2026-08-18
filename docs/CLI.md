@@ -259,6 +259,26 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `chat search <query> [--limit N]` — find messages in this device's **own**
+  stored conversations. A local read: no peer is resolved, no discovery window
+  is opened, nothing is dialled, so it works on a headless box with no network
+  at all and a thread whose device is long gone is searchable exactly like one
+  that is online. A conversation that was deleted is not searchable — its rows
+  are gone.
+
+  Matches a **case-insensitive substring** of a message's text or a shared
+  file's *name*. It is not a regular expression, and a file's `local_path` is
+  never searched: that is where the file happens to sit on this disk, not
+  anything anyone said, so matching it would surface a thread for the name of a
+  folder. Case-insensitivity is Unicode lowercase *mapping*, not full case
+  folding — `ПРИВЕТ` finds `привет`, but `ß` does not match `ss`.
+
+  Results are newest first (ties broken by peer id then message id, so the
+  order is stable) and bounded by `--limit` (default 50, max 500). **When there
+  were more matches than fitted, the command says so** on its own line — a
+  bounded search whose bound is invisible reads as "that is all there is".
+  Finding nothing exits `0`: an empty result set is a successful search, not a
+  failed lookup.
 - `chat watch [--port N]` — listen for and print incoming chat messages in
   real-time. Must be running to receive messages. `--port` specifies the QUIC
   port to listen on (default: from config `transfer.port`). A file share
@@ -658,6 +678,13 @@ emits machine-readable JSON (NDJSON for streaming/long-running commands):
 - `chat history --json` is not a stream: one `{"messages":[…]}` object, each
   message carrying `status` (`staging`/`pending`/`sent`/…) and, for a file,
   `kind:"file"` plus `{"name","size","local_path"}`.
+- `chat search --json` is not a stream either: one
+  `{"hits":[{"peer_id","message_id","timestamp","direction","kind","snippet"}],"truncated":bool,"limit":N}`
+  object. Deliberately one object rather than a line per hit — `truncated` has
+  to sit somewhere a consumer cannot miss it, and a stream of hits with a
+  marker at the end is exactly the shape a script reading the first N lines
+  drops on the floor. `snippet` is a substring of what is stored (the body
+  around the match, or the file's name), unmodified.
 - `trust list --json` → one object per line:
   `{"id","name","fingerprint","trusted_at","approved","permissions"}`.
   **`approved` is a bool**, and it is the field to filter on — the presence of a

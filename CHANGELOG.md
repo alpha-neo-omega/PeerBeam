@@ -6,6 +6,56 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Chat search: find a message in your own history.** Every surface can now
+  search this device's stored conversations — the **text of messages** and the
+  **names of shared files** — case-insensitively.
+
+  **Local only, by construction.** It reads the same conversation namespaces
+  history already reads and nothing else: nothing goes on the wire, no peer is
+  dialled, and there is no way for a peer to observe that it happened. A thread
+  whose device is long gone is searchable exactly like one sitting on the same
+  desk; a conversation that was deleted is not searchable at all, because its
+  rows are gone and there is nowhere for them to come back from.
+
+  **A file's path on this device is never searched.** Its *name* is
+  conversation content; where it happens to sit on disk is not, and matching
+  that would surface a thread because of the name of a folder — every file
+  anyone ever sent answering to `/home/<you>/Downloads`.
+
+  **A truncated result set says so, everywhere.** The engine bounds the results
+  by an explicit limit and reports when there were more. Every surface shows it:
+  the app puts the notice *above* the first hit rather than under the last, the
+  CLI prints a line, the FFI returns `truncated`. A bounded search that silently
+  returns its first N reads as "that is all there is" — for a search over your
+  own history that is a wrong answer, not a partial one.
+
+  **The search is in the engine** (`ChatStore::search`), not a filter in the
+  app. A filter in Dart would mean loading every message of every conversation
+  across the FFI to answer one query, and writing it a third time for the CLI.
+  It is a plain **substring** match, not a regex: a user-supplied pattern is an
+  unbounded amount of work over an unbounded amount of history and nothing here
+  needs one. Results are newest first, ties broken by peer id then message id so
+  the order is stable between runs, and each hit names the conversation it was
+  read from — the thread the message is actually in.
+
+  Case-insensitivity is honest about its limits: Unicode per-character lowercase
+  *mapping*, not full case folding (`ПРИВЕТ` finds `привет`; `ß` does not match
+  `ss`). A row this build cannot decode is skipped rather than fatal, exactly as
+  history skips it, so one row from a newer schema cannot make a conversation
+  unsearchable or abort a search across all of them.
+
+  **App:** a debounced search field on **Chats**, results grouped by
+  conversation. Tapping one opens that thread — not that exact message, which
+  the thread's lazily-built variable-height list cannot yet scroll to honestly.
+  **CLI:** `peerbeam chat search <query> [--limit N]`, with `--json` returning a
+  single object so `truncated` cannot be missed by a script reading the first N
+  lines. Finding nothing exits `0`: an empty result set is a successful search.
+  **FFI:** `pb_chat_search` — `{query, limit?}` → `{hits, truncated, limit}`.
+
+  No wire change of any kind: no message type, no feature bit, nothing a peer
+  can see.
+
 ## [0.7.0] - 2026-08-18 — Beta
 
 ### Added
