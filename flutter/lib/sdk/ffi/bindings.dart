@@ -56,6 +56,7 @@ class Bindings {
   final _RetDart _history;
   final _RetDart _trustList;
   final _ArgRetDart _trustRemove;
+  final _ArgRetDart _rulesSet;
   final _RetDart _historyClear;
   final _RetDart _settingsGet;
   final _ArgRetDart _settingsSet;
@@ -104,6 +105,7 @@ class Bindings {
       _trustRemove = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_trust_remove',
       ),
+      _rulesSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_rules_set'),
       _historyClear = lib.lookupFunction<_RetC, _RetDart>('pb_history_clear'),
       _settingsGet = lib.lookupFunction<_RetC, _RetDart>('pb_settings_get'),
       _settingsSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
@@ -175,6 +177,7 @@ class Bindings {
   String history() => _consume(_history());
   String trustList() => _consume(_trustList());
   String trustRemove(String json) => _withArg(json, _trustRemove);
+  String rulesSet(String json) => _withArg(json, _rulesSet);
   String historyClear() => _consume(_historyClear());
   String settingsGet() => _consume(_settingsGet());
   String settingsSet(String json) => _withArg(json, _settingsSet);

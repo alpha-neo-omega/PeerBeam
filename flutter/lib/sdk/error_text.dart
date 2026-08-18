@@ -29,6 +29,10 @@ String _forException(PeerBeamException e) => switch (e) {
   PeerBeamUnavailable() => 'The transfer engine is unavailable in this build.',
   InvalidArgumentException() => "That action can't be completed.",
   UnimplementedException() => "That feature isn't available yet.",
+  // Not "yet". This platform cannot do it at all, and saying "yet" would leave
+  // someone waiting for a build that is never coming.
+  UnsupportedPlatformException() =>
+    "This device can't do that — see the note in Settings for why.",
   QueueUnreadableException() =>
     "Something still queued to send can't be read right now, so deleting "
         "is on hold — that could discard it before it goes out.",

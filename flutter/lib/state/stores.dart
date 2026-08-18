@@ -64,6 +64,25 @@ class SettingsStore extends ChangeNotifier {
   /// Theme preference as persisted ('system' | 'light' | 'dark').
   String theme;
 
+  /// Ordered auto-save rules: **where** a received file lands.
+  ///
+  /// The order is the tie-break — the first rule that matches a file chooses
+  /// its directory — so this list is presented and edited in order, and a file
+  /// matching none of them goes to [saveDirectory], exactly as every file did
+  /// before rules existed.
+  ///
+  /// A rule never decides *whether* a file is accepted. That is the approval
+  /// prompt and [autoAcceptTrusted], neither of which this touches.
+  List<SaveRule> saveRules;
+
+  /// Whether this platform can honour rules at all — reported by the engine,
+  /// not guessed here.
+  ///
+  /// False on Android, which receives into a SAF-granted location and cannot
+  /// write to an arbitrary absolute path. The UI must say so rather than offer
+  /// an editor that would silently do nothing.
+  bool rulesSupported;
+
   PeerBeamApi? _api;
 
   SettingsStore({
@@ -82,6 +101,10 @@ class SettingsStore extends ChangeNotifier {
     // Likewise, and with more at stake — this is the one buffer guaranteed to
     // sometimes hold a password.
     this.syncClipboard = false,
+    this.saveRules = const [],
+    // Assume not supported until the engine says otherwise, so a surface can
+    // never offer the editor on the strength of a failed load.
+    this.rulesSupported = false,
   });
 
   /// Load persisted settings from the engine (call once after initialize).
@@ -107,6 +130,14 @@ class SettingsStore extends ChangeNotifier {
       // written before this feature existed is not consent.
       syncClipboard = (s['sync_clipboard'] as bool?) ?? syncClipboard;
       theme = (s['theme'] as String?) ?? theme;
+      // Absent -> no rules, which is the same receive behaviour as before this
+      // feature existed. A malformed entry is skipped rather than failing the
+      // whole load: an unreadable rule must not blank every other setting.
+      saveRules = ((s['save_rules'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => SaveRule.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+      rulesSupported = (s['rules_supported'] as bool?) ?? rulesSupported;
       notifyListeners();
     } catch (_) {
       // Engine unavailable (tests/desktop without lib): keep defaults.
@@ -178,6 +209,25 @@ class SettingsStore extends ChangeNotifier {
   void setTheme(String v) {
     theme = v;
     _persist('theme', v);
+    notifyListeners();
+  }
+
+  /// Replace the whole ordered rule list.
+  ///
+  /// Not `_persist`: rules go through their own engine call, which **validates
+  /// them and can refuse**. So this awaits the result and only adopts the new
+  /// list once the engine has stored it — an optimistic update here would show
+  /// a rule that does not exist, and the user would believe their files were
+  /// being sorted. The error is rethrown for the caller to show.
+  Future<void> setSaveRules(List<SaveRule> rules) async {
+    final api = _api;
+    if (api == null) {
+      saveRules = List.unmodifiable(rules);
+      notifyListeners();
+      return;
+    }
+    await api.rulesSet(rules);
+    saveRules = List.unmodifiable(rules);
     notifyListeners();
   }
 }

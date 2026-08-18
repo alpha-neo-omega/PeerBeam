@@ -90,6 +90,24 @@ abstract class PeerBeamApi {
   /// Revoke a pinned device. Returns whether it was pinned.
   Future<bool> trustRemove(String id);
 
+  /// Replace the ordered auto-save rule list. Returns how many were stored.
+  ///
+  /// **The whole list at once**, because the order *is* the tie-break: the
+  /// first rule that matches a received file chooses its directory. Adding,
+  /// removing and reordering are all this one call, so a half-applied edit can
+  /// never be persisted.
+  ///
+  /// Rules decide **where** an accepted file lands, never **whether** it is
+  /// accepted. Every rule is validated by the engine — absolute destination, no
+  /// `..`, an existing parent — and **one bad rule refuses the whole write**,
+  /// throwing [InvalidArgumentException] with the offending rule's index.
+  /// Throws [UnsupportedPlatformException] on Android, which cannot write to an
+  /// arbitrary absolute path.
+  ///
+  /// Read them back through [settingsGet] (`save_rules`), alongside
+  /// `rules_supported`.
+  Future<int> rulesSet(List<SaveRule> rules);
+
   /// Send a chat text message to a peer. Returns the new message id.
   Future<String> chatSend(PeerTarget peer, String text);
 
@@ -357,6 +375,16 @@ class PeerBeam implements PeerBeamApi {
   Future<bool> trustRemove(String id) async {
     final data = _data(_req().trustRemove(jsonEncode({'id': id})));
     return data['removed'] == true;
+  }
+
+  @override
+  Future<int> rulesSet(List<SaveRule> rules) async {
+    final data = _data(
+      _req().rulesSet(
+        jsonEncode({'rules': rules.map((r) => r.toJson()).toList()}),
+      ),
+    );
+    return (data['count'] as num?)?.toInt() ?? 0;
   }
 
   @override

@@ -7,8 +7,11 @@ import '../../platform/desktop_files.dart';
 import '../../platform/open_path.dart';
 import '../../platform/saf.dart';
 import '../../platform/services.dart';
-import '../../sdk/models.dart' show TrustedDevice;
+import '../../sdk/error_text.dart';
+import '../../sdk/exceptions.dart';
+import '../../sdk/models.dart' show SaveRule, TrustedDevice;
 import '../../state/app_scope.dart';
+import '../../state/stores.dart' show SettingsStore;
 import '../../widgets/common.dart';
 
 bool get _isAndroid =>
@@ -168,6 +171,10 @@ class SettingsScreen extends StatelessWidget {
                   ),
                 ),
               ),
+              const Gap(AppSpace.md),
+
+              const _GroupLabel('Auto-save rules'),
+              const _SaveRulesCard(),
               const Gap(AppSpace.md),
 
               const _GroupLabel('Trusted devices'),
@@ -449,6 +456,366 @@ class _ClipboardSyncTile extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// The auto-save rules editor: view, add, **reorder** and remove.
+///
+/// # Two things this section must keep saying
+///
+/// 1. **A rule chooses where a file is saved, never whether it is accepted.**
+///    Approval is a separate decision made by the prompt (and the separate
+///    "Auto-accept trusted devices" switch above); nothing here can accept
+///    anything. The header copy says so, because a list of rules sitting under
+///    "Transfers" would otherwise read like an acceptance filter.
+/// 2. **The first match wins.** That is why this is a `ReorderableListView` and
+///    not a plain list — the order *is* the tie-break, and a user who can drag
+///    a rule upward can predict the outcome. Everything below the first
+///    catch-all is unreachable, which the list marks rather than leaves to be
+///    discovered.
+///
+/// On Android the editor is replaced by a plain statement of why there is no
+/// editor. A section that silently did nothing would be worse than none at all.
+class _SaveRulesCard extends StatelessWidget {
+  const _SaveRulesCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    return AnimatedBuilder(
+      animation: state.settings,
+      builder: (context, _) {
+        if (!state.settings.rulesSupported) {
+          return const Card(
+            child: ListTile(
+              leading: Icon(Icons.rule_folder_outlined),
+              title: Text('Not available on this device'),
+              // The honest reason, not a shrug. Android hands the app one
+              // user-granted folder and no way to write anywhere else, so
+              // there is nothing a rule could point at.
+              subtitle: Text(
+                'Android saves received files to the folder you granted above '
+                'and apps cannot write to any other location, so there is '
+                'nowhere for a rule to send them.',
+              ),
+            ),
+          );
+        }
+
+        final rules = state.settings.saveRules;
+        final theme = Theme.of(context);
+        return Card(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpace.md,
+                  AppSpace.md,
+                  AppSpace.md,
+                  0,
+                ),
+                child: Text(
+                  // Load-bearing copy: what a rule does, and — first — what it
+                  // does not.
+                  'Rules choose where a file is saved. They never decide '
+                  'whether it is accepted. The first rule that matches wins, '
+                  'so drag to reorder; anything matching none goes to '
+                  '${state.settings.saveDirectory}.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              if (rules.isEmpty)
+                const ListTile(
+                  leading: Icon(Icons.rule_folder_outlined),
+                  title: Text('No rules'),
+                  subtitle: Text('Every received file goes to the folder above.'),
+                )
+              else
+                ReorderableListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  buildDefaultDragHandles: false,
+                  itemCount: rules.length,
+                  onReorderItem: (from, to) => _reorder(context, from, to),
+                  itemBuilder: (context, i) =>
+                      _ruleTile(context, rules, i, theme),
+                ),
+              const Divider(height: 1),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.all(AppSpace.sm),
+                  child: TextButton.icon(
+                    onPressed: () => _addRule(context),
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('Add rule'),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _ruleTile(
+    BuildContext context,
+    List<SaveRule> rules,
+    int i,
+    ThemeData theme,
+  ) {
+    final rule = rules[i];
+    // A catch-all makes every rule after it unreachable. Saying so beside the
+    // rule that causes it is far kinder than letting someone wonder why the
+    // rule they just added does nothing.
+    final shadowed = rules
+        .take(i)
+        .any((r) => r.isCatchAll && r.directory != rule.directory);
+    return ListTile(
+      key: ValueKey('rule-$i-${rule.directory}'),
+      leading: ReorderableDragStartListener(
+        index: i,
+        child: const Icon(Icons.drag_handle_rounded),
+      ),
+      title: Text(_criteria(rule)),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(rule.directory),
+          if (shadowed)
+            Text(
+              'Never reached — a catch-all rule above matches everything.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.error,
+              ),
+            ),
+        ],
+      ),
+      isThreeLine: shadowed,
+      trailing: IconButton(
+        tooltip: 'Remove rule',
+        icon: const Icon(Icons.delete_outline_rounded),
+        onPressed: () => _removeRule(context, i),
+      ),
+    );
+  }
+
+  /// The criteria in one line. A rule with none is named as what it is, since
+  /// "matches everything" is the single most consequential thing about it.
+  static String _criteria(SaveRule rule) {
+    if (rule.isCatchAll) return 'Everything';
+    final parts = <String>[];
+    if (rule.deviceId != null) parts.add('From ${rule.deviceId}');
+    if (rule.extension != null) parts.add('*.${rule.extension}');
+    final min = rule.minBytes;
+    final max = rule.maxBytes;
+    if (min != null && max != null) {
+      parts.add('${_size(min)}–${_size(max)}');
+    } else if (min != null) {
+      parts.add('≥ ${_size(min)}');
+    } else if (max != null) {
+      parts.add('≤ ${_size(max)}');
+    }
+    return parts.join(' · ');
+  }
+
+  static String _size(int bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var v = bytes.toDouble();
+    var i = 0;
+    while (v >= 1000 && i < units.length - 1) {
+      v /= 1000;
+      i++;
+    }
+    return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
+  }
+
+  /// `onReorderItem` reports `to` already adjusted for the removal at `from`,
+  /// so this is a plain remove-then-insert with no off-by-one to get wrong.
+  Future<void> _reorder(BuildContext context, int from, int to) async {
+    final settings = AppScope.of(context).settings;
+    final next = [...settings.saveRules];
+    next.insert(to, next.removeAt(from));
+    await _save(context, settings, next);
+  }
+
+  Future<void> _removeRule(BuildContext context, int i) async {
+    final settings = AppScope.of(context).settings;
+    final next = [...settings.saveRules]..removeAt(i);
+    await _save(context, settings, next);
+  }
+
+  Future<void> _addRule(BuildContext context) async {
+    final settings = AppScope.of(context).settings;
+    final rule = await showDialog<SaveRule>(
+      context: context,
+      builder: (_) => const _AddRuleDialog(),
+    );
+    if (rule == null || !context.mounted) return;
+    await _save(context, settings, [...settings.saveRules, rule]);
+  }
+
+  /// Persist, and surface a refusal.
+  ///
+  /// The engine validates and can refuse — a destination that is relative, has
+  /// a `..` in it, or whose parent does not exist. The list on screen is only
+  /// adopted once the write succeeds, so a refused edit leaves the user looking
+  /// at the rules that are actually in force rather than at ones that are not.
+  static Future<void> _save(
+    BuildContext context,
+    SettingsStore settings,
+    List<SaveRule> next,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await settings.setSaveRules(next);
+    } catch (e) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(_ruleError(e))));
+    }
+  }
+
+  /// A rule refusal carries the engine's own reason, which names the offending
+  /// rule and what is wrong with its path — far more useful than the generic
+  /// "that action can't be completed". Anything else falls back to the shared
+  /// friendly text.
+  static String _ruleError(Object e) =>
+      e is InvalidArgumentException ? e.message : friendlyError(e);
+}
+
+/// The add-rule dialog: a destination, and any combination of criteria.
+///
+/// The destination comes from the **native directory picker**, not a text
+/// field: it must be an absolute path that already exists, and typing one is
+/// how you get the error the engine then has to refuse.
+class _AddRuleDialog extends StatefulWidget {
+  const _AddRuleDialog();
+
+  @override
+  State<_AddRuleDialog> createState() => _AddRuleDialogState();
+}
+
+class _AddRuleDialogState extends State<_AddRuleDialog> {
+  final _extension = TextEditingController();
+  String? _deviceId;
+  String? _directory;
+  int? _minBytes;
+  int? _maxBytes;
+  final _min = TextEditingController();
+  final _max = TextEditingController();
+
+  @override
+  void dispose() {
+    _extension.dispose();
+    _min.dispose();
+    _max.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final devices = AppScope.of(context).trust.items;
+    final dir = _directory;
+    return AlertDialog(
+      title: const Text('Add rule'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.folder_rounded),
+              title: const Text('Save to'),
+              subtitle: Text(dir ?? 'Choose a folder'),
+              trailing: const Icon(Icons.edit_rounded),
+              onTap: _pickDirectory,
+            ),
+            const Divider(),
+            Text(
+              'Leave a field empty to match everything. With all of them '
+              'empty this rule matches every file.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const Gap(AppSpace.sm),
+            // The device criterion is a **picker over known devices**, never a
+            // free-text name: what is stored is the authenticated device id,
+            // and a name is something any peer can claim.
+            DropdownButtonFormField<String?>(
+              initialValue: _deviceId,
+              decoration: const InputDecoration(labelText: 'From device'),
+              items: [
+                const DropdownMenuItem(value: null, child: Text('Any device')),
+                for (final d in devices)
+                  DropdownMenuItem(
+                    value: d.id,
+                    child: Text(d.name.isEmpty ? d.id : d.name),
+                  ),
+              ],
+              onChanged: (v) => setState(() => _deviceId = v),
+            ),
+            TextField(
+              controller: _extension,
+              decoration: const InputDecoration(
+                labelText: 'File extension',
+                hintText: 'pdf',
+              ),
+            ),
+            TextField(
+              controller: _min,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Minimum size (bytes)',
+              ),
+              onChanged: (v) => _minBytes = int.tryParse(v.trim()),
+            ),
+            TextField(
+              controller: _max,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Maximum size (bytes)',
+              ),
+              onChanged: (v) => _maxBytes = int.tryParse(v.trim()),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          // Disabled until a folder is chosen: a rule with no destination has
+          // nowhere to put anything, and the engine would refuse it anyway.
+          onPressed: dir == null ? null : () => Navigator.pop(context, _build(dir)),
+          child: const Text('Add'),
+        ),
+      ],
+    );
+  }
+
+  SaveRule _build(String directory) {
+    final ext = _extension.text.trim().replaceFirst(RegExp(r'^\.+'), '');
+    return SaveRule(
+      deviceId: _deviceId,
+      extension: ext.isEmpty ? null : ext,
+      minBytes: _minBytes,
+      maxBytes: _maxBytes,
+      directory: directory,
+    );
+  }
+
+  Future<void> _pickDirectory() async {
+    final picked = await pickSaveDirectory();
+    if (picked != null && picked.isNotEmpty && mounted) {
+      setState(() => _directory = picked);
+    }
   }
 }
 

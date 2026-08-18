@@ -16,6 +16,7 @@ sealed class PeerBeamException implements Exception {
       'transfer' => TransferException(message),
       'encryption' => EncryptionException(message),
       'unimplemented' => UnimplementedException(message),
+      'unsupported' => UnsupportedPlatformException(message),
       'queue_unreadable' => QueueUnreadableException(message),
       _ => InternalException(message),
     };
@@ -59,6 +60,16 @@ class EncryptionException extends PeerBeamException {
 
 class UnimplementedException extends PeerBeamException {
   const UnimplementedException(super.message);
+}
+
+/// The feature cannot work on this platform, and no future build of it will.
+///
+/// Deliberately distinct from [UnimplementedException]: "not yet" tells a user
+/// to wait, while this tells them to stop looking. Auto-save rules on Android
+/// are the case it exists for — an app there receives through a SAF-granted
+/// location and cannot write to an arbitrary absolute path at all.
+class UnsupportedPlatformException extends PeerBeamException {
+  const UnsupportedPlatformException(super.message);
 }
 
 /// A destructive chat operation (currently only deleting a conversation)

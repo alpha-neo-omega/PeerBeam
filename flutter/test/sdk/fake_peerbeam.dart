@@ -152,6 +152,23 @@ class FakePeerBeam implements PeerBeamApi {
     return trusted.length != before;
   }
 
+  /// The last list [rulesSet] was given, so a test can assert what the UI
+  /// actually sent — the **order** above all, since the order is the tie-break.
+  List<SaveRule> rulesWritten = [];
+
+  /// When set, [rulesSet] throws it instead of storing. Stands in for the
+  /// engine's validation refusing a destination.
+  Object? rulesError;
+
+  @override
+  Future<int> rulesSet(List<SaveRule> rules) async {
+    calls.add('rulesSet:${rules.length}');
+    final e = rulesError;
+    if (e != null) throw e;
+    rulesWritten = List.of(rules);
+    return rules.length;
+  }
+
   @override
   Future<List<HistoryEntry>> history() async {
     calls.add('history');

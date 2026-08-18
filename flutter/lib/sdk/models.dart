@@ -560,3 +560,74 @@ class ChatConversation {
     unreadHint: (j['unread_hint'] as num?)?.toInt() ?? 0,
   );
 }
+
+/// One auto-save rule: a **match**, and a **destination**.
+///
+/// A rule decides **where** an accepted file is saved. It never decides
+/// **whether** it is accepted — that is the approval prompt and the separate
+/// "auto-accept trusted devices" setting, neither of which this touches.
+///
+/// Every criterion is optional and an omitted one matches everything, so a rule
+/// with all of them null is a legitimate catch-all. Rules are an **ordered**
+/// list and the **first match wins**, which is why the editor lets the user
+/// reorder them: that is the only tie-break, and it is one they can see.
+@immutable
+class SaveRule {
+  /// The sending device, by its authenticated id — never the name it presents,
+  /// which any peer is free to choose.
+  final String? deviceId;
+
+  /// File extension without the leading dot, matched case-insensitively.
+  final String? extension;
+
+  /// Inclusive size bounds, in bytes.
+  final int? minBytes;
+  final int? maxBytes;
+
+  /// The absolute directory a matching file is written to.
+  final String directory;
+
+  const SaveRule({
+    this.deviceId,
+    this.extension,
+    this.minBytes,
+    this.maxBytes,
+    required this.directory,
+  });
+
+  /// Whether this rule tests anything at all. A rule that does not is a
+  /// catch-all — worth saying out loud in the UI, since one placed above the
+  /// others makes every rule below it unreachable.
+  bool get isCatchAll =>
+      deviceId == null &&
+      extension == null &&
+      minBytes == null &&
+      maxBytes == null;
+
+  factory SaveRule.fromJson(Map<String, dynamic> j) => SaveRule(
+    deviceId: j['device'] as String?,
+    extension: j['extension'] as String?,
+    minBytes: (j['min_bytes'] as num?)?.toInt(),
+    maxBytes: (j['max_bytes'] as num?)?.toInt(),
+    directory: j['directory'] as String? ?? '',
+  );
+
+  /// The engine's shape. An unset criterion is **omitted**, not sent as `""`
+  /// or `0`: a blank criterion matches nothing, and `0` is a legitimate
+  /// `min_bytes`.
+  Map<String, dynamic> toJson() => {
+    if (deviceId != null) 'device': deviceId,
+    if (extension != null) 'extension': extension,
+    if (minBytes != null) 'min_bytes': minBytes,
+    if (maxBytes != null) 'max_bytes': maxBytes,
+    'directory': directory,
+  };
+
+  SaveRule copyWith({String? directory}) => SaveRule(
+    deviceId: deviceId,
+    extension: extension,
+    minBytes: minBytes,
+    maxBytes: maxBytes,
+    directory: directory ?? this.directory,
+  );
+}
