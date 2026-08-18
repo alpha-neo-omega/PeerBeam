@@ -844,6 +844,42 @@ class Note {
   );
 }
 
+/// One thing this device did.
+///
+/// Carries no message body and no clip text: the timeline says *that* something
+/// happened and when, and the conversation and clipboard screens are where you
+/// read the content.
+class TimelineEvent {
+  /// One of `transfer`, `chat`, `clipboard`.
+  final String kind;
+  final DateTime at;
+
+  /// The other device, or empty when this device acted alone.
+  final String peer;
+
+  /// A file name for a transfer or a shared file; empty otherwise.
+  final String detail;
+
+  /// Whether it succeeded. Only meaningful for transfers.
+  final bool ok;
+
+  const TimelineEvent({
+    required this.kind,
+    required this.at,
+    required this.peer,
+    required this.detail,
+    required this.ok,
+  });
+
+  factory TimelineEvent.fromJson(Map<String, dynamic> j) => TimelineEvent(
+    kind: j['kind'] as String? ?? '',
+    at: DateTime.tryParse(j['at'] as String? ?? '') ?? DateTime.now(),
+    peer: j['peer'] as String? ?? '',
+    detail: j['detail'] as String? ?? '',
+    ok: j['ok'] as bool? ?? true,
+  );
+}
+
 /// One remembered clip.
 class ClipEntry {
   final String id;

@@ -329,6 +329,9 @@ abstract class PeerBeamApi {
   /// "refused" could map which devices are listening.
   Future<bool> presenceRing(PeerTarget peer, {int seconds = 15});
 
+  /// This device's activity, newest first. A pure local read.
+  Future<List<TimelineEvent>> timeline({int? limit});
+
   /// Every remembered clip, newest first.
   ///
   /// Empty unless clipboard history is on. Reading is never gated — an empty
@@ -702,6 +705,12 @@ class PeerBeam implements PeerBeamApi {
       ),
     );
     return data['sent'] == true;
+  }
+
+  @override
+  Future<List<TimelineEvent>> timeline({int? limit}) async {
+    final data = _data(_req().timeline(jsonEncode({'limit': ?limit})));
+    return _list(data['events']).map(TimelineEvent.fromJson).toList();
   }
 
   @override

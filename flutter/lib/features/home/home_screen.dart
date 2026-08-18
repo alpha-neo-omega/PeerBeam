@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../notes/notes_screen.dart';
+import '../timeline/timeline_screen.dart';
 
 import '../../app/theme.dart';
 import '../../data/saved_devices_repository.dart' show SavedDevice;
@@ -531,6 +532,15 @@ class _HomeScreenState extends State<HomeScreen> {
                         // well past the three-to-five Material calls readable,
                         // and notes are not a place you spend a session — they
                         // are somewhere you drop in and leave.
+                        IconButton(
+                          icon: const Icon(Icons.timeline_rounded),
+                          tooltip: 'Activity',
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => const TimelineScreen(),
+                            ),
+                          ),
+                        ),
                         IconButton(
                           icon: const Icon(Icons.sticky_note_2_outlined),
                           tooltip: 'Notes',

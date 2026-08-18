@@ -563,6 +563,16 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// The activity this fake reports, newest first.
+  final List<TimelineEvent> timelineEvents = [];
+
+  @override
+  Future<List<TimelineEvent>> timeline({int? limit}) async {
+    calls.add('timeline');
+    final all = List.of(timelineEvents);
+    return limit == null || all.length <= limit ? all : all.sublist(0, limit);
+  }
+
   /// The clips this fake remembers, newest first.
   final List<ClipEntry> clipHistory = [];
 

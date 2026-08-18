@@ -83,6 +83,7 @@ class Bindings {
   final _ArgRetDart _presenceRing;
   final _ArgRetDart _clipHistory;
   final _ArgRetDart _clipHistoryClear;
+  final _ArgRetDart _timeline;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -176,6 +177,7 @@ class Bindings {
       _clipHistoryClear = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_clipboard_history_clear',
       ),
+      _timeline = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_timeline'),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -251,6 +253,7 @@ class Bindings {
   String presenceRing(String json) => _withArg(json, _presenceRing);
   String clipHistory(String json) => _withArg(json, _clipHistory);
   String clipHistoryClear(String json) => _withArg(json, _clipHistoryClear);
+  String timeline(String json) => _withArg(json, _timeline);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);
