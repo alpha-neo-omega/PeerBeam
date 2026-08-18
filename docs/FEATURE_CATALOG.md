@@ -239,14 +239,19 @@ networking, trust, or crypto (I5/I6/I9).
 
 ## Automation
 
-### Rules-based auto-save — Phase B · S
+### Rules-based auto-save — Phase B · S — **shipped**
 - **Why:** route received items to folders by rule instead of a single inbox.
 - **Reuses:** `peerbeam-storage-fs`, `peerbeam-config`.
 - **Dependencies:** none.
-- **Security:** rules are local; no code execution by default (I11).
-- **Storage:** rule config.
+- **Security:** rules are local; no code execution by default (I11). A rule
+  decides **where** an accepted item is saved and never **whether** it is
+  accepted — the approval gate is untouched (I6).
+- **Storage:** `storage.rules` in `peerbeam-config` (additive, absent-tolerant).
 - **Offline:** yes.
-- **CLI:** yes — rules in config.
+- **CLI:** yes — `peerbeam rules list|add|remove`; desktop Settings for the app.
+- **Platforms:** desktop + headless. Android receives through SAF and cannot
+  write arbitrary absolute paths, so rules do not apply there and the app says
+  so (I12).
 
 ### Watch-folder · scheduled sends · receive-hooks — Phase C · M
 - **Why:** automate sending (on change / on schedule) and post-receive actions.

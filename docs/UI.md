@@ -74,6 +74,63 @@ flipped is adopted without being sent — that is not something the user just
 copied, and may well be a password they pasted earlier. A clip over the 64 KiB
 wire cap is skipped, not truncated, and the user is told once.
 
+## Auto-save rules
+
+A Settings section — *Auto-save rules* — that chooses **where** a received file
+is saved. It never chooses **whether** it is accepted, and the section says so
+in its first two sentences, because a list of match criteria sitting one card
+below *Auto-accept trusted devices* would otherwise read as an acceptance
+filter. `test/save_rules_test.dart` pins that copy for the same reason
+`clipboard_sync_test.dart` pins the clipboard warning.
+
+```
+AUTO-SAVE RULES
+┌────────────────────────────────────────────────────────────┐
+│ Rules choose where a file is saved. They never decide       │
+│ whether it is accepted. The first rule that matches wins,   │
+│ so drag to reorder; anything matching none goes to          │
+│ /home/me/Downloads.                                         │
+│ ⠿  *.pdf                        /srv/papers            🗑   │
+│ ⠿  From pb-f4e4d56fce98         /mnt/big               🗑   │
+│ ⠿  Everything                   /srv/inbox             🗑   │
+│ + Add rule                                                  │
+└────────────────────────────────────────────────────────────┘
+```
+
+It is a `ReorderableListView` because **the order is the tie-break**: the first
+rule that matches a file chooses its directory, and dragging is the only way to
+change which of two overlapping rules applies. There is deliberately no
+specificity score — a list a user can see and reorder is a list whose outcome
+they can predict. A rule with no criteria reads as *"Everything"* rather than
+as a blank row, and any rule stranded beneath one is marked *"Never reached"*
+beside itself, since the alternative is adding a rule and quietly wondering why
+nothing ever goes there.
+
+The destination comes from the **native folder picker**, not a text field: it
+must be an absolute path whose parent exists, and typing one is how you produce
+the error the engine then has to refuse. The device criterion is a dropdown
+over known devices for a sharper reason — what is stored is the authenticated
+device id, and a free-text name is something any peer can claim.
+
+Edits go through `pb_rules_set`, which **validates and can refuse**, so the
+list on screen is adopted only once the engine has stored it. An optimistic
+update would leave someone looking at a rule that does not exist while
+believing their files were being sorted; a refusal instead surfaces the
+engine's own message, which names the offending rule and what is wrong with its
+path.
+
+**Desktop and headless only.** Android receives into the SAF folder the user
+granted and cannot write to any other location, so there is nowhere for a rule
+to send anything. The section is replaced there by a plain statement of why —
+driven by the engine's `rules_supported`, not by a platform check in Dart,
+because the engine is what knows and a second opinion could disagree with it.
+An engine that predates the flag reads as unsupported: offering an editor that
+cannot work is the failure that default exists to prevent. (I12 — the
+limitation is documented, not designed around.)
+
+A file matching no rule goes to the save directory, exactly as every file did
+before this existed. A user who never opens this section sees no change at all.
+
 ## How the audit findings were addressed
 
 | Audit finding | Resolution |

@@ -53,6 +53,7 @@ src/engine.rs     build the engine with all discovery providers
 src/exit.rs       typed CliError → stable exit codes
 src/commands.rs   one fn per command + dispatch
 src/trust.rs      trust list/approve/revoke (pinned vs approved)
+src/rules.rs      rules list/add/remove (where a received file lands)
 ```
 
 ## Commands
@@ -385,6 +386,91 @@ Working now:
   (`{"id","name","fingerprint","trusted_at","approved"}`, `approved` an
   explicit bool and the fingerprint in full); `approve` and `revoke` emit one
   `trust_approved` / `trust_revoked` event.
+- `rules list` / `rules add <DIRECTORY> [criteria]` / `rules remove <INDEX>` —
+  **where** a received file is saved.
+
+  ```
+  #  DEVICE           EXT   SIZE       DESTINATION
+  0  pb-f4e4d56fce98  any   ≥ 1.1 GB   /mnt/big
+  1  any              pdf   any        /srv/papers
+  2  any              any   any        /srv/inbox
+  ```
+
+  **A rule decides where a file is saved. A rule never decides whether it is
+  accepted.** Rules are read *after* a transfer has been accepted and is on its
+  way to disk; they cannot approve anything, they have no field that influences
+  approval, and the separate `device.auto_accept_trusted` setting is untouched
+  by all of this. If you want to change what gets accepted, that is the
+  approval prompt and `auto_accept_trusted`, not this command.
+
+  A rule is a **match** plus a **destination**. Every criterion is optional and
+  an omitted one matches everything, so a rule with none is a catch-all:
+
+  | flag | matches |
+  |------|---------|
+  | `--from <device>` | files from that device, by its **authenticated id** |
+  | `--ext <EXT>` | that file extension, case-insensitively (`pdf` or `.pdf`) |
+  | `--min-bytes N` | files of at least N bytes (inclusive) |
+  | `--max-bytes N` | files of at most N bytes (inclusive) |
+
+  **The first rule that matches wins**, and the `#` column is that order. There
+  is no specificity score: a list you can reorder is a list whose outcome you
+  can predict. `--at <INDEX>` inserts rather than appends, which is how you
+  change the tie-break without rewriting the list. A file that matches no rule
+  goes to `storage.save_directory`, exactly as every file did before rules
+  existed — an empty list changes nothing.
+
+  ```bash
+  peerbeam rules add /srv/papers --ext pdf
+  peerbeam rules add /mnt/big --from laptop --min-bytes 1073741824 --at 0
+  peerbeam rules list --json | jq -r '"\(.index)\t\(.directory)"'
+  peerbeam rules remove 1
+  ```
+
+  `--from` resolves exactly as `send --to` and `trust approve <device>` do —
+  exact id, exact name, then unique name prefix — and what is **stored** is the
+  resolved `pb-…` id, never the name that was typed. A name is peer-supplied
+  and any peer may present any name it likes, so a rule matching on one would
+  hand a stranger calling itself "laptop" the laptop's destination. An
+  ambiguous prefix is exit `2` listing the candidates; an unknown *name* is
+  exit `3`; an unknown but well-formed `pb-…` id is accepted verbatim, so a
+  rule can be provisioned before that machine first connects.
+
+  **A rule is validated when it is added**, not when a file arrives: the
+  destination must be absolute, must contain no `..` component, and its parent
+  must already exist (exit `2`, with the reason). Requiring the parent rather
+  than the leaf is deliberate — creating one missing directory on first use is
+  a convenience, while creating a missing *tree* would cheerfully manufacture
+  `/mnt/nas/videos` on the local root the day the NAS is not mounted.
+
+  **A destination that fails anyway does not lose the file.** If the chosen
+  directory cannot be written to when a file arrives — it vanished, the mount
+  went away, permissions changed — the file goes to `storage.save_directory`
+  and the receiver says so:
+
+  ```
+  rule destination /mnt/big is unusable (Not a directory (os error 20)); saving to /srv/incoming instead
+  ```
+
+  Under `--json` that is a `rule_fallback` event on the same stream as every
+  other thing that goes wrong with a receive. A file quietly landing somewhere
+  other than where the rules claimed is worse than having no rules.
+
+  **`receive --dir DIR` turns rules off for that run.** A directory typed on
+  the command line is the more specific instruction of the two, so it wins
+  outright — which also makes it the way to say "ignore my rules just this
+  once" without editing them. `daemon start` always uses the rules.
+
+  Rules live in this machine's config under `storage.rules`, so
+  `peerbeam config show` prints them and the daemon reads them at startup. The
+  desktop app keeps its own list in its own settings document, exactly as it
+  keeps its own save directory and device name.
+
+  Under `--json`, `list` emits one object per line
+  (`{"index","device","extension","min_bytes","max_bytes","directory"}`, with
+  an unset criterion as `null` rather than `""` or `0` — `0` is a legitimate
+  `min_bytes`); `add` and `remove` emit one `rule_added` / `rule_removed`
+  event carrying the same fields.
 
 Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
 application-layer X25519 mutual-auth handshake with TOFU trust pinning and
@@ -440,6 +526,14 @@ peerbeam pipe --listen > backup.img || echo "incomplete — do not use it"
 peerbeam trust list                                # who is approved, who is only pinned
 peerbeam trust approve pb-f4e4d56fce98 --yes       # scripted: no prompt
 peerbeam trust revoke laptop                       # forget it entirely
+
+# Sort what arrives, without changing what is accepted. First match wins, so
+# the order is the tie-break — and a file matching nothing goes where it
+# always did.
+peerbeam rules add /srv/papers --ext pdf
+peerbeam rules add /mnt/big --from laptop --min-bytes 1073741824 --at 0
+peerbeam rules list
+peerbeam rules remove 1
 
 # Shell completion (bash; also zsh/fish/powershell)
 peerbeam completions bash > /etc/bash_completion.d/peerbeam

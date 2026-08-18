@@ -6,6 +6,71 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Rules-based auto-save for received items.** An ordered list of rules that
+  choose **where** an accepted file is written:
+
+  ```bash
+  peerbeam rules add /srv/papers --ext pdf
+  peerbeam rules add /mnt/big --from laptop --min-bytes 1073741824 --at 0
+  peerbeam rules list
+  ```
+
+  **A rule decides where a file is saved. A rule never decides whether it is
+  accepted.** Rules are consulted *after* a transfer has been accepted and is
+  on its way to disk. Nothing here is reachable from the approval path, no
+  rule field influences it, and the existing `device.auto_accept_trusted`
+  setting is untouched (I6). If you want to change what is accepted, that is
+  still the approval prompt and auto-accept.
+
+  A rule is a **match** — any combination of sending device, file extension
+  and a size range — plus an absolute **destination** directory. Every
+  criterion is optional and an omitted one matches everything, so a rule with
+  none is a legitimate catch-all. **The first rule that matches wins**, and
+  there is deliberately no specificity score: a list you can reorder is a list
+  whose outcome you can predict, whereas a ranking nobody can see is a support
+  question waiting to happen. Reordering (`rules add --at`, or dragging in the
+  app) is the supported way to change which of two overlapping rules applies.
+
+  **Nothing changes for anyone who defines no rules.** An empty list — which is
+  what every existing config file and settings document deserializes to —
+  means every received file goes to `storage.save_directory` exactly as
+  before.
+
+  The sender criterion matches the **authenticated device id**, never the name
+  a peer presents: a name is peer-supplied, so matching on one would hand a
+  stranger calling itself "laptop" the laptop's destination. The CLI's
+  `--from` resolves a name through the same resolver `send --to` uses and
+  stores the resolved id; the app offers a dropdown of known devices rather
+  than a text field. Extension matching is on the **sanitised** name, and the
+  peer contributes no part of the destination.
+
+  **A rule is validated when it is added**, not when a file arrives: absolute
+  path, no `..` component, and a parent that already exists — reported then,
+  while the person can still fix it. **A destination that fails anyway does not
+  lose the file**: it falls back to `storage.save_directory` *and says so*, on
+  the same channel every other transfer failure uses (`rule_fallback` in the
+  CLI's `--json`, `transfer_save_fallback` on the app's event stream). A file
+  quietly landing somewhere other than where the rules claimed is worse than
+  having no rules at all.
+
+  Surfaces: `peerbeam rules list|add|remove` (with `--json`, the usual exit
+  codes, and `--at` for position); an *Auto-save rules* section in desktop
+  Settings that views, adds, **reorders** and removes them; `pb_rules_set` on
+  the FFI, with reads through `pb_settings_get` (`save_rules`, plus a managed
+  `rules_supported`). `receive --dir DIR` names a destination for that run
+  explicitly and turns rules off for it.
+
+  **Desktop and headless only.** Android receives into a SAF-granted location
+  and cannot write to arbitrary absolute paths, so rules do not apply there;
+  the app says why instead of offering a list that would silently do nothing,
+  and `pb_rules_set` refuses with a new `unsupported` error code —
+  deliberately distinct from `unimplemented`, which would tell someone to wait
+  for a build that is never coming (I12).
+
+  Storage is additive: `storage.rules` in `peerbeam-config`, absent-tolerant,
+  so every config file and settings document already on disk keeps working.
+
 ## [0.5.0] - 2026-08-18 — Beta
 
 ### Added

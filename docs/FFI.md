@@ -298,6 +298,12 @@ char* pb_settings_get(void);               // {version,transfer_directory,auto_a
                                            //  experimental,trusted_devices[]}
 char* pb_settings_set(const char* json);   // partial merge → persist → settings_changed
 char* pb_settings_reset(void);
+// Auto-save rules: WHERE an accepted file lands, never WHETHER it is accepted.
+// The whole ordered list at once (first match wins, so order is the tie-break);
+// every rule is validated and one bad rule refuses the write. Reads ride
+// pb_settings_get (`save_rules`, plus the managed `rules_supported`).
+char* pb_rules_set(const char* json);      // {rules:[{device?,extension?,min_bytes?,
+                                           //  max_bytes?,directory}]} → {count}
 // Daemon = the receive server (idempotent; started at init)
 char* pb_daemon_start(void);  pb_daemon_stop(void);  pb_daemon_restart(void);
 char* pb_daemon_status(void);              // {running, port}
@@ -318,7 +324,20 @@ Notes / honest scope:
 - **Clipboard** is a local synchronized slot + events; cross-device clipboard
   *over the network* (receive-side detection) is a follow-up.
 - **Settings** persist to `<data_dir>/ffi_settings.json` and are versioned; they
-  apply to the engine on next `pb_init` (no live engine-mutation API).
+  apply to the engine on next `pb_init` (no live engine-mutation API), plus the
+  live deltas `apply_live_settings` pushes (save directory, auto-accept, device
+  name, auto-save rules).
+- **Auto-save rules** are stored in that same document under `save_rules` and
+  overlaid onto `EngineConfig.storage.rules`, which is what the receive path's
+  one matcher reads — the same road `transfer_directory` takes. They are
+  consulted only after a transfer has been accepted (I6): nothing in
+  `pb_rules_set` can approve anything, and `auto_accept` is a separate setting
+  it neither reads nor writes. A destination that cannot be written to when a
+  file arrives falls back to the save directory and emits
+  `transfer_save_fallback` on the transfer event stream. `rules_supported` is
+  `false` on Android/iOS, where an app cannot write to an arbitrary absolute
+  path, and `pb_rules_set` returns the `unsupported` code there — distinct from
+  `unimplemented`, which promises a later build.
 - **Logs** are captured by a `tracing` layer installed once via `try_init`; if a
   global subscriber already exists, capture degrades gracefully.
 - Thread-safe: clipboard slot, settings file, log ring + emit flag, and daemon
