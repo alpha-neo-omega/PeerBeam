@@ -181,11 +181,26 @@ jobs:
           mapfile -t -O "${#files[@]}" files < <(find artifacts/macos \
             -maxdepth 1 -type f -name '*.dmg' 2>/dev/null)
           printf 'upload: %s\n' "${files[@]}"
+          # Hand-written notes when the tag carries them, generated notes when
+          # it does not. This used to be an unconditional --notes-file, which
+          # meant a tag without one failed the job *after* every platform had
+          # built — and, because the step above deletes the existing release
+          # first, a re-pushed tag destroyed a good release and put nothing
+          # back. Releases for v0.4.1, v0.5.0 and v0.6.0 were lost exactly that
+          # way. Missing notes are a documentation gap, not a reason to throw
+          # away six platforms' artifacts.
+          notes_file="docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md"
+          if [ -f "$notes_file" ]; then
+            notes=(--notes-file "$notes_file")
+          else
+            echo "::warning::${notes_file} is missing — publishing with generated notes. Add it and re-push the tag to replace them."
+            notes=(--generate-notes)
+          fi
           if ! gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --prerelease --verify-tag \
-            --notes-file "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md" \
+            "${notes[@]}" \
             "${files[@]}" 2> /tmp/gh-err.txt; then
             # Surface the real error as annotations (readable without log auth).
             while IFS= read -r line; do echo "::error::gh: ${line}"; done < /tmp/gh-err.txt
