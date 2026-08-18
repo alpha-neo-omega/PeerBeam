@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
-use crate::message::{ChatMessage, FileDecline, FileRef, MSG_FILE_DECLINE, MSG_FILE_REF, MSG_TEXT};
+use crate::message::{
+    ChatMessage, FileDecline, FileRef, Reaction, MSG_FILE_DECLINE, MSG_FILE_REF, MSG_REACTION,
+    MSG_TEXT,
+};
 use crate::record::{ChatRecord, Direction, Status};
 use crate::store::ChatStore;
 
@@ -108,6 +111,29 @@ impl MessageHandler for ChatHandler {
                 let _ = self
                     .store
                     .settle_file_row(peer, &d.id, Direction::Out, Status::Declined)
+                    .map_err(SessionError::from)?;
+                Ok(())
+            }
+            // MUST stay above the `other =>` fallback, for the same reason
+            // `MSG_FILE_DECLINE` does: a `Reaction` ships OPTIONAL, so an arm
+            // below it would be swallowed as an "unknown optional type",
+            // return `Ok`, and apply nothing — silently.
+            MSG_REACTION => {
+                // The peer reacted to a message in this conversation, so the
+                // reaction is theirs: `Direction::In`. `apply_reaction`
+                // authorizes against the stored record inside this peer's own
+                // namespace, so a `target_id` naming a message in a different
+                // conversation — or one we have deleted — finds nothing and is
+                // a silent success rather than a channel failure.
+                //
+                // No dedup and no sink, exactly as for a decline: the write is
+                // idempotent because the message states its intended end state,
+                // and a change to an existing row is not a new record to
+                // surface.
+                let r = Reaction::from_frame(&frame)?;
+                let _ = self
+                    .store
+                    .apply_reaction(peer, &r.target_id, &r.emoji, Direction::In, r.remove)
                     .map_err(SessionError::from)?;
                 Ok(())
             }
@@ -244,6 +270,49 @@ mod tests {
         );
         let err = handler.handle(bad).await.unwrap_err();
         assert!(matches!(err, SessionError::FrameDecode(_)));
+    }
+
+    #[tokio::test]
+    async fn an_inbound_reaction_is_applied_to_our_row() {
+        let (cs, _dir) = store(5);
+        let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_cl = received.clone();
+        let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+        let (handler, peer_slot) = ChatHandler::new(cs.clone(), sink);
+        let peer = DeviceId::from("pb-sender");
+        let _ = peer_slot.set(peer.clone());
+
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        let frame = Reaction::add(&m.id, "\u{1F44D}")
+            .to_frame(ChannelId::new(1))
+            .unwrap();
+        handler.handle(frame).await.unwrap();
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist[0].reactions.len(), 1);
+        assert_eq!(hist[0].reactions[0].by, Direction::In);
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a reaction is a change to an existing row, not a new record"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inbound_reaction_naming_nothing_keeps_the_channel() {
+        // A reaction for a message we deleted — or never had — must be a silent
+        // success. Failing the channel would let a peer tear down a
+        // conversation by reacting to an id we no longer hold.
+        let (cs, _dir) = store(5);
+        let sink: ReceivedSink = Arc::new(|_| {});
+        let (handler, peer_slot) = ChatHandler::new(cs.clone(), sink);
+        let _ = peer_slot.set(DeviceId::from("pb-sender"));
+
+        let frame = Reaction::add("no-such-id", "\u{1F44D}")
+            .to_frame(ChannelId::new(1))
+            .unwrap();
+        assert!(handler.handle(frame).await.is_ok());
     }
 
     /// MESSAGE_REGISTRY.md §6: an unknown MessageType flagged OPTIONAL must be
