@@ -86,6 +86,7 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
         },
         ChatAction::Cancel { peer, id } => cancel(ctx, peer, id, path_override).await,
         ChatAction::History { peer } => history(ctx, peer, path_override).await,
+        ChatAction::Search { query, limit } => search(ctx, &query, limit, path_override),
         ChatAction::Watch { port } => watch(ctx, port, path_override).await,
     }
 }
@@ -1147,6 +1148,103 @@ async fn history(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliRes
     Ok(())
 }
 
+/// `chat search <query>` — find messages in this device's stored conversations.
+///
+/// **A local read and nothing else.** No peer is resolved, no discovery window
+/// is opened, nothing is dialled: this reads the same on-disk history
+/// [`history`] reads, so it works on a headless box with no network at all, and
+/// a thread whose device is long gone is searchable exactly like one that is
+/// online. That is also why it is not `async` — there is nothing to await.
+///
+/// Human output is a table; `--json` is a single object, deliberately, and not
+/// one line per hit. `truncated` has to be somewhere a script cannot miss it,
+/// and a stream of hit lines with a marker at the end is exactly the shape a
+/// consumer reading the first N lines drops on the floor — which is how a
+/// script comes to report "3 matches" for a search that had four hundred. It
+/// matches `chat history --json`, which is a single object for the same reason.
+///
+/// Finding nothing is a **successful** search, so it exits 0 rather than 3. A
+/// missing peer or a bad index is a lookup that failed; an empty result set is
+/// an answer.
+fn search(ctx: &Ctx, query: &str, limit: u64, path_override: Option<&str>) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    // `limit` is already bounded to `1..=MAX_SEARCH_LIMIT` by the parser, so
+    // the cast cannot lose anything.
+    let found = store
+        .search(query, limit as usize)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        ctx.json_line(&render_search_json(&found, limit));
+        return Ok(());
+    }
+    if found.hits.is_empty() {
+        ctx.line(&ctx.dim(&format!("no messages match {query:?}")));
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = found.hits.iter().map(search_row_cells).collect();
+    ctx.table(&["WHEN", "PEER", "DIR", "MESSAGE"], &rows);
+    if found.truncated {
+        ctx.line("");
+        // Said out loud, every time. A bounded search whose limit is invisible
+        // reads as "that is all there is" — for a search over your own history
+        // that is a wrong answer, not a partial one.
+        let shown = if limit == 1 {
+            "the newest match".to_string()
+        } else {
+            format!("the newest {limit} matches")
+        };
+        ctx.line(&ctx.yellow(&format!(
+            "showing {shown} — there are more. Narrow the query, or raise \
+             --limit (max {}).",
+            peerbeam_chat::MAX_SEARCH_LIMIT
+        )));
+    }
+    Ok(())
+}
+
+/// One human table row for a hit: when, which conversation, which way, and the
+/// stored text around the match.
+///
+/// The snippet is printed as the engine cut it — a substring of what is
+/// stored — with only its line breaks flattened, because a body may hold them
+/// and a table cell may not. That flattening is the one and only edit made to
+/// it, and it happens here, in the human renderer, rather than in the engine or
+/// in `--json`, where the caller is owed the bytes.
+fn search_row_cells(hit: &peerbeam_chat::SearchHit) -> Vec<String> {
+    vec![
+        hit.timestamp.clone(),
+        hit.peer_id.clone(),
+        dir_str(hit.direction).to_string(),
+        hit.snippet.replace(['\n', '\r'], " "),
+    ]
+}
+
+/// `chat search --json`'s contract: one object, hits newest first, and
+/// `truncated` alongside them rather than after them.
+///
+/// Factored out (like [`render_history_json`]) so it is unit-testable against a
+/// seeded store without a live PeerSession.
+fn render_search_json(found: &peerbeam_chat::SearchResults, limit: u64) -> serde_json::Value {
+    let hits: Vec<serde_json::Value> = found
+        .hits
+        .iter()
+        .map(|h| {
+            json!({
+                "peer_id": h.peer_id,
+                "message_id": h.message_id,
+                "timestamp": h.timestamp,
+                "direction": h.direction,
+                "kind": h.kind,
+                "snippet": h.snippet,
+            })
+        })
+        .collect();
+    json!({ "hits": hits, "truncated": found.truncated, "limit": limit })
+}
+
 /// Resolve a `chat history` peer argument to a [`DeviceId`]. `peer` may
 /// already be the raw device id chat history is actually keyed by
 /// (`pb-<fingerprint>`), or a friendly name that only resolves while the
@@ -1419,8 +1517,8 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
 #[cfg(test)]
 mod tests {
     use super::{
-        reachable_targets, render_file_line, render_history_json, resolve_history_peer, send,
-        send_file, spawn_single_flight,
+        reachable_targets, render_file_line, render_history_json, render_search_json,
+        resolve_history_peer, search, search_row_cells, send, send_file, spawn_single_flight,
     };
     use crate::commands::{self, SecureCtx};
     use crate::exit::CliError;
@@ -1676,6 +1774,160 @@ mod tests {
         let records = store.history(&resolved).expect("history");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body, "hi");
+    }
+
+    // ── chat search ─────────────────────────────────────────────
+
+    /// Seed two conversations under an isolated config and return the config
+    /// path `chat search` should be pointed at, so the command is driven end to
+    /// end (config → identity → store → render) rather than through the store
+    /// alone.
+    fn seeded_searchable_config(dir: &std::path::Path) -> (EngineConfig, std::path::PathBuf) {
+        let config = isolated_config(dir);
+        let cfg_path = dir.join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+
+        let alice = DeviceId::from("pb-alice");
+        let bob = DeviceId::from("pb-bob");
+        store
+            .append(&ChatRecord::sent(
+                &alice,
+                &ChatMessage::new("the quarterly Invoice").expect("msg"),
+            ))
+            .expect("seed alice");
+        store
+            .append(&ChatRecord::received(
+                &bob,
+                &ChatMessage::new("lunch tomorrow?").expect("msg"),
+            ))
+            .expect("seed bob text");
+        let r = FileRef::new("invoice-2026.pdf", 9).expect("file ref");
+        let meta = FileMeta {
+            name: r.name.clone(),
+            size: r.size,
+            // Never searched: it is where the file sits on this disk, not
+            // anything anyone said.
+            local_path: Some("/home/someone/Downloads/private-dir/x.bin".into()),
+        };
+        store
+            .append(&ChatRecord::file_out(&bob, &r, meta, Status::Sent))
+            .expect("seed bob file");
+        (config, cfg_path)
+    }
+
+    /// The command end to end: it reads local history, finds a text body and a
+    /// file name in two different conversations, and never touches the network
+    /// (there is none — the isolated config's transfer port is 0 and no peer
+    /// exists).
+    #[test]
+    fn search_finds_text_and_file_names_without_touching_the_network() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, cfg_path) = seeded_searchable_config(dir.path());
+
+        let ctx = quiet_ctx();
+        let result = search(
+            &ctx,
+            "invoice",
+            peerbeam_chat::DEFAULT_SEARCH_LIMIT as u64,
+            Some(cfg_path.to_str().expect("utf8 path")),
+        );
+        assert!(result.is_ok(), "search must succeed offline: {result:?}");
+
+        // And the same query through the store the command built, so the
+        // assertions can be about the hits rather than about stdout.
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let found = store.search("INVOICE", 50).expect("search");
+        let peers: Vec<&str> = found.hits.iter().map(|h| h.peer_id.as_str()).collect();
+        assert_eq!(found.hits.len(), 2, "{:?}", found.hits);
+        assert!(peers.contains(&"pb-alice") && peers.contains(&"pb-bob"));
+        // The path only exists on this machine and is not conversation
+        // content.
+        assert!(store
+            .search("private-dir", 50)
+            .expect("search")
+            .hits
+            .is_empty());
+    }
+
+    /// Finding nothing is a successful search: exit 0, not the not-found code a
+    /// failed lookup uses.
+    #[test]
+    fn search_with_no_matches_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_config, cfg_path) = seeded_searchable_config(dir.path());
+        let result = search(
+            &quiet_ctx(),
+            "nothing-here-matches-this",
+            50,
+            Some(cfg_path.to_str().expect("utf8 path")),
+        );
+        assert!(
+            result.is_ok(),
+            "an empty result set is an answer: {result:?}"
+        );
+    }
+
+    /// `--json` is one object, and `truncated` sits inside it with the hits —
+    /// not on a trailing line a consumer reading the first N can drop.
+    #[test]
+    fn render_search_json_is_one_object_carrying_truncated_and_limit() {
+        let (store, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        for _ in 0..4 {
+            store
+                .append(&ChatRecord::sent(
+                    &peer,
+                    &ChatMessage::new("invoice").expect("msg"),
+                ))
+                .expect("append");
+        }
+
+        let cut = store.search("invoice", 2).expect("search");
+        let value = render_search_json(&cut, 2);
+        assert_eq!(value["hits"].as_array().expect("hits").len(), 2);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["limit"], 2);
+        let hit = &value["hits"][0];
+        assert_eq!(hit["peer_id"], "pb-bob");
+        assert_eq!(hit["kind"], "text");
+        assert_eq!(hit["direction"], "out");
+        assert_eq!(hit["snippet"], "invoice");
+        assert!(hit["message_id"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let whole = store.search("invoice", 4).expect("search");
+        assert_eq!(render_search_json(&whole, 4)["truncated"], false);
+    }
+
+    #[test]
+    fn render_search_json_with_no_hits_is_an_empty_array_not_null() {
+        let (store, _dir) = seeded_store();
+        let value = render_search_json(&store.search("nothing", 50).expect("search"), 50);
+        assert_eq!(value["hits"], serde_json::json!([]));
+        assert_eq!(value["truncated"], false);
+    }
+
+    /// The human table flattens line breaks — a body may hold them and a table
+    /// cell may not — and changes nothing else about what was stored.
+    #[test]
+    fn search_row_cells_flatten_line_breaks_and_keep_the_rest_verbatim() {
+        let (store, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        store
+            .append(&ChatRecord::sent(
+                &peer,
+                &ChatMessage::new("first line\nInvoice line\rthird").expect("msg"),
+            ))
+            .expect("append");
+
+        let found = store.search("invoice", 50).expect("search");
+        let cells = search_row_cells(&found.hits[0]);
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[1], "pb-bob");
+        assert_eq!(cells[2], "out");
+        assert_eq!(cells[3], "first line Invoice line third");
     }
 
     /// An isolated `EngineConfig` rooted under `dir`, so `SecureCtx::build` /

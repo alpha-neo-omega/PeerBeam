@@ -262,6 +262,28 @@ pub enum ChatAction {
         /// Peer device id.
         peer: String,
     },
+    /// Search this device's stored conversations.
+    ///
+    /// A local read of history already on disk: no peer is contacted, nothing
+    /// goes on the wire, and a thread whose device is long gone is searchable
+    /// exactly like one that is online. Matches a case-insensitive substring of
+    /// a message's text or a shared file's name — never a file's path on this
+    /// machine, which is where it sits on disk rather than anything anyone
+    /// said.
+    Search {
+        /// What to look for. Matched literally, not as a regular expression.
+        #[arg(value_name = "QUERY")]
+        query: String,
+        /// How many matches to print at most. The newest are kept, and a note
+        /// says so when there were more.
+        #[arg(
+            long,
+            default_value_t = peerbeam_chat::DEFAULT_SEARCH_LIMIT as u64,
+            value_name = "N",
+            value_parser = clap::value_parser!(u64).range(1..=peerbeam_chat::MAX_SEARCH_LIMIT as u64),
+        )]
+        limit: u64,
+    },
     /// Listen for and print incoming chat messages.
     Watch {
         /// Port to listen on (overrides `transfer.port` from config).
