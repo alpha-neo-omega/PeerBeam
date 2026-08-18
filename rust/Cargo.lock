@@ -1339,6 +1339,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-notes"
+version = "0.8.2"
+dependencies = [
+ "chrono",
+ "peerbeam-appstore-fs",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "peerbeam-platform"
 version = "0.8.2"
 dependencies = [
