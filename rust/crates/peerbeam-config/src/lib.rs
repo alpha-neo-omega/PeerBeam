@@ -90,6 +90,16 @@ pub struct DeviceConfig {
     /// what this device discloses, never what it will accept — the same
     /// asymmetry presence has.
     pub share_read_receipts: bool,
+    /// *"Keep a short clipboard history on this device"* — the history opt-in.
+    ///
+    /// **Default off**, and deliberately separate from clipboard sync. Syncing
+    /// your clipboard and keeping a record of it are different decisions with
+    /// different risks: bundling them would hand a stored log to someone who
+    /// only wanted two machines to share a clipboard, which is precisely what
+    /// clipboard sync promised not to create.
+    ///
+    /// History is bounded, kept only on this device, and never put on the wire.
+    pub clipboard_history: bool,
 }
 
 /// Discovery configuration.
@@ -184,6 +194,7 @@ impl Default for DeviceConfig {
             // so; see the field's own doc comment.
             share_presence: false,
             share_read_receipts: false,
+            clipboard_history: false,
         }
     }
 }

@@ -225,6 +225,17 @@ pub enum ClipboardAction {
     },
     /// Print the last received clipboard content.
     Get,
+    /// Show — or erase — this device's clipboard history.
+    ///
+    /// Empty unless `device.clipboard_history` is on. History is kept only on
+    /// this device and is never sent to a peer; only the current clip syncs.
+    History {
+        /// Erase every remembered clip. Works whether or not history is
+        /// currently on: turning the setting off stops new entries but does
+        /// not remove what was already recorded.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Args)]

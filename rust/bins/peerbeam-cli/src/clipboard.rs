@@ -11,7 +11,9 @@
 //! a peer's behaviour would depend on which of our two frontends it reached —
 //! the bug 2a shipped with `CHAT_FEAT_FILEREF`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use peerbeam_clipboard::ClipHistory;
 
 use peerbeam_clipboard::{Clip, ClipboardSink};
 use peerbeam_domain::id::DeviceId;
@@ -39,10 +41,33 @@ pub(crate) fn notice(peer: &DeviceId, clip: &Clip) -> String {
     )
 }
 
+/// The clipboard history this process records into, when the user turned it on.
+///
+/// A process-global for the reason `presence`'s is: every dial and accept call
+/// site would otherwise have to thread it, and forgetting one would silently
+/// record nothing. `None` means either unconfigured or opted out — the sink
+/// cannot tell them apart and does not need to, since both mean "do not
+/// record".
+static HISTORY: Mutex<Option<ClipHistory>> = Mutex::new(None);
+
+/// Point this process's clipboard history at `store`, or turn recording off.
+///
+/// Called from `load_config` with the store only when
+/// `device.clipboard_history` is on, so the opt-in is read in one place rather
+/// than at each site that might record something.
+pub(crate) fn configure_history(store: Option<ClipHistory>) {
+    *HISTORY.lock().unwrap_or_else(|e| e.into_inner()) = store;
+}
+
 /// The sink every CLI session's `ClipboardHandler` is built with.
 #[must_use]
 pub(crate) fn sink() -> ClipboardSink {
     Arc::new(|peer: DeviceId, clip: Clip| {
+        // Recorded before the notice, so a clip that arrived is remembered even
+        // if the terminal that would have printed it has gone away.
+        if let Some(h) = HISTORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = h.record(&clip.text, Some(peer.0.as_str()));
+        }
         eprintln!("{}", notice(&peer, &clip));
     })
 }

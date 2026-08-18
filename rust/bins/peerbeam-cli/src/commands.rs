@@ -134,6 +134,15 @@ pub(crate) fn load_config(override_path: Option<&str>) -> Result<EngineConfig, C
     let config = EngineConfig::load_or_default(&config_path(override_path))
         .map_err(|e| CliError::Other(format!("config: {e}")))?;
     crate::presence::configure(&config);
+    // Recording is decided here, once: the sink is handed a store only when the
+    // user opted in, so no call site has to remember to ask.
+    crate::clipboard::configure_history(if config.device.clipboard_history {
+        SecureCtx::build(&config)
+            .ok()
+            .map(|sc| clip_history_store(&config, &sc.enc, &sc.ident))
+    } else {
+        None
+    });
     Ok(config)
 }
 
@@ -1278,6 +1287,21 @@ pub(crate) fn chat_store(
     peerbeam_chat::ChatStore::new(store)
 }
 
+/// Build the CLI's clipboard-history store, over the same encrypted AppStore
+/// notes and chat use — history lives in its own namespace inside it.
+pub(crate) fn clip_history_store(
+    config: &EngineConfig,
+    enc: &Arc<AeadCrypto>,
+    ident: &Identity,
+) -> peerbeam_clipboard::ClipHistory {
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let store: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, enc.clone()),
+    );
+    peerbeam_clipboard::ClipHistory::new(store)
+}
+
 /// Build the CLI's note store, over the same encrypted AppStore chat uses —
 /// notes live in their own namespace inside it, so one machine has one store
 /// rather than two that could disagree about the key.
@@ -2081,6 +2105,7 @@ fn history_cmd(ctx: &Ctx, args: HistoryArgs, path_override: Option<&str>) -> Cli
 async fn clipboard(ctx: &Ctx, args: ClipboardArgs, path_override: Option<&str>) -> CliResult {
     match args.action {
         ClipboardAction::Get => clipboard_get(ctx, path_override),
+        ClipboardAction::History { clear } => clipboard_history(ctx, clear, path_override),
         ClipboardAction::Send { to, addr, text } => {
             clipboard_send(ctx, to, addr, text, path_override).await
         }
@@ -2089,6 +2114,70 @@ async fn clipboard(ctx: &Ctx, args: ClipboardArgs, path_override: Option<&str>) 
 
 /// Print the newest received clipboard payload (the `peerbeam-clipboard-*.txt`
 /// wire convention) from the save directory.
+/// `peerbeam clipboard history [--clear]`.
+///
+/// Reading is never gated on the opt-in: an empty list is the honest answer for
+/// a device that records nothing, and refusing the command would make "off"
+/// indistinguishable from "broken". Clearing likewise works whether or not the
+/// setting is on — turning it off stops new entries but does not erase what was
+/// already recorded, and someone who wants it gone needs a way to say so.
+fn clipboard_history(ctx: &Ctx, clear: bool, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = clip_history_store(&config, &sc.enc, &sc.ident);
+
+    if clear {
+        let n = store.clear().map_err(|e| CliError::Other(e.to_string()))?;
+        if ctx.json {
+            ctx.json_line(&serde_json::json!({ "cleared": n }));
+        } else {
+            ctx.line(&format!("cleared {n} remembered clips"));
+        }
+        return Ok(());
+    }
+
+    let entries = store.list().map_err(|e| CliError::Other(e.to_string()))?;
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({ "entries": entries }));
+        return Ok(());
+    }
+    if entries.is_empty() {
+        ctx.line(&ctx.dim(if config.device.clipboard_history {
+            "no clipboard history yet"
+        } else {
+            "clipboard history is off (device.clipboard_history)"
+        }));
+        return Ok(());
+    }
+    for e in &entries {
+        // One line each, and the text is **abbreviated**: this prints into a
+        // terminal that keeps scrollback, and reproducing a whole remembered
+        // clip there would undo the point of bounding the log at all.
+        let from = e.from.as_deref().unwrap_or("this device");
+        ctx.line(&format!(
+            "{}  {}  {}",
+            ctx.dim(&e.at),
+            from,
+            abbreviate(&e.text)
+        ));
+    }
+    Ok(())
+}
+
+/// A one-line preview of a remembered clip: first line, hard-capped.
+///
+/// Never the whole clip. `clipboard get` exists for someone who actually wants
+/// the content; a listing is for recognising an entry, and printing everything
+/// would put every remembered secret into terminal scrollback at once.
+fn abbreviate(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= 60 {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(59).collect();
+    format!("{cut}…")
+}
+
 fn clipboard_get(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
     let dir = std::path::Path::new(&config.storage.save_directory);
@@ -2948,5 +3037,26 @@ mod chat_receive_bridge_tests {
             Status::Transferring,
             "an outbound row must not be settled by the receive-side bridge"
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_history_tests {
+    #[test]
+    fn a_history_listing_never_reproduces_a_whole_clip() {
+        // This prints into a terminal that keeps scrollback. Bounding the log
+        // at fifty entries would mean nothing if listing it dumped every
+        // remembered secret at once.
+        let long = "s3cr3t-".repeat(40);
+        let shown = super::abbreviate(&long);
+        assert!(shown.chars().count() <= 60);
+        assert!(shown.ends_with('\u{2026}'));
+        assert!(!shown.contains(&long));
+    }
+
+    #[test]
+    fn a_multi_line_clip_is_previewed_by_its_first_line_only() {
+        assert_eq!(super::abbreviate("first\nsecond\nthird"), "first");
+        assert_eq!(super::abbreviate(""), "");
     }
 }
