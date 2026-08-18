@@ -558,6 +558,25 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// One chronological view of this device's activity: `{limit?}` →
+/// `{events:[…], truncated, limit}`, newest first.
+///
+/// A **read across stores that already exist** — transfers, conversations, and
+/// clipboard history when it is on. Nothing is recorded to build it: a timeline
+/// with its own log would be a second copy of the same facts, free to disagree
+/// with them, and a record of activity nobody separately agreed to.
+///
+/// Entries carry no message bodies and no clip text. The timeline says *that*
+/// something happened and when; reading it is what the conversation and
+/// clipboard screens are for.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_timeline(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.timeline(&read_json(json)?))()))
+}
+
 /// Every remembered clip, newest first: `{}` → `{entries:[…]}`.
 ///
 /// Empty unless the user turned clipboard history on. Bounded, and never put on

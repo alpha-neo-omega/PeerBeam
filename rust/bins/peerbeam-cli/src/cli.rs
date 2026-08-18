@@ -71,6 +71,8 @@ pub enum Command {
     Notes(NotesArgs),
     /// Make one of your devices findable — *find my device*.
     Ring(RingArgs),
+    /// One chronological view of this device's activity.
+    Timeline(TimelineArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -446,6 +448,19 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// This device's activity, newest first.
+///
+/// A read across records this device already keeps — transfers, conversations,
+/// and clipboard history when it is on. Nothing is recorded to build it, and
+/// nothing here carries message bodies or clip text: the timeline says *that*
+/// something happened and when.
+#[derive(Args)]
+pub struct TimelineArgs {
+    /// How many entries to show (1..=1000).
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}
+
 /// Ask a device to make itself findable.
 ///
 /// The device decides *how* — a sound, a notification, a flashing window —

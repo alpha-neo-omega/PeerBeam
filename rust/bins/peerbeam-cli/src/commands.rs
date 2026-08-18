@@ -49,6 +49,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
+        Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -2114,6 +2115,101 @@ async fn clipboard(ctx: &Ctx, args: ClipboardArgs, path_override: Option<&str>) 
 
 /// Print the newest received clipboard payload (the `peerbeam-clipboard-*.txt`
 /// wire convention) from the save directory.
+/// `peerbeam timeline [--limit N]`.
+///
+/// Reads the same stores the engine does — transfer history, conversations, and
+/// clipboard history when it is on — and merges them by time. The CLI builds
+/// this itself rather than calling the engine: a running daemon is not required
+/// to look at what this machine has done.
+fn timeline_cmd(
+    ctx: &Ctx,
+    args: crate::cli::TimelineArgs,
+    path_override: Option<&str>,
+) -> CliResult {
+    if args.limit == 0 || args.limit > 1000 {
+        return Err(CliError::Usage("limit must be between 1 and 1000".into()));
+    }
+    let config = load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let chat = chat_store(&config, &sc.enc, &sc.ident);
+
+    #[derive(serde::Serialize)]
+    struct Entry {
+        kind: &'static str,
+        at: String,
+        peer: String,
+        detail: String,
+    }
+    let mut events: Vec<Entry> = Vec::new();
+
+    for peer in chat.conversations().unwrap_or_default() {
+        for rec in chat.history(&peer).unwrap_or_default() {
+            events.push(Entry {
+                kind: "chat",
+                at: rec.timestamp.clone(),
+                peer: peer.0.clone(),
+                // Never the body. A timeline is for recognising when something
+                // happened; `chat history` reads conversations properly.
+                detail: match rec.kind {
+                    peerbeam_chat::Kind::File => rec
+                        .file
+                        .as_ref()
+                        .map_or_else(String::new, |f| f.name.clone()),
+                    _ => String::new(),
+                },
+            });
+        }
+    }
+    if config.device.clipboard_history {
+        let clips = clip_history_store(&config, &sc.enc, &sc.ident);
+        for e in clips.list().unwrap_or_default() {
+            events.push(Entry {
+                kind: "clipboard",
+                at: e.at,
+                peer: e.from.unwrap_or_default(),
+                // No clip text, for the reason the listing abbreviates: this
+                // goes into terminal scrollback.
+                detail: String::new(),
+            });
+        }
+    }
+
+    events.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.kind.cmp(b.kind)));
+    let truncated = events.len() > args.limit;
+    events.truncate(args.limit);
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({ "events": events, "truncated": truncated }));
+        return Ok(());
+    }
+    if events.is_empty() {
+        ctx.line(&ctx.dim("nothing yet"));
+        return Ok(());
+    }
+    for e in &events {
+        let who = if e.peer.is_empty() {
+            "this device"
+        } else {
+            &e.peer
+        };
+        ctx.line(&format!(
+            "{}  {:<9} {}  {}",
+            ctx.dim(&e.at),
+            e.kind,
+            who,
+            e.detail
+        ));
+    }
+    if truncated {
+        // Silently showing the newest N reads as "that is all there is".
+        ctx.line(&ctx.dim(&format!(
+            "…showing the newest {} — pass --limit for more",
+            args.limit
+        )));
+    }
+    Ok(())
+}
+
 /// `peerbeam clipboard history [--clear]`.
 ///
 /// Reading is never gated on the opt-in: an empty list is the honest answer for

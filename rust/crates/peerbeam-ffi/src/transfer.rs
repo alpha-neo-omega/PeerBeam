@@ -2140,6 +2140,108 @@ impl Manager {
         Ok(json!({ "history": *self.history.lock().unwrap() }))
     }
 
+    /// One chronological view of what this device has done: `{limit?}` →
+    /// `{events:[…]}`, newest first.
+    ///
+    /// **A read across stores this device already keeps** — transfer history,
+    /// every conversation, and clipboard history when it is on. Nothing new is
+    /// recorded to build it: a timeline that needed its own log would be a
+    /// second copy of the same facts, free to disagree with them, and a
+    /// durable record of activity the user never separately agreed to.
+    ///
+    /// Clipboard entries appear only when clipboard history is on, because
+    /// otherwise there is nothing to read; they carry **no text**, only that a
+    /// clip happened and who it came from. A timeline is for recognising when
+    /// something occurred, and putting clip contents in a scrollable activity
+    /// feed would undo the care taken to bound and abbreviate them elsewhere.
+    pub fn timeline(&self, req: &Value) -> Op {
+        const DEFAULT_LIMIT: usize = 200;
+        const MAX_LIMIT: usize = 1000;
+        let limit = match req.get("limit") {
+            None | Some(Value::Null) => DEFAULT_LIMIT,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=MAX_LIMIT as u64).contains(n))
+                .ok_or((
+                    Code::InvalidArgument,
+                    format!("limit must be an integer between 1 and {MAX_LIMIT}"),
+                ))? as usize,
+        };
+
+        let mut events: Vec<Value> = Vec::new();
+
+        // Transfers.
+        for item in self.history.lock().unwrap().iter() {
+            let at = item.get("at").and_then(Value::as_str).unwrap_or_default();
+            events.push(json!({
+                "kind": "transfer",
+                "at": at,
+                "peer": item.get("peer").and_then(Value::as_str).unwrap_or_default(),
+                "detail": item.get("file_name").and_then(Value::as_str).unwrap_or_default(),
+                "ok": item.get("success").and_then(Value::as_bool).unwrap_or(false),
+            }));
+        }
+
+        // Conversations. A message's own body is not carried: the timeline says
+        // that a conversation happened, and the conversation itself is one tap
+        // away with far better tools for reading it.
+        if let Ok(peers) = self.chat.conversations() {
+            for peer in peers {
+                if let Ok(history) = self.chat.history(&peer) {
+                    for rec in history {
+                        events.push(json!({
+                            "kind": "chat",
+                            "at": rec.timestamp,
+                            "peer": peer.0,
+                            "detail": match rec.kind {
+                                peerbeam_chat::Kind::File => rec
+                                    .file
+                                    .as_ref()
+                                    .map_or_else(String::new, |f| f.name.clone()),
+                                _ => String::new(),
+                            },
+                            "ok": true,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Clipboard, only when the user opted into remembering it at all.
+        if crate::clipboard::history_enabled() {
+            if let Ok(entries) = self.clip_history.list() {
+                for e in entries {
+                    events.push(json!({
+                        "kind": "clipboard",
+                        "at": e.at,
+                        "peer": e.from.unwrap_or_default(),
+                        "detail": "",
+                        "ok": true,
+                    }));
+                }
+            }
+        }
+
+        // Newest first, with the id as a stable tiebreak so two events in the
+        // same second do not swap places between calls.
+        events.sort_by(|a, b| {
+            let (x, y) = (
+                a.get("at").and_then(Value::as_str).unwrap_or_default(),
+                b.get("at").and_then(Value::as_str).unwrap_or_default(),
+            );
+            y.cmp(x).then_with(|| {
+                let (ka, kb) = (
+                    a.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                    b.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                );
+                ka.cmp(kb)
+            })
+        });
+        let truncated = events.len() > limit;
+        events.truncate(limit);
+        Ok(json!({ "events": events, "truncated": truncated, "limit": limit }))
+    }
+
     /// Pinned devices, newest first.
     ///
     /// `approved` is the difference between "this key was pinned when the
@@ -8151,6 +8253,59 @@ mod tests {
                                            "addresses": ["127.0.0.1"], "port": 49600 } }))
             .expect("a peer without the permission is not an error");
         assert_eq!(out["sent"], false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_timeline_merges_stores_newest_first_and_carries_no_content() {
+        let (mgr, chat, _dir) = test_manager_full("timeliner", 0);
+        let peer = DeviceId::from("pb-bob");
+        let msg = peerbeam_chat::ChatMessage::new("something private").expect("message");
+        chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &msg))
+            .expect("append");
+
+        let out = mgr.timeline(&json!({})).expect("timeline");
+        let events = out["events"].as_array().expect("array");
+        assert!(
+            !events.is_empty(),
+            "a conversation produced no timeline entry"
+        );
+
+        // The timeline says *that* something happened. A message body in a
+        // scrollable activity feed is a second, worse copy of the conversation.
+        let dumped = serde_json::to_string(&out).expect("json");
+        assert!(
+            !dumped.contains("something private"),
+            "the timeline carried a message body"
+        );
+
+        // Newest first.
+        let times: Vec<&str> = events.iter().filter_map(|e| e["at"].as_str()).collect();
+        let mut sorted = times.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(times, sorted, "the timeline was not newest-first");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_timeline_bounds_itself_and_says_when_it_truncated() {
+        let (mgr, chat, _dir) = test_manager_full("timeliner2", 0);
+        let peer = DeviceId::from("pb-bob");
+        for i in 0..5 {
+            let m = peerbeam_chat::ChatMessage::new(&format!("m{i}")).expect("message");
+            chat.append(&peerbeam_chat::ChatRecord::sent(&peer, &m))
+                .expect("append");
+        }
+
+        let out = mgr.timeline(&json!({ "limit": 2 })).expect("timeline");
+        assert_eq!(out["events"].as_array().expect("array").len(), 2);
+        assert_eq!(out["truncated"], true, "truncation was not reported");
+        assert_eq!(out["limit"], 2);
+
+        let (code, _) = mgr
+            .timeline(&json!({ "limit": 0 }))
+            .expect_err("a zero limit is refused");
+        assert!(matches!(code, Code::InvalidArgument));
     }
 
     #[tokio::test]
