@@ -1,7 +1,7 @@
 //! The one decision that answers: *may this device's status leave for this
 //! peer, right now?*
 //!
-//! Three independent gates, all of which must hold. They are combined in a
+//! Four independent gates, all of which must hold. They are combined in a
 //! single pure function rather than scattered through the send path so that
 //! there is exactly one place to read, one place to test, and no way for a
 //! refactor to delete a leg silently — the same shape as
@@ -12,6 +12,7 @@
 //! device with sharing off is a full participant in everyone else's dashboard
 //! and contributes nothing to it, which is exactly what an opt-in means.
 
+use peerbeam_domain::entity::Permission;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
 use peerbeam_domain::session::{CapabilitySet, ChannelType, PRESENCE_FEAT_STATUS};
@@ -30,7 +31,7 @@ pub fn caps_support_status(caps: &CapabilitySet) -> bool {
 
 /// May we put a `Status` on the wire toward `peer`?
 ///
-/// All three must hold:
+/// All four must hold:
 ///
 /// 1. **`sharing_enabled`** — the user turned on *"Share device status with
 ///    trusted devices"*. It defaults to **off** (I11, secure defaults), and
@@ -48,14 +49,23 @@ pub fn caps_support_status(caps: &CapabilitySet) -> bool {
 ///    level, free disk and network kind are a device fingerprint, and they go
 ///    to devices the user actually chose or nowhere. This gate is **not
 ///    configurable**.
-/// 3. **The peer negotiated [`PRESENCE_FEAT_STATUS`]** — capability-advertised,
+/// 3. **The user left this device its `presence` permission** —
+///    [`TrustStore::may`], the workspace's one permission predicate, asked per
+///    heartbeat for the same reason leg 2 is: revoking must stop the next beat,
+///    not the next session. Approval and permission are separate questions and
+///    both are named here. `may` *implies* leg 2 — an unapproved device may
+///    nothing — so this leg alone would be sufficient; it is stated anyway, as
+///    the `is_approved`/`is_trusted` split is, because a gate that leans on one
+///    predicate's internal implication silently weakens if that predicate is
+///    ever "simplified". Two named legs cost one `&&` and cannot drift.
+/// 4. **The peer negotiated [`PRESENCE_FEAT_STATUS`]** — capability-advertised,
 ///    not assumed (MESSAGE_REGISTRY.md §7 / I9). A 1b/2a-era peer never
 ///    advertises the PRESENCE channel, `CapabilitySet::intersect` drops it, and
 ///    it is sent nothing; it shows as "status not shared", never as an error.
 ///
-/// Gates 1 and 2 are local privacy decisions and a peer has no say in them.
-/// Gate 3 is the peer's own statement about what it understands. Keeping that
-/// distinction visible is why this is one function with three named legs rather
+/// Gates 1–3 are local privacy decisions and a peer has no say in them.
+/// Gate 4 is the peer's own statement about what it understands. Keeping that
+/// distinction visible is why this is one function with four named legs rather
 /// than a single `bool` computed somewhere upstream.
 #[must_use]
 pub fn may_share_status(
@@ -64,12 +74,16 @@ pub fn may_share_status(
     peer: &DeviceId,
     negotiated: &CapabilitySet,
 ) -> bool {
-    sharing_enabled && trust.is_approved(peer) && caps_support_status(negotiated)
+    sharing_enabled
+        && trust.is_approved(peer)
+        && trust.may(peer, Permission::Presence)
+        && caps_support_status(negotiated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerbeam_domain::entity::PermissionSet;
     use peerbeam_domain::session::Capability;
 
     /// A trust store that distinguishes the two states a real one has, because
@@ -80,9 +94,13 @@ mod tests {
     /// which `auth.rs` does for *every* never-seen peer with `approved: false`.
     /// A store that answered only "trusted / not trusted" could not tell a
     /// stranger on the LAN from the user's own laptop.
+    /// `permissions` — what an approved device was left; a real store carries
+    /// one set per device, and one shared set is enough here because every test
+    /// asks about a single peer.
     struct FakeTrust {
         approved: Vec<String>,
         pinned: Vec<String>,
+        permissions: PermissionSet,
     }
 
     impl TrustStore for FakeTrust {
@@ -106,6 +124,11 @@ mod tests {
                 name: "Peer".into(),
                 trusted_at: chrono::Utc::now(),
                 approved,
+                permissions: if approved {
+                    self.permissions
+                } else {
+                    PermissionSet::none()
+                },
             }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
@@ -120,6 +143,16 @@ mod tests {
         FakeTrust {
             approved: vec!["pb-bob".to_string()],
             pinned: Vec::new(),
+            permissions: PermissionSet::granted_on_approval(),
+        }
+    }
+
+    /// Approved, but with `permission` taken away — the state a `peerbeam trust
+    /// revoke-permission` or the app's toggle leaves behind.
+    fn trusting_without(permission: Permission) -> FakeTrust {
+        FakeTrust {
+            permissions: PermissionSet::granted_on_approval().set(permission, false),
+            ..trusting()
         }
     }
 
@@ -130,6 +163,7 @@ mod tests {
         FakeTrust {
             approved: Vec::new(),
             pinned: vec!["pb-bob".to_string()],
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -137,6 +171,7 @@ mod tests {
         FakeTrust {
             approved: Vec::new(),
             pinned: Vec::new(),
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -153,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn all_three_gates_open_permits_a_send() {
+    fn all_four_gates_open_permits_a_send() {
         assert!(may_share_status(true, &trusting(), &bob(), &negotiated()));
     }
 
@@ -267,5 +302,38 @@ mod tests {
             !may_share_status(true, &trust, &DeviceId::from("pb-mallory"), &negotiated()),
             "trusting one device must not open the gate for another"
         );
+    }
+
+    /// **The permission gate.** An approved, fully capable peer with its
+    /// `presence` permission revoked is sent nothing — deleting
+    /// `trust.may(peer, Permission::Presence)` from [`may_share_status`] must
+    /// make this fail.
+    #[test]
+    fn revoking_the_presence_permission_refuses_an_otherwise_open_gate() {
+        assert!(
+            !may_share_status(
+                true,
+                &trusting_without(Permission::Presence),
+                &bob(),
+                &negotiated()
+            ),
+            "a device whose presence permission was taken away receives no status"
+        );
+    }
+
+    /// **The permissions are separate bits, not an alias for `approved`.**
+    /// Revoking any *other* permission leaves this gate wide open — a `may`
+    /// that ignored which permission it was asked about would fail this.
+    #[test]
+    fn revoking_a_different_permission_leaves_presence_working() {
+        for other in Permission::ALL
+            .into_iter()
+            .filter(|p| *p != Permission::Presence)
+        {
+            assert!(
+                may_share_status(true, &trusting_without(other), &bob(), &negotiated()),
+                "revoking {other} must not stop presence"
+            );
+        }
     }
 }

@@ -48,6 +48,13 @@ pub enum Code {
     /// offending entry is not necessarily even owned by the conversation the
     /// caller asked about, since the queue is shared across every peer.
     QueueUnreadable,
+    /// A per-device permission the user withheld (or revoked) forbids this.
+    ///
+    /// Distinct from every other code because it is neither a fault nor a
+    /// limitation: the engine can do this and is choosing not to, because the
+    /// person who owns the machine said so. A surface should say which device
+    /// and which permission, and point at Trusted Devices — never retry.
+    PermissionDenied,
     /// A Rust panic was caught at the boundary (never propagated as UB).
     Internal,
 }
@@ -66,6 +73,7 @@ impl Code {
             Code::Unimplemented => "unimplemented",
             Code::Unsupported => "unsupported",
             Code::QueueUnreadable => "queue_unreadable",
+            Code::PermissionDenied => "permission_denied",
             Code::Internal => "internal",
         }
     }

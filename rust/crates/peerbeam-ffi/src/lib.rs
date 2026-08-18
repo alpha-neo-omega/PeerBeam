@@ -407,6 +407,28 @@ pub unsafe extern "C" fn pb_trust_remove(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.trust_remove(&read_json(json)?))()))
 }
 
+/// Grant or withhold one per-device permission:
+/// `{id, permission, granted}` → `{changed}`. Emits `trust_changed`.
+///
+/// `permission` is a name — `files`, `chat`, `clipboard`, `presence`, `pipe` —
+/// as listed in each device's `permissions` array from `pb_trust_list`. An
+/// unknown name is `invalid_argument`, so a surface built against a newer
+/// engine is told rather than silently ignored.
+///
+/// Takes effect on the **next** operation, not the next reconnect: every gate
+/// re-reads the trust store per message, clip, heartbeat and accept.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_set_permission(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.trust_set_permission(&read_json(json)?)
+        })())
+    })
+}
+
 // ── presence ────────────────────────────────────────────────────
 
 /// Live device presence:

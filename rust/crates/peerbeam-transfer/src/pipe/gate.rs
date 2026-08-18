@@ -1,7 +1,7 @@
 //! The one decision that answers: *may this peer's bytes be written to this
 //! process's stdout, right now?*
 //!
-//! Four legs, all of which must hold, combined in a single pure function rather
+//! Five legs, all of which must hold, combined in a single pure function rather
 //! than scattered through the accept path — the same shape as
 //! `peerbeam_presence::gate::may_share_status` and
 //! `peerbeam_clipboard::gate::may_share_clip`, for the same reason: one place
@@ -14,6 +14,7 @@
 //! user's own `pipe --to`: the bytes are their own, chosen deliberately, at a
 //! shell prompt.
 
+use peerbeam_domain::entity::Permission;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
 use peerbeam_domain::session::{CapabilitySet, ChannelType, PIPE_FEAT_STREAM};
@@ -38,7 +39,7 @@ pub fn caps_support_stream(caps: &CapabilitySet) -> bool {
 
 /// May this process write `peer`'s inbound pipe to its stdout?
 ///
-/// All four must hold:
+/// All five must hold:
 ///
 /// 1. **`listening`** — this process is a `peerbeam pipe --listen`, started by
 ///    the user for exactly this. **There is no background acceptance and no
@@ -65,20 +66,28 @@ pub fn caps_support_stream(caps: &CapabilitySet) -> bool {
 ///    record a decision. Asking `is_approved` is what makes this leg carry
 ///    weight against a stranger rather than only against a device the user has
 ///    explicitly revoked. See `docs/SECURITY.md`.
-/// 3. **`only_from`, when set, names this peer** — `pipe --listen --from
+/// 3. **The user left this device its `pipe` permission** —
+///    [`TrustStore::may`], the workspace's one permission predicate, asked per
+///    pipe for the same reason leg 2 is: revoking must refuse the next pipe,
+///    not the next reconnect. Approval and permission are separate questions
+///    and both are named. `may` *implies* leg 2 (an unapproved device may
+///    nothing), so this leg alone would be sufficient; it is stated anyway so
+///    the gate does not lean on another predicate's internal implication —
+///    the same reason legs 2 and 4 do not collapse into each other either.
+/// 4. **`only_from`, when set, names this peer** — `pipe --listen --from
 ///    laptop` accepts that device and refuses every other, trusted or not. The
 ///    comparison is against the **authenticated** `DeviceId` from the
 ///    handshake, never against the human name the peer presented: a name is
 ///    peer-supplied and a peer can present any name it likes, so matching on
 ///    one would turn the restriction into a suggestion.
-/// 4. **The peer negotiated [`PIPE_FEAT_STREAM`]** — capability-advertised, not
+/// 5. **The peer negotiated [`PIPE_FEAT_STREAM`]** — capability-advertised, not
 ///    assumed (MESSAGE_REGISTRY.md §7 / I9). A channel from a peer whose
 ///    negotiated set lacks the bit should not exist at all; refusing it is
 ///    fail-closed rather than trusting the channel type alone.
 ///
-/// Legs 1–3 are local decisions and a peer has no say in them. Leg 4 is the
+/// Legs 1–4 are local decisions and a peer has no say in them. Leg 5 is the
 /// peer's own statement about what it understands. Keeping that distinction
-/// visible is why this is one function with four named legs rather than a
+/// visible is why this is one function with five named legs rather than a
 /// single `bool` computed somewhere upstream.
 #[must_use]
 pub fn may_accept_pipe(
@@ -95,19 +104,26 @@ pub fn may_accept_pipe(
         Some(want) => want == peer,
         None => true,
     };
-    listening && trust.is_approved(peer) && from_permitted && caps_support_stream(negotiated)
+    listening
+        && trust.is_approved(peer)
+        && trust.may(peer, Permission::Pipe)
+        && from_permitted
+        && caps_support_stream(negotiated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerbeam_domain::entity::PermissionSet;
     use peerbeam_domain::session::Capability;
 
-    /// `.0` = ids the user approved; `.1` = ids merely pinned by a handshake.
-    /// The two are kept apart because that distinction is what the trust leg
-    /// turns on — a store answering only "trusted / not trusted" could not tell
-    /// a stranger who connected once from the user's own laptop.
-    struct FakeTrust(Vec<String>, Vec<String>);
+    /// `.0` = ids the user approved; `.1` = ids merely pinned by a handshake;
+    /// `.2` = what an approved id was left. The first two are kept apart
+    /// because that distinction is what the trust leg turns on — a store
+    /// answering only "trusted / not trusted" could not tell a stranger who
+    /// connected once from the user's own laptop — and the third is what the
+    /// permission leg turns on.
+    struct FakeTrust(Vec<String>, Vec<String>, PermissionSet);
 
     impl TrustStore for FakeTrust {
         fn record(
@@ -130,6 +146,11 @@ mod tests {
                 name: "Peer".into(),
                 trusted_at: chrono::Utc::now(),
                 approved,
+                permissions: if approved {
+                    self.2
+                } else {
+                    PermissionSet::none()
+                },
             }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
@@ -141,17 +162,29 @@ mod tests {
         FakeTrust(
             vec!["pb-bob".to_string(), "pb-carol".to_string()],
             Vec::new(),
+            PermissionSet::granted_on_approval(),
         )
+    }
+
+    /// Approved, but with `permission` taken away — the state a `peerbeam trust
+    /// revoke-permission` or the app's toggle leaves behind.
+    fn trusting_without(permission: Permission) -> FakeTrust {
+        let FakeTrust(approved, pinned, permissions) = trusting();
+        FakeTrust(approved, pinned, permissions.set(permission, false))
     }
 
     /// Pinned by the handshake but never accepted by the user — what a stranger
     /// on the LAN looks like the instant after connecting.
     fn pinned_only() -> FakeTrust {
-        FakeTrust(Vec::new(), vec!["pb-bob".to_string()])
+        FakeTrust(
+            Vec::new(),
+            vec!["pb-bob".to_string()],
+            PermissionSet::granted_on_approval(),
+        )
     }
 
     fn empty_trust() -> FakeTrust {
-        FakeTrust(Vec::new(), Vec::new())
+        FakeTrust(Vec::new(), Vec::new(), PermissionSet::granted_on_approval())
     }
 
     fn bob() -> DeviceId {
@@ -188,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn all_four_gates_open_permits_an_accept() {
+    fn all_five_gates_open_permits_an_accept() {
         assert!(may_accept_pipe(
             true,
             &trusting(),
@@ -315,7 +348,11 @@ mod tests {
     /// would take a pipe from everyone.
     #[test]
     fn trust_is_evaluated_for_the_peer_being_accepted() {
-        let trust = FakeTrust(vec!["pb-bob".to_string()], Vec::new());
+        let trust = FakeTrust(
+            vec!["pb-bob".to_string()],
+            Vec::new(),
+            PermissionSet::granted_on_approval(),
+        );
         assert!(may_accept_pipe(true, &trust, &bob(), None, &negotiated()));
         assert!(
             !may_accept_pipe(
@@ -336,10 +373,47 @@ mod tests {
     #[test]
     fn from_compares_authenticated_ids_not_presented_names() {
         let impostor = DeviceId::from("pb-mallory");
-        let trust = FakeTrust(vec!["pb-mallory".to_string()], Vec::new());
+        let trust = FakeTrust(
+            vec!["pb-mallory".to_string()],
+            Vec::new(),
+            PermissionSet::granted_on_approval(),
+        );
         assert!(
             !may_accept_pipe(true, &trust, &impostor, Some(&bob()), &negotiated()),
             "only the id `--from` resolved to may pass"
         );
+    }
+
+    /// **The permission gate.** A listener refuses an approved, fully capable,
+    /// `--from`-matching peer whose `pipe` permission the user took away —
+    /// deleting `trust.may(peer, Permission::Pipe)` from [`may_accept_pipe`]
+    /// must make this fail.
+    #[test]
+    fn revoking_the_pipe_permission_refuses_an_otherwise_open_gate() {
+        assert!(
+            !may_accept_pipe(
+                true,
+                &trusting_without(Permission::Pipe),
+                &bob(),
+                None,
+                &negotiated()
+            ),
+            "a device whose pipe permission was taken away must not reach stdout"
+        );
+    }
+
+    /// **The permissions are separate bits, not an alias for `approved`.**
+    /// Revoking any *other* permission leaves this gate wide open.
+    #[test]
+    fn revoking_a_different_permission_leaves_pipe_working() {
+        for other in Permission::ALL
+            .into_iter()
+            .filter(|p| *p != Permission::Pipe)
+        {
+            assert!(
+                may_accept_pipe(true, &trusting_without(other), &bob(), None, &negotiated()),
+                "revoking {other} must not refuse a pipe"
+            );
+        }
     }
 }

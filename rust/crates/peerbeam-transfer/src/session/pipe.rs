@@ -14,6 +14,7 @@
 
 use futures::io::{AsyncRead, AsyncWrite};
 
+use peerbeam_domain::entity::Permission;
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
@@ -165,6 +166,13 @@ fn refusal(consent: &PipeConsent<'_>, peer: &DeviceId) -> String {
             peer.0, peer.0
         );
     }
+    if !consent.trust.may(peer, Permission::Pipe) {
+        return format!(
+            "refused an inbound pipe from {}: this device is approved but its `pipe` \
+             permission was revoked. Run `peerbeam trust permit {} pipe` here to restore it",
+            peer.0, peer.0
+        );
+    }
     match consent.only_from {
         Some(want) if want != peer => format!(
             "refused an inbound pipe from {}: --from restricts this listener to {}",
@@ -180,14 +188,17 @@ fn refusal(consent: &PipeConsent<'_>, peer: &DeviceId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerbeam_domain::entity::PermissionSet;
     use peerbeam_domain::session::{Capability, PIPE_FEAT_STREAM};
 
-    /// A store in one of the three states a real one can be in for a given
-    /// peer, because the pipe gate asks `is_approved` and the refusal message
-    /// has to tell "pinned but never chosen" apart from "never seen at all".
+    /// A store in one of the states a real one can be in for a given peer,
+    /// because the pipe gate asks `is_approved` and `may`, and the refusal
+    /// message has to tell "pinned but never chosen" from "never seen at all"
+    /// and from "approved, but its pipe permission was revoked".
     struct FakeTrust {
         approved: bool,
         pinned: bool,
+        permissions: PermissionSet,
     }
 
     /// The user chose this device.
@@ -195,6 +206,15 @@ mod tests {
         FakeTrust {
             approved: true,
             pinned: true,
+            permissions: PermissionSet::granted_on_approval(),
+        }
+    }
+
+    /// Chosen, then narrowed: the user revoked its `pipe` permission.
+    fn approving_without_pipe() -> FakeTrust {
+        FakeTrust {
+            permissions: PermissionSet::granted_on_approval().set(Permission::Pipe, false),
+            ..approving()
         }
     }
 
@@ -204,6 +224,7 @@ mod tests {
         FakeTrust {
             approved: false,
             pinned: true,
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -212,6 +233,7 @@ mod tests {
         FakeTrust {
             approved: false,
             pinned: false,
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -235,6 +257,11 @@ mod tests {
                 name: "Peer".into(),
                 trusted_at: chrono::Utc::now(),
                 approved: self.approved,
+                permissions: if self.approved {
+                    self.permissions
+                } else {
+                    PermissionSet::none()
+                },
             }))
         }
         fn is_trusted(&self, _d: &DeviceId) -> bool {
@@ -346,5 +373,35 @@ mod tests {
             ..listening
         };
         assert!(!daemon.permits(&bob()), "a daemon permits nothing");
+    }
+
+    /// **The refusal names the leg that shut.** A device the user approved and
+    /// then narrowed must not be told it "did not negotiate the pipe stream
+    /// capability" — that would send its operator to debug a wire problem that
+    /// does not exist. It is told which permission to restore.
+    #[test]
+    fn a_revoked_pipe_permission_is_refused_by_name_not_as_a_capability_problem() {
+        let trust = approving_without_pipe();
+        let caps = caps();
+        let consent = PipeConsent {
+            listening: true,
+            trust: &trust,
+            only_from: None,
+            negotiated: &caps,
+        };
+        assert!(!consent.permits(&bob()), "the gate is shut");
+        let message = refusal(&consent, &bob());
+        assert!(
+            message.contains("permission was revoked"),
+            "the refusal must name the permission leg: {message}"
+        );
+        assert!(
+            message.contains("trust permit"),
+            "and say how to restore it: {message}"
+        );
+        assert!(
+            !message.contains("negotiate"),
+            "and must not blame the wire: {message}"
+        );
     }
 }

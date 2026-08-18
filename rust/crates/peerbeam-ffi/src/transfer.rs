@@ -25,7 +25,7 @@ use peerbeam_chat::{
 use peerbeam_chat::Kind as ChatKind;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
-    Device, DeviceType, Direction, FileEntry, Progress, TransferSession, TransferStatus,
+    Device, DeviceType, Direction, FileEntry, Permission, Progress, TransferSession, TransferStatus,
 };
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
@@ -379,6 +379,90 @@ fn should_send_decline(
     outcome == AcceptOutcome::Rejected
         && crate::session_exec::caps_support_file_decline(caps)
         && chat.contains(peer, id).unwrap_or(false)
+}
+
+/// What the trust store says about an inbound transfer from `peer`, decided
+/// **before** anyone is asked anything.
+///
+/// Three outcomes rather than a bool, because the store genuinely has three
+/// things to say and collapsing any two of them loses a real behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileAdmission {
+    /// The user approved this device and then took its `files` permission
+    /// away. Refuse without prompting: they have already answered.
+    Refused,
+    /// Ask the user, exactly as this build always has.
+    Prompt,
+    /// Accept without asking.
+    AutoAccept,
+}
+
+/// The trust half of the inbound-transfer decision.
+///
+/// Extracted from `handle_incoming` as a pure function of data already in hand
+/// — no session, no network — so every leg is unit-testable and a refactor
+/// cannot delete one silently. It mirrors [`should_send_decline`] and the four
+/// `may_*` gates: the predicate is the tested unit, the call site is the thin
+/// part.
+///
+/// The legs, in order:
+///
+/// 1. **Approved, but `files` revoked → [`Refused`].** The user said "this
+///    device may not send me files". Prompting anyway would ask them to
+///    re-decide something they already decided, on the schedule of whoever is
+///    sending — which is how a permission becomes a nuisance rather than a
+///    setting. This also beats a resume: an interrupted transfer that was
+///    accepted before the permission was taken away does not get to finish
+///    (revoking applies to the *next* operation, and this is one).
+/// 2. **`auto_accept` and the device may [`Permission::Files`] →
+///    [`AutoAccept`].** Formerly `auto && record.approved`;
+///    [`TrustStore::may`] implies that approval, so this is strictly narrower
+///    than what it replaces and no device that auto-accepted before stops
+///    doing so unless the permission was deliberately removed.
+/// 3. **Everything else → [`Prompt`].** In particular a merely *pinned* peer —
+///    the state the TOFU handshake leaves every stranger in — is prompted
+///    exactly as it always was. Permissions narrow a standing the user granted;
+///    they never create one, and they must not turn first contact into a silent
+///    refusal.
+///
+/// [`Refused`]: FileAdmission::Refused
+/// [`AutoAccept`]: FileAdmission::AutoAccept
+/// [`Prompt`]: FileAdmission::Prompt
+/// [`TrustStore::may`]: peerbeam_domain::port::TrustStore::may
+pub(crate) fn admit_transfer(
+    auto_accept: bool,
+    trust: &dyn TrustStore,
+    peer: &DeviceId,
+) -> FileAdmission {
+    let may_files = trust.may(peer, Permission::Files);
+    if trust.is_approved(peer) && !may_files {
+        return FileAdmission::Refused;
+    }
+    if auto_accept && may_files {
+        return FileAdmission::AutoAccept;
+    }
+    FileAdmission::Prompt
+}
+
+/// The `chat` permission, as an [`Op`]-shaped refusal.
+///
+/// Thin on purpose: [`peerbeam_chat::may_exchange_chat`] is the decision and
+/// the tested unit; this only turns a `false` into the message a user reads.
+/// Both chat entry points call it so a refusal is worded identically whether
+/// the user typed a message or attached a file.
+fn permit_chat(trust: &dyn TrustStore, peer: &DeviceId) -> Result<(), (Code, String)> {
+    if peerbeam_chat::may_exchange_chat(trust, peer) {
+        return Ok(());
+    }
+    Err((
+        Code::PermissionDenied,
+        format!(
+            "messages to {} are not permitted: this device's `chat` permission \
+             was revoked. Restore it in Trusted Devices, or run \
+             `peerbeam trust permit {} chat`",
+            peer.0, peer.0
+        ),
+    ))
 }
 
 // ── manager ─────────────────────────────────────────────────────
@@ -1981,6 +2065,12 @@ impl Manager {
     /// machines — and only the approved ones may be sent presence, clipboard
     /// contents, or an accepted pipe. A surface that renders the two alike
     /// tells the user a stranger is trusted.
+    ///
+    /// `permissions` is an explicit **array of names**, never a bitmask and
+    /// never inferred from `approved`: it is what the device may actually do,
+    /// and a surface renders one toggle per entry. It is emitted for pinned
+    /// devices too (where it is typically empty), so a surface never has to
+    /// guess what an absent key means.
     pub fn trust_list(&self) -> Op {
         let devices: Vec<Value> = self
             .trust
@@ -1993,10 +2083,66 @@ impl Manager {
                     "fingerprint": r.fingerprint,
                     "trusted_at": r.trusted_at.to_rfc3339(),
                     "approved": r.approved,
+                    "permissions": r
+                        .effective_permissions()
+                        .granted()
+                        .into_iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect();
         Ok(json!({ "devices": devices }))
+    }
+
+    /// Grant or withhold one permission for one pinned device:
+    /// `{id, permission, granted}` → `{changed}`.
+    ///
+    /// Names, not indices, so the call means the same thing across an engine
+    /// upgrade that adds a permission. An unknown name is an
+    /// [`Code::InvalidArgument`] rather than a silent no-op — a surface asking
+    /// for something this engine cannot enforce must be told, not humoured.
+    ///
+    /// `changed: false` means the store already read that way (or the device is
+    /// not pinned); it is not an error, so a UI that re-asserts a toggle is
+    /// idempotent.
+    ///
+    /// Emits `trust_changed`, which is what makes the Trusted Devices list —
+    /// and any other open surface — re-read without polling.
+    pub fn trust_set_permission(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let name = req
+            .get("permission")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "permission required".into()))?;
+        let granted = req
+            .get("granted")
+            .and_then(|v| v.as_bool())
+            .ok_or((Code::InvalidArgument, "granted required".into()))?;
+        let permission = Permission::parse(name).ok_or((
+            Code::InvalidArgument,
+            format!(
+                "unknown permission `{name}` — this engine knows {}",
+                Permission::ALL.map(|p| p.as_str()).join(", ")
+            ),
+        ))?;
+        let device = DeviceId::from(id);
+        let changed = self
+            .trust
+            .set_permission(&device, permission, granted)
+            .map_err(from_domain)?;
+        // Presence is displayed from a live registry, so a revoked `presence`
+        // permission must also drop what this device already holds — otherwise
+        // the dashboard keeps showing a status for a peer that may no longer
+        // send one. The send side needs nothing: every gate re-reads the store.
+        if !granted && permission == Permission::Presence {
+            self.presence_forget(&device);
+        }
+        events::event(&json!({ "type": "trust_changed", "timestamp": timestamp() }));
+        Ok(json!({ "changed": changed }))
     }
 
     /// Revoke a pinned device; its next connection needs fresh approval.
@@ -2035,6 +2181,11 @@ impl Manager {
             .ok_or((Code::InvalidArgument, "text required".into()))?;
         let msg = peerbeam_chat::ChatMessage::new(text)
             .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        // Refuse **before** persisting: a message that may never be sent has no
+        // business sitting in the thread looking Pending. The gate is
+        // `may_exchange_chat`, the same predicate the drain asks, so the two can
+        // never disagree about whether this peer is reachable.
+        permit_chat(self.trust.as_ref(), &device.id)?;
         // Persist Pending + enqueue immediately; return without waiting on the network.
         self.chat
             .enqueue(&device.id, &msg)
@@ -2094,6 +2245,10 @@ impl Manager {
             .and_then(|v| v.as_str())
             .ok_or((Code::InvalidArgument, "path required".into()))?
             .to_string();
+        // A file shared *in chat* is a chat operation: it puts a `FileRef` row
+        // in the conversation, and the bytes only follow because of it. So it
+        // is refused for the same reason and by the same predicate as text.
+        permit_chat(self.trust.as_ref(), &device.id)?;
         // Validate + persist the outgoing row synchronously, so the caller's id
         // is durable and visible in `chat_history` before this returns and a
         // refused path (missing, a directory, a bad name) leaves no row at all.
@@ -2685,6 +2840,20 @@ impl Manager {
         // same rationale documented on the old `chat_send`: the outbox/history
         // are namespaced by the authenticated identity.
         let peer = session.peer_device.clone();
+        // The permission is asked here, of the **authenticated** peer, and on
+        // every drain — so revoking `chat` for a device stops the very next
+        // message rather than the next reconnect, and a message queued before
+        // the revocation is not delivered after it. Nothing is discarded: the
+        // outbox keeps it, exactly as it does for an unreachable peer, and it
+        // flows again if the permission is restored.
+        if !peerbeam_chat::may_exchange_chat(self.trust.as_ref(), &peer) {
+            tracing::info!(
+                peer_id = %peer.0,
+                "not flushing chat: this device's `chat` permission was revoked"
+            );
+            session.close().await;
+            return Vec::new();
+        }
         let flushed = peerbeam_chat::flush_to_session(&session.handle, &self.chat, &peer)
             .await
             .unwrap_or_default();
@@ -3527,14 +3696,16 @@ impl Manager {
         // (TOFU trust, MITM protection) is not consent to auto-accept — that
         // requires the user to have accepted at least once before.
         // Read the flag fresh so a live toggle applies without a restart.
-        let auto = self.auto_accept.load(Ordering::SeqCst);
-        let approved = self
-            .trust
-            .lookup(&session.peer_device)
-            .ok()
-            .flatten()
-            .map(|r| r.approved)
-            .unwrap_or(false);
+        //
+        // Which of the three ways this can go is decided by `admit_transfer`,
+        // where each leg is named and unit-tested — including the one this
+        // increment adds: a device the user approved and then denied `files`
+        // is refused outright rather than prompted about.
+        let admission = admit_transfer(
+            self.auto_accept.load(Ordering::SeqCst),
+            self.trust.as_ref(),
+            &session.peer_device,
+        );
         // A transfer the user already accepted, interrupted and now offered
         // again, resumes without a second prompt — being asked twice for one
         // file because the Wi-Fi dropped is exactly the friction resume exists
@@ -3548,10 +3719,13 @@ impl Manager {
         // interruption must not turn an unanswered prompt into a yes (I6).
         let resuming =
             self.resumes_accepted_receive(&id, &session.peer_device, &preview.name, preview.size);
-        let outcome = if resuming || (auto && approved) {
-            AcceptOutcome::Accepted
-        } else {
-            self.wait_for_accept(&id, &session.peer_device).await
+        let outcome = match admission {
+            // A revoked `files` permission beats a resume: the user's decision
+            // is newer than the checkpoint.
+            FileAdmission::Refused => AcceptOutcome::Rejected,
+            FileAdmission::AutoAccept => AcceptOutcome::Accepted,
+            FileAdmission::Prompt if resuming => AcceptOutcome::Accepted,
+            FileAdmission::Prompt => self.wait_for_accept(&id, &session.peer_device).await,
         };
         // The decision is settled, so this transfer is no longer an open
         // first-contact question — drop the record however it resolved. A
@@ -5550,6 +5724,7 @@ mod tests {
                 name: "peer".into(),
                 trusted_at: chrono::Utc::now(),
                 approved: false,
+                permissions: peerbeam_domain::entity::PermissionSet::none(),
             })
             .expect("pin device");
     }
@@ -6143,6 +6318,157 @@ mod tests {
             &peer,
             &id
         ));
+    }
+
+    // ── admit_transfer: the `files` permission on the accept path ──────────
+
+    /// A trust store in whichever of the four states matters here.
+    struct AdmitTrust {
+        pinned: bool,
+        approved: bool,
+        permissions: peerbeam_domain::entity::PermissionSet,
+    }
+
+    impl TrustStore for AdmitTrust {
+        fn record(
+            &self,
+            _r: peerbeam_domain::entity::TrustRecord,
+        ) -> peerbeam_domain::error::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            d: &DeviceId,
+        ) -> peerbeam_domain::error::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            if !self.pinned {
+                return Ok(None);
+            }
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: d.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: self.approved,
+                permissions: self.permissions,
+            }))
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            self.pinned
+        }
+    }
+
+    fn admit_approved() -> AdmitTrust {
+        AdmitTrust {
+            pinned: true,
+            approved: true,
+            permissions: peerbeam_domain::entity::PermissionSet::granted_on_approval(),
+        }
+    }
+
+    fn admit_approved_without(p: Permission) -> AdmitTrust {
+        AdmitTrust {
+            permissions: peerbeam_domain::entity::PermissionSet::granted_on_approval()
+                .set(p, false),
+            ..admit_approved()
+        }
+    }
+
+    fn admit_peer() -> DeviceId {
+        DeviceId::from("pb-bob")
+    }
+
+    /// Leg 2, and the compatibility statement for this whole change: an
+    /// approved device with its permissions intact auto-accepts exactly as it
+    /// did before permissions existed.
+    #[test]
+    fn an_approved_device_still_auto_accepts_when_the_setting_is_on() {
+        assert_eq!(
+            admit_transfer(true, &admit_approved(), &admit_peer()),
+            FileAdmission::AutoAccept
+        );
+        assert_eq!(
+            admit_transfer(false, &admit_approved(), &admit_peer()),
+            FileAdmission::Prompt,
+            "with auto-accept off it is prompted, exactly as before"
+        );
+    }
+
+    /// **The permission gate.** Revoking `files` refuses the transfer outright
+    /// — it does not fall back to a prompt. The user already answered this
+    /// question, and re-asking it on the sender's schedule is how a setting
+    /// turns into a nuisance. Deleting the `Refused` leg must make this fail.
+    #[test]
+    fn revoking_files_refuses_an_inbound_transfer_without_prompting() {
+        let trust = admit_approved_without(Permission::Files);
+        assert_eq!(
+            admit_transfer(true, &trust, &admit_peer()),
+            FileAdmission::Refused
+        );
+        assert_eq!(
+            admit_transfer(false, &trust, &admit_peer()),
+            FileAdmission::Refused,
+            "the auto-accept setting has no bearing on a revoked permission"
+        );
+    }
+
+    /// **The permissions are separate bits, not an alias for `approved`.**
+    /// Revoking any *other* permission leaves transfers exactly as they were.
+    #[test]
+    fn revoking_a_different_permission_leaves_transfers_working() {
+        for other in Permission::ALL
+            .into_iter()
+            .filter(|p| *p != Permission::Files)
+        {
+            let trust = admit_approved_without(other);
+            assert_eq!(
+                admit_transfer(true, &trust, &admit_peer()),
+                FileAdmission::AutoAccept,
+                "revoking {other} must not affect transfers"
+            );
+        }
+    }
+
+    /// **The backward-compatibility leg.** A merely pinned peer — every
+    /// stranger the TOFU handshake has ever recorded — is prompted, never
+    /// silently refused. Permissions narrow a standing the user granted; they
+    /// must not turn first contact into a refusal nobody sees.
+    #[test]
+    fn a_merely_pinned_peer_is_still_prompted_not_refused() {
+        let pinned = AdmitTrust {
+            approved: false,
+            permissions: peerbeam_domain::entity::PermissionSet::none(),
+            ..admit_approved()
+        };
+        assert!(pinned.is_trusted(&admit_peer()), "the handshake pinned it");
+        assert_eq!(
+            admit_transfer(true, &pinned, &admit_peer()),
+            FileAdmission::Prompt
+        );
+
+        let unknown = AdmitTrust {
+            pinned: false,
+            ..pinned
+        };
+        assert_eq!(
+            admit_transfer(true, &unknown, &admit_peer()),
+            FileAdmission::Prompt,
+            "a device with no record at all is first contact, and is asked about"
+        );
+    }
+
+    /// Approval alone no longer auto-accepts: the permission has to be there
+    /// too. A record with an empty set (which only an explicit revoke-all
+    /// produces) is refused rather than auto-accepted.
+    #[test]
+    fn approval_without_the_files_permission_is_not_auto_accept() {
+        let trust = AdmitTrust {
+            permissions: peerbeam_domain::entity::PermissionSet::none(),
+            ..admit_approved()
+        };
+        assert_eq!(
+            admit_transfer(true, &trust, &admit_peer()),
+            FileAdmission::Refused
+        );
     }
 
     // ── BUG 1: daemon_running must reset when serve() exits on its own ──

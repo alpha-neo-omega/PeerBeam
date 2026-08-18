@@ -1,7 +1,7 @@
 //! The one decision that answers: *may this device's clipboard leave for this
 //! peer, right now?*
 //!
-//! Three independent gates, all of which must hold. They are combined in a
+//! Four independent gates, all of which must hold. They are combined in a
 //! single pure function rather than scattered through the send path so that
 //! there is exactly one place to read, one place to test, and no way for a
 //! refactor to delete a leg silently — the same shape as
@@ -13,6 +13,7 @@
 //! opt-in means: the setting governs what leaves this machine, not what reaches
 //! it.
 
+use peerbeam_domain::entity::Permission;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
 use peerbeam_domain::session::{CapabilitySet, ChannelType, CLIPBOARD_FEAT_CLIP};
@@ -31,7 +32,7 @@ pub fn caps_support_clip(caps: &CapabilitySet) -> bool {
 
 /// May we put a `Clip` on the wire toward `peer`?
 ///
-/// All three must hold:
+/// All four must hold:
 ///
 /// 1. **`sync_enabled`** — the user turned on *"Sync clipboard with trusted
 ///    devices"*. It defaults to **off** (I11, secure defaults), and while it is
@@ -45,15 +46,24 @@ pub fn caps_support_clip(caps: &CapabilitySet) -> bool {
 ///    buffer on a desktop — it holds whatever the user last copied, and (see
 ///    the crate docs) nothing can tell which of those were passwords — so it
 ///    goes to the user's own pinned devices or nowhere.
-/// 3. **The peer negotiated [`CLIPBOARD_FEAT_CLIP`]** — capability-advertised,
+/// 3. **The user left this device its `clipboard` permission** —
+///    [`TrustStore::may`], the workspace's one permission predicate, asked per
+///    push for the same reason leg 2 is: revoking must stop the next clip, not
+///    the next session. This is what makes *"this laptop may sync files but
+///    must never read my clipboard"* expressible at all — approval on its own
+///    could only say yes to everything. `may` *implies* leg 2 (an unapproved
+///    device may nothing), so this leg alone would be sufficient; it is stated
+///    anyway, exactly as the `is_approved`/`is_trusted` split is, so the gate
+///    does not lean on another predicate's internal implication.
+/// 4. **The peer negotiated [`CLIPBOARD_FEAT_CLIP`]** — capability-advertised,
 ///    not assumed (MESSAGE_REGISTRY.md §7 / I9). A peer from before this
 ///    feature never advertises the CLIPBOARD channel, `CapabilitySet::intersect`
 ///    drops it, and it is sent nothing; it simply does not take part in sync,
 ///    which is not an error.
 ///
-/// Gates 1 and 2 are local privacy decisions and a peer has no say in them.
-/// Gate 3 is the peer's own statement about what it understands. Keeping that
-/// distinction visible is why this is one function with three named legs rather
+/// Gates 1–3 are local privacy decisions and a peer has no say in them.
+/// Gate 4 is the peer's own statement about what it understands. Keeping that
+/// distinction visible is why this is one function with four named legs rather
 /// than a single `bool` computed somewhere upstream.
 #[must_use]
 pub fn may_share_clip(
@@ -62,12 +72,16 @@ pub fn may_share_clip(
     peer: &DeviceId,
     negotiated: &CapabilitySet,
 ) -> bool {
-    sync_enabled && trust.is_approved(peer) && caps_support_clip(negotiated)
+    sync_enabled
+        && trust.is_approved(peer)
+        && trust.may(peer, Permission::Clipboard)
+        && caps_support_clip(negotiated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerbeam_domain::entity::PermissionSet;
     use peerbeam_domain::session::Capability;
 
     /// A trust store that distinguishes the two states a real one has, because
@@ -78,9 +92,12 @@ mod tests {
     /// which `auth.rs` does for *every* never-seen peer with `approved: false`.
     /// A store that answered only "trusted / not trusted" could not tell a
     /// stranger on the LAN from the user's own laptop.
+    /// `permissions` — what an approved device was left; one shared set is
+    /// enough here because every test asks about a single peer.
     struct FakeTrust {
         approved: Vec<String>,
         pinned: Vec<String>,
+        permissions: PermissionSet,
     }
 
     impl TrustStore for FakeTrust {
@@ -104,6 +121,11 @@ mod tests {
                 name: "Peer".into(),
                 trusted_at: chrono::Utc::now(),
                 approved,
+                permissions: if approved {
+                    self.permissions
+                } else {
+                    PermissionSet::none()
+                },
             }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {
@@ -118,6 +140,16 @@ mod tests {
         FakeTrust {
             approved: vec!["pb-bob".to_string()],
             pinned: Vec::new(),
+            permissions: PermissionSet::granted_on_approval(),
+        }
+    }
+
+    /// Approved, but with `permission` taken away — the state a `peerbeam trust
+    /// revoke-permission` or the app's toggle leaves behind.
+    fn trusting_without(permission: Permission) -> FakeTrust {
+        FakeTrust {
+            permissions: PermissionSet::granted_on_approval().set(permission, false),
+            ..trusting()
         }
     }
 
@@ -128,6 +160,7 @@ mod tests {
         FakeTrust {
             approved: Vec::new(),
             pinned: vec!["pb-bob".to_string()],
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -135,6 +168,7 @@ mod tests {
         FakeTrust {
             approved: Vec::new(),
             pinned: Vec::new(),
+            permissions: PermissionSet::granted_on_approval(),
         }
     }
 
@@ -168,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn all_three_gates_open_permits_a_send() {
+    fn all_four_gates_open_permits_a_send() {
         assert!(may_share_clip(true, &trusting(), &bob(), &negotiated()));
     }
 
@@ -282,5 +316,38 @@ mod tests {
             !may_share_clip(true, &trust, &DeviceId::from("pb-mallory"), &negotiated()),
             "trusting one device must not open the gate for another"
         );
+    }
+
+    /// **The permission gate.** An approved, fully capable peer with its
+    /// `clipboard` permission revoked is sent nothing even with sync on —
+    /// deleting `trust.may(peer, Permission::Clipboard)` from
+    /// [`may_share_clip`] must make this fail. This is the whole point of the
+    /// model: "may sync files, must never read my clipboard".
+    #[test]
+    fn revoking_the_clipboard_permission_refuses_an_otherwise_open_gate() {
+        assert!(
+            !may_share_clip(
+                true,
+                &trusting_without(Permission::Clipboard),
+                &bob(),
+                &negotiated()
+            ),
+            "a device whose clipboard permission was taken away receives no clip"
+        );
+    }
+
+    /// **The permissions are separate bits, not an alias for `approved`.**
+    /// Revoking any *other* permission leaves this gate wide open.
+    #[test]
+    fn revoking_a_different_permission_leaves_clipboard_working() {
+        for other in Permission::ALL
+            .into_iter()
+            .filter(|p| *p != Permission::Clipboard)
+        {
+            assert!(
+                may_share_clip(true, &trusting_without(other), &bob(), &negotiated()),
+                "revoking {other} must not stop clipboard sync"
+            );
+        }
     }
 }
