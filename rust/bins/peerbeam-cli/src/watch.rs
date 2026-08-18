@@ -114,6 +114,9 @@ pub async fn watch(ctx: &Ctx, args: WatchArgs, path_override: Option<&str>) -> C
             let sent = crate::commands::send_paths(
                 ctx,
                 SendArgs {
+                    // A watch sends the moment a file settles; a delay here
+                    // would leave finished files sitting unsent.
+                    at: None,
                     paths: vec![path.to_string_lossy().into_owned()],
                     to: Some(args.to.clone()),
                     addr: None,

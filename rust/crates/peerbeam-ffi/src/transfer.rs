@@ -506,6 +506,10 @@ pub struct Manager {
     notes: peerbeam_notes::NoteStore,
     /// Clipboard history — empty and unwritten unless the user turned it on.
     clip_history: peerbeam_clipboard::ClipHistory,
+    /// A program to run after a received file lands, or empty for none.
+    /// Behind a lock so a settings change reaches the next file rather than the
+    /// next restart.
+    receive_hook: RwLock<String>,
     /// The outbox's own copy of every file waiting to be sent. `Arc` because
     /// `StagingStore` is deliberately not `Clone` (it owns a directory), and
     /// the background send tasks need it alongside `chat`.
@@ -605,6 +609,7 @@ impl Manager {
         chat: ChatStore,
         notes: peerbeam_notes::NoteStore,
         clip_history: peerbeam_clipboard::ClipHistory,
+        receive_hook: String,
         staging: Arc<StagingStore>,
         staging_limits: StagingLimits,
         identity: Identity,
@@ -631,6 +636,7 @@ impl Manager {
             chat,
             notes,
             clip_history,
+            receive_hook: RwLock::new(receive_hook),
             staging,
             staging_limits,
             chat_file_in_flight: Mutex::new(HashSet::new()),
@@ -1889,6 +1895,22 @@ impl Manager {
                 "at": timestamp(),
             })
         };
+        // The receive hook, if the user configured one. **Received files only,
+        // and only successful ones**: a hook that fired on this device's own
+        // sends would run on files that never arrived from anywhere, and one
+        // that fired on a failure would be handed a partial or absent path.
+        //
+        // Read from live config each time, so turning the hook off stops the
+        // next file rather than the next restart.
+        if success && a.direction == "receive" {
+            let hook = self.receive_hook.read().unwrap().clone();
+            if let (Some(p), Some(peer)) = (
+                entry.get("path").and_then(Value::as_str),
+                entry.get("peer_id").and_then(Value::as_str),
+            ) {
+                crate::hook::run(&hook, p, peer);
+            }
+        }
         {
             let mut history = self.history.lock().unwrap();
             history.push(entry);
@@ -5423,6 +5445,9 @@ mod tests {
             chat.clone(),
             peerbeam_notes::NoteStore::new(appstore.clone()),
             peerbeam_clipboard::ClipHistory::new(appstore.clone()),
+            // No hook in tests: running a program per received file would make
+            // the suite depend on this machine's configuration.
+            String::new(),
             staging,
             StagingLimits {
                 max_bytes: u64::MAX,

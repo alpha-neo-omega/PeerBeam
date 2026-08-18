@@ -21,6 +21,17 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   An empty listing is the same answer whether the device shares nothing, has not
   granted you permission, or the folder is gone. That is deliberate: a caller
   able to tell them apart could map a filesystem it may never see.
+- **Receive hooks.** Set `device.receive_hook` to a program and it runs after
+  each received file, with the saved path and the sender's device id as
+  arguments. **Empty by default**, executed directly and **never through a
+  shell**, so a file named `; rm -rf ~` is an argument rather than a command —
+  which is also why it is one program and not a command line. A hook that
+  fails, hangs or does not exist never affects the transfer that already
+  completed.
+- **`peerbeam snippet`** — pipe a log or a command's output straight into a
+  conversation. Oversized input is truncated, not refused.
+- **`peerbeam send --at <when>`** — wait until a time, then send. A delay rather
+  than a scheduler, and it says so: the process must stay running.
 - **An activity view** — one chronological list of transfers, conversations and
   clips, from Home or `peerbeam timeline`. It carries no message bodies and no
   clip text.

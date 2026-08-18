@@ -454,6 +454,7 @@ pub fn init(config_json: &str) -> OpResult {
         chat,
         notes,
         clip_history,
+        config.device.receive_hook.clone(),
         staging,
         staging_limits,
         identity,

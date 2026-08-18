@@ -53,6 +53,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Watch(a) => crate::watch::watch(ctx, a, cfg_override.as_deref()).await,
         Command::Browse(a) => crate::browse::browse(ctx, a, cfg_override.as_deref()).await,
         Command::Sync(a) => crate::browse::sync(ctx, a, cfg_override.as_deref()).await,
+        Command::Snippet(a) => crate::chat::snippet(ctx, a, cfg_override.as_deref()).await,
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -907,13 +908,97 @@ pub(crate) async fn send_paths(
     send(ctx, args, path_override).await
 }
 
+/// A duration in the words people use for one.
+fn humantime(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// How long to wait before a `--at` send, or an error naming what was expected.
+///
+/// Accepts `HH:MM` (the next occurrence, today or tomorrow) and a full RFC-3339
+/// local datetime. Deliberately not a general date parser: two formats people
+/// actually type beat a dozen that each fail differently.
+///
+/// **A delay, not a scheduler.** The process waits, so a reboot cancels it —
+/// which is why the flag's help says to use cron for anything that must
+/// survive one, rather than implying a durability this cannot provide.
+pub(crate) fn delay_until(
+    now: chrono::DateTime<chrono::Local>,
+    when: &str,
+) -> Result<std::time::Duration, CliError> {
+    use chrono::{Duration, NaiveTime, TimeZone};
+
+    let target = if let Ok(t) = NaiveTime::parse_from_str(when.trim(), "%H:%M") {
+        let today = now.date_naive().and_time(t);
+        let candidate = chrono::Local
+            .from_local_datetime(&today)
+            .single()
+            .ok_or_else(|| CliError::Usage(format!("ambiguous local time: {when}")))?;
+        // A time already past today means tomorrow — nobody typing 09:00 at
+        // ten in the morning means "nine hours ago".
+        if candidate <= now {
+            candidate + Duration::days(1)
+        } else {
+            candidate
+        }
+    } else {
+        let naive = chrono::NaiveDateTime::parse_from_str(when.trim(), "%Y-%m-%dT%H:%M:%S")
+            .map_err(|_| {
+                CliError::Usage(format!(
+                    "could not read {when} as a time — use HH:MM or YYYY-MM-DDTHH:MM:SS"
+                ))
+            })?;
+        chrono::Local
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or_else(|| CliError::Usage(format!("ambiguous local time: {when}")))?
+    };
+
+    let delta = target - now;
+    if delta <= Duration::zero() {
+        return Err(CliError::Usage(format!(
+            "{when} is in the past — nothing to wait for"
+        )));
+    }
+    delta
+        .to_std()
+        .map_err(|_| CliError::Usage(format!("{when} is too far away")))
+}
+
 async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResult {
+    // Waited out **before** the peer is resolved: looking a device up now and
+    // dialling it in six hours would use an address that has almost certainly
+    // changed. Paths are validated first, though — a typo should fail at once
+    // rather than at nine tomorrow morning.
+    let wait = args
+        .at
+        .as_deref()
+        .map(|when| delay_until(chrono::Local::now(), when))
+        .transpose()?;
+
     // Validate every path up front so a bad entry fails the whole call
     // before anything is sent.
     for p in &args.paths {
         if !std::path::Path::new(p).exists() {
             return Err(CliError::NotFound(format!("path {p}")));
         }
+    }
+
+    if let Some(delay) = wait {
+        // Said plainly: this is a delay, and a reboot cancels it. Implying a
+        // durability the process cannot provide would be worse than the wait.
+        ctx.line(&ctx.dim(&format!(
+            "waiting {} — this process must stay running",
+            humantime(delay)
+        )));
+        tokio::time::sleep(delay).await;
     }
 
     let config = load_config(path_override)?;
@@ -2365,6 +2450,7 @@ async fn clipboard_send(
     std::fs::write(&tmp, &text)?;
 
     let send_args = SendArgs {
+        at: None,
         paths: vec![tmp.to_string_lossy().into_owned()],
         to,
         addr,
@@ -3169,5 +3255,54 @@ mod clipboard_history_tests {
     fn a_multi_line_clip_is_previewed_by_its_first_line_only() {
         assert_eq!(super::abbreviate("first\nsecond\nthird"), "first");
         assert_eq!(super::abbreviate(""), "");
+    }
+}
+
+#[cfg(test)]
+mod scheduled_send_tests {
+    use super::delay_until;
+    use chrono::{Local, TimeZone};
+
+    fn at(h: u32, m: u32) -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 19, h, m, 0)
+            .single()
+            .expect("a real local time")
+    }
+
+    #[test]
+    fn a_time_later_today_waits_until_today() {
+        let d = delay_until(at(9, 0), "17:30").expect("a valid time");
+        assert_eq!(d.as_secs(), 8 * 3600 + 30 * 60);
+    }
+
+    /// Nobody typing `09:00` at ten in the morning means nine hours ago.
+    #[test]
+    fn a_time_already_past_means_tomorrow() {
+        let d = delay_until(at(10, 0), "09:00").expect("a valid time");
+        assert_eq!(d.as_secs(), 23 * 3600);
+    }
+
+    #[test]
+    fn a_full_datetime_is_accepted() {
+        let d = delay_until(at(9, 0), "2026-08-19T09:30:00").expect("a valid time");
+        assert_eq!(d.as_secs(), 30 * 60);
+    }
+
+    #[test]
+    fn a_past_datetime_is_refused_rather_than_sent_immediately() {
+        // Sending at once would be a surprise: the user asked for a time, and
+        // silently ignoring it is not the same as honouring it.
+        assert!(delay_until(at(9, 0), "2026-08-19T08:00:00").is_err());
+    }
+
+    #[test]
+    fn unreadable_input_says_what_was_expected() {
+        let err = delay_until(at(9, 0), "next tuesday").expect_err("not a time");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HH:MM"),
+            "the error did not name a format: {msg}"
+        );
     }
 }

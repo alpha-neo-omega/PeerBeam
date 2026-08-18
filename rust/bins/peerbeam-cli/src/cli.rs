@@ -79,6 +79,8 @@ pub enum Command {
     Browse(BrowseArgs),
     /// Mirror a device's shared folder into a local directory.
     Sync(SyncArgs),
+    /// Send piped text — a log, a command's output, a snippet — as a message.
+    Snippet(SnippetArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -194,6 +196,14 @@ pub struct SendArgs {
     /// Target device (id, name, or name prefix). Omit to pick interactively.
     #[arg(long)]
     pub to: Option<String>,
+    /// Wait until this local time before sending, e.g. `2026-08-20T09:00:00`
+    /// or `09:00` for the next occurrence today or tomorrow.
+    ///
+    /// The process stays running until then — this is a delay, not a system
+    /// scheduler, and it is named as one. For anything that must survive a
+    /// reboot, use cron or a systemd timer and call `peerbeam send` from it.
+    #[arg(long, value_name = "WHEN")]
+    pub at: Option<String>,
     /// Dial a peer directly at `IP:PORT`, skipping discovery (headless/testing).
     #[arg(long, value_name = "IP:PORT", conflicts_with = "to")]
     pub addr: Option<String>,
@@ -463,6 +473,22 @@ pub enum TrustAction {
 ///
 /// Requires the peer to have granted this machine both `browse` (to see what
 /// exists) and `files` (to receive any of it).
+/// Send whatever is on stdin to a device as a chat message.
+///
+/// `cargo test 2>&1 | peerbeam snippet --to laptop`. It is `chat send` with the
+/// text coming from a pipe, which is the shape terminal output actually has —
+/// and it goes to the conversation rather than becoming a file, because a
+/// snippet is something you read, not something you save.
+#[derive(Args)]
+pub struct SnippetArgs {
+    /// Target device (id, name, or unambiguous name prefix).
+    #[arg(long)]
+    pub to: String,
+    /// A line to put above the snippet, e.g. what produced it.
+    #[arg(long)]
+    pub title: Option<String>,
+}
+
 #[derive(Args)]
 pub struct SyncArgs {
     /// Target device (id, name, or unambiguous name prefix).

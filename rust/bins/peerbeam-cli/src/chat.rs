@@ -998,6 +998,50 @@ async fn send_file(
 /// that outlives that process — the queue entry, the bytes, and a row left
 /// stranded by a send that was interrupted (Ctrl-C during a stage leaves
 /// exactly that).
+/// `peerbeam snippet --to <PEER> [--title T]` — send stdin as a message.
+///
+/// Terminal output arrives on a pipe, so that is where this reads it from.
+/// **Truncated to fit a chat message rather than refused**: a 200 MB log piped
+/// by accident should not fail with a size error after the command that
+/// produced it has already finished — the head of it is what someone wanted to
+/// show anyway, and the message says it was cut.
+pub async fn snippet(
+    ctx: &Ctx,
+    args: crate::cli::SnippetArgs,
+    path_override: Option<&str>,
+) -> CliResult {
+    use std::io::Read;
+
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        .map_err(|e| CliError::Other(format!("reading the snippet from stdin: {e}")))?;
+    if body.trim().is_empty() {
+        return Err(CliError::Usage(
+            "nothing on stdin — pipe something in, e.g. `cmd | peerbeam snippet --to laptop`"
+                .into(),
+        ));
+    }
+
+    let title = args.title.map(|t| format!("{t}\n")).unwrap_or_default();
+    // Leave room for the title and the truncation notice, so the assembled
+    // message is inside the cap rather than just the body.
+    const NOTICE: &str = "\n… (truncated)";
+    let room = peerbeam_chat::MAX_BODY - title.len() - NOTICE.len();
+    let text = if body.len() > room {
+        // Cut on a char boundary: slicing a UTF-8 string mid-character panics.
+        let mut cut = room;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{title}{}{NOTICE}", &body[..cut])
+    } else {
+        format!("{title}{body}")
+    };
+
+    send(ctx, Some(args.to), None, text, path_override).await
+}
+
 /// `peerbeam chat react <PEER> <ID> <EMOJI> [--remove]`.
 ///
 /// Applies to this device's own history first and regardless of reachability —

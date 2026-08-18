@@ -111,6 +111,22 @@ pub struct DeviceConfig {
     /// A path that cannot be resolved is dropped rather than kept: an
     /// unresolvable root cannot be compared against safely.
     pub shared_directories: Vec<String>,
+    /// A command to run after a file is received, or empty for none.
+    ///
+    /// **Empty by default.** Running a program because someone sent you a file
+    /// is a large amount of trust, and it is trust in *this machine's own
+    /// configuration*, never in the peer: nothing a sender controls decides
+    /// whether a hook runs or which one.
+    ///
+    /// Executed directly, **never through a shell** — the received path is
+    /// passed as a single argument, so a file named `; rm -rf ~` is an
+    /// argument, not a command. That is why this is one program and not a
+    /// command line: supporting `cmd && other` would mean invoking a shell,
+    /// and a shell is exactly what must not see a peer-supplied name.
+    ///
+    /// The hook receives the saved path as argv\[1\], the sender's device id as
+    /// argv\[2\], and nothing else.
+    pub receive_hook: String,
 }
 
 /// Discovery configuration.
@@ -207,6 +223,7 @@ impl Default for DeviceConfig {
             share_read_receipts: false,
             clipboard_history: false,
             shared_directories: Vec::new(),
+            receive_hook: String::new(),
         }
     }
 }

@@ -259,6 +259,15 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `snippet --to <peer> [--title T]` — send piped text as a message:
+  `cargo test 2>&1 | peerbeam snippet --to laptop`. Oversized input is
+  truncated rather than refused — a long log piped by accident should not fail
+  after the command that produced it has finished, and the message says it was
+  cut.
+- `send … --at <when>` — wait until `HH:MM` (next occurrence) or
+  `YYYY-MM-DDTHH:MM:SS`, then send. **A delay, not a scheduler**: the process
+  must stay running, so use cron or a systemd timer for anything that has to
+  survive a reboot.
 - `sync <peer> <path> <into>` — mirror a device's shared folder into a local
   directory. **One-way pull**: nothing local is deleted, nothing is pushed back,
   and a local file newer than the peer's copy is left alone. Needs both `browse`
