@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-18 — Beta
+
 ### Added
 - **Chat search: find a message in your own history.** Every surface can now
   search this device's stored conversations — the **text of messages** and the
