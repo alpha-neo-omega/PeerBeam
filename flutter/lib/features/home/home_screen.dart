@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../notes/notes_screen.dart';
+
 import '../../app/theme.dart';
 import '../../data/saved_devices_repository.dart' show SavedDevice;
 import '../../platform/desktop_files.dart';
@@ -191,8 +193,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   final p = int.tryParse(port.text.trim()) ?? 0;
                   if (h.isEmpty || p <= 0 || p > 65535) {
                     setState(
-                      () => error =
-                          'Enter a host and a port between 1 and 65535',
+                      () =>
+                          error = 'Enter a host and a port between 1 and 65535',
                     );
                     return;
                   }
@@ -269,8 +271,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   final p = int.tryParse(port.text.trim()) ?? 0;
                   if (h.isEmpty || p <= 0 || p > 65535) {
                     setState(
-                      () => error =
-                          'Enter a host and a port between 1 and 65535',
+                      () =>
+                          error = 'Enter a host and a port between 1 and 65535',
                     );
                     return;
                   }
@@ -351,8 +353,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   final p = int.tryParse(port.text.trim()) ?? 0;
                   if (h.isEmpty || p <= 0 || p > 65535) {
                     setState(
-                      () => error =
-                          'Enter a host and a port between 1 and 65535',
+                      () =>
+                          error = 'Enter a host and a port between 1 and 65535',
                     );
                     return;
                   }
@@ -500,6 +502,25 @@ class _HomeScreenState extends State<HomeScreen> {
                           ? const BrandLockup()
                           : null,
                       actions: [
+                        // Notes live here rather than in the navigation bar: a
+                        // seventh destination would push a phone's bottom bar
+                        // well past the three-to-five Material calls readable,
+                        // and notes are not a place you spend a session — they
+                        // are somewhere you drop in and leave.
+                        IconButton(
+                          icon: const Icon(Icons.sticky_note_2_outlined),
+                          tooltip: 'Notes',
+                          // Pushed, not a shell branch: the branches are
+                          // index-for-index with the navigation destinations,
+                          // and adding a seventh branch silently re-pointed
+                          // every tab after it. Chat detail is opened the same
+                          // way, for the same reason.
+                          onPressed: () => Navigator.of(context).push(
+                            MaterialPageRoute<void>(
+                              builder: (_) => const NotesScreen(),
+                            ),
+                          ),
+                        ),
                         IconButton(
                           icon: const Icon(Icons.dns_rounded),
                           tooltip: 'Send to address',
@@ -658,9 +679,14 @@ class _HomeScreenState extends State<HomeScreen> {
                                 // see `_discovered`. Null hides the action
                                 // rather than offering a thread whose replies
                                 // would be filed somewhere else.
-                                onChat: switch (_discovered(context, saved[i])) {
-                                  final Device found => () =>
-                                      _chatWith(context, found),
+                                onChat: switch (_discovered(
+                                  context,
+                                  saved[i],
+                                )) {
+                                  final Device found => () => _chatWith(
+                                    context,
+                                    found,
+                                  ),
                                   null => null,
                                 },
                                 onShare: () => _shareSaved(context, saved[i]),

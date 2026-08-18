@@ -809,6 +809,41 @@ class ChatSearchHit {
 
 /// What a history search found — and whether that was all there was.
 @immutable
+/// One note.
+///
+/// A deleted note is never handed to the app: the engine keeps a tombstone so a
+/// deletion can reach other devices, and that is a sync concern, not something
+/// a list should render.
+class Note {
+  final String id;
+  final String title;
+  final String body;
+  final DateTime updatedAt;
+
+  const Note({
+    required this.id,
+    required this.title,
+    required this.body,
+    required this.updatedAt,
+  });
+
+  /// What a list shows for this note: its title, or its first line when it has
+  /// none. Plenty of notes are one line of text and never earn a heading.
+  String get heading {
+    if (title.isNotEmpty) return title;
+    final first = body.split('\n').first.trim();
+    return first.isEmpty ? 'Untitled' : first;
+  }
+
+  factory Note.fromJson(Map<String, dynamic> j) => Note(
+    id: j['id'] as String? ?? '',
+    title: j['title'] as String? ?? '',
+    body: j['body'] as String? ?? '',
+    updatedAt:
+        DateTime.tryParse(j['updated_at'] as String? ?? '') ?? DateTime.now(),
+  );
+}
+
 class ChatSearchResults {
   /// Newest first, tie-broken by peer id then message id so the order is stable
   /// between runs.

@@ -514,6 +514,55 @@ class FakePeerBeam implements PeerBeamApi {
     return (applied: true, delivered: reactDelivered);
   }
 
+  /// The notes this fake holds, newest edit first once listed. Tombstones are
+  /// modelled the way the engine models them — a deleted note stays here so a
+  /// test can prove it is neither listed nor editable.
+  final List<Note> notes = [];
+  final Set<String> deletedNotes = {};
+  int _noteSeq = 0;
+
+  @override
+  Future<List<Note>> notesList() async {
+    calls.add('notesList');
+    final live = notes.where((n) => !deletedNotes.contains(n.id)).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return live;
+  }
+
+  @override
+  Future<String> notesCreate(String body, {String title = ''}) async {
+    calls.add('notesCreate:$title');
+    final id = 'note-${++_noteSeq}';
+    notes.add(
+      Note(id: id, title: title, body: body, updatedAt: DateTime.now()),
+    );
+    return id;
+  }
+
+  @override
+  Future<bool> notesEdit(String id, String body, {String title = ''}) async {
+    calls.add('notesEdit:$id');
+    if (deletedNotes.contains(id)) return false;
+    final i = notes.indexWhere((n) => n.id == id);
+    if (i < 0) return false;
+    notes[i] = Note(
+      id: id,
+      title: title,
+      body: body,
+      updatedAt: DateTime.now(),
+    );
+    return true;
+  }
+
+  @override
+  Future<bool> notesDelete(String id) async {
+    calls.add('notesDelete:$id');
+    if (deletedNotes.contains(id)) return false;
+    if (!notes.any((n) => n.id == id)) return false;
+    deletedNotes.add(id);
+    return true;
+  }
+
   /// What the engine would report. False models the default: receipts off.
   bool markReadSent = false;
 

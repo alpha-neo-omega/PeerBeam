@@ -25,6 +25,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/data/chat_repository.dart';
+import 'package:peerbeam/data/notes_repository.dart';
 import 'package:peerbeam/data/clipboard_sync.dart';
 import 'package:peerbeam/data/discovery_repository.dart';
 import 'package:peerbeam/data/history_repository.dart';
@@ -108,6 +109,7 @@ Widget _settingsApp(SettingsStore settings) => AppScope(
     saved: SavedDevicesRepository(),
     trust: TrustRepository(),
     chat: ChatRepository(),
+    notes: NotesRepository(),
     presence: PresenceRepository(),
     settings: settings,
     staging: StagingStore(),

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../data/chat_repository.dart';
+import '../data/notes_repository.dart';
 import '../data/clipboard_sync.dart';
 import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
@@ -295,6 +296,7 @@ class AppState {
   final SavedDevicesRepository saved;
   final TrustRepository trust;
   final ChatRepository chat;
+  final NotesRepository notes;
   final PresenceRepository presence;
   final SettingsStore settings;
   final StagingStore staging;
@@ -316,6 +318,7 @@ class AppState {
     required this.saved,
     required this.trust,
     required this.chat,
+    required this.notes,
     required this.presence,
     required this.settings,
     required this.staging,
@@ -349,6 +352,7 @@ class AppState {
       saved: SavedDevicesRepository()..load(),
       trust: trust,
       chat: ChatRepository(api: api),
+      notes: NotesRepository(api: api),
       presence: PresenceRepository(api: api),
       settings: settings,
       staging: StagingStore(),

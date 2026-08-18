@@ -75,6 +75,10 @@ class Bindings {
   final _ArgRetDart _chatSearch;
   final _ArgRetDart _chatReact;
   final _ArgRetDart _chatMarkRead;
+  final _ArgRetDart _notesList;
+  final _ArgRetDart _notesCreate;
+  final _ArgRetDart _notesEdit;
+  final _ArgRetDart _notesDelete;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -156,6 +160,10 @@ class Bindings {
       _chatSearch = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_search'),
       _chatReact = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_react'),
       _chatMarkRead = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_mark_read'),
+      _notesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_list'),
+      _notesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_create'),
+      _notesEdit = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_edit'),
+      _notesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_delete'),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -223,6 +231,10 @@ class Bindings {
   String chatSearch(String json) => _withArg(json, _chatSearch);
   String chatReact(String json) => _withArg(json, _chatReact);
   String chatMarkRead(String json) => _withArg(json, _chatMarkRead);
+  String notesList(String json) => _withArg(json, _notesList);
+  String notesCreate(String json) => _withArg(json, _notesCreate);
+  String notesEdit(String json) => _withArg(json, _notesEdit);
+  String notesDelete(String json) => _withArg(json, _notesDelete);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);

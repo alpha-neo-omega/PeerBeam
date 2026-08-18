@@ -301,6 +301,20 @@ abstract class PeerBeamApi {
   /// is never, by itself, consent to report having read it.
   Future<bool> chatMarkRead(String peerId, String readThrough);
 
+  /// Every live note, newest edit first. Deleted notes are never returned.
+  Future<List<Note>> notesList();
+
+  /// Create a note, returning its id.
+  Future<String> notesCreate(String body, {String title = ''});
+
+  /// Replace a note's content. `false` means no such note, or one that has been
+  /// deleted — editing a tombstone would resurrect it.
+  Future<bool> notesEdit(String id, String body, {String title = ''});
+
+  /// Delete a note, leaving a tombstone so the deletion can reach other
+  /// devices. `false` means there was nothing to delete.
+  Future<bool> notesDelete(String id);
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -618,6 +632,34 @@ class PeerBeam implements PeerBeamApi {
       ),
     );
     return data['sent'] == true;
+  }
+
+  @override
+  Future<List<Note>> notesList() async {
+    final data = _data(_req().notesList('{}'));
+    return _list(data['notes']).map(Note.fromJson).toList();
+  }
+
+  @override
+  Future<String> notesCreate(String body, {String title = ''}) async {
+    final data = _data(
+      _req().notesCreate(jsonEncode({'title': title, 'body': body})),
+    );
+    return data['id'] as String;
+  }
+
+  @override
+  Future<bool> notesEdit(String id, String body, {String title = ''}) async {
+    final data = _data(
+      _req().notesEdit(jsonEncode({'id': id, 'title': title, 'body': body})),
+    );
+    return data['updated'] == true;
+  }
+
+  @override
+  Future<bool> notesDelete(String id) async {
+    final data = _data(_req().notesDelete(jsonEncode({'id': id})));
+    return data['deleted'] == true;
   }
 
   @override
