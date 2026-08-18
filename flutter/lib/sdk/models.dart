@@ -454,8 +454,11 @@ abstract final class PeerBeamPermission {
   /// Have an inbound `peerbeam pipe` accepted by a listening terminal.
   static const pipe = 'pipe';
 
+  /// Exchange notes with this device.
+  static const notes = 'notes';
+
   /// Every permission this build can render, in the engine's slot order.
-  static const all = <String>[files, chat, clipboard, presence, pipe];
+  static const all = <String>[files, chat, clipboard, presence, pipe, notes];
 
   /// The switch label for `permission`.
   static String label(String permission) => switch (permission) {
@@ -464,6 +467,7 @@ abstract final class PeerBeamPermission {
     clipboard => 'Clipboard',
     presence => 'Device status',
     pipe => 'Pipes',
+    notes => 'Notes',
     _ => permission,
   };
 
@@ -475,6 +479,7 @@ abstract final class PeerBeamPermission {
     clipboard => 'Send this device your clipboard when sync is on',
     presence => 'Send this device your battery, disk and network status',
     pipe => 'Let it pipe data into a listening terminal here',
+    notes => 'Keep your notes in sync with this device',
     _ => '',
   };
 }

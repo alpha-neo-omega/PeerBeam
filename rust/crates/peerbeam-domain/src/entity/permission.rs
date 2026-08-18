@@ -60,6 +60,15 @@ pub enum Permission {
     Presence,
     /// Have an inbound `peerbeam pipe` accepted by a listening terminal.
     Pipe,
+    /// Exchange notes with this device.
+    ///
+    /// The roadmap calls notes *"synced to your own devices"*, and PeerBeam has
+    /// no notion of owning a device — only of trusting one. This permission
+    /// **is** that notion, made explicit and per-device: a device syncs your
+    /// notes because you said it may, not because something inferred that it is
+    /// yours. Granting it to a colleague's laptop is possible and is your
+    /// decision to make; nothing pretends to know better.
+    Notes,
 }
 
 impl Permission {
@@ -68,12 +77,13 @@ impl Permission {
     /// Used to render a device's grants and to drive the "each permission gates
     /// its own feature" tests. It is **not** the legacy default and must never
     /// be used as one — see [`PermissionSet::granted_on_approval`].
-    pub const ALL: [Permission; 5] = [
+    pub const ALL: [Permission; 6] = [
         Permission::Files,
         Permission::Chat,
         Permission::Clipboard,
         Permission::Presence,
         Permission::Pipe,
+        Permission::Notes,
     ];
 
     /// This permission's permanent bit position.
@@ -89,6 +99,11 @@ impl Permission {
             Permission::Clipboard => 2,
             Permission::Presence => 3,
             Permission::Pipe => 4,
+            // Slot 5, the first assigned after `granted_on_approval` was
+            // frozen — so every device trusted before this build is denied it
+            // until the user grants it, by construction rather than by a
+            // version check.
+            Permission::Notes => 5,
         }
     }
 
@@ -111,6 +126,7 @@ impl Permission {
             Permission::Clipboard => "clipboard",
             Permission::Presence => "presence",
             Permission::Pipe => "pipe",
+            Permission::Notes => "notes",
         }
     }
 
@@ -344,7 +360,12 @@ mod tests {
     /// were — the property the whole model rests on.
     #[test]
     fn setting_one_permission_does_not_disturb_the_others() {
-        let all = PermissionSet::granted_on_approval();
+        // Every permission this build knows, not the frozen approval set: a
+        // permission assigned after the freeze is absent for its own reason,
+        // and starting from the approval set would blame the revocation for it.
+        let all = Permission::ALL
+            .into_iter()
+            .fold(PermissionSet::none(), |set, p| set.set(p, true));
         for target in Permission::ALL {
             let without = all.set(target, false);
             assert!(!without.grants(target));
@@ -407,11 +428,30 @@ mod tests {
         }
     }
 
+    /// `granted_on_approval` is **frozen** at the permissions that existed when
+    /// approval last meant "everything". It is deliberately no longer equal to
+    /// [`Permission::ALL`]: `Notes` was added afterwards, so a device approved
+    /// before this build does not silently acquire it.
+    ///
+    /// Asserting the exact list — rather than `ALL` — is the point. Written as
+    /// `Permission::ALL`, this test would keep passing while every future
+    /// permission was handed to every already-trusted device, which is the one
+    /// failure the frozen constant exists to prevent.
     #[test]
-    fn granted_lists_in_slot_order() {
+    fn granted_lists_in_slot_order_and_excludes_later_permissions() {
         assert_eq!(
             PermissionSet::granted_on_approval().granted(),
-            Permission::ALL.to_vec()
+            vec![
+                Permission::Files,
+                Permission::Chat,
+                Permission::Clipboard,
+                Permission::Presence,
+                Permission::Pipe,
+            ]
+        );
+        assert!(
+            !PermissionSet::granted_on_approval().grants(Permission::Notes),
+            "a permission added after the freeze was granted by approval alone"
         );
     }
 }

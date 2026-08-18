@@ -135,20 +135,52 @@ mod tests {
     fn an_approved_device_may_what_it_was_granted() {
         let store = Store::Holds(record(true, PermissionSet::granted_on_approval()));
         for p in Permission::ALL {
-            assert!(store.may(&bob(), p), "{p} was granted");
+            let granted = PermissionSet::granted_on_approval().grants(p);
+            assert_eq!(
+                store.may(&bob(), p),
+                granted,
+                "{p}: may() disagreed with what approval actually granted"
+            );
         }
     }
 
+    /// The upgrade rule, stated as behaviour rather than as a constant: a
+    /// device approved before a permission existed must be refused that
+    /// permission until someone grants it. `Notes` is slot 5, assigned after
+    /// `granted_on_approval` was frozen, so it is the real case rather than a
+    /// hypothetical one.
+    #[test]
+    fn approval_predating_a_permission_does_not_confer_it() {
+        let store = Store::Holds(record(true, PermissionSet::granted_on_approval()));
+        assert!(
+            !store.may(&bob(), Permission::Notes),
+            "a device trusted before notes existed was allowed to sync them"
+        );
+
+        let store = Store::Holds(record(
+            true,
+            PermissionSet::granted_on_approval().set(Permission::Notes, true),
+        ));
+        assert!(
+            store.may(&bob(), Permission::Notes),
+            "granting the permission explicitly must still work"
+        );
+    }
+
     /// **Permissions are separate bits, not an alias for `approved`.** Revoking
-    /// one must leave the other four answering `true` — a `may` that ignored
-    /// its `permission` argument would fail this.
+    /// one must leave every other *granted* permission answering `true` — a
+    /// `may` that ignored its `permission` argument would fail this.
     #[test]
     fn revoking_one_permission_leaves_the_others() {
+        // Start from a device holding *every* permission this build knows, not
+        // just the ones approval grants — otherwise a permission added after
+        // the freeze (`Notes`) is absent for its own reason and the test would
+        // report it as collateral damage from the revocation under test.
+        let all = Permission::ALL
+            .into_iter()
+            .fold(PermissionSet::none(), |set, p| set.set(p, true));
         for target in Permission::ALL {
-            let store = Store::Holds(record(
-                true,
-                PermissionSet::granted_on_approval().set(target, false),
-            ));
+            let store = Store::Holds(record(true, all.set(target, false)));
             assert!(!store.may(&bob(), target), "{target} was revoked");
             for other in Permission::ALL.into_iter().filter(|p| *p != target) {
                 assert!(
