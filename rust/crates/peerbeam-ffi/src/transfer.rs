@@ -444,6 +444,31 @@ pub(crate) fn admit_transfer(
     FileAdmission::Prompt
 }
 
+/// The `files` permission on the **outbound** path, as an [`Op`]-shaped refusal.
+///
+/// The mirror of [`admit_transfer`]'s first leg, and deliberately the same
+/// shape: a device the user narrowed is refused, a device they never decided
+/// about is not. Sending to a merely-pinned peer must keep working — that is
+/// the ordinary "spot a device, send it a file" flow, and gating it on `may`
+/// (which implies approval) would break the app's primary purpose for every
+/// device the user has not explicitly accepted.
+///
+/// Without this, revoking `files` stopped that device's files arriving but left
+/// this device happily sending to it, which is not what "Send and receive files
+/// with this device" says on the switch.
+fn permit_send_files(trust: &dyn TrustStore, peer: &DeviceId) -> Result<(), (Code, String)> {
+    if trust.is_approved(peer) && !trust.may(peer, Permission::Files) {
+        return Err((
+            Code::PermissionDenied,
+            format!(
+                "this device may not exchange files with {} — its Files permission was turned off",
+                peer.0
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The `chat` permission, as an [`Op`]-shaped refusal.
 ///
 /// Thin on purpose: [`peerbeam_chat::may_exchange_chat`] is the decision and
@@ -1021,6 +1046,7 @@ impl Manager {
     /// a specific id needs that exact id or an error, never a different one.
     pub fn send(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
+        permit_send_files(self.trust.as_ref(), &device.id)?;
         let requested_id = match req.get("transfer_id") {
             None | Some(Value::Null) => None,
             Some(v) => Some(valid_transfer_id(v)?),
@@ -1110,6 +1136,7 @@ impl Manager {
     /// Queue a folder to a peer.
     pub fn send_folder(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
+        permit_send_files(self.trust.as_ref(), &device.id)?;
         let path = req
             .get("path")
             .and_then(|p| p.as_str())
@@ -6318,6 +6345,54 @@ mod tests {
             &peer,
             &id
         ));
+    }
+
+    // ── permit_send_files: the `files` permission on the SEND path ─────────
+    //
+    // `admit_transfer` covers what arrives. These cover what leaves, which the
+    // switch's own wording ("Send and receive files with this device") promises
+    // and which nothing enforced until now.
+
+    /// The flow the app exists for: spot a device, send it a file. It has never
+    /// required approval and must not start — `may` implies approval, so gating
+    /// on it alone would refuse every device the user has not explicitly
+    /// accepted.
+    #[test]
+    fn sending_to_a_merely_pinned_device_is_still_permitted() {
+        let trust = AdmitTrust {
+            pinned: true,
+            approved: false,
+            permissions: peerbeam_domain::entity::PermissionSet::none(),
+        };
+        assert!(permit_send_files(&trust, &admit_peer()).is_ok());
+    }
+
+    /// An approved device the user narrowed is refused in *both* directions.
+    #[test]
+    fn sending_to_an_approved_device_without_files_is_refused() {
+        let trust = admit_approved_without(Permission::Files);
+        let err = permit_send_files(&trust, &admit_peer()).expect_err("must refuse");
+        assert!(
+            matches!(err.0, Code::PermissionDenied),
+            "a narrowed device is a permission refusal, not a generic failure"
+        );
+    }
+
+    /// ...and revoking `files` does not quietly take anything else with it.
+    #[test]
+    fn revoking_another_permission_leaves_sending_alone() {
+        for other in [
+            Permission::Chat,
+            Permission::Clipboard,
+            Permission::Presence,
+            Permission::Pipe,
+        ] {
+            let trust = admit_approved_without(other);
+            assert!(
+                permit_send_files(&trust, &admit_peer()).is_ok(),
+                "revoking {other:?} must not stop file sends"
+            );
+        }
     }
 
     // ── admit_transfer: the `files` permission on the accept path ──────────

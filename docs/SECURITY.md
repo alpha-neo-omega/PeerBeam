@@ -567,6 +567,26 @@ nothing — auto-accept requires `approved`, which only an explicit
 accept-and-trust sets (I6). Pinned devices are listed with their fingerprints in
 Trusted Devices and `peerbeam trust list`.
 
+### What each permission actually stops
+
+A permission is checked where the code can enforce it, and the two file-shaped
+ones are not symmetric. Worth stating plainly, because a switch whose scope is
+guessed at is a switch people trust wrongly:
+
+- **Files** — enforced in **both** directions. Inbound, `admit_transfer` refuses
+  an approved device whose `files` was turned off. Outbound, `permit_send_files`
+  refuses the same device before a path is validated. Neither refuses a
+  *merely pinned* peer: sending to a device you have just discovered has never
+  required approval, and gating it on `may` (which implies approval) would break
+  the app's primary flow.
+- **Messages** — enforced on **sending only**. Revoking it means this device
+  will not message that one; it does not stop that device messaging here. Chat
+  has never required approval to receive, and the inbound path would need the
+  chat handler to carry the trust store. The switch is worded "Send messages to
+  this device" so it does not promise the half that is not there.
+- **Clipboard**, **Device status** — send-side by nature: they gate what leaves.
+- **Pipes** — receive-side by nature: it gates what a listening terminal accepts.
+
 ## Bulk approval is accept-once, never trust
 
 The Transfers screen offers **Accept all** / **Decline all** when two or more

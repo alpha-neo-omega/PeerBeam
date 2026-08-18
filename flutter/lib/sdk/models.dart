@@ -471,7 +471,7 @@ abstract final class PeerBeamPermission {
   /// switch is never a word with no consequence attached.
   static String description(String permission) => switch (permission) {
     files => 'Send and receive files with this device',
-    chat => 'Exchange messages with this device',
+    chat => 'Send messages to this device',
     clipboard => 'Send this device your clipboard when sync is on',
     presence => 'Send this device your battery, disk and network status',
     pipe => 'Let it pipe data into a listening terminal here',
