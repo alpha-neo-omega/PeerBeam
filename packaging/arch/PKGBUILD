@@ -1,0 +1,36 @@
+# Maintainer: PeerBeam Contributors <noreply@peerbeam>
+#
+# Builds from the release tarball rather than from source: the upstream artifact
+# is a prebuilt Flutter bundle plus the Rust engine, and rebuilding it here would
+# produce a different binary than the one that was tested and released.
+#
+# Usage:
+#   cd packaging/arch && makepkg -si
+pkgname=peerbeam
+pkgver=0.8.0
+pkgrel=1
+pkgdesc="Zero-configuration, secure, cross-platform file & clipboard sharing"
+arch=('x86_64')
+url="https://github.com/alpha-neo-omega/PeerBeam"
+license=('AGPL-3.0-or-later')
+depends=('gtk3')
+options=('!strip')   # the bundle ships already-stripped binaries
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/peerbeam-$pkgver-linux-x64.tar.gz")
+# Replace with the real digest for the version you are packaging:
+#   makepkg -g
+sha256sums=('SKIP')
+
+package() {
+  # The tarball already carries the FHS layout the package needs.
+  cp -a "$srcdir/opt" "$pkgdir/opt"
+  install -d "$pkgdir/usr/bin"
+  ln -sf "/opt/$pkgname/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 "$srcdir/usr/share/applications/$pkgname.desktop" \
+    "$pkgdir/usr/share/applications/$pkgname.desktop"
+  for s in 32 64 128 256 512; do
+    icon="$srcdir/usr/share/icons/hicolor/${s}x${s}/apps/$pkgname.png"
+    [ -f "$icon" ] && install -Dm644 "$icon" \
+      "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/$pkgname.png"
+  done
+  return 0
+}

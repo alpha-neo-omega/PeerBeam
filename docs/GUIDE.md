@@ -20,8 +20,10 @@ Everything is attached to the release:
 
 | You want | File |
 |---|---|
-| Linux app (portable) | `peerbeam-<ver>-linux-x64.tar.gz` |
-| Linux app (Debian/Ubuntu) | `peerbeam-<ver>-amd64.deb` |
+| Linux app (Debian/Ubuntu family) | `peerbeam-<ver>-amd64.deb` |
+| Linux app (Fedora/RHEL/openSUSE) | `peerbeam-<ver>-x86_64.rpm` |
+| Linux app (any distribution) | `PeerBeam-<ver>-x86_64.AppImage` |
+| Linux app (portable tarball) | `peerbeam-<ver>-linux-x64.tar.gz` |
 | Windows app | `peerbeam-<ver>-windows-x64-portable.zip` |
 | macOS app | `PeerBeam-<ver>.dmg` |
 | Android app | `peerbeam-<ver>-android.apk` |
@@ -39,21 +41,66 @@ one machine is normal and they share the same identity, trust store and history.
 
 ### Linux
 
-Portable:
+Pick the row for your distribution. All of them install the same build; only the
+packaging differs.
+
+| Distribution | Package | Command |
+|---|---|---|
+| Ubuntu · Debian · Mint · Pop!_OS · elementary · Zorin | `.deb` | `sudo apt install ./peerbeam-<ver>-amd64.deb` |
+| Fedora · RHEL · Rocky · Alma · CentOS Stream | `.rpm` | `sudo dnf install ./peerbeam-<ver>-x86_64.rpm` |
+| openSUSE (Leap · Tumbleweed) | `.rpm` | `sudo zypper install --allow-unsigned-rpm ./peerbeam-<ver>-x86_64.rpm` |
+| Arch · Manjaro · EndeavourOS · Garuda | `PKGBUILD` | see below |
+| Anything else (NixOS, Void, Gentoo, Alpine, Slackware…) | `.AppImage` or `.tar.gz` | see below |
+
+**AppImage — works on any distribution, installs nothing:**
+```bash
+chmod +x PeerBeam-<ver>-x86_64.AppImage
+./PeerBeam-<ver>-x86_64.AppImage
+```
+Needs FUSE. If your system lacks it (common on minimal or containerised
+installs), run it without mounting:
+```bash
+./PeerBeam-<ver>-x86_64.AppImage --appimage-extract-and-run
+```
+
+**Portable tarball — no root required:**
 ```bash
 tar xzf peerbeam-<ver>-linux-x64.tar.gz
 ./opt/peerbeam/peerbeam
 ```
 
-System-wide:
+System-wide from the same tarball:
 ```bash
 sudo cp -r opt/peerbeam /opt/
 sudo ln -sf /opt/peerbeam/peerbeam /usr/bin/peerbeam
 sudo cp usr/share/applications/peerbeam.desktop /usr/share/applications/
 sudo cp -r usr/share/icons/hicolor/* /usr/share/icons/hicolor/
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
 ```
 
-Debian/Ubuntu: `sudo apt install ./peerbeam-<ver>-amd64.deb`
+**Arch and derivatives** — build a native package from the release tarball:
+```bash
+git clone https://github.com/alpha-neo-omega/PeerBeam
+cd PeerBeam/packaging/arch
+makepkg -g >> PKGBUILD     # record the tarball's checksum
+makepkg -si                # build and install
+```
+
+**Runtime requirement.** The GUI needs **GTK 3** at run time; the `.deb`, `.rpm`
+and `PKGBUILD` all declare it, so your package manager pulls it in. The tarball
+and AppImage do not check — if the app exits immediately, install GTK 3
+(`libgtk-3-0` on Debian family, `gtk3` elsewhere). The **CLI has no GTK
+dependency at all**, which is what makes it the right choice on a headless
+server.
+
+Nothing here is signed or in any distribution's repositories, so your package
+manager may warn about an untrusted origin — that is expected, not a
+misconfiguration on your side.
+
+**Uninstall:** `sudo apt remove peerbeam` · `sudo dnf remove peerbeam` ·
+`sudo pacman -R peerbeam` · or delete `/opt/peerbeam` and the desktop entry.
+Your data is left alone (see §6); remove it deliberately if you want a clean
+slate.
 
 ### Windows
 

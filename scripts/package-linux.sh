@@ -74,8 +74,69 @@ else
 fi
 
 # ---- .rpm (if rpmbuild) ----
+#
+# This used to print "see docs/BUILD.md for the .spec flow" and build nothing,
+# while the header above claimed .rpm was produced when the tool was present.
+# CI installs `rpm`, so it took this branch every release and shipped no package
+# at all — Fedora, RHEL and openSUSE had only the tarball.
+#
+# Built from the same $STAGE tree as the .deb, so the two cannot describe
+# different layouts. rpmbuild insists on its own directory tree, hence the
+# --define overrides rather than touching ~/rpmbuild.
 if command -v rpmbuild >/dev/null; then
-  echo "rpmbuild present — see docs/BUILD.md for the .spec flow"
+  RPMTOP="$DIST/rpmbuild"; rm -rf "$RPMTOP"
+  install -d "$RPMTOP"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+  # rpm rejects a dash in Version; keep the tag's exact string in Release-free
+  # form and let it fail loudly rather than silently mangling a pre-release.
+  RPMVER="${VER%%-*}"
+  cat > "$RPMTOP/SPECS/$APP.spec" <<SPEC
+Name:           $APP
+Version:        $RPMVER
+Release:        1%{?dist}
+Summary:        Secure, zero-config file & clipboard sharing
+License:        AGPL-3.0-or-later
+URL:            https://github.com/alpha-neo-omega/PeerBeam
+BuildArch:      x86_64
+# The GUI links GTK3 at runtime; everything else is static in the bundle.
+Requires:       gtk3
+# The payload is a prebuilt Flutter bundle: already stripped, and its .so files
+# are not meant to be picked apart by rpm's automatic dependency generator.
+AutoReqProv:    no
+%global __os_install_post %{nil}
+
+%description
+PeerBeam discovers peers across LAN, mDNS and Tailscale at once and streams
+files of any size with end-to-end encryption, resumable integrity-checked
+transfers, chat, clipboard sync and presence. No accounts, no cloud.
+
+%install
+cp -a %{_sourcedir}/stage/. %{buildroot}/
+
+%files
+/opt/$APP
+/usr/bin/$APP
+/usr/share/applications/$APP.desktop
+/usr/share/icons/hicolor/*/apps/$APP.png
+
+%changelog
+* $(LC_ALL=C date '+%a %b %d %Y') PeerBeam Contributors <noreply@peerbeam> - $RPMVER-1
+- Release $VER
+SPEC
+  install -d "$RPMTOP/SOURCES/stage"
+  cp -a "$STAGE"/. "$RPMTOP/SOURCES/stage/"
+  rpmbuild -bb "$RPMTOP/SPECS/$APP.spec" \
+    --define "_topdir $(cd "$RPMTOP" && pwd)" \
+    --define "_sourcedir $(cd "$RPMTOP" && pwd)/SOURCES" \
+    --define "_buildrootdir $(cd "$RPMTOP" && pwd)/BUILDROOT" >/dev/null
+  RPMOUT=$(find "$RPMTOP/RPMS" -name '*.rpm' -type f | head -1)
+  if [ -n "$RPMOUT" ]; then
+    mv "$RPMOUT" "$DIST/${APP}-${VER}-x86_64.rpm"
+    rm -rf "$RPMTOP"
+    echo "OK  $DIST/${APP}-${VER}-x86_64.rpm"
+  else
+    echo "FAIL .rpm: rpmbuild produced nothing" >&2
+    exit 1
+  fi
 else
   echo "skip .rpm (rpmbuild absent)"
 fi
@@ -87,8 +148,10 @@ if command -v appimagetool >/dev/null; then
   cp packaging/linux/peerbeam.desktop "$APPDIR/$APP.desktop"
   [ -f "$ICONS/256.png" ] && cp "$ICONS/256.png" "$APPDIR/$APP.png"
   ln -sf "$APP" "$APPDIR/AppRun"
-  appimagetool "$APPDIR" "$DIST/${APP}-${VER}-x86_64.AppImage"
-  echo "OK  AppImage"
+  # appimagetool cannot always infer the architecture from the payload; state it.
+  ARCH=x86_64 appimagetool "$APPDIR" "$DIST/${APP}-${VER}-x86_64.AppImage"
+  rm -rf "$APPDIR"
+  echo "OK  $DIST/${APP}-${VER}-x86_64.AppImage"
 else
   echo "skip AppImage (appimagetool absent)"
 fi

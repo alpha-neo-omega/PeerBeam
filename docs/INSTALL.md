@@ -11,9 +11,19 @@ For a walkthrough including the standalone CLI and everyday commands, see
   sudo cp usr/share/applications/peerbeam.desktop /usr/share/applications/
   sudo cp -r usr/share/icons/hicolor/* /usr/share/icons/hicolor/
   ```
-- **.deb:** `sudo apt install ./peerbeam-<ver>-amd64.deb`
-- **.rpm:** `sudo dnf install ./peerbeam-<ver>.x86_64.rpm`
-- **AppImage:** `chmod +x PeerBeam-<ver>-x86_64.AppImage && ./PeerBeam-<ver>-x86_64.AppImage`
+- **.deb** (Ubuntu, Debian, Mint, Pop!_OS, elementary, Zorin):
+  `sudo apt install ./peerbeam-<ver>-amd64.deb`
+- **.rpm** (Fedora, RHEL, Rocky, Alma, CentOS Stream):
+  `sudo dnf install ./peerbeam-<ver>-x86_64.rpm`
+- **.rpm** (openSUSE):
+  `sudo zypper install --allow-unsigned-rpm ./peerbeam-<ver>-x86_64.rpm`
+- **Arch, Manjaro, EndeavourOS:** `packaging/arch/PKGBUILD` → `makepkg -si`
+- **AppImage** (any distribution, installs nothing):
+  `chmod +x PeerBeam-<ver>-x86_64.AppImage && ./PeerBeam-<ver>-x86_64.AppImage`
+  (add `--appimage-extract-and-run` on systems without FUSE)
+
+The GUI needs **GTK 3** at run time; the packaged formats declare it, the
+tarball and AppImage do not. The CLI needs nothing.
 
 Uninstall: `sudo apt remove peerbeam` / `sudo dnf remove peerbeam` / delete
 `/opt/peerbeam` + the desktop entry. Config/history persist under
