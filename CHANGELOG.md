@@ -6,6 +6,31 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-18 — Beta
+
+### Fixed
+- **Fedora, RHEL, Rocky, Alma and openSUSE have a package for the first time.**
+  `package-linux.sh`'s `.rpm` branch printed a message and built nothing, under
+  a header claiming it produced one when `rpmbuild` was present. CI installs
+  `rpm`, so it took that branch every release and shipped nothing.
+- **An AppImage is built.** The branch was live but CI never installed
+  `appimagetool`, so the artifact that runs on any distribution was never
+  produced.
+- **Linux packages carry the app icon.** CI installed `librsvg2-bin`, but the
+  icon master is a PNG needing resizing and the script looks for
+  `magick`/`convert`; every build warned "no rasterizer" and shipped a desktop
+  entry pointing at a file that did not exist. Invisible because ImageMagick is
+  present on a typical dev machine — local builds had all five sizes, CI's had
+  none, and only CI's ship.
+- **A manual release run no longer names the branch as the version.** The
+  version came from `GITHUB_REF_NAME`, the *branch* under `workflow_dispatch`,
+  so dpkg refused a control file reading `Version: main` and every manual run
+  died there — before the rpm or AppImage steps were reached.
+
+### Added
+- `packaging/arch/PKGBUILD` for Arch and derivatives, building from the release
+  tarball rather than from source.
+
 ## [0.8.0] - 2026-08-18 — Beta
 
 ### Added
