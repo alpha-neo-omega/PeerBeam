@@ -678,6 +678,15 @@ mod tests {
     /// pin on the machine with it — and the unknown grant is not honoured.
     #[test]
     fn a_record_from_a_newer_build_loads_and_its_unknown_grant_is_ignored() {
+        // **Proved unknown, not assumed.** The placeholder here was `browse`
+        // until shared folders shipped, at which point this test started
+        // honouring the grant it exists to reject — and said nothing. A string
+        // cannot notice that; this assertion does.
+        const UNKNOWN: &str = "xyzzy-not-a-permission";
+        assert!(
+            Permission::parse(UNKNOWN).is_none(),
+            "{UNKNOWN} is a real permission now — pick another placeholder"
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trust.json");
         let store = store_with(

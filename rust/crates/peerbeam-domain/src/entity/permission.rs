@@ -311,6 +311,10 @@ impl<'de> Deserialize<'de> for PermissionSet {
 
 #[cfg(test)]
 mod tests {
+    /// A permission name this build does not know. Guarded by an assertion at
+    /// the point of use, so it cannot quietly become real.
+    const UNKNOWN: &str = "xyzzy-not-a-permission";
+
     use super::*;
 
     /// **The frozen constant.** Adding a permission to
@@ -408,19 +412,21 @@ mod tests {
     /// It must load — failing to parse would take every pin on the machine with
     /// it — and the unknown grant must not be honoured.
     ///
-    /// The placeholder is deliberately **not** a plausible future permission.
-    /// This test used `"browse"`, which was hypothetical right up until browsing
-    /// shipped — at which point it silently stopped testing anything, because
-    /// the "unknown" name was suddenly honoured. A name from another problem
-    /// domain entirely cannot be quietly promoted into reality.
+    /// The placeholder is **proved unknown, not assumed**. This test used
+    /// `"browse"`, which was hypothetical right up until shared folders shipped
+    /// — at which point it started honouring the grant it exists to reject, and
+    /// said nothing, because a string cannot notice it has become real.
+    /// Renaming the placeholder fixes today and repeats the bug tomorrow; the
+    /// assertion below fixes it for good.
     #[test]
     fn an_unknown_permission_name_loads_and_is_not_honoured() {
-        let set: PermissionSet = serde_json::from_value(serde_json::json!([
-            "files",
-            "xyzzy-not-a-permission",
-            "chat"
-        ]))
-        .unwrap();
+        assert!(
+            Permission::parse(UNKNOWN).is_none(),
+            "{UNKNOWN} is a real permission now — this test needs a different \
+             placeholder, and would otherwise pass while checking nothing"
+        );
+        let set: PermissionSet =
+            serde_json::from_value(serde_json::json!(["files", UNKNOWN, "chat"])).unwrap();
         assert!(set.grants(Permission::Files));
         assert!(set.grants(Permission::Chat));
         assert_eq!(

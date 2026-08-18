@@ -103,6 +103,11 @@ Future<void> _flip(WidgetTester tester, Finder tile) async {
   await tester.pumpAndSettle();
 }
 
+/// A permission name this build does not know, for the forward-compatibility
+/// test. Guarded by an assertion at the point of use so it cannot quietly
+/// become real.
+const unknownPermission = 'xyzzy-not-a-permission';
+
 void main() {
   testWidgets('a pinned-but-unapproved device is marked, not shown as trusted', (
     tester,
@@ -319,19 +324,26 @@ void main() {
     // cannot render. It decodes and is readable, but only the names in
     // `PeerBeamPermission.all` get a switch — a control this build cannot
     // describe is worse than none.
+    // **Proved unknown, not assumed.** This test's placeholder was 'browse'
+    // until shared folders shipped, at which point it started honouring the
+    // grant it exists to reject — and said nothing. The assertion comes first
+    // now, so a fourth promotion fails loudly instead of passing vacuously.
+    expect(
+      PeerBeamPermission.all,
+      isNot(contains(unknownPermission)),
+      reason:
+          '$unknownPermission is a real permission now — this test needs a '
+          'different placeholder, and would otherwise check nothing',
+    );
     final future = TrustedDevice.fromJson(const {
       'id': 'pb-a',
       'name': 'Laptop',
       'fingerprint': 'ff',
       'trusted_at': '2026-08-18T00:00:00Z',
       'approved': true,
-      // Deliberately not a plausible future permission: this test used
-      // 'browse', which was hypothetical right up until shared folders
-      // shipped — at which point it silently stopped testing anything.
-      'permissions': ['files', 'xyzzy-not-a-permission'],
+      'permissions': ['files', unknownPermission],
     });
-    expect(future.may('xyzzy-not-a-permission'), isTrue, reason: 'it decodes');
-    expect(PeerBeamPermission.all, isNot(contains('xyzzy-not-a-permission')));
+    expect(future.may(unknownPermission), isTrue, reason: 'it decodes');
   });
 
   testWidgets('About reports the engine version, not a number written in Dart', (
