@@ -45,7 +45,9 @@ jobs:
       - run: flutter config --enable-linux-desktop && (cd flutter && flutter pub get)
       - run: bash scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
-        with: { name: ${{ matrix.artifact }}, path: dist/* }
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
 
   windows:
     runs-on: windows-latest
@@ -143,7 +145,9 @@ jobs:
             rust/target/release/peerbeam completions fish > out/peerbeam.fish
           fi
       - uses: actions/upload-artifact@v4
-        with: { name: ${{ matrix.artifact }}, path: out/* }
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/*
 
   cli-macos:
     runs-on: macos-latest
