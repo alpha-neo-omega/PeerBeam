@@ -486,6 +486,137 @@ async fn a_resumed_send_continues_from_the_receivers_offset() {
     pb_shutdown();
 }
 
+/// **The offset property, on the receiving side.** A resumed receive goes back
+/// to the directory its own checkpoint records, not to wherever the save
+/// directory points now.
+///
+/// The partial bytes live at `<that directory>/<name>.part`, and the receive
+/// engine looks for them relative to the directory it is handed. Re-deriving
+/// that from the current settings would find nothing, restart the transfer from
+/// zero, and strand the first half in the old folder — and it would do it
+/// silently, because the finished file would still be byte-exact. A user who
+/// changed their save folder while a transfer was interrupted is the ordinary
+/// case, which is why the save directory is deliberately moved here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_resumed_receive_continues_in_its_own_directory_after_the_save_dir_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = 49880;
+    init_ffi(port, dir.path());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let payload = pattern(1024 * 1024);
+    let src = dir.path().join("moved.bin");
+    std::fs::write(&src, &payload).unwrap();
+    let route = direct_route("127.0.0.1", port);
+    let first_dir = dir.path().join("recv");
+    let second_dir = dir.path().join("recv-elsewhere");
+    std::fs::create_dir_all(&second_dir).unwrap();
+
+    // ── accepted, then cut ──
+    let (enc, trust, sender) = peer_identity(dir.path(), "sender");
+    let cut = offer_file_cut(
+        &route,
+        enc,
+        trust,
+        sender.clone(),
+        "move-1",
+        src.clone(),
+        payload.len() as u64,
+        256 * 1024,
+    );
+    let driver = async {
+        let q = tokio::task::spawn_blocking(|| {
+            wait_event(10, |e| {
+                e["type"] == "transfer_queued" && e["transfer_id"] == "move-1"
+            })
+        })
+        .await
+        .unwrap();
+        assert!(q.is_some(), "queued");
+        let v = call_json(pb_transfer_accept, &json!({ "id": "move-1" }));
+        assert_eq!(v["ok"], true, "accept: {v}");
+    };
+    let (_r, ()) = tokio::join!(cut, driver);
+
+    let ended = tokio::task::spawn_blocking(|| {
+        wait_event(20, |e| {
+            e["transfer_id"] == "move-1"
+                && matches!(
+                    e["type"].as_str(),
+                    Some("transfer_failed") | Some("transfer_cancelled")
+                )
+        })
+    })
+    .await
+    .unwrap();
+    assert!(ended.is_some(), "the receive should have settled");
+
+    let part = first_dir.join("moved.bin.part");
+    let offset = std::fs::metadata(&part)
+        .expect("the interrupted receive keeps its partial file")
+        .len();
+    assert!(offset > 0 && offset < payload.len() as u64, "{offset}");
+
+    // ── the user changes where received files go ──
+    let v = call_json(
+        pb_settings_set,
+        &json!({ "transfer_directory": second_dir.to_string_lossy() }),
+    );
+    assert_eq!(v["ok"], true, "settings: {v}");
+
+    // ── the sender offers it again ──
+    EVENTS.lock().unwrap().clear();
+    let (enc, trust, identity) = same_peer(dir.path(), &sender);
+    let again = offer_file(
+        &route,
+        enc,
+        trust,
+        identity,
+        "move-1",
+        src.clone(),
+        payload.len() as u64,
+    );
+    let watcher = tokio::task::spawn_blocking(|| {
+        wait_event(30, |e| {
+            e["type"] == "transfer_completed" && e["transfer_id"] == "move-1"
+        })
+    });
+    let (send_res, done) = tokio::join!(again, watcher);
+    assert!(send_res.is_ok(), "the re-offer should have gone through");
+    assert!(done.unwrap().is_some(), "and completed");
+
+    // It finished where it started, over its own partial file.
+    let landed = first_dir.join("moved.bin");
+    assert!(
+        landed.is_file(),
+        "a resumed receive must finish in the directory its checkpoint records, \
+         not in the one the settings now name"
+    );
+    assert_eq!(std::fs::read(&landed).unwrap(), payload, "byte-exact");
+    assert!(!part.exists(), "and the partial file is promoted, not left");
+    assert!(
+        !second_dir.join("moved.bin").exists() && !second_dir.join("moved.bin.part").exists(),
+        "nothing should have been written to the new save directory: that would \
+         mean the transfer restarted from zero and stranded its first half"
+    );
+
+    // The bytes that actually moved: the second leg opened past the offset.
+    let first = events_snapshot()
+        .into_iter()
+        .find(|e| e["type"] == "transfer_progress" && e["transfer_id"] == "move-1")
+        .expect("the resumed leg should report progress");
+    let opened_at = first["payload"]["stats"]["transferred_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        opened_at >= offset,
+        "the resumed receive opened at {opened_at} with {offset} already on \
+         disk — it restarted from zero"
+    );
+    pb_shutdown();
+}
+
 /// Integrity survives resume. A resumed file whose partial bytes are not the
 /// bytes the sender sent fails loudly, and never lands.
 ///
