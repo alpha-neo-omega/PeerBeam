@@ -250,6 +250,11 @@ char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} 
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
 char* pb_chat_mark_read(const char* json);      // {peer, read_through} → {sent}
+char* pb_notes_list(const char* json);          // {} → {notes:[…]}
+char* pb_notes_create(const char* json);        // {title?, body} → {id}
+char* pb_notes_edit(const char* json);          // {id, title?, body} → {updated}
+char* pb_notes_delete(const char* json);        // {id} → {deleted}
+char* pb_notes_sync(const char* json);          // {peer} → {sent}
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
@@ -319,6 +324,20 @@ survived), while `pb_chat_delete_messages` **names** the kept ids, so a surface
 can tell the user which of the messages they picked are still on their way out.
 An id the conversation does not hold is neither removed nor kept, and an empty
 `message_ids` deletes nothing rather than failing.
+
+The `pb_notes_*` calls manage notes kept on this device. `delete` leaves a
+**tombstone** rather than removing the row, so a deletion can reach the devices
+granted the `notes` permission; `list` never returns one. `edit` and `delete`
+report `false` for a note that is missing or already deleted — editing a
+tombstone would resurrect it, and re-deleting would re-stamp it and win a
+conflict it should have lost.
+
+`pb_notes_sync` exchanges sets with a peer: this device sends its whole set
+(tombstones included) and the peer answers with its own, which the handler
+merges. Two passes, then done. `sent: false` is a normal answer, not a failure —
+the peer may not have been granted `notes`, may be unreachable, or may run a
+build without them. Sync also happens automatically when a permitted peer
+connects, so this is for syncing on demand rather than the only way it happens.
 
 `pb_chat_mark_read` sends a read watermark, and `sent: false` is its ordinary
 answer rather than a fault: this device sends no receipts at all unless the user

@@ -59,6 +59,67 @@ class _NotesScreenState extends State<NotesScreen> {
     }
   }
 
+  /// Offer the devices that may sync notes, and exchange with the chosen one.
+  ///
+  /// Only devices that have actually been granted the permission are listed:
+  /// offering a device that would be refused turns a permission the user set
+  /// into a failure they have to diagnose.
+  Future<void> _sync() async {
+    final state = AppScope.of(context);
+    final permitted = state.trust.items
+        .where((d) => d.permissions.contains(PeerBeamPermission.notes))
+        .toList();
+
+    if (permitted.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No device may sync notes yet. Grant one the Notes permission in '
+            'Settings → Trusted devices.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final chosen = await showDialog<TrustedDevice>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Sync notes with'),
+        children: [
+          for (final d in permitted)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop(d),
+              child: Text(d.name),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null || !mounted) return;
+
+    // The device list is the trust store's, which holds no addresses — the
+    // engine resolves the peer itself, so an empty target here is honest
+    // rather than a guess at where the device is.
+    final sent = await state.notes.sync(
+      PeerTarget(
+        id: chosen.id,
+        name: chosen.name,
+        addresses: const [],
+        port: 0,
+      ),
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          sent
+              ? 'Notes sent to ${chosen.name}. Theirs will arrive shortly.'
+              : 'Could not reach ${chosen.name}.',
+        ),
+      ),
+    );
+  }
+
   Future<void> _delete(Note note) async {
     final state = AppScope.of(context);
     final confirmed = await showDialog<bool>(
@@ -86,7 +147,16 @@ class _NotesScreenState extends State<NotesScreen> {
   Widget build(BuildContext context) {
     final state = AppScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Notes')),
+      appBar: AppBar(
+        title: const Text('Notes'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.sync_rounded),
+            tooltip: 'Sync notes with a device',
+            onPressed: _sync,
+          ),
+        ],
+      ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _edit(null),
         tooltip: 'New note',

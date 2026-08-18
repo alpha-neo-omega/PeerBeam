@@ -35,7 +35,7 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
     PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
@@ -136,6 +136,10 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
+        .with(Capability::with_features(
+            ChannelType::NOTES,
+            NOTES_FEAT_SYNC,
+        ))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -189,6 +193,33 @@ pub struct Session {
     presence: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Send a sequence of note batches over one Notes channel, opening it once for
+/// the whole sequence — a large set is several frames of one conversation.
+pub async fn send_note_batches(
+    handle: &SessionHandle,
+    batches: &[peerbeam_notes::NoteBatch],
+) -> Result<(), CliError> {
+    let channel = handle
+        .open_channel(ChannelType::NOTES)
+        .await
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    for b in batches {
+        let frame = b
+            .to_frame(channel)
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        handle
+            .send_on_channel(
+                channel,
+                peerbeam_notes::NoteBatch::message_type(),
+                frame.flags,
+                frame.payload,
+            )
+            .await
+            .map_err(|e| CliError::Other(e.to_string()))?;
+    }
+    Ok(())
+}
+
 impl Session {
     /// Whether the peer negotiated the chat `FileRef` feature. A peer from
     /// before this feature advertises `features: 0`, so this is false and
@@ -197,6 +228,15 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
+    }
+
+    /// Whether the peer negotiated note sync — whether sending it notes would
+    /// mean anything at all.
+    #[must_use]
+    pub fn supports_notes(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::NOTES)
+            .is_some_and(|f| f & NOTES_FEAT_SYNC != 0)
     }
 
     /// Whether the peer negotiated the chat `Receipt` feature — whether telling

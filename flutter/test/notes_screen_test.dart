@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/features/notes/notes_screen.dart';
+import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
 
@@ -116,5 +117,57 @@ void main() {
     await tester.tap(find.text('Delete'));
     await tester.pumpAndSettle();
     expect(fake.calls.any((c) => c.startsWith('notesDelete')), isTrue);
+  });
+
+  testWidgets('sync offers only devices actually granted the permission', (
+    tester,
+  ) async {
+    // Offering a device that would be refused turns a permission the user set
+    // into a failure they have to diagnose.
+    final fake = FakePeerBeam()
+      ..trusted.addAll([
+        TrustedDevice(
+          id: 'pb-yes',
+          name: 'Laptop',
+          fingerprint: 'aa',
+          trustedAt: DateTime.now(),
+          approved: true,
+          permissions: const {'files', 'notes'},
+        ),
+        TrustedDevice(
+          id: 'pb-no',
+          name: 'Phone',
+          fingerprint: 'bb',
+          trustedAt: DateTime.now(),
+          approved: true,
+          permissions: const {'files'},
+        ),
+      ]);
+    final state = await _open(tester, fake);
+    await state.trust.refresh();
+    await tester.pump();
+
+    await tester.tap(find.byIcon(Icons.sync_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Laptop'), findsOneWidget);
+    expect(
+      find.text('Phone'),
+      findsNothing,
+      reason: 'a device without the notes permission was offered',
+    );
+  });
+
+  testWidgets('sync says so when no device may sync notes', (tester) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.sync_rounded));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('No device may sync notes yet'),
+      findsOneWidget,
+    );
   });
 }

@@ -7,6 +7,20 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Notes, synced to the devices you choose.** Text with a title, kept encrypted
+  on this device — in the app (from Home), and as `peerbeam notes
+  list|add|edit|remove|sync`. They sync to any device you grant the new **Notes**
+  permission, automatically when it connects and on demand.
+
+  "Your own devices" is that permission, made explicit: PeerBeam has no notion
+  of *owning* a device, only of trusting one, so a device receives your notes
+  because you said it may. Granting it to a colleague's laptop is possible and is
+  your decision.
+
+  Deleting leaves a tombstone rather than removing the row, so a deletion
+  actually reaches your other devices instead of the note reappearing from one
+  that had not seen it. Conflicting edits resolve last-writer-wins, with
+  deletion winning a tie so a note you deleted does not come back.
 - **Read receipts, off by default.** A message you sent shows a distinct marker
   once the peer tells you it read it. What it discloses is when *you* looked, so
   the setting ("Read receipts", in Settings) starts off and gates **sending

@@ -469,6 +469,14 @@ pub enum NotesAction {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Exchange notes with a device you have granted the `notes` permission.
+    ///
+    /// Sends this device's whole set — tombstones included, so deletions travel
+    /// — and merges what the peer answers with. Two passes, then done.
+    Sync {
+        /// Target device (id, name, or unambiguous name prefix).
+        peer: String,
+    },
     /// Delete a note, leaving a tombstone so the deletion can propagate.
     Remove {
         /// The note's id, as shown by `notes list --json`.

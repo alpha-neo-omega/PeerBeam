@@ -563,6 +563,16 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// What the engine would report. False models the default: a device that was
+  /// never granted the notes permission.
+  bool notesSyncSent = false;
+
+  @override
+  Future<bool> notesSync(PeerTarget peer) async {
+    calls.add('notesSync:${peer.id}');
+    return notesSyncSent;
+  }
+
   /// What the engine would report. False models the default: receipts off.
   bool markReadSent = false;
 

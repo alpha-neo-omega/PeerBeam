@@ -69,6 +69,24 @@ class NotesRepository extends ChangeNotifier {
     }
   }
 
+  /// Exchange notes with [peer].
+  ///
+  /// The peer's own set arrives asynchronously through the session, so this
+  /// refreshes afterwards: what came back is already in the store by the time
+  /// a user could act on the result, and re-reading is cheaper than inventing
+  /// an event for it.
+  Future<bool> sync(PeerTarget peer) async {
+    final api = _api;
+    if (api == null) return false;
+    try {
+      final sent = await api.notesSync(peer);
+      await refresh();
+      return sent;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<bool> delete(String id) async {
     final api = _api;
     if (api == null) return false;

@@ -259,6 +259,18 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `notes list` — every note, newest edit first. Deleted notes are not shown.
+- `notes add [BODY] [--title T]` — write a note. With no `BODY` the text is read
+  from stdin, so `pbpaste | peerbeam notes add` and `notes add < draft.md` work
+  over SSH.
+- `notes edit <id> [BODY] [--title T]` — replace a note's text. Refuses a
+  deleted note rather than resurrecting it.
+- `notes remove <id>` — delete a note, leaving a tombstone so the deletion can
+  reach other devices.
+- `notes sync <peer>` — exchange notes with a device you have granted the
+  `notes` permission (`peerbeam trust permit <device> notes`). Sends this
+  device's whole set and merges what comes back. Notes also sync automatically
+  whenever a permitted device connects.
 - `chat history <peer> [--mark-read]` — `--mark-read` also tells the peer you
   have read it. Opt-in on top of an opt-in: printing a conversation is never
   consent to report having read it, and nothing is sent unless

@@ -3932,6 +3932,36 @@ impl Manager {
             }
         }
 
+        // Notes sync on connect, for the same reason chat flushes here: a
+        // device that has just connected is reachable *now*, and that is the
+        // only moment either side can be sure of. Nothing schedules a sync
+        // otherwise, so without this notes would only ever move when someone
+        // asked for it by hand.
+        //
+        // Gated on the permission and on the negotiated capability, and asked
+        // of the **authenticated** peer. An unpermitted or older peer costs one
+        // pair of lookups and nothing on the wire.
+        //
+        // A batch that arrives twice merges to no-ops — every note either loses
+        // its conflict or is already identical — so an exchange racing an
+        // explicit `notes_sync` is wasteful, never wrong.
+        if peerbeam_notes::may_sync_notes(self.trust.as_ref(), &session.peer_device)
+            && crate::session_exec::caps_support_notes(&session.capabilities)
+        {
+            match self.notes.all() {
+                Ok(mine) => {
+                    let batches = peerbeam_notes::NoteBatch::split(mine, false);
+                    if let Err((_, e)) =
+                        crate::session_exec::send_note_batches(&session.handle, &batches).await
+                    {
+                        tracing::debug!(error = %e, peer = %session.peer_device.0,
+                            "notes sync-on-connect not delivered");
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "notes unreadable for sync-on-connect"),
+            }
+        }
+
         // Only a connection that actually opens a transfer stream is a
         // transfer. Since chat 1b, peers dial purely to deliver chat, so
         // registering a transfer and prompting the user before knowing whether

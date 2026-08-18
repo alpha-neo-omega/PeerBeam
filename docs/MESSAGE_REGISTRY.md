@@ -43,7 +43,7 @@ near-term). Assignments are stable once published.
 | `0x0102` | Clipboard | B | clipboard sync; `Clip` (implemented), opt-in and trusted-only |
 | `0x0103` | Presence | B | device status heartbeats; `Status` (implemented), opt-in and trusted-only |
 | `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
-| `0x0105` | Notes | C | rides Sync; may not need its own channel |
+| `0x0105` | Notes | C | **implemented** — note sync (`NoteBatch`) |
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
 | `0x0107` | Pipe | B | `peerbeam pipe` — an unbounded stdin↔stdout byte stream; a **stream** channel like Transfer, implemented |
 | `0x0108 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
@@ -303,6 +303,43 @@ belonging to each capability's future spec:
 
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).
+
+### Notes (`0x0105`)
+
+`NoteBatch = 1` (implemented) — a slice of this device's note set, offered to a
+peer. **Tombstones are included**: a deletion is a fact about the set exactly as
+an edit is, and a batch of only live notes could never tell a peer something was
+deleted — the set would simply look older and the peer would offer the note
+back.
+
+Bounded twice, by encoded bytes (`MAX_BATCH_BYTES`) and by count
+(`MAX_BATCH_NOTES`), and **both are re-checked on decode**: a peer's claim about
+how much it is sending is not trusted, because every note in a batch costs the
+receiver a store write. A set larger than one batch is sent as several, and
+`more` marks all but the last.
+
+`reply` makes an exchange terminate. The receiver answers with its own set only
+after a batch with `more: false`, and **never answers a reply** — without that,
+two devices volley forever, each answering the other's answer. A sync is
+therefore exactly two passes.
+
+Conflicts are **last-writer-wins by `updated_at`, with deletion breaking a
+tie**. Two devices that edited while apart cannot both be right and there is
+nobody to ask; surfacing every divergence as a conflict would turn a notepad
+into a merge tool. The tie goes to deletion so a note deleted on one device does
+not come back because the clocks agreed to the second.
+
+Carries `NOTES_FEAT_SYNC = 1 << 0`. Like every feature bit it asserts
+comprehension, not consent: **whether notes are exchanged with a given device is
+`Permission::Notes`**, checked before sending, again against the authenticated
+identity after the handshake, and per inbound batch. The permission is also what
+makes "your own devices" concrete — PeerBeam has no notion of owning a device,
+only of trusting one, so a device receives your notes because you said it may.
+
+Unlike chat, the inbound side is gated too. A chat message that has arrived is
+in hand and refusing to persist it would lose the user's data; a note batch is
+someone else's data being written into this device's store, so an ungranted peer
+writes nothing here and learns nothing about what is here.
 
 ## 5. Plugin message allocation
 

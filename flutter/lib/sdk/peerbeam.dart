@@ -315,6 +315,12 @@ abstract class PeerBeamApi {
   /// devices. `false` means there was nothing to delete.
   Future<bool> notesDelete(String id);
 
+  /// Exchange notes with [peer], returning whether anything was sent.
+  ///
+  /// `false` is a normal answer: the device may not have been granted the
+  /// `notes` permission, may be unreachable, or may run a build without notes.
+  Future<bool> notesSync(PeerTarget peer);
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -660,6 +666,14 @@ class PeerBeam implements PeerBeamApi {
   Future<bool> notesDelete(String id) async {
     final data = _data(_req().notesDelete(jsonEncode({'id': id})));
     return data['deleted'] == true;
+  }
+
+  @override
+  Future<bool> notesSync(PeerTarget peer) async {
+    final data = _data(
+      _req().notesSync(jsonEncode({'peer': peer.toJson()})),
+    );
+    return data['sent'] == true;
   }
 
   @override

@@ -7,21 +7,99 @@
 //! and the next exchange would offer it back.
 
 use std::io::Read;
+use std::sync::Arc;
 
+use peerbeam_domain::id::DeviceId;
+use peerbeam_engine::RouteManager;
 use peerbeam_notes::Note;
+use peerbeam_transfer_quic::QuicTransport;
+
+use crate::session_transfer;
 
 use crate::cli::NotesAction;
 use crate::commands::{self, SecureCtx};
 use crate::exit::{CliError, CliResult};
 use crate::output::Ctx;
 
-pub fn notes(ctx: &Ctx, action: NotesAction, path_override: Option<&str>) -> CliResult {
+pub async fn notes(ctx: &Ctx, action: NotesAction, path_override: Option<&str>) -> CliResult {
     match action {
         NotesAction::List => list(ctx, path_override),
         NotesAction::Add { body, title } => add(ctx, body, title, path_override),
         NotesAction::Edit { id, body, title } => edit(ctx, &id, body, title, path_override),
         NotesAction::Remove { id } => remove(ctx, &id, path_override),
+        NotesAction::Sync { peer } => sync(ctx, peer, path_override).await,
     }
+}
+
+/// `peerbeam notes sync <PEER>`.
+///
+/// Sends this device's whole set and merges what comes back. The permission is
+/// checked here before anything is dialled, and again against the
+/// **authenticated** identity after the handshake — the name on the command
+/// line resolves to whatever discovery believes, which is not yet proof of who
+/// answered.
+async fn sync(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::note_store(&config, &sc.enc, &sc.ident);
+
+    let devices = commands::snapshot(config.clone(), 2).await;
+    let candidates: Vec<(String, String)> = devices
+        .iter()
+        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+        .collect();
+    let index = commands::resolve_peer(ctx, &candidates, &Some(peer))?;
+    let device = devices[index].device.clone();
+
+    if !peerbeam_notes::may_sync_notes(sc.trust.as_ref(), &device.id) {
+        return Err(CliError::Usage(format!(
+            "{} has not been granted the notes permission — \
+             run `peerbeam trust permit {} notes`",
+            device.name, device.id
+        )));
+    }
+
+    let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
+    let routes = RouteManager::new(quic.clone());
+    let session = session_transfer::dial(
+        &quic, &routes, &device, "notes", &sc.ident, &sc.enc, &sc.trust, None,
+    )
+    .await
+    .map_err(|e| CliError::Other(format!("could not reach {}: {e}", device.name)))?;
+
+    let authenticated = DeviceId::from(session.peer_id.clone());
+    if !peerbeam_notes::may_sync_notes(sc.trust.as_ref(), &authenticated) {
+        session.close().await;
+        return Err(CliError::Usage(format!(
+            "{authenticated} has not been granted the notes permission"
+        )));
+    }
+    if !session.supports_notes() {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} is running a build without notes",
+            device.name
+        )));
+    }
+
+    let mine = store.all().map_err(|e| CliError::Other(e.to_string()))?;
+    let batches = peerbeam_notes::NoteBatch::split(mine, false);
+    let count: usize = batches.iter().map(|b| b.notes.len()).sum();
+    let sent = session_transfer::send_note_batches(&session.handle, &batches).await;
+    session.close().await;
+    sent.map_err(|e| CliError::Other(format!("sending notes: {e}")))?;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "peer": authenticated.0, "sent": count,
+        }));
+    } else {
+        // What was *sent*, not what the peer now has: its answer merges into
+        // this device asynchronously, and claiming a converged total here would
+        // be a number nobody measured.
+        ctx.line(&format!("sent {count} notes to {}", ctx.bold(&device.name)));
+    }
+    Ok(())
 }
 
 /// The note's text: the argument when given, otherwise stdin.
