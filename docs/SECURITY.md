@@ -350,6 +350,78 @@ sessions, so it can be re-verified later. Revoking later is available in the app
 list` prints each pinned fingerprint, which is what an out-of-band comparison
 needs on a headless box.
 
+### Where the check is enforced
+
+**In the engine, not in a frontend.** `Manager::accept`/`accept_trust` consult
+`pairing_gate` — the deliberate twin of the CLI's, with the same three inputs
+and the same three outcomes — and refuse an unconfirmed first-contact accept
+whoever is asking. The GUI's dialog and the CLI's stdin prompt are two ways of
+obtaining the same answer, not two implementations of the same rule (I7).
+
+The answer crosses as `confirmed` on the accept payload
+(`pb_transfer_accept {id, confirmed}`). **Only a literal `true` counts.**
+Absent, `null`, `false`, `"true"` and `1` all confirm nothing, so a caller that
+has never heard of this prompt — a script, an older frontend — cannot satisfy
+it by accident. That is the same safe default the CLI's gate applies to a
+missing answer, and it is why a non-interactive context refuses rather than
+proceeds.
+
+A blocked accept leaves the transfer **pending**, not declined. The user can go
+and read the other device's screen and answer properly; being asked to verify
+must not cost them the file.
+
+### What a confirmed code proves, and what it does not
+
+It proves that **the two devices that ran this handshake derived the same
+number from the keys they actually negotiated**. Under a man-in-the-middle,
+each side is negotiating with the attacker, so the two numbers differ and the
+comparison fails. That is the whole of it.
+
+It does **not** prove:
+
+- **That anyone compared anything.** The app displays the code; it cannot see
+  the other screen and never claims to have checked. `confirmed` records what
+  the user said, not what they did. A user who taps through without looking has
+  a pinned stranger and an app that never said otherwise.
+- **That the comparison used a channel the attacker is not on.** An adversary
+  positioned to relay a handshake can usually also relay a screenshot, a chat
+  message, or a call. This is why the UI copy says to look at the *device
+  itself*, and why a code read back over a channel the attacker controls proves
+  nothing.
+- **Anything about later sessions.** The code is derived from long-term keys,
+  so it is stable — which is what makes re-verification possible — but a
+  confirmation is a statement about the pin, not a per-session attestation.
+
+### A refused first contact un-pins; other endings do not
+
+Declining a transfer from a peer **this session pinned** removes the pin. Which
+transfers those are is recorded once, from the handshake's `newly_trusted`, and
+read from that one record by both the accept gate and the un-pin. It is
+deliberately not re-derived from the trust store at decision time: by then the
+handshake has pinned the peer, and a lookup can no longer distinguish a
+stranger met seconds ago from a device approved last week — which is exactly
+what stops a routine "no thanks" from revoking a long-standing trust.
+
+**A failed un-pin is reported as a failure.** Reporting success on a removal
+that did not happen would leave the peer trusted on disk while the app said
+otherwise, and the *next* connection from it would then not be first contact at
+all: no `newly_trusted`, no code, no gate, silently — the user never asked
+again about the device they had just refused as a suspected MITM. The refusal
+itself stands regardless; the error tells the user the pin is still there and
+to remove it in Trusted Devices.
+
+**Known scope: an unanswered prompt un-pins nothing.** A prompt that times out
+(`ACCEPT_TIMEOUT`, 180 s) or whose sender drops is not the user refusing, and
+this codebase does not convert absence into a decision — see `AcceptOutcome`,
+where the same distinction stops a timeout being reported to the peer as a
+decline. The consequence is real and worth stating: a peer that connects while
+nobody is at the machine stays pinned, so the *next* connection is not first
+contact and the code is not shown again. The pin alone grants nothing (auto-
+accept requires `approved`, which only an explicit accept-and-trust sets, I6),
+but the verification opportunity is not offered a second time. Pinned devices
+are listed with their fingerprints in Trusted Devices and `peerbeam trust
+list`, which is the way back.
+
 ## Bulk approval is accept-once, never trust
 
 The Transfers screen offers **Accept all** / **Decline all** when two or more

@@ -7,6 +7,49 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **The app can tell a stranger from a familiar device.** An approval prompt for
+  a device this one has never spoken to now says so, and shows the session's
+  **pairing code** — a 128-bit safety number both devices derive from the keys
+  they actually negotiated. Comparing it against the other device's screen is
+  what detects a man-in-the-middle on first contact.
+
+  The engine has derived that number on every session, and carried it to the app
+  alongside `newly_trusted`, for several releases. Only the CLI ever acted on
+  it: accepting a file from a total stranger took the same one tap as accepting
+  one from a laptop used daily, with the one field that would have caught an
+  interception sitting unread in the event payload. The number itself has not
+  changed and nothing new crosses the wire.
+
+  Both approval surfaces carry it — the Transfers card and a file offered in a
+  conversation — and the code is shown **in full**, because all 128 bits are
+  what make it expensive to forge.
+
+  **Settings → Transfers → Verify new devices with a pairing code**
+  (`require_pairing_confirmation`, off by default, the same setting the CLI
+  reads) makes the check mandatory: a first-contact transfer cannot be accepted
+  until the user confirms both screens show the same code. Nothing is
+  pre-selected and dismissing the dialog counts as *not* confirmed. Cancelling
+  accepts nothing and declines nothing — the transfer stays waiting, so going to
+  read the other screen costs the user nothing.
+
+  **The gate is in the engine, not in the UI.** `pb_transfer_accept` takes a
+  `confirmed` flag and refuses an unconfirmed first-contact accept whoever asks,
+  so the rule holds for every frontend rather than for one. Only a literal
+  `true` satisfies it, so a caller that has never heard of this prompt cannot
+  satisfy it by accident.
+
+  **Declining a first-contact transfer un-pins the device**, matching what the
+  CLI has always done. A removal that fails is reported as a failure rather than
+  assumed: a pin left behind while the app claimed otherwise would mean the next
+  connection was not "new" at all, skipping the check silently.
+
+  What this proves is bounded, and [SECURITY.md](docs/SECURITY.md#what-a-confirmed-code-proves-and-what-it-does-not)
+  says so: the app displays a code and records what the user said, it cannot see
+  the other screen, and an unanswered prompt un-pins nothing.
+
+  With the setting off — the default — every accept behaves exactly as it did
+  before.
+
 - **Resumable transfers, surfaced.** A transfer interrupted by a dropped link or
   by the app closing is no longer lost. It comes back as an **interrupted**
   transfer — in the Transfers screen, in `peerbeam transfers`, and over the FFI —

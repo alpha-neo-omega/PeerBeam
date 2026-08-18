@@ -75,6 +75,7 @@ networking, trust, or crypto (I5/I6/I9).
 - **Storage:** trust records (exists).
 - **Offline:** yes.
 - **CLI:** receiver prints the pairing code and, with `require_pairing_confirmation`, prompts to confirm it before accepting (mismatch/decline un-pins the peer). No standalone trust-management subcommand yet.
+- **GUI:** a first-contact approval prompt (Transfers card and chat file offer alike) says the device is new and shows the code in full; with `require_pairing_confirmation` on, accepting requires an explicit "the codes match", and declining un-pins. Settings → Transfers carries the toggle. The gate itself is enforced in the engine (`pb_transfer_accept {confirmed}`), not in the UI, so it holds for every frontend (I7).
 
 ---
 

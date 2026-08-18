@@ -360,6 +360,67 @@ survival across an incoming message, the single delete call with exactly the
 selected ids, the engine's `removed`/`kept` rendering, and forwarding's order,
 per-kind routing and exclusion.
 
+## A device that has never connected before
+
+An approval prompt for a device this one has never spoken to no longer looks
+like an approval prompt for a laptop used daily. When the transfer is first
+contact, the prompt gains a panel — **This device has never connected before**
+— and shows the session's **pairing code**: a 128-bit safety number both
+devices derive from the keys they actually negotiated, in the engine's own
+grouping of eight groups of four uppercase hex digits.
+
+**The code is shown, never checked here.** This device cannot know what the
+other screen displays; the comparison is the user's, out of band, and the copy
+says to look at the other device *itself* rather than at a message or
+screenshot of it — an attacker able to relay a handshake can usually relay a
+screenshot too. Nothing in the UI may imply PeerBeam verified anything.
+
+It is shown **in full**. All 128 bits are what make the number expensive to
+forge, so there is no ellipsis, no `maxLines` and no "tap to see the rest"; it
+wraps instead, and is selectable for reading aloud or comparing character by
+character.
+
+The panel appears whenever a device is new — **not** only when the
+confirmation setting is on. Knowing a device has never connected before, and
+being able to check it, is worth having by default; the setting decides whether
+that check is *required*.
+
+Both places a file can be accepted carry it: the Transfers card, and a file
+offered inside a conversation. Routing the chat one around the check on the
+grounds that a conversation implies familiarity would leave the gate guarding
+one of the two ways a file gets accepted.
+
+### Requiring the check
+
+**Settings → Transfers → Verify new devices with a pairing code**
+(`require_pairing_confirmation`, **off by default** — the same setting the CLI
+reads). With it on, tapping **Accept** or **Trust** on a first-contact transfer
+opens a dialog showing the code, and only its **The codes match** action
+accepts anything.
+
+- **Confirmation is a decision, not a formality.** Nothing is pre-selected,
+  there is no default action, and dismissing the dialog — Cancel, a back
+  gesture, a tap outside — counts as *not* confirmed. The engine agrees: only a
+  literal `true` on the accept payload satisfies it.
+- **Cancelling costs nothing.** It accepts nothing *and* declines nothing. The
+  transfer stays waiting, so the user can go and read the other screen and come
+  back. Being asked to verify a device must never cost them the file.
+- **Decline is never gated.** Refusing needs no verification, and it is exactly
+  the answer a user who cannot match the codes needs to be able to give without
+  another dialog in the way. Declining a first-contact transfer also **un-pins**
+  the peer; see [SECURITY.md](SECURITY.md#a-refused-first-contact-un-pins-other-endings-do-not).
+- **Trust is gated too.** It grants standing auto-accept, so letting it skip a
+  check the weaker Accept honoured would guard only the lesser act.
+- **A batch cannot confirm.** With the check on, a first-contact transfer is
+  never handed to **Accept all** or a selection: one tap answers for every card
+  on screen, and comparing a safety number is a per-device act nobody performed
+  there. It is reported as failed rather than as "no longer waiting" — it very
+  much still is — and can be accepted from its own card.
+
+The copy in the panel, the dialog and the setting is pinned verbatim by
+`test/pairing_test.dart`, for the same reason the clipboard warning is: a
+softened rewrite would be a security regression dressed as a copy-edit.
+
 ## Approving several transfers at once
 
 When **two or more** inbound transfers are awaiting approval, the Transfers
