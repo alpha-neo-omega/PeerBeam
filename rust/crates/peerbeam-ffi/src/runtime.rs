@@ -403,7 +403,7 @@ pub fn init(config_json: &str) -> OpResult {
     // Browsing serves nothing until this is configured, and the default config
     // shares no directories at all.
     crate::browse::configure(&config.device.shared_directories);
-    let chat = peerbeam_chat::ChatStore::new(appstore);
+    let chat = peerbeam_chat::ChatStore::new(appstore.clone());
     reconcile_chat(&chat);
 
     // The outbox's own copy of every queued file. A sibling of `appstore`
@@ -454,6 +454,7 @@ pub fn init(config_json: &str) -> OpResult {
         chat,
         notes,
         clip_history,
+        appstore.clone(),
         config.device.receive_hook.clone(),
         staging,
         staging_limits,

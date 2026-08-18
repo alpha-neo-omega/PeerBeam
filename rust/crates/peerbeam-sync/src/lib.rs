@@ -10,13 +10,15 @@
 //! always said: a second bulk path would mean a second set of resume, checksum
 //! and progress semantics to keep in step with the first.
 
+mod apply;
 mod handler;
 mod index;
 mod manifest;
 mod reconcile;
 mod version;
 
-pub use handler::{build, IncomingSink, ManifestSink, SendFile, SyncHandler};
+pub use apply::{apply_local, Outcome};
+pub use handler::{build, build_with, IncomingSink, ManifestSink, SendFile, SyncHandler};
 pub use index::{IndexEntry, SyncIndex, NS as INDEX_NS};
 pub use manifest::{
     plan, FileEntry, FileRequest, Manifest, ManifestRequest, Plan, SyncError, MAX_FILES, MAX_PATH,

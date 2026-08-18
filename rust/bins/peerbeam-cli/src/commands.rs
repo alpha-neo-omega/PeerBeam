@@ -1388,6 +1388,24 @@ pub(crate) fn chat_store(
     peerbeam_chat::ChatStore::new(store)
 }
 
+/// Build the CLI's folder-sync index, over the same encrypted AppStore.
+///
+/// Keyed by this device's own id: the index records which device made each
+/// edit, and a counter raised under the wrong name would claim someone else's
+/// work as this machine's.
+pub(crate) fn sync_index(
+    config: &EngineConfig,
+    enc: &Arc<AeadCrypto>,
+    ident: &Identity,
+) -> peerbeam_sync::SyncIndex {
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let store: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, enc.clone()),
+    );
+    peerbeam_sync::SyncIndex::new(store, &ident.device_id.0)
+}
+
 /// Build the CLI's clipboard-history store, over the same encrypted AppStore
 /// notes and chat use — history lives in its own namespace inside it.
 pub(crate) fn clip_history_store(

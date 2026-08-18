@@ -506,6 +506,9 @@ pub struct Manager {
     notes: peerbeam_notes::NoteStore,
     /// Clipboard history — empty and unwritten unless the user turned it on.
     clip_history: peerbeam_clipboard::ClipHistory,
+    /// The encrypted store every capability shares, kept so folder sync can
+    /// open its own index namespace without a second key derivation.
+    appstore: Arc<dyn peerbeam_domain::port::AppStore>,
     /// A program to run after a received file lands, or empty for none.
     /// Behind a lock so a settings change reaches the next file rather than the
     /// next restart.
@@ -609,6 +612,7 @@ impl Manager {
         chat: ChatStore,
         notes: peerbeam_notes::NoteStore,
         clip_history: peerbeam_clipboard::ClipHistory,
+        appstore: Arc<dyn peerbeam_domain::port::AppStore>,
         receive_hook: String,
         staging: Arc<StagingStore>,
         staging_limits: StagingLimits,
@@ -636,6 +640,7 @@ impl Manager {
             chat,
             notes,
             clip_history,
+            appstore,
             receive_hook: RwLock::new(receive_hook),
             staging,
             staging_limits,
@@ -3299,16 +3304,25 @@ impl Manager {
         sender.ring(seconds).await.is_ok()
     }
 
-    /// Mirror a peer's shared folder into a local directory:
-    /// `{peer, path, into}` → `{fetching, up_to_date, truncated}`.
+    /// Sync a folder with a peer, in both directions:
+    /// `{peer, path, into}` → `{fetching, pushing, deleted, conflicts:[…]}`.
     ///
-    /// **A one-way pull.** Nothing is deleted, nothing is pushed, and a local
-    /// file that is newer than the peer's is left alone — silently overwriting
-    /// work done here would lose it with no warning and no undo.
+    /// **Bidirectional, with conflicts kept rather than resolved.** Each side
+    /// carries per-file version vectors, so this can tell "their copy is newer"
+    /// from "we both changed it" — the distinction a modification time cannot
+    /// make, and the one that decides whether an edit survives.
     ///
-    /// Returns as soon as the files have been *asked for*. The bytes arrive as
-    /// ordinary inbound transfers, through the same approval path as any other
-    /// file, because they are ordinary transfers.
+    /// * Only they changed it → fetch.
+    /// * Only we changed it → push.
+    /// * They deleted something we had not touched since → delete ours.
+    /// * **Both changed it** → their copy arrives as
+    ///   `name.sync-conflict-<peer>.ext` and **ours is left untouched**. No
+    ///   automatic rule can pick correctly, and every one of them loses
+    ///   somebody's work.
+    ///
+    /// The local folder is rescanned first, so a file edited in an editor
+    /// counts as this device's edit — otherwise the next sync would quietly
+    /// overwrite it with the peer's older copy.
     pub fn sync_pull(self: &Arc<Self>, req: &Value) -> Op {
         let device = device_from(req.get("peer"))?;
         let path = req
@@ -3316,11 +3330,11 @@ impl Manager {
             .and_then(|v| v.as_str())
             .ok_or((Code::InvalidArgument, "path required".into()))?
             .to_string();
-        let into = req
-            .get("into")
-            .and_then(|v| v.as_str())
-            .ok_or((Code::InvalidArgument, "into required".into()))?;
-        let into = std::path::PathBuf::from(into);
+        let into = std::path::PathBuf::from(
+            req.get("into")
+                .and_then(|v| v.as_str())
+                .ok_or((Code::InvalidArgument, "into required".into()))?,
+        );
         if !into.is_dir() {
             return Err((
                 Code::InvalidArgument,
@@ -3328,36 +3342,119 @@ impl Manager {
             ));
         }
 
+        // Rescan before anything else: an edit made outside PeerBeam is exactly
+        // as real as one received, and a sync that ignored it would overwrite
+        // the user's work with a peer's older copy.
+        let index = self.sync_index();
+        index
+            .rescan(&path, &into)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        let local = index
+            .load(&path)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+
         let me = self.clone();
-        let plan_path = path.clone();
-        let result =
-            crate::runtime::block_on(async move { me.pull_folder(device, plan_path, into).await });
-        match result {
-            Some((fetching, up_to_date, truncated)) => Ok(json!({
-                "fetching": fetching,
-                "up_to_date": up_to_date,
-                "truncated": truncated,
-            })),
-            None => Err((
+        let manifest_path = path.clone();
+        let manifest = crate::runtime::block_on(async move {
+            me.fetch_manifest(device.clone(), manifest_path).await
+        });
+        let Some(manifest) = manifest else {
+            return Err((
                 Code::Connection,
                 format!("could not get a manifest for {path}"),
-            )),
-        }
+            ));
+        };
+
+        let remote: Vec<peerbeam_sync::RemoteFile> = manifest
+            .files
+            .iter()
+            .map(|f| peerbeam_sync::RemoteFile {
+                path: f.path.clone(),
+                size: f.size,
+                version: f.version.clone(),
+                deleted: f.deleted,
+            })
+            .collect();
+        let peer_name = req
+            .get("peer")
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("peer");
+        let actions = peerbeam_sync::reconcile(&local, &remote, peer_name);
+
+        let remote_versions: std::collections::BTreeMap<String, peerbeam_sync::VersionVector> =
+            remote
+                .iter()
+                .map(|f| (f.path.clone(), f.version.clone()))
+                .collect();
+        let outcome = peerbeam_sync::apply_local(&index, &path, &into, &actions, &remote_versions)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+
+        // Ask for everything the plan wants from the peer. A conflict is
+        // fetched too — under its conflict name — because keeping both copies
+        // means actually having both.
+        let device = device_from(req.get("peer"))?;
+        let wanted: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                peerbeam_sync::Action::Fetch { path } => Some(path.clone()),
+                peerbeam_sync::Action::Conflict { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let me = self.clone();
+        let request_path = path.clone();
+        crate::runtime::block_on(async move {
+            me.request_files(device, request_path, wanted).await;
+        });
+
+        Ok(json!({
+            "fetching": outcome.fetching,
+            "pushing": outcome.pushing,
+            "deleted": outcome.deleted,
+            "conflicts": outcome.conflicts,
+            "truncated": manifest.truncated,
+        }))
     }
 
-    /// Fetch the manifest, plan against the local mirror, and request each file
-    /// that is needed. `None` when the peer cannot be reached or answered.
-    async fn pull_folder(
+    /// The per-device sync index, keyed by this device's own id — the counter
+    /// its own edits raise.
+    fn sync_index(&self) -> peerbeam_sync::SyncIndex {
+        peerbeam_sync::SyncIndex::new(self.appstore.clone(), &self.identity().device_id.0)
+    }
+
+    /// Dial and fetch a manifest. `None` when the peer cannot be reached or
+    /// does not implement folder sync.
+    async fn fetch_manifest(
         self: &Arc<Self>,
         device: Device,
         path: String,
-        into: std::path::PathBuf,
-    ) -> Option<(usize, usize, bool)> {
+    ) -> Option<peerbeam_sync::Manifest> {
+        let session = self.sync_session(&device).await?;
+        crate::session_exec::request_manifest(&session, &path).await
+    }
+
+    /// Ask the peer for each wanted file. Best effort: the bytes arrive as
+    /// ordinary transfers, so nothing here waits for them.
+    async fn request_files(self: &Arc<Self>, device: Device, folder: String, wanted: Vec<String>) {
+        let Some(session) = self.sync_session(&device).await else {
+            return;
+        };
+        for rel in wanted {
+            crate::session_exec::request_file(&session, &format!("{folder}/{rel}")).await;
+        }
+    }
+
+    /// A session for folder sync, or `None` if the peer cannot take one.
+    async fn sync_session(
+        self: &Arc<Self>,
+        device: &Device,
+    ) -> Option<crate::session_exec::Session> {
         let meta = self.session(&format!("sync-{}", device.id.0), device.id.clone(), 0);
         let session = crate::session_exec::dial(
             &self.quic,
             &self.rm,
-            &device,
+            device,
             &meta,
             self.identity(),
             self.enc.clone(),
@@ -3367,18 +3464,7 @@ impl Manager {
         )
         .await
         .ok()?;
-        if !crate::session_exec::caps_support_sync(&session.capabilities) {
-            return None;
-        }
-        let manifest = crate::session_exec::request_manifest(&session, &path).await?;
-        let plan = peerbeam_sync::plan(&manifest, &into);
-        for f in &plan.fetch {
-            // Share-relative, joined the way the peer names things — the local
-            // mirror's layout is this side's business and never goes out.
-            let remote = format!("{path}/{}", f.path);
-            crate::session_exec::request_file(&session, &remote).await;
-        }
-        Some((plan.fetch.len(), plan.up_to_date, manifest.truncated))
+        crate::session_exec::caps_support_sync(&session.capabilities).then_some(session)
     }
 
     /// Ask a device what is in one of its shared folders:
@@ -5445,6 +5531,7 @@ mod tests {
             chat.clone(),
             peerbeam_notes::NoteStore::new(appstore.clone()),
             peerbeam_clipboard::ClipHistory::new(appstore.clone()),
+            appstore.clone(),
             // No hook in tests: running a program per received file would make
             // the suite depend on this machine's configuration.
             String::new(),

@@ -306,7 +306,7 @@ async fn next_event(
     pred: impl Fn(&SessionEvent) -> bool,
 ) -> SessionEvent {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(ev)) if pred(&ev) => return ev,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("event stream ended"),
@@ -320,7 +320,7 @@ async fn next_channel(
     pred: impl Fn(&ChannelEvent) -> bool,
 ) -> ChannelEvent {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(ev)) if pred(&ev) => return ev,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("channel event stream ended"),
@@ -329,12 +329,24 @@ async fn next_channel(
     }
 }
 
+/// How long a test waits for something the code is expected to do.
+///
+/// **Generous on purpose.** These tests assert *behaviour* — an event arrives, a
+/// handle reappears — never latency. Under `cargo test --workspace` this file
+/// runs alongside a hundred other binaries, and a five-second bound turned CPU
+/// starvation into a failure that looked like a reconnect bug: it failed
+/// intermittently in full runs and passed every time on its own, which is the
+/// signature of a clock, not a defect. A wait long enough to be unreachable
+/// unless something is genuinely stuck says the same thing without lying about
+/// what broke.
+const WAIT: Duration = Duration::from_secs(60);
+
 async fn live_handle(rx: &mut watch::Receiver<Option<SessionHandle>>) -> SessionHandle {
     loop {
         if let Some(h) = rx.borrow_and_update().clone() {
             return h;
         }
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(WAIT, rx.changed())
             .await
             .expect("handle watch timed out")
             .expect("handle watch closed");
@@ -452,7 +464,7 @@ async fn recovery_exhausts_and_fails_closed_when_the_network_stays_down() {
 
     // The manager's run resolves with a typed exhaustion error, and the handle
     // watch has fallen to None (fail-closed).
-    let result = tokio::time::timeout(Duration::from_secs(5), ep.init_run)
+    let result = tokio::time::timeout(WAIT, ep.init_run)
         .await
         .expect("manager did not finish")
         .expect("join");

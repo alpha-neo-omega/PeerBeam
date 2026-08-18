@@ -156,30 +156,79 @@ pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&
         )));
     }
 
-    let plan = peerbeam_sync::plan(&manifest, &into);
-    for f in &plan.fetch {
-        let remote = format!("{}/{}", args.path, f.path);
-        session_transfer::request_file(&session, &remote).await;
+    // Rescan first: a file edited in an editor is exactly as real as one
+    // received, and a sync that ignored it would overwrite the user's work with
+    // the peer's older copy.
+    let index = commands::sync_index(&config, &sc.enc, &sc.ident);
+    index
+        .rescan(&args.path, &into)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    let local = index
+        .load(&args.path)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    let remote: Vec<peerbeam_sync::RemoteFile> = manifest
+        .files
+        .iter()
+        .map(|f| peerbeam_sync::RemoteFile {
+            path: f.path.clone(),
+            size: f.size,
+            version: f.version.clone(),
+            deleted: f.deleted,
+        })
+        .collect();
+    let actions = peerbeam_sync::reconcile(&local, &remote, &device.id.0);
+    let remote_versions: std::collections::BTreeMap<String, peerbeam_sync::VersionVector> = remote
+        .iter()
+        .map(|f| (f.path.clone(), f.version.clone()))
+        .collect();
+    let outcome = peerbeam_sync::apply_local(&index, &args.path, &into, &actions, &remote_versions)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    for a in &actions {
+        let want = match a {
+            peerbeam_sync::Action::Fetch { path } => Some(path),
+            // A conflict is fetched too: keeping both copies means having both.
+            peerbeam_sync::Action::Conflict { path, .. } => Some(path),
+            _ => None,
+        };
+        if let Some(rel) = want {
+            session_transfer::request_file(&session, &format!("{}/{rel}", args.path)).await;
+        }
     }
     session.close().await;
 
     if ctx.json {
         ctx.json_line(&serde_json::json!({
-            "fetching": plan.fetch.len(),
-            "up_to_date": plan.up_to_date,
+            "fetching": outcome.fetching,
+            "pushing": outcome.pushing,
+            "deleted": outcome.deleted,
+            "conflicts": outcome.conflicts,
             "truncated": manifest.truncated,
         }));
         return Ok(());
     }
     ctx.line(&format!(
-        "asked for {} file(s); {} already up to date",
-        ctx.bold(&plan.fetch.len().to_string()),
-        plan.up_to_date
+        "{} to fetch, {} to send, {} deleted",
+        ctx.bold(&outcome.fetching.to_string()),
+        outcome.pushing,
+        outcome.deleted
     ));
-    if !plan.fetch.is_empty() {
+    if !outcome.conflicts.is_empty() {
+        // Named individually, not counted. A conflict is a decision the user
+        // now has to make, and "3 conflicts" tells them nothing about where.
+        ctx.line(&format!(
+            "{} — your version is untouched; theirs arrives as:",
+            ctx.bold("conflicts")
+        ));
+        for name in &outcome.conflicts {
+            ctx.line(&format!("  {name}"));
+        }
+    }
+    if outcome.fetching > 0 || !outcome.conflicts.is_empty() {
         ctx.line(&ctx.dim(
-            "they arrive as ordinary transfers — `peerbeam receive` or the \
-             daemon must be running to accept them",
+            "incoming files arrive as ordinary transfers — `peerbeam receive` \
+             or the daemon must be running to accept them",
         ));
     }
     if manifest.truncated {
