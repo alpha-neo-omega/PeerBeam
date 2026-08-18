@@ -16,6 +16,7 @@ mod error;
 mod events;
 mod logs;
 mod presence;
+mod rules;
 mod runtime;
 mod session;
 mod session_exec;
@@ -558,6 +559,36 @@ pub unsafe extern "C" fn pb_settings_set(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn pb_settings_reset() -> *mut c_char {
     guard(|| error::envelope(settings::reset()))
+}
+
+// ── auto-save rules ─────────────────────────────────────────────
+
+/// Replace the ordered auto-save rule list: `{rules:[{device?, extension?,
+/// min_bytes?, max_bytes?, directory}]}` → `{count}`.
+///
+/// A rule decides **where** an accepted file is written, never **whether** it
+/// is accepted — this export cannot approve anything, and the approval path
+/// never reads a rule (I6). The **first** matching rule wins, so the order of
+/// the list is the tie-break; a rule with no criteria matches everything, and
+/// an empty list means every file goes to the save directory exactly as
+/// before.
+///
+/// The whole list at once, because reordering is the point: add, remove and
+/// reorder are one call and there is no window where a half-applied edit is on
+/// disk. Every rule is validated first — absolute destination, no `..`, an
+/// existing parent, a satisfiable size range — and **one bad rule refuses the
+/// whole write**, naming which. Reads go through [`pb_settings_get`]
+/// (`save_rules`, plus the managed `rules_supported`); there is no separate
+/// getter to drift from it.
+///
+/// Returns `unsupported` on Android/iOS, where an app cannot write to an
+/// arbitrary absolute path at all.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_rules_set(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| rules::set(&read_json(json)?))()))
 }
 
 // ── daemon ──────────────────────────────────────────────────────

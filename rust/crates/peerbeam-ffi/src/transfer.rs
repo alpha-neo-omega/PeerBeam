@@ -385,6 +385,11 @@ pub struct Manager {
     /// Received-files directory. Interior-mutable so a live settings change
     /// (`set_save_dir`) reaches in-flight/future receives without a restart.
     save_dir: RwLock<String>,
+    /// Ordered auto-save rules — **where** an accepted item lands, never
+    /// whether it is accepted. Interior-mutable for the same reason
+    /// `save_dir` is: editing the list in Settings must apply to the next
+    /// receive, not the next launch.
+    save_rules: RwLock<Vec<peerbeam_config::SaveRule>>,
     /// Approval policy. Interior-mutable so toggling auto-accept applies live.
     auto_accept: AtomicBool,
     chunk_size: u32,
@@ -413,6 +418,7 @@ impl Manager {
         staging_limits: StagingLimits,
         identity: Identity,
         save_dir: String,
+        save_rules: Vec<peerbeam_config::SaveRule>,
         auto_accept: bool,
         chunk_size: u32,
         daemon_port: u16,
@@ -438,6 +444,7 @@ impl Manager {
             identity,
             identity_name,
             save_dir: RwLock::new(save_dir),
+            save_rules: RwLock::new(save_rules),
             auto_accept: AtomicBool::new(auto_accept),
             chunk_size: chunk_size.max(1),
             daemon_port,
@@ -465,6 +472,25 @@ impl Manager {
     /// Apply a new save directory live (persisted settings change; no restart).
     pub fn set_save_dir(&self, dir: String) {
         *self.save_dir.write().unwrap() = dir;
+    }
+
+    /// The auto-save rules to consult for the next received item.
+    ///
+    /// **The one gate.** `crate::rules::SUPPORTED` is checked here rather than
+    /// at each write, so there is no arrangement of settings files, hot
+    /// restarts or hand-edited documents under which a platform that cannot
+    /// honour a destination ends up trying to. On Android this is always
+    /// empty, which means "the save directory", which is what SAF gave us.
+    fn save_rules(&self) -> Vec<peerbeam_config::SaveRule> {
+        if !crate::rules::SUPPORTED {
+            return Vec::new();
+        }
+        self.save_rules.read().unwrap().clone()
+    }
+
+    /// Apply a new rule list live (persisted settings change; no restart).
+    pub fn set_save_rules(&self, rules: Vec<peerbeam_config::SaveRule>) {
+        *self.save_rules.write().unwrap() = rules;
     }
 
     /// Apply the auto-accept policy live (persisted settings change; no restart).
@@ -3267,7 +3293,49 @@ impl Manager {
         // bridge: an ordinary transfer has no row and settles nothing.
         self.chat_settle(&active, ChatStatus::Transferring, None);
 
-        let save_dir = self.save_dir();
+        // **Where this item lands.** The one call site: consulted here, after
+        // every decision about *whether* to accept has been made above, and
+        // immediately before the bytes are written (I6 — nothing in the
+        // matcher can accept anything, and nothing above it reads a rule).
+        //
+        // Its three inputs are the authenticated `peer_device` id — never the
+        // name the peer presented, which it chose — the *sanitized* name
+        // (`preview.name` came through `sanitize_file_name`) and the size. A
+        // peek that learned nothing gives an empty name and a zero size, which
+        // simply matches fewer rules; a catch-all still applies and the save
+        // directory is still the answer when nothing matches.
+        let resolved = peerbeam_config::rules::destination(
+            &self.save_rules(),
+            &self.save_dir(),
+            &session.peer_device.0,
+            &preview.name,
+            preview.size,
+        );
+        // A destination that could not be used must be *said*. The file is
+        // safe — it is going to the save directory — but a user who wrote a
+        // rule believes the sort happened, and a file quietly landing
+        // elsewhere is worse than no rules at all. It rides the transfer
+        // event stream, the same channel every other thing that goes wrong
+        // with this transfer uses, keyed to this transfer's own id.
+        if let Some(fb) = &resolved.fallback {
+            events::transfer(
+                &id,
+                "transfer_save_fallback",
+                json!({
+                    "peer_id": session.peer_device.0,
+                    "rule_directory": fb.rule_directory,
+                    "directory": resolved.directory,
+                    "reason": fb.reason,
+                }),
+            );
+            tracing::warn!(
+                transfer_id = %id,
+                rule_directory = %fb.rule_directory,
+                reason = %fb.reason,
+                "auto-save rule destination unusable; saving to the save directory"
+            );
+        }
+        let save_dir = resolved.directory;
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
         // Filled in by the folder branch with the sanitized root name
@@ -3300,9 +3368,21 @@ impl Manager {
         )
         .await;
         if matches!(outcome, Ok(TransferOutcome::Completed)) {
-            if let Some(root) = folder_root.lock().unwrap().clone() {
+            // **Where it actually landed**, recorded for both shapes now
+            // rather than only for folders. `record`/`record_history` fall
+            // back to `self.save_dir()` when this is unset — which was exactly
+            // right while there was only one destination, and would now name
+            // the wrong directory for a rule-routed file in history, in the
+            // chat row's "Open", and in the completion event. A folder still
+            // points at the folder itself rather than its parent.
+            let landed = folder_root
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| active.file.lock().unwrap().clone());
+            if !landed.is_empty() {
                 *active.path.lock().unwrap() =
-                    Some(format!("{}/{}", save_dir.trim_end_matches('/'), root));
+                    Some(format!("{}/{}", save_dir.trim_end_matches('/'), landed));
             }
         }
         session.close().await;
@@ -3907,6 +3987,9 @@ mod tests {
             },
             identity,
             dir.path().to_string_lossy().into_owned(),
+            // No rules: these tests are about the transfer → chat bridge, and
+            // the save destination is not the variable under study.
+            Vec::new(),
             false,
             1024,
             daemon_port,
@@ -7096,5 +7179,89 @@ mod tests {
         let err = delete_messages(&mgr, "pb/bob", &["anything"])
             .expect_err("an invalid conversation namespace must fail the delete");
         assert_eq!(err.0.as_str(), Code::Internal.as_str());
+    }
+
+    // ── auto-save rules: the manager's copy of the list ──────────
+
+    fn catch_all(dir: &str) -> peerbeam_config::SaveRule {
+        peerbeam_config::SaveRule {
+            directory: dir.to_string(),
+            ..peerbeam_config::SaveRule::default()
+        }
+    }
+
+    /// **The "nothing changed" default.** A manager built with no rules
+    /// resolves every item to the save directory — the behaviour that shipped
+    /// before this feature existed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn with_no_rules_everything_resolves_to_the_save_directory() {
+        let (mgr, _chat, dir) = test_manager_full("receiver", 0);
+        assert!(mgr.save_rules().is_empty());
+
+        let resolved = peerbeam_config::rules::destination(
+            &mgr.save_rules(),
+            &mgr.save_dir(),
+            "pb-alice000001",
+            "report.pdf",
+            10,
+        );
+        assert_eq!(resolved.directory, dir.path().to_string_lossy());
+        assert!(resolved.fallback.is_none());
+    }
+
+    /// A rule list applied live (a Settings edit) is what the *next* receive
+    /// resolves against — not the list the engine started with. The whole
+    /// point of holding it behind a lock rather than reading it once at init.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_rule_edit_applies_to_the_next_item() {
+        let (mgr, _chat, dir) = test_manager_full("receiver", 0);
+        let sorted = dir.path().join("sorted");
+
+        mgr.set_save_rules(vec![catch_all(&sorted.to_string_lossy())]);
+        assert_eq!(mgr.save_rules().len(), 1, "rules apply without a restart");
+
+        let resolved = peerbeam_config::rules::destination(
+            &mgr.save_rules(),
+            &mgr.save_dir(),
+            "pb-alice000001",
+            "report.pdf",
+            10,
+        );
+        assert_eq!(resolved.directory, sorted.to_string_lossy());
+
+        // …and clearing the list puts the save directory back in charge.
+        mgr.set_save_rules(Vec::new());
+        let resolved = peerbeam_config::rules::destination(
+            &mgr.save_rules(),
+            &mgr.save_dir(),
+            "pb-alice000001",
+            "report.pdf",
+            10,
+        );
+        assert_eq!(resolved.directory, dir.path().to_string_lossy());
+    }
+
+    /// **The platform gate is on the read, not on each write.** However a rule
+    /// list got into the manager — init, a live settings edit, a hand-edited
+    /// document — a build that cannot honour a destination must consult none of
+    /// them. On desktop this build can, so the same call returns the list.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_platform_gate_is_checked_where_the_rules_are_read() {
+        let (mgr, _chat, dir) = test_manager_full("receiver", 0);
+        mgr.set_save_rules(vec![catch_all(
+            &dir.path().join("sorted").to_string_lossy(),
+        )]);
+
+        if crate::rules::SUPPORTED {
+            assert_eq!(mgr.save_rules().len(), 1);
+        } else {
+            assert!(
+                mgr.save_rules().is_empty(),
+                "a platform that cannot write an absolute path must consult no rules"
+            );
+        }
     }
 }

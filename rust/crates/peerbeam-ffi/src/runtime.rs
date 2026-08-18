@@ -144,6 +144,13 @@ pub fn apply_live_settings(partial: &Value) {
             apply_live_device_name(&m, name);
         }
     }
+    // Auto-save rules, live: an edit in Settings must apply to the next file
+    // that arrives, not the next launch. Only when the key is present, so
+    // toggling an unrelated setting cannot clear the list — every other branch
+    // here is guarded the same way.
+    if partial.get(crate::rules::RULES_KEY).is_some() {
+        m.set_save_rules(crate::rules::from_settings(partial));
+    }
 }
 
 /// Rename the running device live: update the transfer identity (so the next
@@ -433,6 +440,11 @@ pub fn init(config_json: &str) -> OpResult {
         staging_limits,
         identity,
         config.storage.save_directory.clone(),
+        // Auto-save rules, already overlaid from the persisted settings
+        // document above. Empty for every install that has never opened the
+        // section — and empty means "the save directory", i.e. the behaviour
+        // that shipped before rules existed.
+        config.storage.rules.clone(),
         config.device.auto_accept_trusted,
         // Clamp BEFORE the u32 cast: a configured chunk_size >= 2^32 would
         // otherwise truncate (e.g. 2^32 -> 0), and Manager::new's max(1) guard

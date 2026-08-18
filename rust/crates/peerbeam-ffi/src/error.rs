@@ -34,6 +34,12 @@ pub enum Code {
     Encryption,
     /// The feature is not implemented yet.
     Unimplemented,
+    /// The feature cannot work on this platform, and no future build of it
+    /// will. Distinct from [`Code::Unimplemented`] on purpose: "not yet" tells
+    /// a user to wait, while this tells them to stop looking — as with
+    /// auto-save rules on Android, where an app cannot write to an arbitrary
+    /// absolute path at all (I12: the limit is documented, not papered over).
+    Unsupported,
     /// A destructive chat operation refused because the shared send queue
     /// holds an entry this build cannot decode, and guessing which records it
     /// backs risks discarding something still waiting to be delivered (see
@@ -58,6 +64,7 @@ impl Code {
             Code::Transfer => "transfer",
             Code::Encryption => "encryption",
             Code::Unimplemented => "unimplemented",
+            Code::Unsupported => "unsupported",
             Code::QueueUnreadable => "queue_unreadable",
             Code::Internal => "internal",
         }

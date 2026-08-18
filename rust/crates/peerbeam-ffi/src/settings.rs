@@ -54,6 +54,11 @@ fn defaults() -> Value {
         // document written before this feature existed is never mistaken for
         // consent.
         crate::clipboard::SYNC_KEY: false,
+        // Auto-save rules: an **ordered** list, first match wins. Empty by
+        // default, and an empty list means every received file goes to
+        // `transfer_directory` exactly as it always has — this feature adds
+        // nothing to the experience of a user who never opens it.
+        crate::rules::RULES_KEY: [],
         "experimental": {},
     })
 }
@@ -95,6 +100,12 @@ pub fn overlay(config: &mut EngineConfig) {
     if let Some(auto) = s.get("auto_accept").and_then(|v| v.as_bool()) {
         config.device.auto_accept_trusted = auto;
     }
+    // Auto-save rules travel the same road as the save directory: persisted in
+    // this document, copied onto the engine's config here, read from there by
+    // the one matcher. `from_settings` is total — an absent, malformed or
+    // unsupported-platform list is an empty one — so an unreadable rule can
+    // never stop this device receiving files, it only stops it sorting them.
+    config.storage.rules = crate::rules::from_settings(&s);
 }
 
 fn path() -> Option<PathBuf> {
@@ -139,6 +150,12 @@ pub fn get() -> Op {
     let mut s = load();
     if let Value::Object(m) = &mut s {
         m.insert("trusted_devices".into(), trusted());
+        // Whether this platform can honour auto-save rules at all. A managed
+        // field, like `trusted_devices`: it is a fact about the build, not a
+        // preference, so `set` refuses to write it. The UI reads it to explain
+        // the limitation rather than offering a list that would silently do
+        // nothing.
+        m.insert("rules_supported".into(), json!(crate::rules::SUPPORTED));
     }
     Ok(s)
 }
@@ -152,7 +169,7 @@ pub fn set(partial: &Value) -> Op {
     let mut current = load();
     if let Value::Object(m) = &mut current {
         for (k, v) in obj {
-            if k == "version" || k == "trusted_devices" {
+            if k == "version" || k == "trusted_devices" || k == "rules_supported" {
                 continue; // managed fields
             }
             m.insert(k.clone(), v.clone());
