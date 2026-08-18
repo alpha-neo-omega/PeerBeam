@@ -343,19 +343,39 @@ pub struct TrustArgs {
 pub enum TrustAction {
     /// List every pinned device, and whether it is approved or only pinned.
     List,
-    /// Approve a device: let it receive this machine's status, clipboard and
-    /// pipes. Prints the fingerprint being approved and asks, unless `--yes`.
+    /// Approve a device and grant it every permission this build has: files,
+    /// chat, clipboard, presence, pipe. Narrow it afterwards with
+    /// `trust revoke-permission`. Prints the fingerprint and asks, unless `--yes`.
     Approve {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
         device: String,
     },
-    /// Forget a device entirely: its pin and its approval. The next connection
-    /// from it is a fresh first contact.
+    /// Forget a device entirely: its pin, its approval and its permissions. The
+    /// next connection from it is a fresh first contact.
     Revoke {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
         device: String,
+    },
+    /// Grant one or more permissions to a device: what it may actually do.
+    Permit {
+        /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// One or more of: files, chat, clipboard, presence, pipe.
+        #[arg(value_name = "PERMISSION", required = true)]
+        permissions: Vec<String>,
+    },
+    /// Withhold one or more permissions from a device, keeping it approved.
+    /// Takes effect on its next operation, not its next connection.
+    RevokePermission {
+        /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// One or more of: files, chat, clipboard, presence, pipe.
+        #[arg(value_name = "PERMISSION", required = true)]
+        permissions: Vec<String>,
     },
 }
 

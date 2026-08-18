@@ -329,6 +329,23 @@ pub(crate) fn spawn_drain_tick(
     });
 }
 
+/// The `chat` permission, as a [`CliError`].
+///
+/// Thin on purpose: [`peerbeam_chat::may_exchange_chat`] is the decision and the
+/// tested unit; this only turns a `false` into what an operator reads. Exit `1`
+/// (`Other`) rather than `2`: nothing about the invocation was wrong, this
+/// machine is declining.
+fn permit_chat(trust: &peerbeam_trust_fs::FsTrust, peer: &DeviceId) -> Result<(), CliError> {
+    if peerbeam_chat::may_exchange_chat(trust, peer) {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "messages to {} are not permitted: its `chat` permission was revoked \
+         (`peerbeam trust permit {} chat` restores it)",
+        peer.0, peer.0
+    )))
+}
+
 /// `chat send` — resolve the peer exactly like `commands::send`, enqueue the
 /// message, and make one opportunistic dial+flush attempt. The dial registers
 /// chat wiring on this side too (not "we only send" — a session we dial can
@@ -389,6 +406,11 @@ async fn send(
     // addr` still shows it Pending — but nothing currently reconciles it to
     // the authenticated peer's outbox. Only `--to` sends can be opportunistically
     // flushed by this call.
+    // Refuse **before** enqueueing: a message that will never be sent has no
+    // business sitting in the thread looking Pending. Asked of the routing
+    // target here, and of the *authenticated* peer again after the dial — the
+    // same predicate both times, so the two can never disagree.
+    permit_chat(&sc.trust, &target.id)?;
     let msg = peerbeam_chat::ChatMessage::new(&text).map_err(CliError::from)?;
     store.enqueue(&target.id, &msg).map_err(CliError::from)?;
     let id = msg.id.clone();
@@ -426,9 +448,16 @@ async fn send(
             // different `--addr` targets collide under (or split across) the
             // same conversation.
             let peer = DeviceId::from(session.peer_id.clone());
-            let flushed = flush_to_session(&session.handle, &store, &peer)
-                .await
-                .unwrap_or_default();
+            // Asked again here, of the authenticated identity, because that is
+            // the device the permission is actually about — a `--addr` send
+            // resolved nothing until the handshake completed.
+            let flushed = if peerbeam_chat::may_exchange_chat(sc.trust.as_ref(), &peer) {
+                flush_to_session(&session.handle, &store, &peer)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             session.close().await;
             // `flush_to_session` sends a peer's queued entries FIFO and stops
             // at the first per-message failure, returning only the ids it

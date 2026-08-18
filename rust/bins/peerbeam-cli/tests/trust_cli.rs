@@ -346,3 +346,292 @@ fn revoking_an_absent_device_exits_non_zero() {
     );
     assert!(!err(&o).trim().is_empty(), "and say so");
 }
+
+// ── permissions ─────────────────────────────────────────────────────────────
+
+/// **The literal pre-upgrade store, through the real binary.** `laptop_and_
+/// stranger` writes records with no `permissions` key — exactly what a build
+/// before this feature left on disk. The approved one must still list all five;
+/// reading the absent field as "none" would show a working laptop as permitted
+/// nothing, which is what the upgrade rule exists to prevent.
+#[test]
+fn a_pre_upgrade_store_lists_every_permission_for_an_approved_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let laptop = row(&rows(&cfg), "pb-laptop00001").clone();
+    assert_eq!(
+        laptop["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"]),
+        "an upgraded record keeps everything it had"
+    );
+
+    let o = run(&cfg, &["trust", "list"]);
+    let line = out(&o)
+        .lines()
+        .find(|l| l.contains("pb-laptop00001"))
+        .unwrap_or_else(|| panic!("laptop missing: {}", out(&o)))
+        .to_string();
+    assert!(
+        line.contains("files,chat,clipboard,presence,pipe"),
+        "the table names them too: {line}"
+    );
+}
+
+/// `--json` carries permissions as an explicit array on every row, so a script
+/// can ask "may this device read my clipboard?" without inferring anything.
+#[test]
+fn json_rows_carry_permissions_as_an_array_even_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = store(
+        dir.path(),
+        json!([{
+            "device": "pb-locked00001",
+            "fingerprint": fingerprint('c'),
+            "name": "Locked",
+            "trusted_at": "2026-08-17T10:30:00Z",
+            "approved": true,
+            "permissions": [],
+        }]),
+    );
+    let locked = row(&rows(&cfg), "pb-locked00001").clone();
+    assert_eq!(locked["permissions"], json!([]));
+    assert!(locked["permissions"].is_array());
+    assert_eq!(locked["approved"], json!(true), "still approved");
+}
+
+/// **Revoking one permission leaves the others.** The whole point of the model:
+/// "may sync files, must never read my clipboard".
+#[test]
+fn revoke_permission_takes_one_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(
+        &cfg,
+        &["trust", "revoke-permission", "pb-laptop00001", "clipboard"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("revoked"),
+        "the receipt says what happened: {}",
+        out(&o)
+    );
+
+    let laptop = row(&rows(&cfg), "pb-laptop00001").clone();
+    assert_eq!(
+        laptop["permissions"],
+        json!(["files", "chat", "presence", "pipe"]),
+        "only clipboard is gone"
+    );
+    assert_eq!(laptop["approved"], json!(true), "and it is still approved");
+}
+
+/// `permit` is the exact inverse, and both are idempotent — a provisioning
+/// script must be safe to re-run.
+#[test]
+fn permit_restores_what_revoke_permission_took_and_both_are_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    for _ in 0..2 {
+        let o = run(
+            &cfg,
+            &["trust", "revoke-permission", "pb-laptop00001", "pipe"],
+        );
+        assert!(o.status.success(), "{}", err(&o));
+    }
+    assert!(!row(&rows(&cfg), "pb-laptop00001")["permissions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("pipe")));
+
+    for _ in 0..2 {
+        let o = run(&cfg, &["trust", "permit", "pb-laptop00001", "pipe"]);
+        assert!(o.status.success(), "{}", err(&o));
+    }
+    assert_eq!(
+        row(&rows(&cfg), "pb-laptop00001")["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"])
+    );
+}
+
+/// Several permissions in one invocation, since that is how an operator
+/// actually narrows a device.
+#[test]
+fn several_permissions_change_in_one_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(
+        &cfg,
+        &[
+            "trust",
+            "revoke-permission",
+            "pb-laptop00001",
+            "clipboard",
+            "presence",
+            "pipe",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        row(&rows(&cfg), "pb-laptop00001")["permissions"],
+        json!(["files", "chat"]),
+        "exactly the laptop that may sync files and chat, and nothing else"
+    );
+}
+
+/// **A typo applies nothing.** A half-applied permission change is the one
+/// outcome an operator cannot reason about, so the whole invocation is rejected
+/// (exit `2`, usage) before anything is written.
+#[test]
+fn an_unknown_permission_name_is_a_usage_error_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(
+        &cfg,
+        &[
+            "trust",
+            "revoke-permission",
+            "pb-laptop00001",
+            "clipboard",
+            "clip",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "usage error: {}", err(&o));
+    assert!(
+        err(&o).contains("clipboard"),
+        "it must list what is valid: {}",
+        err(&o)
+    );
+    assert_eq!(
+        row(&rows(&cfg), "pb-laptop00001")["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"]),
+        "the valid name in the same invocation must not have been applied"
+    );
+}
+
+/// `<device>` resolves the same way everywhere else in this command does —
+/// exact id, exact name, then unique name prefix.
+#[test]
+fn a_device_resolves_by_name_prefix_as_it_does_everywhere_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(&cfg, &["trust", "revoke-permission", "lap", "presence"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(
+        row(&rows(&cfg), "pb-laptop00001")["permissions"],
+        json!(["files", "chat", "clipboard", "pipe"])
+    );
+
+    let missing = run(&cfg, &["trust", "permit", "nobody", "files"]);
+    assert_eq!(missing.status.code(), Some(3), "{}", err(&missing));
+}
+
+/// **Permissions narrow a standing; without one there is nothing to narrow.**
+/// Permitting a pinned-but-unapproved device is refused with the next step
+/// rather than accepted as a change with no effect — `TrustStore::may` implies
+/// approval, so any bit written there would grant nothing.
+#[test]
+fn permitting_a_pinned_but_unapproved_device_is_refused_with_the_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(&cfg, &["trust", "permit", "pb-stranger001", "files"]);
+    assert_eq!(o.status.code(), Some(2), "usage error: {}", err(&o));
+    assert!(
+        err(&o).contains("trust approve"),
+        "it must name the next step: {}",
+        err(&o)
+    );
+
+    // And such a device is listed as permitted nothing, whatever a pre-upgrade
+    // record's absent field defaulted to — it may nothing, so it shows nothing.
+    let stranger = row(&rows(&cfg), "pb-stranger001").clone();
+    assert_eq!(stranger["permissions"], json!([]));
+    assert_eq!(stranger["approved"], json!(false));
+}
+
+/// The `--json` receipt names what was asked for and what actually changed, so
+/// a script can tell "applied" from "already like that" without a second list.
+#[test]
+fn the_json_receipt_separates_what_was_asked_from_what_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let first = run(
+        &cfg,
+        &[
+            "--json",
+            "trust",
+            "revoke-permission",
+            "pb-laptop00001",
+            "chat",
+        ],
+    );
+    assert!(first.status.success(), "{}", err(&first));
+    let ev: Value = serde_json::from_str(out(&first).trim()).expect("one JSON object");
+    assert_eq!(ev["event"], json!("trust_permissions_changed"));
+    assert_eq!(ev["granted"], json!(false));
+    assert_eq!(ev["requested"], json!(["chat"]));
+    assert_eq!(ev["changed"], json!(["chat"]));
+    assert_eq!(
+        ev["permissions"],
+        json!(["files", "clipboard", "presence", "pipe"])
+    );
+
+    let again = run(
+        &cfg,
+        &[
+            "--json",
+            "trust",
+            "revoke-permission",
+            "pb-laptop00001",
+            "chat",
+        ],
+    );
+    assert!(again.status.success(), "re-running must not fail");
+    let ev: Value = serde_json::from_str(out(&again).trim()).expect("one JSON object");
+    assert_eq!(ev["requested"], json!(["chat"]));
+    assert_eq!(ev["changed"], json!([]), "nothing changed the second time");
+}
+
+/// Approving a device grants every permission this build has — which is exactly
+/// what approval used to mean implicitly, so nothing about an approve-then-use
+/// flow changes.
+#[test]
+fn approving_grants_every_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(&cfg, &["trust", "approve", "pb-stranger001", "--yes"]);
+    assert!(o.status.success(), "{}", err(&o));
+
+    let stranger = row(&rows(&cfg), "pb-stranger001").clone();
+    assert_eq!(stranger["approved"], json!(true));
+    assert_eq!(
+        stranger["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"])
+    );
+}
+
+/// Revoking a device removes its permissions along with everything else — the
+/// record is gone, not narrowed.
+#[test]
+fn revoking_a_device_takes_its_permissions_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    assert!(run(&cfg, &["trust", "revoke", "pb-laptop00001"])
+        .status
+        .success());
+    assert!(
+        rows(&cfg)
+            .iter()
+            .all(|r| r["id"] != json!("pb-laptop00001")),
+        "the whole record is gone"
+    );
+}
