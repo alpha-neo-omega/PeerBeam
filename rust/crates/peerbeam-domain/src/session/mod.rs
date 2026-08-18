@@ -26,6 +26,6 @@ pub use negotiation::{
     negotiate_version, Capability, CapabilitySet, Version, VersionNegotiation, BROWSE_FEAT_LIST,
     CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
     CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
-    PRESENCE_FEAT_STATUS,
+    PRESENCE_FEAT_STATUS, SYNC_FEAT_MANIFEST,
 };
 pub use state::SessionState;

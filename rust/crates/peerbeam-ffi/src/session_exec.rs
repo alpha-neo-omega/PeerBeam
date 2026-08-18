@@ -15,12 +15,12 @@ use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, RouteKind, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
-use peerbeam_domain::session::BROWSE_FEAT_LIST;
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
     PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
 };
+use peerbeam_domain::session::{BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
 
@@ -40,6 +40,7 @@ const PRESENCE: ChannelType = ChannelType::PRESENCE;
 const PIPE: ChannelType = ChannelType::PIPE;
 const NOTES: ChannelType = ChannelType::NOTES;
 const BROWSE: ChannelType = ChannelType::BROWSE;
+const SYNC: ChannelType = ChannelType::SYNC;
 
 /// Chat wiring for a session: the store + a received-sink. Every dial AND
 /// every accept call site in this codebase registers this (built via
@@ -154,6 +155,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
         .with(Capability::with_features(NOTES, NOTES_FEAT_SYNC))
         .with(Capability::with_features(BROWSE, BROWSE_FEAT_LIST))
+        .with(Capability::with_features(SYNC, SYNC_FEAT_MANIFEST))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -253,6 +255,73 @@ pub async fn request_listing(
     .flatten()
 }
 
+/// Ask a peer for a manifest and wait for it, bounded.
+pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_sync::Manifest> {
+    use tokio::time::{timeout, Duration};
+
+    let channel = session.handle.open_channel(SYNC).await.ok()?;
+    let req = peerbeam_sync::ManifestRequest {
+        path: path.to_string(),
+    };
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_sync::ManifestRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .ok()?;
+
+    let rx = session.sync_rx.clone();
+    // A manifest can describe thousands of files, so this waits longer than a
+    // browse listing — but still bounded, because a peer that never answers
+    // must not hold a caller forever.
+    timeout(Duration::from_secs(30), async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Ask a peer to send one file it shares.
+///
+/// Fire-and-forget: the bytes arrive as an ordinary inbound transfer, through
+/// the same accept/approve path as any other file, because they *are* an
+/// ordinary transfer. Nothing here waits for them.
+pub async fn request_file(session: &Session, path: &str) -> bool {
+    let Ok(channel) = session.handle.open_channel(SYNC).await else {
+        return false;
+    };
+    let req = peerbeam_sync::FileRequest {
+        path: path.to_string(),
+    };
+    let Ok(frame) = req.to_frame(channel) else {
+        return false;
+    };
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_sync::FileRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .is_ok()
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries
+/// folder sync.
+pub fn caps_support_sync(caps: &CapabilitySet) -> bool {
+    caps.features(SYNC)
+        .is_some_and(|f| f & SYNC_FEAT_MANIFEST != 0)
+}
+
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries
 /// browsing.
 pub fn caps_support_browse(caps: &CapabilitySet) -> bool {
@@ -309,6 +378,8 @@ pub struct Session {
     /// handler. Behind a lock because a session is shared and only one caller
     /// waits on an answer at a time.
     pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
+    /// Manifests **this side asked for**.
+    pub sync_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::Manifest>>>,
     /// The authenticated peer's device id.
     pub peer_id: String,
     /// The peer's presented human name (may be empty).
@@ -447,6 +518,36 @@ async fn establish(
         browse_incoming = irx;
         handlers.push(h as Arc<dyn MessageHandler>);
     }
+    // Folder sync, registered unconditionally alongside browsing: it serves
+    // the same shares and answers the same "may you look" question, and a
+    // session without it drops a manifest request silently.
+    let sync_slot: Arc<OnceLock<DeviceId>>;
+    let sync_answers: UnboundedReceiver<peerbeam_sync::Manifest>;
+    let sync_incoming: UnboundedReceiver<peerbeam_sync::Manifest>;
+    let sync_files: UnboundedReceiver<std::path::PathBuf>;
+    {
+        let (tx, rx) = unbounded_channel();
+        let (itx, irx) = unbounded_channel();
+        let (ftx, frx) = unbounded_channel();
+        let (h, slot) = peerbeam_sync::SyncHandler::new(
+            crate::browse::shares(),
+            trust.clone(),
+            Arc::new(move |m| {
+                let _ = tx.send(m);
+            }),
+            Arc::new(move |p| {
+                let _ = ftx.send(p);
+            }),
+            Arc::new(move |m| {
+                let _ = itx.send(m);
+            }),
+        );
+        sync_slot = slot;
+        sync_answers = rx;
+        sync_incoming = irx;
+        sync_files = frx;
+        handlers.push(h as Arc<dyn MessageHandler>);
+    }
     // Presence gets the same treatment for the same reason: an unregistered
     // handler means an inbound Status is silently dropped, not refused.
     let mut presence_slot: Option<Arc<OnceLock<DeviceId>>> = None;
@@ -503,6 +604,7 @@ async fn establish(
         let _ = slot.set(ps.peer().clone());
     }
     let _ = browse_slot.set(ps.peer().clone());
+    let _ = sync_slot.set(ps.peer().clone());
     if let Some(slot) = presence_slot {
         let _ = slot.set(ps.peer().clone());
     }
@@ -521,6 +623,51 @@ async fn establish(
     // Drain the notes handler's replies onto this session. Spawned rather than
     // awaited: an answer is owed *after* frames start arriving, which is long
     // after this function returns.
+    {
+        let mut rx = sync_answers;
+        let reply_handle = handle.clone();
+        crate::runtime::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
+                    break;
+                };
+                let Ok(frame) = m.to_frame(channel) else {
+                    continue;
+                };
+                if reply_handle
+                    .send_on_channel(
+                        channel,
+                        peerbeam_sync::Manifest::message_type(),
+                        frame.flags,
+                        frame.payload,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    // A peer asked for a file it is allowed to have. Sending it is the Transfer
+    // channel's job, so the request surfaces as an event rather than being
+    // served here: this crate owns no second bulk path.
+    {
+        let mut rx = sync_files;
+        let peer_for_files = peer_device.clone();
+        crate::runtime::spawn(async move {
+            while let Some(path) = rx.recv().await {
+                crate::events::emit(&serde_json::json!({
+                    "type": "sync_file_requested",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "payload": {
+                        "device_id": peer_for_files.0,
+                        "path": path.to_string_lossy(),
+                    },
+                }));
+            }
+        });
+    }
     {
         let mut rx = browse_answers;
         let reply_handle = handle.clone();
@@ -597,6 +744,7 @@ async fn establish(
     Ok(Session {
         handle,
         browse_rx: Arc::new(tokio::sync::Mutex::new(browse_incoming)),
+        sync_rx: Arc::new(tokio::sync::Mutex::new(sync_incoming)),
         peer_id,
         peer_name,
         peer_device,

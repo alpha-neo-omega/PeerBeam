@@ -259,6 +259,11 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `sync <peer> <path> <into>` — mirror a device's shared folder into a local
+  directory. **One-way pull**: nothing local is deleted, nothing is pushed back,
+  and a local file newer than the peer's copy is left alone. Needs both `browse`
+  and `files` permissions from the peer. The files arrive as ordinary
+  transfers, so `peerbeam receive` or the daemon must be running to accept them.
 - `browse <peer> [path]` — list what a device shares, read-only. Paths are
   share-relative (`photos/2026`). An empty listing is the same answer whether
   the device shares nothing, has not granted this machine the `browse`

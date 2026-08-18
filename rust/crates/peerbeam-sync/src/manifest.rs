@@ -124,9 +124,14 @@ pub fn plan(manifest: &Manifest, local_root: &std::path::Path) -> Plan {
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs() as i64);
-                if meta.len() != f.size && local_mtime <= f.modified {
-                    fetch.push(f.clone());
-                } else if local_mtime < f.modified {
+                // Two reasons to fetch, and both defer to a newer local file:
+                // the peer's copy is a different size and no older than ours,
+                // or it is simply newer. A local file that is newer is left
+                // alone whatever its size — this is a pull, and overwriting
+                // work done here would lose it with no warning and no undo.
+                let differs_and_not_older = meta.len() != f.size && local_mtime <= f.modified;
+                let peer_is_newer = local_mtime < f.modified;
+                if differs_and_not_older || peer_is_newer {
                     fetch.push(f.clone());
                 } else {
                     up_to_date += 1;

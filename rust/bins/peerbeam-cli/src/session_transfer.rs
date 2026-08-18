@@ -33,12 +33,12 @@ use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
-use peerbeam_domain::session::BROWSE_FEAT_LIST;
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
     PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
 };
+use peerbeam_domain::session::{BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
 use peerbeam_transfer::{
@@ -148,6 +148,10 @@ fn advertised_caps() -> CapabilitySet {
             ChannelType::BROWSE,
             BROWSE_FEAT_LIST,
         ))
+        .with(Capability::with_features(
+            ChannelType::SYNC,
+            SYNC_FEAT_MANIFEST,
+        ))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -180,6 +184,8 @@ fn dial_meta(device: &Device, id: &str) -> TransferSession {
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
 /// so the receiving side can await the peer's transfer channel.
 pub struct Session {
+    /// Manifests this side asked for.
+    pub sync_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::Manifest>>>,
     /// Answers to listings this side asked for.
     pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
     /// Control handle for opening channels / closing.
@@ -201,6 +207,59 @@ pub struct Session {
     /// This session's presence heartbeat, if presence was configured. Held so
     /// `close` can stop it rather than wait out the next tick's liveness probe.
     presence: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Ask a peer for a manifest and wait for it, bounded.
+pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_sync::Manifest> {
+    use tokio::time::{timeout, Duration};
+
+    let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
+    let req = peerbeam_sync::ManifestRequest {
+        path: path.to_string(),
+    };
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_sync::ManifestRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .ok()?;
+    let rx = session.sync_rx.clone();
+    timeout(Duration::from_secs(30), async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Ask a peer to send one file it shares. Fire-and-forget: the bytes arrive as
+/// an ordinary inbound transfer.
+pub async fn request_file(session: &Session, path: &str) -> bool {
+    let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
+        return false;
+    };
+    let req = peerbeam_sync::FileRequest {
+        path: path.to_string(),
+    };
+    let Ok(frame) = req.to_frame(channel) else {
+        return false;
+    };
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_sync::FileRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .is_ok()
 }
 
 /// Ask a peer for one listing and wait for its answer, bounded.
@@ -287,6 +346,14 @@ impl Session {
         self.capabilities
             .features(ChannelType::PRESENCE)
             .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
+    }
+
+    /// Whether the peer negotiated folder sync.
+    #[must_use]
+    pub fn supports_sync(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::SYNC)
+            .is_some_and(|f| f & SYNC_FEAT_MANIFEST != 0)
     }
 
     /// Whether the peer negotiated browsing.
@@ -407,6 +474,19 @@ async fn establish(
     // session is not a file server) but must still receive the answers to its
     // own requests.
     let (browse_tx, browse_rx) = unbounded_channel();
+    let (sync_tx, sync_rx) = unbounded_channel();
+    // The CLI serves no shares — a terminal session is not a file server — so
+    // its sync handler answers nothing and only routes back the manifests it
+    // asked for.
+    let (sync_handler, sync_slot) = peerbeam_sync::SyncHandler::new(
+        peerbeam_browse::Shares::default(),
+        trust.clone(),
+        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(move |m| {
+            let _ = sync_tx.send(m);
+        }),
+    );
     let (browse_handler, browse_slot) = peerbeam_browse::BrowseHandler::new(
         peerbeam_browse::Shares::default(),
         trust.clone(),
@@ -417,6 +497,7 @@ async fn establish(
     );
     handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
     handlers.push(browse_handler as Arc<dyn MessageHandler>);
+    handlers.push(sync_handler as Arc<dyn MessageHandler>);
 
     // Event/channel-event sinks are unused by the CLI (diagnostics read the
     // engine registry, not these); their receivers drop and emits are ignored.
@@ -444,6 +525,7 @@ async fn establish(
     }
     let _ = presence_slot.set(ps.peer().clone());
     let _ = browse_slot.set(ps.peer().clone());
+    let _ = sync_slot.set(ps.peer().clone());
     let _ = clipboard_slot.set(ps.peer().clone());
     let peer_device = ps.peer().clone();
     let peer_id = ps.peer().0.clone();
@@ -476,6 +558,7 @@ async fn establish(
     Ok(Session {
         handle,
         browse_rx: Arc::new(tokio::sync::Mutex::new(browse_rx)),
+        sync_rx: Arc::new(tokio::sync::Mutex::new(sync_rx)),
         peer_id,
         newly_trusted,
         pairing_code,

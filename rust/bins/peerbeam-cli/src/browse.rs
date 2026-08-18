@@ -96,6 +96,98 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// `peerbeam sync <PEER> <PATH> <INTO>`.
+///
+/// Fetches the peer's manifest, works out what this directory is missing or
+/// behind on, and asks for those files. The bytes arrive as ordinary inbound
+/// transfers — so a `peerbeam receive` or daemon must be running to accept
+/// them, exactly as for any other file. Said plainly here because a sync that
+/// reported "12 files" and then delivered nothing would be baffling.
+pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&str>) -> CliResult {
+    let into = std::path::PathBuf::from(&args.into);
+    if !into.is_dir() {
+        return Err(CliError::NotFound(format!(
+            "{} is not a directory",
+            args.into
+        )));
+    }
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let devices = commands::snapshot(config.clone(), 2).await;
+    let candidates: Vec<(String, String)> = devices
+        .iter()
+        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+        .collect();
+    let index = commands::resolve_peer(ctx, &candidates, &Some(args.peer))?;
+    let device = devices[index].device.clone();
+
+    let quic = Arc::new(peerbeam_transfer_quic::QuicTransport::new().map_err(CliError::from)?);
+    let routes = peerbeam_engine::RouteManager::new(quic.clone());
+    let session = session_transfer::dial(
+        &quic, &routes, &device, "sync", &sc.ident, &sc.enc, &sc.trust, None,
+    )
+    .await
+    .map_err(|e| CliError::Other(format!("could not reach {}: {e}", device.name)))?;
+
+    if !session.supports_sync() {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} is running a build without folder sync",
+            device.name
+        )));
+    }
+
+    let manifest = session_transfer::request_manifest(&session, &args.path).await;
+    let Some(manifest) = manifest else {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} did not answer about {}",
+            device.name, args.path
+        )));
+    };
+    if manifest.denied {
+        session.close().await;
+        // One sentence for every reason, as browsing does: the device sent one
+        // answer for all of them.
+        return Err(CliError::Other(format!(
+            "{} is not sharing {} with this device — it may share nothing \
+             there, or may not have granted permission",
+            device.name, args.path
+        )));
+    }
+
+    let plan = peerbeam_sync::plan(&manifest, &into);
+    for f in &plan.fetch {
+        let remote = format!("{}/{}", args.path, f.path);
+        session_transfer::request_file(&session, &remote).await;
+    }
+    session.close().await;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "fetching": plan.fetch.len(),
+            "up_to_date": plan.up_to_date,
+            "truncated": manifest.truncated,
+        }));
+        return Ok(());
+    }
+    ctx.line(&format!(
+        "asked for {} file(s); {} already up to date",
+        ctx.bold(&plan.fetch.len().to_string()),
+        plan.up_to_date
+    ));
+    if !plan.fetch.is_empty() {
+        ctx.line(&ctx.dim(
+            "they arrive as ordinary transfers — `peerbeam receive` or the \
+             daemon must be running to accept them",
+        ));
+    }
+    if manifest.truncated {
+        ctx.line(&ctx.dim("the folder has more files than one manifest carries"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

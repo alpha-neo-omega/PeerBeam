@@ -77,6 +77,8 @@ pub enum Command {
     Watch(WatchArgs),
     /// List what a device shares, read-only.
     Browse(BrowseArgs),
+    /// Mirror a device's shared folder into a local directory.
+    Sync(SyncArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -452,6 +454,25 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// Mirror a device's shared folder into a local directory.
+///
+/// **A one-way pull.** Nothing local is deleted, nothing is pushed back, and a
+/// local file newer than the peer's copy is left alone — overwriting work done
+/// here would lose it with no warning and no undo. Removing files is a decision
+/// you make with your own tools.
+///
+/// Requires the peer to have granted this machine both `browse` (to see what
+/// exists) and `files` (to receive any of it).
+#[derive(Args)]
+pub struct SyncArgs {
+    /// Target device (id, name, or unambiguous name prefix).
+    pub peer: String,
+    /// Share-relative path on the device, e.g. `photos`.
+    pub path: String,
+    /// Local directory to mirror into. Must already exist.
+    pub into: String,
+}
+
 /// List what a device shares.
 ///
 /// Read-only, and shows only what that device chose to share **and** granted

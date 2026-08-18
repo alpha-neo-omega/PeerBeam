@@ -32,6 +32,7 @@ peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
 peerbeam-reliability-fs = { path = "../../crates/peerbeam-reliability-fs" }
 peerbeam-appstore-fs = { path = "../../crates/peerbeam-appstore-fs" }
 peerbeam-browse = { path = "../../crates/peerbeam-browse" }
+peerbeam-sync = { path = "../../crates/peerbeam-sync" }
 peerbeam-chat = { path = "../../crates/peerbeam-chat" }
 peerbeam-notes = { path = "../../crates/peerbeam-notes" }
 peerbeam-clipboard = { path = "../../crates/peerbeam-clipboard" }

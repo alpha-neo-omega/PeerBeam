@@ -3277,6 +3277,88 @@ impl Manager {
         sender.ring(seconds).await.is_ok()
     }
 
+    /// Mirror a peer's shared folder into a local directory:
+    /// `{peer, path, into}` → `{fetching, up_to_date, truncated}`.
+    ///
+    /// **A one-way pull.** Nothing is deleted, nothing is pushed, and a local
+    /// file that is newer than the peer's is left alone — silently overwriting
+    /// work done here would lose it with no warning and no undo.
+    ///
+    /// Returns as soon as the files have been *asked for*. The bytes arrive as
+    /// ordinary inbound transfers, through the same approval path as any other
+    /// file, because they are ordinary transfers.
+    pub fn sync_pull(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let path = req
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "path required".into()))?
+            .to_string();
+        let into = req
+            .get("into")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "into required".into()))?;
+        let into = std::path::PathBuf::from(into);
+        if !into.is_dir() {
+            return Err((
+                Code::InvalidArgument,
+                format!("{} is not a directory", into.display()),
+            ));
+        }
+
+        let me = self.clone();
+        let plan_path = path.clone();
+        let result =
+            crate::runtime::block_on(async move { me.pull_folder(device, plan_path, into).await });
+        match result {
+            Some((fetching, up_to_date, truncated)) => Ok(json!({
+                "fetching": fetching,
+                "up_to_date": up_to_date,
+                "truncated": truncated,
+            })),
+            None => Err((
+                Code::Connection,
+                format!("could not get a manifest for {path}"),
+            )),
+        }
+    }
+
+    /// Fetch the manifest, plan against the local mirror, and request each file
+    /// that is needed. `None` when the peer cannot be reached or answered.
+    async fn pull_folder(
+        self: &Arc<Self>,
+        device: Device,
+        path: String,
+        into: std::path::PathBuf,
+    ) -> Option<(usize, usize, bool)> {
+        let meta = self.session(&format!("sync-{}", device.id.0), device.id.clone(), 0);
+        let session = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        .ok()?;
+        if !crate::session_exec::caps_support_sync(&session.capabilities) {
+            return None;
+        }
+        let manifest = crate::session_exec::request_manifest(&session, &path).await?;
+        let plan = peerbeam_sync::plan(&manifest, &into);
+        for f in &plan.fetch {
+            // Share-relative, joined the way the peer names things — the local
+            // mirror's layout is this side's business and never goes out.
+            let remote = format!("{path}/{}", f.path);
+            crate::session_exec::request_file(&session, &remote).await;
+        }
+        Some((plan.fetch.len(), plan.up_to_date, manifest.truncated))
+    }
+
     /// Ask a device what is in one of its shared folders:
     /// `{peer, path?}` → `{path, entries:[…], truncated, denied}`.
     ///

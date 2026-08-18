@@ -559,6 +559,21 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// Mirror a peer's shared folder into a local directory:
+/// `{peer, path, into}` → `{fetching, up_to_date, truncated}`.
+///
+/// **A one-way pull.** Nothing is deleted, nothing is pushed, and a local file
+/// newer than the peer's is left alone. Returns once the files have been asked
+/// for; the bytes arrive as ordinary inbound transfers through the usual
+/// approval path, because that is what they are.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_sync_pull(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.sync_pull(&read_json(json)?))()))
+}
+
 /// Ask a device what is in one of its shared folders:
 /// `{peer, path?}` → `{path, entries:[…], truncated, denied}`.
 ///

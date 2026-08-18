@@ -7,6 +7,26 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Browse and mirror a device's shared folders.** Point `device.shared_directories`
+  at what you want to offer (**empty by default**), grant a device the new
+  **Browse** permission, and it can list what is there — in the app from a
+  device's menu, or with `peerbeam browse <peer> [path]`.
+
+  `peerbeam sync <peer> <path> <into>` mirrors a shared folder locally. It is a
+  **one-way pull**: nothing local is deleted, nothing is pushed back, and a file
+  newer on your machine is never overwritten. Receiving files needs the `files`
+  permission as well as `browse` — being allowed to see that a file exists is
+  not being allowed to take it.
+
+  An empty listing is the same answer whether the device shares nothing, has not
+  granted you permission, or the folder is gone. That is deliberate: a caller
+  able to tell them apart could map a filesystem it may never see.
+- **An activity view** — one chronological list of transfers, conversations and
+  clips, from Home or `peerbeam timeline`. It carries no message bodies and no
+  clip text.
+- **`peerbeam watch <dir> --to <peer>`** — send whatever lands in a folder. A
+  file is sent only once it has stopped growing, so a copy still in progress is
+  never delivered half-written.
 - **Clipboard history — off by default, and a separate switch from sync.**
   Remembers your last 50 clips **on this device only**; nothing about history is
   ever sent to a peer. View or erase it in Settings → Clipboard history, or with
