@@ -453,7 +453,23 @@ pub fn init(config_json: &str) -> OpResult {
         config.transfer.chunk_size.clamp(1, u32::MAX as u64) as u32,
         config.transfer.port,
         Some(std::path::Path::new(&config.storage.data_directory).join("history.json")),
+        // Checkpoints: the record an interrupted transfer leaves behind. A
+        // sibling of history.json rather than something inside it — history is
+        // what happened, a checkpoint is what has not finished happening.
+        Arc::new(peerbeam_reliability_fs::FsReliability::new(
+            std::path::Path::new(&config.storage.data_directory).join("checkpoints"),
+        )),
     ));
+
+    // Startup is the only moment at which nothing is running, so it is the
+    // only moment at which every checkpoint on disk is genuinely stale rather
+    // than merely in progress: reclaim the ones nobody will come back to, then
+    // tell the surface about the ones that survived. Without the second half a
+    // transfer interrupted by the app closing would simply be gone — the
+    // checkpoint would sit there, resumable, and nothing would ever mention
+    // it.
+    manager.sweep_checkpoints();
+    manager.announce_interrupted();
 
     // Start the receive server (the "daemon") so accept/reject have incoming
     // transfers; controllable via pb_daemon_*. Propagate failure instead of
@@ -570,6 +586,20 @@ pub fn discovery_stop() -> OpResult {
         .map_err(crate::error::from_engine)?;
     DISCOVERING.store(false, Ordering::SeqCst);
     Ok(json!({ "discovering": false }))
+}
+
+/// The live device record for `id`, if discovery currently sees it.
+///
+/// Used by the resume path, which holds a peer id from a checkpoint and needs
+/// the addresses that go with it *now* rather than the ones that applied when
+/// the transfer was interrupted.
+pub fn find_device(id: &peerbeam_domain::id::DeviceId) -> Option<Device> {
+    let engine = engine().ok()?;
+    engine
+        .devices()
+        .iter()
+        .find(|d| d.device.id == *id)
+        .map(|d| d.device.clone())
 }
 
 pub fn devices() -> OpResult {

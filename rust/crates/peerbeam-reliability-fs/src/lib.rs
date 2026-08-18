@@ -98,7 +98,7 @@ impl ReliabilityStore for FsReliability {
                 None => continue,
             }
         }
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         Ok(out)
     }
 

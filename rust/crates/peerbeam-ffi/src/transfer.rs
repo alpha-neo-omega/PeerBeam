@@ -25,16 +25,16 @@ use peerbeam_chat::{
 use peerbeam_chat::Kind as ChatKind;
 use peerbeam_crypto::AeadCrypto;
 use peerbeam_domain::entity::{
-    Device, DeviceType, Direction, Progress, TransferSession, TransferStatus,
+    Device, DeviceType, Direction, FileEntry, Progress, TransferSession, TransferStatus,
 };
 use peerbeam_domain::error::Result as DResult;
 use peerbeam_domain::id::{DeviceId, TransferId};
-use peerbeam_domain::port::TrustStore;
+use peerbeam_domain::port::{ReliabilityStore, TrustStore};
 use peerbeam_domain::session::CapabilitySet;
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    peek_incoming_meta, receive_on_channel, send_file_on_session, send_folder_on_session,
+    peek_incoming_meta, receive_on_channel, send_file_on_session_recover, send_folder_on_session,
     ChannelReceived, FolderSendRequest, Identity, SendRequest, TransferControl, TransferOutcome,
     BACK_PAUSE, BACK_RESUME,
 };
@@ -43,6 +43,7 @@ use peerbeam_trust_fs::FsTrust;
 
 use crate::error::{from_domain, Code};
 use crate::events;
+use crate::resume::CheckpointWriter;
 
 // ── statistics ──────────────────────────────────────────────────
 
@@ -142,7 +143,7 @@ impl Stats {
 
 // ── active transfer ─────────────────────────────────────────────
 
-struct Active {
+pub(crate) struct Active {
     id: String,
     direction: &'static str,
     peer: String,
@@ -164,7 +165,7 @@ struct Active {
     path: Mutex<Option<String>>,
     /// The background task running this transfer, so cancel can abort it
     /// immediately even if a send is blocked on a slow link.
-    task: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Active {
@@ -399,12 +400,19 @@ pub struct Manager {
     history: Mutex<Vec<Value>>,
     /// Where history persists across restarts (None = in-memory only, tests).
     history_path: Option<std::path::PathBuf>,
+    /// Checkpoints for transfers that were interrupted rather than finished.
+    ///
+    /// The engine's own store (I2 — there is one recovery implementation and
+    /// this is the port it writes through). It is what makes a transfer
+    /// killed by a dropped link or a closed app something the user can come
+    /// back to instead of something that is simply gone.
+    reliability: Arc<dyn ReliabilityStore>,
     counter: AtomicU64,
     daemon_task: Mutex<Option<JoinHandle<()>>>,
     daemon_running: AtomicBool,
 }
 
-type Op = Result<Value, (Code, String)>;
+pub(crate) type Op = Result<Value, (Code, String)>;
 
 impl Manager {
     #[allow(clippy::too_many_arguments)]
@@ -423,6 +431,7 @@ impl Manager {
         chunk_size: u32,
         daemon_port: u16,
         history_path: Option<std::path::PathBuf>,
+        reliability: Arc<dyn ReliabilityStore>,
     ) -> Self {
         let history = history_path
             .as_deref()
@@ -452,6 +461,7 @@ impl Manager {
             pending: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
             history_path,
+            reliability,
             counter: AtomicU64::new(0),
             daemon_task: Mutex::new(None),
             daemon_running: AtomicBool::new(false),
@@ -724,6 +734,20 @@ impl Manager {
         FsStorage::new()
     }
 
+    /// The checkpoint store. The single handle every interrupted-transfer
+    /// operation goes through — see [`crate::resume`].
+    pub(crate) fn checkpoints(&self) -> &dyn ReliabilityStore {
+        self.reliability.as_ref()
+    }
+
+    /// Whether a transfer is registered and running under `id` right now.
+    /// A checkpoint's id and a live transfer's id are the same keyspace, so
+    /// anything that acts on a checkpoint has to be able to ask.
+    pub(crate) fn is_active(&self, id: &str) -> bool {
+        self.active.lock().unwrap().contains_key(id)
+    }
+
+    /// Transfer-session metadata used to dial (routing/telemetry only).
     fn session(&self, id: &str, peer: DeviceId, total: u64) -> TransferSession {
         TransferSession {
             id: TransferId::from(id),
@@ -736,6 +760,64 @@ impl Manager {
             started_at: chrono::Utc::now(),
             completed_at: None,
             is_resume: false,
+            accepted: true,
+        }
+    }
+
+    /// The record that survives this transfer being interrupted.
+    ///
+    /// Unlike [`session`](Self::session) — which only ever describes a dial to
+    /// the route manager — this one is written to disk and read back by a
+    /// process that knows nothing else about the transfer, so every field a
+    /// resume has to check is filled in: the peer, the file's name, its
+    /// destination (a receive) or source (a send), and its size, in both the
+    /// per-file entry and `total_bytes` because `check_resume` compares them
+    /// against each other.
+    ///
+    /// `accepted` is the caller's assertion that the local user consented, and
+    /// is the only place that assertion is made. Every send passes `true` (the
+    /// user started it); the receive path passes `true` only on the far side of
+    /// the approval gate.
+    ///
+    /// `is_resume` is not a parameter because it is not a caller's opinion: a
+    /// checkpoint already sitting under this id *is* a prior interrupted run,
+    /// and there is nothing else it could be. `started_at` restarts here too,
+    /// so a transfer someone keeps retrying never ages into expiry.
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint(
+        &self,
+        id: &str,
+        peer: DeviceId,
+        direction: Direction,
+        path: &str,
+        name: &str,
+        size: u64,
+        accepted: bool,
+    ) -> TransferSession {
+        let is_resume = self
+            .reliability
+            .load_checkpoint(&TransferId::from(id))
+            .ok()
+            .flatten()
+            .is_some();
+        TransferSession {
+            id: TransferId::from(id),
+            peer,
+            direction,
+            status: TransferStatus::Transferring,
+            files: vec![FileEntry {
+                path: std::path::PathBuf::from(path),
+                name: name.to_string(),
+                size,
+                mime_type: String::new(),
+                checksum: None,
+            }],
+            total_bytes: size,
+            transferred_bytes: 0,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            is_resume,
+            accepted,
         }
     }
 
@@ -905,7 +987,7 @@ impl Manager {
     /// removal must therefore not trust the id alone — see
     /// [`claim`](Self::claim), which is what actually keeps one transfer's
     /// unwind from tearing out its successor.
-    fn register_vacant(
+    pub(crate) fn register_vacant(
         &self,
         id: &str,
         direction: &'static str,
@@ -1060,7 +1142,7 @@ impl Manager {
         }
     }
 
-    async fn run_send(
+    pub(crate) async fn run_send(
         self: Arc<Self>,
         id: String,
         active: Arc<Active>,
@@ -1120,6 +1202,20 @@ impl Manager {
         *active.status.lock().unwrap() = "transferring".into();
 
         let handle = session.handle.clone();
+        // The record that outlives an interruption. Built before the transfer
+        // rather than after it fails, because the case it exists for — the
+        // process being killed — never reaches an "after".
+        let checkpoint = self.checkpoint(
+            id,
+            device.id.clone(),
+            Direction::Sending,
+            &path,
+            &name,
+            size,
+            // A send is the local user's own action; there is no prompt and
+            // nothing to withhold.
+            true,
+        );
         let req = SendRequest {
             transfer_id: id.to_string(),
             name,
@@ -1129,18 +1225,32 @@ impl Manager {
         };
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
+        let reliability = self.reliability.clone();
+        let writer = CheckpointWriter::new(self.reliability.clone(), checkpoint.clone());
         let outcome = drive(
             id.to_string(),
             active.stats.clone(),
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let r = send_file_on_session(&handle, &storage, req, &ctrl, &ptx, 3).await;
+                let r = send_file_on_session_recover(
+                    &handle,
+                    &storage,
+                    reliability.as_ref(),
+                    req,
+                    checkpoint,
+                    &ctrl,
+                    &ptx,
+                    SEND_RECOVER_ATTEMPTS,
+                    3,
+                )
+                .await;
                 drop(ptx);
                 r
             },
             None,
             None,
+            Some(writer),
         )
         .await;
         session.close().await;
@@ -1202,6 +1312,11 @@ impl Manager {
                 r
             },
             None,
+            None,
+            // A folder is a manifest plus N files, not one resumable stream —
+            // a checkpoint naming a single file/size would be a lie about what
+            // is on disk, and `check_resume` would have nothing true to bind
+            // to. Folder resume is Phase C's folder-sync work, not this.
             None,
         )
         .await;
@@ -3203,7 +3318,20 @@ impl Manager {
             .flatten()
             .map(|r| r.approved)
             .unwrap_or(false);
-        let outcome = if auto && approved {
+        // A transfer the user already accepted, interrupted and now offered
+        // again, resumes without a second prompt — being asked twice for one
+        // file because the Wi-Fi dropped is exactly the friction resume exists
+        // to remove.
+        //
+        // It grants nothing by itself: `resumes_accepted_receive` requires a
+        // stored checkpoint whose `accepted` is true AND whose peer, file name
+        // and total size match what this connection is actually offering. A
+        // transfer that was declined, timed out, or never answered has no
+        // checkpoint at all and lands in the ordinary gate below — an
+        // interruption must not turn an unanswered prompt into a yes (I6).
+        let resuming =
+            self.resumes_accepted_receive(&id, &session.peer_device, &preview.name, preview.size);
+        let outcome = if resuming || (auto && approved) {
             AcceptOutcome::Accepted
         } else {
             self.wait_for_accept(&id, &session.peer_device).await
@@ -3304,13 +3432,35 @@ impl Manager {
         // peek that learned nothing gives an empty name and a zero size, which
         // simply matches fewer rules; a catch-all still applies and the save
         // directory is still the answer when nothing matches.
-        let resolved = peerbeam_config::rules::destination(
-            &self.save_rules(),
-            &self.save_dir(),
-            &session.peer_device.0,
-            &preview.name,
-            preview.size,
-        );
+        //
+        // A **resume** skips the matcher entirely and goes back to the
+        // directory its own checkpoint records. The partial bytes are at
+        // `<that directory>/<name>.part`, and the receive engine looks for
+        // them relative to the directory it is handed — so re-deriving the
+        // destination here would send a resumed file wherever the rules and
+        // save directory point *now*, find no partial file, restart from zero,
+        // and strand the first half in the old directory. Nothing about
+        // consent moves: this only ever runs for a transfer already accepted
+        // above, and it can only ever choose a directory this device itself
+        // chose earlier.
+        let resumed_dir = resuming
+            .then(|| {
+                self.resume_destination(&id, &session.peer_device, &preview.name, preview.size)
+            })
+            .flatten();
+        let resolved = match resumed_dir {
+            Some(dir) => peerbeam_config::rules::Destination {
+                directory: dir,
+                fallback: None,
+            },
+            None => peerbeam_config::rules::destination(
+                &self.save_rules(),
+                &self.save_dir(),
+                &session.peer_device.0,
+                &preview.name,
+                preview.size,
+            ),
+        };
         // A destination that could not be used must be *said*. The file is
         // safe — it is going to the save directory — but a user who wrote a
         // rule believes the sort happened, and a file quietly landing
@@ -3336,6 +3486,40 @@ impl Manager {
             );
         }
         let save_dir = resolved.directory;
+        // The record that survives an interruption, written **here** and
+        // nowhere earlier: every line above this one is part of deciding
+        // whether these bytes may land at all, and a checkpoint written before
+        // that decision would be a consent record for a decision nobody made.
+        // `accepted: true` is therefore only ever asserted on this side of the
+        // gate.
+        //
+        // A folder gets none: it is a manifest plus N files, so a checkpoint
+        // naming one file and one size would be a claim `check_resume` could
+        // not honestly bind to. `preview.is_folder` is peer-supplied, but the
+        // failure mode of a lie is only a missing (or an unbindable, therefore
+        // refused) checkpoint — never a wrong one.
+        let checkpoint = (!preview.is_folder).then(|| {
+            self.checkpoint(
+                &id,
+                session.peer_device.clone(),
+                Direction::Receiving,
+                &format!("{}/{}", save_dir.trim_end_matches('/'), preview.name),
+                &preview.name,
+                preview.size,
+                true,
+            )
+        });
+        if let Some(cp) = &checkpoint {
+            if let Err(e) = self.reliability.save_checkpoint(cp) {
+                // Not fatal: the transfer still works, it just will not be
+                // resumable if it dies. Losing the file to a refusal to record
+                // it would be the worse trade.
+                tracing::warn!(error = %e, transfer_id = %id, "receive checkpoint not written");
+            }
+        }
+        let writer = checkpoint
+            .clone()
+            .map(|cp| crate::resume::CheckpointWriter::new(self.reliability.clone(), cp));
         let storage = self.storage();
         let ctrl = active.ctrl.clone();
         // Filled in by the folder branch with the sanitized root name
@@ -3365,8 +3549,46 @@ impl Manager {
             },
             None,
             None,
+            writer,
         )
         .await;
+        // What the checkpoint is worth now that this leg has ended.
+        //
+        // Completed: nothing left to resume, drop it.
+        //
+        // Cancelled **by this side** — `Manager::cancel` sets our own `ctrl`,
+        // and nothing else does — is the user refusing the file, so the
+        // partial bytes go with the record: they are not a head start on
+        // anything, and leaving them would let a transfer the user threw away
+        // seed the next one of the same name.
+        //
+        // Cancelled by the **peer** is not a refusal at all, it is the sender
+        // walking away mid-stream — which is exactly what an interrupted
+        // transfer looks like from here. Keep both, the same as an error: the
+        // engine itself keeps the `.part` on a cancel for precisely this
+        // reason, and deleting it would throw away the thing resume exists
+        // for.
+        if let Some(cp) = &checkpoint {
+            match &outcome {
+                Ok(TransferOutcome::Completed) => {
+                    if let Err(e) = self.reliability.clear_checkpoint(&cp.id) {
+                        tracing::warn!(error = %e, transfer_id = %id, "checkpoint not cleared");
+                    }
+                }
+                Ok(TransferOutcome::Cancelled) if active.ctrl.is_cancelled() => {
+                    self.discard_checkpoint(cp);
+                }
+                Ok(TransferOutcome::Cancelled) => tracing::info!(
+                    transfer_id = %id,
+                    "sender stopped mid-transfer; checkpoint kept for resume"
+                ),
+                Err(e) => tracing::info!(
+                    error = %e,
+                    transfer_id = %id,
+                    "receive interrupted; checkpoint kept for resume"
+                ),
+            }
+        }
         if matches!(outcome, Ok(TransferOutcome::Completed)) {
             // **Where it actually landed**, recorded for both shapes now
             // rather than only for folders. `record`/`record_history` fall
@@ -3430,6 +3652,17 @@ const PEER_PROGRESS_GRACE: Duration = Duration::from_secs(3);
 /// backlog: cutting it off early would mark in-flight messages Sent and lose
 /// them (see `flush_to_session`).
 const STREAM_GRACE: Duration = Duration::from_secs(60);
+
+/// How many times a send re-opens a transfer channel on the same session
+/// before giving up.
+///
+/// Small on purpose. The session-level reconnect that matters — a new dial
+/// over whatever route is now best — is `open_send_retry`'s, one layer up;
+/// this only covers a channel that failed while the session itself survived,
+/// which is a narrow window. Two attempts turn a single transient channel
+/// error into a resumed transfer; more would just delay reporting a link that
+/// is genuinely gone.
+const SEND_RECOVER_ATTEMPTS: u32 = 2;
 
 /// Minimum spacing between emitted progress updates (~20/s) — keeps small-chunk
 /// progress smooth without flooding the event bridge.
@@ -3533,6 +3766,12 @@ impl StagingThrottle {
 /// otherwise only ever carries real byte counts (see `in_task` below), and
 /// pausing/resuming `ctrl` here is what actually stops/resumes the send loop
 /// (which was handed its own clone of the same `TransferControl`).
+///
+/// `checkpoint`, when present, is kept roughly current from the same progress
+/// stream: the checkpoint written before the transfer starts says zero bytes
+/// forever otherwise, and a resumable transfer whose recorded progress is
+/// always zero is one the user is told nothing useful about after a restart.
+#[allow(clippy::too_many_arguments)]
 async fn drive<F, Fut>(
     id: String,
     stats: Arc<Mutex<Stats>>,
@@ -3541,6 +3780,7 @@ async fn drive<F, Fut>(
     run: F,
     progress_out: Option<Box<dyn peerbeam_domain::port::ProgressSink>>,
     progress_in: Option<Box<dyn peerbeam_domain::port::ProgressSource>>,
+    checkpoint: Option<crate::resume::CheckpointWriter>,
 ) -> DResult<TransferOutcome>
 where
     F: FnOnce(mpsc::UnboundedSender<Progress>) -> Fut,
@@ -3659,9 +3899,18 @@ where
         // see `stream::receive_file`) only fires the event/back-channel
         // signal once per pause, and the matching resume fires once too.
         let mut was_paused = false;
+        let mut checkpoint = checkpoint;
         while let Some(p) = prx.recv().await {
             if let Some(f) = &p.current_file {
                 *file.lock().unwrap() = f.clone();
+            }
+
+            // Before any of the throttling/suppression below, which exists for
+            // the *event bridge* and would otherwise silently decide how much
+            // progress survives a crash. The writer does its own, far coarser
+            // throttling.
+            if let Some(w) = checkpoint.as_mut() {
+                w.record(p.transferred_bytes);
             }
 
             // A pause/resume status change is a signal, not a byte update —
@@ -3862,7 +4111,7 @@ fn valid_message_id(v: Option<&Value>) -> Result<String, (Code, String)> {
 }
 
 /// Build a target `Device` from a `peer` JSON object.
-fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)> {
+pub(crate) fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)> {
     let peer = peer.ok_or((Code::InvalidArgument, "peer required".into()))?;
     let addresses: Vec<String> = peer
         .get("addresses")
@@ -3994,6 +4243,9 @@ mod tests {
             1024,
             daemon_port,
             None,
+            Arc::new(peerbeam_reliability_fs::FsReliability::new(
+                dir.path().join("checkpoints"),
+            )),
         );
         (mgr, chat, appstore, dir)
     }
@@ -6017,6 +6269,7 @@ mod tests {
             },
             progress_out,
             None,
+            None,
         )
         .await;
         assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
@@ -6065,6 +6318,7 @@ mod tests {
             },
             progress_out,
             None,
+            None,
         )
         .await;
         assert_eq!(outcome.unwrap(), TransferOutcome::Completed);
@@ -6107,6 +6361,7 @@ mod tests {
             },
             None,
             progress_in,
+            None,
         ));
 
         src_tx.send(BACK_PAUSE).unwrap();
@@ -6148,6 +6403,7 @@ mod tests {
                 Ok(TransferOutcome::Completed)
             },
             progress_out,
+            None,
             None,
         )
         .await;

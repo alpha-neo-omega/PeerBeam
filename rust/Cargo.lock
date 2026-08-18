@@ -1314,6 +1314,7 @@ dependencies = [
  "peerbeam-identity-fs",
  "peerbeam-platform",
  "peerbeam-presence",
+ "peerbeam-reliability-fs",
  "peerbeam-storage-fs",
  "peerbeam-transfer",
  "peerbeam-transfer-quic",

@@ -47,12 +47,13 @@ pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
 pub use session::{
     accept_pipe, peek_incoming_meta, receive_file_on_channel, receive_folder_on_channel,
-    receive_on_channel, send_file_on_session, send_folder_on_session, send_pipe_on_session,
-    ChannelEvent, ChannelInfo, ChannelReceived, ChannelStats, CloseReason, ControlMessage,
-    HandlerRegistry, IncomingStreamChannel, Keepalive, KeepaliveAction, KeepaliveConfig,
-    PeerSession, PipeConsent, PreservedSession, RecoveryConfig, RecoveryManager, RecoveryStats,
-    ResumeBinding, ResumeToken, RunExit, SessionConfig, SessionEvent, SessionHandle, SessionHello,
-    SessionInfo, SessionRegistry, SessionRole, SessionWiring, TransferPreview, TransportFactory,
+    receive_on_channel, send_file_on_session, send_file_on_session_recover, send_folder_on_session,
+    send_pipe_on_session, ChannelEvent, ChannelInfo, ChannelReceived, ChannelStats, CloseReason,
+    ControlMessage, HandlerRegistry, IncomingStreamChannel, Keepalive, KeepaliveAction,
+    KeepaliveConfig, PeerSession, PipeConsent, PreservedSession, RecoveryConfig, RecoveryManager,
+    RecoveryStats, ResumeBinding, ResumeToken, RunExit, SessionConfig, SessionEvent, SessionHandle,
+    SessionHello, SessionInfo, SessionRegistry, SessionRole, SessionWiring, TransferPreview,
+    TransportFactory,
 };
 pub use stream::{
     part_path, receive_file, send_file, Received, SendRequest, TransferOutcome, PART_SUFFIX,

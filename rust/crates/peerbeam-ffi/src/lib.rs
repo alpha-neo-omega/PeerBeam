@@ -16,6 +16,7 @@ mod error;
 mod events;
 mod logs;
 mod presence;
+mod resume;
 mod rules;
 mod runtime;
 mod session;
@@ -94,7 +95,7 @@ pub extern "C" fn pb_version_json() -> *mut c_char {
     to_cstring(json!({
         "abi": ABI_VERSION,
         "semver": env!("CARGO_PKG_VERSION"),
-        "features": ["peersession_diagnostics", "transport_diagnostics", "session_events", "presence"],
+        "features": ["peersession_diagnostics", "transport_diagnostics", "session_events", "presence", "resumable_transfers"],
     }))
 }
 
@@ -270,6 +271,74 @@ pub unsafe extern "C" fn pb_transfer_reject(json: *const c_char) -> *mut c_char 
 #[no_mangle]
 pub extern "C" fn pb_transfers_active() -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.active_list())()))
+}
+
+/// Every **interrupted** transfer — one whose checkpoint outlived it — newest
+/// first: `{transfers:[{id,direction,peer_id,file,path,status:"interrupted",
+/// started_at,is_resume,resumable,stats}]}`.
+///
+/// Deliberately separate from [`pb_transfers_active`]: these are not running,
+/// nothing will ever emit a progress event for one, and `resumable` is false
+/// for the inbound half of them (see [`pb_transfer_resume_interrupted`]). A
+/// surface merges the two lists knowing which is which; folding them into one
+/// call would make "is this thing alive?" a field nobody remembers to read.
+#[no_mangle]
+pub extern "C" fn pb_transfers_interrupted() -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.interrupted_list())()))
+}
+
+/// Restart an interrupted transfer from its checkpoint: `{id, peer?}` →
+/// `{id,resumed}`.
+///
+/// **Not [`pb_transfer_resume`]**, which un-pauses a transfer this process is
+/// already running. These are two different verbs and they deliberately do not
+/// share a name: one needs a live transfer and fails without one, the other
+/// needs a checkpoint and a peer to dial, and a surface that called the wrong
+/// one would get a confusing error at best and the wrong action at worst.
+///
+/// Verifies the checkpoint still binds to its transfer — peer, file name and
+/// size, against the source file as it is on disk *now* — before anything is
+/// queued. Refuses an **incoming** transfer with `unsupported`: the transfer
+/// protocol is sender-driven, so an interrupted receive resumes when its
+/// sender offers it again, and it keeps its consent and its partial bytes
+/// until then.
+///
+/// `peer` is optional and carries only *how to reach* the device — the same
+/// `{id,name,addresses,port}` object [`pb_transfer_send`] takes — for a surface
+/// that already has it in front of the user. Its `id` must be the checkpoint's
+/// or the call is refused, so it can never redirect a resume at a different
+/// device. Omit it and the addresses come from live discovery.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_resume_interrupted(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            let v = read_json(json)?;
+            runtime::manager()?.resume_interrupted(&v)
+        })())
+    })
+}
+
+/// Forget an interrupted transfer and the partial bytes it was holding:
+/// `{id}` → `{discarded,partial_removed}`.
+///
+/// Without this an interrupted transfer is permanent clutter: it cannot
+/// complete, no event will ever clear it, and its `.part` file sits beside the
+/// destination forever. Refuses while a transfer is running under the same id
+/// — cancel that instead.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_transfer_discard_interrupted(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            let id = id_of(&read_json(json)?)?;
+            runtime::manager()?.discard_interrupted(&id)
+        })())
+    })
 }
 
 /// One transfer by id: `{id}`.

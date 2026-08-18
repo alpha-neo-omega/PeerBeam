@@ -25,10 +25,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use peerbeam_domain::entity::Progress;
+use async_trait::async_trait;
+
+use peerbeam_domain::entity::{Progress, TransferSession};
 use peerbeam_domain::error::{DomainError, Result};
-use peerbeam_domain::port::{Frame, FrameKind, Link, StorageProvider};
-use peerbeam_domain::session::{ChannelType, SessionError};
+use peerbeam_domain::port::{Frame, FrameKind, Link, ReliabilityStore, StorageProvider};
+use peerbeam_domain::session::{ChannelId, ChannelType, SessionError};
 
 use super::channel::IncomingStreamChannel;
 use super::SessionHandle;
@@ -38,6 +40,7 @@ use crate::folder::{
 };
 use crate::peek::{OwnedPeekLink, PeekLink};
 use crate::protocol::parse_meta;
+use crate::recover::{send_file_recover, LinkFactory};
 use crate::stream::{
     receive_file, sanitize_file_name, send_file, Received, SendRequest, TransferOutcome,
 };
@@ -67,6 +70,96 @@ pub async fn send_file_on_session(
     let outcome = send_file(link.as_mut(), storage, req, ctrl, progress, retries).await;
     session.close_channel(channel);
     outcome
+}
+
+/// [`send_file_on_session`] with **checkpoint persistence and reconnect** —
+/// the engine's own recovery driver ([`send_file_recover`]) driven over this
+/// session.
+///
+/// The only difference from [`send_file_on_session`] is where the link comes
+/// from: instead of one channel opened once, a [`LinkFactory`] opens a **fresh**
+/// transfer channel per attempt, which is what lets the driver retry. Because
+/// the transfer negotiates its resume offset from the receiver's on-disk bytes,
+/// each retry continues where the last one stopped.
+///
+/// `checkpoint` is written before the first attempt and cleared once the
+/// transfer ends without error, so an interruption — a dropped link, a killed
+/// process — leaves exactly one record behind and a completed transfer leaves
+/// none.
+///
+/// This exists here rather than in each frontend because both of them need it:
+/// a factory built twice is a factory that leaks a channel in one of the two
+/// copies.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_file_on_session_recover(
+    session: &SessionHandle,
+    storage: &dyn StorageProvider,
+    reliability: &dyn ReliabilityStore,
+    req: SendRequest,
+    checkpoint: TransferSession,
+    ctrl: &TransferControl,
+    progress: &UnboundedSender<Progress>,
+    max_attempts: u32,
+    retries: u32,
+) -> Result<TransferOutcome> {
+    let mut factory = ChannelLinkFactory::new(session);
+    let outcome = send_file_recover(
+        &mut factory,
+        storage,
+        reliability,
+        req,
+        checkpoint,
+        ctrl,
+        progress,
+        max_attempts.max(1),
+        retries,
+    )
+    .await;
+    factory.close();
+    outcome
+}
+
+/// A [`LinkFactory`] that opens a fresh transfer channel on one session.
+///
+/// Holds the channel it last opened so it can close it: a retry abandons the
+/// previous channel, and a channel nobody closes stays registered on the
+/// session pump for the life of the session. `close()` is called on the single
+/// exit of [`send_file_on_session_recover`], mirroring
+/// [`send_file_on_session`]'s own best-effort close.
+struct ChannelLinkFactory<'a> {
+    session: &'a SessionHandle,
+    open: Option<ChannelId>,
+}
+
+impl<'a> ChannelLinkFactory<'a> {
+    fn new(session: &'a SessionHandle) -> Self {
+        ChannelLinkFactory {
+            session,
+            open: None,
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some(channel) = self.open.take() {
+            self.session.close_channel(channel);
+        }
+    }
+}
+
+#[async_trait]
+impl LinkFactory for ChannelLinkFactory<'_> {
+    async fn connect(&mut self) -> Result<Box<dyn Link>> {
+        // Close the previous attempt's channel before opening the next, so a
+        // long retry chain cannot accumulate dead channels on the pump.
+        self.close();
+        let (channel, link) = self
+            .session
+            .open_stream_channel(ChannelType::TRANSFER)
+            .await
+            .map_err(sess_to_dom)?;
+        self.open = Some(channel);
+        Ok(link)
+    }
 }
 
 /// Receive a file over an accepted incoming transfer channel, reusing the file

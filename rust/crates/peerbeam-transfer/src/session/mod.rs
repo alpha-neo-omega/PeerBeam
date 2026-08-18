@@ -44,7 +44,8 @@ pub use registry::{HandlerRegistry, SessionInfo, SessionRegistry};
 pub use resume::{ResumeBinding, ResumeToken};
 pub use transfer::{
     peek_incoming_meta, receive_file_on_channel, receive_folder_on_channel, receive_on_channel,
-    send_file_on_session, send_folder_on_session, ChannelReceived, TransferPreview,
+    send_file_on_session, send_file_on_session_recover, send_folder_on_session, ChannelReceived,
+    TransferPreview,
 };
 
 use std::collections::{HashSet, VecDeque};
