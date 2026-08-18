@@ -34,6 +34,20 @@ use crate::protocol::{
     chunk_frame_owned, control_frame, meta_frame, parse_control, parse_meta, Control, TransferMeta,
 };
 
+/// Suffix of the file a partial receive is written to. The final name only
+/// appears once the whole file has arrived and verified, so a `.part` is never
+/// something the user believes they already have — which is what makes it safe
+/// for [`crate::checkpoint`] to reclaim one whose transfer will never resume.
+pub const PART_SUFFIX: &str = ".part";
+
+/// Where a partial receive of `dest` is written. The single definition, shared
+/// with [`crate::checkpoint`] so the receive path and the disposal path cannot
+/// drift onto two different files.
+#[must_use]
+pub fn part_path(dest: &str) -> String {
+    format!("{dest}{PART_SUFFIX}")
+}
+
 /// Base backoff between retry attempts (grows linearly with attempts).
 const RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -205,7 +219,7 @@ pub async fn receive_file(
     // alone (no size/hash binding), so two different transfers that resolve
     // to the same destination could in principle share a `.part`. Out of
     // scope for this fix.
-    let part = format!("{dest}.part");
+    let part = part_path(&dest);
 
     // Resume from whatever the in-progress `.part` already holds.
     let existing = storage.size(&part).await?.unwrap_or(0).min(meta.size);

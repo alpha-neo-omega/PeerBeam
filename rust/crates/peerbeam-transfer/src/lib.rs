@@ -16,6 +16,7 @@
 //! and temp files.
 
 mod auth;
+mod checkpoint;
 mod clipboard;
 mod control;
 mod folder;
@@ -29,6 +30,10 @@ mod session;
 mod stream;
 
 pub use auth::{authenticate, Identity, Session};
+pub use checkpoint::{
+    check_resume, is_expired, is_expired_after, partial_file, ResumeClaim, ResumeRefusal,
+    CHECKPOINT_MAX_AGE_DAYS,
+};
 pub use clipboard::{receive_clipboard, send_clipboard};
 pub use control::TransferControl;
 pub use folder::{receive_folder, send_folder, FolderReceived, FolderSendRequest};
@@ -49,4 +54,6 @@ pub use session::{
     ResumeBinding, ResumeToken, RunExit, SessionConfig, SessionEvent, SessionHandle, SessionHello,
     SessionInfo, SessionRegistry, SessionRole, SessionWiring, TransferPreview, TransportFactory,
 };
-pub use stream::{receive_file, send_file, Received, SendRequest, TransferOutcome};
+pub use stream::{
+    part_path, receive_file, send_file, Received, SendRequest, TransferOutcome, PART_SUFFIX,
+};
