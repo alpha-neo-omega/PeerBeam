@@ -6,6 +6,80 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Resumable transfers, surfaced.** A transfer interrupted by a dropped link or
+  by the app closing is no longer lost. It comes back as an **interrupted**
+  transfer — in the Transfers screen, in `peerbeam transfers`, and over the FFI —
+  showing how far it got, and it can be resumed from there or discarded.
+
+  The recovery engine itself is not new: `send_file_recover`, the
+  `ReliabilityStore` port and its filesystem implementation have been in the
+  engine, tested, for several releases. Nothing called them. Sends now run
+  through the recovery driver and receives persist their own checkpoint, so the
+  capability finally reaches a user.
+
+  ```bash
+  peerbeam transfers list             # ID, DIR, PEER, FILE, PROGRESS, AGE
+  peerbeam transfers resume tx-4131-0
+  peerbeam transfers discard fileref-7
+  ```
+
+  **A checkpoint binds to its transfer.** Resuming appends to a partial file, so
+  before a byte moves the checkpoint is checked against direction, the persisted
+  consent flag, the peer id, the file name and the total size — the last of
+  those against the source file *as it is on disk now*, not against what the
+  checkpoint remembers. A source that has been replaced or resized is refused: a
+  resume that appended its bytes to a receiver's prefix of the old contents
+  would build a file that never existed anywhere. The end-of-transfer checksum
+  still runs on a resumed transfer, so one that does not verify fails loudly
+  rather than landing.
+
+  **Consent is remembered, and does not spread.** An inbound transfer the user
+  already accepted resumes without a second prompt — being asked twice for one
+  file because the Wi-Fi dropped is exactly the friction this removes. It grants
+  nothing on its own: a transfer that was declined, that timed out, or that
+  nobody answered leaves no checkpoint at all, so a later offer of the same id
+  meets the ordinary approval prompt. An interruption never turns an unanswered
+  prompt into an approval (I6). A checkpoint missing the consent field reads as
+  "not accepted".
+
+  **An interrupted receive resumes when its sender offers it again**, not on
+  demand. Resume is the existing transfer protocol's own mechanism — no new
+  frame, no new channel — and that protocol is sender-driven, so the receiving
+  side has no way to pull. Such a transfer keeps its partial file, its progress
+  and its consent, and the surfaces say "waiting for sender" rather than
+  offering a Resume that would do nothing.
+
+  **A resumed receive lands where it was already landing**, read from its own
+  checkpoint rather than re-derived from the current save directory and rules. A
+  user who changed their save folder while a transfer was interrupted would
+  otherwise get the second half in the new folder, the first half stranded in
+  the old one, and a transfer that silently restarted from zero.
+
+  **Checkpoints are disposable, two ways.** Explicitly — discarding one drops the
+  record and the partial file together (never the *source* of a send: giving up
+  on a send is not permission to delete your file) — and by age: 14 days from
+  the last attempt, swept at startup along with the partial file. Long enough
+  for a laptop shut over a holiday, short enough that an abandoned 40 GB
+  transfer is not still pinning its bytes a year later. A resume restarts the
+  clock, so a transfer you keep retrying never ages out.
+
+  New FFI exports, all additive (ABI stays 1): `pb_transfers_interrupted`,
+  `pb_transfer_resume_interrupted`, `pb_transfer_discard_interrupted`, plus the
+  `transfer_interrupted` and `transfer_discarded` events. **`pb_transfer_resume`
+  is unchanged and still means "un-pause a live transfer"** — the two verbs are
+  deliberately two different calls, because one name for both is how a surface
+  ends up calling the wrong one.
+
+  `peerbeam transfers` keeps its existing `sessions`/`transport` output and gains
+  an `interrupted` array beside it; `peerbeam send` deliberately writes no
+  checkpoint of its own, since re-running a foreground send already resumes from
+  the receiver's partial file.
+
+  Completes the last substantive gap in Phase A (`ROADMAP.md`: "Resumable
+  transfers surfaced in the UI").
+
+
 ## [0.6.0] - 2026-08-18 — Beta
 
 ### Added

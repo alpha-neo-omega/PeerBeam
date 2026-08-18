@@ -429,6 +429,60 @@ call log for both paths, the scope, selection mode's entry/exit and liveness
 narrowing, and each report; `test/data/repository_test.dart` pins the same at
 the repository seam.
 
+## Interrupted transfers
+
+A transfer that ends because the link dropped or the app was closed mid-flight
+is **interrupted**, not failed. The engine keeps a checkpoint for it, and the
+Transfers screen shows it as a row in its own state.
+
+**It survives a restart.** `TransferState.interrupted` is the only transfer
+state that outlives the process: it is rebuilt from the engine's checkpoint by
+`TransferRepository.refreshInterrupted()`, called from `main.dart` after
+`initialize()` — the same "fetch after init" rule `HistoryRepository` documents,
+because an engine call any earlier only answers `not_initialised` and being
+swallowed would leave a cold start looking as though nothing had been
+interrupted. Mid-session, the engine's `transfer_interrupted` event arrives
+*after* the transfer's own terminal event and puts the row back.
+
+**The row says how far it got.** `320 MB / 4.0 GB`, with the bar where the
+transfer actually stopped. A resumable transfer that showed no progress would
+give the user no reason to resume rather than start again.
+
+**Resume and Discard, not Pause and Cancel.** There is nothing to pause and
+nothing to cancel — the transfer is already over. Discard exists because
+otherwise the row is clutter nothing can ever clear: no event will complete it
+and no retry will remove it. Discarding also reclaims the partial file the
+engine was holding for it.
+
+**Resume here is a different verb from the Resume on a paused transfer.** A
+paused transfer un-pauses (`pb_transfer_resume`); an interrupted one is
+re-dialed from its checkpoint (`pb_transfer_resume_interrupted`). The repository
+keeps them as two methods for that reason, and the test asserts the button calls
+the second and never the first — calling the wrong one on a dead transfer would
+silently do nothing.
+
+**An incoming transfer shows no Resume.** The transfer protocol is
+sender-driven, so this side cannot ask a peer to start sending again; the card
+says **"Waiting for sender"** and offers only Discard. Showing a Resume that
+could not work would be worse than showing none, so the button is driven by the
+engine's own `resumable` flag rather than by anything the UI infers.
+
+**A refusal is shown.** Unlike pause/resume/cancel, `resumeInterrupted` reaches
+the error channel on failure: it can legitimately refuse — the peer may be
+unreachable, or the source file may have changed since the transfer stopped, in
+which case resuming would append the wrong bytes to the receiver's partial file.
+Swallowing that would leave the user tapping a button that does nothing, which
+is the fail-open shape this project has already fixed twice.
+
+**It is not counted as work.** Interrupted rows are excluded from `activeCount`,
+so the nav badge does not sit permanently lit, and from `awaitingApproval`, so
+they can never be swept into a bulk Accept — nobody is being asked anything.
+
+`test/transfers_screen_test.dart` pins the action pair, the progress line, the
+two-verbs distinction, the inbound case and the badge exclusion;
+`test/data/repository_test.dart` pins the same at the repository seam, plus that
+a live transfer wins over a checkpoint bearing its id.
+
 ## UX polish pass
 
 A dedicated pass over the whole app (no new features — experience only):

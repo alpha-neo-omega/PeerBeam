@@ -73,6 +73,81 @@ char* pb_transfer_get(const char* json);         // {id} → {transfer} | invali
 char* pb_history_get(void);                       // {history:[…]}
 ```
 
+### Interrupted transfers (additive — ABI still v1)
+
+```c
+char* pb_transfers_interrupted(void);                    // {transfers:[…]} newest first
+char* pb_transfer_resume_interrupted(const char* json);  // {id, peer?} → {id, resumed}
+char* pb_transfer_discard_interrupted(const char* json); // {id} → {discarded, partial_removed}
+```
+
+A transfer that ends because the link dropped or the process died leaves a
+**checkpoint** in `<data_directory>/checkpoints/<id>.json` — the peer id, the
+file, its size, and how far it got. `pb_init` reads them all: it reclaims the
+ones that have aged out and emits a `transfer_interrupted` for each survivor.
+A transfer that completes, or that the local user cancels, leaves none.
+
+Each row is shaped like an active transfer so one view can hold both:
+
+```json
+{ "id": "tx-4131-0", "direction": "sending", "peer_id": "pb-f4e4d56fce98",
+  "file": "movie.mkv", "path": "/home/me/movie.mkv", "status": "interrupted",
+  "started_at": "2026-08-18T09:12:44Z", "is_resume": false, "resumable": true,
+  "stats": { "transferred_bytes": 1288490188, "total_bytes": 4294967296,
+             "current_speed": 0.0, "average_speed": 0.0, "eta_secs": null } }
+```
+
+`peer_id` and no `peer` name: a checkpoint outlives the run that made it, and
+after a restart there is no name to resolve until discovery finds the device
+again. `status` is always `"interrupted"`, which no active transfer ever
+reports, so the two lists can never be confused.
+
+**`pb_transfer_resume_interrupted` is not `pb_transfer_resume`.** That one
+un-pauses a live transfer and fails without one; this one restarts a dead one
+from its checkpoint. Two verbs on one name is how a surface calls the wrong one.
+
+Before a byte moves it verifies the checkpoint still **binds** to its transfer:
+direction, the persisted consent flag, the peer id, the file name, and the total
+size — against the source file *as it is on disk now*, not against what the
+checkpoint remembers. A source that has been replaced, truncated or extended is
+refused (`invalid_argument`), because appending its bytes to a receiver's prefix
+of the old contents would build a file that never existed anywhere.
+`transferred_bytes` is deliberately **not** part of the binding: the real offset
+is negotiated from the bytes on the receiver's disk, and preferring the record
+over the disk is how a resume would skip bytes it never sent.
+
+`resumable` is false for every **incoming** transfer and
+`pb_transfer_resume_interrupted` answers `unsupported` for one. The transfer
+protocol is sender-driven and resume is that protocol's own mechanism (no new
+frame, no new channel), so an interrupted receive keeps its partial file, its
+progress and its consent, and continues the moment its sender offers it again.
+
+`peer` is optional and carries only *how to reach* the device — the same
+`{id,name,addresses,port}` object `pb_transfer_send` takes. Its `id` must be the
+checkpoint's or the call is refused, so a caller can never redirect a resume at
+a different device; omit it and the engine uses live discovery.
+
+**Consent is persisted, and does not spread.** The checkpoint carries
+`accepted`, set only past the approval gate, and it is what lets an inbound
+transfer the user already accepted resume without a second prompt. A transfer
+that was declined, that timed out, or that nobody answered leaves no checkpoint
+at all, so a later offer of the same id meets the ordinary prompt: an
+interruption never launders an unanswered prompt into an approval (I6). A
+checkpoint missing the field reads as `false`.
+
+**Disposal.** A checkpoint is not immortal — it pins its own record and, far
+more importantly, the `.part` file whose bytes are the point of keeping it.
+Two rules, both of them:
+
+* **explicit** — `pb_transfer_discard_interrupted` drops the record and the
+  partial file together (never the *source* of a send: giving up on a send is
+  not permission to delete the user's file). It refuses while a transfer is
+  running under the same id — cancel that instead.
+* **age** — 14 days from `started_at`, swept at `pb_init`. Long enough for a
+  laptop shut over a holiday; short enough that an abandoned 40 GB transfer is
+  not still holding its partial file a year later. A resume refreshes
+  `started_at`, so a transfer someone keeps retrying never ages out.
+
 `pb_init` also starts a **receive server** on `transfer.port` so incoming
 transfers can be accepted/rejected. `subscribe_to_transfer_events` is the M1
 `pb_set_event_callback` — one stream carries everything, tagged by `type`.
@@ -87,7 +162,14 @@ Every transfer event: `{ "type", "transfer_id", "timestamp": <rfc3339>,
 `transfer_progress` (payload = `{stats, file}`), `transfer_paused`,
 `transfer_resumed`, `transfer_retrying`, `transfer_completed`,
 `transfer_cancelled`, `transfer_failed` (payload = `{error:{code,message}}`),
-plus `history_updated`. Per-transfer ordering is guaranteed — each transfer's
+`transfer_interrupted` (payload = the `pb_transfers_interrupted` row),
+`transfer_discarded`, plus `history_updated`.
+
+`transfer_interrupted` always **follows** a transfer's own terminal event and
+never replaces one: the terminal event says the transfer is over, this says what
+it left behind. A surface that drops the row on `transfer_failed` and rebuilds
+it here ends up in the right place; one that only listens for terminal events
+behaves exactly as it did before this existed. Per-transfer ordering is guaranteed — each transfer's
 events are emitted from its own task in sequence.
 
 ### Concurrency & performance
@@ -141,12 +223,18 @@ Flutter        FFI (Rust)                          Peer
   │◀ transfer_cancelled                              │
 ```
 
-**Resume** (pause → resume; byte-level resume is engine-side)
+**Resume** — two different things with the same English word:
+
 ```
-Flutter        FFI (Rust)
-  │ pb_transfer_pause({id}) ─▶ TransferControl.pause()  →  ◀ transfer_paused
-  │ pb_transfer_resume({id})─▶ TransferControl.resume() →  ◀ transfer_resumed
+Flutter        FFI (Rust)                       what it needs
+  │ pb_transfer_pause({id}) ─▶ TransferControl.pause()   a LIVE transfer
+  │ pb_transfer_resume({id})─▶ TransferControl.resume()  a LIVE transfer
+  │ pb_transfer_resume_interrupted({id, peer?})          a CHECKPOINT + a peer
 ```
+
+The first pair moves a running transfer between paused and transferring. The
+third re-dials a transfer that is already over and continues it from the
+receiver's on-disk bytes.
 
 ### Chat (additive — ABI still v1)
 

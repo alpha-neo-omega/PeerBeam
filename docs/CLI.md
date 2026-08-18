@@ -472,6 +472,59 @@ Working now:
   `min_bytes`); `add` and `remove` emit one `rule_added` / `rule_removed`
   event carrying the same fields.
 
+- `transfers [list|resume <ID>|discard <ID>]` — what is moving, and what
+  stopped moving.
+
+  A transfer that ends because the link dropped or the process died leaves a
+  **checkpoint** in `<data_directory>/checkpoints`: the peer, the file, its size
+  and how far it got. That directory belongs to the *machine*, not to a
+  frontend, so `transfers list` on a headless box shows what the desktop app and
+  the daemon left behind, and `resume` can pick one up over SSH.
+
+  ```text
+    ID          DIR   PEER              FILE          PROGRESS         AGE
+    tx-4131-0   out   pb-f4e4d56fce98   movie.mkv     1.2 GB / 4.0 GB  2h
+    fileref-7   in    pb-9a10c2b40f21   photos.zip    88 MB / 210 MB   1d
+  ```
+
+  `peerbeam transfers` with no subcommand keeps printing the live
+  session/transport snapshot it always did and adds an `interrupted` array
+  beside it — additive, so a script reading `sessions`/`transport` is untouched.
+
+  **`out` can be resumed; `in` resumes itself.** The transfer protocol is
+  sender-driven, and resume is that protocol's own mechanism rather than a new
+  message, so this side cannot ask a peer to start sending again. An incoming
+  checkpoint keeps its partial file, its progress and its consent, and continues
+  the moment its sender offers it again; `resume` on one exits `2` and says so.
+
+  `resume <ID>` re-dials the peer — using **discovery**, never an address from
+  the checkpoint, because where a device can be reached is exactly what changes
+  while a transfer sits interrupted — and continues from the bytes the receiver
+  already has. Before anything moves it checks that the checkpoint still binds
+  to its transfer: direction, the persisted consent flag, the peer id, the file
+  name, and the total size *as the source file is on disk now*. A source that
+  has been replaced or resized exits `2`: appending its bytes to a receiver's
+  prefix of the old contents would build a file that never existed anywhere.
+  The end-of-transfer checksum still runs, so a resumed file that does not
+  verify fails (exit `5`) rather than landing.
+
+  `discard <ID>` drops the record and, for an incoming transfer, the `.part`
+  file it was holding — leaving that behind would let a transfer the user threw
+  away seed the next one of the same name. It never touches the **source** of a
+  send: giving up on a send is not permission to delete your file.
+
+  Checkpoints are also swept by age. The desktop engine reclaims anything older
+  than 14 days (and its partial file) at startup; a resume refreshes the clock,
+  so a transfer you keep retrying never ages out.
+
+  **`peerbeam send` writes no checkpoints of its own**, deliberately. It is a
+  foreground command, and re-running it already resumes — the receiver's partial
+  file is what negotiates the offset, not a record on this side.
+
+  Under `--json`, `list` emits one object per line
+  (`{"id","direction","peer","file","path","transferred_bytes","total_bytes","started_at","resumable"}`);
+  `discard` emits one `discarded` event with `partial_removed`.
+
 Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
 application-layer X25519 mutual-auth handshake with TOFU trust pinning and
 per-frame replay protection ([Security](SECURITY.md)).
