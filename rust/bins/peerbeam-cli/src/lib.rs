@@ -1,6 +1,7 @@
 //! PeerBeam CLI library surface (exposed so integration tests can exercise
 //! argument parsing and the pure helpers).
 
+pub mod browse;
 pub mod chat;
 pub mod cli;
 pub(crate) mod clipboard;

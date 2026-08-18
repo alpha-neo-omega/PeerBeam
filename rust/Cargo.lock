@@ -1150,6 +1150,7 @@ dependencies = [
  "futures",
  "peerbeam-app",
  "peerbeam-appstore-fs",
+ "peerbeam-browse",
  "peerbeam-chat",
  "peerbeam-clipboard",
  "peerbeam-config",

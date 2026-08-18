@@ -75,6 +75,8 @@ pub enum Command {
     Timeline(TimelineArgs),
     /// Watch a folder and send whatever lands in it.
     Watch(WatchArgs),
+    /// List what a device shares, read-only.
+    Browse(BrowseArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -450,6 +452,20 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// List what a device shares.
+///
+/// Read-only, and shows only what that device chose to share **and** granted
+/// this machine permission to see. An empty listing is the same answer whether
+/// the device shares nothing, has not granted the permission, or the path does
+/// not exist — it deliberately does not say which.
+#[derive(Args)]
+pub struct BrowseArgs {
+    /// Target device (id, name, or unambiguous name prefix).
+    pub peer: String,
+    /// A share-relative path, e.g. `photos/2026`. Omit to list the shares.
+    pub path: Option<String>,
+}
+
 /// Watch a folder and send each new file to a device.
 ///
 /// Polls rather than subscribing to filesystem events: a poll needs no

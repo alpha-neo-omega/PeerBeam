@@ -259,6 +259,13 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `browse <peer> [path]` — list what a device shares, read-only. Paths are
+  share-relative (`photos/2026`). An empty listing is the same answer whether
+  the device shares nothing, has not granted this machine the `browse`
+  permission, or the path does not exist — it deliberately does not say which,
+  because a caller able to tell would be able to map a filesystem it may not
+  see. Share folders with `device.shared_directories` (empty by default) and
+  grant access with `peerbeam trust permit <device> browse`.
 - `watch <dir> --to <peer> [--interval N] [--existing]` — send whatever lands in
   a folder. Polls rather than using a filesystem watcher, so it behaves the same
   on every OS and works on the network shares people actually drop files onto.

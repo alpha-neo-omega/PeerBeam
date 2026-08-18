@@ -51,6 +51,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
         Command::Watch(a) => crate::watch::watch(ctx, a, cfg_override.as_deref()).await,
+        Command::Browse(a) => crate::browse::browse(ctx, a, cfg_override.as_deref()).await,
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,

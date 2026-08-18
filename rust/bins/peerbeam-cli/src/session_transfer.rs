@@ -33,6 +33,7 @@ use peerbeam_clipboard::ClipboardHandler;
 use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus};
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
+use peerbeam_domain::session::BROWSE_FEAT_LIST;
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
@@ -143,6 +144,10 @@ fn advertised_caps() -> CapabilitySet {
             ChannelType::NOTES,
             NOTES_FEAT_SYNC,
         ))
+        .with(Capability::with_features(
+            ChannelType::BROWSE,
+            BROWSE_FEAT_LIST,
+        ))
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -175,6 +180,8 @@ fn dial_meta(device: &Device, id: &str) -> TransferSession {
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
 /// so the receiving side can await the peer's transfer channel.
 pub struct Session {
+    /// Answers to listings this side asked for.
+    pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
     /// Control handle for opening channels / closing.
     pub handle: SessionHandle,
     /// The authenticated peer id.
@@ -194,6 +201,46 @@ pub struct Session {
     /// This session's presence heartbeat, if presence was configured. Held so
     /// `close` can stop it rather than wait out the next tick's liveness probe.
     presence: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Ask a peer for one listing and wait for its answer, bounded.
+///
+/// The CLI has no session run-loop of its own to route the response through, so
+/// it opens the channel, sends, and reads the next Browse frame off the same
+/// channel. Bounded because a peer that never answers must not hold a terminal
+/// forever.
+pub async fn request_listing(
+    session: &Session,
+    path: &str,
+) -> Option<peerbeam_browse::ListResponse> {
+    use tokio::time::{timeout, Duration};
+
+    let channel = session
+        .handle
+        .open_channel(ChannelType::BROWSE)
+        .await
+        .ok()?;
+    let req = peerbeam_browse::ListRequest::new(path);
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            peerbeam_browse::ListRequest::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .ok()?;
+
+    let rx = session.browse_rx.clone();
+    timeout(Duration::from_secs(10), async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Send a sequence of note batches over one Notes channel, opening it once for
@@ -240,6 +287,14 @@ impl Session {
         self.capabilities
             .features(ChannelType::PRESENCE)
             .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
+    }
+
+    /// Whether the peer negotiated browsing.
+    #[must_use]
+    pub fn supports_browse(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::BROWSE)
+            .is_some_and(|f| f & BROWSE_FEAT_LIST != 0)
     }
 
     /// Whether the peer negotiated note sync — whether sending it notes would
@@ -347,7 +402,21 @@ async fn establish(
     // Receiving is never gated; the CLI simply has no system clipboard to apply
     // the clip to, and says so.
     let (clipboard_handler, clipboard_slot) = ClipboardHandler::new(crate::clipboard::sink());
+    // Browsing: registered unconditionally like clipboard, so no call site can
+    // forget it. The CLI serves nothing (its share list is empty — a terminal
+    // session is not a file server) but must still receive the answers to its
+    // own requests.
+    let (browse_tx, browse_rx) = unbounded_channel();
+    let (browse_handler, browse_slot) = peerbeam_browse::BrowseHandler::new(
+        peerbeam_browse::Shares::default(),
+        trust.clone(),
+        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(move |r| {
+            let _ = browse_tx.send(r);
+        }),
+    );
     handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
+    handlers.push(browse_handler as Arc<dyn MessageHandler>);
 
     // Event/channel-event sinks are unused by the CLI (diagnostics read the
     // engine registry, not these); their receivers drop and emits are ignored.
@@ -374,6 +443,7 @@ async fn establish(
         let _ = slot.set(ps.peer().clone());
     }
     let _ = presence_slot.set(ps.peer().clone());
+    let _ = browse_slot.set(ps.peer().clone());
     let _ = clipboard_slot.set(ps.peer().clone());
     let peer_device = ps.peer().clone();
     let peer_id = ps.peer().0.clone();
@@ -405,6 +475,7 @@ async fn establish(
     });
     Ok(Session {
         handle,
+        browse_rx: Arc::new(tokio::sync::Mutex::new(browse_rx)),
         peer_id,
         newly_trusted,
         pairing_code,
