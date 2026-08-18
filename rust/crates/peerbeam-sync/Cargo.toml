@@ -17,5 +17,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
 tempfile = { workspace = true }
 tokio = { workspace = true }

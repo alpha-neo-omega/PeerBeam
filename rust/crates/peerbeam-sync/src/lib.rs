@@ -11,10 +11,16 @@
 //! and progress semantics to keep in step with the first.
 
 mod handler;
+mod index;
 mod manifest;
+mod reconcile;
+mod version;
 
 pub use handler::{build, IncomingSink, ManifestSink, SendFile, SyncHandler};
+pub use index::{IndexEntry, SyncIndex, NS as INDEX_NS};
 pub use manifest::{
     plan, FileEntry, FileRequest, Manifest, ManifestRequest, Plan, SyncError, MAX_FILES, MAX_PATH,
     MSG_FILE_REQUEST, MSG_MANIFEST, MSG_MANIFEST_REQUEST,
 };
+pub use reconcile::{conflict_name, reconcile, Action, RemoteFile};
+pub use version::{Relation, VersionVector};
