@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use peerbeam_domain::entity::TrustRecord;
+use peerbeam_domain::entity::{Permission, PermissionSet, TrustRecord};
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
@@ -140,15 +140,60 @@ impl FsTrust {
     /// the user explicitly accepts an incoming transfer from it — a declined
     /// transfer must never call this. A no-op (returning `Ok`) if the device
     /// isn't pinned; a device is always pinned before it can be approved.
+    ///
+    /// Approving also writes the device's **initial permission set**
+    /// ([`PermissionSet::granted_on_approval`]): the five that existed when
+    /// permissions were introduced, which is exactly what approval used to
+    /// grant implicitly. A permission added in a later release is therefore not
+    /// granted here — it stays opt-in, via [`set_permission`].
+    ///
+    /// The grant is written only on the transition to approved, so re-running
+    /// `peerbeam trust approve` against an already-approved device cannot undo
+    /// a permission the user deliberately revoked.
+    ///
+    /// [`set_permission`]: FsTrust::set_permission
     pub fn approve(&self, device: &DeviceId) -> Result<()> {
         let mut cache = self.cache.lock().unwrap();
         if let Some(record) = cache.get_mut(&device.0) {
             if !record.approved {
                 record.approved = true;
+                record.permissions = PermissionSet::granted_on_approval();
                 self.persist(&mut cache, &[])?;
             }
         }
         Ok(())
+    }
+
+    /// Grant or withhold one permission for a pinned device.
+    ///
+    /// Returns whether a record was found and changed, so a surface can tell
+    /// "done" from "that device is not pinned" and from "it was already like
+    /// that" without a second lookup racing the first.
+    ///
+    /// Writing is all this does — it never approves. A device nobody approved
+    /// may nothing whatever its bits say ([`TrustStore::may`]), so permitting a
+    /// merely-pinned device stages a decision rather than taking one.
+    ///
+    /// The change is visible to the very next [`TrustStore::may`] on this store,
+    /// because the gates re-read per operation: revoking stops the next clip,
+    /// heartbeat, message or accept, not the next reconnect.
+    pub fn set_permission(
+        &self,
+        device: &DeviceId,
+        permission: Permission,
+        granted: bool,
+    ) -> Result<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        let Some(record) = cache.get_mut(&device.0) else {
+            return Ok(false);
+        };
+        let updated = record.permissions.set(permission, granted);
+        if updated == record.permissions {
+            return Ok(false);
+        }
+        record.permissions = updated;
+        self.persist(&mut cache, &[])?;
+        Ok(true)
     }
 }
 
@@ -190,6 +235,7 @@ mod tests {
             name: "Peer".to_string(),
             trusted_at: Utc::now(),
             approved: false,
+            permissions: PermissionSet::none(),
         }
     }
 
@@ -392,5 +438,282 @@ mod tests {
             .unwrap();
         assert!(!rec.approved);
         assert_eq!(rec.fingerprint, "fp-legacy");
+    }
+
+    // ── permissions ─────────────────────────────────────────────────────────
+
+    /// **A `trust.json` exactly as a build before permissions wrote it**, byte
+    /// for byte: `serde_json::to_vec_pretty` over two records with no
+    /// `permissions` key. Written as a literal rather than built from
+    /// `TrustRecord`s on purpose — a constructed record would be serialized by
+    /// *this* build, which always emits the field, so it could never exercise
+    /// the missing-field path this whole rule is about.
+    const PRE_UPGRADE_TRUST_JSON: &str = r#"[
+  {
+    "device": "pb-laptop00001",
+    "fingerprint": "3f9a1b2c4d5e6f70a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718",
+    "name": "laptop",
+    "trusted_at": "2026-08-17T10:30:00Z",
+    "approved": true
+  },
+  {
+    "device": "pb-stranger001",
+    "fingerprint": "77b2ccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+    "name": "Unknown Peer",
+    "trusted_at": "2026-08-18T02:11:00Z",
+    "approved": false
+  }
+]"#;
+
+    fn store_with(path: &Path, json: &str) -> FsTrust {
+        std::fs::write(path, json).unwrap();
+        FsTrust::open(path).unwrap()
+    }
+
+    /// **The upgrade rule.** A device that worked before the upgrade must work
+    /// after it. Reading the absent field as "no permissions" would silently
+    /// stop this laptop's chat and transfers with no reason given; reading it
+    /// as "everything" would hand it permissions added in later releases. It
+    /// means *the permissions that existed when the record was written* —
+    /// exactly the five — and slot 5, where a sixth would land, stays clear.
+    #[test]
+    fn a_pre_upgrade_record_keeps_the_five_and_gains_nothing_added_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(&path, PRE_UPGRADE_TRUST_JSON);
+
+        let laptop = DeviceId::from("pb-laptop00001");
+        for p in Permission::ALL {
+            assert!(
+                store.may(&laptop, p),
+                "an approved pre-upgrade device must keep {p} across the upgrade"
+            );
+        }
+
+        let permissions = store.lookup(&laptop).unwrap().unwrap().permissions;
+        for slot in 5..32u8 {
+            assert!(
+                !permissions.grants_slot(slot),
+                "slot {slot} — a permission introduced after this record was \
+                 written — must not be granted to a device nobody reviewed"
+            );
+        }
+        assert_eq!(
+            permissions,
+            PermissionSet::granted_on_approval(),
+            "the legacy reading is the frozen default, not `all bits`"
+        );
+    }
+
+    /// The same legacy file's *unapproved* record gains nothing: permissions
+    /// narrow a standing, they never create one.
+    #[test]
+    fn a_pre_upgrade_stranger_is_still_permitted_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(&path, PRE_UPGRADE_TRUST_JSON);
+
+        let stranger = DeviceId::from("pb-stranger001");
+        assert!(store.is_trusted(&stranger), "it is pinned");
+        for p in Permission::ALL {
+            assert!(!store.may(&stranger, p), "but it may not {p}");
+        }
+    }
+
+    /// A pin grants nothing on disk; approving is what writes the five.
+    #[test]
+    fn approving_grants_exactly_the_frozen_five() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-1");
+
+        store.record(record("dev-1", "fp")).unwrap();
+        assert_eq!(
+            store.lookup(&id).unwrap().unwrap().permissions,
+            PermissionSet::none(),
+            "a pinned stranger's record must not read as a grant"
+        );
+
+        store.approve(&id).unwrap();
+        assert_eq!(
+            store.lookup(&id).unwrap().unwrap().permissions,
+            PermissionSet::granted_on_approval()
+        );
+        for p in Permission::ALL {
+            assert!(store.may(&id, p));
+        }
+    }
+
+    /// Re-running `trust approve` on an already-approved device must not
+    /// resurrect a permission the user deliberately revoked — a provisioning
+    /// script is expected to be re-run.
+    #[test]
+    fn re_approving_does_not_undo_a_revoked_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        store.approve(&id).unwrap();
+
+        assert!(store
+            .set_permission(&id, Permission::Clipboard, false)
+            .unwrap());
+        store.approve(&id).unwrap();
+        assert!(!store.may(&id, Permission::Clipboard), "still revoked");
+    }
+
+    /// **Revocation applies to the next operation, not the next reconnect.**
+    /// The gates re-read the store per operation, so the same store instance a
+    /// running session holds must answer differently the instant the bit
+    /// changes — no restart, no reconnect, no cache to invalidate.
+    #[test]
+    fn a_revoked_permission_is_refused_by_the_very_next_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        store.approve(&id).unwrap();
+        assert!(store.may(&id, Permission::Clipboard));
+
+        assert!(store
+            .set_permission(&id, Permission::Clipboard, false)
+            .unwrap());
+        assert!(
+            !store.may(&id, Permission::Clipboard),
+            "the next query must already refuse"
+        );
+        for p in Permission::ALL
+            .into_iter()
+            .filter(|p| *p != Permission::Clipboard)
+        {
+            assert!(store.may(&id, p), "and only {p:?} 's neighbour changed");
+        }
+
+        // And it survives a reopen, so the decision is durable rather than a
+        // property of this process.
+        let reopened = FsTrust::open(&path).unwrap();
+        assert!(!reopened.may(&id, Permission::Clipboard));
+        assert!(reopened.may(&id, Permission::Files));
+    }
+
+    /// Granting back is symmetric, and the return value distinguishes "changed"
+    /// from "already like that" so a surface never reports a write it did not
+    /// make.
+    #[test]
+    fn set_permission_reports_whether_it_changed_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        store.approve(&id).unwrap();
+
+        assert!(store.set_permission(&id, Permission::Pipe, false).unwrap());
+        assert!(!store.set_permission(&id, Permission::Pipe, false).unwrap());
+        assert!(store.set_permission(&id, Permission::Pipe, true).unwrap());
+        assert!(store.may(&id, Permission::Pipe));
+    }
+
+    /// A device that is not pinned cannot be permitted — reported, not
+    /// silently invented as a new record.
+    #[test]
+    fn permitting_an_unpinned_device_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let ghost = DeviceId::from("ghost");
+        assert!(!store
+            .set_permission(&ghost, Permission::Files, true)
+            .unwrap());
+        assert!(store.lookup(&ghost).unwrap().is_none());
+    }
+
+    /// Permitting is not approving. The store writes the bit; `may` still says
+    /// no, because it implies approval.
+    #[test]
+    fn permitting_a_merely_pinned_device_does_not_approve_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+
+        assert!(store.set_permission(&id, Permission::Files, true).unwrap());
+        assert!(store
+            .lookup(&id)
+            .unwrap()
+            .unwrap()
+            .permissions
+            .grants(Permission::Files));
+        assert!(!store.is_approved(&id));
+        assert!(
+            !store.may(&id, Permission::Files),
+            "the bit is not a standing"
+        );
+    }
+
+    /// A store written by a **newer** build carries a permission name this one
+    /// cannot enforce. It must still load — refusing to parse would take every
+    /// pin on the machine with it — and the unknown grant is not honoured.
+    #[test]
+    fn a_record_from_a_newer_build_loads_and_its_unknown_grant_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(
+            &path,
+            r#"[{"device":"pb-future0001","fingerprint":"ab","name":"Future",
+                 "trusted_at":"2026-08-18T02:11:00Z","approved":true,
+                 "permissions":["files","browse","chat"]}]"#,
+        );
+        let id = DeviceId::from("pb-future0001");
+        assert!(store.may(&id, Permission::Files));
+        assert!(store.may(&id, Permission::Chat));
+        assert!(!store.may(&id, Permission::Clipboard));
+        assert_eq!(
+            store.lookup(&id).unwrap().unwrap().permissions.bits(),
+            Permission::Files.mask() | Permission::Chat.mask()
+        );
+    }
+
+    /// An explicitly empty array is an empty set, not the legacy default: only
+    /// an **absent** field means "the five that existed then".
+    #[test]
+    fn an_explicit_empty_permission_array_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(
+            &path,
+            r#"[{"device":"pb-locked00001","fingerprint":"ab","name":"Locked",
+                 "trusted_at":"2026-08-18T02:11:00Z","approved":true,
+                 "permissions":[]}]"#,
+        );
+        let id = DeviceId::from("pb-locked00001");
+        assert!(store.is_approved(&id));
+        for p in Permission::ALL {
+            assert!(!store.may(&id, p));
+        }
+    }
+
+    /// Permissions survive the write path, so what a gate reads after a restart
+    /// is what the user chose.
+    #[test]
+    fn permissions_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let id = DeviceId::from("dev-1");
+        {
+            let store = FsTrust::open(&path).unwrap();
+            store.record(record("dev-1", "fp")).unwrap();
+            store.approve(&id).unwrap();
+            store
+                .set_permission(&id, Permission::Presence, false)
+                .unwrap();
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"permissions\""), "stored by name: {raw}");
+        assert!(!raw.contains("\"presence\""), "and the revoked one is gone");
+
+        let store = FsTrust::open(&path).unwrap();
+        assert!(!store.may(&id, Permission::Presence));
+        assert!(store.may(&id, Permission::Clipboard));
     }
 }

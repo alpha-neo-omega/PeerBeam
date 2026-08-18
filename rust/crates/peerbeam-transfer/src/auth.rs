@@ -33,7 +33,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use peerbeam_domain::entity::TrustRecord;
+use peerbeam_domain::entity::{PermissionSet, TrustRecord};
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{
@@ -190,12 +190,20 @@ pub async fn authenticate(
             // Pin the key now (MITM protection). This is *not* approval for
             // auto-accept — that only happens if the user explicitly accepts
             // the transfer that follows (see `FsTrust::approve`).
+            //
+            // It grants **nothing**: a pin is a memory, not a decision, so the
+            // record it writes must not read as a permission either. The five
+            // permissions are granted by `FsTrust::approve`, the one act a
+            // person performs; until then `TrustStore::may` answers `false`
+            // here for every one of them regardless, because it implies
+            // approval.
             trust.record(TrustRecord {
                 device: peer_id.clone(),
                 fingerprint,
                 name: peer_name,
                 trusted_at: Utc::now(),
                 approved: false,
+                permissions: PermissionSet::none(),
             })?;
             true
         }
