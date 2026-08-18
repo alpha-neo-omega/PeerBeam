@@ -20,10 +20,10 @@ Everything is attached to the release:
 
 | You want | File |
 |---|---|
-| Linux app (Debian/Ubuntu family) | `peerbeam-<ver>-amd64.deb` · `-arm64.deb` |
-| Linux app (Fedora/RHEL/openSUSE) | `peerbeam-<ver>-x86_64.rpm` · `-aarch64.rpm` |
-| Linux app (any distribution) | `peerbeam-<ver>-x86_64.AppImage` · `-aarch64.AppImage` |
-| Linux app (portable tarball) | `peerbeam-<ver>-linux-x64.tar.gz` · `-linux-arm64.tar.gz` |
+| Linux app (Debian/Ubuntu family) | `peerbeam-<ver>-amd64.deb` |
+| Linux app (Fedora/RHEL/openSUSE) | `peerbeam-<ver>-x86_64.rpm` |
+| Linux app (any distribution) | `peerbeam-<ver>-x86_64.AppImage` |
+| Linux app (portable tarball) | `peerbeam-<ver>-linux-x64.tar.gz` |
 | CLI, Linux | `peerbeam-linux-x64` · `peerbeam-linux-arm64` |
 | Windows app | `peerbeam-<ver>-windows-x64-portable.zip` |
 | macOS app | `PeerBeam-<ver>.dmg` |
@@ -44,11 +44,19 @@ one machine is normal and they share the same identity, trust store and history.
 Pick the row for your distribution. All of them install the same build; only the
 packaging differs.
 
-**Both x86_64 and arm64 are published.** Check with `uname -m`: `x86_64` wants
-the `x86_64`/`amd64`/`x64` files, `aarch64` wants `aarch64`/`arm64`. That covers
-a Raspberry Pi 4/5 on 64-bit Raspberry Pi OS, Ampere and Graviton servers, and
-Asahi Linux on Apple silicon. 32-bit ARM (`armv7l`, older Pis on a 32-bit OS) is
-**not** published — build from source if you need it.
+**On ARM (`uname -m` says `aarch64`), use the CLI.** A Raspberry Pi 4/5 on
+64-bit Raspberry Pi OS, an Ampere or Graviton server, or Asahi Linux on Apple
+silicon all run `peerbeam-linux-arm64` natively — and on a headless box the CLI
+is what you want anyway.
+
+**The desktop app is x86_64 only on Linux, and that is not our choice:** Google
+publishes no Linux arm64 Flutter SDK. Every one of the 730 Linux releases in
+Flutter's manifest is `x64` or unspecified, so an arm64 build fails at SDK
+setup. The CLI has no such constraint — it is plain Rust — which is why it
+builds natively for both. If Flutter ships an arm64 Linux SDK, the packaging
+already handles the architecture and it becomes a one-line change.
+
+32-bit ARM (`armv7l`, older Pis on a 32-bit OS) is not published at all.
 
 | Distribution | Package | Command |
 |---|---|---|

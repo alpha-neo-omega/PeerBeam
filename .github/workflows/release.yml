@@ -6,17 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  # x86_64 and arm64 build natively — GitHub's arm64 runners are free for public
-  # repositories, and cross-compiling a Flutter Linux desktop bundle is far more
-  # trouble than a second runner. `fail-fast: false` so a problem on one
-  # architecture cannot take the other's artifacts down with it.
+  # x86_64 only, and not by choice: Google publishes **no Linux arm64 Flutter
+  # SDK**. Checked against the release manifest — 730 Linux releases carry
+  # `dart_sdk_arch` of x64 or nothing, none arm64 — and an arm64 runner fails at
+  # setup with "Unable to determine Flutter version for channel: stable version:
+  # any architecture: arm64". Building the SDK and its engine from source on
+  # arm64 is hours of work with no upstream support behind it.
+  #
+  # So Linux arm64 gets the CLI (see cli-linux, which does build natively) and
+  # not the GUI. Re-add an arm64 leg here the moment Flutter ships an arm64
+  # Linux SDK; the packaging script already handles the architecture.
   linux:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest,    appimage_arch: x86_64,  artifact: linux }
-          - { runner: ubuntu-24.04-arm, appimage_arch: aarch64, artifact: linux-arm64 }
+          - { runner: ubuntu-latest, appimage_arch: x86_64, artifact: linux }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -209,7 +214,7 @@ jobs:
           # Top-level files only: artifact dirs also carry build-debris
           # subtrees (e.g. the deb staging tree), whose contents collide on
           # basename (gh names assets by basename -> 422 duplicate).
-          mapfile -t files < <(find artifacts/linux artifacts/linux-arm64 \
+          mapfile -t files < <(find artifacts/linux \
             artifacts/android artifacts/cli-linux artifacts/cli-linux-arm64 \
             artifacts/cli-macos artifacts/cli-windows \
             -maxdepth 1 -type f 2>/dev/null)
