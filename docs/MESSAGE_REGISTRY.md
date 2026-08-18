@@ -165,9 +165,24 @@ belonging to each capability's future spec:
   conversation finds nothing rather than reaching across, and an id we have
   deleted is a silent success rather than a channel failure. What counts as an
   emoji is the sending client's business: the bound is a resource limit, not a
-  taste test. `Receipt`, `Edit` reserved (not
-  implemented; they were never numbered, so `3` and `4` were free and nothing
-  was renumbered). The Chat handler honors §6: unknown MessageTypes flagged
+  taste test. `Receipt = 5` (implemented) — "I have read your messages up to and including
+  `read_through`": a watermark and a `timestamp`. **A watermark, not a
+  per-message acknowledgement**, because ids are lexicographically time-ordered
+  (`mint_id`), so one id names a prefix of the conversation: a whole thread-read
+  costs one frame, re-applying marks nothing new, and a stale watermark arriving
+  out of order cannot move a read row back to unread. Sent `OPTIONAL`, carrying
+  `CHAT_FEAT_RECEIPT = 1 << 3`. **The bit asserts that a peer can *apply* a
+  receipt, deliberately not that its user sends them** — whether this device
+  discloses read times is `DeviceConfig::share_read_receipts`, **default off**,
+  and conflating the two would put a privacy setting on the wire.
+  `ChatStore::apply_receipt` marks only our own **outgoing** rows inside that
+  peer's namespace (the direction check `settle_file_row` makes: a peer must not
+  rewrite a row it sent us), so a watermark naming an unknown id marks whatever
+  is below it and is otherwise a silent success. The opt-in gates **sending
+  only**: receipts a peer sends are always applied, so opting out never costs
+  you what others choose to tell you — the same asymmetry presence has. `Edit`
+  reserved (not implemented; it was never numbered, so `3`, `4` and `5` were
+  free and nothing was renumbered). The Chat handler honors §6: unknown MessageTypes flagged
   `OPTIONAL` are ignored and the channel continues; unknown required types
   close that channel only. `Message`'s body is capped at `MAX_BODY = 16384`
   bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is

@@ -7,6 +7,17 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Read receipts, off by default.** A message you sent shows a distinct marker
+  once the peer tells you it read it. What it discloses is when *you* looked, so
+  the setting ("Read receipts", in Settings) starts off and gates **sending
+  only** — receipts other people send are always applied, so opting out never
+  costs you what they choose to tell you. `peerbeam chat history --mark-read`
+  is the CLI equivalent, opt-in on top of the opt-in: printing a conversation is
+  not consent to report having read it.
+
+  It is a watermark rather than one message per read: ids are time-ordered, so
+  one id names the prefix that has been read. A repeat marks nothing new, and a
+  stale watermark arriving late cannot move a read message back to unread.
 - **React to a message** — an emoji on any message in a conversation, in the app
   (a control on the bubble opens a quick picker) and from the CLI
   (`peerbeam chat react <peer> <id> <emoji> [--remove]`). Reactions group by

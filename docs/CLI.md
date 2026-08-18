@@ -259,6 +259,10 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `chat history <peer> [--mark-read]` — `--mark-read` also tells the peer you
+  have read it. Opt-in on top of an opt-in: printing a conversation is never
+  consent to report having read it, and nothing is sent unless
+  `device.share_read_receipts` is on.
 - `chat react <peer> <id> <emoji> [--remove]` — react to a message, or withdraw
   a reaction. Applies to this device's history whether or not the peer can be
   reached, and reports both answers: `--json` returns `applied` and `delivered`,

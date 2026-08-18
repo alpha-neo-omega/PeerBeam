@@ -249,6 +249,7 @@ char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
 char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
+char* pb_chat_mark_read(const char* json);      // {peer, read_through} → {sent}
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
@@ -318,6 +319,14 @@ survived), while `pb_chat_delete_messages` **names** the kept ids, so a surface
 can tell the user which of the messages they picked are still on their way out.
 An id the conversation does not hold is neither removed nor kept, and an empty
 `message_ids` deletes nothing rather than failing.
+
+`pb_chat_mark_read` sends a read watermark, and `sent: false` is its ordinary
+answer rather than a fault: this device sends no receipts at all unless the user
+has opted in (`share_read_receipts`, **default off**), and the peer may be
+offline or predate receipts. A read receipt discloses when *you* looked — a fact
+about your attention, not about the message — so silence is the default state of
+the feature. The opt-in gates sending only: receipts a peer sends are always
+applied, and `record_dto`'s `read_at` reports them.
 
 `pb_chat_react` answers **two** questions, and a caller must not collapse them.
 `applied` says this device's own history changed; `delivered` says the peer was
