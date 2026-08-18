@@ -1,5 +1,8 @@
 # Installing PeerBeam
 
+For a walkthrough including the standalone CLI and everyday commands, see
+[GUIDE.md](GUIDE.md).
+
 ## Linux
 - **tar.gz** (portable): extract and run, or install system-wide:
   ```
@@ -17,19 +20,27 @@ Uninstall: `sudo apt remove peerbeam` / `sudo dnf remove peerbeam` / delete
 `~/.local/share/peerbeam` and `~/.config/peerbeam` (untouched by uninstall).
 
 ## Windows
-Install the **MSIX**: double-click, or `Add-AppxPackage peerbeam-<ver>.msix`.
-An unsigned MSIX needs its test certificate trusted first (dev only). Start-menu
-entry + optional desktop shortcut are created automatically. Uninstall from
-*Settings → Apps*. Upgrading installs a higher `msix_version` in place.
+Unzip **`peerbeam-<ver>-windows-x64-portable.zip`** and run `peerbeam.exe`. It is
+portable: no installer, and nothing written outside the folder and your user
+profile. SmartScreen warns because the binary is unsigned — *More info → Run
+anyway*.
+
+The MSIX packaging in `scripts/package-windows.ps1` is **not published**: it
+needs a signing certificate this project does not have, so its CI job is
+`continue-on-error` and only the portable zip ships.
 
 ## macOS
-Open the **DMG** and drag PeerBeam to Applications. First launch on a notarized
-build passes Gatekeeper; an un-notarized build needs *right-click → Open*.
+Open the **DMG** and drag PeerBeam to Applications. The published DMG is **not notarized**, so Gatekeeper
+blocks the first launch: either `xattr -dr com.apple.quarantine
+/Applications/PeerBeam.app`, or right-click the app → *Open* → *Open*. The build
+is universal (Intel + Apple Silicon).
 Uninstall: move the app to Trash (config persists under
 `~/Library/Application Support/peerbeam`).
 
 ## Android
-Install the **APK** (`adb install app-release.apk`) or ship the **AAB** via Play.
+Install the **APK** (`adb install -r peerbeam-<ver>-android.apk`) or ship the
+**AAB** via Play. `-r` upgrades in place and keeps identity, trust and history;
+uninstalling first discards them.
 Grant notification + nearby-devices permissions on first run. Background
 transfers use a foreground service ([Android](ANDROID.md)).
 
