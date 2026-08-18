@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 peerbeam-domain = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

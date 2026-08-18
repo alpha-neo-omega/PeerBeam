@@ -140,6 +140,15 @@ pub const CHAT_FEAT_REACTION: u32 = 1 << 2;
 /// against a peer that predates it.
 pub const CHAT_FEAT_RECEIPT: u32 = 1 << 3;
 
+/// Feature bit on the NOTES capability: this peer understands the `NoteBatch`
+/// message (notes MessageType 1) — sending it notes will mean something.
+///
+/// Read like every other feature bit: it asserts comprehension, not consent.
+/// Whether notes are actually exchanged with a given device is
+/// `Permission::Notes` in the trust store, which is the user's decision and is
+/// checked on both sides of every exchange.
+pub const NOTES_FEAT_SYNC: u32 = 1 << 0;
+
 /// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
 /// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
 /// something.

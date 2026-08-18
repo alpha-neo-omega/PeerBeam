@@ -105,6 +105,15 @@ impl ChannelType {
     pub const CLIPBOARD: ChannelType = ChannelType(0x0102);
     /// Device status heartbeats (Phase B). See MESSAGE_REGISTRY.md §2.
     pub const PRESENCE: ChannelType = ChannelType(0x0103);
+    /// Note sync (Phase C). See MESSAGE_REGISTRY.md §2.
+    ///
+    /// The id the registry reserved for Notes. It was pencilled in as "rides
+    /// Sync; may not need its own channel", but Sync (`0x0104`) reconciles
+    /// *folders* — a different shape of problem, with bytes carried over
+    /// Transfer. Notes are small, self-contained records with their own
+    /// conflict rule, so they get the id already set aside for them rather than
+    /// waiting on a channel built for something else.
+    pub const NOTES: ChannelType = ChannelType(0x0105);
     /// Encrypted byte pipe — `peerbeam pipe` (Phase B). See MESSAGE_REGISTRY.md
     /// §2/§4.
     ///

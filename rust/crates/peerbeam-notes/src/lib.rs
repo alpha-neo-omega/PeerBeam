@@ -6,8 +6,12 @@
 //! leaves a tombstone. Anything richer — attachments, history, folders — is a
 //! different feature wearing this one's name.
 
+mod gate;
+mod message;
 mod note;
 mod store;
 
+pub use gate::may_sync_notes;
+pub use message::{NoteBatch, MAX_BATCH_BYTES, MAX_BATCH_NOTES, MSG_NOTE_BATCH};
 pub use note::{mint_id, Note, NoteError, MAX_BODY, MAX_ID, MAX_TITLE};
 pub use store::{NoteStore, NS};
