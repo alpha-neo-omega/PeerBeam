@@ -37,6 +37,27 @@ ChatMessage _text(String peerId, String id, {DateTime? at, String? body}) =>
       status: ChatStatusValue.received,
     );
 
+/// A settled file row, for searching by name (and for pinning that a file's
+/// path on this device is not what gets matched).
+ChatMessage _fileNamed(
+  String peerId,
+  String id,
+  String name, {
+  DateTime? at,
+  String? localPath,
+}) => ChatMessage(
+  id: id,
+  peerId: peerId,
+  direction: 'out',
+  body: '',
+  at: at ?? DateTime.now(),
+  status: ChatStatusValue.sent,
+  kind: ChatMessageKind.file,
+  fileName: name,
+  fileSize: 7,
+  localPath: localPath,
+);
+
 ChatMessage _queuedFile(String peerId, String id, String name) => ChatMessage(
   id: id,
   peerId: peerId,
@@ -343,6 +364,162 @@ void main() {
 
     expect(find.textContaining('Could not delete "pb-bob"'), findsOneWidget);
     expect(fake.chatHistories['pb-bob'], hasLength(1));
+    expect(find.text('pb-bob'), findsOneWidget);
+  });
+
+  // ── search ──────────────────────────────────────────────────────────────
+  //
+  // The search runs in the engine, not here: `ChatRepository.search` is a
+  // passthrough to `pb_chat_search`, so these tests pin what the screen does
+  // with the engine's answer — including the one thing it must never do, which
+  // is present a bounded result set as though it were everything.
+
+  /// Type into the search field and let the debounce elapse and the search
+  /// answer.
+  Future<void> searchFor(WidgetTester tester, String query) async {
+    await tester.enterText(find.byType(TextField), query);
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump();
+  }
+
+  testWidgets('searching finds a message body and a file name, grouped by '
+      'conversation', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-alice'] = [
+      _text('pb-alice', 'm1', body: 'the quarterly Invoice'),
+      _text('pb-alice', 'm2', body: 'lunch tomorrow?'),
+    ];
+    fake.chatHistories['pb-bob'] = [
+      _fileNamed('pb-bob', 'f1', 'invoice-2026.pdf'),
+    ];
+    await _pumpChats(tester, fake);
+
+    await searchFor(tester, 'invoice');
+
+    // The engine did the searching.
+    expect(fake.calls, contains('chatSearch:invoice'));
+    // Both hits, each under the conversation it is actually in.
+    expect(find.text('the quarterly Invoice'), findsOneWidget);
+    expect(find.text('invoice-2026.pdf'), findsOneWidget);
+    expect(find.text('pb-alice'), findsOneWidget);
+    expect(find.text('pb-bob'), findsOneWidget);
+    // The message that did not match is not on screen.
+    expect(find.text('lunch tomorrow?'), findsNothing);
+  });
+
+  /// The failure this exists to prevent: a bounded result set presented as
+  /// everything. Silence here would tell the user the message they are looking
+  /// for does not exist.
+  testWidgets('a truncated result set says so', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      for (var i = 0; i < 8; i++)
+        _text('pb-bob', 'm$i', body: 'invoice number $i'),
+    ];
+    await _pumpChats(tester, fake);
+    await searchFor(tester, 'invoice');
+
+    // The fake applies the engine's own default limit (50), so nothing is cut
+    // yet and nothing is claimed.
+    expect(find.textContaining('there are more'), findsNothing);
+
+    // Now cut it. `ChatRepository.search` passes the limit straight through.
+    final results = await AppScope.of(
+      tester.element(find.byType(ChatsScreen)),
+    ).chat.search('invoice', limit: 3);
+    expect(results.hits, hasLength(3));
+    expect(results.truncated, isTrue);
+    expect(results.limit, 3);
+  });
+
+  testWidgets('the truncation notice is rendered above the first hit', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      for (var i = 0; i < 60; i++)
+        _text('pb-bob', 'm$i', body: 'invoice number $i'),
+    ];
+    await _pumpChats(tester, fake);
+    await searchFor(tester, 'invoice');
+
+    // 60 matches against the engine's default limit of 50.
+    final notice = find.textContaining('Showing the newest 50 matches');
+    expect(notice, findsOneWidget);
+    expect(find.textContaining('there are more'), findsOneWidget);
+    // Above the results, not under them — it has to be read before the user
+    // concludes the message is not there.
+    final noticeY = tester.getTopLeft(notice).dy;
+    final firstHitY = tester.getTopLeft(find.text('pb-bob').first).dy;
+    expect(noticeY, lessThan(firstHitY));
+  });
+
+  /// A file's path is where it happens to sit on this disk, not conversation
+  /// content — matching it would surface a thread for the name of a folder.
+  testWidgets('a file\'s path on this device is not searched', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _fileNamed(
+        'pb-bob',
+        'f1',
+        'notes.txt',
+        localPath: '/home/someone/Downloads/private-dir/notes.txt',
+      ),
+    ];
+    await _pumpChats(tester, fake);
+
+    await searchFor(tester, 'private-dir');
+    expect(find.textContaining('No messages match'), findsOneWidget);
+
+    // The name itself still matches, so this is an exclusion rather than a
+    // file row that cannot be found at all.
+    await searchFor(tester, 'notes');
+    expect(find.text('notes.txt'), findsOneWidget);
+  });
+
+  testWidgets('tapping a hit opens the conversation it is in', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-alice'] = [_text('pb-alice', 'm1', body: 'nothing')];
+    fake.chatHistories['pb-ghost'] = [
+      _text('pb-ghost', 'm2', body: 'the missing invoice'),
+    ];
+    await _pumpChats(tester, fake);
+    await searchFor(tester, 'invoice');
+
+    await tester.tap(find.text('the missing invoice'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // The thread the message is actually in — never the other one.
+    expect(fake.calls, contains('chatHistory:pb-ghost'));
+    expect(fake.calls, isNot(contains('chatHistory:pb-alice')));
+  });
+
+  testWidgets('a query that matches nothing says so, and does not empty the '
+      'conversation list', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [_text('pb-bob', 'm1', body: 'hello')];
+    await _pumpChats(tester, fake);
+
+    await searchFor(tester, 'zzzz-nothing');
+    expect(find.textContaining('No messages match'), findsOneWidget);
+
+    // Clearing returns to the conversation list, which was never touched.
+    await tester.tap(find.byTooltip('Clear search'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.textContaining('No messages match'), findsNothing);
+    expect(find.text('pb-bob'), findsOneWidget);
+  });
+
+  /// An empty field is the conversation list, not a search for everything.
+  testWidgets('an empty query does not search', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [_text('pb-bob', 'm1', body: 'hello')];
+    await _pumpChats(tester, fake);
+
+    await searchFor(tester, '   ');
+    expect(fake.calls.where((c) => c.startsWith('chatSearch')), isEmpty);
     expect(find.text('pb-bob'), findsOneWidget);
   });
 }

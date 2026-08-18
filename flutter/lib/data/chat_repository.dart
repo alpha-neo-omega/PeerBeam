@@ -255,6 +255,32 @@ class ChatRepository extends ChangeNotifier {
     return result;
   }
 
+  /// Search this device's stored conversations, newest match first.
+  ///
+  /// A **passthrough**, deliberately: results belong to the query that asked
+  /// for them, so they are handed straight back to the caller rather than
+  /// cached here and re-shown for a query that has since changed. Nothing is
+  /// notified — no repository state moves — so a search cannot rebuild the
+  /// conversation list or any open thread.
+  ///
+  /// The engine does the searching (see [PeerBeamApi.chatSearch]). A filter
+  /// here would mean pulling every message of every conversation across the FFI
+  /// to answer one query.
+  ///
+  /// A transient failure comes back as [ChatSearchResults.empty] rather than
+  /// throwing, matching every other read in this repository; the surface shows
+  /// "no matches", which is the same thing the user sees for a query that
+  /// genuinely matched nothing.
+  Future<ChatSearchResults> search(String query, {int? limit}) async {
+    final api = _api;
+    if (api == null) return ChatSearchResults.empty;
+    try {
+      return await api.chatSearch(query, limit: limit);
+    } catch (_) {
+      return ChatSearchResults.empty;
+    }
+  }
+
   /// Call off a file we are sharing, and report **honestly** whether anything
   /// was cancelled.
   ///

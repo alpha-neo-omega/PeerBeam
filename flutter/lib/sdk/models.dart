@@ -699,6 +699,99 @@ class ChatConversation {
   );
 }
 
+/// One message that matched a search of this device's stored history, and
+/// enough to navigate to it.
+///
+/// It is deliberately not a [ChatMessage]. A hit carries a *snippet* rather
+/// than the whole body — that is the point of a bounded search — and has no
+/// status and no file metadata, so reusing the message type would mean either
+/// shipping every match in full or filling those fields in with values nothing
+/// stands behind.
+@immutable
+class ChatSearchHit {
+  /// The conversation the message is in. This is the thread a surface opens
+  /// when the hit is tapped, and it comes from the namespace the row was read
+  /// from rather than from a field copied out of the row.
+  final String peerId;
+
+  /// The message's id within that conversation.
+  final String messageId;
+
+  /// When the message was stamped. Best-effort recency for an inbound row,
+  /// whose timestamp came off the peer's own clock.
+  final DateTime? at;
+
+  /// `'out'` or `'in'`, spelled as [ChatMessage.direction] is.
+  final String direction;
+
+  /// One of [ChatMessageKind]: the matched text was this message's body, or —
+  /// for a file — its name.
+  final String kind;
+
+  /// A **substring of what is stored**: the body around the match for a text
+  /// message, the file name for a file. Never re-rendered or reformatted by the
+  /// engine, so a surface may highlight the query inside it and be highlighting
+  /// the real thing.
+  final String snippet;
+
+  const ChatSearchHit({
+    required this.peerId,
+    required this.messageId,
+    required this.at,
+    required this.direction,
+    required this.kind,
+    required this.snippet,
+  });
+
+  bool get isMine => direction == 'out';
+
+  bool get isFile => kind == ChatMessageKind.file;
+
+  factory ChatSearchHit.fromJson(Map<String, dynamic> j) => ChatSearchHit(
+    peerId: j['peer_id'] as String? ?? '',
+    messageId: j['message_id'] as String? ?? '',
+    at: DateTime.tryParse(j['timestamp'] as String? ?? ''),
+    direction: j['direction'] as String? ?? 'in',
+    kind: j['kind'] as String? ?? ChatMessageKind.text,
+    snippet: j['snippet'] as String? ?? '',
+  );
+}
+
+/// What a history search found — and whether that was all there was.
+@immutable
+class ChatSearchResults {
+  /// Newest first, tie-broken by peer id then message id so the order is stable
+  /// between runs.
+  final List<ChatSearchHit> hits;
+
+  /// **There were more matches than [limit] allowed.**
+  ///
+  /// A surface must show this. A bounded search that silently returns its first
+  /// `n` reads as "that is all there is", which for a search over the user's own
+  /// history is a wrong answer rather than a partial one: the message they are
+  /// looking for exists, they have been told it does not, and nothing on screen
+  /// suggests asking differently.
+  final bool truncated;
+
+  /// The limit the engine actually applied — echoed back, so a surface can say
+  /// how many it is showing without having to know whether it passed one.
+  final int limit;
+
+  const ChatSearchResults({
+    required this.hits,
+    required this.truncated,
+    required this.limit,
+  });
+
+  static const empty = ChatSearchResults(
+    hits: [],
+    truncated: false,
+    limit: 0,
+  );
+
+  bool get isEmpty => hits.isEmpty;
+}
+
 /// One auto-save rule: a **match**, and a **destination**.
 ///
 /// A rule decides **where** an accepted file is saved. It never decides

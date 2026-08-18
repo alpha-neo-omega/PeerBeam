@@ -250,6 +250,32 @@ abstract class PeerBeamApi {
     List<String> messageIds,
   );
 
+  /// Search this device's stored conversations for [query], newest match
+  /// first.
+  ///
+  /// **A pure local read.** It never dials, never opens a channel, and never
+  /// depends on a peer being online — a thread whose device is long gone is
+  /// searchable exactly like one that is here. A conversation the user deleted
+  /// is not searchable at all: its rows are gone, and there is nowhere for them
+  /// to come back from.
+  ///
+  /// [query] matches **case-insensitively** as a plain substring of a message's
+  /// text or a shared file's *name*. It is not a regular expression, and a
+  /// file's path on this device is never searched — that is where the file
+  /// happens to sit on disk, not anything anyone said. An empty or
+  /// whitespace-only query finds nothing rather than everything.
+  ///
+  /// [limit] bounds the results (the engine's default when omitted; at most
+  /// 500). Whatever it is, check [ChatSearchResults.truncated] and show it —
+  /// silently returning the first `n` reads as "that is all there is", which
+  /// for a search over the user's own history is a wrong answer rather than a
+  /// partial one.
+  ///
+  /// The search runs in the engine and not here, deliberately: a filter in Dart
+  /// would mean loading every message of every conversation across the FFI to
+  /// answer one query.
+  Future<ChatSearchResults> chatSearch(String query, {int? limit});
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -517,6 +543,23 @@ class PeerBeam implements PeerBeamApi {
       _req().chatSendFile(jsonEncode({'peer': peer.toJson(), 'path': path})),
     );
     return data['id'] as String;
+  }
+
+  @override
+  Future<ChatSearchResults> chatSearch(String query, {int? limit}) async {
+    // `limit` is omitted rather than sent as null when the caller did not ask
+    // for one: the engine refuses an out-of-range limit rather than clamping
+    // it, and "no opinion" must reach it as no key at all.
+    final data = _data(
+      _req().chatSearch(
+        jsonEncode({'query': query, 'limit': ?limit}),
+      ),
+    );
+    return ChatSearchResults(
+      hits: _list(data['hits']).map(ChatSearchHit.fromJson).toList(),
+      truncated: data['truncated'] == true,
+      limit: (data['limit'] as num?)?.toInt() ?? 0,
+    );
   }
 
   @override

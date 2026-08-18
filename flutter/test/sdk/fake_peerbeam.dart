@@ -476,6 +476,57 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// The engine's default `limit` (`peerbeam_chat::DEFAULT_SEARCH_LIMIT`),
+  /// applied here so a caller that passes none is bounded exactly as the real
+  /// engine bounds it — including reporting truncation.
+  static const searchDefaultLimit = 50;
+
+  @override
+  Future<ChatSearchResults> chatSearch(String query, {int? limit}) async {
+    calls.add('chatSearch:$query');
+    final cap = limit ?? searchDefaultLimit;
+    // Mirrors `ChatStore::search`: a trimmed, empty query finds nothing rather
+    // than everything.
+    final needle = query.trim().toLowerCase();
+    if (needle.isEmpty) {
+      return ChatSearchResults(hits: const [], truncated: false, limit: cap);
+    }
+    final hits = <ChatSearchHit>[];
+    for (final entry in chatHistories.entries) {
+      for (final m in entry.value) {
+        // Body, then the file's NAME — never its `localPath`, exactly as the
+        // engine refuses to search a file's place on disk.
+        final haystack = m.isFile ? (m.fileName ?? '') : m.body;
+        if (!haystack.toLowerCase().contains(needle)) continue;
+        hits.add(
+          ChatSearchHit(
+            // The conversation the row is filed under, not `m.peerId`.
+            peerId: entry.key,
+            messageId: m.id,
+            at: m.at,
+            direction: m.direction,
+            kind: m.kind,
+            snippet: haystack,
+          ),
+        );
+      }
+    }
+    // Newest first, ties broken by peer then message id — the engine's own
+    // total order.
+    hits.sort((a, b) {
+      final at = a.at, bt = b.at;
+      final byTime = (at == null || bt == null) ? 0 : bt.compareTo(at);
+      if (byTime != 0) return byTime;
+      final byPeer = a.peerId.compareTo(b.peerId);
+      return byPeer != 0 ? byPeer : a.messageId.compareTo(b.messageId);
+    });
+    return ChatSearchResults(
+      hits: hits.take(cap).toList(),
+      truncated: hits.length > cap,
+      limit: cap,
+    );
+  }
+
   @override
   Future<List<ChatConversation>> chatConversations() async {
     calls.add('chatConversations');
