@@ -412,6 +412,20 @@ impl Manager {
         }
     }
 
+    /// Announce one transfer as interrupted, if it left a checkpoint.
+    ///
+    /// Called after a transfer settles. The terminal event a surface already
+    /// gets (`transfer_failed`, `transfer_cancelled`) says the transfer is
+    /// over, and every surface responds by dropping the row — which is right
+    /// when nothing survived and wrong when something did. This is the second
+    /// half of the sentence: the transfer is over *and* here is what it left.
+    /// Emitted after the terminal event, so a surface applies them in order.
+    pub(crate) fn announce_if_interrupted(&self, id: &str) {
+        if let Some(cp) = self.load_checkpoint(id) {
+            events::transfer(id, "transfer_interrupted", dto(&cp));
+        }
+    }
+
     /// Throw a checkpoint away along with the partial bytes it was holding.
     ///
     /// The one place the two are dropped together, so a caller cannot clear

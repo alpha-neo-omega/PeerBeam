@@ -84,6 +84,31 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<TransferSnapshot>> activeTransfers() async => const [];
+
+  /// What `pb_transfers_interrupted` would report. Seeded by tests.
+  List<InterruptedTransfer> interrupted = [];
+
+  /// Ids `resumeInterrupted` refuses, as the engine does when a checkpoint no
+  /// longer binds to its transfer.
+  Set<String> unresumableIds = {};
+
+  @override
+  Future<List<InterruptedTransfer>> interruptedTransfers() async => interrupted;
+
+  @override
+  Future<void> resumeInterrupted(String id, {PeerTarget? peer}) async {
+    calls.add('resumeInterrupted:$id');
+    if (unresumableIds.contains(id)) {
+      throw InvalidArgumentException('cannot resume $id');
+    }
+    interrupted = interrupted.where((t) => t.id != id).toList();
+  }
+
+  @override
+  Future<void> discardInterrupted(String id) async {
+    calls.add('discardInterrupted:$id');
+    interrupted = interrupted.where((t) => t.id != id).toList();
+  }
   Map<String, dynamic> settings = {};
 
   @override

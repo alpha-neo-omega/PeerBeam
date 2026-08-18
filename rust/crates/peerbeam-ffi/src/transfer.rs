@@ -1270,6 +1270,10 @@ impl Manager {
             },
         };
         self.finish(active, outcome);
+        // The terminal event above says the transfer is over; this says what
+        // it left behind. Emitted only when a checkpoint actually survived, so
+        // a completed or cancelled transfer says nothing extra.
+        self.announce_if_interrupted(id);
         leg
     }
 
@@ -3609,6 +3613,7 @@ impl Manager {
         }
         session.close().await;
         self.finish(&active, outcome);
+        self.announce_if_interrupted(&id);
     }
 }
 

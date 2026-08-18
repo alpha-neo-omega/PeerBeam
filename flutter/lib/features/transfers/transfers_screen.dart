@@ -387,7 +387,11 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
 Color _stateColor(TransferState s, ColorScheme scheme) => switch (s) {
   TransferState.completed => AppColors.success,
   TransferState.failed => scheme.error,
-  TransferState.paused => AppColors.warning,
+  // Interrupted is a warning, not an error: nothing went wrong that the user
+  // has to fix, and the bytes already moved are still there. Sharing the
+  // paused colour is the honest reading — this is a transfer that stopped and
+  // can go again.
+  TransferState.paused || TransferState.interrupted => AppColors.warning,
   _ => scheme.primary,
 };
 
@@ -437,6 +441,10 @@ class _TransferCard extends StatelessWidget {
     final text = Theme.of(context).textTheme;
     final sending = transfer.direction == TransferDirection.sending;
     final paused = transfer.state == TransferState.paused;
+    // Not running at all — its checkpoint outlived it. The pause/cancel
+    // controls are meaningless here (there is nothing to pause and nothing to
+    // cancel), so this card gets its own pair.
+    final interrupted = transfer.state == TransferState.interrupted;
     final pct = (transfer.progress * 100).round();
     final accent = _stateColor(transfer.state, scheme);
     // An inbound transfer awaiting the user's approval — needs Accept/Decline,
@@ -563,7 +571,42 @@ class _TransferCard extends StatelessWidget {
                       alignment: WrapAlignment.end,
                       spacing: AppSpace.xs,
                       runSpacing: AppSpace.xs,
-                      children: !awaitingApproval
+                      children: interrupted
+                          // An interrupted transfer: pick it up, or let it go.
+                          // Resume only when the engine says this side can —
+                          // an inbound transfer resumes when its *sender*
+                          // offers it again, and a button here would do
+                          // nothing but lie about that.
+                          ? [
+                              if (transfer.resumable)
+                                FilledButton.tonalIcon(
+                                  onPressed: () => state.transfer
+                                      .resumeInterrupted(transfer.id),
+                                  icon: const Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 18,
+                                  ),
+                                  label: const Text('Resume'),
+                                )
+                              else
+                                Tooltip(
+                                  message:
+                                      'This will continue on its own when '
+                                      '${transfer.peerName} sends it again',
+                                  child: Text(
+                                    'Waiting for sender',
+                                    style: text.bodySmall?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              TextButton(
+                                onPressed: () => state.transfer
+                                    .discardInterrupted(transfer.id),
+                                child: const Text('Discard'),
+                              ),
+                            ]
+                          : !awaitingApproval
                           ? [
                               IconButton(
                                 tooltip: paused ? 'Resume' : 'Pause',

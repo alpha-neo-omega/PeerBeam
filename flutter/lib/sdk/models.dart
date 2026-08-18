@@ -234,6 +234,72 @@ class TransferSnapshot {
   );
 }
 
+/// A transfer whose checkpoint outlived it — one that ended because the link
+/// dropped or the app closed, rather than because it finished or was
+/// cancelled.
+///
+/// Deliberately a separate model from [TransferSnapshot] rather than a status
+/// on it. An interrupted transfer is not running: nothing will ever emit
+/// progress for it, its speed and ETA are meaningless, and — for an inbound
+/// one — it cannot be restarted from this side at all. [resumable] carries
+/// that last part, and the UI must honour it rather than offer a Resume that
+/// would do nothing.
+@immutable
+class InterruptedTransfer {
+  final String id;
+  final String direction; // "sending" | "receiving"
+
+  /// The peer's **id**, not its name: a checkpoint outlives the run that made
+  /// it, and after a restart there is no name to resolve until discovery finds
+  /// the device again.
+  final String peerId;
+  final String file;
+  final String path;
+  final int transferredBytes;
+  final int totalBytes;
+  final String startedAt;
+
+  /// Whether this side can restart it. Only an outgoing transfer can: the
+  /// transfer protocol is sender-driven, so an interrupted receive continues
+  /// when its sender offers it again.
+  final bool resumable;
+
+  const InterruptedTransfer({
+    required this.id,
+    required this.direction,
+    required this.peerId,
+    required this.file,
+    required this.path,
+    required this.transferredBytes,
+    required this.totalBytes,
+    required this.startedAt,
+    required this.resumable,
+  });
+
+  bool get sending => direction == 'sending';
+
+  factory InterruptedTransfer.fromJson(Map<String, dynamic> j) =>
+      InterruptedTransfer(
+        id: j['id'] as String? ?? '',
+        direction: j['direction'] as String? ?? 'sending',
+        peerId: j['peer_id'] as String? ?? '',
+        file: j['file'] as String? ?? '',
+        path: j['path'] as String? ?? '',
+        transferredBytes: (j['stats'] is Map
+            ? (j['stats'] as Map)['transferred_bytes']
+            : j['transferred_bytes']) as int? ??
+            0,
+        totalBytes: (j['stats'] is Map
+            ? (j['stats'] as Map)['total_bytes']
+            : j['total_bytes']) as int? ??
+            0,
+        startedAt: j['started_at'] as String? ?? '',
+        // Absent means "not resumable": offering a button that cannot work is
+        // worse than not offering one.
+        resumable: j['resumable'] == true,
+      );
+}
+
 @immutable
 class HistoryEntry {
   final String id;

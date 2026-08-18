@@ -52,6 +52,9 @@ class Bindings {
   final _ArgRetDart _acceptTrust;
   final _ArgRetDart _reject;
   final _RetDart _active;
+  final _RetDart _interrupted;
+  final _ArgRetDart _resumeInterrupted;
+  final _ArgRetDart _discardInterrupted;
   final _ArgRetDart _get;
   final _RetDart _history;
   final _RetDart _trustList;
@@ -99,6 +102,17 @@ class Bindings {
       ),
       _reject = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_reject'),
       _active = lib.lookupFunction<_RetC, _RetDart>('pb_transfers_active'),
+      _interrupted = lib.lookupFunction<_RetC, _RetDart>(
+        'pb_transfers_interrupted',
+      ),
+      // NOT `pb_transfer_resume`: that un-pauses a live transfer, this
+      // restarts a dead one from its checkpoint. Two verbs, two symbols.
+      _resumeInterrupted = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_transfer_resume_interrupted',
+      ),
+      _discardInterrupted = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_transfer_discard_interrupted',
+      ),
       _get = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_transfer_get'),
       _history = lib.lookupFunction<_RetC, _RetDart>('pb_history_get'),
       _trustList = lib.lookupFunction<_RetC, _RetDart>('pb_trust_list'),
@@ -173,6 +187,10 @@ class Bindings {
   String acceptTrust(String json) => _withArg(json, _acceptTrust);
   String reject(String json) => _withArg(json, _reject);
   String active() => _consume(_active());
+  String interrupted() => _consume(_interrupted());
+  String resumeInterrupted(String json) => _withArg(json, _resumeInterrupted);
+  String discardInterrupted(String json) =>
+      _withArg(json, _discardInterrupted);
   String get(String json) => _withArg(json, _get);
   String history() => _consume(_history());
   String trustList() => _consume(_trustList());

@@ -47,6 +47,28 @@ abstract class PeerBeamApi {
   Future<void> reject(String id);
 
   Future<List<TransferSnapshot>> activeTransfers();
+
+  /// Transfers whose checkpoint outlived them — interrupted by a dropped link
+  /// or a closed app, still resumable (outgoing) or still waiting for their
+  /// sender (incoming).
+  ///
+  /// A separate call from [activeTransfers] on purpose: none of these are
+  /// running, and folding them into one list would make "is this alive?" a
+  /// field a caller has to remember to read.
+  Future<List<InterruptedTransfer>> interruptedTransfers();
+
+  /// Restart an interrupted **outgoing** transfer from its checkpoint.
+  ///
+  /// Not [resume], which un-pauses a live transfer. `peer` says only *how* to
+  /// reach the device — its id must be the checkpoint's, so this can never be
+  /// redirected at a different one; omit it and the engine uses discovery.
+  /// Throws when the checkpoint no longer binds to its transfer (a different
+  /// peer, a changed file) or when the transfer is inbound.
+  Future<void> resumeInterrupted(String id, {PeerTarget? peer});
+
+  /// Forget an interrupted transfer and the partial bytes it was holding.
+  Future<void> discardInterrupted(String id);
+
   Future<List<HistoryEntry>> history();
 
   /// Clear all transfer history (persisted).
@@ -332,6 +354,26 @@ class PeerBeam implements PeerBeamApi {
     final data = _data(_req().active());
     return _list(data['transfers']).map(TransferSnapshot.fromJson).toList();
   }
+
+  @override
+  Future<List<InterruptedTransfer>> interruptedTransfers() async {
+    final data = _data(_req().interrupted());
+    return _list(data['transfers']).map(InterruptedTransfer.fromJson).toList();
+  }
+
+  @override
+  Future<void> resumeInterrupted(String id, {PeerTarget? peer}) async => _data(
+    _req().resumeInterrupted(
+      jsonEncode({
+        'id': id,
+        if (peer != null) 'peer': peer.toJson(),
+      }),
+    ),
+  );
+
+  @override
+  Future<void> discardInterrupted(String id) async =>
+      _data(_req().discardInterrupted(_id(id)));
 
   @override
   Future<Map<String, dynamic>> settingsGet() async =>

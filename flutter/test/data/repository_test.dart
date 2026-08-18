@@ -105,6 +105,159 @@ void main() {
       expect(repo.transfers, isEmpty); // moves out of active
     });
 
+    // ── interrupted transfers ────────────────────────────────
+    //
+    // The state that outlives the process. Everything here is about a row that
+    // no event of this session created and no event will ever complete.
+
+    InterruptedTransfer cp(
+      String id, {
+      String direction = 'sending',
+      int done = 400,
+      int total = 1000,
+      bool resumable = true,
+    }) => InterruptedTransfer(
+      id: id,
+      direction: direction,
+      peerId: 'pb-peer-1',
+      file: '$id.bin',
+      path: '/save/$id.bin',
+      transferredBytes: done,
+      totalBytes: total,
+      startedAt: '',
+      resumable: resumable,
+    );
+
+    test('a surviving checkpoint becomes an interrupted row with the progress '
+        'it actually reached', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t-old', done: 400, total: 1000)];
+      final repo = TransferRepository(api: fake);
+
+      await repo.refreshInterrupted();
+      final t = repo.transfers.single;
+      expect(t.id, 't-old');
+      expect(t.state, ui.TransferState.interrupted);
+      // Not a fresh zero-progress row: how far it got is the whole reason to
+      // resume rather than restart.
+      expect(t.doneBytes, 400);
+      expect(t.totalBytes, 1000);
+      expect(t.progress, 0.4);
+      expect(t.resumable, isTrue);
+      // And it is not counted as work in progress — nothing is moving.
+      expect(repo.activeCount, 0);
+      expect(repo.awaitingApproval, isEmpty);
+    });
+
+    test('an inbound checkpoint is not resumable from this side', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t-in', direction: 'receiving', resumable: false)];
+      final repo = TransferRepository(api: fake);
+
+      await repo.refreshInterrupted();
+      final t = repo.transfers.single;
+      expect(t.direction, ui.TransferDirection.receiving);
+      expect(
+        t.resumable,
+        isFalse,
+        reason:
+            'the transfer protocol is sender-driven — a Resume here would do '
+            'nothing',
+      );
+    });
+
+    test('a live transfer wins over a checkpoint bearing its id', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t1')];
+      final repo = TransferRepository(api: fake);
+
+      fake.emit(ev('transfer_queued', 't1', {'peer': 'Bob', 'file': 'a.bin'}));
+      await flush();
+      await repo.refreshInterrupted();
+
+      expect(repo.transfers.single.state, ui.TransferState.pending);
+      expect(repo.transfers.single.peerName, 'Bob');
+    });
+
+    test('transfer_interrupted brings a row back after its terminal event '
+        'removed it', () async {
+      final fake = FakePeerBeam();
+      final repo = TransferRepository(api: fake);
+
+      fake.emit(ev('transfer_queued', 't1', {'peer': 'Bob', 'file': 'a.bin'}));
+      fake.emit(ev('transfer_failed', 't1', {'error': {'code': 'connection'}}));
+      await flush();
+      expect(repo.transfers, isEmpty);
+
+      fake.emit(
+        ev('transfer_interrupted', 't1', {
+          'peer_id': 'pb-peer-1',
+          'file': 'a.bin',
+          'direction': 'sending',
+          'resumable': true,
+          'stats': {'transferred_bytes': 700, 'total_bytes': 1000},
+        }),
+      );
+      await flush();
+      final t = repo.transfers.single;
+      expect(t.state, ui.TransferState.interrupted);
+      expect(t.doneBytes, 700);
+      expect(t.resumable, isTrue);
+    });
+
+    test('resumeInterrupted goes to the engine, and is not resume', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t-old')];
+      final repo = TransferRepository(api: fake);
+      await repo.refreshInterrupted();
+
+      repo.resumeInterrupted('t-old');
+      await flush();
+      expect(fake.calls, contains('resumeInterrupted:t-old'));
+      expect(
+        fake.calls,
+        isNot(contains('resume:t-old')),
+        reason:
+            'resume un-pauses a live transfer; these are two different verbs '
+            'and calling the wrong one would silently do nothing',
+      );
+    });
+
+    test('a refused resume is surfaced, never swallowed', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t-old')];
+      fake.unresumableIds = {'t-old'};
+      final repo = TransferRepository(api: fake);
+      await repo.refreshInterrupted();
+
+      final errors = <String>[];
+      final sub = repo.errors.listen(errors.add);
+      repo.resumeInterrupted('t-old');
+      await flush();
+      await flush();
+      await sub.cancel();
+
+      expect(errors, isNotEmpty);
+      expect(errors.single, contains('resume'));
+      // And the row stays: a refusal changed nothing.
+      expect(repo.transfers.single.state, ui.TransferState.interrupted);
+    });
+
+    test('discarding removes the row', () async {
+      final fake = FakePeerBeam();
+      fake.interrupted = [cp('t-old')];
+      final repo = TransferRepository(api: fake);
+      await repo.refreshInterrupted();
+
+      repo.discardInterrupted('t-old');
+      await flush();
+      expect(fake.calls, contains('discardInterrupted:t-old'));
+
+      fake.emit(ev('transfer_discarded', 't-old'));
+      await flush();
+      expect(repo.transfers, isEmpty);
+    });
+
     test('fileReceived carries the path, name, and sending peer', () async {
       final fake = FakePeerBeam();
       final repo = TransferRepository(api: fake);

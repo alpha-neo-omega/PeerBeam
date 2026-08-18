@@ -83,7 +83,137 @@ Future<void> _enterSelectMode(WidgetTester tester) async {
   await tester.pump();
 }
 
+/// A `transfer_interrupted` for [id] — the event the engine emits when a
+/// transfer leaves a checkpoint behind, and the one a restart replays for every
+/// checkpoint it finds.
+TransferEvent _interrupted(
+  String id, {
+  required bool resumable,
+  String direction = 'sending',
+  int done = 700,
+  int total = 1000,
+}) => TransferEvent(
+  kind: 'transfer_interrupted',
+  transferId: id,
+  timestamp: '',
+  payload: {
+    'peer_id': 'pb-peer-1',
+    'file': '$id.bin',
+    'direction': direction,
+    'resumable': resumable,
+    'stats': {'transferred_bytes': done, 'total_bytes': total},
+  },
+);
+
 void main() {
+  // ── interrupted transfers ──────────────────────────────────────
+  //
+  // A transfer whose checkpoint outlived it is the one row on this screen that
+  // is not running. It must say how far it got, offer the two actions that
+  // apply to it, and offer neither of the two that do not.
+  group('an interrupted transfer', () {
+    testWidgets('shows Resume and Discard, and not Pause or Cancel', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_interrupted('t1', resumable: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(find.text('Resume'), findsOneWidget);
+      expect(find.text('Discard'), findsOneWidget);
+      expect(find.text('Interrupted'), findsOneWidget);
+      // Nothing to pause and nothing to cancel: the transfer is already over.
+      expect(find.byIcon(Icons.pause_rounded), findsNothing);
+      expect(find.byIcon(Icons.close_rounded), findsNothing);
+      // Nor is it a decision anyone is being asked for.
+      expect(find.text('Accept'), findsNothing);
+      expect(find.text('Decline'), findsNothing);
+    });
+
+    testWidgets('shows how far it got', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_interrupted('t1', resumable: true, done: 700, total: 1000));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // The progress line is `done / total`; a resumable transfer that claimed
+      // zero progress would give the user no reason to resume it.
+      expect(find.textContaining('700 B / 1000 B'), findsOneWidget);
+    });
+
+    testWidgets('Resume calls resumeInterrupted, never resume', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_interrupted('t1', resumable: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.tap(find.text('Resume'));
+      await tester.pump();
+
+      expect(fake.calls, contains('resumeInterrupted:t1'));
+      expect(
+        fake.calls.where((c) => c == 'resume:t1'),
+        isEmpty,
+        reason:
+            'pb_transfer_resume un-pauses a live transfer — calling it on a '
+            'dead one does nothing at all',
+      );
+    });
+
+    testWidgets('Discard calls discardInterrupted', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(_interrupted('t1', resumable: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.tap(find.text('Discard'));
+      await tester.pump();
+
+      expect(fake.calls, contains('discardInterrupted:t1'));
+    });
+
+    testWidgets('an inbound one offers Discard and says it is waiting for its '
+        'sender, rather than a Resume that would do nothing', (tester) async {
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+
+      fake.emit(
+        _interrupted('t1', resumable: false, direction: 'receiving'),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(find.text('Resume'), findsNothing);
+      expect(find.text('Waiting for sender'), findsOneWidget);
+      expect(find.text('Discard'), findsOneWidget);
+    });
+
+    testWidgets('is not counted as work in progress', (tester) async {
+      final fake = FakePeerBeam();
+      final state = await _pumpTransfers(tester, fake);
+
+      fake.emit(_interrupted('t1', resumable: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(
+        state.transfer.activeCount,
+        0,
+        reason:
+            'a badge that counted interrupted transfers would sit permanently '
+            'lit',
+      );
+      expect(state.transfer.awaitingApproval, isEmpty);
+    });
+  });
+
   group('bulk approval banner visibility', () {
     testWidgets('hidden when nothing is waiting', (tester) async {
       final fake = FakePeerBeam();

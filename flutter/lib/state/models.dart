@@ -79,7 +79,22 @@ class Device {
 
 enum TransferDirection { sending, receiving }
 
-enum TransferState { pending, transferring, paused, completed, failed }
+/// Where a transfer is in its life.
+///
+/// [interrupted] is the odd one out and deliberately so: it is the only state
+/// that outlives the process. A transfer reaches it when the link drops or the
+/// app closes mid-flight, and it comes back from the engine's checkpoint after
+/// a restart rather than from any event this session saw. Nothing will ever
+/// emit progress for one — the only ways out are Resume, Discard, or (for an
+/// inbound transfer) its sender offering it again.
+enum TransferState {
+  pending,
+  transferring,
+  paused,
+  completed,
+  failed,
+  interrupted,
+}
 
 extension TransferStateUi on TransferState {
   String get label => switch (this) {
@@ -88,6 +103,7 @@ extension TransferStateUi on TransferState {
     TransferState.paused => 'Paused',
     TransferState.completed => 'Completed',
     TransferState.failed => 'Failed',
+    TransferState.interrupted => 'Interrupted',
   };
 }
 
@@ -106,6 +122,14 @@ class Transfer {
   /// Estimated seconds remaining, or null when unknown.
   final int? etaSecs;
 
+  /// Whether this side can restart it, for a [TransferState.interrupted] row.
+  ///
+  /// Only an outgoing transfer can be: the transfer protocol is sender-driven,
+  /// so an interrupted receive continues when its sender offers it again and a
+  /// Resume button on one would do nothing. Meaningless — and false — for
+  /// every other state.
+  final bool resumable;
+
   const Transfer({
     required this.id,
     required this.peerName,
@@ -116,6 +140,7 @@ class Transfer {
     required this.doneBytes,
     this.speedBps = 0,
     this.etaSecs,
+    this.resumable = false,
   });
 
   double get progress =>
@@ -126,6 +151,7 @@ class Transfer {
     int? doneBytes,
     double? speedBps,
     int? etaSecs,
+    bool? resumable,
   }) => Transfer(
     id: id,
     peerName: peerName,
@@ -136,6 +162,7 @@ class Transfer {
     doneBytes: doneBytes ?? this.doneBytes,
     speedBps: speedBps ?? this.speedBps,
     etaSecs: etaSecs ?? this.etaSecs,
+    resumable: resumable ?? this.resumable,
   );
 }
 

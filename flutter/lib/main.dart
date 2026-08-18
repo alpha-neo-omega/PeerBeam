@@ -73,6 +73,12 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // and is swallowed, leaving cold start looking empty).
         await _state.history.refresh();
         await _state.trust.refresh();
+        // Transfers the engine's checkpoints say were interrupted — by a
+        // dropped link, or by this app being closed mid-flight. Nothing else
+        // will ever mention them: the events that would have described them
+        // belonged to a process that is gone, so without this fetch a transfer
+        // killed by a restart is simply invisible, resumable but unseen.
+        await _state.transfer.refreshInterrupted();
         // Presence is live state, so this fetch is only ever "what has already
         // arrived" — normally nothing on a cold start. Refreshing anyway picks
         // up our own sharing flag for the dashboard banner, and any peer that

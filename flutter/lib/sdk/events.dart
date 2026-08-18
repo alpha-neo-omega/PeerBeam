@@ -37,6 +37,10 @@ sealed class BridgeEvent {
       case 'transfer_completed':
       case 'transfer_cancelled':
       case 'transfer_failed':
+      // A transfer left a checkpoint behind: it is over, and it is resumable.
+      // Always follows its own terminal event, never replaces one.
+      case 'transfer_interrupted':
+      case 'transfer_discarded':
         return TransferEvent(
           kind: type,
           transferId: j['transfer_id'] as String? ?? '',
@@ -188,9 +192,19 @@ class TransferEvent extends BridgeEvent {
   /// authoritative running totals still come from [stats].
   int? get size => (payload['size'] as num?)?.toInt();
 
-  /// Local path of the completed item (on `transfer_completed`).
+  /// Local path of the completed item (on `transfer_completed`), or of the
+  /// item a checkpoint describes (on `transfer_interrupted`).
   String? get path => payload['path'] as String?;
   bool get incoming => payload['incoming'] == true;
+
+  /// Direction as the engine spells it (`transfer_interrupted`, whose row is
+  /// rebuilt from a checkpoint rather than from a `transfer_queued` this
+  /// session saw).
+  String? get direction => payload['direction'] as String?;
+
+  /// Whether an interrupted transfer can be restarted from this side. Absent
+  /// means no — a Resume that cannot work is worse than none.
+  bool get resumable => payload['resumable'] == true;
 
   ({String code, String message})? get error {
     final e = payload['error'];

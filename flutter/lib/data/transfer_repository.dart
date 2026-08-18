@@ -28,6 +28,9 @@ class TransferRepository extends ChangeNotifier {
   StreamSubscription<BridgeEvent>? _sub;
   final StreamController<String> _errors = StreamController<String>.broadcast();
 
+  /// Set in [dispose]: an in-flight fetch must not notify a dead listener.
+  bool _disposed = false;
+
   TransferRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen(_onEvent);
   }
@@ -80,6 +83,12 @@ class TransferRepository extends ChangeNotifier {
       )
       .toList(growable: false);
 
+  /// How many transfers are in flight, for the nav badge.
+  ///
+  /// An interrupted transfer is deliberately not one of them: nothing is
+  /// moving, and a badge that counted them would sit permanently lit until the
+  /// user cleaned up. `awaitingApproval` excludes them for the sharper reason
+  /// that they are not `pending` — nobody is being asked anything.
   int get activeCount => _byId.values
       .where(
         (t) =>
@@ -92,6 +101,73 @@ class TransferRepository extends ChangeNotifier {
   void pause(String id) => _api?.pause(id).catchError((_) {});
   void resume(String id) => _api?.resume(id).catchError((_) {});
   void cancel(String id) => _api?.cancel(id).catchError((_) {});
+
+  /// Restart an **interrupted** transfer from its checkpoint.
+  ///
+  /// Deliberately not [resume], which un-pauses a live one — they are two
+  /// different verbs and the engine keeps them as two different calls for
+  /// exactly this reason.
+  ///
+  /// Failure is surfaced rather than swallowed, like the approval actions and
+  /// unlike pause/resume/cancel: this one *can* legitimately refuse — the peer
+  /// may be unreachable, or the source file may have changed since the
+  /// transfer stopped, in which case resuming would append the wrong bytes to
+  /// the receiver's partial file. Silence would leave the user tapping a
+  /// button that does nothing.
+  void resumeInterrupted(String id, {PeerTarget? peer}) => _decide(
+    id,
+    'resume',
+    _api?.resumeInterrupted(id, peer: peer),
+  );
+
+  /// Forget an interrupted transfer and the partial bytes it was holding.
+  /// Without it an interrupted transfer is clutter nothing can ever clear.
+  void discardInterrupted(String id) =>
+      _decide(id, 'discard', _api?.discardInterrupted(id));
+
+  /// Load the transfers whose checkpoints outlived the runs that made them.
+  ///
+  /// Called after `initialize()`, not from the constructor: an engine call
+  /// before init just answers `not_initialised`, and swallowing that would
+  /// leave a cold start looking as though nothing had been interrupted.
+  ///
+  /// Additive — it never removes a row. A transfer that is live right now is
+  /// authoritative over any checkpoint bearing its id, so an entry already in
+  /// the map is left exactly as it is.
+  Future<void> refreshInterrupted() async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      final rows = await api.interruptedTransfers();
+      if (_disposed) return;
+      for (final r in rows) {
+        if (_byId.containsKey(r.id)) continue;
+        _byId[r.id] = _fromCheckpoint(r);
+      }
+      notifyListeners();
+    } catch (_) {
+      // A transient failure leaves the current view alone rather than
+      // blanking it: an empty list is a claim, and this one would be false.
+    }
+  }
+
+  /// A row for a transfer that only exists as a checkpoint.
+  ///
+  /// The peer shows as its **id**, because that is all a checkpoint holds: a
+  /// name is neither unique nor stable, and after a restart there is nothing
+  /// to resolve one against until discovery finds the device again.
+  Transfer _fromCheckpoint(InterruptedTransfer r) => Transfer(
+    id: r.id,
+    peerName: r.peerId,
+    fileName: r.file,
+    direction: r.sending
+        ? TransferDirection.sending
+        : TransferDirection.receiving,
+    state: TransferState.interrupted,
+    totalBytes: r.totalBytes,
+    doneBytes: r.transferredBytes,
+    resumable: r.resumable,
+  );
 
   /// The three approval actions. Unlike pause/resume/cancel these are the
   /// user's **consent**, and they only mean anything while the engine is
@@ -301,6 +377,26 @@ class TransferRepository extends ChangeNotifier {
         final friendly = friendlyErrorForCode(e.error?.code ?? 'internal');
         _errors.add('$name — $friendly');
         _byId.remove(id);
+      case 'transfer_interrupted':
+        // Always arrives *after* the terminal event that removed the row, and
+        // says the transfer left something to come back to. Rebuilt from the
+        // payload rather than from whatever the row held, because at startup
+        // there was never a row: this is the only description of it that
+        // exists.
+        _byId[id] = Transfer(
+          id: id,
+          peerName: e.peerId ?? '',
+          fileName: e.file ?? '',
+          direction: e.direction == 'receiving'
+              ? TransferDirection.receiving
+              : TransferDirection.sending,
+          state: TransferState.interrupted,
+          totalBytes: e.stats?.totalBytes ?? 0,
+          doneBytes: e.stats?.transferredBytes ?? 0,
+          resumable: e.resumable,
+        );
+      case 'transfer_discarded':
+        _byId.remove(id);
       default:
         return;
     }
@@ -337,6 +433,7 @@ class TransferRepository extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _sub?.cancel();
     _errors.close();
     _clipboards.close();
