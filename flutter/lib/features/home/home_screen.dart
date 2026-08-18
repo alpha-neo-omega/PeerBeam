@@ -72,6 +72,30 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// Share a saved device's address as a QR for another phone to scan.
+  /// Ask a saved device to make itself findable.
+  ///
+  /// The answer only says the request went out. Whether the device rings is its
+  /// own decision — taken against the presence permission it holds for this
+  /// machine — and it never reports back, so the message here says what was
+  /// asked rather than claiming anything happened.
+  Future<void> _ringSaved(BuildContext context, SavedDevice d) async {
+    final state = AppScope.of(context);
+    final sent = await state.device.ring(
+      PeerTarget(id: d.id, name: d.name, addresses: [d.host], port: d.port),
+    );
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          sent
+              ? 'Asked ${d.name} to ring. It will only do so if it allows this '
+                    'device to see its status.'
+              : 'Could not reach ${d.name}.',
+        ),
+      ),
+    );
+  }
+
   Future<void> _shareSaved(BuildContext context, SavedDevice d) {
     return showShareQrDialog(
       context,
@@ -689,6 +713,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   ),
                                   null => null,
                                 },
+                                onRing: () => _ringSaved(context, saved[i]),
                                 onShare: () => _shareSaved(context, saved[i]),
                                 onEdit: () =>
                                     _editSavedDevice(context, saved[i]),
@@ -863,12 +888,16 @@ class _SavedDeviceCard extends StatelessWidget {
   /// offered at all rather than a dead or misfiling one.
   final VoidCallback? onChat;
   final VoidCallback onShare;
+
+  /// Ask this device to make itself findable.
+  final VoidCallback onRing;
   final VoidCallback onEdit;
   final VoidCallback onRemove;
   const _SavedDeviceCard({
     required this.device,
     required this.onTap,
     required this.onChat,
+    required this.onRing,
     required this.onShare,
     required this.onEdit,
     required this.onRemove,
@@ -933,11 +962,20 @@ class _SavedDeviceCard extends StatelessWidget {
               PopupMenuButton<String>(
                 tooltip: 'Device actions',
                 onSelected: (v) => switch (v) {
+                  'ring' => onRing(),
                   'share' => onShare(),
                   'edit' => onEdit(),
                   _ => onRemove(),
                 },
                 itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'ring',
+                    child: ListTile(
+                      leading: Icon(Icons.notifications_active_outlined),
+                      title: Text('Ring'),
+                      subtitle: Text('Make it findable'),
+                    ),
+                  ),
                   PopupMenuItem(
                     value: 'share',
                     child: ListTile(

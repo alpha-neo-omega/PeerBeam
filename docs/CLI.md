@@ -259,6 +259,9 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `ring <peer> [--seconds N]` — *find my device*: ask one of your devices to
+  make itself findable. It rings only if it has granted this machine the
+  `presence` permission, and never reports back either way.
 - `notes list` — every note, newest edit first. Deleted notes are not shown.
 - `notes add [BODY] [--title T]` — write a note. With no `BODY` the text is read
   from stdin, so `pbpaste | peerbeam notes add` and `notes add < draft.md` work

@@ -11,6 +11,7 @@ import '../data/presence_repository.dart';
 import '../data/saved_devices_repository.dart';
 import '../data/transfer_repository.dart';
 import '../data/trust_repository.dart';
+import '../sdk/events.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 import 'staging.dart';
@@ -287,6 +288,45 @@ class SettingsStore extends ChangeNotifier {
   }
 }
 
+/// Whether another device is currently looking for this one.
+///
+/// Held here rather than in a screen because a ring must be noticeable wherever
+/// the user happens to be — the whole point is that they cannot find the
+/// device, so they are not looking at any particular tab.
+class RingAlert extends ChangeNotifier {
+  /// The name of the device asking, or null when nothing is ringing.
+  String? from;
+
+  Timer? _timer;
+
+  /// Start (or extend) an alert for [seconds].
+  ///
+  /// Extending rather than queueing: two rings in a row mean someone is still
+  /// looking, not that the device owes two separate alerts.
+  void ring(String from, int seconds) {
+    this.from = from;
+    _timer?.cancel();
+    _timer = Timer(Duration(seconds: seconds.clamp(1, 60)), clear);
+    notifyListeners();
+  }
+
+  /// Stop the alert — on timeout, or because the user found the device and
+  /// dismissed it.
+  void clear() {
+    _timer?.cancel();
+    _timer = null;
+    if (from == null) return;
+    from = null;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+}
+
 /// Top-level container of all state, created once and shared via [AppScope].
 class AppState {
   final ThemeController theme;
@@ -297,6 +337,9 @@ class AppState {
   final TrustRepository trust;
   final ChatRepository chat;
   final NotesRepository notes;
+
+  /// Set while another device is looking for this one.
+  final RingAlert ring;
   final PresenceRepository presence;
   final SettingsStore settings;
   final StagingStore staging;
@@ -319,6 +362,7 @@ class AppState {
     required this.trust,
     required this.chat,
     required this.notes,
+    required this.ring,
     required this.presence,
     required this.settings,
     required this.staging,
@@ -340,6 +384,13 @@ class AppState {
       notifications: true,
       compression: true,
     );
+    final ring = RingAlert();
+    // Subscribed here rather than in a screen: a ring has to be noticeable
+    // wherever the user is, and the reason the device is being rung is that
+    // they cannot find it — so they are not looking at any particular tab.
+    api.events.listen((e) {
+      if (e is DeviceRing) ring.ring(e.deviceName, e.seconds);
+    });
     return AppState(
       api: api,
       theme: ThemeController(),
@@ -353,6 +404,7 @@ class AppState {
       trust: trust,
       chat: ChatRepository(api: api),
       notes: NotesRepository(api: api),
+      ring: ring,
       presence: PresenceRepository(api: api),
       settings: settings,
       staging: StagingStore(),

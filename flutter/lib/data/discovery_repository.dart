@@ -178,4 +178,19 @@ class DiscoveryRepository extends ChangeNotifier {
 
   static Device _withLatency(Device d, int? latencyMs) =>
       d.copyWith(latencyMs: latencyMs);
+
+  /// Ask [peer] to make itself findable, returning whether the request went
+  /// out.
+  ///
+  /// Whether the device rings is its own decision and it never answers, so a
+  /// `true` here means "asked", never "rang".
+  Future<bool> ring(PeerTarget peer, {int seconds = 15}) async {
+    final api = _api;
+    if (api == null) return false;
+    try {
+      return await api.presenceRing(peer, seconds: seconds);
+    } catch (_) {
+      return false;
+    }
+  }
 }

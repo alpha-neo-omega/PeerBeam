@@ -7,6 +7,14 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Find my device.** Ring a device you trust from Home, or with
+  `peerbeam ring <peer>`. The device shows a banner naming who is looking,
+  wherever you are in the app — the reason it is being rung is that you cannot
+  find it, so it is not hiding the alert on one tab.
+
+  It rings only if it has granted your device the **Device status** permission,
+  and never tells you either way: a caller told "refused" could map which
+  devices are listening, and one told "it rang" could map which are awake.
 - **Notes, synced to the devices you choose.** Text with a title, kept encrypted
   on this device — in the app (from Home), and as `peerbeam notes
   list|add|edit|remove|sync`. They sync to any device you grant the new **Notes**

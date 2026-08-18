@@ -762,6 +762,23 @@ impl Manager {
             .may(peer, peerbeam_domain::entity::Permission::Presence)
     }
 
+    /// The display name this device has recorded for `peer`, if any.
+    ///
+    /// Sent with a ring so the alert can name who is looking. An unattributed
+    /// noise from a pocket is alarming and gives the user nothing to act on,
+    /// and by the time a ring is authorised the trust record — which carries
+    /// the name — has already been read.
+    #[must_use]
+    pub fn peer_name(&self, peer: &DeviceId) -> Option<String> {
+        use peerbeam_domain::port::TrustStore;
+        self.trust
+            .lookup(peer)
+            .ok()
+            .flatten()
+            .map(|r| r.name)
+            .filter(|n| !n.is_empty())
+    }
+
     /// The note store, for the session wiring that serves the Notes channel.
     #[must_use]
     pub fn notes_store(&self) -> peerbeam_notes::NoteStore {

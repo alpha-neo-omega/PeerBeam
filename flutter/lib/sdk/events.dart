@@ -53,6 +53,16 @@ sealed class BridgeEvent {
         return const TrustChanged();
       case 'device_resync':
         return const DeviceResync();
+      case 'device_ring':
+        final ring = _map(j['payload']);
+        final id = ring['device_id'] as String? ?? '';
+        return DeviceRing(
+          id,
+          (ring['device_name'] as String?)?.trim().isNotEmpty == true
+              ? ring['device_name'] as String
+              : id,
+          (ring['seconds'] as num?)?.toInt() ?? 15,
+        );
       case 'presence_updated':
         // Live device status from a trusted peer. Payload mirrors one entry of
         // `pb_presence_json`'s `devices` array.
@@ -100,6 +110,27 @@ sealed class BridgeEvent {
 class PresenceUpdated extends BridgeEvent {
   final SdkPresence presence;
   const PresenceUpdated(this.presence);
+}
+
+/// A trusted peer asked this device to make itself findable — *find my device*.
+///
+/// The engine has already checked that the asking device holds the presence
+/// permission, so a surface's only job is to be noticeable for [seconds]. It is
+/// deliberately not told whether we complied: reporting that back would let a
+/// caller map which devices are listening.
+class DeviceRing extends BridgeEvent {
+  /// Who asked, so the surface can say so rather than alarming someone with an
+  /// unattributed noise.
+  final String deviceId;
+
+  /// The asking device's display name, as this machine recorded it. Falls back
+  /// to the id, which is at least specific.
+  final String deviceName;
+
+  /// How long to keep signalling. Already clamped by the engine.
+  final int seconds;
+
+  const DeviceRing(this.deviceId, this.deviceName, this.seconds);
 }
 
 /// A trusted peer synced its clipboard to this device.

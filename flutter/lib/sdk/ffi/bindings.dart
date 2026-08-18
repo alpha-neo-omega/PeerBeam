@@ -80,6 +80,7 @@ class Bindings {
   final _ArgRetDart _notesEdit;
   final _ArgRetDart _notesDelete;
   final _ArgRetDart _notesSync;
+  final _ArgRetDart _presenceRing;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -166,6 +167,7 @@ class Bindings {
       _notesEdit = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_edit'),
       _notesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_delete'),
       _notesSync = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_sync'),
+      _presenceRing = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_presence_ring'),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -238,6 +240,7 @@ class Bindings {
   String notesEdit(String json) => _withArg(json, _notesEdit);
   String notesDelete(String json) => _withArg(json, _notesDelete);
   String notesSync(String json) => _withArg(json, _notesSync);
+  String presenceRing(String json) => _withArg(json, _presenceRing);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);

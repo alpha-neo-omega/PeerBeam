@@ -563,6 +563,15 @@ class FakePeerBeam implements PeerBeamApi {
     return true;
   }
 
+  /// What the engine would report for a ring request.
+  bool ringSent = true;
+
+  @override
+  Future<bool> presenceRing(PeerTarget peer, {int seconds = 15}) async {
+    calls.add('presenceRing:${peer.id}:$seconds');
+    return ringSent;
+  }
+
   /// What the engine would report. False models the default: a device that was
   /// never granted the notes permission.
   bool notesSyncSent = false;

@@ -87,16 +87,24 @@ pub fn sharing_enabled() -> bool {
 #[must_use]
 pub fn ring_sink() -> peerbeam_presence::RingSink {
     Arc::new(|peer: DeviceId, ring: peerbeam_presence::Ring| {
-        let permitted = crate::runtime::manager()
-            .ok()
-            .is_some_and(|m| m.may_ring(&peer));
-        if !permitted {
+        let Ok(mgr) = crate::runtime::manager() else {
+            return;
+        };
+        if !mgr.may_ring(&peer) {
             return;
         }
+        // The name comes from the trust record, which was just read to
+        // authorise this — so naming who is looking costs nothing extra, and an
+        // alert that cannot say who asked is one nobody can act on.
+        let name = mgr.peer_name(&peer).unwrap_or_else(|| peer.0.clone());
         crate::events::emit(&json!({
             "type": "device_ring",
             "timestamp": chrono::Utc::now().to_rfc3339(),
-            "payload": { "device_id": peer.0, "seconds": ring.seconds },
+            "payload": {
+                "device_id": peer.0,
+                "device_name": name,
+                "seconds": ring.seconds,
+            },
         }));
     })
 }

@@ -46,6 +46,22 @@ class TransferNotifications {
     );
   }
 
+  /// *Find my device*: someone asked this device to make itself noticeable.
+  ///
+  /// Names who asked. An unattributed noise from a pocket is alarming, and the
+  /// engine has already established that the asking device holds this
+  /// machine's presence permission — so there is always a name to give.
+  static NotificationContent ring({
+    required int notificationId,
+    required String deviceName,
+  }) {
+    return NotificationContent(
+      id: notificationId,
+      title: 'Ringing',
+      body: '$deviceName is looking for this device',
+    );
+  }
+
   static NotificationContent complete({
     required int notificationId,
     required String fileName,

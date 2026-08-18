@@ -110,6 +110,7 @@ Widget _settingsApp(SettingsStore settings) => AppScope(
     trust: TrustRepository(),
     chat: ChatRepository(),
     notes: NotesRepository(),
+    ring: RingAlert(),
     presence: PresenceRepository(),
     settings: settings,
     staging: StagingStore(),

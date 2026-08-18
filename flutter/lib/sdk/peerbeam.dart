@@ -321,6 +321,14 @@ abstract class PeerBeamApi {
   /// `notes` permission, may be unreachable, or may run a build without notes.
   Future<bool> notesSync(PeerTarget peer);
 
+  /// Ask [peer] to make itself findable for [seconds].
+  ///
+  /// The returned value says only that the request went out. Whether the device
+  /// rings is its own decision, taken against the presence permission it holds
+  /// for this machine, and it deliberately never answers — a caller told
+  /// "refused" could map which devices are listening.
+  Future<bool> presenceRing(PeerTarget peer, {int seconds = 15});
+
   /// Chat history with a given peer, oldest first. A pure read.
   Future<List<ChatMessage>> chatHistory(String peerId);
 
@@ -672,6 +680,16 @@ class PeerBeam implements PeerBeamApi {
   Future<bool> notesSync(PeerTarget peer) async {
     final data = _data(
       _req().notesSync(jsonEncode({'peer': peer.toJson()})),
+    );
+    return data['sent'] == true;
+  }
+
+  @override
+  Future<bool> presenceRing(PeerTarget peer, {int seconds = 15}) async {
+    final data = _data(
+      _req().presenceRing(
+        jsonEncode({'peer': peer.toJson(), 'seconds': seconds}),
+      ),
     );
     return data['sent'] == true;
   }

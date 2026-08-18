@@ -304,6 +304,32 @@ belonging to each capability's future spec:
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).
 
+### Presence — `Ring = 2` (implemented)
+
+"Make yourself findable", behind *find my device*. Carries a duration and
+nothing else: the receiving device decides **how** to be noticeable — a sound, a
+notification, a banner — and a sender dictating the method would be deciding
+about hardware it cannot see. A CLI, having neither speaker nor tray, prints who
+asked rather than pretending to have rung.
+
+The duration is **clamped on receipt, not refused**. A peer asking for an hour is
+unreasonable rather than hostile, and refusing outright leaves someone standing
+next to a silent phone; `MAX_RING_SECONDS` answers the question they meant.
+
+Carries `PRESENCE_FEAT_RING = 1 << 1`. Gated on `Permission::Presence`: a device
+already allowed to see this machine's battery and network is one the user has
+decided may locate it — ringing adds noise to that relationship, not knowledge.
+
+**A refused ring is silent, and a successful one is not acknowledged.** Telling
+an ungranted peer "you may not ring this device" confirms the device exists and
+is listening, which is precisely what a stranger probing for hardware wants to
+learn; and a sender told "it rang" could map which devices are awake. The sender
+learns only that its request went out.
+
+Deliberately independent of the presence *sharing* opt-in. That setting governs
+what this device reveals about itself; ringing reveals nothing here, so someone
+who shares no status at all can still find their own phone.
+
 ### Notes (`0x0105`)
 
 `NoteBatch = 1` (implemented) — a slice of this device's note set, offered to a

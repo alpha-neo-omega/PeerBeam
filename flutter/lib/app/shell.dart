@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../features/send/drop_zone.dart';
 import '../state/app_scope.dart';
+import '../state/stores.dart';
 import '../widgets/brand_mark.dart';
 import 'theme.dart';
 
@@ -46,7 +47,16 @@ class AppShell extends StatelessWidget {
     final index = navigationShell.currentIndex;
 
     // Desktop-only drag & drop wraps the whole content area.
-    final body = DropZone(staging: state.staging, child: navigationShell);
+    // A ring banner sits above everything: the device is being looked for, so
+    // whatever screen happens to be open is the wrong place to hide it.
+    final body = Column(
+      children: [
+        _RingBanner(alert: state.ring),
+        Expanded(
+          child: DropZone(staging: state.staging, child: navigationShell),
+        ),
+      ],
+    );
 
     // Transfer badge count reacts only to the transfer store.
     Widget badgedIcon(Widget icon) => AnimatedBuilder(
@@ -185,6 +195,60 @@ class _RailLeading extends StatelessWidget {
         horizontal: AppSpace.sm,
       ),
       child: BrandLockup(showWordmark: extended),
+    );
+  }
+}
+
+/// Shown while another device is looking for this one.
+///
+/// Deliberately loud and deliberately dismissible: the point is to be found, and
+/// the moment the user has the device in their hand the banner is noise. It
+/// clears itself when the ring expires, so a device nobody reaches stops
+/// shouting on its own.
+class _RingBanner extends StatelessWidget {
+  final RingAlert alert;
+  const _RingBanner({required this.alert});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: alert,
+      builder: (context, _) {
+        final from = alert.from;
+        if (from == null) return const SizedBox.shrink();
+        final scheme = Theme.of(context).colorScheme;
+        return Material(
+          color: scheme.primaryContainer,
+          child: SafeArea(
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpace.md,
+                vertical: AppSpace.sm,
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.notifications_active_rounded,
+                    color: scheme.onPrimaryContainer,
+                  ),
+                  const Gap(AppSpace.sm),
+                  Expanded(
+                    child: Text(
+                      '$from is looking for this device',
+                      style: TextStyle(color: scheme.onPrimaryContainer),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: alert.clear,
+                    child: const Text('Found it'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
