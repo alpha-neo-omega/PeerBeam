@@ -194,6 +194,48 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<List<TrustedDevice>> trustList() async => trusted;
 
+  /// Every `trustSetPermission` call, in order — so a test can assert what the
+  /// UI actually asked the engine for, not merely what it drew afterwards.
+  final List<({String id, String permission, bool granted})> permissionCalls =
+      [];
+
+  /// When set, `trustSetPermission` throws it. For the refused-toggle path.
+  Object? trustSetPermissionError;
+
+  @override
+  Future<bool> trustSetPermission(
+    String id,
+    String permission,
+    bool granted,
+  ) async {
+    permissionCalls.add((id: id, permission: permission, granted: granted));
+    final error = trustSetPermissionError;
+    if (error != null) throw error;
+    var changed = false;
+    trusted = [
+      for (final t in trusted)
+        if (t.id != id)
+          t
+        else ...[
+          () {
+            changed = t.permissions.contains(permission) != granted;
+            return TrustedDevice(
+              id: t.id,
+              name: t.name,
+              fingerprint: t.fingerprint,
+              trustedAt: t.trustedAt,
+              approved: t.approved,
+              permissions: {
+                ...t.permissions.where((p) => granted || p != permission),
+                if (granted) permission,
+              },
+            );
+          }(),
+        ],
+    ];
+    return changed;
+  }
+
   @override
   Future<bool> trustRemove(String id) async {
     final before = trusted.length;

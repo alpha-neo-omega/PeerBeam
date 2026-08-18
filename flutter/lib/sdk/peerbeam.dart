@@ -127,6 +127,18 @@ abstract class PeerBeamApi {
   /// Revoke a pinned device. Returns whether it was pinned.
   Future<bool> trustRemove(String id);
 
+  /// Grant or withhold one per-device permission. Returns whether the store
+  /// changed (`false` when it already read that way, which is not an error, so
+  /// re-asserting a toggle is idempotent).
+  ///
+  /// `permission` is a [PeerBeamPermission] name. Takes effect on the device's
+  /// **next** operation, not its next connection: every engine gate re-reads
+  /// the trust store per message, clip, heartbeat and accept.
+  ///
+  /// Throws `invalid_argument` for a name this engine does not know — a surface
+  /// built against a newer engine is told rather than silently ignored.
+  Future<bool> trustSetPermission(String id, String permission, bool granted);
+
   /// Replace the ordered auto-save rule list. Returns how many were stored.
   ///
   /// **The whole list at once**, because the order *is* the tie-break: the
@@ -433,6 +445,20 @@ class PeerBeam implements PeerBeamApi {
   Future<bool> trustRemove(String id) async {
     final data = _data(_req().trustRemove(jsonEncode({'id': id})));
     return data['removed'] == true;
+  }
+
+  @override
+  Future<bool> trustSetPermission(
+    String id,
+    String permission,
+    bool granted,
+  ) async {
+    final data = _data(
+      _req().trustSetPermission(
+        jsonEncode({'id': id, 'permission': permission, 'granted': granted}),
+      ),
+    );
+    return data['changed'] == true;
   }
 
   @override

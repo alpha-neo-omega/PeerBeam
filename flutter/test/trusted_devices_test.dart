@@ -20,12 +20,29 @@ TrustedDevice _device({
   required String id,
   required String name,
   required bool approved,
+  Set<String>? permissions,
 }) => TrustedDevice(
   id: id,
   name: name,
   fingerprint: 'ab12cd34ef56ab12cd34ef56ab12cd34',
   trustedAt: DateTime(2026, 8, 18),
   approved: approved,
+  // An approved device the engine has not narrowed holds everything, which is
+  // what `trust approve` grants; an unapproved one holds nothing, because the
+  // engine reports the *effective* set and permissions never create a standing.
+  permissions:
+      permissions ??
+      (approved ? PeerBeamPermission.all.toSet() : const <String>{}),
+);
+
+/// The switch inside [deviceId]'s permission block whose title is [label].
+///
+/// Scoped by the block's key rather than by the device's name: every approved
+/// device renders the same five labels, so anything looser matches the wrong row
+/// as soon as a test has two devices — which the interesting ones all do.
+Finder _switchFor(String deviceId, String label) => find.descendant(
+  of: find.byKey(Key('device-permissions-$deviceId')),
+  matching: find.widgetWithText(SwitchListTile, label),
 );
 
 /// Open Settings with the fake's trust list loaded, and scroll the Trusted
@@ -73,6 +90,19 @@ bool _iconIn(WidgetTester tester, String deviceName, IconData icon) => find
     .evaluate()
     .isNotEmpty;
 
+/// Tap a switch that may be scrolled out of the viewport.
+///
+/// The permission block sits under a device row inside a long lazy scroll view,
+/// so with more than one device a switch is routinely outside the 800x600 test
+/// surface even though it is built. Scrolling it in is part of tapping it here,
+/// not something a test should be able to forget.
+Future<void> _flip(WidgetTester tester, Finder tile) async {
+  await tester.ensureVisible(tile);
+  await tester.pumpAndSettle();
+  await tester.tap(tile);
+  await tester.pumpAndSettle();
+}
+
 void main() {
   testWidgets('a pinned-but-unapproved device is marked, not shown as trusted', (
     tester,
@@ -119,5 +149,184 @@ void main() {
       'trusted_at': '2026-08-18T00:00:00Z',
     });
     expect(d.approved, isFalse);
+  });
+
+  testWidgets('an approved device shows one switch per permission, on', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)];
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    for (final permission in PeerBeamPermission.all) {
+      final label = PeerBeamPermission.label(permission);
+      final tile = _switchFor('pb-mine', label);
+      expect(tile, findsOneWidget, reason: 'no switch for $label');
+      expect(
+        tester.widget<SwitchListTile>(tile).value,
+        isTrue,
+        reason: '$label is granted, so its switch must read on',
+      );
+      // Each switch says what it allows. A security control whose consequence
+      // is unstated is one people flip to find out.
+      expect(
+        find.text(PeerBeamPermission.description(permission)),
+        findsOneWidget,
+      );
+    }
+  });
+
+  testWidgets('a narrowed permission reads off while the others read on', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(
+          id: 'pb-mine',
+          name: 'My Laptop',
+          approved: true,
+          permissions: PeerBeamPermission.all
+              .where((p) => p != PeerBeamPermission.clipboard)
+              .toSet(),
+        ),
+      ];
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    expect(
+      tester.widget<SwitchListTile>(_switchFor('pb-mine', 'Clipboard')).value,
+      isFalse,
+      reason: 'the revoked permission must read off',
+    );
+    for (final permission in PeerBeamPermission.all.where(
+      (p) => p != PeerBeamPermission.clipboard,
+    )) {
+      expect(
+        tester
+            .widget<SwitchListTile>(
+              _switchFor('pb-mine', PeerBeamPermission.label(permission)),
+            )
+            .value,
+        isTrue,
+        reason: 'revoking clipboard must not disturb $permission',
+      );
+    }
+  });
+
+  testWidgets('toggling a switch asks the engine for that one permission', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-mine', name: 'My Laptop', approved: true),
+        _device(id: 'pb-other', name: 'Desktop', approved: true),
+      ];
+    await _open(tester, fake, scrollTo: 'Desktop');
+
+    await _flip(tester, _switchFor('pb-mine', 'Clipboard'));
+
+    expect(fake.permissionCalls, hasLength(1));
+    // The device it belongs to, the permission it names, and the direction the
+    // switch was moved — a call that got any of the three wrong would silently
+    // change the wrong thing.
+    expect(fake.permissionCalls.single.id, 'pb-mine');
+    expect(fake.permissionCalls.single.permission, 'clipboard');
+    expect(fake.permissionCalls.single.granted, isFalse);
+
+    // And the switch reflects it without waiting for a refetch.
+    expect(
+      tester.widget<SwitchListTile>(_switchFor('pb-mine', 'Clipboard')).value,
+      isFalse,
+    );
+    expect(
+      tester.widget<SwitchListTile>(_switchFor('pb-other', 'Clipboard')).value,
+      isTrue,
+      reason: 'the other device must be untouched',
+    );
+  });
+
+  testWidgets('a refused toggle snaps back to what the engine actually holds', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)]
+      ..trustSetPermissionError = Exception('unknown permission');
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    await _flip(tester, _switchFor('pb-mine', 'Pipes'));
+
+    expect(fake.permissionCalls, hasLength(1), reason: 'it was attempted');
+    expect(
+      tester.widget<SwitchListTile>(_switchFor('pb-mine', 'Pipes')).value,
+      isTrue,
+      reason: 'a switch must never be left showing something that did not happen',
+    );
+  });
+
+  testWidgets('a pinned-but-unapproved device is offered no permissions', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-stranger', name: 'Unknown Box', approved: false),
+      ];
+    await _open(tester, fake, scrollTo: 'Unknown Box');
+
+    // Permissions narrow a standing and never create one, so there is nothing
+    // to narrow here — and offering a switch that grants nothing would be a
+    // control with no effect.
+    expect(find.text('What Unknown Box may do'), findsNothing);
+    // Asserted by description rather than by `find.byType(SwitchListTile)`:
+    // this screen has plenty of unrelated switches, so the broad finder would
+    // pass or fail on whichever of them happens to be in the viewport.
+    for (final permission in PeerBeamPermission.all) {
+      expect(
+        find.text(PeerBeamPermission.description(permission)),
+        findsNothing,
+        reason: 'no $permission switch for a device that may nothing',
+      );
+    }
+  });
+
+  test('permissions decode as an explicit set, and default to empty', () {
+    final narrowed = TrustedDevice.fromJson(const {
+      'id': 'pb-a',
+      'name': 'Laptop',
+      'fingerprint': 'ff',
+      'trusted_at': '2026-08-18T00:00:00Z',
+      'approved': true,
+      'permissions': ['files', 'chat'],
+    });
+    expect(narrowed.permissions, {'files', 'chat'});
+    expect(narrowed.may(PeerBeamPermission.files), isTrue);
+    expect(narrowed.may(PeerBeamPermission.clipboard), isFalse);
+
+    // An engine that predates the field grants nothing here: a permission this
+    // app cannot see is one it must not claim is granted.
+    final old = TrustedDevice.fromJson(const {
+      'id': 'pb-old',
+      'name': 'Old Engine',
+      'fingerprint': 'ff',
+      'trusted_at': '2026-08-18T00:00:00Z',
+      'approved': true,
+    });
+    expect(old.permissions, isEmpty);
+    expect(old.may(PeerBeamPermission.files), isFalse);
+  });
+
+  test('a permission name this build has no label for is not offered', () {
+    // Forward compatibility: a newer engine may report a permission this build
+    // cannot render. It decodes and is readable, but only the names in
+    // `PeerBeamPermission.all` get a switch — a control this build cannot
+    // describe is worse than none.
+    final future = TrustedDevice.fromJson(const {
+      'id': 'pb-a',
+      'name': 'Laptop',
+      'fingerprint': 'ff',
+      'trusted_at': '2026-08-18T00:00:00Z',
+      'approved': true,
+      'permissions': ['files', 'browse'],
+    });
+    expect(future.may('browse'), isTrue, reason: 'it decodes');
+    expect(PeerBeamPermission.all, isNot(contains('browse')));
   });
 }

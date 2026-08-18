@@ -9,7 +9,8 @@ import '../../platform/saf.dart';
 import '../../platform/services.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/exceptions.dart';
-import '../../sdk/models.dart' show SaveRule, TrustedDevice;
+import '../../sdk/models.dart'
+    show PeerBeamPermission, SaveRule, TrustedDevice;
 import '../../state/app_scope.dart';
 import '../../state/stores.dart' show SettingsStore;
 import '../../widgets/common.dart';
@@ -251,6 +252,13 @@ class SettingsScreen extends StatelessWidget {
                               onPressed: () => _confirmRevoke(context, pins[i]),
                             ),
                           ),
+                          // Permissions belong to an approved device: they
+                          // narrow a standing the user granted and never create
+                          // one, so a pinned stranger has nothing to narrow and
+                          // is offered no switches (the engine reports its
+                          // effective set as empty for exactly that reason).
+                          if (pins[i].approved)
+                            _DevicePermissions(device: pins[i]),
                         ],
                       ],
                     ),
@@ -418,6 +426,72 @@ class SettingsScreen extends StatelessWidget {
 ///   shows a code, the user compares it, and a mismatch is the signal. Nothing
 ///   here blocks an attacker on its own.
 ///
+/// The per-device permission switches, under an approved device's row.
+///
+/// # Why they are here and not in a dialog
+///
+/// The distinction this section already draws — approved versus merely pinned —
+/// is *whether* the user chose a device. Permissions are *what* that choice
+/// left it, which is the same question one level finer, so they belong in the
+/// same place rather than behind a tap that has to be discovered. Approving
+/// grants all of them, so the common device shows five switches all on and
+/// costs the reader nothing; a narrowed one shows exactly which is off.
+///
+/// # Why each switch carries a sentence
+///
+/// "Clipboard" alone does not say that turning it on lets another machine
+/// receive whatever was last copied. A permission switch with no stated
+/// consequence is a switch people flip to see what happens, which is the one
+/// thing a security control must not be.
+///
+/// Revoking takes effect on that device's **next** operation, not its next
+/// connection — the engine's gates re-read the trust store per message, clip,
+/// heartbeat and accept — so the subtitle can promise "next", and does.
+class _DevicePermissions extends StatelessWidget {
+  const _DevicePermissions({required this.device});
+
+  final TrustedDevice device;
+
+  @override
+  Widget build(BuildContext context) {
+    final trust = AppScope.of(context).trust;
+    final theme = Theme.of(context);
+    return Padding(
+      // Keyed by device id so a test — and anything else reaching for one
+      // device's switches — can scope to this block. Every approved device
+      // renders the same five labels, so an unkeyed finder matches the wrong
+      // row the moment there are two devices, which is the normal case.
+      key: Key('device-permissions-${device.id}'),
+      padding: const EdgeInsets.only(
+        left: AppSpace.lg,
+        right: AppSpace.sm,
+        bottom: AppSpace.sm,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'What ${device.name.isEmpty ? device.id : device.name} may do',
+            style: theme.textTheme.labelLarge?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          for (final permission in PeerBeamPermission.all)
+            SwitchListTile.adaptive(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text(PeerBeamPermission.label(permission)),
+              subtitle: Text(PeerBeamPermission.description(permission)),
+              value: device.may(permission),
+              onChanged: (v) =>
+                  trust.setPermission(device.id, permission, granted: v),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 /// It must not overclaim. PeerBeam already pins keys on first contact and
 /// refuses a changed one; what this adds is a chance to notice that the very
 /// first key was the wrong one — the one moment TOFU cannot cover by itself.

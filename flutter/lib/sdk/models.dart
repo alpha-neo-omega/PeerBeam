@@ -389,13 +389,34 @@ class TrustedDevice {
   /// approval.
   final bool approved;
 
+  /// **What** this device may do — the engine's `permissions` array, by name.
+  ///
+  /// The engine reports the *effective* set, so an unapproved device is always
+  /// empty here however its stored record reads: permissions narrow a standing,
+  /// they never create one. Rendering is therefore a straight read — a surface
+  /// never has to re-derive "but is it approved?".
+  ///
+  /// Names, not a bitmask, so this list stays meaningful across an engine that
+  /// adds a permission: an unknown name simply appears, and
+  /// [PeerBeamPermission.all] decides what gets a toggle.
+  ///
+  /// Empty for an engine that predates the field, which is the fail-closed
+  /// reading — a permission this app cannot see is one it must not claim is
+  /// granted.
+  final Set<String> permissions;
+
   const TrustedDevice({
     required this.id,
     required this.name,
     required this.fingerprint,
     required this.trustedAt,
     this.approved = false,
+    this.permissions = const {},
   });
+
+  /// Whether this device is permitted `permission` (a [PeerBeamPermission]
+  /// name).
+  bool may(String permission) => permissions.contains(permission);
 
   factory TrustedDevice.fromJson(Map<String, dynamic> j) => TrustedDevice(
     id: j['id'] as String? ?? '',
@@ -404,7 +425,58 @@ class TrustedDevice {
     trustedAt:
         DateTime.tryParse(j['trusted_at'] as String? ?? '') ?? DateTime.now(),
     approved: j['approved'] as bool? ?? false,
+    permissions: {
+      ...?(j['permissions'] as List<dynamic>?)?.whereType<String>(),
+    },
   );
+}
+
+/// The per-device permission names the engine understands, and how to label
+/// them.
+///
+/// Mirrors `peerbeam_domain::entity::Permission`. Kept as plain strings rather
+/// than an enum so an engine that adds a permission does not fail to decode
+/// here — a name this build has no label for is simply not offered as a toggle,
+/// which is the fail-closed direction for a UI.
+abstract final class PeerBeamPermission {
+  /// Send and receive file transfers.
+  static const files = 'files';
+
+  /// Exchange chat messages.
+  static const chat = 'chat';
+
+  /// Receive this device's clipboard while clipboard sync is on.
+  static const clipboard = 'clipboard';
+
+  /// Receive this device's status heartbeat while sharing is on.
+  static const presence = 'presence';
+
+  /// Have an inbound `peerbeam pipe` accepted by a listening terminal.
+  static const pipe = 'pipe';
+
+  /// Every permission this build can render, in the engine's slot order.
+  static const all = <String>[files, chat, clipboard, presence, pipe];
+
+  /// The switch label for `permission`.
+  static String label(String permission) => switch (permission) {
+    files => 'Files',
+    chat => 'Messages',
+    clipboard => 'Clipboard',
+    presence => 'Device status',
+    pipe => 'Pipes',
+    _ => permission,
+  };
+
+  /// What granting `permission` actually allows, in the user's terms — so a
+  /// switch is never a word with no consequence attached.
+  static String description(String permission) => switch (permission) {
+    files => 'Send and receive files with this device',
+    chat => 'Exchange messages with this device',
+    clipboard => 'Send this device your clipboard when sync is on',
+    presence => 'Send this device your battery, disk and network status',
+    pipe => 'Let it pipe data into a listening terminal here',
+    _ => '',
+  };
 }
 
 /// What a chat record holds, as the engine serializes `peerbeam_chat::Kind`.

@@ -53,6 +53,52 @@ class TrustRepository extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// Grant or withhold one permission for a device.
+  ///
+  /// Optimistic: the row is updated locally and listeners notified before the
+  /// engine's `trust_changed` arrives, so a switch does not visibly lag the
+  /// tap. The refresh that event triggers is the authority — a failed call
+  /// leaves the local guess in place only until the next `refresh()`, which is
+  /// why the fallback below re-reads rather than trusting the guess.
+  Future<void> setPermission(
+    String id,
+    String permission, {
+    required bool granted,
+  }) async {
+    final api = _api;
+    if (api == null) return;
+    _applyLocally(id, permission, granted);
+    try {
+      await api.trustSetPermission(id, permission, granted);
+    } catch (_) {
+      // The engine refused (an unknown permission, an unreadable store). Put
+      // the truth back rather than leaving a switch showing something that did
+      // not happen.
+      await refresh();
+    }
+  }
+
+  void _applyLocally(String id, String permission, bool granted) {
+    _items = [
+      for (final d in _items)
+        if (d.id != id)
+          d
+        else
+          TrustedDevice(
+            id: d.id,
+            name: d.name,
+            fingerprint: d.fingerprint,
+            trustedAt: d.trustedAt,
+            approved: d.approved,
+            permissions: {
+              ...d.permissions.where((p) => granted || p != permission),
+              if (granted) permission,
+            },
+          ),
+    ];
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     _disposed = true;
