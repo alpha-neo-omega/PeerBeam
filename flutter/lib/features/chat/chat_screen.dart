@@ -13,6 +13,7 @@ import '../../state/models.dart';
 import '../../state/stores.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
+import '../../widgets/pairing.dart';
 import '../../widgets/processing.dart';
 import '../send/pick_device.dart';
 import 'chat_drop_zone.dart';
@@ -909,26 +910,64 @@ class _FileBody extends StatelessWidget {
               if (!_offersApproval(state.transfer.byId(message.id))) {
                 return const SizedBox.shrink();
               }
+              // The live transfer behind this row, if the engine has one. It
+              // carries the handshake facts the chat offer itself never had:
+              // whether this is first contact, and the pairing code to check
+              // it with. Null is ordinary here — `_offersApproval` treats it as
+              // permissive on purpose, since a `FileRef` can arrive on the chat
+              // channel before its transfer's first frame does — and a row with
+              // no entry has no first-contact record either, so it is not
+              // gated. See `acceptWithPairingCheck` for what a null means once
+              // a confirmation IS required.
+              final live = state.transfer.byId(message.id);
               return Padding(
                 padding: const EdgeInsets.only(top: AppSpace.xxs),
-                child: Wrap(
-                  spacing: AppSpace.xs,
-                  runSpacing: AppSpace.xxs,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    TextButton(
-                      onPressed: () => state.transfer.reject(message.id),
-                      child: const Text('Decline'),
-                    ),
-                    FilledButton.tonal(
-                      onPressed: () => state.transfer.accept(message.id),
-                      child: const Text('Accept'),
-                    ),
-                    Tooltip(
-                      message: 'Accept and always trust this device',
-                      child: FilledButton(
-                        onPressed: () => state.transfer.acceptTrust(message.id),
-                        child: const Text('Trust'),
-                      ),
+                    // A file offered in a conversation is approved right here,
+                    // so first contact has to be visible here too. Routing this
+                    // decision around the check — on the grounds that a chat
+                    // implies familiarity — would leave the gate guarding one
+                    // of the two ways a file gets accepted.
+                    if (live != null && live.newlyTrusted) ...[
+                      PairingCodePanel(transfer: live),
+                      const Gap(AppSpace.xxs),
+                    ],
+                    Wrap(
+                      spacing: AppSpace.xs,
+                      runSpacing: AppSpace.xxs,
+                      children: [
+                        TextButton(
+                          onPressed: () => state.transfer.reject(message.id),
+                          child: const Text('Decline'),
+                        ),
+                        FilledButton.tonal(
+                          onPressed: () => acceptWithPairingCheck(
+                            context,
+                            live,
+                            needsConfirmation: state.transfer
+                                .needsPairingConfirmation(message.id),
+                            accept: ({required confirmed}) => state.transfer
+                                .accept(message.id, confirmed: confirmed),
+                          ),
+                          child: const Text('Accept'),
+                        ),
+                        Tooltip(
+                          message: 'Accept and always trust this device',
+                          child: FilledButton(
+                            onPressed: () => acceptWithPairingCheck(
+                              context,
+                              live,
+                              needsConfirmation: state.transfer
+                                  .needsPairingConfirmation(message.id),
+                              accept: ({required confirmed}) => state.transfer
+                                  .acceptTrust(message.id, confirmed: confirmed),
+                            ),
+                            child: const Text('Trust'),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),

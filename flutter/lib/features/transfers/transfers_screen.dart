@@ -6,6 +6,7 @@ import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
+import '../../widgets/pairing.dart';
 
 /// Active transfers with animated progress and per-transfer controls. Listens
 /// to the transfer store only.
@@ -549,6 +550,14 @@ class _TransferCard extends StatelessWidget {
                   ),
                 ),
                 const Gap(AppSpace.xs),
+                // First contact: say so, and show the pairing code. Above the
+                // actions, because it is what the Accept beneath it is a
+                // decision about — a device this one has never spoken to
+                // before must not look identical to a laptop used daily.
+                if (awaitingApproval && transfer.newlyTrusted) ...[
+                  PairingCodePanel(transfer: transfer),
+                  const Gap(AppSpace.xs),
+                ],
                 // A `Wrap` (not a `Row`) so the action cluster can drop to its
                 // own line on narrow widths instead of overflowing — the
                 // awaitingApproval case has three actions (Decline/Accept/
@@ -639,16 +648,41 @@ class _TransferCard extends StatelessWidget {
                                     state.transfer.reject(transfer.id),
                                 child: const Text('Decline'),
                               ),
+                              // Accept and Trust both go through the
+                              // first-contact check. Decline does not: refusing
+                              // needs no verification, and it is the answer a
+                              // user who cannot match the codes should be able
+                              // to give without another prompt in the way.
                               FilledButton.tonal(
-                                onPressed: () =>
-                                    state.transfer.accept(transfer.id),
+                                onPressed: () => acceptWithPairingCheck(
+                                  context,
+                                  transfer,
+                                  needsConfirmation: state.transfer
+                                      .needsPairingConfirmation(transfer.id),
+                                  accept: ({required confirmed}) => state
+                                      .transfer
+                                      .accept(
+                                        transfer.id,
+                                        confirmed: confirmed,
+                                      ),
+                                ),
                                 child: const Text('Accept'),
                               ),
                               Tooltip(
                                 message: 'Accept and always trust this device',
                                 child: FilledButton(
-                                  onPressed: () =>
-                                      state.transfer.acceptTrust(transfer.id),
+                                  onPressed: () => acceptWithPairingCheck(
+                                    context,
+                                    transfer,
+                                    needsConfirmation: state.transfer
+                                        .needsPairingConfirmation(transfer.id),
+                                    accept: ({required confirmed}) => state
+                                        .transfer
+                                        .acceptTrust(
+                                          transfer.id,
+                                          confirmed: confirmed,
+                                        ),
+                                  ),
                                   child: const Text('Trust'),
                                 ),
                               ),

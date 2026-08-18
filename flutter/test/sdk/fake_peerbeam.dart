@@ -75,10 +75,34 @@ class FakePeerBeam implements PeerBeamApi {
     }
   }
 
+  /// Transfer ids the engine refuses to accept without a pairing confirmation
+  /// — its first-contact gate, as a test can stand it up. An accept for one of
+  /// these that does not carry `confirmed: true` fails exactly as the real
+  /// engine's does.
+  final Set<String> needsPairingConfirmationIds = {};
+
+  void _acceptDecision(String verb, String id, bool confirmed) {
+    // Recorded with the answer, so a test can tell an accept that carried the
+    // user's confirmation from one that merely happened after a prompt was
+    // shown. The two are the whole difference between a check and a formality.
+    calls.add(confirmed ? '$verb:$id:confirmed' : '$verb:$id');
+    if (needsPairingConfirmationIds.contains(id) && !confirmed) {
+      throw InvalidArgumentException(
+        'transfer $id is from a device seen for the first time; '
+        'confirm the pairing code matches the other device before accepting',
+      );
+    }
+    if (noPendingDecisionIds.contains(id)) {
+      throw InvalidArgumentException('no pending transfer $id');
+    }
+  }
+
   @override
-  Future<void> accept(String id) async => _decision('accept', id);
+  Future<void> accept(String id, {bool confirmed = false}) async =>
+      _acceptDecision('accept', id, confirmed);
   @override
-  Future<void> acceptTrust(String id) async => _decision('acceptTrust', id);
+  Future<void> acceptTrust(String id, {bool confirmed = false}) async =>
+      _acceptDecision('acceptTrust', id, confirmed);
   @override
   Future<void> reject(String id) async => _decision('reject', id);
 

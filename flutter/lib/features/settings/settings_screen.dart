@@ -161,6 +161,8 @@ class SettingsScreen extends StatelessWidget {
                         onChanged: state.settings.setAutoAccept,
                       ),
                       const Divider(height: 1),
+                      const _PairingConfirmationTile(),
+                      const Divider(height: 1),
                       SwitchListTile.adaptive(
                         secondary: const Icon(Icons.notifications_rounded),
                         title: const Text('Notifications'),
@@ -398,6 +400,50 @@ class SettingsScreen extends StatelessWidget {
     if (dir != null && dir.isNotEmpty) {
       settings.setSaveDirectory(dir);
     }
+  }
+}
+
+/// The first-contact verification opt-in.
+///
+/// **This copy is load-bearing and `test/pairing_test.dart` pins it.** A
+/// security toggle has to state its price as plainly as its benefit, or the
+/// user cannot make the trade:
+///
+/// * *What it costs*: one extra step, and only on a device's very first
+///   connection. Not every transfer, not every device — saying "you'll be
+///   asked to confirm a code" without "the first time a device connects" reads
+///   like permanent friction and the setting stays off for the wrong reason.
+/// * *What it buys*: detection of someone intercepting that first connection.
+///   It is worth being exact that this is *detection*, not prevention: the app
+///   shows a code, the user compares it, and a mismatch is the signal. Nothing
+///   here blocks an attacker on its own.
+///
+/// It must not overclaim. PeerBeam already pins keys on first contact and
+/// refuses a changed one; what this adds is a chance to notice that the very
+/// first key was the wrong one — the one moment TOFU cannot cover by itself.
+class _PairingConfirmationTile extends StatelessWidget {
+  const _PairingConfirmationTile();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    // Its own AnimatedBuilder for the same reason `_ClipboardSyncTile` has
+    // one: this widget is `const`, so it is canonicalised and would otherwise
+    // never rebuild when the setting changes.
+    return AnimatedBuilder(
+      animation: state.settings,
+      builder: (context, _) => SwitchListTile.adaptive(
+        secondary: const Icon(Icons.pin_rounded),
+        title: const Text('Verify new devices with a pairing code'),
+        subtitle: const Text(
+          'The first time a device connects, both screens show the same code '
+          'and you confirm they match before accepting. Catches someone '
+          'intercepting that first connection. Off by default.',
+        ),
+        value: state.settings.requirePairingConfirmation,
+        onChanged: state.settings.setRequirePairingConfirmation,
+      ),
+    );
   }
 }
 
