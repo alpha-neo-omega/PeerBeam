@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod rules;
+
+pub use rules::{Destination, Fallback, RuleError, SaveRule};
+
 /// Errors from loading or saving configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -123,6 +127,18 @@ pub struct StorageConfig {
     pub save_directory: String,
     /// Directory for application data (checkpoints, trust store).
     pub data_directory: String,
+    /// Ordered auto-save rules: **where** an accepted item lands.
+    ///
+    /// Consulted after acceptance, on the way to disk — never as part of
+    /// deciding whether to accept (see [`rules`], and I6). The **first**
+    /// matching rule wins, so the order of this list is the user's tie-break;
+    /// an empty list — the default, and what every config file written before
+    /// this field existed deserializes to — means every item goes to
+    /// [`StorageConfig::save_directory`] exactly as before.
+    ///
+    /// Absolute paths, so this applies on desktop and headless only; Android
+    /// receives through SAF and cannot write arbitrary paths.
+    pub rules: Vec<SaveRule>,
 }
 
 /// Logging configuration consumed by `peerbeam-telemetry`.
@@ -199,6 +215,9 @@ impl Default for StorageConfig {
                 .to_string_lossy()
                 .into_owned(),
             data_directory: peerbeam_platform::data_dir().to_string_lossy().into_owned(),
+            // No rules by default: the out-of-the-box behaviour is the one
+            // that shipped before rules existed.
+            rules: Vec::new(),
         }
     }
 }
@@ -356,6 +375,43 @@ mod compat_tests {
         let back: EngineConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert!(back.device.share_presence);
+    }
+
+    /// Auto-save rules are **additive**: every config file already on disk
+    /// predates them and must load as "no rules", which is the same receive
+    /// behaviour those users have today. An upgrade that started diverting
+    /// files because a key was missing would be the worst possible bug in this
+    /// feature.
+    #[test]
+    fn save_rules_default_empty_and_a_config_that_predates_them_still_loads() {
+        assert!(StorageConfig::default().rules.is_empty());
+
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"device":{"name":"old-box"},"storage":{"save_directory":"/tmp/dl","data_directory":"/tmp/data"}}"#,
+        )
+        .expect("a config written before rules existed must still parse");
+        assert_eq!(cfg.storage.save_directory, "/tmp/dl");
+        assert!(
+            cfg.storage.rules.is_empty(),
+            "a missing list means no rules, never a default rule"
+        );
+
+        // And a list that is present is honoured, round trip included.
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"storage":{"rules":[{"extension":"pdf","directory":"/srv/pdfs"}]}}"#,
+        )
+        .expect("a config with rules parses");
+        assert_eq!(cfg.storage.rules.len(), 1);
+        assert_eq!(cfg.storage.rules[0].extension.as_deref(), Some("pdf"));
+        assert_eq!(cfg.storage.rules[0].directory, "/srv/pdfs");
+        assert_eq!(
+            cfg.storage.rules[0].device, None,
+            "an omitted criterion stays omitted rather than becoming a value"
+        );
+
+        let back: EngineConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).expect("serialize")).expect("reload");
+        assert_eq!(back.storage.rules, cfg.storage.rules);
     }
 
     /// `DiscoveryConfig::port` must default to the well-known discovery port
