@@ -296,7 +296,7 @@ impl Manager {
 
         let name = file.name.clone();
         let size = file.size;
-        let device = self.peer_device(&cp.peer, req.get("peer"))?;
+        let device = self.peer_device(id, &cp.peer, req.get("peer"))?;
 
         let active = self
             .register_vacant(
@@ -482,6 +482,7 @@ impl Manager {
     /// nothing to do with.
     fn peer_device(
         &self,
+        id: &str,
         peer: &DeviceId,
         supplied: Option<&Value>,
     ) -> Result<Device, (Code, String)> {
@@ -489,7 +490,7 @@ impl Manager {
             if !v.is_null() {
                 let device = crate::transfer::device_from(Some(v))?;
                 if device.id != *peer {
-                    return Err(refuse(peer.0.as_str(), ResumeRefusal::Peer));
+                    return Err(refuse(id, ResumeRefusal::Peer));
                 }
                 return Ok(device);
             }
