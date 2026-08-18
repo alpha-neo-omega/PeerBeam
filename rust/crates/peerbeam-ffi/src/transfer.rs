@@ -3290,7 +3290,34 @@ impl Manager {
             // `Ok(Err(_))`: the sending half dropped without ever deciding.
             // `Err(_)`: ACCEPT_TIMEOUT elapsed with the prompt unanswered.
             // Neither is the user saying no.
-            Ok(Err(_)) | Err(_) => AcceptOutcome::Unanswered,
+            Ok(Err(_)) | Err(_) => {
+                // ...but while the pairing check is on, an unanswered first
+                // contact must not quietly *consume* the one chance to verify
+                // this device. The handshake pinned it; leaving that pin means
+                // the next connection is not `newly_trusted`, so no code is
+                // shown and the gate never fires again — the peer is silently
+                // accepted as known, having never been checked by anyone. That
+                // is the same trap `reject`'s comment describes, reached by
+                // nobody being at the machine rather than by a swallowed error.
+                //
+                // So the pin is given back and the device stays genuinely new.
+                // Only while the check is required: with it off nothing was
+                // going to be verified anyway, and un-pinning would be churn
+                // that changes the default behaviour for no gain.
+                if self.require_pairing_confirmation() {
+                    if let Some(peer) = self.take_first_contact(id) {
+                        if let Err(e) = self.trust.remove(&peer) {
+                            tracing::warn!(
+                                transfer = %id,
+                                error = %e,
+                                "an unanswered first contact could not be un-pinned; \
+                                 it will not be treated as new next time"
+                            );
+                        }
+                    }
+                }
+                AcceptOutcome::Unanswered
+            }
         };
         self.pending.lock().unwrap().remove(id);
         outcome
@@ -5898,13 +5925,14 @@ mod tests {
         );
     }
 
-    /// Scope, pinned deliberately: an *unanswered* prompt is not a refusal.
+    /// **With the pairing check off**, an unanswered prompt is not a refusal.
     /// `AcceptOutcome` exists precisely so this project never converts absence
-    /// into the user's decision, and un-pinning on a timeout would do exactly
-    /// that. The peer stays pinned; it is still not `approved`, so it gains
-    /// nothing (I6).
+    /// into the user's decision. The peer stays pinned by ordinary TOFU; it is
+    /// still not `approved`, so it gains nothing (I6), and nothing was going to
+    /// be verified anyway — so there is no verification opportunity to give
+    /// back. The companion test below covers the case where there is.
     #[tokio::test(start_paused = true)]
-    async fn an_unanswered_first_contact_prompt_un_pins_nothing() {
+    async fn an_unanswered_first_contact_prompt_un_pins_nothing_while_the_check_is_off() {
         let mgr = Arc::new(test_manager("Device"));
         let peer = DeviceId::from("peer-nobody-home");
         pin(&mgr.trust, &peer);
@@ -5921,6 +5949,45 @@ mod tests {
         assert!(
             !record.unwrap().approved,
             "and it grants the device nothing either"
+        );
+    }
+
+    /// **With the pairing check on**, an unanswered first contact gives the pin
+    /// back, and this is the case that matters.
+    ///
+    /// The handshake pinned the peer. If that pin survives an unanswered
+    /// prompt, the *next* connection is not `newly_trusted` — no code is shown,
+    /// the gate does not fire, and the device is treated as known having been
+    /// checked by nobody. A stranger connecting while the machine is unattended
+    /// would consume the single verification opportunity by doing nothing at
+    /// all. That is the same trap `reject`'s comment describes, reached by
+    /// absence instead of by a swallowed error.
+    ///
+    /// This is not absence being read as a decision: the transfer is still
+    /// `Unanswered` and nothing is refused to the peer. Only the pin is
+    /// released, so the device stays genuinely new until somebody looks at it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_first_contact_gives_the_pin_back_while_the_check_is_on() {
+        let mgr = Arc::new(test_manager("Device"));
+        mgr.set_require_pairing_confirmation(true);
+        let peer = DeviceId::from("peer-nobody-home");
+        pin(&mgr.trust, &peer);
+        let id = "tx-unanswered-gated-first-contact";
+        mgr.mark_first_contact(id, &peer);
+
+        let waiter = park_decision(&mgr, id, &peer);
+        wait_until(|| mgr.pending.lock().unwrap().contains_key(id)).await;
+        tokio::time::advance(ACCEPT_TIMEOUT + Duration::from_millis(1)).await;
+
+        assert_eq!(
+            waiter.await.expect("task join"),
+            AcceptOutcome::Unanswered,
+            "still not a refusal — only the pin is released"
+        );
+        assert!(
+            mgr.trust.lookup(&peer).unwrap().is_none(),
+            "the pin must be given back, so the next connection is first \
+             contact again and the code is shown"
         );
     }
 

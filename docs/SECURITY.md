@@ -410,17 +410,27 @@ again about the device they had just refused as a suspected MITM. The refusal
 itself stands regardless; the error tells the user the pin is still there and
 to remove it in Trusted Devices.
 
-**Known scope: an unanswered prompt un-pins nothing.** A prompt that times out
-(`ACCEPT_TIMEOUT`, 180 s) or whose sender drops is not the user refusing, and
-this codebase does not convert absence into a decision — see `AcceptOutcome`,
-where the same distinction stops a timeout being reported to the peer as a
-decline. The consequence is real and worth stating: a peer that connects while
-nobody is at the machine stays pinned, so the *next* connection is not first
-contact and the code is not shown again. The pin alone grants nothing (auto-
-accept requires `approved`, which only an explicit accept-and-trust sets, I6),
-but the verification opportunity is not offered a second time. Pinned devices
-are listed with their fingerprints in Trusted Devices and `peerbeam trust
-list`, which is the way back.
+**An unanswered prompt gives the pin back — while the check is on.** A prompt
+that times out (`ACCEPT_TIMEOUT`, 180 s) or whose sender drops is *not* the user
+refusing, and this codebase does not convert absence into a decision: the
+transfer stays `Unanswered`, and nothing is reported to the peer as a decline
+(see `AcceptOutcome`, where the same distinction is enforced).
+
+But the pin is a different question from the decision. Left in place, it would
+mean the *next* connection is not first contact — no code shown, no gate — so a
+stranger connecting while the machine is unattended would consume the single
+verification opportunity by doing nothing at all. That is the same trap the
+failed-un-pin case above describes, reached by absence instead of by a swallowed
+error. So while `require_pairing_confirmation` is on, an unanswered first
+contact is un-pinned and the device stays genuinely new until somebody looks at
+it.
+
+With the check **off** the pin stays, and that is not an inconsistency: nothing
+was going to be verified, so there is no opportunity to give back, and
+un-pinning would only churn ordinary TOFU state. Either way the pin alone grants
+nothing — auto-accept requires `approved`, which only an explicit
+accept-and-trust sets (I6). Pinned devices are listed with their fingerprints in
+Trusted Devices and `peerbeam trust list`.
 
 ## Bulk approval is accept-once, never trust
 
