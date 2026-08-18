@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-18 — Beta
+
 ### Added
 - **Rules-based auto-save for received items.** An ordered list of rules that
   choose **where** an accepted file is written:
