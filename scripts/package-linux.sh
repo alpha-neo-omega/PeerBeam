@@ -126,7 +126,7 @@ cp -a %{_sourcedir}/stage/. %{buildroot}/
 /opt/$APP
 /usr/bin/$APP
 /usr/share/applications/$APP.desktop
-/usr/share/icons/hicolor/*/apps/$APP.png
+$(cd "$STAGE" && find usr/share/icons -name "$APP.png" 2>/dev/null | sed 's|^|/|')
 
 %changelog
 * $(LC_ALL=C date '+%a %b %d %Y') PeerBeam Contributors <noreply@peerbeam> - $RPMVER-1
