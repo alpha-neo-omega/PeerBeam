@@ -6,8 +6,18 @@ on:
   workflow_dispatch:
 
 jobs:
+  # x86_64 and arm64 build natively — GitHub's arm64 runners are free for public
+  # repositories, and cross-compiling a Flutter Linux desktop bundle is far more
+  # trouble than a second runner. `fail-fast: false` so a problem on one
+  # architecture cannot take the other's artifacts down with it.
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    appimage_arch: x86_64,  artifact: linux }
+          - { runner: ubuntu-24.04-arm, appimage_arch: aarch64, artifact: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,13 +30,13 @@ jobs:
           # and package-linux.sh looks for `magick`/`convert`. librsvg2-bin renders
           # SVGs and satisfies neither, so icons were silently skipped every build.
           sudo apt-get install -y ninja-build libgtk-3-dev dpkg-dev rpm imagemagick librsvg2-bin
-      # appimagetool is not packaged; fetch the official binary. Run it with
-      # --appimage-extract-and-run because GitHub runners have no FUSE, which a
-      # plain AppImage needs to mount itself.
+      # appimagetool is not packaged; fetch the official binary for this
+      # architecture. Run it with --appimage-extract-and-run because GitHub
+      # runners have no FUSE, which a plain AppImage needs to mount itself.
       - name: appimagetool
         run: |
           curl -fsSL -o /tmp/appimagetool \
-            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage
           chmod +x /tmp/appimagetool
           printf '#!/bin/sh\nexec /tmp/appimagetool --appimage-extract-and-run "$@"\n' \
             | sudo tee /usr/local/bin/appimagetool >/dev/null
@@ -35,7 +45,7 @@ jobs:
       - run: flutter config --enable-linux-desktop && (cd flutter && flutter pub get)
       - run: bash scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
-        with: { name: linux, path: dist/* }
+        with: { name: ${{ matrix.artifact }}, path: dist/* }
 
   windows:
     runs-on: windows-latest
@@ -108,8 +118,17 @@ jobs:
   # Standalone CLI binaries — pure cargo, no Flutter/signing, so they build fast
   # and reliably for every desktop OS. The release waits on these (unlike the
   # signed GUI jobs) so the CLI ships on every platform.
+  # Native per architecture, same reasoning as the GUI job. Only the x64 leg
+  # emits the shell completions: they are identical whoever generates them, and
+  # two copies would collide on basename when the release uploads by basename.
   cli-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    suffix: x64,   completions: true,  artifact: cli-linux }
+          - { runner: ubuntu-24.04-arm, suffix: arm64, completions: false, artifact: cli-linux-arm64 }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -117,12 +136,14 @@ jobs:
       - name: Stage CLI + shell completions
         run: |
           mkdir -p out
-          cp rust/target/release/peerbeam out/peerbeam-linux-x64
-          rust/target/release/peerbeam completions bash > out/peerbeam.bash
-          rust/target/release/peerbeam completions zsh  > out/_peerbeam
-          rust/target/release/peerbeam completions fish > out/peerbeam.fish
+          cp rust/target/release/peerbeam out/peerbeam-linux-${{ matrix.suffix }}
+          if [ "${{ matrix.completions }}" = "true" ]; then
+            rust/target/release/peerbeam completions bash > out/peerbeam.bash
+            rust/target/release/peerbeam completions zsh  > out/_peerbeam
+            rust/target/release/peerbeam completions fish > out/peerbeam.fish
+          fi
       - uses: actions/upload-artifact@v4
-        with: { name: cli-linux, path: out/* }
+        with: { name: ${{ matrix.artifact }}, path: out/* }
 
   cli-macos:
     runs-on: macos-latest
@@ -154,6 +175,7 @@ jobs:
   # GITHUB_TOKEN.
   release:
     needs: [linux, windows, android, cli-linux, cli-macos, cli-windows]
+    # `linux` and `cli-linux` are matrices; needing them waits for every leg.
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -183,8 +205,9 @@ jobs:
           # Top-level files only: artifact dirs also carry build-debris
           # subtrees (e.g. the deb staging tree), whose contents collide on
           # basename (gh names assets by basename -> 422 duplicate).
-          mapfile -t files < <(find artifacts/linux artifacts/android \
-            artifacts/cli-linux artifacts/cli-macos artifacts/cli-windows \
+          mapfile -t files < <(find artifacts/linux artifacts/linux-arm64 \
+            artifacts/android artifacts/cli-linux artifacts/cli-linux-arm64 \
+            artifacts/cli-macos artifacts/cli-windows \
             -maxdepth 1 -type f 2>/dev/null)
           # Windows GUI ships as the portable zip only (MSIX awaits signing).
           # The windows artifact preserves subdirs (multi-path upload), so

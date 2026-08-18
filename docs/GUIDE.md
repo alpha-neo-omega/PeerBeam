@@ -20,14 +20,14 @@ Everything is attached to the release:
 
 | You want | File |
 |---|---|
-| Linux app (Debian/Ubuntu family) | `peerbeam-<ver>-amd64.deb` |
-| Linux app (Fedora/RHEL/openSUSE) | `peerbeam-<ver>-x86_64.rpm` |
-| Linux app (any distribution) | `PeerBeam-<ver>-x86_64.AppImage` |
-| Linux app (portable tarball) | `peerbeam-<ver>-linux-x64.tar.gz` |
+| Linux app (Debian/Ubuntu family) | `peerbeam-<ver>-amd64.deb` · `-arm64.deb` |
+| Linux app (Fedora/RHEL/openSUSE) | `peerbeam-<ver>-x86_64.rpm` · `-aarch64.rpm` |
+| Linux app (any distribution) | `peerbeam-<ver>-x86_64.AppImage` · `-aarch64.AppImage` |
+| Linux app (portable tarball) | `peerbeam-<ver>-linux-x64.tar.gz` · `-linux-arm64.tar.gz` |
+| CLI, Linux | `peerbeam-linux-x64` · `peerbeam-linux-arm64` |
 | Windows app | `peerbeam-<ver>-windows-x64-portable.zip` |
 | macOS app | `PeerBeam-<ver>.dmg` |
 | Android app | `peerbeam-<ver>-android.apk` |
-| CLI, Linux | `peerbeam-linux-x64` |
 | CLI, macOS | `peerbeam-macos-arm64` |
 | CLI, Windows | `peerbeam-windows-x64.exe` |
 | Shell completions | `peerbeam.bash` · `peerbeam.fish` · `_peerbeam` |
@@ -43,6 +43,12 @@ one machine is normal and they share the same identity, trust store and history.
 
 Pick the row for your distribution. All of them install the same build; only the
 packaging differs.
+
+**Both x86_64 and arm64 are published.** Check with `uname -m`: `x86_64` wants
+the `x86_64`/`amd64`/`x64` files, `aarch64` wants `aarch64`/`arm64`. That covers
+a Raspberry Pi 4/5 on 64-bit Raspberry Pi OS, Ampere and Graviton servers, and
+Asahi Linux on Apple silicon. 32-bit ARM (`armv7l`, older Pis on a 32-bit OS) is
+**not** published — build from source if you need it.
 
 | Distribution | Package | Command |
 |---|---|---|
@@ -150,7 +156,7 @@ on your `PATH`.
 
 **Linux**
 ```bash
-install -Dm755 peerbeam-linux-x64 ~/.local/bin/peerbeam
+install -Dm755 peerbeam-linux-x64 ~/.local/bin/peerbeam     # or -arm64 on aarch64
 peerbeam --version
 ```
 

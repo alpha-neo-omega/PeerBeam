@@ -25,7 +25,16 @@ mkdir -p "$DIST"
 echo "== build engine + flutter (release) =="
 bash scripts/build-ffi.sh release
 ( cd flutter && flutter build linux --release )
-BUNDLE="flutter/build/linux/x64/release/bundle"
+# Four ecosystems, four spellings of the same architecture. Derived once from
+# the host rather than hardcoded, so this script packages an arm64 build without
+# renaming anything: Flutter says x64/arm64, dpkg says amd64/arm64, rpm and
+# AppImage say x86_64/aarch64, and our own filenames follow Flutter.
+case "$(uname -m)" in
+  x86_64|amd64)  FARCH=x64;   DARCH=amd64; RARCH=x86_64  ;;
+  aarch64|arm64) FARCH=arm64; DARCH=arm64; RARCH=aarch64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+BUNDLE="flutter/build/linux/$FARCH/release/bundle"
 [ -d "$BUNDLE" ] || { echo "flutter bundle missing: $BUNDLE"; exit 1; }
 
 # Render hicolor icon sizes from the brand master (packaging/icon-1024.png).
@@ -60,7 +69,7 @@ for s in 32 64 128 256 512; do
 done
 
 # ---- tar.gz (always) ----
-TGZ="$DIST/${APP}-${VER}-linux-x64.tar.gz"
+TGZ="$DIST/${APP}-${VER}-linux-${FARCH}.tar.gz"
 tar -C "$STAGE" -czf "$TGZ" .
 echo "OK  $TGZ"
 
@@ -73,11 +82,11 @@ Package: $APP
 Version: $VER
 Section: net
 Priority: optional
-Architecture: amd64
+Architecture: $DARCH
 Maintainer: PeerBeam Contributors <noreply@peerbeam>
 Description: Secure, zero-config file & clipboard sharing
 CTRL
-  dpkg-deb --build --root-owner-group "$DEB" "$DIST/${APP}-${VER}-amd64.deb"
+  dpkg-deb --build --root-owner-group "$DEB" "$DIST/${APP}-${VER}-${DARCH}.deb"
   echo "OK  $DIST/${APP}-${VER}-amd64.deb"
 else
   echo "skip .deb (dpkg-deb absent)"
@@ -106,7 +115,7 @@ Release:        1%{?dist}
 Summary:        Secure, zero-config file & clipboard sharing
 License:        AGPL-3.0-or-later
 URL:            https://github.com/alpha-neo-omega/PeerBeam
-BuildArch:      x86_64
+BuildArch:      $RARCH
 # The GUI links GTK3 at runtime; everything else is static in the bundle.
 Requires:       gtk3
 # The payload is a prebuilt Flutter bundle: already stripped, and its .so files
@@ -140,9 +149,9 @@ SPEC
     --define "_buildrootdir $(cd "$RPMTOP" && pwd)/BUILDROOT" >/dev/null
   RPMOUT=$(find "$RPMTOP/RPMS" -name '*.rpm' -type f | head -1)
   if [ -n "$RPMOUT" ]; then
-    mv "$RPMOUT" "$DIST/${APP}-${VER}-x86_64.rpm"
+    mv "$RPMOUT" "$DIST/${APP}-${VER}-${RARCH}.rpm"
     rm -rf "$RPMTOP"
-    echo "OK  $DIST/${APP}-${VER}-x86_64.rpm"
+    echo "OK  $DIST/${APP}-${VER}-${RARCH}.rpm"
   else
     echo "FAIL .rpm: rpmbuild produced nothing" >&2
     exit 1
@@ -159,9 +168,9 @@ if command -v appimagetool >/dev/null; then
   [ -f "$ICONS/256.png" ] && cp "$ICONS/256.png" "$APPDIR/$APP.png"
   ln -sf "$APP" "$APPDIR/AppRun"
   # appimagetool cannot always infer the architecture from the payload; state it.
-  ARCH=x86_64 appimagetool "$APPDIR" "$DIST/${APP}-${VER}-x86_64.AppImage"
+  ARCH=$RARCH appimagetool "$APPDIR" "$DIST/${APP}-${VER}-${RARCH}.AppImage"
   rm -rf "$APPDIR"
-  echo "OK  $DIST/${APP}-${VER}-x86_64.AppImage"
+  echo "OK  $DIST/${APP}-${VER}-${RARCH}.AppImage"
 else
   echo "skip AppImage (appimagetool absent)"
 fi
