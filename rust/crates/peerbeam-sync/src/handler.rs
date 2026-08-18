@@ -120,19 +120,37 @@ impl MessageHandler for SyncHandler {
     }
 }
 
+/// Build a manifest with no version information — the shape a device serving a
+/// read-only share sends, since it keeps no index of what it changed.
+#[must_use]
+pub fn build(shares: &Shares, path: &str) -> Manifest {
+    build_with(shares, path, None)
+}
+
+/// Build the manifest for one share-relative path, with version vectors from
+/// `index` when one is supplied.
+///
+/// Without an index the entries carry empty vectors, which relate as `Behind`
+/// to anything — the safe reading for a device that cannot say what it changed,
+/// since its files are taken rather than treated as conflicts.
+///
 /// Build the manifest for one share-relative path.
 ///
 /// Recursive, unlike browsing's single-level listing: a mirror needs the whole
 /// subtree, and asking per directory would cost a round trip per folder.
 /// Bounded at [`MAX_FILES`], and says when it was.
 #[must_use]
-pub fn build(shares: &Shares, path: &str) -> Manifest {
+pub fn build_with(
+    shares: &Shares,
+    path: &str,
+    versions: Option<&std::collections::BTreeMap<String, crate::version::VersionVector>>,
+) -> Manifest {
     let Ok(root) = shares.resolve(path) else {
         return Manifest::denied(path);
     };
     let mut files = Vec::new();
     let mut truncated = false;
-    walk(&root, &root, &mut files, &mut truncated);
+    walk(&root, &root, &mut files, &mut truncated, versions);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Manifest {
         path: path.to_string(),
@@ -142,7 +160,13 @@ pub fn build(shares: &Shares, path: &str) -> Manifest {
     }
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, truncated: &mut bool) {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<FileEntry>,
+    truncated: &mut bool,
+    versions: Option<&std::collections::BTreeMap<String, crate::version::VersionVector>>,
+) {
     if *truncated {
         return;
     }
@@ -166,19 +190,26 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<FileEntry>, truncated: &mut bool)
             continue;
         }
         if meta.is_dir() {
-            walk(root, &path, out, truncated);
+            walk(root, &path, out, truncated, versions);
         } else if meta.is_file() {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
+            let rel_path = rel.to_string_lossy().into_owned();
+            let version = versions
+                .and_then(|v| v.get(&rel_path))
+                .cloned()
+                .unwrap_or_default();
             out.push(FileEntry {
-                path: rel.to_string_lossy().into_owned(),
+                path: rel_path,
                 size: meta.len(),
                 modified: meta
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs() as i64),
+                version,
+                deleted: false,
             });
         }
     }

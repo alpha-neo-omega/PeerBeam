@@ -310,21 +310,22 @@ mod tests {
         assert_eq!(s.charging, Some(true));
         assert_eq!(s.network.as_deref(), Some("lan"), "route still classified");
 
-        // What this host reports with nothing pushed — the answer an absurd
-        // reading must fall back to. Captured rather than assumed: asserting
-        // "not 100" would be testing the machine, and fails outright on a
-        // laptop sitting at a full charge.
-        set_battery(None, None);
-        let native = collect_status(&path, Some(RouteKind::Lan)).battery_percent;
-
         // Absurd: ignored rather than clamped, and it must never leave a status
         // this build's own encoder would refuse.
+        //
+        // **Nothing here compares against a second live reading of the host's
+        // battery.** An earlier version captured `native` and asserted the
+        // absurd push produced the same value — which is true only if the
+        // machine's charge does not change between the two samples. On a laptop
+        // that is discharging it does, and the test failed for a reason that
+        // had nothing to do with the code. The comment below already said so;
+        // the assertion it described had not actually been removed.
         set_battery(Some(250), Some(true));
         let s = collect_status(&path, Some(RouteKind::Lan));
-        assert_ne!(s.battery_percent, Some(250));
-        assert_eq!(
-            s.battery_percent, native,
-            "an absurd push is dropped, leaving the native collector's answer"
+        assert_ne!(s.battery_percent, Some(250), "an absurd push was accepted");
+        assert!(
+            s.battery_percent.is_none_or(|p| p <= 100),
+            "a dropped push left an impossible reading behind"
         );
         // That it is *ignored rather than clamped* is pinned where the decision
         // lives, against a fixed baseline:

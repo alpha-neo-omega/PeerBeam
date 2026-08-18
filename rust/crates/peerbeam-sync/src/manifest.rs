@@ -53,6 +53,18 @@ pub struct FileEntry {
     pub size: u64,
     /// Unix seconds. `0` when the peer could not read one.
     pub modified: i64,
+    /// Per-device edit counters — what makes bidirectional sync possible.
+    ///
+    /// `default` so a manifest from a build that predates version vectors
+    /// still decodes. Such an entry has an **empty** vector, which relates as
+    /// `Behind` to anything at all: an older peer's files are taken rather than
+    /// treated as conflicts, which is the safe reading when it cannot tell us
+    /// what it changed.
+    #[serde(default)]
+    pub version: crate::version::VersionVector,
+    /// Whether this records a deletion rather than a file.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// What the peer has.
@@ -189,6 +201,8 @@ mod tests {
             path: path.to_string(),
             size,
             modified,
+            version: crate::version::VersionVector::new(),
+            deleted: false,
         }
     }
 
@@ -263,6 +277,34 @@ mod tests {
         assert!(
             Path::new(&dir.path().join("mine.txt")).exists(),
             "planning deleted a local file"
+        );
+    }
+
+    /// **A manifest from a build that predates version vectors still decodes**,
+    /// and its files carry an empty vector. That relates as `Behind` to
+    /// anything, so an older peer's files are *taken* rather than treated as
+    /// conflicts — the safe reading when a device cannot say what it changed.
+    /// The alternative, refusing to parse, would make one old peer break sync
+    /// for everyone.
+    #[test]
+    fn a_manifest_without_versions_decodes_and_reads_as_behind() {
+        let legacy = serde_json::json!({
+            "path": "share",
+            "files": [{ "path": "a.txt", "size": 10, "modified": 5 }],
+            "truncated": false,
+            "denied": false,
+        });
+        let m: Manifest = serde_json::from_value(legacy).expect("legacy manifests must load");
+        assert_eq!(m.files.len(), 1);
+        assert!(m.files[0].version.is_empty());
+        assert!(!m.files[0].deleted);
+
+        let mut mine = crate::version::VersionVector::new();
+        mine.bump("pb-me");
+        assert_eq!(
+            m.files[0].version.relate(&mine),
+            crate::version::Relation::Behind,
+            "an older peer's file must be safe to take, never a conflict"
         );
     }
 
