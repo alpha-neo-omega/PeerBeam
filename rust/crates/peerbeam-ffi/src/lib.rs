@@ -557,6 +557,47 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// Every live note, newest edit first: `{}` → `{notes: [...]}`.
+///
+/// Deleted notes are not returned: a tombstone exists so a deletion can reach a
+/// peer, not to be read back as a note.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_notes_list(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.notes_list(&read_json(json)?))()))
+}
+
+/// Create a note: `{title?, body}` → `{id}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_notes_create(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.notes_create(&read_json(json)?))()))
+}
+
+/// Replace a note's content: `{id, title?, body}` → `{updated}`.
+///
+/// `updated: false` means no such note, or one that has been deleted.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_notes_edit(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.notes_edit(&read_json(json)?))()))
+}
+
+/// Delete a note, leaving a tombstone: `{id}` → `{deleted}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_notes_delete(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.notes_delete(&read_json(json)?))()))
+}
+
 /// Tell a peer we have read its messages up to `read_through`:
 /// `{peer, read_through}` → `{sent}`.
 ///

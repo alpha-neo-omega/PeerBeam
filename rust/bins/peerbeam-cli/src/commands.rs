@@ -47,6 +47,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
+        Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -1274,6 +1275,22 @@ pub(crate) fn chat_store(
         peerbeam_appstore_fs::FsAppStore::open(root, key, enc.clone()),
     );
     peerbeam_chat::ChatStore::new(store)
+}
+
+/// Build the CLI's note store, over the same encrypted AppStore chat uses —
+/// notes live in their own namespace inside it, so one machine has one store
+/// rather than two that could disagree about the key.
+pub(crate) fn note_store(
+    config: &EngineConfig,
+    enc: &Arc<AeadCrypto>,
+    ident: &Identity,
+) -> peerbeam_notes::NoteStore {
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let store: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, enc.clone()),
+    );
+    peerbeam_notes::NoteStore::new(store)
 }
 
 /// Build the CLI's staging store: the outbox's own copy of every file waiting

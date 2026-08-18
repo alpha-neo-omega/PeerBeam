@@ -396,6 +396,9 @@ pub fn init(config_json: &str) -> OpResult {
     let appstore: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
         peerbeam_appstore_fs::FsAppStore::open(appstore_root, chat_key, enc.clone()),
     );
+    // Notes share the same encrypted AppStore under their own namespace — the
+    // "future capabilities share the same store" note above, cashed in.
+    let notes = peerbeam_notes::NoteStore::new(appstore.clone());
     let chat = peerbeam_chat::ChatStore::new(appstore);
     reconcile_chat(&chat);
 
@@ -445,6 +448,7 @@ pub fn init(config_json: &str) -> OpResult {
         enc,
         trust,
         chat,
+        notes,
         staging,
         staging_limits,
         identity,

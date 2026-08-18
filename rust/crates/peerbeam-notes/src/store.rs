@@ -344,4 +344,33 @@ mod tests {
             Err(NoteError::TitleTooLarge { .. })
         ));
     }
+
+    #[test]
+    fn a_tombstone_is_visible_to_a_second_store_over_the_same_directory() {
+        // The CLI opens a fresh store per command, so a deletion written by one
+        // instance must be seen by the next. If it were not, `notes edit` would
+        // happily resurrect a note the previous command deleted.
+        let (ns, dir) = new_store();
+        let n = Note::new("t", "b").unwrap();
+        ns.put(&n).unwrap();
+        assert!(ns.delete(&n.id).unwrap());
+
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
+        let key = derive_subkey(&[7u8; 32], b"peerbeam-appstore-v1");
+        let app: Arc<dyn AppStore> = Arc::new(peerbeam_appstore_fs::FsAppStore::open(
+            dir.path().join("appstore"),
+            key,
+            enc,
+        ));
+        let second = NoteStore::new(app);
+        assert!(
+            second
+                .get(&n.id)
+                .unwrap()
+                .expect("the row is there")
+                .deleted,
+            "a second store did not see the tombstone"
+        );
+        assert!(!second.edit(&n.id, "t", "back").unwrap());
+    }
 }

@@ -67,6 +67,8 @@ pub enum Command {
     Trust(TrustArgs),
     /// List, add or remove the rules that choose where received files land.
     Rules(RulesArgs),
+    /// Write and read notes kept on this device.
+    Notes(NotesArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -431,6 +433,49 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// Notes kept on this device.
+///
+/// Text with a title and a last-edited time, nothing more. Deleting leaves a
+/// tombstone rather than removing the row, so a deletion can reach the devices
+/// you have granted the `notes` permission once sync lands — a row that simply
+/// vanished would be indistinguishable from one they had not seen yet.
+#[derive(Args)]
+pub struct NotesArgs {
+    #[command(subcommand)]
+    pub action: NotesAction,
+}
+
+#[derive(Subcommand)]
+pub enum NotesAction {
+    /// List every note, newest edit first. Deleted notes are not shown.
+    List,
+    /// Write a new note. The body is read from the argument, or from stdin
+    /// when it is omitted — so `pbpaste | peerbeam notes add` works.
+    Add {
+        /// The note's text. Omit to read it from stdin.
+        body: Option<String>,
+        /// An optional heading.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Replace a note's text. Refuses a deleted note rather than resurrecting
+    /// one.
+    Edit {
+        /// The note's id, as shown by `notes list --json`.
+        id: String,
+        /// The replacement text. Omit to read it from stdin.
+        body: Option<String>,
+        /// A replacement heading. Omitted clears it.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Delete a note, leaving a tombstone so the deletion can propagate.
+    Remove {
+        /// The note's id, as shown by `notes list --json`.
+        id: String,
+    },
+}
+
 #[derive(Args)]
 pub struct RulesArgs {
     #[command(subcommand)]

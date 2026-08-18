@@ -502,6 +502,8 @@ pub struct Manager {
     /// accept path registers a `ChatHandler` against a clone of this store, so
     /// every accepted session persists into the same on-disk conversation log.
     chat: ChatStore,
+    /// Notes, in the same encrypted AppStore under their own namespace.
+    notes: peerbeam_notes::NoteStore,
     /// The outbox's own copy of every file waiting to be sent. `Arc` because
     /// `StagingStore` is deliberately not `Clone` (it owns a directory), and
     /// the background send tasks need it alongside `chat`.
@@ -599,6 +601,7 @@ impl Manager {
         enc: Arc<AeadCrypto>,
         trust: Arc<FsTrust>,
         chat: ChatStore,
+        notes: peerbeam_notes::NoteStore,
         staging: Arc<StagingStore>,
         staging_limits: StagingLimits,
         identity: Identity,
@@ -623,6 +626,7 @@ impl Manager {
             enc,
             trust,
             chat,
+            notes,
             staging,
             staging_limits,
             chat_file_in_flight: Mutex::new(HashSet::new()),
@@ -3059,6 +3063,71 @@ impl Manager {
     /// conversation it was read from, so tapping it opens the right thread.
     ///
     /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    /// Every live note, newest edit first: `{}` → `{notes: [...]}`.
+    ///
+    /// Tombstones are not included. They exist so a deletion can reach a peer,
+    /// not to be read back as notes.
+    pub fn notes_list(&self, _req: &Value) -> Op {
+        let notes = self
+            .notes
+            .list()
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        Ok(json!({ "notes": notes }))
+    }
+
+    /// Create a note: `{title?, body}` → `{id}`.
+    pub fn notes_create(&self, req: &Value) -> Op {
+        let title = req.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let body = req
+            .get("body")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "body required".into()))?;
+        let note = peerbeam_notes::Note::new(title, body)
+            .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        self.notes
+            .put(&note)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        Ok(json!({ "id": note.id }))
+    }
+
+    /// Replace a note's content: `{id, title?, body}` → `{updated}`.
+    ///
+    /// `updated: false` means there is no such note, or it has been deleted —
+    /// editing a tombstone would resurrect it without anyone asking.
+    pub fn notes_edit(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let title = req.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let body = req
+            .get("body")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "body required".into()))?;
+        let updated = self
+            .notes
+            .edit(id, title, body)
+            .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        Ok(json!({ "updated": updated }))
+    }
+
+    /// Delete a note: `{id}` → `{deleted}`.
+    ///
+    /// Leaves a tombstone so the deletion can reach a peer. `deleted: false`
+    /// means there was nothing to delete, or it was already deleted — a repeat
+    /// must not re-stamp the tombstone and win a conflict it should have lost.
+    pub fn notes_delete(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let deleted = self
+            .notes
+            .delete(id)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        Ok(json!({ "deleted": deleted }))
+    }
+
     /// Tell a peer we have read its messages: `{peer, read_through}` →
     /// `{sent}`.
     ///
@@ -4900,6 +4969,7 @@ mod tests {
             enc,
             trust,
             chat.clone(),
+            peerbeam_notes::NoteStore::new(appstore.clone()),
             staging,
             StagingLimits {
                 max_bytes: u64::MAX,
@@ -7857,6 +7927,85 @@ mod tests {
         let (code, _) = mgr
             .chat_cancel(&json!({ "message_id": "1785559080834abcdef0123456789" }))
             .expect_err("peer_id is required");
+        assert!(matches!(code, Code::InvalidArgument));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn notes_round_trip_through_create_edit_list_and_delete() {
+        let (mgr, _chat, _dir) = test_manager_full("noter", 0);
+
+        let id = mgr
+            .notes_create(&json!({ "title": "Shopping", "body": "milk" }))
+            .expect("create")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let listed = mgr.notes_list(&json!({})).expect("list");
+        assert_eq!(listed["notes"].as_array().expect("array").len(), 1);
+        assert_eq!(listed["notes"][0]["body"], "milk");
+
+        assert_eq!(
+            mgr.notes_edit(&json!({ "id": id, "title": "Shopping", "body": "milk, bread" }))
+                .expect("edit")["updated"],
+            true
+        );
+        assert_eq!(
+            mgr.notes_list(&json!({})).expect("list")["notes"][0]["body"],
+            "milk, bread"
+        );
+
+        assert_eq!(
+            mgr.notes_delete(&json!({ "id": id })).expect("delete")["deleted"],
+            true
+        );
+        assert!(
+            mgr.notes_list(&json!({})).expect("list")["notes"]
+                .as_array()
+                .expect("array")
+                .is_empty(),
+            "a deleted note is still listed"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_deleted_note_cannot_be_edited_or_deleted_again() {
+        // Both would resurrect or re-stamp a tombstone, and a re-stamped
+        // tombstone wins conflicts it should lose.
+        let (mgr, _chat, _dir) = test_manager_full("noter2", 0);
+        let id = mgr
+            .notes_create(&json!({ "body": "temporary" }))
+            .expect("create")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        mgr.notes_delete(&json!({ "id": id })).expect("delete");
+
+        assert_eq!(
+            mgr.notes_edit(&json!({ "id": id, "body": "back" }))
+                .expect("edit")["updated"],
+            false
+        );
+        assert_eq!(
+            mgr.notes_delete(&json!({ "id": id })).expect("delete")["deleted"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn notes_refuse_what_the_store_refuses() {
+        let (mgr, _chat, _dir) = test_manager_full("noter3", 0);
+        let (code, _) = mgr
+            .notes_create(&json!({ "body": "x".repeat(peerbeam_notes::MAX_BODY + 1) }))
+            .expect_err("an oversized body is refused");
+        assert!(matches!(code, Code::InvalidArgument));
+
+        let (code, _) = mgr
+            .notes_create(&json!({ "title": "t" }))
+            .expect_err("a note with no body is refused");
         assert!(matches!(code, Code::InvalidArgument));
     }
 

@@ -32,6 +32,7 @@ peerbeam-storage-fs = { path = "../../crates/peerbeam-storage-fs" }
 peerbeam-reliability-fs = { path = "../../crates/peerbeam-reliability-fs" }
 peerbeam-appstore-fs = { path = "../../crates/peerbeam-appstore-fs" }
 peerbeam-chat = { path = "../../crates/peerbeam-chat" }
+peerbeam-notes = { path = "../../crates/peerbeam-notes" }
 peerbeam-clipboard = { path = "../../crates/peerbeam-clipboard" }
 peerbeam-presence = { path = "../../crates/peerbeam-presence" }
 # `io-std` on top of the workspace feature set: `peerbeam pipe` is the only

@@ -483,12 +483,22 @@ mod tests {
         let store = store_with(&path, PRE_UPGRADE_TRUST_JSON);
 
         let laptop = DeviceId::from("pb-laptop00001");
-        for p in Permission::ALL {
+        for p in Permission::ALL
+            .into_iter()
+            .filter(|p| PermissionSet::granted_on_approval().grants(*p))
+        {
             assert!(
                 store.may(&laptop, p),
                 "an approved pre-upgrade device must keep {p} across the upgrade"
             );
         }
+        // ...and gains nothing assigned after the freeze. `Notes` is slot 5,
+        // the first such permission, so this is the real case rather than the
+        // hypothetical one the loop below covers.
+        assert!(
+            !store.may(&laptop, Permission::Notes),
+            "a device nobody reviewed was handed a permission added later"
+        );
 
         let permissions = store.lookup(&laptop).unwrap().unwrap().permissions;
         for slot in 5..32u8 {
@@ -541,7 +551,11 @@ mod tests {
             PermissionSet::granted_on_approval()
         );
         for p in Permission::ALL {
-            assert!(store.may(&id, p));
+            assert_eq!(
+                store.may(&id, p),
+                PermissionSet::granted_on_approval().grants(p),
+                "{p}: approval granted something other than the frozen set"
+            );
         }
     }
 
@@ -588,7 +602,15 @@ mod tests {
             .into_iter()
             .filter(|p| *p != Permission::Clipboard)
         {
-            assert!(store.may(&id, p), "and only {p:?} 's neighbour changed");
+            // Against what approval actually granted, not against every
+            // permission this build knows: one assigned after the freeze is
+            // absent for its own reason, and blaming the revocation for it
+            // would make this test fail every time a permission is added.
+            assert_eq!(
+                store.may(&id, p),
+                PermissionSet::granted_on_approval().grants(p),
+                "revoking clipboard disturbed {p}"
+            );
         }
 
         // And it survives a reopen, so the decision is durable rather than a
