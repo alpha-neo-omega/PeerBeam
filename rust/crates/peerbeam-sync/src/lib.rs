@@ -1,10 +1,10 @@
 //! Folder reconciliation: what a peer has, and what this device needs.
 //!
-//! **A one-way pull mirror, not bidirectional continuous sync.** Two devices
-//! editing the same file while apart is a conflict problem with no good
-//! automatic answer, and pretending otherwise is how sync tools lose work. This
-//! fetches what a peer has and never deletes, never overwrites newer local
-//! work, and never pushes.
+//! **Bidirectional, with conflicts kept rather than resolved.** Per-file version
+//! vectors distinguish "their copy is newer" from "we both changed it" — the
+//! question a modification time cannot answer, and the one that decides whether
+//! an edit survives. When both sides changed, both copies are kept: no
+//! automatic rule picks correctly, and every one of them loses somebody's work.
 //!
 //! Bytes travel over the Transfer channel, exactly as `MESSAGE_REGISTRY.md`
 //! always said: a second bulk path would mean a second set of resume, checksum

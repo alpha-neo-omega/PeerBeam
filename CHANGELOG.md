@@ -12,11 +12,17 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   **Browse** permission, and it can list what is there — in the app from a
   device's menu, or with `peerbeam browse <peer> [path]`.
 
-  `peerbeam sync <peer> <path> <into>` mirrors a shared folder locally. It is a
-  **one-way pull**: nothing local is deleted, nothing is pushed back, and a file
-  newer on your machine is never overwritten. Receiving files needs the `files`
-  permission as well as `browse` — being allowed to see that a file exists is
-  not being allowed to take it.
+  `peerbeam sync <peer> <path> <into>` syncs a folder **both ways**. Files only
+  they changed are fetched, files only you changed are pushed, and their
+  deletions are applied when they follow from your copy. Receiving files needs
+  the `files` permission as well as `browse` — being allowed to see that a file
+  exists is not being allowed to take it.
+
+  **When both devices changed the same file, both copies are kept**: theirs
+  arrives as `name.sync-conflict-<peer>.ext` and yours is untouched. PeerBeam
+  tracks per-device edit counts rather than comparing clocks, so it can tell
+  "theirs is newer" from "we both edited this" — the difference between applying
+  an update and silently destroying your work.
 
   An empty listing is the same answer whether the device shares nothing, has not
   granted you permission, or the folder is gone. That is deliberate: a caller

@@ -268,11 +268,14 @@ Working now:
   `YYYY-MM-DDTHH:MM:SS`, then send. **A delay, not a scheduler**: the process
   must stay running, so use cron or a systemd timer for anything that has to
   survive a reboot.
-- `sync <peer> <path> <into>` — mirror a device's shared folder into a local
-  directory. **One-way pull**: nothing local is deleted, nothing is pushed back,
-  and a local file newer than the peer's copy is left alone. Needs both `browse`
-  and `files` permissions from the peer. The files arrive as ordinary
-  transfers, so `peerbeam receive` or the daemon must be running to accept them.
+- `sync <peer> <path> <into>` — sync a folder with a device, **both ways**.
+  Files only they changed are fetched, files only you changed are pushed, and
+  their deletions are applied when they descend from your copy. When **both**
+  changed a file, their copy arrives as `name.sync-conflict-<peer>.ext` and
+  yours is left untouched — each conflict is named, because it is a decision you
+  now have to make. Needs both `browse` and `files` permissions from the peer,
+  and incoming files arrive as ordinary transfers, so `peerbeam receive` or the
+  daemon must be running to accept them.
 - `browse <peer> [path]` — list what a device shares, read-only. Paths are
   share-relative (`photos/2026`). An empty listing is the same answer whether
   the device shares nothing, has not granted this machine the `browse`

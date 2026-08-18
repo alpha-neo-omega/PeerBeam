@@ -312,9 +312,22 @@ a peer has under a path, and a request for one file of it. **Bytes travel over
 Transfer**, exactly as this table always said: a second bulk path would mean a
 second set of resume, checksum and progress semantics to keep in step.
 
-**A one-way pull mirror, not bidirectional continuous sync.** Two devices
-editing the same file while apart is a conflict problem with no good automatic
-answer, and pretending otherwise is how sync tools lose work.
+**Bidirectional, with conflicts kept rather than resolved.** Manifest entries
+carry a **version vector** — per-device edit counters — which answers a question
+a modification time cannot: not "which is more recent?" but "did both devices
+change this?". Two devices editing while apart produce two mtimes, and the later
+one wins, silently discarding the other edit. A vector distinguishes *behind*,
+*ahead* and *diverged*, and every other behaviour depends on that distinction.
+
+When both changed, the peer's copy arrives as `name.sync-conflict-<peer>.ext`
+and the local file is **not touched**. No automatic rule picks correctly:
+last-writer-wins discards an edit, refusing to sync leaves the folders
+permanently apart, and merging is a guess that corrupts anything binary.
+
+Vectors are `serde(default)`, so a manifest from a build that predates them
+still decodes — with an **empty** vector, which relates as *behind* to anything.
+An older peer's files are taken rather than treated as conflicts, the safe
+reading when a device cannot say what it changed.
 
 Three rules make a pull safe, and each is tested:
 
