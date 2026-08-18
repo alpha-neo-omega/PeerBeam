@@ -61,6 +61,20 @@ class SettingsStore extends ChangeNotifier {
   /// sent. See the Settings copy, which says so in as many words.
   bool syncClipboard;
 
+  /// "Verify new devices with a pairing code" — the first-contact opt-in.
+  ///
+  /// **Default off**, and unlike [sharePresence] and [syncClipboard] the
+  /// default is not about what leaves this device: off simply means an accept
+  /// behaves as it always has. On, a transfer from a device pinned by that very
+  /// handshake cannot be accepted until the user has confirmed both screens
+  /// show the same pairing code.
+  ///
+  /// The engine, not this flag, is what actually enforces it — this is the copy
+  /// the UI renders against, so a stale value can only ever make the app ask
+  /// for a confirmation the engine would not have required, never skip one it
+  /// would.
+  bool requirePairingConfirmation;
+
   /// Theme preference as persisted ('system' | 'light' | 'dark').
   String theme;
 
@@ -101,6 +115,9 @@ class SettingsStore extends ChangeNotifier {
     // Likewise, and with more at stake — this is the one buffer guaranteed to
     // sometimes hold a password.
     this.syncClipboard = false,
+    // Off, so the approval prompt a user already knows does not change until
+    // they ask for the extra check.
+    this.requirePairingConfirmation = false,
     this.saveRules = const [],
     // Assume not supported until the engine says otherwise, so a surface can
     // never offer the editor on the strength of a failed load.
@@ -129,6 +146,11 @@ class SettingsStore extends ChangeNotifier {
       // Absent -> stays false, for the same reason: a settings document
       // written before this feature existed is not consent.
       syncClipboard = (s['sync_clipboard'] as bool?) ?? syncClipboard;
+      // Absent -> stays false. A settings document written before this check
+      // existed must not be read as the user having asked for it.
+      requirePairingConfirmation =
+          (s['require_pairing_confirmation'] as bool?) ??
+          requirePairingConfirmation;
       theme = (s['theme'] as String?) ?? theme;
       // Absent -> no rules, which is the same receive behaviour as before this
       // feature existed. A malformed entry is skipped rather than failing the
@@ -191,6 +213,14 @@ class SettingsStore extends ChangeNotifier {
   void setSyncClipboard(bool v) {
     syncClipboard = v;
     _persist('sync_clipboard', v);
+    notifyListeners();
+  }
+
+  /// Turn the first-contact pairing check on or off. The engine applies it
+  /// live, so the next connection is already covered.
+  void setRequirePairingConfirmation(bool v) {
+    requirePairingConfirmation = v;
+    _persist('require_pairing_confirmation', v);
     notifyListeners();
   }
 
@@ -267,22 +297,29 @@ class AppState {
   factory AppState.live(PeerBeamApi api) {
     final device = DiscoveryRepository(api: api);
     final trust = TrustRepository(api: api);
+    // Built before the transfer repository so the approval prompt can read the
+    // pairing-check setting live — a closure, not a captured value, so turning
+    // the check on reaches a prompt that is already on screen.
+    final settings = SettingsStore(
+      deviceName: 'This Device',
+      saveDirectory: '~/Downloads/PeerBeam',
+      autoAcceptTrusted: false,
+      notifications: true,
+      compression: true,
+    );
     return AppState(
       theme: ThemeController(),
       device: device,
-      transfer: TransferRepository(api: api),
+      transfer: TransferRepository(
+        api: api,
+        pairingConfirmationRequired: () => settings.requirePairingConfirmation,
+      ),
       history: HistoryRepository(api: api),
       saved: SavedDevicesRepository()..load(),
       trust: trust,
       chat: ChatRepository(api: api),
       presence: PresenceRepository(api: api),
-      settings: SettingsStore(
-        deviceName: 'This Device',
-        saveDirectory: '~/Downloads/PeerBeam',
-        autoAcceptTrusted: false,
-        notifications: true,
-        compression: true,
-      ),
+      settings: settings,
       staging: StagingStore(),
       // Offered only to devices that are pinned AND currently addressable.
       // The engine's gate is still authoritative and re-checks trust against

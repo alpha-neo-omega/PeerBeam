@@ -197,6 +197,26 @@ class TransferEvent extends BridgeEvent {
   String? get path => payload['path'] as String?;
   bool get incoming => payload['incoming'] == true;
 
+  /// Whether the sending device was pinned by **this very handshake** — i.e.
+  /// this is the first time these two devices have ever spoken.
+  ///
+  /// The one moment that fact is knowable. Trust-on-first-use pins a peer as
+  /// it connects, so from the next event onwards the trust store reads the
+  /// same for a stranger and for a laptop used daily; only the engine, at
+  /// handshake time, can tell them apart. Absent means no — a payload that
+  /// does not say so is never treated as first contact.
+  bool get newlyTrusted => payload['newly_trusted'] == true;
+
+  /// The session's **pairing code**: a 128-bit safety number derived from both
+  /// devices' public keys, in the engine's own grouping (eight groups of four
+  /// uppercase hex).
+  ///
+  /// Both honest peers compute the *same* code; under a man-in-the-middle each
+  /// side computes a different one. It is only ever displayed — never compared
+  /// here, because this device cannot know what the other screen shows. That
+  /// comparison is the user's, out of band, and it is the whole point.
+  String get pairingCode => payload['pairing_code'] as String? ?? '';
+
   /// Direction as the engine spells it (`transfer_interrupted`, whose row is
   /// rebuilt from a checkpoint rather than from a `transfer_queued` this
   /// session saw).

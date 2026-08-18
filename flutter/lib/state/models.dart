@@ -130,6 +130,22 @@ class Transfer {
   /// every other state.
   final bool resumable;
 
+  /// Whether the sending device was pinned by the handshake that offered this
+  /// transfer — the first time these two devices have ever spoken.
+  ///
+  /// What makes an approval prompt say so, and what makes a refusal un-pin the
+  /// peer. False for everything else, including every outgoing transfer.
+  final bool newlyTrusted;
+
+  /// The session's pairing code — a 128-bit safety number both devices derive
+  /// from the keys they actually negotiated.
+  ///
+  /// Shown, in full, on a first-contact prompt so the user can compare it with
+  /// the other device's screen. Never compared here: this device has no way to
+  /// know what the other one is showing, and anything claiming otherwise would
+  /// be inventing the one check the code exists to make the user perform.
+  final String pairingCode;
+
   const Transfer({
     required this.id,
     required this.peerName,
@@ -141,6 +157,8 @@ class Transfer {
     this.speedBps = 0,
     this.etaSecs,
     this.resumable = false,
+    this.newlyTrusted = false,
+    this.pairingCode = '',
   });
 
   double get progress =>
@@ -163,6 +181,13 @@ class Transfer {
     speedBps: speedBps ?? this.speedBps,
     etaSecs: etaSecs ?? this.etaSecs,
     resumable: resumable ?? this.resumable,
+    // Both are facts about the handshake that offered this transfer, settled
+    // before the first progress update and true for its whole life. Nothing
+    // that happens later may revise them, so they are carried, never copied
+    // over — a `copyWith` that could blank the pairing code would let a
+    // first-contact prompt lose the very thing it exists to show.
+    newlyTrusted: newlyTrusted,
+    pairingCode: pairingCode,
   );
 }
 

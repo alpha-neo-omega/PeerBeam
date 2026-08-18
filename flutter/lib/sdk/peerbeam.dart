@@ -38,12 +38,27 @@ abstract class PeerBeamApi {
   Future<void> pause(String id);
   Future<void> resume(String id);
   Future<void> cancel(String id);
-  Future<void> accept(String id);
+  /// Accept an incoming transfer, this once.
+  ///
+  /// [confirmed] answers the engine's first-contact pairing check: it means the
+  /// user compared this session's pairing code against the *other device's*
+  /// screen and they match. The engine consults it only when the sender was
+  /// pinned by that very handshake and `require_pairing_confirmation` is on;
+  /// unconfirmed there, the accept is refused and the transfer stays pending.
+  ///
+  /// It defaults to false and must never be passed on anything but a real
+  /// answer from the user. Passing true "because the prompt was shown" would
+  /// turn the one check that detects a man-in-the-middle into a formality.
+  Future<void> accept(String id, {bool confirmed = false});
 
   /// Accept AND trust the sending device: future transfers from it are
   /// auto-accepted whenever auto-accept is enabled. A plain [accept] never
   /// does this — trusting a device is always a separate, explicit choice.
-  Future<void> acceptTrust(String id);
+  ///
+  /// [confirmed] means what it does on [accept], and the engine gates this the
+  /// same way — more strictly if anything, since this is the call that grants
+  /// standing auto-accept.
+  Future<void> acceptTrust(String id, {bool confirmed = false});
   Future<void> reject(String id);
 
   Future<List<TransferSnapshot>> activeTransfers();
@@ -342,10 +357,11 @@ class PeerBeam implements PeerBeamApi {
   @override
   Future<void> cancel(String id) async => _data(_req().cancel(_id(id)));
   @override
-  Future<void> accept(String id) async => _data(_req().accept(_id(id)));
+  Future<void> accept(String id, {bool confirmed = false}) async =>
+      _data(_req().accept(_decision(id, confirmed)));
   @override
-  Future<void> acceptTrust(String id) async =>
-      _data(_req().acceptTrust(_id(id)));
+  Future<void> acceptTrust(String id, {bool confirmed = false}) async =>
+      _data(_req().acceptTrust(_decision(id, confirmed)));
   @override
   Future<void> reject(String id) async => _data(_req().reject(_id(id)));
 
@@ -534,4 +550,16 @@ class PeerBeam implements PeerBeamApi {
       : const [];
 
   String _id(String id) => jsonEncode({'id': id});
+
+  /// An accept request, carrying the user's pairing answer.
+  ///
+  /// `confirmed` is only ever sent when it is true. The engine accepts nothing
+  /// but a literal `true`, so an omitted key and an explicit `false` mean the
+  /// same thing to it — and sending the key only when there is something to say
+  /// keeps every ordinary accept byte-identical to what it was before this
+  /// check existed.
+  String _decision(String id, bool confirmed) => jsonEncode({
+    'id': id,
+    if (confirmed) 'confirmed': true,
+  });
 }

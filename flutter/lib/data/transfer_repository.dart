@@ -31,9 +31,32 @@ class TransferRepository extends ChangeNotifier {
   /// Set in [dispose]: an in-flight fetch must not notify a dead listener.
   bool _disposed = false;
 
-  TransferRepository({PeerBeamApi? api}) : _api = api {
+  /// Whether the first-contact pairing check is currently on, read live rather
+  /// than captured, so toggling it in Settings applies to the prompt already on
+  /// screen.
+  ///
+  /// Advisory only: the engine enforces the check itself and is the authority.
+  /// Reading false here while the engine says true costs nothing worse than a
+  /// refused accept the user can retry after confirming.
+  final bool Function() _pairingConfirmationRequired;
+
+  TransferRepository({
+    PeerBeamApi? api,
+    bool Function()? pairingConfirmationRequired,
+  }) : _api = api,
+       _pairingConfirmationRequired =
+           pairingConfirmationRequired ?? _checkOffByDefault {
     _sub = _api?.events.listen(_onEvent);
   }
+
+  static bool _checkOffByDefault() => false;
+
+  /// Whether accepting [id] needs the user to confirm a pairing code first:
+  /// the transfer is from a device this session pinned, and the check is on.
+  ///
+  /// The prompt asks this; it never guesses from the transfer alone.
+  bool needsPairingConfirmation(String id) =>
+      (_byId[id]?.newlyTrusted ?? false) && _pairingConfirmationRequired();
 
   List<Transfer> get transfers => List.unmodifiable(_byId.values);
 
@@ -181,8 +204,13 @@ class TransferRepository extends ChangeNotifier {
   /// indistinguishable from success. It is also the exact shape of this
   /// project's pairing-gate fail-open. So the failure is surfaced, on the same
   /// channel every other transfer failure uses.
-  void accept(String id) => _decide(id, 'accept', _api?.accept(id));
-  void acceptTrust(String id) => _decide(id, 'accept', _api?.acceptTrust(id));
+  /// [confirmed] is the user's answer to the first-contact pairing prompt, and
+  /// belongs to the surface that actually asked. It is never inferred here: a
+  /// repository cannot know whether anyone looked at the other device's screen.
+  void accept(String id, {bool confirmed = false}) =>
+      _decide(id, 'accept', _api?.accept(id, confirmed: confirmed));
+  void acceptTrust(String id, {bool confirmed = false}) =>
+      _decide(id, 'accept', _api?.acceptTrust(id, confirmed: confirmed));
   void reject(String id) => _decide(id, 'decline', _api?.reject(id));
 
   /// Accept every inbound transfer currently [awaitingApproval] — one engine
@@ -267,6 +295,19 @@ class TransferRepository extends ChangeNotifier {
         gone++;
         continue;
       }
+      // A batch cannot confirm a pairing code. One tap answers for every
+      // transfer on screen, and comparing a safety number against another
+      // device is a per-device act the user has not performed here — so a
+      // first-contact transfer is never handed to the engine as a batch accept
+      // while the check is on. The engine would refuse it anyway; stopping
+      // here is what keeps the tally honest, since its refusal arrives as the
+      // same `InvalidArgumentException` that means "no longer waiting", and
+      // this one very much still is. Declines are unaffected: refusing needs
+      // no verification.
+      if (accepting && needsPairingConfirmation(id)) {
+        failed++;
+        continue;
+      }
       try {
         // `accept`, never `acceptTrust` — see acceptAll's contract.
         await (accepting ? api.accept(id) : api.reject(id));
@@ -331,6 +372,12 @@ class TransferRepository extends ChangeNotifier {
           // update rather than 0.
           totalBytes: e.stats?.totalBytes ?? e.size ?? 0,
           doneBytes: 0,
+          // First contact, and the code that lets the user check it is the
+          // device they think it is. Carried from `transfer_queued` because
+          // that is the only event that reports them — the approval prompt
+          // this row feeds is rendered long after the handshake is over.
+          newlyTrusted: e.newlyTrusted,
+          pairingCode: e.pairingCode,
         );
       case 'transfer_started':
         _update(id, state: TransferState.transferring);
