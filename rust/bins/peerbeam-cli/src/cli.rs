@@ -257,6 +257,23 @@ pub enum ChatAction {
         /// The share's message id, as shown by `chat history --json`.
         id: String,
     },
+    /// React to a message with an emoji — or withdraw a reaction.
+    ///
+    /// Applies to this device's own history whether or not the peer can be
+    /// reached, and reports separately whether it was delivered: an older peer
+    /// that never negotiated reactions, or one that is simply offline, leaves
+    /// `delivered` false. Reactions are not queued for later delivery.
+    React {
+        /// Peer device id (`pb-…`), or a name that is discoverable right now.
+        peer: String,
+        /// The message id to react to, as shown by `chat history --json`.
+        id: String,
+        /// The reaction itself, e.g. an emoji.
+        emoji: String,
+        /// Withdraw this reaction instead of adding it.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Print a conversation's history.
     History {
         /// Peer device id.

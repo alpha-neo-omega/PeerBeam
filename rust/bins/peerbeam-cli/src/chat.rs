@@ -85,6 +85,12 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
             )),
         },
         ChatAction::Cancel { peer, id } => cancel(ctx, peer, id, path_override).await,
+        ChatAction::React {
+            peer,
+            id,
+            emoji,
+            remove,
+        } => react(ctx, peer, id, &emoji, remove, path_override).await,
         ChatAction::History { peer } => history(ctx, peer, path_override).await,
         ChatAction::Search { query, limit } => search(ctx, &query, limit, path_override),
         ChatAction::Watch { port } => watch(ctx, port, path_override).await,
@@ -990,6 +996,130 @@ async fn send_file(
 /// that outlives that process — the queue entry, the bytes, and a row left
 /// stranded by a send that was interrupted (Ctrl-C during a stage leaves
 /// exactly that).
+/// `peerbeam chat react <PEER> <ID> <EMOJI> [--remove]`.
+///
+/// Applies to this device's own history first and regardless of reachability —
+/// it is our record of our own gesture — then tries to tell the peer. The two
+/// answers are reported separately for the same reason the FFI separates them:
+/// a peer that is offline, or too old to have negotiated the reaction
+/// capability, must not be described as having seen it.
+///
+/// Reactions are not queued. `chat send` leaves an undelivered message in the
+/// outbox to flow later; a reaction that missed its moment is noise by the time
+/// it would arrive, so it is applied locally and simply not delivered.
+async fn react(
+    ctx: &Ctx,
+    peer: String,
+    id: String,
+    emoji: &str,
+    remove: bool,
+    path_override: Option<&str>,
+) -> CliResult {
+    if emoji.is_empty() || emoji.len() > peerbeam_chat::MAX_REACTION {
+        return Err(CliError::Usage(format!(
+            "reaction must be 1..={} bytes",
+            peerbeam_chat::MAX_REACTION
+        )));
+    }
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    // Same resolution `chat history` and `chat cancel` use, so an id read out
+    // of `chat history bob` can be reacted to with the same word `bob`.
+    let peer_id = resolve_history_peer(ctx, &config, &store, peer).await;
+
+    let applied = store
+        .apply_reaction(&peer_id, &id, emoji, Direction::Out, remove)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    if !applied && !ctx.json {
+        ctx.line(&ctx.dim(
+            "nothing changed — no such message in this conversation, \
+             or the reaction was already in that state",
+        ));
+    }
+
+    let delivered = deliver_reaction(&config, &sc, &store, ctx, &peer_id, &id, emoji, remove).await;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "peer": peer_id.0,
+            "id": id,
+            "emoji": emoji,
+            "removed": remove,
+            "applied": applied,
+            "delivered": delivered,
+        }));
+    } else if applied {
+        let verb = if remove { "withdrew" } else { "reacted" };
+        let where_ = if delivered {
+            "delivered"
+        } else {
+            "not delivered (peer offline, or too old for reactions)"
+        };
+        ctx.line(&format!("{verb} {emoji} on {id} — {where_}"));
+    }
+    Ok(())
+}
+
+/// Best-effort live delivery of one reaction. Every negative answer — cannot
+/// resolve, cannot dial, peer never negotiated the capability, send failed — is
+/// simply `false`; none of them is an error for the caller, whose local history
+/// is already correct.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_reaction(
+    config: &EngineConfig,
+    sc: &SecureCtx,
+    store: &ChatStore,
+    ctx: &Ctx,
+    peer_id: &DeviceId,
+    id: &str,
+    emoji: &str,
+    remove: bool,
+) -> bool {
+    let devices = commands::snapshot(config.clone(), 2).await;
+    let Some(meta) = devices.iter().find(|m| m.device.id == *peer_id) else {
+        return false;
+    };
+    let Ok(quic) = QuicTransport::new() else {
+        return false;
+    };
+    let quic = Arc::new(quic);
+    let routes = RouteManager::new(quic.clone());
+    let sink = received_sink(ctx);
+    let Ok(session) = session_transfer::dial(
+        &quic,
+        &routes,
+        &meta.device,
+        "react",
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        Some((store.clone(), sink)),
+    )
+    .await
+    else {
+        return false;
+    };
+    // Asked of the authenticated identity, like every other chat send.
+    let peer = DeviceId::from(session.peer_id.clone());
+    let ok = if peerbeam_chat::may_exchange_chat(sc.trust.as_ref(), &peer)
+        && session.supports_reaction()
+    {
+        let r = if remove {
+            peerbeam_chat::Reaction::remove(id, emoji)
+        } else {
+            peerbeam_chat::Reaction::add(id, emoji)
+        };
+        peerbeam_chat::send_reaction(&session.handle, &r)
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+    session.close().await;
+    ok
+}
+
 async fn cancel(ctx: &Ctx, peer: String, id: String, path_override: Option<&str>) -> CliResult {
     let config = commands::load_config(path_override)?;
     let sc = SecureCtx::build(&config)?;
@@ -2289,6 +2419,65 @@ mod tests {
     // `chat cancel` on a queued share: the entry goes, the bytes go, and the
     // row settles. This is the only thing that reclaims a queued file's disk
     // space on this surface, so all three parts are load-bearing.
+    #[tokio::test]
+    async fn chat_react_applies_locally_even_with_no_peer_to_tell() {
+        // The reaction is this device's record of its own gesture. An
+        // unreachable peer means "not delivered", never "not applied".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let cfg_str = cfg_path.to_str().expect("utf8 path");
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("pb-bob");
+        let msg = peerbeam_chat::ChatMessage::new("ship it").expect("message");
+        store
+            .append(&ChatRecord::sent(&peer, &msg))
+            .expect("append");
+
+        super::react(
+            &ctx,
+            "pb-bob".to_string(),
+            msg.id.clone(),
+            "\u{1F44D}",
+            false,
+            Some(cfg_str),
+        )
+        .await
+        .expect("reacting to our own row is allowed");
+
+        let hist = store.history(&peer).expect("history");
+        assert_eq!(hist[0].reactions.len(), 1);
+        assert_eq!(hist[0].reactions[0].by, peerbeam_chat::Direction::Out);
+    }
+
+    #[tokio::test]
+    async fn chat_react_refuses_an_empty_or_oversized_reaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let cfg_str = cfg_path.to_str().expect("utf8 path");
+
+        for bad in [String::new(), "e".repeat(peerbeam_chat::MAX_REACTION + 1)] {
+            let err = super::react(
+                &ctx,
+                "pb-bob".to_string(),
+                "m1".to_string(),
+                &bad,
+                false,
+                Some(cfg_str),
+            )
+            .await
+            .expect_err("an empty or oversized reaction is a usage error");
+            assert!(matches!(err, CliError::Usage(_)));
+        }
+    }
+
     #[tokio::test]
     async fn chat_cancel_dequeues_a_queued_file_and_deletes_its_blob() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -35,7 +35,8 @@ use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM,
+    PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
@@ -130,7 +131,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::new(TRANSFER))
         .with(Capability::with_features(
             CHAT,
-            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
@@ -196,6 +197,17 @@ impl Session {
     #[must_use]
     pub fn supports_file_ref(&self) -> bool {
         caps_support_file_ref(&self.capabilities)
+    }
+
+    /// Whether the peer negotiated the chat `Reaction` feature. A peer from
+    /// before reactions advertises `features: 0`, so this is false and the
+    /// gesture is kept local rather than reported as delivered to a screen
+    /// that never showed it.
+    #[must_use]
+    pub fn supports_reaction(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::CHAT)
+            .is_some_and(|f| f & CHAT_FEAT_REACTION != 0)
     }
 
     /// Whether the peer negotiated the pipe stream capability. A peer from
