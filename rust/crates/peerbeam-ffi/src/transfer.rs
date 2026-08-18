@@ -504,6 +504,8 @@ pub struct Manager {
     chat: ChatStore,
     /// Notes, in the same encrypted AppStore under their own namespace.
     notes: peerbeam_notes::NoteStore,
+    /// Clipboard history — empty and unwritten unless the user turned it on.
+    clip_history: peerbeam_clipboard::ClipHistory,
     /// The outbox's own copy of every file waiting to be sent. `Arc` because
     /// `StagingStore` is deliberately not `Clone` (it owns a directory), and
     /// the background send tasks need it alongside `chat`.
@@ -602,6 +604,7 @@ impl Manager {
         trust: Arc<FsTrust>,
         chat: ChatStore,
         notes: peerbeam_notes::NoteStore,
+        clip_history: peerbeam_clipboard::ClipHistory,
         staging: Arc<StagingStore>,
         staging_limits: StagingLimits,
         identity: Identity,
@@ -627,6 +630,7 @@ impl Manager {
             trust,
             chat,
             notes,
+            clip_history,
             staging,
             staging_limits,
             chat_file_in_flight: Mutex::new(HashSet::new()),
@@ -777,6 +781,13 @@ impl Manager {
             .flatten()
             .map(|r| r.name)
             .filter(|n| !n.is_empty())
+    }
+
+    /// Clipboard history. Reading it is always allowed; **writing happens only
+    /// when the opt-in is on**, which `clipboard::sink` decides.
+    #[must_use]
+    pub fn clip_history(&self) -> peerbeam_clipboard::ClipHistory {
+        self.clip_history.clone()
     }
 
     /// The note store, for the session wiring that serves the Notes channel.
@@ -5165,6 +5176,7 @@ mod tests {
             trust,
             chat.clone(),
             peerbeam_notes::NoteStore::new(appstore.clone()),
+            peerbeam_clipboard::ClipHistory::new(appstore.clone()),
             staging,
             StagingLimits {
                 max_bytes: u64::MAX,

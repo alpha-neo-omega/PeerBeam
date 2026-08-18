@@ -50,6 +50,37 @@ pub fn sync_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The settings key for clipboard history.
+///
+/// *"Keep a short clipboard history on this device"*, **default off**, and
+/// deliberately **separate from [`SYNC_KEY`]**. Syncing your clipboard and
+/// keeping a record of it are different decisions with different risks, and
+/// bundling them would mean someone who wanted their laptop and desktop to
+/// share a clipboard also got a stored log they never asked for — which is
+/// precisely what clipboard sync promised not to create.
+pub const HISTORY_KEY: &str = "clipboard_history";
+
+/// Whether clipboard history is on. **Defaults to off** on an absent,
+/// unreadable or non-boolean key: a settings document written before this
+/// feature existed must never be read as consent to start recording.
+#[must_use]
+pub fn history_enabled() -> bool {
+    crate::settings::get()
+        .ok()
+        .is_some_and(|s| history_enabled_in(&s))
+}
+
+/// The decision as a pure function of a settings document.
+///
+/// Split out for the reason the read-receipt opt-in was: read through global
+/// settings the fallback is unreachable, because `defaults()` writes the key —
+/// so a test going through [`history_enabled`] cannot tell `unwrap_or(false)`
+/// from `unwrap_or(true)`. Only an explicit `true` is consent.
+#[must_use]
+pub fn history_enabled_in(settings: &Value) -> bool {
+    settings.get(HISTORY_KEY).and_then(Value::as_bool) == Some(true)
+}
+
 /// Emit a `clipboard_received` event so the surface can apply the clip to the
 /// system clipboard and tell the user it happened.
 ///
@@ -84,7 +115,17 @@ pub fn emit_received(peer: &DeviceId, clip: &Clip) {
 /// here at all — there is no call site to miss.
 #[must_use]
 pub fn sink() -> ClipboardSink {
-    std::sync::Arc::new(|peer: DeviceId, clip: Clip| emit_received(&peer, &clip))
+    std::sync::Arc::new(|peer: DeviceId, clip: Clip| {
+        // Recorded before the event, so history reflects what arrived even if
+        // the surface never applies it — and gated here, once, rather than at
+        // each surface that might want to remember something.
+        if history_enabled() {
+            if let Ok(mgr) = crate::runtime::manager() {
+                let _ = mgr.clip_history().record(&clip.text, Some(peer.0.as_str()));
+            }
+        }
+        emit_received(&peer, &clip);
+    })
 }
 
 fn kind_str(k: ClipboardKind) -> &'static str {
@@ -119,6 +160,17 @@ pub fn set(req: &Value) -> Op {
         ));
     };
 
+    // Remember what this device put on its own clipboard, when history is on.
+    // Text only: an image entry carries metadata, not content, and a log of
+    // sizes and MIME types is noise nobody can paste.
+    if history_enabled() {
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            if let Ok(mgr) = crate::runtime::manager() {
+                let _ = mgr.clip_history().record(text, None);
+            }
+        }
+    }
+
     *SLOT.lock().unwrap() = Some(item.clone());
     events::emit(&json!({
         "type": "clipboard_updated",
@@ -126,6 +178,32 @@ pub fn set(req: &Value) -> Op {
         "payload": { "item": item },
     }));
     Ok(json!({ "set": true }))
+}
+
+/// Every remembered clip, newest first: `{}` → `{entries:[…]}`.
+///
+/// Empty unless the user turned history on. Reading is never gated — an empty
+/// list is the honest answer for a device that records nothing, and refusing
+/// the call would make "off" indistinguishable from "broken".
+pub fn history_list() -> Op {
+    let entries = crate::runtime::manager()?
+        .clip_history()
+        .list()
+        .map_err(|e| (Code::Internal, e.to_string()))?;
+    Ok(json!({ "entries": entries }))
+}
+
+/// Forget every remembered clip: `{}` → `{cleared: n}`.
+///
+/// Works whether or not history is currently on: turning the setting off stops
+/// new entries but does not erase what was already recorded, and a user who
+/// wants it gone needs a way to say so.
+pub fn history_clear() -> Op {
+    let cleared = crate::runtime::manager()?
+        .clip_history()
+        .clear()
+        .map_err(|e| (Code::Internal, e.to_string()))?;
+    Ok(json!({ "cleared": cleared }))
 }
 
 /// The current clipboard item, or `{item:null}`.
@@ -141,4 +219,38 @@ pub fn subscribe() -> Op {
 
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The promise clipboard sync made.** With history off — which includes a
+    /// settings document written before this feature existed, one this build
+    /// cannot parse, and one storing the key as anything but a bool — nothing
+    /// is recorded. Only an explicit `true` is consent.
+    ///
+    /// Asserted against the pure function rather than through global settings:
+    /// `defaults()` writes the key, so the fallback is unreachable that way and
+    /// a test could not tell `unwrap_or(false)` from `unwrap_or(true)`.
+    #[test]
+    fn clipboard_history_records_nothing_without_explicit_consent() {
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({ "clipboard_history": false }),
+            serde_json::json!({ "clipboard_history": "yes" }),
+            serde_json::json!({ "clipboard_history": 1 }),
+            serde_json::json!({ "clipboard_history": null }),
+            // Syncing is not consent to record: they are separate decisions.
+            serde_json::json!({ "sync_clipboard": true }),
+        ] {
+            assert!(
+                !history_enabled_in(&doc),
+                "read as consent to record the clipboard: {doc}"
+            );
+        }
+        assert!(history_enabled_in(
+            &serde_json::json!({ "clipboard_history": true })
+        ));
+    }
 }

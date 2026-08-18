@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
 peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 tempfile = { workspace = true }

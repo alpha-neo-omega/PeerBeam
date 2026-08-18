@@ -63,6 +63,12 @@ fn defaults() -> Value {
         // mistaken for consent. It gates **sending** only: receipts a peer
         // sends are still applied, so opting out costs you nothing others do.
         crate::chat_receipts::SHARE_KEY: false,
+        // "Keep a short clipboard history on this device" — **default off**,
+        // and separate from the sync toggle on purpose. Syncing your clipboard
+        // and keeping a record of it are different decisions: bundling them
+        // would hand a stored log to someone who only wanted two machines to
+        // share a clipboard, which is exactly what sync promised not to do.
+        crate::clipboard::HISTORY_KEY: false,
         // "Sync clipboard with trusted devices" — **default off**, and that
         // default carries even more weight than presence's (I11): the
         // clipboard is the one buffer guaranteed to sometimes hold a password,

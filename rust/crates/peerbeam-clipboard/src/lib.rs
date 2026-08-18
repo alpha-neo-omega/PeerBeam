@@ -56,10 +56,12 @@
 
 mod gate;
 mod handler;
+mod history;
 mod message;
 mod send;
 
 pub use gate::{caps_support_clip, may_share_clip};
 pub use handler::{ClipboardHandler, ClipboardSink};
+pub use history::{ClipEntry, ClipHistory, MAX_ENTRIES, NS as HISTORY_NS};
 pub use message::{Clip, ClipboardError, MAX_CLIP, MSG_CLIP};
 pub use send::{ClipboardSender, Push, SendError, SyncSetting};

@@ -1168,6 +1168,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "peerbeam-appstore-fs",
  "peerbeam-crypto",
  "peerbeam-domain",
  "peerbeam-transfer",

@@ -399,6 +399,7 @@ pub fn init(config_json: &str) -> OpResult {
     // Notes share the same encrypted AppStore under their own namespace — the
     // "future capabilities share the same store" note above, cashed in.
     let notes = peerbeam_notes::NoteStore::new(appstore.clone());
+    let clip_history = peerbeam_clipboard::ClipHistory::new(appstore.clone());
     let chat = peerbeam_chat::ChatStore::new(appstore);
     reconcile_chat(&chat);
 
@@ -449,6 +450,7 @@ pub fn init(config_json: &str) -> OpResult {
         trust,
         chat,
         notes,
+        clip_history,
         staging,
         staging_limits,
         identity,

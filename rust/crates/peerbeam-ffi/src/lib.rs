@@ -558,6 +558,32 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// Every remembered clip, newest first: `{}` → `{entries:[…]}`.
+///
+/// Empty unless the user turned clipboard history on. Bounded, and never put on
+/// the wire — only the current clip syncs; what a device remembers is its own.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_clipboard_history(json: *const c_char) -> *mut c_char {
+    let _ = json;
+    guard(|| error::envelope(clipboard::history_list()))
+}
+
+/// Forget every remembered clip: `{}` → `{cleared: n}`.
+///
+/// Turning the setting off stops new entries; it does not erase what was
+/// already recorded. This does.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_clipboard_history_clear(json: *const c_char) -> *mut c_char {
+    let _ = json;
+    guard(|| error::envelope(clipboard::history_clear()))
+}
+
 /// Ask a device to make itself findable: `{peer, seconds?}` → `{sent}`.
 ///
 /// *Find my device.* `sent` reports only that the request went out; whether the
