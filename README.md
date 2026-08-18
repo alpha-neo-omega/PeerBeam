@@ -19,16 +19,18 @@ of any size with end-to-end encryption and resumable, integrity-checked
 transfers. A Rust engine does the work; a Flutter app and a first-class CLI are
 two frontends over the same core.
 
-> **Status: 🟢 Release Candidate.** Engine, discovery, security, QUIC transport,
-> RouteManager, full FFI, Dart SDK, and the Flutter app are implemented and
-> tested (377 Rust + 35 Flutter tests, clippy/fmt clean). Networked
-> `send`/`receive` work end to end over QUIC with mutual authentication —
-> **verified live on real hardware** (Android → Linux, byte-exact). Linux + CLI
-> are build- and run-verified; Android runs the full engine on-device.
+> **Status: 🟢 Beta (v0.7.0).** PeerBeam is no longer only a file mover: it
+> carries chat, clipboard, presence and pipes over the same authenticated
+> session, each as a negotiated channel. Engine, discovery, security, QUIC
+> transport, RouteManager, full FFI, Dart SDK, CLI and the Flutter app are
+> implemented and tested — **1135 Rust + 310 Flutter tests**, clippy/fmt clean.
+> Networked `send`/`receive` work end to end over QUIC with mutual
+> authentication, **verified live on real hardware** (Android ↔ Linux,
+> byte-exact). Linux, Android and the CLI are build- and run-verified.
 > **Stable v1.0 is gated on Windows/macOS host builds and a real multi-transport
-> matrix** (this project's audit ran on a single Linux host). Remaining gaps:
-> `clipboard`/`history` CLI, desktop OS notifications/tray, persistent device
-> identity. See [Stable Readiness](docs/STABLE_READINESS.md),
+> matrix** — this project's audit runs on a single Linux host, so those two
+> platforms are built by CI and not exercised by hand. See
+> [Stable Readiness](docs/STABLE_READINESS.md),
 > [Known Issues](docs/KNOWN_ISSUES.md), and the docs below.
 
 ## Highlights
@@ -46,6 +48,30 @@ two frontends over the same core.
 - **Two frontends, one core** — polished Material 3 Flutter app and a
   scriptable, SSH-friendly CLI.
 - **Private** — no accounts, no telemetry, no cloud dependency.
+
+### More than transfers
+
+Each of these is a negotiated channel on the same session, so an older peer is
+never sent something it cannot read:
+
+- **Chat** — text and files in a conversation, queued for an offline peer and
+  delivered when it returns. Attach by kind, drag files onto a conversation,
+  select messages to forward or delete, and search your own history.
+- **Clipboard sync** — opt-in, trusted devices only. Copy on one desktop and it
+  is on the others. Everything you copy is sent, passwords included, and the
+  toggle says so: no platform PeerBeam supports exposes a "this is sensitive"
+  signal, and a guess would be wrong in both directions.
+- **Presence** — battery, free storage and network kind from your own trusted
+  devices, opt-in and off by default. Absent readings render as absent; a
+  desktop has no battery and is not shown as flat.
+- **`peerbeam pipe`** — an encrypted byte pipe between two devices:
+  `tar cz ./src | peerbeam pipe --to laptop`. Accepted only by a process you
+  started with `--listen`, never by a background daemon.
+- **Auto-save rules** — route received files by sender, extension or size.
+- **Resumable transfers** — an interrupted transfer survives a restart and
+  continues from its offset.
+- **Per-device permissions** — a device can be allowed files but not your
+  clipboard. Approval and permission are separate questions.
 
 ## Repository layout
 
