@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-18 — Beta
+
 ### Added
 - **Per-device permissions: what a trusted device may do, not just whether it is
   trusted.** Approval used to be one bit that meant *everything* — approving a
