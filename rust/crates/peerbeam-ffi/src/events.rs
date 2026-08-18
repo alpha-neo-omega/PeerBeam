@@ -212,6 +212,7 @@ mod tests {
             status: peerbeam_chat::Status::Received,
             kind: peerbeam_chat::Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         };
         let dto = record_dto(&rec);
@@ -262,6 +263,7 @@ mod tests {
             status: Status::Received,
             kind: Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         };
         chat(&rec);

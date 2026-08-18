@@ -539,8 +539,50 @@ impl ChatStore {
             status: Status::Sent,
             kind,
             file,
+            read_at: None,
             reactions: Vec::new(),
         })
+    }
+
+    /// Apply a read watermark: mark every one of **our own outgoing** messages
+    /// up to and including `read_through` as read, and report how many rows
+    /// that changed.
+    ///
+    /// Only outgoing rows, because a receipt is the peer telling us it read
+    /// something *we* sent — the same direction check
+    /// [`settle_file_row`](Self::settle_file_row) makes, and for the same
+    /// reason: a peer must not be able to rewrite a row it sent us. Scoped to
+    /// that peer's namespace, so a receipt cannot reach another conversation.
+    ///
+    /// Idempotent and monotonic: a row already marked read is left alone, so
+    /// re-applying the same watermark — or an older one arriving late out of
+    /// order — changes nothing and cannot move a read row back to unread.
+    ///
+    /// Comparison is on the id, which [`crate::mint_id`] makes lexicographically
+    /// time-ordered, so one id names a prefix of the conversation. A row whose
+    /// id did not come from `mint_id` (only reachable from another
+    /// implementation) simply compares as the string it is; it can be missed by
+    /// a watermark but never wrongly marked, since the bound is inclusive and
+    /// one-sided.
+    pub fn apply_receipt(
+        &self,
+        peer: &DeviceId,
+        read_through: &str,
+        at: &str,
+    ) -> Result<usize, ChatError> {
+        let mut changed = 0;
+        for mut rec in self.history(peer)? {
+            if rec.direction != Direction::Out
+                || rec.read_at.is_some()
+                || rec.id.as_str() > read_through
+            {
+                continue;
+            }
+            rec.read_at = Some(at.to_string());
+            self.append(&rec)?;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     /// Add or withdraw a reaction on one message, in place.
@@ -1057,6 +1099,100 @@ mod tests {
         let app: Arc<dyn AppStore> =
             Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
         (ChatStore::new(app.clone()), app, dir)
+    }
+
+    #[test]
+    fn a_receipt_marks_our_outgoing_messages_up_to_the_watermark() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m1 = ChatMessage::new("first").unwrap();
+        let m2 = ChatMessage::new("second").unwrap();
+        let m3 = ChatMessage::new("third").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m1)).unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m2)).unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m3)).unwrap();
+
+        assert_eq!(
+            cs.apply_receipt(&peer, &m2.id, "2026-01-01T00:00:00Z")
+                .unwrap(),
+            2
+        );
+        let hist = cs.history(&peer).unwrap();
+        assert!(hist[0].read_at.is_some(), "first is below the watermark");
+        assert!(
+            hist[1].read_at.is_some(),
+            "the watermark itself is inclusive"
+        );
+        assert!(hist[2].read_at.is_none(), "third is above the watermark");
+    }
+
+    #[test]
+    fn a_receipt_never_touches_what_the_peer_sent_us() {
+        // A receipt is the peer saying it read something *we* wrote. Letting it
+        // mark its own inbound rows would let a peer rewrite its own messages
+        // in our history.
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let theirs = ChatMessage::new("from bob").unwrap();
+        cs.append(&ChatRecord::received(&peer, &theirs)).unwrap();
+
+        assert_eq!(
+            cs.apply_receipt(&peer, &theirs.id, "2026-01-01T00:00:00Z")
+                .unwrap(),
+            0
+        );
+        assert!(cs.history(&peer).unwrap()[0].read_at.is_none());
+    }
+
+    #[test]
+    fn a_receipt_is_idempotent_and_cannot_move_a_row_back_to_unread() {
+        // Watermarks arrive out of order over a lossy link. An older one must
+        // not un-read anything, and a repeat must change nothing.
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m1 = ChatMessage::new("first").unwrap();
+        let m2 = ChatMessage::new("second").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m1)).unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m2)).unwrap();
+
+        assert_eq!(
+            cs.apply_receipt(&peer, &m2.id, "2026-01-01T00:00:02Z")
+                .unwrap(),
+            2
+        );
+        let first_at = cs.history(&peer).unwrap()[0].read_at.clone();
+
+        // A repeat, and then a stale older watermark.
+        assert_eq!(
+            cs.apply_receipt(&peer, &m2.id, "2026-01-01T00:00:03Z")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            cs.apply_receipt(&peer, &m1.id, "2026-01-01T00:00:01Z")
+                .unwrap(),
+            0
+        );
+
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist[0].read_at, first_at, "the first read time stands");
+        assert!(hist[1].read_at.is_some(), "still read");
+    }
+
+    #[test]
+    fn a_receipt_cannot_reach_another_conversation() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let eve = DeviceId::from("pb-eve");
+        let m = ChatMessage::new("private").unwrap();
+        cs.append(&ChatRecord::sent(&bob, &m)).unwrap();
+
+        assert_eq!(
+            cs.apply_receipt(&eve, &m.id, "2026-01-01T00:00:00Z")
+                .unwrap(),
+            0
+        );
+        assert!(cs.history(&bob).unwrap()[0].read_at.is_none());
     }
 
     #[test]
@@ -1863,6 +1999,7 @@ mod tests {
             status: Status::Sent,
             kind: Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         };
         let later = ChatRecord {

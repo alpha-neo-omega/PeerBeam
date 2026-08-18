@@ -160,6 +160,15 @@ pub struct ChatRecord {
     /// Present only when `kind == Kind::File`.
     #[serde(default)]
     pub file: Option<FileMeta>,
+    /// When the peer read this message, if it told us.
+    ///
+    /// Only ever set on our own **outgoing** rows: it records something the
+    /// peer disclosed about our message. `None` means "not read, or the peer
+    /// does not send receipts" — the two are deliberately indistinguishable
+    /// here, because a peer that has opted out owes no explanation and a
+    /// surface must not imply it was withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
     /// Reactions on this message, in the order they were applied.
     ///
     /// `default` so every row written before reactions existed decodes as
@@ -183,6 +192,7 @@ impl ChatRecord {
             status: Status::Sent,
             kind: Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         }
     }
@@ -199,6 +209,7 @@ impl ChatRecord {
             status: Status::Received,
             kind: Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         }
     }
@@ -216,6 +227,7 @@ impl ChatRecord {
             status,
             kind: Kind::Text,
             file: None,
+            read_at: None,
             reactions: Vec::new(),
         }
     }
@@ -232,6 +244,7 @@ impl ChatRecord {
             status,
             kind: Kind::File,
             file: Some(meta),
+            read_at: None,
             reactions: Vec::new(),
         }
     }
@@ -253,6 +266,7 @@ impl ChatRecord {
             // correlated by id alone. `ChatStore::set_file_row_landing`
             // reconciles this row against that stream.
             file: Some(FileMeta::new(&r.name, r.size, None)),
+            read_at: None,
             reactions: Vec::new(),
         }
     }

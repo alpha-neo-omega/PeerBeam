@@ -75,6 +75,21 @@ pub struct DeviceConfig {
     /// ever with devices in the trust store, which is not configurable here or
     /// anywhere else.
     pub share_presence: bool,
+    /// *"Tell people when you have read their messages"* — the read-receipt
+    /// opt-in.
+    ///
+    /// **Default off**, for the same reason [`share_presence`] is
+    /// (I11): a read receipt is a disclosure about *you* — it tells a peer the
+    /// moment you looked at something, which is a claim about your attention,
+    /// not about the message. Reading someone's message must never be the thing
+    /// that reports on you.
+    ///
+    /// While it is false this device sends no receipts at all, to anyone; it
+    /// still **applies** receipts its peers send, so a peer that has opted in
+    /// is shown as having read your messages either way. The setting governs
+    /// what this device discloses, never what it will accept — the same
+    /// asymmetry presence has.
+    pub share_read_receipts: bool,
 }
 
 /// Discovery configuration.
@@ -168,6 +183,7 @@ impl Default for DeviceConfig {
             // Opt-in. Nothing about this device leaves it until the user says
             // so; see the field's own doc comment.
             share_presence: false,
+            share_read_receipts: false,
         }
     }
 }

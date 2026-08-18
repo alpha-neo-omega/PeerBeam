@@ -8,8 +8,8 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
 use crate::message::{
-    ChatMessage, FileDecline, FileRef, Reaction, MSG_FILE_DECLINE, MSG_FILE_REF, MSG_REACTION,
-    MSG_TEXT,
+    ChatMessage, FileDecline, FileRef, Reaction, Receipt, MSG_FILE_DECLINE, MSG_FILE_REF,
+    MSG_REACTION, MSG_RECEIPT, MSG_TEXT,
 };
 use crate::record::{ChatRecord, Direction, Status};
 use crate::store::ChatStore;
@@ -134,6 +134,25 @@ impl MessageHandler for ChatHandler {
                 let _ = self
                     .store
                     .apply_reaction(peer, &r.target_id, &r.emoji, Direction::In, r.remove)
+                    .map_err(SessionError::from)?;
+                Ok(())
+            }
+            // Above the fallback, like every OPTIONAL type before it: an arm
+            // below would be swallowed as "unknown optional", return Ok, and
+            // apply nothing.
+            MSG_RECEIPT => {
+                // The peer read our messages up to a watermark. `apply_receipt`
+                // marks only our own OUTGOING rows inside this peer's
+                // namespace, so a receipt can neither reach another
+                // conversation nor rewrite a row the peer itself sent. A
+                // watermark naming an id we do not have marks whatever is below
+                // it and is otherwise a silent success.
+                //
+                // No sink: this changes existing rows rather than adding one.
+                let r = Receipt::from_frame(&frame)?;
+                let _ = self
+                    .store
+                    .apply_receipt(peer, &r.read_through, &r.timestamp)
                     .map_err(SessionError::from)?;
                 Ok(())
             }
@@ -270,6 +289,25 @@ mod tests {
         );
         let err = handler.handle(bad).await.unwrap_err();
         assert!(matches!(err, SessionError::FrameDecode(_)));
+    }
+
+    #[tokio::test]
+    async fn an_inbound_receipt_marks_our_messages_read() {
+        let (cs, _dir) = store(5);
+        let sink: ReceivedSink = Arc::new(|_| {});
+        let (handler, peer_slot) = ChatHandler::new(cs.clone(), sink);
+        let peer = DeviceId::from("pb-sender");
+        let _ = peer_slot.set(peer.clone());
+
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        let frame = Receipt::read_through(&m.id)
+            .to_frame(ChannelId::new(1))
+            .unwrap();
+        handler.handle(frame).await.unwrap();
+
+        assert!(cs.history(&peer).unwrap()[0].read_at.is_some());
     }
 
     #[tokio::test]

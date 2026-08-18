@@ -8,7 +8,7 @@ use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
 use peerbeam_transfer::{SessionHandle, TransferControl};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::message::{ChatError, ChatMessage, FileDecline, FileRef, Reaction};
+use crate::message::{ChatError, ChatMessage, FileDecline, FileRef, Reaction, Receipt};
 use crate::record::{ChatRecord, FileMeta, Kind, Status};
 use crate::staging::{StagingLimits, StagingStore};
 use crate::store::{ChatStore, OutboxEntry, StagedFile};
@@ -408,6 +408,24 @@ pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), Se
 /// `CHAT_FEAT_FILEDECLINE`; sending a message the negotiation says the peer does
 /// not speak is exactly the silent wire drift capability negotiation exists to
 /// prevent.
+/// Send one [`Receipt`] — a read watermark — over the peer's CHAT channel.
+///
+/// Whether a receipt should be sent at all is the caller's decision: it depends
+/// on `DeviceConfig::share_read_receipts`, which is a privacy choice and has no
+/// business being read down here.
+pub async fn send_receipt(handle: &SessionHandle, r: &Receipt) -> Result<(), SendError> {
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+    let frame = r.to_frame(channel)?;
+    handle
+        .send_on_channel(channel, Receipt::message_type(), frame.flags, frame.payload)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
+}
+
 /// Send one [`Reaction`] to a peer over its own CHAT channel.
 ///
 /// Same shape as [`send_file_decline`]: open, wait for open, send. The caller

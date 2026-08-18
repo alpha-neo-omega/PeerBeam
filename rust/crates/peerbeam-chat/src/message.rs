@@ -28,6 +28,8 @@ pub const MSG_FILE_REF: u16 = 2;
 pub const MSG_FILE_DECLINE: u16 = 3;
 /// MessageType id for a reaction within the Chat channel namespace.
 pub const MSG_REACTION: u16 = 4;
+/// MessageType id for a read receipt within the Chat channel namespace.
+pub const MSG_RECEIPT: u16 = 5;
 /// Maximum length of a reaction, in bytes.
 ///
 /// An emoji is a handful of scalar values at most — a family emoji with skin
@@ -51,6 +53,8 @@ pub enum ChatError {
     BadName(String),
     #[error("bad reaction: {0}")]
     BadReaction(String),
+    #[error("bad receipt: {0}")]
+    BadReceipt(String),
     #[error("bad file id: {0}")]
     BadId(String),
     /// An outbox entry exists but could not be decoded — most likely written
@@ -434,6 +438,76 @@ impl Reaction {
     }
 }
 
+/// "I have read your messages up to and including `read_through`."
+///
+/// **A watermark, not a per-message acknowledgement.** Message ids are
+/// lexicographically time-ordered ([`mint_id`]), so one id names a prefix of
+/// the conversation, and one receipt covers a whole thread-read instead of one
+/// frame per message. That makes it naturally idempotent — re-applying a
+/// watermark marks nothing new — and monotonic, since a watermark only ever
+/// moves forward. A per-message scheme would need dedup, ordering, and a
+/// decision about what a receipt for a message you never sent means.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Receipt {
+    /// The newest message of ours the peer has read, inclusive.
+    pub read_through: String,
+    /// RFC 3339 time the peer read it.
+    pub timestamp: String,
+}
+
+impl Receipt {
+    /// A receipt saying everything up to `read_through` has been read.
+    #[must_use]
+    pub fn read_through(id: &str) -> Receipt {
+        Receipt {
+            read_through: id.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// The chat MessageType (`Receipt` = 5).
+    #[must_use]
+    pub fn message_type() -> MessageType {
+        MessageType::new(MSG_RECEIPT)
+    }
+
+    /// Encode as a Chat-channel frame. OPTIONAL, like every chat message added
+    /// after 2a: a peer that predates receipts skips it rather than failing the
+    /// channel.
+    pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, ChatError> {
+        let payload = serde_json::to_vec(self)
+            .map(Bytes::from)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(SessionFrame::new(
+            channel,
+            Self::message_type(),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            payload,
+        ))
+    }
+
+    /// Decode from a Chat-channel frame, bounding the watermark id.
+    ///
+    /// `read_through` authorizes nothing on its own: `ChatStore::apply_receipt`
+    /// marks only **our own outgoing** rows, inside this peer's own namespace,
+    /// so a receipt can neither reach another conversation nor rewrite a row
+    /// the peer itself sent.
+    pub fn from_frame(frame: &SessionFrame) -> Result<Receipt, ChatError> {
+        if frame.message_type.get() != MSG_RECEIPT {
+            return Err(ChatError::WrongType(frame.message_type.get()));
+        }
+        let r: Receipt = serde_json::from_slice(&frame.payload)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        if r.read_through.is_empty() || r.read_through.len() > MAX_ID {
+            return Err(ChatError::BadReceipt(format!(
+                "read_through length {} (max {MAX_ID})",
+                r.read_through.len()
+            )));
+        }
+        Ok(r)
+    }
+}
+
 /// Last-minted (millis, suffix) pair, used only to keep [`mint_id`]
 /// monotonically non-decreasing when two ids are minted within the same
 /// wall-clock millisecond (routine under fast/automated sends, where an
@@ -466,6 +540,35 @@ pub fn mint_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receipt_round_trips_and_ships_optional() {
+        let r = Receipt::read_through("m-9");
+        let frame = r.to_frame(ChannelId::new(2)).unwrap();
+        assert_eq!(frame.message_type.get(), MSG_RECEIPT);
+        assert!(
+            frame.flags.contains(MessageFlags::OPTIONAL),
+            "a peer predating receipts must skip, not fail the channel"
+        );
+        assert_eq!(Receipt::from_frame(&frame).unwrap(), r);
+    }
+
+    #[test]
+    fn an_empty_or_oversized_watermark_is_refused() {
+        let mut r = Receipt::read_through("m-9");
+        r.read_through = String::new();
+        assert!(matches!(
+            Receipt::from_frame(&r.to_frame(ChannelId::new(1)).unwrap()),
+            Err(ChatError::BadReceipt(_))
+        ));
+
+        let mut r = Receipt::read_through("m-9");
+        r.read_through = "i".repeat(MAX_ID + 1);
+        assert!(matches!(
+            Receipt::from_frame(&r.to_frame(ChannelId::new(1)).unwrap()),
+            Err(ChatError::BadReceipt(_))
+        ));
+    }
+
     #[test]
     fn reaction_round_trips_and_states_its_intent() {
         let r = Reaction::add("m-1", "\u{1F44D}");

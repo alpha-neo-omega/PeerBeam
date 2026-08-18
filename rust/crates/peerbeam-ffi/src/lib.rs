@@ -10,6 +10,7 @@
 //!   [`pb_free_string`]. Dart allocates argument strings and frees them itself.
 //! - **No bytes cross.** Files are referred to by path; streaming stays in Rust.
 
+mod chat_receipts;
 mod clipboard;
 mod dto;
 mod error;
@@ -554,6 +555,21 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
+}
+
+/// Tell a peer we have read its messages up to `read_through`:
+/// `{peer, read_through}` → `{sent}`.
+///
+/// `sent` is false — with no error — when the user has not opted into read
+/// receipts (`share_read_receipts`, default off), when the peer is unreachable,
+/// or when its build predates receipts. Silence is the default state of this
+/// feature, not a fault.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_mark_read(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_mark_read(&read_json(json)?))()))
 }
 
 /// React to one message in a conversation: `{peer, id, emoji, remove?}` →

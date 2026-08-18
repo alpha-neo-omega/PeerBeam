@@ -3059,6 +3059,73 @@ impl Manager {
     /// conversation it was read from, so tapping it opens the right thread.
     ///
     /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    /// Tell a peer we have read its messages: `{peer, read_through}` →
+    /// `{sent}`.
+    ///
+    /// Sends nothing at all unless the user has opted in
+    /// (`share_read_receipts`, default off). A read receipt discloses when
+    /// *you* looked, which is a fact about your attention rather than about the
+    /// message, so the default is silence and `sent: false` is the ordinary
+    /// answer rather than a failure.
+    ///
+    /// One watermark rather than one message per receipt: ids are
+    /// time-ordered, so a single id names the prefix of the conversation that
+    /// has been read. That makes the message idempotent and monotonic, and one
+    /// thread-read costs one frame.
+    ///
+    /// Nothing is written locally. Whether *we* have read a peer's messages is
+    /// the surface's own business — persisting it here would invent a second
+    /// read-state that no wire message maintains.
+    pub fn chat_mark_read(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let read_through = req
+            .get("read_through")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "read_through required".into()))?;
+        if read_through.is_empty() || read_through.len() > peerbeam_chat::MAX_ID {
+            return Err((
+                Code::InvalidArgument,
+                format!("read_through must be 1..={} bytes", peerbeam_chat::MAX_ID),
+            ));
+        }
+        if !crate::chat_receipts::sending_enabled() {
+            return Ok(json!({ "sent": false }));
+        }
+        permit_chat(self.trust.as_ref(), &device.id)?;
+
+        let r = peerbeam_chat::Receipt::read_through(read_through);
+        let me = self.clone();
+        let sent = crate::runtime::block_on(async move { me.deliver_receipt(device, r).await });
+        Ok(json!({ "sent": sent }))
+    }
+
+    /// Put one read receipt on the wire if the peer is reachable and
+    /// understands them. Never fails the caller.
+    async fn deliver_receipt(self: &Arc<Self>, device: Device, r: peerbeam_chat::Receipt) -> bool {
+        let meta = self.session(&format!("receipt-{}", device.id.0), device.id.clone(), 0);
+        let Ok(session) = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        else {
+            return false;
+        };
+        if !crate::session_exec::caps_support_receipt(&session.capabilities) {
+            return false;
+        }
+        peerbeam_chat::send_receipt(&session.handle, &r)
+            .await
+            .is_ok()
+    }
+
     /// React to one message: `{peer, id, emoji, remove?}` →
     /// `{applied, delivered}`.
     ///

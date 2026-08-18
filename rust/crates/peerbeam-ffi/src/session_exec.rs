@@ -17,8 +17,8 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM,
-    PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP,
+    PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
@@ -126,7 +126,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::new(TRANSFER))
         .with(Capability::with_features(
             CHAT,
-            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION | CHAT_FEAT_RECEIPT,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
@@ -170,6 +170,18 @@ pub fn caps_support_file_decline(caps: &CapabilitySet) -> bool {
 pub fn caps_support_reaction(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_REACTION != 0)
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// chat `Receipt` feature, i.e. whether telling this peer "I have read your
+/// messages up to here" would mean anything to it.
+///
+/// Advertising the bit says only that a peer can *apply* a receipt. Whether
+/// this device *sends* one is `DeviceConfig::share_read_receipts` — a privacy
+/// choice, kept off the wire.
+pub fn caps_support_receipt(caps: &CapabilitySet) -> bool {
+    caps.features(CHAT)
+        .is_some_and(|f| f & CHAT_FEAT_RECEIPT != 0)
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver

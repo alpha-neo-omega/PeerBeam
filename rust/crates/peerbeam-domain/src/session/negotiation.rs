@@ -124,6 +124,22 @@ pub const CHAT_FEAT_FILEDECLINE: u32 = 1 << 1;
 /// against a peer that predates it.
 pub const CHAT_FEAT_REACTION: u32 = 1 << 2;
 
+/// Feature bit on the CHAT capability: this peer understands the `Receipt`
+/// message (chat MessageType 5) — telling it "I have read your messages up to
+/// here" will mean something.
+///
+/// **A receive capability, read like [`CHAT_FEAT_FILEREF`]**: it asserts
+/// comprehension, not behaviour. A build advertises it if it can *apply* a
+/// receipt, regardless of whether its user has opted into *sending* one —
+/// those are different questions, and conflating them would make a privacy
+/// setting visible on the wire. Whether this device sends receipts is
+/// `DeviceConfig::share_read_receipts`, which is nobody else's business.
+///
+/// Advertising it is not a wire change: it rides the `Capability.features`
+/// bitset already on the wire, and [`CapabilitySet::intersect`] ANDs it away
+/// against a peer that predates it.
+pub const CHAT_FEAT_RECEIPT: u32 = 1 << 3;
+
 /// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
 /// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
 /// something.

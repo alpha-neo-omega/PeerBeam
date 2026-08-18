@@ -54,6 +54,15 @@ fn defaults() -> Value {
         // is missing or unparseable, so a settings file this build cannot read
         // is never mistaken for consent.
         crate::presence::SHARE_KEY: false,
+        // "Tell people when you have read their messages" — **default off**,
+        // for the reason presence is (I11): a read receipt discloses when *you*
+        // looked, which is a fact about your attention rather than about the
+        // message. Reading someone's message must never be the act that reports
+        // on you. Like the others, an absent or unparseable key reads as false,
+        // so a settings document written before receipts existed is never
+        // mistaken for consent. It gates **sending** only: receipts a peer
+        // sends are still applied, so opting out costs you nothing others do.
+        crate::chat_receipts::SHARE_KEY: false,
         // "Sync clipboard with trusted devices" — **default off**, and that
         // default carries even more weight than presence's (I11): the
         // clipboard is the one buffer guaranteed to sometimes hold a password,
