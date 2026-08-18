@@ -18,7 +18,7 @@ use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
-    PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
+    PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
@@ -145,7 +145,10 @@ fn advertised_caps() -> CapabilitySet {
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION | CHAT_FEAT_RECEIPT,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
-        .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
+        .with(Capability::with_features(
+            PRESENCE,
+            PRESENCE_FEAT_STATUS | PRESENCE_FEAT_RING,
+        ))
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
         .with(Capability::with_features(NOTES, NOTES_FEAT_SYNC))
 }
@@ -199,6 +202,14 @@ pub fn caps_support_reaction(caps: &CapabilitySet) -> bool {
 pub fn caps_support_receipt(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_RECEIPT != 0)
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// presence `Ring` feature: whether asking this peer to make itself findable
+/// would mean anything.
+pub fn caps_support_ring(caps: &CapabilitySet) -> bool {
+    caps.features(PRESENCE)
+        .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries the
@@ -360,7 +371,11 @@ async fn establish(
     if let Some(w) = &presence {
         let sink: PresenceSink =
             Arc::new(|peer, entry| crate::presence::emit_updated(&peer, &entry));
-        let (h, slot) = PresenceHandler::new(w.registry.clone(), sink);
+        // Ringing is gated where it is acted on, not here: the handler only
+        // reports that a peer asked, and `crate::presence::ring_sink` decides
+        // whether this device answers.
+        let (h, slot) =
+            PresenceHandler::new(w.registry.clone(), sink, crate::presence::ring_sink());
         presence_slot = Some(slot);
         handlers.push(h as Arc<dyn MessageHandler>);
     }

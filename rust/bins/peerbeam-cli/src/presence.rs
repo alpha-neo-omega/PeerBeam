@@ -63,6 +63,79 @@ pub fn enabled() -> bool {
     sharing().is_some_and(|s| s.enabled)
 }
 
+/// `peerbeam ring <PEER> [--seconds N]`.
+///
+/// Opens a session and asks the device to make itself findable. Success here
+/// means the request went out, not that anything made a sound: whether a device
+/// rings is its own decision, taken against its `presence` permission for this
+/// machine, and it deliberately never answers. A caller told "refused" could
+/// enumerate which devices are listening and which permission each holds.
+pub async fn ring(
+    ctx: &crate::output::Ctx,
+    args: crate::cli::RingArgs,
+    path_override: Option<&str>,
+) -> crate::exit::CliResult {
+    use crate::exit::CliError;
+
+    let config = crate::commands::load_config(path_override)?;
+    let sc = crate::commands::SecureCtx::build(&config)?;
+    let devices = crate::commands::snapshot(config.clone(), 2).await;
+    let candidates: Vec<(String, String)> = devices
+        .iter()
+        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+        .collect();
+    let index = crate::commands::resolve_peer(ctx, &candidates, &Some(args.peer))?;
+    let device = devices[index].device.clone();
+
+    let quic =
+        std::sync::Arc::new(peerbeam_transfer_quic::QuicTransport::new().map_err(CliError::from)?);
+    let routes = peerbeam_engine::RouteManager::new(quic.clone());
+    let session = crate::session_transfer::dial(
+        &quic, &routes, &device, "ring", &sc.ident, &sc.enc, &sc.trust, None,
+    )
+    .await
+    .map_err(|e| CliError::Other(format!("could not reach {}: {e}", device.name)))?;
+
+    if !session.supports_ring() {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} is running a build that cannot ring",
+            device.name
+        )));
+    }
+
+    let mut sender = peerbeam_presence::PresenceSender::new(
+        session.handle.clone(),
+        peerbeam_domain::id::DeviceId::from(session.peer_id.clone()),
+        session.capabilities().clone(),
+        sc.trust.clone(),
+        std::sync::Arc::new(|| false),
+        std::sync::Arc::new(peerbeam_presence::Status::default),
+    );
+    let sent = sender.ring(args.seconds).await;
+    session.close().await;
+    sent.map_err(|e| CliError::Other(format!("ringing {}: {e}", device.name)))?;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "peer": session_peer(&device), "seconds": args.seconds, "sent": true,
+        }));
+    } else {
+        ctx.line(&format!(
+            "asked {} to ring for {}s",
+            ctx.bold(&device.name),
+            args.seconds
+        ));
+    }
+    Ok(())
+}
+
+/// The device id to report, so `--json` names the device rather than the label
+/// the user happened to type.
+fn session_peer(device: &peerbeam_domain::entity::Device) -> String {
+    device.id.0.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,6 +69,8 @@ pub enum Command {
     Rules(RulesArgs),
     /// Write and read notes kept on this device.
     Notes(NotesArgs),
+    /// Make one of your devices findable — *find my device*.
+    Ring(RingArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -433,6 +435,22 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// Ask a device to make itself findable.
+///
+/// The device decides *how* — a sound, a notification, a flashing window —
+/// because a sender cannot see hardware it is not holding. It rings only if it
+/// has granted this machine the `presence` permission, and this side is never
+/// told whether it did: reporting that back would let anyone map which devices
+/// are listening.
+#[derive(Args)]
+pub struct RingArgs {
+    /// Target device (id, name, or unambiguous name prefix).
+    pub peer: String,
+    /// How long to keep signalling, in seconds (max 60).
+    #[arg(long, default_value_t = 15)]
+    pub seconds: u16,
+}
+
 /// Notes kept on this device.
 ///
 /// Text with a title and a last-edited time, nothing more. Deleting leaves a

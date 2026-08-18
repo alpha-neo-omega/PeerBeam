@@ -200,6 +200,15 @@ pub const CLIPBOARD_FEAT_CLIP: u32 = 1 << 0;
 /// `peerbeam_presence::may_share_status`.
 pub const PRESENCE_FEAT_STATUS: u32 = 1 << 0;
 
+/// Feature bit on the PRESENCE capability: this peer understands the `Ring`
+/// message (presence MessageType 2) — asking it to make itself findable will
+/// mean something.
+///
+/// Comprehension, not consent, like every feature bit. Whether a device will
+/// actually ring is `Permission::Presence` in the trust store, checked on both
+/// sides.
+pub const PRESENCE_FEAT_RING: u32 = 1 << 1;
+
 /// Feature bit on the PIPE capability: this peer understands an inbound
 /// **byte stream** on the Pipe channel (`0x0107`) — opening one and writing
 /// chunks at it will mean something.

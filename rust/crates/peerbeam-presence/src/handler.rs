@@ -14,11 +14,18 @@ use chrono::Utc;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
-use crate::message::{Status, MSG_STATUS};
+use crate::message::{Ring, Status, MSG_RING, MSG_STATUS};
 use crate::registry::{PeerStatus, PresenceRegistry};
 
 /// Called with each accepted status so a surface can refresh live.
 pub type PresenceSink = Arc<dyn Fn(DeviceId, PeerStatus) + Send + Sync>;
+
+/// Called when a peer asks this device to make itself findable.
+///
+/// A callback rather than an action, because *how* a device rings is the
+/// surface's business — a phone has a speaker and a notification channel, a
+/// headless server has neither, and this crate can see none of it.
+pub type RingSink = Arc<dyn Fn(DeviceId, Ring) + Send + Sync>;
 
 /// Serves inbound Presence-channel frames for one session. The session peer is
 /// bound once, after the handshake, via the returned [`OnceLock`] — the same
@@ -27,6 +34,7 @@ pub struct PresenceHandler {
     registry: PresenceRegistry,
     peer: Arc<OnceLock<DeviceId>>,
     sink: PresenceSink,
+    ring: RingSink,
 }
 
 impl PresenceHandler {
@@ -36,12 +44,14 @@ impl PresenceHandler {
     pub fn new(
         registry: PresenceRegistry,
         sink: PresenceSink,
+        ring: RingSink,
     ) -> (Arc<PresenceHandler>, Arc<OnceLock<DeviceId>>) {
         let peer = Arc::new(OnceLock::new());
         let handler = Arc::new(PresenceHandler {
             registry,
             peer: peer.clone(),
             sink,
+            ring,
         });
         (handler, peer)
     }
@@ -76,6 +86,19 @@ impl MessageHandler for PresenceHandler {
                 (self.sink)(peer.clone(), entry);
                 Ok(())
             }
+            // Above the fallback: `Ring` ships OPTIONAL, so an arm below would
+            // be swallowed as "unknown optional" and the device would never
+            // make a sound.
+            MSG_RING => {
+                // The duration is clamped inside `from_frame`, so nothing past
+                // this line can ask for an unbounded noise.
+                let ring = Ring::from_frame(&frame)?;
+                // Whether this device *will* ring is the surface's decision —
+                // it owns the sound, the notification and the screen. The
+                // handler's job is to say a permitted peer asked.
+                (self.ring)(peer.clone(), ring);
+                Ok(())
+            }
             // MESSAGE_REGISTRY.md §6 — unknown type: OPTIONAL means skip and
             // keep the channel; required means fail this channel only.
             other => {
@@ -94,7 +117,56 @@ impl MessageHandler for PresenceHandler {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_ring_reaches_the_sink_with_its_duration() {
+        let (h, slot, rings) = ring_handler();
+        let _ = slot.set(DeviceId::from("pb-bob"));
+
+        h.handle(Ring::new(20).to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        let got = rings.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.seconds, 20);
+        assert_eq!(got[0].0, DeviceId::from("pb-bob"));
+    }
+
+    #[tokio::test]
+    async fn an_unreasonable_ring_is_clamped_rather_than_refused() {
+        // A peer asking for an hour is being unreasonable, not hostile.
+        // Refusing outright would leave someone standing next to a silent
+        // phone; clamping answers the question they meant to ask.
+        let (h, slot, rings) = ring_handler();
+        let _ = slot.set(DeviceId::from("pb-bob"));
+
+        let mut r = Ring::new(1);
+        r.seconds = 3600;
+        h.handle(r.to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(rings.lock().unwrap()[0].1.seconds, MAX_RING_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn a_status_does_not_reach_the_ring_sink() {
+        let (h, slot, rings) = ring_handler();
+        let _ = slot.set(DeviceId::from("pb-bob"));
+
+        h.handle(
+            Status::default()
+                .to_frame(ChannelId::new(1))
+                .expect("status frame"),
+        )
+        .await
+        .unwrap();
+
+        assert!(rings.lock().unwrap().is_empty());
+    }
+
     use super::*;
+    use crate::message::MAX_RING_SECONDS;
     use bytes::Bytes;
     use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType};
     use std::sync::Mutex;
@@ -124,8 +196,22 @@ mod tests {
         let sink: PresenceSink = Arc::new(move |id, st| {
             seen_cl.lock().unwrap().push((id, st));
         });
-        let (handler, slot) = PresenceHandler::new(reg.clone(), sink);
+        let (handler, slot) = PresenceHandler::new(reg.clone(), sink, Arc::new(|_, _| {}));
         (handler, slot, reg, seen)
+    }
+
+    /// Rings observed by a handler, for the ring tests.
+    type Rings = Arc<Mutex<Vec<(DeviceId, Ring)>>>;
+
+    fn ring_handler() -> (Arc<PresenceHandler>, Arc<OnceLock<DeviceId>>, Rings) {
+        let rings: Rings = Arc::new(Mutex::new(Vec::new()));
+        let seen = rings.clone();
+        let (handler, slot) = PresenceHandler::new(
+            PresenceRegistry::new(),
+            Arc::new(|_, _| {}),
+            Arc::new(move |id, r| seen.lock().unwrap().push((id, r))),
+        );
+        (handler, slot, rings)
     }
 
     #[tokio::test]

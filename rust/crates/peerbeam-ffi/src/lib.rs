@@ -558,6 +558,21 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// Ask a device to make itself findable: `{peer, seconds?}` → `{sent}`.
+///
+/// *Find my device.* `sent` reports only that the request went out; whether the
+/// device makes a sound is its own decision, gated there on the presence
+/// permission, and this side never learns it. Deliberately independent of the
+/// presence sharing opt-in: that governs what this device reveals, and ringing
+/// reveals nothing here.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_presence_ring(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.presence_ring(&read_json(json)?))()))
+}
+
 /// Sync notes with a peer: `{peer}` → `{sent}`.
 ///
 /// Sends this device's whole set (tombstones included) and merges what the peer

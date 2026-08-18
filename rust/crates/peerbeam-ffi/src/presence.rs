@@ -71,6 +71,36 @@ pub fn sharing_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// The sink every session's `PresenceHandler` is built with.
+///
+/// **This is where a ring is authorised.** The handler reports that a peer
+/// asked; whether this device answers is a trust decision, and it is made here
+/// so there is one place that knows the rule rather than one per surface.
+///
+/// Gated on [`Permission::Presence`]: a device the user allowed to see this
+/// machine's battery and network is one they have already decided may know
+/// where it is. Ringing adds noise, not knowledge, to that relationship.
+///
+/// A refused request is silent by design — telling an ungranted peer "you may
+/// not ring this device" confirms the device exists and is listening, which is
+/// exactly what a stranger probing for hardware wants to learn.
+#[must_use]
+pub fn ring_sink() -> peerbeam_presence::RingSink {
+    Arc::new(|peer: DeviceId, ring: peerbeam_presence::Ring| {
+        let permitted = crate::runtime::manager()
+            .ok()
+            .is_some_and(|m| m.may_ring(&peer));
+        if !permitted {
+            return;
+        }
+        crate::events::emit(&json!({
+            "type": "device_ring",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "payload": { "device_id": peer.0, "seconds": ring.seconds },
+        }));
+    })
+}
+
 /// Emit a `presence_updated` event so a dashboard re-renders live rather than
 /// polling.
 pub fn emit_updated(peer: &DeviceId, entry: &PeerStatus) {

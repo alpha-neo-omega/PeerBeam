@@ -110,7 +110,7 @@ async fn pair(a_trusts_b: bool, sharing: bool, b_advertises: CapabilitySet) -> P
     let log = b_sink_log.clone();
     let sink: PresenceSink = Arc::new(move |id, st| log.lock().unwrap().push((id, st)));
     let (handler_b, peer_slot_b): (_, Arc<OnceLock<DeviceId>>) =
-        PresenceHandler::new(b_registry.clone(), sink);
+        PresenceHandler::new(b_registry.clone(), sink, std::sync::Arc::new(|_, _| {}));
 
     let (ta, tb) = MemTransport::pair();
     let (a_ev, _a_ev_rx) = unbounded_channel();
@@ -339,7 +339,11 @@ async fn sharing_off_still_receives_and_displays_an_incoming_status() {
     let frame = inbound
         .to_frame(peerbeam_domain::session::ChannelId::new(9))
         .expect("encode");
-    let (handler, slot) = PresenceHandler::new(p.b_registry.clone(), Arc::new(|_, _| {}));
+    let (handler, slot) = PresenceHandler::new(
+        p.b_registry.clone(),
+        Arc::new(|_, _| {}),
+        Arc::new(|_, _| {}),
+    );
     let _ = slot.set(DeviceId::from("device-a"));
     handler.handle(frame).await.expect("receiving is ungated");
 

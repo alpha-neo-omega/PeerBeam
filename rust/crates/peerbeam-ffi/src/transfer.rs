@@ -750,6 +750,18 @@ impl Manager {
     /// channel actor: `if let Some(h) = &handler { h.handle(sf) }`, no
     /// `else`) — so every session, dial or accept, needs this wired or a
     /// pushed message is lost even though the sender marks it delivered.
+    /// Whether `peer` may ask this device to ring.
+    ///
+    /// [`Permission::Presence`], for the reason `presence::ring_sink`
+    /// documents: a device already allowed to see this machine's status is one
+    /// the user has decided may locate it.
+    #[must_use]
+    pub fn may_ring(&self, peer: &DeviceId) -> bool {
+        use peerbeam_domain::port::TrustStore;
+        self.trust
+            .may(peer, peerbeam_domain::entity::Permission::Presence)
+    }
+
     /// The note store, for the session wiring that serves the Notes channel.
     #[must_use]
     pub fn notes_store(&self) -> peerbeam_notes::NoteStore {
@@ -3076,6 +3088,65 @@ impl Manager {
     /// conversation it was read from, so tapping it opens the right thread.
     ///
     /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    /// Ask a device to make itself findable: `{peer, seconds?}` → `{sent}`.
+    ///
+    /// The other half of *find my device*. `sent: false` means the peer could
+    /// not be reached or runs a build without ringing — whether it actually
+    /// makes a sound is its own decision, and this device never learns it.
+    ///
+    /// **Not gated on the presence sharing opt-in.** That setting governs what
+    /// this device reveals about itself; ringing asks something of the other
+    /// device and reveals nothing here, so someone who shares no status can
+    /// still find their own phone.
+    pub fn presence_ring(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let seconds = req
+            .get("seconds")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(15)
+            .min(u64::from(peerbeam_presence::MAX_RING_SECONDS)) as u16;
+        let me = self.clone();
+        let sent = crate::runtime::block_on(async move { me.deliver_ring(device, seconds).await });
+        Ok(json!({ "sent": sent }))
+    }
+
+    /// Dial and ring. Never fails the caller; every negative answer is
+    /// "not sent".
+    async fn deliver_ring(self: &Arc<Self>, device: Device, seconds: u16) -> bool {
+        let meta = self.session(&format!("ring-{}", device.id.0), device.id.clone(), 0);
+        let Ok(session) = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        else {
+            return false;
+        };
+        if !crate::session_exec::caps_support_ring(&session.capabilities) {
+            return false;
+        }
+        // Built with this device's real trust and sharing settings even though
+        // `ring` consults neither: the sender owns the channel bookkeeping both
+        // paths share, and handing it a fake gate would leave a `beat` added
+        // here later silently ungated.
+        let mut sender = peerbeam_presence::PresenceSender::new(
+            session.handle.clone(),
+            session.peer_device.clone(),
+            session.capabilities.clone(),
+            self.trust.clone(),
+            Arc::new(crate::presence::sharing_enabled),
+            Arc::new(peerbeam_presence::Status::default),
+        );
+        sender.ring(seconds).await.is_ok()
+    }
+
     /// Sync notes with a peer: `{peer}` → `{sent}`.
     ///
     /// Sends this device's whole note set — tombstones included, because a

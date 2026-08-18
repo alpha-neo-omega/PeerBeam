@@ -9,6 +9,15 @@ use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType, SessionErro
 /// (`docs/MESSAGE_REGISTRY.md` §4, Presence `Status = 1`).
 pub const MSG_STATUS: u16 = 1;
 
+/// MessageType id for a ring request within the Presence channel namespace.
+pub const MSG_RING: u16 = 2;
+
+/// How long a ring may ask a device to make itself findable, in seconds.
+///
+/// A bound, not a preference: without one a peer could ask a phone to sound
+/// indefinitely, which is a nuisance a user has to physically chase down.
+pub const MAX_RING_SECONDS: u16 = 60;
+
 /// The complete vocabulary of the [`Status::network`] field.
 ///
 /// A **frozen wire constant**: this is a closed set, and a value outside it is
@@ -22,6 +31,69 @@ pub const NETWORK_KINDS: [&str; 5] = ["lan", "wifi", "ethernet", "tailscale", "u
 /// The largest meaningful `battery_percent`. A reading above this is a broken
 /// collector on the sender, not a very full battery.
 pub const MAX_BATTERY_PERCENT: u8 = 100;
+
+/// "Make yourself findable" — the message behind *find my device*.
+///
+/// Carries nothing but a duration, because there is nothing else to say: the
+/// receiving device decides *how* to be findable (a sound, a notification, a
+/// flashing window), and a sender that dictated the method would be making a
+/// decision about hardware it cannot see.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ring {
+    /// How long to keep signalling, in seconds. Clamped on receipt.
+    pub seconds: u16,
+    /// RFC 3339 send time, for logging and for a receiver that wants to ignore
+    /// a request that sat in a queue.
+    pub timestamp: String,
+}
+
+impl Ring {
+    /// A ring for `seconds`, clamped to [`MAX_RING_SECONDS`].
+    #[must_use]
+    pub fn new(seconds: u16) -> Ring {
+        Ring {
+            seconds: seconds.clamp(1, MAX_RING_SECONDS),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// The Presence MessageType (`Ring` = 2).
+    #[must_use]
+    pub fn message_type() -> MessageType {
+        MessageType::new(MSG_RING)
+    }
+
+    /// Encode as a Presence-channel frame. OPTIONAL: a peer that predates
+    /// ringing skips it rather than failing the channel, so asking an older
+    /// device to ring costs the request and nothing else.
+    pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, PresenceError> {
+        let payload = serde_json::to_vec(self)
+            .map(Bytes::from)
+            .map_err(|e| PresenceError::Serialization(e.to_string()))?;
+        Ok(SessionFrame::new(
+            channel,
+            Self::message_type(),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            payload,
+        ))
+    }
+
+    /// Decode from a Presence-channel frame, clamping the duration.
+    ///
+    /// Clamped rather than refused: a peer asking for an hour is being
+    /// unreasonable, not hostile, and refusing outright would leave a user
+    /// standing next to a silent phone. One minute is the most any device is
+    /// asked to make noise for.
+    pub fn from_frame(frame: &SessionFrame) -> Result<Ring, PresenceError> {
+        if frame.message_type.get() != MSG_RING {
+            return Err(PresenceError::WrongType(frame.message_type.get()));
+        }
+        let mut r: Ring = serde_json::from_slice(&frame.payload)
+            .map_err(|e| PresenceError::Serialization(e.to_string()))?;
+        r.seconds = r.seconds.clamp(1, MAX_RING_SECONDS);
+        Ok(r)
+    }
+}
 
 /// Errors from encoding/decoding/validating a status message.
 #[derive(Debug, thiserror::Error)]

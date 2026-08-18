@@ -151,6 +151,28 @@ impl PresenceSender {
         Ok(Beat::Sent)
     }
 
+    /// Ask the peer to make itself findable for `seconds`.
+    ///
+    /// Independent of [`may_send`](Self::may_send) and of the heartbeat: that
+    /// gate is the *sharing* opt-in, which governs whether this device reveals
+    /// its own battery and network. Ringing reveals nothing about this device —
+    /// it asks something of the other one — so a user who shares no status can
+    /// still find their phone.
+    pub async fn ring(&mut self, seconds: u16) -> Result<(), SendError> {
+        let channel = self.ensure_channel().await?;
+        let r = crate::message::Ring::new(seconds);
+        let frame = r.to_frame(channel)?;
+        self.handle
+            .send_on_channel(
+                channel,
+                crate::message::Ring::message_type(),
+                frame.flags,
+                frame.payload,
+            )
+            .await
+            .map_err(|e| SendError::Session(e.to_string()))
+    }
+
     /// Heartbeat until the session ends: once immediately (so a dashboard
     /// populates on connect rather than up to a minute later), then every
     /// `interval`.

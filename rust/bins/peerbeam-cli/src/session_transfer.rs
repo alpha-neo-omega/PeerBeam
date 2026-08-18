@@ -36,7 +36,7 @@ use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
     CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
-    PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
+    PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
@@ -134,7 +134,10 @@ fn advertised_caps() -> CapabilitySet {
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION | CHAT_FEAT_RECEIPT,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
-        .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
+        .with(Capability::with_features(
+            PRESENCE,
+            PRESENCE_FEAT_STATUS | PRESENCE_FEAT_RING,
+        ))
         .with(Capability::with_features(PIPE, PIPE_FEAT_STREAM))
         .with(Capability::with_features(
             ChannelType::NOTES,
@@ -230,6 +233,15 @@ impl Session {
         caps_support_file_ref(&self.capabilities)
     }
 
+    /// Whether the peer negotiated ringing — whether asking it to make itself
+    /// findable would mean anything.
+    #[must_use]
+    pub fn supports_ring(&self) -> bool {
+        self.capabilities
+            .features(ChannelType::PRESENCE)
+            .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
+    }
+
     /// Whether the peer negotiated note sync — whether sending it notes would
     /// mean anything at all.
     #[must_use]
@@ -320,6 +332,12 @@ async fn establish(
     let (presence_handler, presence_slot) = PresenceHandler::new(
         crate::presence::registry().clone(),
         Arc::new(|_peer, _entry| {}),
+        // A CLI has no speaker and no notification tray. It prints the request
+        // to stderr so a `peerbeam daemon` on a headless box leaves a trace of
+        // who asked — and does not pretend to have rung.
+        Arc::new(|peer, ring: peerbeam_presence::Ring| {
+            eprintln!("ring requested by {} for {}s", peer.0, ring.seconds);
+        }),
     );
     handlers.push(presence_handler as Arc<dyn MessageHandler>);
     // Clipboard, for the same reason and on the same unconditional terms: this

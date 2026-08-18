@@ -33,9 +33,10 @@ mod send;
 
 pub use collect::{battery, collect, network, storage_free};
 pub use gate::{caps_support_status, may_share_status};
-pub use handler::{PresenceHandler, PresenceSink};
+pub use handler::{PresenceHandler, PresenceSink, RingSink};
 pub use message::{
-    is_known_network, PresenceError, Status, MAX_BATTERY_PERCENT, MSG_STATUS, NETWORK_KINDS,
+    is_known_network, PresenceError, Ring, Status, MAX_BATTERY_PERCENT, MAX_RING_SECONDS, MSG_RING,
+    MSG_STATUS, NETWORK_KINDS,
 };
 pub use registry::{PeerStatus, PresenceRegistry};
 pub use send::{Beat, PresenceSender, SendError, SharingSetting, StatusSource, HEARTBEAT_INTERVAL};

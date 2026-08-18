@@ -48,6 +48,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
+        Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
