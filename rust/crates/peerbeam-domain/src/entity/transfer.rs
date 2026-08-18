@@ -63,6 +63,22 @@ pub struct TransferSession {
     pub completed_at: Option<DateTime<Utc>>,
     /// Whether this session resumed a prior interrupted one.
     pub is_resume: bool,
+    /// Whether the **local** user has consented to this session's bytes.
+    ///
+    /// Always `true` for a [`Direction::Sending`] session: the local user
+    /// started it. For a [`Direction::Receiving`] session it is `true` only
+    /// once the approval gate has actually returned an acceptance — never
+    /// because a peer connected, never because a key is pinned (I6).
+    ///
+    /// This is the field that survives a crash, so it is the field that
+    /// decides whether an interrupted inbound transfer may resume without a
+    /// second prompt. A checkpoint with `accepted: false` may **never** be
+    /// resumed into an accepted transfer: a crash is not an approval. It
+    /// defaults to `false` so a checkpoint written by an older build — or one
+    /// truncated, hand-edited or otherwise missing the field — fails closed
+    /// rather than granting consent nobody gave.
+    #[serde(default)]
+    pub accepted: bool,
 }
 
 /// A progress snapshot emitted during an active transfer.

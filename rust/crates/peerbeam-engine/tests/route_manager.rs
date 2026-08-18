@@ -119,6 +119,7 @@ fn session() -> TransferSession {
         started_at: Utc::now(),
         completed_at: None,
         is_resume: false,
+        accepted: true,
     }
 }
 

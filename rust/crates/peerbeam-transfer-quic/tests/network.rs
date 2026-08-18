@@ -48,6 +48,7 @@ fn session(size: u64) -> TransferSession {
         started_at: Utc::now(),
         completed_at: None,
         is_resume: false,
+        accepted: true,
     }
 }
 

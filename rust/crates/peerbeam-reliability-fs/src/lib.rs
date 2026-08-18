@@ -71,6 +71,37 @@ impl ReliabilityStore for FsReliability {
         }
     }
 
+    fn list_checkpoints(&self) -> Result<Vec<TransferSession>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            // No directory yet simply means no checkpoint has ever been
+            // written — an empty list, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(DomainError::Storage(format!("list checkpoints: {e}"))),
+        };
+        let mut out: Vec<TransferSession> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `.json` only: `save_checkpoint`'s uniquely-named `.tmp` files may
+            // be mid-write, and a half-written temp is not a transfer.
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // A file that cannot be read or parsed is skipped rather than
+            // failing the whole listing — see the port's contract.
+            match std::fs::read(&path).ok().and_then(|bytes| {
+                serde_json::from_slice::<TransferSession>(&bytes)
+                    .map_err(|e| tracing::warn!(path = %path.display(), error = %e, "unreadable checkpoint skipped"))
+                    .ok()
+            }) {
+                Some(session) => out.push(session),
+                None => continue,
+            }
+        }
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(out)
+    }
+
     fn resumable_offset(&self, transfer: &TransferId) -> Result<u64> {
         Ok(self
             .load_checkpoint(transfer)?
@@ -124,6 +155,7 @@ mod tests {
             started_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             completed_at: None,
             is_resume: false,
+            accepted: true,
         }
     }
 
@@ -156,6 +188,59 @@ mod tests {
         assert!(store.load_checkpoint(&id).unwrap().is_none());
         // Clearing a missing checkpoint is a no-op.
         store.clear_checkpoint(&id).unwrap();
+    }
+
+    #[test]
+    fn listing_returns_every_checkpoint_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsReliability::new(dir.path());
+        assert!(store.list_checkpoints().unwrap().is_empty());
+
+        let mut old = session("older", 10);
+        old.started_at = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        store.save_checkpoint(&old).unwrap();
+        store.save_checkpoint(&session("newer", 20)).unwrap();
+
+        let all = store.list_checkpoints().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id.as_str(), "newer");
+        assert_eq!(all[1].id.as_str(), "older");
+    }
+
+    #[test]
+    fn one_corrupt_checkpoint_does_not_cost_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsReliability::new(dir.path());
+        store.save_checkpoint(&session("good", 42)).unwrap();
+        std::fs::write(dir.path().join("broken.json"), b"{ not json").unwrap();
+        // A stray temp from an interrupted write is not a transfer either.
+        std::fs::write(dir.path().join("good.json.99.0.tmp"), b"{}").unwrap();
+
+        let all = store.list_checkpoints().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id.as_str(), "good");
+    }
+
+    #[test]
+    fn a_checkpoint_missing_the_consent_field_reads_as_not_accepted() {
+        // Fail closed: a checkpoint written before `accepted` existed, or one
+        // truncated/edited, must never be read as consent the user gave.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsReliability::new(dir.path());
+        let mut json = serde_json::to_value(session("legacy", 5)).unwrap();
+        json.as_object_mut().unwrap().remove("accepted");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("legacy.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store
+            .load_checkpoint(&TransferId::from("legacy"))
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.accepted);
     }
 
     #[test]

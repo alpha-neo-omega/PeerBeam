@@ -160,6 +160,7 @@ fn dial_meta(device: &Device, id: &str) -> TransferSession {
         started_at: chrono::Utc::now(),
         completed_at: None,
         is_resume: false,
+        accepted: true,
     }
 }
 
