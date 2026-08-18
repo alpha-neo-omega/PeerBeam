@@ -65,6 +65,8 @@ pub enum Command {
     History(HistoryArgs),
     /// List, approve or revoke the devices this machine trusts.
     Trust(TrustArgs),
+    /// List, add or remove the rules that choose where received files land.
+    Rules(RulesArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -324,6 +326,54 @@ pub enum TrustAction {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
         device: String,
+    },
+}
+
+/// `peerbeam rules` — where received files land.
+///
+/// A rule is a match plus a destination, and it decides **where** an accepted
+/// file is written, never **whether** it is accepted. Nothing here touches the
+/// approval prompt or `device.auto_accept_trusted`; rules are read after a
+/// transfer has been accepted and is on its way to disk.
+#[derive(Args)]
+pub struct RulesArgs {
+    #[command(subcommand)]
+    pub action: RulesAction,
+}
+
+#[derive(Subcommand)]
+pub enum RulesAction {
+    /// List the rules in order. The first one that matches a file wins.
+    List,
+    /// Add a rule. Omitted criteria match everything; with none at all the
+    /// rule is a catch-all.
+    Add {
+        /// Absolute destination directory. Its parent must already exist.
+        #[arg(value_name = "DIRECTORY")]
+        directory: String,
+        /// Only files from this device (id, name, or unambiguous name prefix,
+        /// as shown by `trust list`). Stored as the device's authenticated id.
+        #[arg(long, value_name = "DEVICE")]
+        from: Option<String>,
+        /// Only files with this extension (with or without the leading dot).
+        #[arg(long, value_name = "EXT")]
+        ext: Option<String>,
+        /// Only files of at least this many bytes (inclusive).
+        #[arg(long, value_name = "BYTES")]
+        min_bytes: Option<u64>,
+        /// Only files of at most this many bytes (inclusive).
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: Option<u64>,
+        /// Insert at this position instead of appending. Order is the
+        /// tie-break between two rules that both match.
+        #[arg(long, value_name = "INDEX")]
+        at: Option<usize>,
+    },
+    /// Remove the rule at this position (as shown by `rules list`).
+    Remove {
+        /// Rule position, from `rules list`.
+        #[arg(value_name = "INDEX")]
+        index: usize,
     },
 }
 

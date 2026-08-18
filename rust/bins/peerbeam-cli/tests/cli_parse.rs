@@ -1,7 +1,9 @@
 //! Argument-parsing tests for the CLI surface.
 
 use clap::{CommandFactory, Parser};
-use peerbeam_cli::cli::{BenchTarget, ChatAction, Cli, Command, ConfigAction, TrustAction};
+use peerbeam_cli::cli::{
+    BenchTarget, ChatAction, Cli, Command, ConfigAction, RulesAction, TrustAction,
+};
 
 #[test]
 fn command_definition_is_valid() {
@@ -351,5 +353,100 @@ fn trust_approve_accepts_yes_on_either_side() {
     ] {
         let cli = Cli::try_parse_from(args).unwrap();
         assert!(cli.global.yes);
+    }
+}
+
+// ── rules ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn rules_subcommands_parse() {
+    let cli = Cli::try_parse_from(["peerbeam", "rules", "list"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Rules(a) if matches!(a.action, RulesAction::List)
+    ));
+
+    let cli = Cli::try_parse_from(["peerbeam", "rules", "remove", "2"]).unwrap();
+    match cli.command {
+        Command::Rules(a) => match a.action {
+            RulesAction::Remove { index } => assert_eq!(index, 2),
+            _ => panic!("expected remove"),
+        },
+        _ => panic!("expected rules"),
+    }
+}
+
+/// Every criterion is optional, and the destination is not. A rule with no
+/// destination has nowhere to put anything; a rule with no criteria is a
+/// legitimate catch-all.
+#[test]
+fn rules_add_needs_a_destination_and_nothing_else() {
+    let cli = Cli::try_parse_from(["peerbeam", "rules", "add", "/srv/inbox"]).unwrap();
+    match cli.command {
+        Command::Rules(a) => match a.action {
+            RulesAction::Add {
+                directory,
+                from,
+                ext,
+                min_bytes,
+                max_bytes,
+                at,
+            } => {
+                assert_eq!(directory, "/srv/inbox");
+                assert_eq!(from, None);
+                assert_eq!(ext, None);
+                assert_eq!(min_bytes, None);
+                assert_eq!(max_bytes, None);
+                assert_eq!(at, None);
+            }
+            _ => panic!("expected add"),
+        },
+        _ => panic!("expected rules"),
+    }
+
+    assert!(Cli::try_parse_from(["peerbeam", "rules", "add"]).is_err());
+}
+
+/// Every criterion, and the position — the flag that makes the tie-break
+/// reachable from a script.
+#[test]
+fn rules_add_parses_every_criterion_and_a_position() {
+    let cli = Cli::try_parse_from([
+        "peerbeam",
+        "rules",
+        "add",
+        "/mnt/big",
+        "--from",
+        "laptop",
+        "--ext",
+        "mkv",
+        "--min-bytes",
+        "1000",
+        "--max-bytes",
+        "2000",
+        "--at",
+        "0",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Rules(a) => match a.action {
+            RulesAction::Add {
+                directory,
+                from,
+                ext,
+                min_bytes,
+                max_bytes,
+                at,
+            } => {
+                assert_eq!(directory, "/mnt/big");
+                assert_eq!(from.as_deref(), Some("laptop"));
+                assert_eq!(ext.as_deref(), Some("mkv"));
+                assert_eq!(min_bytes, Some(1000));
+                assert_eq!(max_bytes, Some(2000));
+                assert_eq!(at, Some(0));
+            }
+            _ => panic!("expected add"),
+        },
+        _ => panic!("expected rules"),
     }
 }

@@ -46,6 +46,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Pipe(a) => crate::pipe::pipe(ctx, a, cfg_override.as_deref()).await,
         Command::History(a) => history_cmd(ctx, a, cfg_override.as_deref()),
         Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
+        Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -1183,7 +1184,16 @@ async fn receive(ctx: &Ctx, args: ReceiveArgs, path_override: Option<&str>) -> C
         .clone()
         .unwrap_or_else(|| config.storage.save_directory.clone());
     std::fs::create_dir_all(&dir)?;
-    serve_loop(ctx, &config, port, &dir, args.once).await
+    // `--dir` is an explicit destination for *this run*, so it wins outright:
+    // rules are not consulted at all. A stored rule quietly overriding a
+    // directory the operator just typed on the command line would be the
+    // surprising direction, and this doubles as the way to say "ignore my
+    // rules once" without editing them.
+    let rules: &[peerbeam_config::SaveRule] = match args.dir {
+        Some(_) => &[],
+        None => &config.storage.rules,
+    };
+    serve_loop(ctx, &config, port, &dir, rules, args.once).await
 }
 
 /// Background daemon: serve transfers until interrupted.
@@ -1205,7 +1215,7 @@ async fn daemon(ctx: &Ctx, args: DaemonArgs, path_override: Option<&str>) -> Cli
             } else {
                 ctx.line(&ctx.dim("daemon: serving transfers (Ctrl-C to stop)"));
             }
-            serve_loop(ctx, &config, port, &dir, false).await
+            serve_loop(ctx, &config, port, &dir, &config.storage.rules, false).await
         }
         DaemonAction::Stop | DaemonAction::Status => Err(CliError::Unavailable(
             "daemon IPC (stop/status) is not implemented; run `daemon start` (it always runs in the foreground)".into(),
@@ -1449,13 +1459,19 @@ fn settle_received_chat_file(
 }
 
 /// Serve inbound QUIC connections as PeerSessions, accept each peer's transfer
-/// channel, and receive one file or folder per connection into `dir`. Advertises
-/// presence via discovery so senders find us.
+/// channel, and receive one file or folder per connection. Advertises presence
+/// via discovery so senders find us.
+///
+/// `dir` is where an item lands when no rule claims it — today's
+/// `storage.save_directory`, or whatever `receive --dir` overrode it with.
+/// `rules` is the ordered list consulted first; an empty slice is "no rules",
+/// which is exactly the behaviour that shipped before rules existed.
 async fn serve_loop(
     ctx: &Ctx,
     config: &EngineConfig,
     port: u16,
     dir: &str,
+    rules: &[peerbeam_config::SaveRule],
     once: bool,
 ) -> CliResult {
     use futures::StreamExt;
@@ -1762,6 +1778,48 @@ async fn serve_loop(
                     (!preview.name.is_empty()).then_some((preview.name.as_str(), preview.size)),
                     None,
                 );
+
+                // **Where this item lands.** The one call site: the matcher is
+                // consulted once, here, after the transfer has been accepted
+                // and immediately before its bytes are written. It cannot
+                // affect *whether* anything is accepted — everything that
+                // decides that has already run above (I6).
+                //
+                // The three inputs are the authenticated sender id, the
+                // *sanitized* name (`preview.name` is what `peek_incoming_meta`
+                // put through `sanitize_file_name`, never the raw wire name)
+                // and the size. A peek that learned nothing leaves the name
+                // empty and the size zero, which simply matches fewer rules —
+                // a catch-all still applies, and `dir` is still the answer when
+                // nothing matches.
+                let dest = peerbeam_config::rules::destination(
+                    rules,
+                    dir,
+                    &peer_id,
+                    &preview.name,
+                    preview.size,
+                );
+                // A destination that failed must be *said*, not swallowed. The
+                // file is safe — it is going to `dir` — but a user who wrote a
+                // rule believes the sort happened.
+                if let Some(fb) = &dest.fallback {
+                    let msg = format!(
+                        "rule destination {} is unusable ({}); saving to {} instead",
+                        fb.rule_directory, fb.reason, dest.directory
+                    );
+                    if ctx.json {
+                        ctx.json_line(&json!({
+                            "event": "rule_fallback",
+                            "rule_directory": fb.rule_directory,
+                            "directory": dest.directory,
+                            "reason": fb.reason,
+                            "peer": peer_id,
+                        }));
+                    } else {
+                        ctx.line(&ctx.yellow(&msg));
+                    }
+                }
+                let dir = dest.directory.as_str();
 
                 let storage_ref = &storage;
                 let handle = &session.handle;
