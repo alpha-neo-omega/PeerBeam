@@ -58,7 +58,8 @@ nobody chose any of them — so `is_trusted`, which is "is there a record", is
 
 Approval is set by an act of a person: accept-and-trust in the app, or
 `peerbeam trust approve <device>` at a shell. It is what the three features that
-send something outward on the user's behalf, without asking again, gate on:
+send something outward on the user's behalf, without asking again, gate on — and
+what a device's [permissions](#what-an-approved-device-may-do) then narrow:
 
 - **presence** — battery level, free disk and network kind, on every heartbeat;
 - **clipboard sync** — whatever the user last copied;
@@ -72,14 +73,148 @@ predicate cannot pass silently, and `peerbeam-cli/tests/pipe_e2e.rs` proves the
 same thing across two real processes.
 
 Revoking (`peerbeam trust revoke`, or Trusted Devices in the app) removes the
-whole record rather than just the flag, so the next connection is a fresh first
-contact: re-pinned, and unapproved until someone says otherwise. Both the CLI
-and the app mean the same thing by the word.
+whole record — permissions included — rather than just the flag, so the next
+connection is a fresh first contact: re-pinned, and unapproved until someone says
+otherwise. Both the CLI and the app mean the same thing by the word. To keep a
+device but take one power away, withhold that permission instead
+(`peerbeam trust revoke-permission`).
 
 Approval had been reachable only from the app's accept-and-trust prompt, which
 left a headless or CLI-only machine — a first-class target for this project —
 unable to use any of the three features at all. `peerbeam trust` closes that;
 see [CLI](CLI.md).
+
+## What an approved device may do
+
+Approval answers *whether* the user chose a device. Permissions answer **what**
+that choice left it. `VISION.md` permits remote capabilities only as "explicit,
+**permissioned**, narrowly-scoped actions", and I6 requires "explicit,
+revocable, **per-capability** consent"; one `approved` bit could express neither.
+Before this, approving a laptop so it could receive files also granted it this
+machine's clipboard, its status heartbeat, and an accepted pipe, with no way to
+say otherwise.
+
+A `TrustRecord` therefore carries a **permission set** alongside `approved`,
+covering the features that exist today:
+
+| Permission | Governs | Enforced in |
+|---|---|---|
+| `files` | inbound file transfers | `peerbeam_ffi::transfer::admit_transfer` |
+| `chat` | outbound chat messages and in-chat file shares | `peerbeam_chat::gate::may_exchange_chat` |
+| `clipboard` | this machine's clipboard leaving for that peer | `peerbeam_clipboard::gate::may_share_clip` |
+| `presence` | this machine's status heartbeat leaving for that peer | `peerbeam_presence::gate::may_share_status` |
+| `pipe` | an inbound `pipe` reaching a listening terminal | `peerbeam_transfer::pipe::gate::may_accept_pipe` |
+
+There is deliberately **no permission for a feature that does not exist**. One
+could not be tested, and would be the wrong shape by the time its feature was
+built.
+
+### One predicate
+
+`TrustStore::may(device, Permission)` is the only thing in the workspace that
+reads the set. Every gate calls it as one more named leg in the pure function it
+already was, so there is one place to read, one place to test, and no way for
+two features to disagree about what a grant means.
+
+`may` **implies approval**: an unapproved device may nothing, whatever its bits
+say. That rule lives in `TrustRecord::effective_permissions`, so the predicate
+and every listing agree by construction — a stranger the handshake pinned is
+never even *shown* holding a permission it cannot use. It fails **closed** on a
+store error, exactly as `is_approved` does. This is the same lesson as
+[Pinned is not approved](#pinned-is-not-approved) one level down: a predicate
+that skipped approval would answer `true` for a peer nobody chose.
+
+The gates keep their own `is_approved` leg alongside `may` rather than
+collapsing into it, for the same reason `is_approved` and `is_trusted` are two
+legs and not one: a gate must not lean on another predicate's internal
+implication, which a later "simplification" could quietly remove.
+
+### Revoking applies to the next operation
+
+Every gate re-reads the trust store **per operation** — per message, per clip,
+per heartbeat, per accept — so withholding a permission stops the next one
+rather than the next reconnect. Revoking `presence` additionally drops what the
+live presence registry already holds, so a dashboard stops displaying a status
+the peer may no longer be sent.
+
+Two features needed more than a narrowing, because neither required approval
+before permissions existed. The rule for both, stated once:
+
+> A device the user took a decision about is governed by that decision. A device
+> they did not is governed by the feature's pre-existing policy.
+
+- **Transfers.** An approved device whose `files` permission was revoked is
+  refused **outright**, without a prompt: the user already answered, and
+  re-asking on the sender's schedule is how a permission becomes a nuisance. A
+  revoked permission also beats a resume — the decision is newer than the
+  checkpoint. A merely *pinned* peer is prompted exactly as before, so first
+  contact is unchanged.
+- **Chat.** Chat has never required approval; a peer that completes the
+  handshake can exchange messages. Gating it on `may` alone would not narrow
+  anything — it would revoke chat from every device nobody explicitly approved,
+  which is the silent breakage this model exists to avoid. So an approved device
+  is governed by its `chat` permission and an unapproved one behaves as it always
+  has. I6 lists the sensitive actions needing per-capability consent — auto-
+  accept, remote commands, live clipboard, remote browse — and a text message to
+  a peer already talking to you is not one of them.
+
+Chat is gated on **sending** only, as presence and clipboard are: a message that
+has already arrived is in hand, and refusing to persist it would lose the user's
+data to enforce a policy about what this machine says.
+
+### The upgrade rule
+
+A `trust.json` written before this field has no `permissions` key, and how that
+absence is read is the part a user would experience as the app breaking.
+
+- Reading it as **no permissions** would silently revoke every working device the
+  moment they upgraded: chat stops, transfers stop, and nothing says why.
+- Reading it as **all permissions** is the mirror danger: a permission added in
+  some later release would be auto-granted to devices nobody ever reviewed.
+
+Neither. **A record written before this field means the permissions that existed
+when it was written** — exactly the five above — **and any permission introduced
+later is denied by default, for legacy and new records alike.**
+
+The mechanism is what makes that true rather than merely intended. Each
+permission owns a **slot**: a small integer assigned once and never reused, even
+if a permission is retired. `PermissionSet::granted_on_approval()` is a **frozen**
+constant enumerating the five slots that existed at introduction, and it is both
+the `serde` default for a missing field and what `FsTrust::approve` writes. A
+slot allocated later is clear in it *by construction*, so:
+
+- a pre-upgrade record keeps everything it had, and gains nothing;
+- a newly approved device gets the five, and gains nothing added afterwards;
+- a permission added in a later release is **opt-in, always** — granted only by
+  an explicit `peerbeam trust permit` or the app's switch, which is precisely the
+  "explicit, permissioned, narrowly-scoped" consent `VISION.md` requires.
+
+`PermissionSet::grants_slot` exists so that "a permission added later is denied"
+can be *asserted* against a slot no `Permission` variant occupies yet, without
+inventing a fake sixth permission to prove it with — and without a version stamp
+on the record. `peerbeam-trust-fs` pins it with a test that loads a **literal**
+pre-upgrade `trust.json` (not a constructed record, which this build's own
+serializer would always write the field into) and asserts all five are permitted
+while every later slot is not; `peerbeam-cli/tests/trust_cli.rs` repeats it
+through the real binary.
+
+Note this is the **opposite** default to `approved`, deliberately. `approved` was
+a new power no prior record could have consented to, so it defaults off.
+Permissions are a *narrowing* of a power a legacy record already held in full, so
+defaulting them off would take away what the user already granted.
+
+Two smaller consequences, recorded because they are choices:
+
+- Permissions are stored as an **array of names**, so a `trust.json` says what it
+  grants to whoever opens it and a renumbering can never silently re-point a
+  grant. A name this build does not know — a store written by a newer release —
+  is ignored rather than rejected: refusing to parse would take every pin on the
+  machine with it, and an unknown grant is not honoured by a build that cannot
+  enforce it. It is therefore also **not preserved** if an older build rewrites
+  the file, so downgrading and re-upgrading requires re-granting anything new.
+- Permissions apply only to an approved device, so `peerbeam trust permit` on a
+  pinned-but-unapproved one is refused with the next step (`trust approve`)
+  rather than writing a bit that would grant nothing.
 
 ## Device identity
 

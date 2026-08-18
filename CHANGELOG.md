@@ -7,6 +7,50 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Per-device permissions: what a trusted device may do, not just whether it is
+  trusted.** Approval used to be one bit that meant *everything* — approving a
+  laptop so it could receive files also handed it this machine's clipboard, its
+  status heartbeat and an accepted pipe, with no way to say otherwise. There is
+  now a permission per feature that exists today — **files**, **chat**,
+  **clipboard**, **presence**, **pipe** — so "this laptop may sync files but must
+  never read my clipboard" is expressible.
+
+  **Settings → Trusted devices** shows one switch per permission under each
+  approved device, each stating what granting it actually allows. A
+  pinned-but-unapproved device is offered none: permissions narrow a standing the
+  user granted and never create one.
+
+  **CLI:** `peerbeam trust list` gains a `PERMISSIONS` column (and an explicit
+  array under `--json`), plus `peerbeam trust permit <device> <permission>…` and
+  `peerbeam trust revoke-permission <device> <permission>…`. Several names may be
+  given at once and every one is parsed before anything is written, so a typo
+  applies nothing instead of leaving a half-applied change. Both directions are
+  idempotent, so provisioning scripts are safe to re-run.
+
+  **Revoking applies to the next operation, not the next reconnect.** Every gate
+  re-reads the trust store per message, clip, heartbeat and accept, so turning a
+  switch off refuses the very next thing that device tries. Revoking `presence`
+  also drops the status the dashboard already holds for it.
+
+  **One predicate.** `TrustStore::may(device, permission)` is the only thing that
+  reads the set, called as one more named leg by each of the five gates rather
+  than checked at call sites. It implies approval — an unapproved device may
+  nothing, whatever its bits say — and fails closed on a store error, exactly as
+  `is_approved` does.
+
+  **Upgrading an existing `trust.json` changes nothing about what works.** A
+  record written before this field means *the permissions that existed when it
+  was written*, so every device that worked before the upgrade keeps working;
+  reading it as "none" would have silently cut off chat and transfers with no
+  reason given. It is equally not read as "all": permissions are stored as fixed
+  slots and the default enumerates the five that existed, so **a permission added
+  in a later release is denied by default** — for legacy and newly approved
+  devices alike — until explicitly granted. See
+  [Security](docs/SECURITY.md#the-upgrade-rule).
+
+  New engine export `pb_trust_set_permission`; `pb_trust_list` rows carry a
+  `permissions` array. No wire change: permissions are local policy about a peer,
+  never negotiated with it.
 - **The app can tell a stranger from a familiar device.** An approval prompt for
   a device this one has never spoken to now says so, and shows the session's
   **pairing code** — a 128-bit safety number both devices derive from the keys

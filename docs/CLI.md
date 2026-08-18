@@ -52,7 +52,7 @@ src/resolve.rs    pure peer resolution (id → name → prefix)
 src/engine.rs     build the engine with all discovery providers
 src/exit.rs       typed CliError → stable exit codes
 src/commands.rs   one fn per command + dispatch
-src/trust.rs      trust list/approve/revoke (pinned vs approved)
+src/trust.rs      trust list/approve/revoke/permit (pinned vs approved vs permitted)
 src/rules.rs      rules list/add/remove (where a received file lands)
 ```
 
@@ -334,13 +334,15 @@ Working now:
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
-- `trust list` / `trust approve <device>` / `trust revoke <device>` — the
-  devices this machine trusts, and **which of them the user actually chose**.
+- `trust list` / `trust approve <device>` / `trust revoke <device>` /
+  `trust permit <device> <permission>…` /
+  `trust revoke-permission <device> <permission>…` — the devices this machine
+  trusts, **which of them the user actually chose**, and **what each may do**.
 
   ```
-  STATUS    DEVICE           NAME          FINGERPRINT          PINNED
-  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11
-  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30
+  STATUS    DEVICE           NAME          FINGERPRINT          PINNED            PERMISSIONS
+  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11  none
+  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30  files,chat,presence,pipe
   ```
 
   Two states, and the difference is the point. A device is **pinned** by the
@@ -382,10 +384,41 @@ Working now:
   Revoking a device that is not pinned is exit `3`. There is deliberately no
   confirmation on `revoke` — it only ever removes standing.
 
+  **`permit` and `revoke-permission` narrow what an approved device may do**,
+  without un-approving it. The permissions are `files`, `chat`, `clipboard`,
+  `presence` and `pipe`; approving grants all of them, which is exactly what
+  approval always meant. This is how "this laptop may sync files but must never
+  read my clipboard" is expressed:
+
+  ```bash
+  peerbeam trust revoke-permission laptop clipboard presence
+  peerbeam trust permit laptop clipboard          # and back again
+  peerbeam trust list --json | jq -r 'select(.permissions | index("clipboard") | not) | .id'
+  ```
+
+  A change applies to that device's **next operation, not its next connection** —
+  every gate re-reads the store per message, clip, heartbeat and accept. Several
+  permissions may be given in one invocation, and **every name is parsed before
+  anything is written**, so a typo applies nothing (exit `2`, listing the valid
+  names) rather than leaving a half-applied change. Both directions are
+  idempotent and exit `0` when nothing changed, so a provisioning script is safe
+  to re-run, and neither prompts: revoking only removes standing, and permitting
+  can only restore what `approve` already granted once. Permitting a
+  pinned-but-*unapproved* device is exit `2` naming the next step — permissions
+  narrow a standing and never create one, so there would be nothing to narrow.
+
+  A `trust.json` written before permissions existed keeps all five for every
+  device it had approved; a permission added in a later release is denied by
+  default until explicitly permitted. See
+  [Security](SECURITY.md#the-upgrade-rule).
+
   Under `--json`, `list` emits one object per line
-  (`{"id","name","fingerprint","trusted_at","approved"}`, `approved` an
-  explicit bool and the fingerprint in full); `approve` and `revoke` emit one
-  `trust_approved` / `trust_revoked` event.
+  (`{"id","name","fingerprint","trusted_at","approved","permissions"}`,
+  `approved` an explicit bool, `permissions` an explicit array — empty included —
+  and the fingerprint in full); `approve` and `revoke` emit one
+  `trust_approved` / `trust_revoked` event; `permit` and `revoke-permission`
+  emit one `trust_permissions_changed` carrying `granted`, `requested`,
+  `changed` (what actually moved) and the resulting `permissions`.
 - `rules list` / `rules add <DIRECTORY> [criteria]` / `rules remove <INDEX>` —
   **where** a received file is saved.
 
@@ -576,8 +609,9 @@ peerbeam pipe --listen > backup.img || echo "incomplete — do not use it"
 
 # Approve a device on a headless box — required before it can be sent this
 # machine's presence status or clipboard, or pipe into a `pipe --listen`.
-peerbeam trust list                                # who is approved, who is only pinned
+peerbeam trust list                                # who is approved, and what each may do
 peerbeam trust approve pb-f4e4d56fce98 --yes       # scripted: no prompt
+peerbeam trust revoke-permission laptop clipboard  # keep it, take one power away
 peerbeam trust revoke laptop                       # forget it entirely
 
 # Sort what arrives, without changing what is accepted. First match wins, so
@@ -625,12 +659,16 @@ emits machine-readable JSON (NDJSON for streaming/long-running commands):
   message carrying `status` (`staging`/`pending`/`sent`/…) and, for a file,
   `kind:"file"` plus `{"name","size","local_path"}`.
 - `trust list --json` → one object per line:
-  `{"id","name","fingerprint","trusted_at","approved"}`. **`approved` is a
-  bool**, and it is the field to filter on — the presence of a row means only
-  that the device's key was pinned when it connected.
+  `{"id","name","fingerprint","trusted_at","approved","permissions"}`.
+  **`approved` is a bool**, and it is the field to filter on — the presence of a
+  row means only that the device's key was pinned when it connected.
+  **`permissions` is an array of names**, emitted even when empty, so a script
+  can test what a device may do rather than infer it.
   `trust approve --json` → one `{"event":"trust_approved",…,"changed":bool}`
   (`changed:false` when it was already approved, still exit `0`);
-  `trust revoke --json` → one `{"event":"trust_revoked",…,"removed":true}`.
+  `trust revoke --json` → one `{"event":"trust_revoked",…,"removed":true}`;
+  `trust permit --json` / `trust revoke-permission --json` → one
+  `{"event":"trust_permissions_changed","granted":bool,"requested":[…],"changed":[…],"permissions":[…]}`.
 
 Branch on the exit code for success/failure; parse the JSON for details.
 

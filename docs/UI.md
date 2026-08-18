@@ -42,6 +42,54 @@ inventing a dead battery. `test/presence_test.dart` pins this from both sides �
 a missing reading must not render as zero, and a genuine `0%` must not be
 swallowed as missing.
 
+## Trusted devices
+
+Settings lists every pinned device with its key fingerprint, and marks the ones
+nobody approved — the handshake pins every peer that connects, so this list holds
+strangers as well as the user's own machines, and a screen that showed both under
+the same shield would be saying a stranger is trusted.
+
+Under each **approved** device sit its **permission switches**: Files, Messages,
+Clipboard, Device status, Pipes. Approving a device grants all five (exactly what
+approval always meant), so the ordinary device shows five switches all on and
+costs the reader nothing; a narrowed one shows precisely which is off.
+
+They are here rather than behind a dialog because this section already draws the
+distinction that matters most — approved versus merely pinned — and permissions
+are the same question one level finer: *what did that choice leave it?* Putting
+them one tap away would make the finer answer the harder one to find.
+
+**Every switch states its consequence.** "Clipboard" on its own does not say that
+another machine receives whatever was last copied. A security control whose
+effect is unstated is one people flip to find out, so each switch carries a
+sentence — "Send this device your clipboard when sync is on", "Let it pipe data
+into a listening terminal here" — and the switch label alone is never the whole
+message.
+
+**A pinned-but-unapproved device is offered no switches at all.** Permissions
+narrow a standing and never create one, so there is nothing there to narrow; the
+engine reports such a device's effective permissions as empty for exactly that
+reason, which is what lets this screen be a straight read rather than
+re-deriving "but is it approved?". The row still says what to do instead —
+accept a transfer from it to approve it.
+
+A switch takes effect on that device's **next** operation, not its next
+connection: the engine's gates re-read the trust store per message, clip,
+heartbeat and accept. Turning one off is therefore immediate in the sense a user
+means by the word — the next thing that device tries is refused.
+
+Toggling is optimistic so the switch does not visibly lag the tap, and a call the
+engine refuses re-reads the truth rather than leaving a switch showing something
+that did not happen. `test/trusted_devices_test.dart` pins all of it: one switch
+per permission and its stated consequence, a narrowed permission reading off
+while the other four read on, the engine being asked for exactly one permission
+on exactly one device, the snap-back on refusal, and a stranger being offered
+nothing.
+
+Revoking trust (the unlink button) removes the whole record, permissions
+included, so the device's next connection is a fresh first contact. To keep a
+device and take one power away, turn that switch off instead.
+
 ## Clipboard sync
 
 Opt-in in Settings and **off by default**. While it is on, anything copied on a
