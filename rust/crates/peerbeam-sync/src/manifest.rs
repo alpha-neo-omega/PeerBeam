@@ -1,0 +1,286 @@
+//! What a peer has in a folder, and what this device needs from it.
+
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+
+use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType, SessionFrame};
+
+/// MessageType ids within the Sync channel namespace.
+pub const MSG_MANIFEST_REQUEST: u16 = 1;
+pub const MSG_MANIFEST: u16 = 2;
+pub const MSG_FILE_REQUEST: u16 = 3;
+
+/// Most files one manifest describes.
+///
+/// A shared folder can hold a hundred thousand files. Answering with all of
+/// them would make one request cost the responder that many stat calls and the
+/// asker a frame it must buffer — so it is capped, and says when it was.
+pub const MAX_FILES: usize = 2000;
+
+/// Longest share-relative path, in bytes.
+pub const MAX_PATH: usize = 4096;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("sync serialization: {0}")]
+    Serialization(String),
+    #[error("unexpected sync message type {0}")]
+    WrongType(u16),
+    #[error("path too long: {0} bytes (max {MAX_PATH})")]
+    PathTooLong(usize),
+}
+
+/// "What do you have under this path?"
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestRequest {
+    /// A **share-relative** path, as browsing uses. Never absolute: a device's
+    /// filesystem layout is not the asker's business.
+    pub path: String,
+}
+
+/// One file a peer holds.
+///
+/// Size and modification time, and nothing else. **No checksum**, deliberately:
+/// hashing a shared folder on every manifest would read every byte of it to
+/// answer a question about what changed, which is the opposite of what a
+/// manifest is for. Size-and-mtime is what every practical mirror uses, and its
+/// weakness — a file edited in place, same length, same second — is stated
+/// rather than papered over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Path relative to the manifest's own path.
+    pub path: String,
+    pub size: u64,
+    /// Unix seconds. `0` when the peer could not read one.
+    pub modified: i64,
+}
+
+/// What the peer has.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Manifest {
+    pub path: String,
+    pub files: Vec<FileEntry>,
+    /// Whether files were dropped to fit [`MAX_FILES`].
+    #[serde(default)]
+    pub truncated: bool,
+    /// Nothing to report, for any reason. Same rule browsing follows: a peer
+    /// that may not look, a path outside every share and a path that does not
+    /// exist are indistinguishable.
+    #[serde(default)]
+    pub denied: bool,
+}
+
+/// "Send me this file."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileRequest {
+    /// Share-relative path of the file wanted.
+    pub path: String,
+}
+
+/// What a mirror must do to match a peer's manifest.
+///
+/// Deliberately only ever **additive or replacing**: nothing here deletes. A
+/// pull that removed local files because a peer no longer has them turns a
+/// mirror into a weapon — one misconfigured share, and a folder empties.
+/// Removing is a separate decision the user makes with their own file manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// Files to fetch: missing locally, or a different size/time.
+    pub fetch: Vec<FileEntry>,
+    /// Files present locally and already matching. Reported so a caller can say
+    /// "12 already up to date" rather than implying it did nothing.
+    pub up_to_date: usize,
+}
+
+impl Manifest {
+    #[must_use]
+    pub fn denied(path: &str) -> Manifest {
+        Manifest {
+            path: path.to_string(),
+            files: Vec::new(),
+            truncated: false,
+            denied: true,
+        }
+    }
+}
+
+/// Decide what to fetch, given a peer's manifest and the local mirror.
+///
+/// A file is fetched when it is absent locally, a different size, or newer on
+/// the peer. **A local file that is newer is left alone**: this is a pull, and
+/// silently overwriting something the user edited here would lose work with no
+/// warning and no undo.
+#[must_use]
+pub fn plan(manifest: &Manifest, local_root: &std::path::Path) -> Plan {
+    let mut fetch = Vec::new();
+    let mut up_to_date = 0;
+    for f in &manifest.files {
+        let local = local_root.join(&f.path);
+        match std::fs::metadata(&local) {
+            Err(_) => fetch.push(f.clone()),
+            Ok(meta) => {
+                let local_mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                if meta.len() != f.size && local_mtime <= f.modified {
+                    fetch.push(f.clone());
+                } else if local_mtime < f.modified {
+                    fetch.push(f.clone());
+                } else {
+                    up_to_date += 1;
+                }
+            }
+        }
+    }
+    Plan { fetch, up_to_date }
+}
+
+macro_rules! wire {
+    ($t:ty, $id:expr) => {
+        impl $t {
+            #[must_use]
+            pub fn message_type() -> MessageType {
+                MessageType::new($id)
+            }
+
+            pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, SyncError> {
+                let payload = serde_json::to_vec(self)
+                    .map(Bytes::from)
+                    .map_err(|e| SyncError::Serialization(e.to_string()))?;
+                Ok(SessionFrame::new(
+                    channel,
+                    Self::message_type(),
+                    // OPTIONAL: a peer without folder sync skips it rather than
+                    // failing the channel.
+                    MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+                    payload,
+                ))
+            }
+
+            pub fn from_frame(f: &SessionFrame) -> Result<$t, SyncError> {
+                if f.message_type.get() != $id {
+                    return Err(SyncError::WrongType(f.message_type.get()));
+                }
+                serde_json::from_slice(&f.payload)
+                    .map_err(|e| SyncError::Serialization(e.to_string()))
+            }
+        }
+    };
+}
+
+wire!(ManifestRequest, MSG_MANIFEST_REQUEST);
+wire!(Manifest, MSG_MANIFEST);
+wire!(FileRequest, MSG_FILE_REQUEST);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn entry(path: &str, size: u64, modified: i64) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size,
+            modified,
+        }
+    }
+
+    fn manifest(files: Vec<FileEntry>) -> Manifest {
+        Manifest {
+            path: "share".into(),
+            files,
+            truncated: false,
+            denied: false,
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = plan(&manifest(vec![entry("a.txt", 10, 100)]), dir.path());
+        assert_eq!(p.fetch.len(), 1);
+        assert_eq!(p.up_to_date, 0);
+    }
+
+    #[test]
+    fn an_identical_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"0123456789").unwrap();
+        let meta = std::fs::metadata(dir.path().join("a.txt")).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let p = plan(&manifest(vec![entry("a.txt", 10, mtime)]), dir.path());
+        assert!(p.fetch.is_empty(), "an unchanged file was refetched");
+        assert_eq!(p.up_to_date, 1);
+    }
+
+    /// **A pull never overwrites newer local work.** Silently replacing
+    /// something the user edited here would lose it with no warning and no
+    /// undo.
+    #[test]
+    fn a_locally_newer_file_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"edited here").unwrap();
+        // The peer's copy is older and a different size — still not taken.
+        let p = plan(&manifest(vec![entry("a.txt", 999, 1)]), dir.path());
+        assert!(p.fetch.is_empty(), "a pull clobbered newer local work");
+    }
+
+    #[test]
+    fn a_remotely_newer_file_is_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        let p = plan(&manifest(vec![entry("a.txt", 3, future)]), dir.path());
+        assert_eq!(p.fetch.len(), 1);
+    }
+
+    /// **Nothing is ever deleted.** A pull that removed local files because a
+    /// peer no longer has them turns a mirror into a weapon: one misconfigured
+    /// share and a folder empties.
+    #[test]
+    fn a_local_file_the_peer_does_not_have_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.txt"), b"local only").unwrap();
+        let p = plan(&manifest(vec![]), dir.path());
+        assert!(p.fetch.is_empty());
+        assert!(
+            Path::new(&dir.path().join("mine.txt")).exists(),
+            "planning deleted a local file"
+        );
+    }
+
+    #[test]
+    fn messages_round_trip() {
+        let r = ManifestRequest {
+            path: "share".into(),
+        };
+        assert_eq!(
+            ManifestRequest::from_frame(&r.to_frame(ChannelId::new(1)).unwrap()).unwrap(),
+            r
+        );
+        let m = manifest(vec![entry("a", 1, 2)]);
+        assert_eq!(
+            Manifest::from_frame(&m.to_frame(ChannelId::new(1)).unwrap()).unwrap(),
+            m
+        );
+        let f = FileRequest {
+            path: "share/a".into(),
+        };
+        assert_eq!(
+            FileRequest::from_frame(&f.to_frame(ChannelId::new(1)).unwrap()).unwrap(),
+            f
+        );
+    }
+}

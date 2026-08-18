@@ -42,7 +42,7 @@ near-term). Assignments are stable once published.
 | `0x0101` | Chat | B | text/markdown messages; file references (2a) + file declines (2b), implemented |
 | `0x0102` | Clipboard | B | clipboard sync; `Clip` (implemented), opt-in and trusted-only |
 | `0x0103` | Presence | B | device status heartbeats; `Status` (implemented), opt-in and trusted-only |
-| `0x0104` | Sync | C | folder/dataset reconciliation (reuses Transfer for bytes) |
+| `0x0104` | Sync | C | **implemented** — folder reconciliation; bytes over Transfer |
 | `0x0105` | Notes | C | **implemented** — note sync (`NoteBatch`) |
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
 | `0x0107` | Pipe | B | `peerbeam pipe` — an unbounded stdin↔stdout byte stream; a **stream** channel like Transfer, implemented |
@@ -304,6 +304,42 @@ belonging to each capability's future spec:
 
 A capability may add MessageTypes to its own namespace at will; that is a
 backward-compatible (minor) change (§6).
+
+### Sync (`0x0104`)
+
+`ManifestRequest = 1` / `Manifest = 2` / `FileRequest = 3` (implemented) — what
+a peer has under a path, and a request for one file of it. **Bytes travel over
+Transfer**, exactly as this table always said: a second bulk path would mean a
+second set of resume, checksum and progress semantics to keep in step.
+
+**A one-way pull mirror, not bidirectional continuous sync.** Two devices
+editing the same file while apart is a conflict problem with no good automatic
+answer, and pretending otherwise is how sync tools lose work.
+
+Three rules make a pull safe, and each is tested:
+
+* **Nothing is ever deleted.** A pull that removed local files because a peer no
+  longer has them turns a mirror into a weapon — one misconfigured share and a
+  folder empties. Removing is a decision the user makes with their own tools.
+* **Newer local work is never overwritten**, even when the peer's copy differs
+  in size. Silently replacing something edited here would lose it with no
+  warning and no undo.
+* **Symlinks are skipped, not followed.** Following one could walk out of the
+  share or in a circle — and `Shares::resolve` would refuse to serve the file
+  anyway, so the manifest would list entries that can never be fetched.
+
+Entries carry size and mtime, **no checksum**: hashing a shared folder on every
+manifest would read every byte of it to answer a question about what changed.
+The weakness — a file edited in place, same length, same second — is stated
+rather than papered over.
+
+**Two permissions, because these are two questions.** `Permission::Browse`
+answers a `ManifestRequest` (may you see what exists); `Permission::Files` is
+required *as well* before any byte moves for a `FileRequest`. A device allowed
+to read a folder listing has not thereby been allowed to pull every file out of
+it. Containment is `Shares::resolve` — the same canonicalise-then-compare
+browsing uses, so a file request cannot climb out by any route browsing already
+refuses.
 
 ### Browse (`0x0108`)
 

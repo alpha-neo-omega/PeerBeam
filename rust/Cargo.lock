@@ -1431,6 +1431,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-sync"
+version = "0.8.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "peerbeam-browse",
+ "peerbeam-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "peerbeam-telemetry"
 version = "0.8.2"
 dependencies = [

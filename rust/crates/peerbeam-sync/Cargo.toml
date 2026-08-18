@@ -1,0 +1,21 @@
+[package]
+name = "peerbeam-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+peerbeam-browse = { path = "../peerbeam-browse" }
+peerbeam-domain = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

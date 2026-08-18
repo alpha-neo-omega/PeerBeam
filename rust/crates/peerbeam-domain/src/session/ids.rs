@@ -114,6 +114,13 @@ impl ChannelType {
     /// conflict rule, so they get the id already set aside for them rather than
     /// waiting on a channel built for something else.
     pub const NOTES: ChannelType = ChannelType(0x0105);
+    /// Folder reconciliation — manifests and file requests (Phase C).
+    ///
+    /// Carries the *plan*: what a peer has, and a request for one file. The
+    /// bytes travel over [`TRANSFER`](ChannelType::TRANSFER), exactly as the
+    /// registry always said they would, because a second bulk path would mean a
+    /// second set of resume, checksum and progress semantics to keep in step.
+    pub const SYNC: ChannelType = ChannelType(0x0104);
     /// Read-only browsing of folders a device chose to share (Phase C).
     ///
     /// Allocated from the reserved first-party range rather than folded into

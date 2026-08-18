@@ -11,6 +11,7 @@ members = [
     "crates/peerbeam-discovery-mdns",
     "crates/peerbeam-discovery-tailscale",
     "crates/peerbeam-storage-fs",
+    "crates/peerbeam-sync",
     "crates/peerbeam-transfer",
     "crates/peerbeam-transfer-quic",
     "crates/peerbeam-ffi",

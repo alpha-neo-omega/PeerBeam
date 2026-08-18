@@ -157,6 +157,16 @@ pub const NOTES_FEAT_SYNC: u32 = 1 << 0;
 /// configured, a permitted peer still sees nothing, which is the default state.
 pub const BROWSE_FEAT_LIST: u32 = 1 << 0;
 
+/// Feature bit on the SYNC capability: this peer answers `ManifestRequest` with
+/// a `Manifest`, and honours `FileRequest` by sending the file over Transfer.
+///
+/// Comprehension, not consent. Whether it answers at all is
+/// `Permission::Browse` for the manifest — the same "may you see what exists"
+/// question browsing asks — and `Permission::Files` before any bytes move,
+/// because being allowed to see a name is not being allowed to receive the
+/// file.
+pub const SYNC_FEAT_MANIFEST: u32 = 1 << 0;
+
 /// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
 /// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
 /// something.
