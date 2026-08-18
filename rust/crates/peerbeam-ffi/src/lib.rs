@@ -556,6 +556,25 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
+/// React to one message in a conversation: `{peer, id, emoji, remove?}` →
+/// `{applied, delivered}`.
+///
+/// `applied` says whether **this device's** history changed; `delivered` says
+/// whether the peer was told. They are separate answers on purpose: the
+/// reaction is our own record either way, and a peer that is offline — or too
+/// old to have negotiated the reaction capability — leaves `delivered` false
+/// rather than turning the whole call into a failure. A caller that shows a
+/// reaction as "sent" should read `delivered`, not the absence of an error.
+///
+/// Reactions are not queued for later delivery; see `Manager::chat_react`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_react(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_react(&read_json(json)?))()))
+}
+
 /// Settle one conversation's rows that no event will ever finish — a file left
 /// mid-flight by a crash or a hard restart: `{peer_id}` → `{changed}`. Emits a
 /// `chat_status` per settled row.

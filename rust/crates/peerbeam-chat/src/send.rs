@@ -8,7 +8,7 @@ use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
 use peerbeam_transfer::{SessionHandle, TransferControl};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
+use crate::message::{ChatError, ChatMessage, FileDecline, FileRef, Reaction};
 use crate::record::{ChatRecord, FileMeta, Kind, Status};
 use crate::staging::{StagingLimits, StagingStore};
 use crate::store::{ChatStore, OutboxEntry, StagedFile};
@@ -408,6 +408,29 @@ pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), Se
 /// `CHAT_FEAT_FILEDECLINE`; sending a message the negotiation says the peer does
 /// not speak is exactly the silent wire drift capability negotiation exists to
 /// prevent.
+/// Send one [`Reaction`] to a peer over its own CHAT channel.
+///
+/// Same shape as [`send_file_decline`]: open, wait for open, send. The caller
+/// decides *whether* to send — that decision reads the negotiated capability
+/// and lives with the rest of the send policy, not here.
+pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), SendError> {
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+    let frame = r.to_frame(channel)?;
+    handle
+        .send_on_channel(
+            channel,
+            Reaction::message_type(),
+            frame.flags,
+            frame.payload,
+        )
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
+}
+
 pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Result<(), SendError> {
     let channel = handle
         .open_channel(ChannelType::CHAT)

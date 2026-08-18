@@ -3059,6 +3059,97 @@ impl Manager {
     /// conversation it was read from, so tapping it opens the right thread.
     ///
     /// [`ChatStore::search`]: peerbeam_chat::ChatStore::search
+    /// React to one message: `{peer, id, emoji, remove?}` →
+    /// `{applied, delivered}`.
+    ///
+    /// Applies to **our own** history first and unconditionally — it is our
+    /// record of our own gesture, and a peer being unreachable is no reason for
+    /// this device to forget that its user reacted. `applied` is false only
+    /// when nothing changed: no such message in that conversation, or the
+    /// reaction was already in the requested state.
+    ///
+    /// Delivery is best-effort and reported separately rather than folded into
+    /// success. `delivered` is false when the peer could not be reached, or
+    /// when it never negotiated [`CHAT_FEAT_REACTION`] — an older build would
+    /// drop the OPTIONAL frame in silence, and telling the caller "sent" would
+    /// be a claim about a screen where nothing appeared.
+    ///
+    /// Reactions are deliberately **not** queued in the outbox the way text and
+    /// files are. A gesture that arrives long after its conversation moved on
+    /// is noise, and the outbox's terminal-state handling is the most defect-
+    /// prone part of this crate; a reaction that missed its moment is better
+    /// lost than resurrected.
+    pub fn chat_react(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let emoji = req
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "emoji required".into()))?;
+        if emoji.is_empty() || emoji.len() > peerbeam_chat::MAX_REACTION {
+            return Err((
+                Code::InvalidArgument,
+                format!("emoji must be 1..={} bytes", peerbeam_chat::MAX_REACTION),
+            ));
+        }
+        let remove = req
+            .get("remove")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        // Same gate as sending a message: reacting is chatting.
+        permit_chat(self.trust.as_ref(), &device.id)?;
+
+        let applied = self
+            .chat
+            .apply_reaction(&device.id, id, emoji, peerbeam_chat::Direction::Out, remove)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+
+        let r = if remove {
+            peerbeam_chat::Reaction::remove(id, emoji)
+        } else {
+            peerbeam_chat::Reaction::add(id, emoji)
+        };
+        let me = self.clone();
+        let delivered =
+            crate::runtime::block_on(async move { me.deliver_reaction(device, r).await });
+        Ok(json!({ "applied": applied, "delivered": delivered }))
+    }
+
+    /// Put one reaction on the wire if the peer is reachable and understands
+    /// them. Never fails the caller: every negative answer is simply "not
+    /// delivered".
+    async fn deliver_reaction(
+        self: &Arc<Self>,
+        device: Device,
+        r: peerbeam_chat::Reaction,
+    ) -> bool {
+        let meta = self.session(&format!("react-{}", device.id.0), device.id.clone(), 0);
+        let Ok(session) = crate::session_exec::dial(
+            &self.quic,
+            &self.rm,
+            &device,
+            &meta,
+            self.identity(),
+            self.enc.clone(),
+            self.trust.clone(),
+            Some(self.chat_wiring()),
+            Some(self.presence_wiring()),
+        )
+        .await
+        else {
+            return false;
+        };
+        if !crate::session_exec::caps_support_reaction(&session.capabilities) {
+            return false;
+        }
+        peerbeam_chat::send_reaction(&session.handle, &r)
+            .await
+            .is_ok()
+    }
+
     pub fn chat_search(&self, req: &Value) -> Op {
         let query = req
             .get("query")

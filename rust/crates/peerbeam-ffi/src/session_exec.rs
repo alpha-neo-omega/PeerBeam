@@ -17,7 +17,8 @@ use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM, PRESENCE_FEAT_STATUS,
+    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CLIPBOARD_FEAT_CLIP, PIPE_FEAT_STREAM,
+    PRESENCE_FEAT_STATUS,
 };
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, PresenceSink, HEARTBEAT_INTERVAL};
@@ -125,7 +126,7 @@ fn advertised_caps() -> CapabilitySet {
         .with(Capability::new(TRANSFER))
         .with(Capability::with_features(
             CHAT,
-            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE,
+            CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION,
         ))
         .with(Capability::with_features(CLIPBOARD, CLIPBOARD_FEAT_CLIP))
         .with(Capability::with_features(PRESENCE, PRESENCE_FEAT_STATUS))
@@ -155,6 +156,20 @@ fn caps_support_file_ref(caps: &CapabilitySet) -> bool {
 pub fn caps_support_file_decline(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_FILEDECLINE != 0)
+}
+
+/// Whether `caps` — an **already-negotiated** (intersected) set — carries the
+/// chat `Reaction` feature, i.e. whether an emoji attached to one of this
+/// peer's messages would mean anything to it. Same shape and same reason as
+/// [`caps_support_file_ref`].
+///
+/// The `Reaction` frame is OPTIONAL, so an older peer would drop it harmlessly
+/// either way. The bit exists so a sender can decline to offer the gesture at
+/// all, rather than let its user believe a reaction landed somewhere it was
+/// never displayed.
+pub fn caps_support_reaction(caps: &CapabilitySet) -> bool {
+    caps.features(CHAT)
+        .is_some_and(|f| f & CHAT_FEAT_REACTION != 0)
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver

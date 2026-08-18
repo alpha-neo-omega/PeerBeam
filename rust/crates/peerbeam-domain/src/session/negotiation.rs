@@ -104,6 +104,26 @@ pub const CHAT_FEAT_FILEREF: u32 = 1 << 0;
 /// [`CapabilitySet::intersect`] ANDs it away against a peer that predates it.
 pub const CHAT_FEAT_FILEDECLINE: u32 = 1 << 1;
 
+/// Feature bit on the CHAT capability: this peer understands the `Reaction`
+/// message (chat MessageType 4) — an emoji attached to one of its messages will
+/// mean something to it.
+///
+/// **A receive capability, read like [`CHAT_FEAT_FILEREF`]**: the party that
+/// consults it is the one *sending* a reaction, asking whether the peer
+/// negotiated the bit before putting the message on the wire. It asserts
+/// comprehension, not behaviour — a build with no way to react still advertises
+/// it truthfully if it can display one it is sent.
+///
+/// Without it a reaction sent to an older peer is simply dropped on arrival
+/// (the frame is OPTIONAL), which costs the reaction and nothing else. The bit
+/// exists so a sender can decline to offer the gesture at all rather than let a
+/// user believe it landed.
+///
+/// Advertising it is not a wire change: it rides the `Capability.features`
+/// bitset already on the wire, and [`CapabilitySet::intersect`] ANDs it away
+/// against a peer that predates it.
+pub const CHAT_FEAT_REACTION: u32 = 1 << 2;
+
 /// Feature bit on the CLIPBOARD capability: this peer understands the `Clip`
 /// message (clipboard MessageType 1) — a synced clipboard sent to it will mean
 /// something.

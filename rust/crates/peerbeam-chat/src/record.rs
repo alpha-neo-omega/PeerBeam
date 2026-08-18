@@ -58,6 +58,22 @@ pub enum Kind {
     Decline,
 }
 
+/// One reaction as it is kept in history: which emoji, and which side of the
+/// conversation put it there.
+///
+/// [`Direction`] rather than a device id because a conversation has exactly two
+/// participants: "us" and "them" is the whole set, and storing an id would
+/// invite code that believes a third could appear.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredReaction {
+    /// The reaction as its sender expressed it.
+    pub emoji: String,
+    /// Which side reacted.
+    pub by: Direction,
+    /// RFC 3339 time the reaction was applied.
+    pub timestamp: String,
+}
+
 /// Whether `c` must never reach a *rendered* file name.
 ///
 /// A chat file row prints its name directly above an Accept button, so the
@@ -144,6 +160,14 @@ pub struct ChatRecord {
     /// Present only when `kind == Kind::File`.
     #[serde(default)]
     pub file: Option<FileMeta>,
+    /// Reactions on this message, in the order they were applied.
+    ///
+    /// `default` so every row written before reactions existed decodes as
+    /// having none, and `skip_serializing_if` so a row with none is written
+    /// exactly as it was before — an upgrade must not rewrite the shape of
+    /// history that nothing has reacted to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<StoredReaction>,
 }
 
 impl ChatRecord {
@@ -159,6 +183,7 @@ impl ChatRecord {
             status: Status::Sent,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -174,6 +199,7 @@ impl ChatRecord {
             status: Status::Received,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -190,6 +216,7 @@ impl ChatRecord {
             status,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -205,6 +232,7 @@ impl ChatRecord {
             status,
             kind: Kind::File,
             file: Some(meta),
+            reactions: Vec::new(),
         }
     }
 
@@ -225,6 +253,7 @@ impl ChatRecord {
             // correlated by id alone. `ChatStore::set_file_row_landing`
             // reconciles this row against that stream.
             file: Some(FileMeta::new(&r.name, r.size, None)),
+            reactions: Vec::new(),
         }
     }
 

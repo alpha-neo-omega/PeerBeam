@@ -3,13 +3,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::AppStore;
 
 use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
-use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status};
+use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status, StoredReaction};
 
 /// The AppStore namespace for a conversation with `peer`.
 #[must_use]
@@ -538,7 +539,62 @@ impl ChatStore {
             status: Status::Sent,
             kind,
             file,
+            reactions: Vec::new(),
         })
+    }
+
+    /// Add or withdraw a reaction on one message, in place.
+    ///
+    /// Authorization is the record, not the id — the same rule
+    /// [`settle_file_row`](Self::settle_file_row) applies, and for the same
+    /// reason: `target_id` arrives from the peer, so a bare key match is not
+    /// permission to write. The lookup is scoped to that peer's own namespace,
+    /// so a peer can only ever react inside its own conversation, and a
+    /// `target_id` naming a message in a different conversation finds nothing
+    /// here rather than reaching across.
+    ///
+    /// **Idempotent in both directions**, because the wire message states the
+    /// intended end state rather than toggling: adding a reaction that is
+    /// already present changes nothing, and withdrawing one that is absent
+    /// changes nothing. A duplicated or replayed frame is therefore harmless,
+    /// which a toggle could not promise.
+    ///
+    /// A missing record is a silent no-op — a reaction can outlive the message
+    /// it names, once that message has been deleted.
+    ///
+    /// Returns whether history actually changed, so a caller can avoid
+    /// emitting an event for a write that did not happen.
+    pub fn apply_reaction(
+        &self,
+        peer: &DeviceId,
+        target_id: &str,
+        emoji: &str,
+        by: Direction,
+        remove: bool,
+    ) -> Result<bool, ChatError> {
+        let Some(mut rec) = self.get(peer, target_id)? else {
+            return Ok(false);
+        };
+        // One reaction per (emoji, side): a second identical one from the same
+        // side is the same statement, not a louder one.
+        let existing = rec
+            .reactions
+            .iter()
+            .position(|r| r.emoji == emoji && r.by == by);
+        match (existing, remove) {
+            (Some(i), true) => {
+                rec.reactions.remove(i);
+            }
+            (None, false) => rec.reactions.push(StoredReaction {
+                emoji: emoji.to_string(),
+                by,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+            // Already in the requested state; no write, no event.
+            _ => return Ok(false),
+        }
+        self.append(&rec)?;
+        Ok(true)
     }
 
     /// Replace a record's status in place (upsert at the same key). A missing
@@ -1001,6 +1057,121 @@ mod tests {
         let app: Arc<dyn AppStore> =
             Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
         (ChatStore::new(app.clone()), app, dir)
+    }
+
+    #[test]
+    fn a_reaction_attaches_to_the_message_it_names() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        assert!(cs
+            .apply_reaction(&peer, &m.id, "\u{1F44D}", Direction::In, false)
+            .unwrap());
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist[0].reactions.len(), 1);
+        assert_eq!(hist[0].reactions[0].emoji, "\u{1F44D}");
+        assert_eq!(hist[0].reactions[0].by, Direction::In);
+    }
+
+    #[test]
+    fn adding_the_same_reaction_twice_changes_nothing() {
+        // The wire message states the end state rather than toggling, so a
+        // duplicated or replayed frame must be inert. A toggle would turn the
+        // second delivery into a removal and leave the two devices disagreeing.
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        assert!(cs
+            .apply_reaction(&peer, &m.id, "\u{1F389}", Direction::In, false)
+            .unwrap());
+        assert!(
+            !cs.apply_reaction(&peer, &m.id, "\u{1F389}", Direction::In, false)
+                .unwrap(),
+            "second identical add reported a write"
+        );
+        assert_eq!(cs.history(&peer).unwrap()[0].reactions.len(), 1);
+    }
+
+    #[test]
+    fn withdrawing_a_reaction_that_is_not_there_changes_nothing() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        assert!(
+            !cs.apply_reaction(&peer, &m.id, "\u{1F44D}", Direction::In, true)
+                .unwrap(),
+            "removing an absent reaction reported a write"
+        );
+        assert!(cs.history(&peer).unwrap()[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn each_side_reacts_independently_with_the_same_emoji() {
+        // One reaction per (emoji, side): both participants liking the same
+        // message are two reactions, not one overwriting the other.
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("ship it").unwrap();
+        cs.append(&ChatRecord::sent(&peer, &m)).unwrap();
+
+        cs.apply_reaction(&peer, &m.id, "\u{1F44D}", Direction::In, false)
+            .unwrap();
+        cs.apply_reaction(&peer, &m.id, "\u{1F44D}", Direction::Out, false)
+            .unwrap();
+        assert_eq!(cs.history(&peer).unwrap()[0].reactions.len(), 2);
+
+        // ...and withdrawing one leaves the other standing.
+        cs.apply_reaction(&peer, &m.id, "\u{1F44D}", Direction::In, true)
+            .unwrap();
+        let hist = cs.history(&peer).unwrap();
+        assert_eq!(hist[0].reactions.len(), 1);
+        assert_eq!(hist[0].reactions[0].by, Direction::Out);
+    }
+
+    #[test]
+    fn a_peer_cannot_react_into_another_conversation() {
+        // The lookup is scoped to the reacting peer's own namespace, so a
+        // target id naming someone else's message finds nothing rather than
+        // reaching across. This is the failure worth pinning: `target_id`
+        // arrives from the peer.
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let eve = DeviceId::from("pb-eve");
+        let m = ChatMessage::new("private").unwrap();
+        cs.append(&ChatRecord::sent(&bob, &m)).unwrap();
+
+        assert!(
+            !cs.apply_reaction(&eve, &m.id, "\u{1F440}", Direction::In, false)
+                .unwrap(),
+            "eve reacted to a message in bob's conversation"
+        );
+        assert!(cs.history(&bob).unwrap()[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn a_reaction_to_a_message_that_is_gone_is_a_no_op() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        assert!(!cs
+            .apply_reaction(&peer, "no-such-id", "\u{1F44D}", Direction::In, false)
+            .unwrap());
+    }
+
+    #[test]
+    fn a_row_written_before_reactions_existed_decodes_with_none() {
+        // Upgrade safety: history written by an older build has no `reactions`
+        // key at all, and must read as "no reactions" rather than failing the
+        // conversation.
+        let legacy = br#"{"id":"m1","peer_id":"pb-bob","direction":"out","timestamp":"2026-01-01T00:00:00Z","body":"hi","status":"sent"}"#;
+        let rec = ChatRecord::decode(legacy).unwrap();
+        assert!(rec.reactions.is_empty());
+        assert_eq!(rec.body, "hi");
     }
 
     #[test]
@@ -1692,6 +1863,7 @@ mod tests {
             status: Status::Sent,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         };
         let later = ChatRecord {
             id: "0000000000003".into(),

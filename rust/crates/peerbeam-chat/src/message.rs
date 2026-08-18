@@ -26,6 +26,17 @@ pub const MAX_ID: usize = 128;
 pub const MSG_FILE_REF: u16 = 2;
 /// MessageType id for a file decline within the Chat channel namespace.
 pub const MSG_FILE_DECLINE: u16 = 3;
+/// MessageType id for a reaction within the Chat channel namespace.
+pub const MSG_REACTION: u16 = 4;
+/// Maximum length of a reaction, in bytes.
+///
+/// An emoji is a handful of scalar values at most — a family emoji with skin
+/// tones and zero-width joiners is around 25 bytes — so this holds every real
+/// one with room to spare while refusing a body smuggled in as a "reaction".
+/// This is a resource bound, not a taste test: what counts as an emoji is the
+/// sending client's business, and a build that offers a different set is not
+/// wrong, it is newer.
+pub const MAX_REACTION: usize = 64;
 
 /// Errors from encoding/decoding/validating a chat message.
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +49,8 @@ pub enum ChatError {
     WrongType(u16),
     #[error("bad file name: {0}")]
     BadName(String),
+    #[error("bad reaction: {0}")]
+    BadReaction(String),
     #[error("bad file id: {0}")]
     BadId(String),
     /// An outbox entry exists but could not be decoded — most likely written
@@ -318,6 +331,109 @@ impl FileDecline {
     }
 }
 
+/// A reaction to one message in a conversation: an emoji attached to, or
+/// withdrawn from, the message named by `target_id`.
+///
+/// **Add and remove are the same message with a flag, not a toggle.** A toggle
+/// derives the new state from what the receiver believes the old one was, so a
+/// single dropped or duplicated frame leaves the two devices permanently
+/// disagreeing about whether the reaction is there. Stating the intended end
+/// state makes the message idempotent: applying it twice is applying it once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reaction {
+    /// The id of the message being reacted to, in this conversation.
+    pub target_id: String,
+    /// The reaction itself, as the sender's client chose to express it.
+    pub emoji: String,
+    /// `true` withdraws this reaction, `false` adds it.
+    #[serde(default)]
+    pub remove: bool,
+    /// RFC 3339 send time, for ordering only.
+    pub timestamp: String,
+}
+
+impl Reaction {
+    /// A reaction adding `emoji` to `target_id`.
+    #[must_use]
+    pub fn add(target_id: &str, emoji: &str) -> Reaction {
+        Reaction {
+            target_id: target_id.to_string(),
+            emoji: emoji.to_string(),
+            remove: false,
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// A reaction withdrawing `emoji` from `target_id`.
+    #[must_use]
+    pub fn remove(target_id: &str, emoji: &str) -> Reaction {
+        Reaction {
+            target_id: target_id.to_string(),
+            emoji: emoji.to_string(),
+            remove: true,
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// The chat MessageType (`Reaction` = 4).
+    #[must_use]
+    pub fn message_type() -> MessageType {
+        MessageType::new(MSG_REACTION)
+    }
+
+    /// Encode as a Chat-channel frame. OPTIONAL, like `FileDecline`: a peer
+    /// that predates reactions skips the message rather than failing the
+    /// channel, so reacting to an older build costs the reaction and nothing
+    /// else (MESSAGE_REGISTRY.md §6/§7).
+    pub fn to_frame(&self, channel: ChannelId) -> Result<SessionFrame, ChatError> {
+        let payload = serde_json::to_vec(self)
+            .map(Bytes::from)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        Ok(SessionFrame::new(
+            channel,
+            Self::message_type(),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            payload,
+        ))
+    }
+
+    /// Decode from a Chat-channel frame, bounding both fields.
+    ///
+    /// `emoji` is length-checked here but **not** character-checked: like a
+    /// file name, it is peer-supplied text that ends up rendered, and the one
+    /// display policy for that is [`display_name`](crate::display_name), which
+    /// substitutes rather than deletes. Applying it at the point of render
+    /// keeps a single authority for the rule instead of a second, stricter
+    /// one that would reject a message the rest of the app would have shown
+    /// safely.
+    ///
+    /// `target_id` is bounded by [`MAX_ID`] because it is a message id and is
+    /// echoed into events and history exactly as `FileRef`'s is. It is not
+    /// otherwise validated: it authorizes nothing on its own — every write it
+    /// drives goes through `ChatStore::apply_reaction`, which looks the record
+    /// up in the peer's own namespace and does nothing when it is absent.
+    pub fn from_frame(frame: &SessionFrame) -> Result<Reaction, ChatError> {
+        if frame.message_type.get() != MSG_REACTION {
+            return Err(ChatError::WrongType(frame.message_type.get()));
+        }
+        let r: Reaction = serde_json::from_slice(&frame.payload)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        if r.target_id.is_empty() || r.target_id.len() > MAX_ID {
+            return Err(ChatError::BadReaction(format!(
+                "target id length {} (max {MAX_ID})",
+                r.target_id.len()
+            )));
+        }
+        if r.emoji.is_empty() || r.emoji.len() > MAX_REACTION {
+            return Err(ChatError::BadReaction(format!(
+                "reaction length {} (max {MAX_REACTION})",
+                r.emoji.len()
+            )));
+        }
+        Ok(r)
+    }
+}
+
 /// Last-minted (millis, suffix) pair, used only to keep [`mint_id`]
 /// monotonically non-decreasing when two ids are minted within the same
 /// wall-clock millisecond (routine under fast/automated sends, where an
@@ -350,6 +466,83 @@ pub fn mint_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reaction_round_trips_and_states_its_intent() {
+        let r = Reaction::add("m-1", "\u{1F44D}");
+        let frame = r.to_frame(ChannelId::new(7)).unwrap();
+        assert_eq!(frame.message_type.get(), MSG_REACTION);
+        let back = Reaction::from_frame(&frame).unwrap();
+        assert_eq!(back, r);
+        assert!(!back.remove);
+
+        let w = Reaction::remove("m-1", "\u{1F44D}");
+        let back = Reaction::from_frame(&w.to_frame(ChannelId::new(7)).unwrap()).unwrap();
+        assert!(back.remove);
+    }
+
+    #[test]
+    fn a_reaction_frame_is_optional_so_an_older_peer_skips_it() {
+        // A peer that predates reactions must drop the message, not fail the
+        // channel — reacting at an old build costs the reaction, nothing more.
+        let frame = Reaction::add("m-1", "\u{2764}")
+            .to_frame(ChannelId::new(3))
+            .unwrap();
+        assert!(
+            frame.flags.contains(MessageFlags::OPTIONAL),
+            "reaction frame was not OPTIONAL"
+        );
+    }
+
+    #[test]
+    fn an_oversized_or_empty_reaction_is_refused() {
+        let mut r = Reaction::add("m-1", "x");
+        r.emoji = "e".repeat(MAX_REACTION + 1);
+        let frame = r.to_frame(ChannelId::new(1)).unwrap();
+        assert!(matches!(
+            Reaction::from_frame(&frame),
+            Err(ChatError::BadReaction(_))
+        ));
+
+        let mut r = Reaction::add("m-1", "x");
+        r.emoji = String::new();
+        let frame = r.to_frame(ChannelId::new(1)).unwrap();
+        assert!(matches!(
+            Reaction::from_frame(&frame),
+            Err(ChatError::BadReaction(_))
+        ));
+    }
+
+    #[test]
+    fn an_oversized_or_empty_target_id_is_refused() {
+        let mut r = Reaction::add("m-1", "\u{1F44D}");
+        r.target_id = "i".repeat(MAX_ID + 1);
+        let frame = r.to_frame(ChannelId::new(1)).unwrap();
+        assert!(matches!(
+            Reaction::from_frame(&frame),
+            Err(ChatError::BadReaction(_))
+        ));
+
+        let mut r = Reaction::add("m-1", "\u{1F44D}");
+        r.target_id = String::new();
+        let frame = r.to_frame(ChannelId::new(1)).unwrap();
+        assert!(matches!(
+            Reaction::from_frame(&frame),
+            Err(ChatError::BadReaction(_))
+        ));
+    }
+
+    #[test]
+    fn a_reaction_does_not_decode_from_another_message_type() {
+        let frame = ChatMessage::new("hello")
+            .unwrap()
+            .to_frame(ChannelId::new(1))
+            .unwrap();
+        assert!(matches!(
+            Reaction::from_frame(&frame),
+            Err(ChatError::WrongType(MSG_TEXT))
+        ));
+    }
+
     use super::*;
     use peerbeam_domain::session::ChannelId;
 

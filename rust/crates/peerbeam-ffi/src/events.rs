@@ -226,6 +226,7 @@ mod tests {
             status: Status::Received,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         };
         chat(&rec);
 

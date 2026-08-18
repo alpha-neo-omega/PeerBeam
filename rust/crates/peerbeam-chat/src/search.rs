@@ -354,6 +354,7 @@ mod tests {
             status: Status::Received,
             kind: Kind::Text,
             file: None,
+            reactions: Vec::new(),
         }
     }
 
@@ -371,6 +372,7 @@ mod tests {
                 size: 12,
                 local_path: local_path.map(str::to_string),
             }),
+            reactions: Vec::new(),
         }
     }
 
