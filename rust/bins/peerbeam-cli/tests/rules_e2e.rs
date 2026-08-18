@@ -34,12 +34,38 @@ fn receiver_config(dir: &Path, save_dir: &Path, rules: Vec<SaveRule>) -> PathBuf
 /// sharing one would collapse the handshake's directional keys (see
 /// `transfer_e2e.rs`).
 fn sender_config(dir: &Path) -> PathBuf {
+    sender_config_named(dir, "sender")
+}
+
+/// [`sender_config`] with a chosen device **name** — the peer-supplied half of
+/// its identity, and the one a rule must never match on.
+fn sender_config_named(dir: &Path, name: &str) -> PathBuf {
     let mut cfg = EngineConfig::default();
     cfg.storage.data_directory = dir.join("data-send").to_string_lossy().into_owned();
     cfg.storage.save_directory = dir.join("send-recv").to_string_lossy().into_owned();
+    cfg.device.name = name.to_string();
     let path = dir.join("send-config.json");
     cfg.save(&path).unwrap();
     path
+}
+
+/// The sender's **authenticated** device id, as its own `status` reports it.
+///
+/// Running `status` also generates the identity keypair, so the id is fixed
+/// before the receiver's rules are written against it — which is what makes
+/// the assertion below meaningful rather than circular.
+fn device_id_of(cfg: &Path) -> String {
+    let out = Command::new(BIN)
+        .args(["--config", cfg.to_str().unwrap(), "--json", "status"])
+        .output()
+        .expect("run status");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .find(|l| l.contains("device_id"))
+        .unwrap_or_else(|| panic!("no device_id in status output: {text}"));
+    let v: serde_json::Value = serde_json::from_str(line).expect("status is one JSON object");
+    v["device_id"].as_str().expect("device_id").to_string()
 }
 
 /// A rule matching everything, pointed at `dest`.
@@ -305,6 +331,66 @@ fn an_explicit_dir_overrides_the_rules_for_that_run() {
         "output was:\n{output}"
     );
     assert!(!sorted.exists(), "the rule must not have been consulted");
+}
+
+/// **The sender criterion is the authenticated device id, not the name the
+/// peer presents.**
+///
+/// The receiver holds two rules, and the one keyed to the sender's *name* is
+/// **first** — so if the matcher were ever fed a name, first-match-wins would
+/// send the file to `by-name`. It lands in `by-id` instead, which is the only
+/// outcome consistent with the authenticated id reaching the matcher.
+///
+/// Feeding the peer-supplied name to `destination` at the call site must break
+/// this, and so must making `SaveRule::matches` accept one.
+#[test]
+fn the_sender_criterion_matches_the_authenticated_id_not_the_presented_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let save_dir = dir.path().join("downloads");
+    let by_name = dir.path().join("by-name");
+    let by_id = dir.path().join("by-id");
+
+    let sender_cfg = sender_config_named(dir.path(), "laptop");
+    let sender_id = device_id_of(&sender_cfg);
+    assert!(sender_id.starts_with("pb-"), "unexpected id: {sender_id}");
+
+    let cfg = receiver_config(
+        dir.path(),
+        &save_dir,
+        vec![
+            // First — and it names the device the way a *person* would.
+            SaveRule {
+                device: Some("laptop".into()),
+                ..catch_all(&by_name)
+            },
+            // Second, and the one that must actually apply.
+            SaveRule {
+                device: Some(sender_id.clone()),
+                ..catch_all(&by_id)
+            },
+        ],
+    );
+
+    let payload = b"whose rule is this?".to_vec();
+    let src = dir.path().join("hello.bin");
+    std::fs::write(&src, &payload).unwrap();
+
+    let (mut child, lines) = start_receiver(&cfg);
+    let mut collected = Vec::new();
+    let port = port_from(&lines, &mut collected);
+    send_to(&sender_cfg, &src, port);
+    let output = finish(&mut child, &lines, &mut collected);
+
+    assert_eq!(
+        std::fs::read(by_id.join("hello.bin")).expect("the id rule must be the one that applies"),
+        payload,
+        "output was:\n{output}"
+    );
+    assert!(
+        !by_name.exists(),
+        "a rule keyed to the peer's self-reported name must never match"
+    );
+    assert!(!save_dir.join("hello.bin").exists());
 }
 
 fn parse_listen_port(line: &str) -> Option<u16> {
