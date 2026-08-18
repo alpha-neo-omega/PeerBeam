@@ -7,6 +7,16 @@ cd "$(dirname "$0")/.."
 # In CI the tag is the source of truth; VERSION is the local fallback.
 VER="${GITHUB_REF_NAME:-}"
 VER="${VER#v}"
+# ...but only when the ref actually is a version tag. The workflow also offers
+# `workflow_dispatch`, where GITHUB_REF_NAME is the *branch* — which produced
+# `peerbeam-main-linux-x64.tar.gz` and a .deb whose Version field was literally
+# `main`, so dpkg-deb refused it ("version number does not start with digit")
+# and every manual run of the release workflow died there. A ref that is not a
+# version falls back to VERSION, the same source `set-version.sh` writes.
+case "$VER" in
+  [0-9]*) ;;
+  *) VER="" ;;
+esac
 [ -n "$VER" ] || VER="$(cat VERSION)"
 DIST="dist"
 APP="peerbeam"
