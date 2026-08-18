@@ -259,6 +259,15 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `watch <dir> --to <peer> [--interval N] [--existing]` — send whatever lands in
+  a folder. Polls rather than using a filesystem watcher, so it behaves the same
+  on every OS and works on the network shares people actually drop files onto.
+  **A file is sent only once it has stopped growing**, so a copy still in
+  progress is never delivered half-written. Files already present when the watch
+  starts are left alone unless `--existing` is given.
+- `timeline [--limit N]` — one chronological view of this device's activity:
+  transfers, conversations, and clips when clipboard history is on. Carries no
+  message bodies and no clip text.
 - `clipboard history [--clear]` — show or erase what this device remembers
   copying. Empty unless `device.clipboard_history` is on (default off, and
   separate from clipboard sync). The listing abbreviates each clip to one

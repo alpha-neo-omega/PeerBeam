@@ -73,6 +73,8 @@ pub enum Command {
     Ring(RingArgs),
     /// One chronological view of this device's activity.
     Timeline(TimelineArgs),
+    /// Watch a folder and send whatever lands in it.
+    Watch(WatchArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -448,6 +450,32 @@ pub enum TrustAction {
 /// file is written, never **whether** it is accepted. Nothing here touches the
 /// approval prompt or `device.auto_accept_trusted`; rules are read after a
 /// transfer has been accepted and is on its way to disk.
+/// Watch a folder and send each new file to a device.
+///
+/// Polls rather than subscribing to filesystem events: a poll needs no
+/// platform-specific watcher, behaves the same on every OS PeerBeam supports,
+/// and works over the network filesystems people actually drop files onto.
+///
+/// A file is only sent once it has **stopped growing**, so a large copy still
+/// in progress is not sent half-written. Files already in the folder when the
+/// watch starts are left alone: they are not "new", and sending someone's whole
+/// Downloads directory because they pointed a watch at it would be the wrong
+/// surprise.
+#[derive(Args)]
+pub struct WatchArgs {
+    /// Directory to watch. Only its top level; subdirectories are ignored.
+    pub directory: String,
+    /// Target device (id, name, or unambiguous name prefix).
+    #[arg(long)]
+    pub to: String,
+    /// Seconds between scans.
+    #[arg(long, default_value_t = 3)]
+    pub interval: u64,
+    /// Send what is already in the folder when the watch starts, too.
+    #[arg(long)]
+    pub existing: bool,
+}
+
 /// This device's activity, newest first.
 ///
 /// A read across records this device already keeps — transfers, conversations,

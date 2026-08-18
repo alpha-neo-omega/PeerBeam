@@ -50,6 +50,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
+        Command::Watch(a) => crate::watch::watch(ctx, a, cfg_override.as_deref()).await,
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,
@@ -890,6 +891,18 @@ fn completions(shell: clap_complete::Shell) -> CliResult {
 /// that gap.
 pub(crate) fn clamp_chunk_size(chunk_size: u64) -> u32 {
     chunk_size.clamp(1, u32::MAX as u64) as u32
+}
+
+/// Send some paths, for a caller that already has a `SendArgs`.
+///
+/// Exposed so `watch` can reuse the one send path rather than growing a second
+/// one that could drift from it.
+pub(crate) async fn send_paths(
+    ctx: &Ctx,
+    args: SendArgs,
+    path_override: Option<&str>,
+) -> CliResult {
+    send(ctx, args, path_override).await
 }
 
 async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResult {
