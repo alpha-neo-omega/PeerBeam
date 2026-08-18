@@ -248,6 +248,7 @@ char* pb_chat_cancel(const char* json);         // {peer_id, message_id} → {ca
 char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
 char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
+char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
 
 char* pb_presence_json(void);                   // {} → {sharing, self:{…}, devices:{id:{…}}}
 char* pb_presence_battery(const char* json);    // {percent, charging} → {}  (Android pushes its own reading down)
@@ -317,6 +318,18 @@ survived), while `pb_chat_delete_messages` **names** the kept ids, so a surface
 can tell the user which of the messages they picked are still on their way out.
 An id the conversation does not hold is neither removed nor kept, and an empty
 `message_ids` deletes nothing rather than failing.
+
+`pb_chat_react` answers **two** questions, and a caller must not collapse them.
+`applied` says this device's own history changed; `delivered` says the peer was
+told. The reaction is applied locally regardless of reachability — it is this
+device's record of its own user's gesture — so an offline peer, or one too old
+to have negotiated `CHAT_FEAT_REACTION`, leaves `delivered` false rather than
+turning the call into an error. A surface that shows a reaction as seen must
+read `delivered`, not merely the absence of an error. `applied` is false when
+nothing changed: no such message in that conversation, or the reaction was
+already in the requested state (the call is idempotent by design). Reactions are
+**not** queued for later delivery the way text and files are — a gesture that
+arrives long after its conversation moved on is noise.
 
 `pb_chat_search` is a **pure local read** of the same conversation namespaces
 `pb_chat_history` reads. Nothing goes on the wire, no peer is dialled, and there

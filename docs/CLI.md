@@ -259,6 +259,11 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `chat react <peer> <id> <emoji> [--remove]` — react to a message, or withdraw
+  a reaction. Applies to this device's history whether or not the peer can be
+  reached, and reports both answers: `--json` returns `applied` and `delivered`,
+  and the human line says "not delivered (peer offline, or too old for
+  reactions)" rather than implying it was seen. Reactions are not queued.
 - `chat search <query> [--limit N]` — find messages in this device's **own**
   stored conversations. A local read: no peer is resolved, no discovery window
   is opened, nothing is dialled, so it works on a headless box with no network

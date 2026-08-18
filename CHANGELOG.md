@@ -6,6 +6,23 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **React to a message** — an emoji on any message in a conversation, in the app
+  (a control on the bubble opens a quick picker) and from the CLI
+  (`peerbeam chat react <peer> <id> <emoji> [--remove]`). Reactions group by
+  emoji with a count, and a chip you reacted with is outlined so tapping to
+  withdraw aims at something visible.
+
+  Add and remove are one wire message with a flag rather than a toggle: a toggle
+  derives the new state from what the receiver believes the old one was, so one
+  dropped or duplicated frame leaves two devices disagreeing forever. Stating
+  the end state makes it idempotent.
+
+  A reaction is applied to your own history whether or not the peer can be
+  reached, and delivery is reported separately — an offline peer, or one whose
+  build predates reactions, is told to you rather than silently implied to have
+  seen it.
+
 ## [0.8.2] - 2026-08-18 — Beta
 
 ### Added

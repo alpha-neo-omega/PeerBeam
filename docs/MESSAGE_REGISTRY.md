@@ -144,9 +144,30 @@ belonging to each capability's future spec:
   terminal (a connection failure is not counted — nobody was asked).
   PeerBeam's own builds advertise the bit for both halves, sending a
   `FileDecline` when their user refuses a file and settling their own outgoing
-  row on receiving one. `Receipt`, `Reaction`, `Edit` reserved (not
-  implemented; they were never numbered, so `3` was free and nothing was
-  renumbered). The Chat handler honors §6: unknown MessageTypes flagged
+  row on receiving one. `Reaction = 4` (implemented) — "this emoji is, or is no longer, on the message
+  named by `target_id`": a `target_id`, an `emoji`, a `remove` flag and a
+  `timestamp`. **Add and remove are one message with a flag, not a toggle**: a
+  toggle derives the new state from what the receiver believes the old one was,
+  so a single dropped or duplicated frame leaves the two devices permanently
+  disagreeing about whether the reaction is there. Stating the intended end
+  state makes the message idempotent, on the wire and in the store alike. Sent
+  `OPTIONAL` (§6/§7), like `FileRef` and `FileDecline`, and carrying the third
+  Chat feature bit: `CHAT_FEAT_REACTION = 1 << 2`
+  (`peerbeam_domain::session::CHAT_FEAT_REACTION`). Advertising it asserts that
+  **this peer understands/handles MessageType 4**; a sender must see the bit in
+  the *negotiated* set first. A peer that predates reactions would skip the
+  OPTIONAL frame harmlessly, so the bit exists for the sender's own sake — it
+  reports the gesture as undelivered rather than letting a user believe it
+  landed on a screen that never showed it. `target_id` is bounded by `MAX_ID`
+  and the reaction by `MAX_REACTION` (64 bytes); neither authorizes anything on
+  its own — `ChatStore::apply_reaction` looks the record up **inside that
+  peer's own namespace**, so a `target_id` naming a message in a different
+  conversation finds nothing rather than reaching across, and an id we have
+  deleted is a silent success rather than a channel failure. What counts as an
+  emoji is the sending client's business: the bound is a resource limit, not a
+  taste test. `Receipt`, `Edit` reserved (not
+  implemented; they were never numbered, so `3` and `4` were free and nothing
+  was renumbered). The Chat handler honors §6: unknown MessageTypes flagged
   `OPTIONAL` are ignored and the channel continues; unknown required types
   close that channel only. `Message`'s body is capped at `MAX_BODY = 16384`
   bytes (`peerbeam-chat::message::MAX_BODY`, pinned by a unit test) — this is
