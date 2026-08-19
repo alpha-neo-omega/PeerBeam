@@ -306,6 +306,25 @@ fn approve(ctx: &Ctx, query: &str, path_override: Option<&str>) -> CliResult {
         return report(ctx, record, "already approved", false);
     }
 
+    // With PIN pairing required, approving from here would be a lie. A PIN
+    // proves who is on the other end of a *live handshake* — it signs that
+    // handshake's transcript — and this command has no handshake, only a record
+    // on disk. Approving anyway would satisfy the setting's letter while
+    // proving nothing, which is worse than refusing: the operator would believe
+    // a check had happened.
+    if config.encryption.require_pin_pairing && !record.approved {
+        return Err(CliError::Usage(format!(
+            "{} requires PIN pairing, which needs a live connection — run \
+             `peerbeam pair {}` instead",
+            if record.name.is_empty() {
+                &record.device.0
+            } else {
+                &record.name
+            },
+            record.device.0
+        )));
+    }
+
     let answer = if ctx.interactive {
         Some(prompt::confirm(ctx, &approval_question(record), false))
     } else {

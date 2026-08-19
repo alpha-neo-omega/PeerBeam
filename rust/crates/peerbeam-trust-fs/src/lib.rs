@@ -153,6 +153,30 @@ impl FsTrust {
     ///
     /// [`set_permission`]: FsTrust::set_permission
     pub fn approve(&self, device: &DeviceId) -> Result<()> {
+        self.approve_gated(device, true)
+    }
+
+    /// [`approve`](Self::approve), refusing unless PIN pairing has been
+    /// satisfied for this device.
+    ///
+    /// `pin_satisfied` is the caller's answer to "may this device be approved?"
+    /// — false when `require_pin_pairing` is on and nobody has proved knowledge
+    /// of the PIN. The check lives **here**, at the single place approval is
+    /// written, rather than at each surface that offers a button: a gate that
+    /// every caller has to remember is a gate that one of them eventually
+    /// forgets.
+    ///
+    /// **Refuses rather than silently doing nothing.** An approval that quietly
+    /// fails leaves a surface showing a device as trusted when it is not, which
+    /// is a worse outcome than an error the user can read.
+    pub fn approve_gated(&self, device: &DeviceId, pin_satisfied: bool) -> Result<()> {
+        if !pin_satisfied {
+            return Err(DomainError::Encryption(format!(
+                "device {} cannot be approved: PIN pairing is required and has \
+                 not been completed",
+                device.0
+            )));
+        }
         let mut cache = self.cache.lock().unwrap();
         if let Some(record) = cache.get_mut(&device.0) {
             if !record.approved {
@@ -405,6 +429,45 @@ mod tests {
         // Persisted across reopen.
         let reopened = FsTrust::open(&path).unwrap();
         assert!(reopened.lookup(&id).unwrap().unwrap().approved);
+    }
+
+    /// **The gate refuses; it does not quietly do nothing.** An approval that
+    /// silently fails leaves a surface showing a device as trusted when it is
+    /// not, which is worse than an error somebody can read.
+    #[test]
+    fn approval_is_refused_while_pin_pairing_is_unsatisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let device = DeviceId::from("pb-new");
+        trust.record(record("pb-new", "fp")).unwrap();
+
+        let err = trust
+            .approve_gated(&device, false)
+            .expect_err("an unsatisfied PIN must refuse approval");
+        assert!(
+            format!("{err}").contains("PIN pairing"),
+            "the error does not say why: {err}"
+        );
+        assert!(
+            !trust.lookup(&device).unwrap().unwrap().approved,
+            "the device was approved despite the refusal"
+        );
+        assert!(
+            !trust.may(&device, Permission::Files),
+            "a refused approval still granted a permission"
+        );
+    }
+
+    #[test]
+    fn approval_proceeds_once_the_pin_is_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let device = DeviceId::from("pb-new");
+        trust.record(record("pb-new", "fp")).unwrap();
+
+        trust.approve_gated(&device, true).unwrap();
+        assert!(trust.lookup(&device).unwrap().unwrap().approved);
+        assert!(trust.may(&device, Permission::Files));
     }
 
     #[test]

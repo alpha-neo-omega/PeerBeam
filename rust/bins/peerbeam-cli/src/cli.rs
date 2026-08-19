@@ -81,6 +81,8 @@ pub enum Command {
     Sync(SyncArgs),
     /// Send piped text — a log, a command's output, a snippet — as a message.
     Snippet(SnippetArgs),
+    /// PIN-pair with a device, proving first contact reached the right one.
+    Pair(PairArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -473,6 +475,29 @@ pub enum TrustAction {
 ///
 /// Requires the peer to have granted this machine both `browse` (to see what
 /// exists) and `files` (to receive any of it).
+/// PIN-pair with a device.
+///
+/// Trust-on-first-use pins whatever key answers first; if someone is on the
+/// path during that first handshake, they are pinned instead of the real
+/// device. PIN pairing closes that window: the other device shows six digits, a
+/// person reads them across, and this proves knowledge of them over *this*
+/// handshake's transcript — so a proof is worthless to anyone relaying between
+/// two connections.
+///
+/// The PIN is never sent. Only a proof derived from it is.
+#[derive(Args)]
+pub struct PairArgs {
+    /// Target device (id, name, or unambiguous name prefix).
+    pub peer: String,
+    /// The six digits shown on the other device. Omit to be prompted.
+    #[arg(long)]
+    pub pin: Option<String>,
+    /// Show a PIN and wait for the other device to prove it, rather than
+    /// entering one.
+    #[arg(long, conflicts_with = "pin")]
+    pub show: bool,
+}
+
 /// Send whatever is on stdin to a device as a chat message.
 ///
 /// `cargo test 2>&1 | peerbeam snippet --to laptop`. It is `chat send` with the

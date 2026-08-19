@@ -195,6 +195,7 @@ mod tests {
             peer_name: "peer".into(),
             newly_trusted: false,
             pairing_code: String::new(),
+            transcript: Vec::new(),
         };
         let recv = Session {
             send_key: k2,
@@ -205,6 +206,7 @@ mod tests {
             peer_name: "me".into(),
             newly_trusted: false,
             pairing_code: String::new(),
+            transcript: Vec::new(),
         };
         (send, recv)
     }

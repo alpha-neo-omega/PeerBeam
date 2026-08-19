@@ -128,6 +128,13 @@ impl ChannelType {
     /// directions and Command is for consented *actions*, while browsing is a
     /// read that changes nothing and needs neither's machinery.
     pub const BROWSE: ChannelType = ChannelType(0x0108);
+    /// PIN pairing — proving a first contact reached the intended device.
+    ///
+    /// Its own channel rather than part of the handshake: the handshake must
+    /// complete before a person can be asked anything, and a PIN typed by a
+    /// person is not something a transport can wait on. Carries a *proof*, never
+    /// a PIN — see `peerbeam-pairing`.
+    pub const PAIRING: ChannelType = ChannelType(0x0109);
     /// Encrypted byte pipe — `peerbeam pipe` (Phase B). See MESSAGE_REGISTRY.md
     /// §2/§4.
     ///

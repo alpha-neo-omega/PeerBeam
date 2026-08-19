@@ -11,6 +11,7 @@ pub mod exit;
 pub mod history;
 pub mod notes;
 pub mod output;
+pub mod pair;
 pub mod pipe;
 pub mod presence;
 pub mod prompt;

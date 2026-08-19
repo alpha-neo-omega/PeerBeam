@@ -39,6 +39,12 @@
 //! This is the same construction as Bluetooth's passkey entry, and the reason
 //! it is safe at six digits when a displayed-and-compared code is not.
 
+pub mod handler;
+pub mod wire;
+
+pub use handler::{decode, encode, PairingHandler, PairingSink};
+pub use wire::{PairingMsg, CHANNEL};
+
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use rand::RngCore;

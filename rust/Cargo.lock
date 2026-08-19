@@ -1162,6 +1162,7 @@ dependencies = [
  "peerbeam-engine",
  "peerbeam-identity-fs",
  "peerbeam-notes",
+ "peerbeam-pairing",
  "peerbeam-platform",
  "peerbeam-presence",
  "peerbeam-reliability-fs",
@@ -1382,9 +1383,12 @@ dependencies = [
 name = "peerbeam-pairing"
 version = "0.8.2"
 dependencies = [
+ "async-trait",
  "hmac",
+ "peerbeam-domain",
  "rand 0.8.7",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
 ]

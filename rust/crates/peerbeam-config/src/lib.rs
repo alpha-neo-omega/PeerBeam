@@ -169,6 +169,17 @@ pub struct TransferConfig {
 pub struct EncryptionConfig {
     /// Require encryption for all transfers.
     pub required: bool,
+    /// Require a PIN to be confirmed before a *new* device is pinned.
+    ///
+    /// **Off by default**, because turning it on means no device can pair
+    /// without a person present at both ends — correct for someone who wants
+    /// it, and a broken first run for someone who does not expect it.
+    ///
+    /// When on, trust-on-first-use is no longer trust-on-first-*sight*: the
+    /// unknown peer must prove it knows a PIN shown on this device before its
+    /// key is pinned. It has no effect on devices already trusted; re-pairing a
+    /// known device is not what this protects.
+    pub require_pin_pairing: bool,
 }
 
 /// Storage/location configuration.
@@ -260,7 +271,13 @@ impl Default for TransferConfig {
 
 impl Default for EncryptionConfig {
     fn default() -> Self {
-        Self { required: true }
+        Self {
+            required: true,
+            // Off by default: on, no device can pair without a person at
+            // both ends, which is right for someone who chose it and a
+            // broken first run for someone who did not.
+            require_pin_pairing: false,
+        }
     }
 }
 

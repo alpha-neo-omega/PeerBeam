@@ -71,6 +71,16 @@ pub struct Session {
     /// optional first-contact MITM verification. Empty for resumed/relayed
     /// sessions (which are never first contact).
     pub pairing_code: String,
+    /// This handshake's transcript, for binding a PIN-pairing proof to *this*
+    /// connection.
+    ///
+    /// **Not a secret**, and deliberately not one: it is both sides' public
+    /// keys, nonces and presented identities, all of which crossed the wire in
+    /// the clear. Its value is that it is *unique to this handshake*, so a
+    /// proof computed over it is worthless on any other — including the second
+    /// leg of a machine-in-the-middle, which is the whole reason PIN pairing
+    /// signs it rather than signing the PIN alone.
+    pub transcript: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -221,6 +231,7 @@ pub async fn authenticate(
         peer_name: peer_name_display,
         newly_trusted,
         pairing_code: enc.pairing_code(&PublicKey(our_pub), &PublicKey(peer_pub)),
+        transcript,
     })
 }
 

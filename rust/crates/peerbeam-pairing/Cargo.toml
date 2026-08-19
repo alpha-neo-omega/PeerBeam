@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+peerbeam-domain = { path = "../peerbeam-domain" }
+serde_json = { workspace = true }
 subtle = "2"
+

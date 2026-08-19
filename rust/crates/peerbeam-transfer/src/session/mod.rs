@@ -308,6 +308,10 @@ pub struct PeerSession {
     /// The first-contact pairing code from this session's handshake (empty for
     /// a resumed session — there is no handshake to derive it from).
     pairing_code: String,
+    /// This handshake's transcript, for binding a PIN-pairing proof to it.
+    /// Empty for a resumed session, which has no handshake to bind to — and a
+    /// PIN proved against nothing is not a proof.
+    transcript: Vec<u8>,
 }
 
 impl PeerSession {
@@ -348,6 +352,7 @@ impl PeerSession {
         let newly_trusted = auth_session.newly_trusted;
         let peer_name = auth_session.peer_name.clone();
         let pairing_code = auth_session.pairing_code.clone();
+        let transcript = auth_session.transcript.clone();
         let session_crypto = SessionCrypto::from_session(&auth_session, role, enc.clone());
         let mut control_crypto = session_crypto.control()?;
 
@@ -416,6 +421,7 @@ impl PeerSession {
         session.newly_trusted = newly_trusted;
         session.peer_name = peer_name;
         session.pairing_code = pairing_code;
+        session.transcript = transcript;
         Ok(session)
     }
 
@@ -483,6 +489,9 @@ impl PeerSession {
             newly_trusted: false,
             peer_name: String::new(),
             pairing_code: String::new(),
+            // A resumed session has no handshake, so nothing to bind a PIN
+            // proof to. Empty is the honest answer, and `transcript()` says so.
+            transcript: Vec::new(),
         };
 
         if let Some(reg) = &session.registry {
@@ -547,6 +556,18 @@ impl PeerSession {
     #[must_use]
     pub fn pairing_code(&self) -> &str {
         &self.pairing_code
+    }
+
+    /// This handshake's transcript, for PIN pairing.
+    ///
+    /// **Not a secret** — every byte of it crossed the wire in the clear. Its
+    /// value is being unique to this handshake, so a PIN proof over it cannot
+    /// be replayed onto another connection, which is exactly what a machine in
+    /// the middle would need to do. Empty for a resumed session: there is no
+    /// handshake to bind to, and a proof against nothing proves nothing.
+    #[must_use]
+    pub fn transcript(&self) -> &[u8] {
+        &self.transcript
     }
 
     /// The current lifecycle state.

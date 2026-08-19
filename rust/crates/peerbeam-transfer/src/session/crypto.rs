@@ -382,6 +382,7 @@ mod tests {
             peer_name: "r".into(),
             newly_trusted: false,
             pairing_code: String::new(),
+            transcript: Vec::new(),
         };
         let resp = Session {
             send_key: k_rev,
@@ -392,6 +393,7 @@ mod tests {
             peer_name: "i".into(),
             newly_trusted: false,
             pairing_code: String::new(),
+            transcript: Vec::new(),
         };
         let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
         (

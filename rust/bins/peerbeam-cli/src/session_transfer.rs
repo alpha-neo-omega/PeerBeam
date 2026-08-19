@@ -34,9 +34,10 @@ use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
-    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
-    PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
+    Capability, CapabilitySet, ChannelType, MessageFlags, MessageHandler, MessageType,
+    CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
+    CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
+    PRESENCE_FEAT_STATUS,
 };
 use peerbeam_domain::session::{BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
@@ -197,6 +198,11 @@ pub struct Session {
     /// The first-contact pairing code from this session's handshake (empty
     /// for a resumed session — there is no handshake to derive it from).
     pub pairing_code: String,
+    /// This handshake's transcript, for binding a PIN-pairing proof to it.
+    /// Not a secret; every byte of it crossed the wire in the clear.
+    pub transcript: Vec<u8>,
+    /// Pairing messages from the peer.
+    pub pairing_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_pairing::PairingMsg>>>,
     /// The capabilities both sides agreed on (already intersected). Read via
     /// [`supports_file_ref`](Self::supports_file_ref). Captured here — rather
     /// than fetched on demand — because the negotiated value has to be read
@@ -207,6 +213,85 @@ pub struct Session {
     /// This session's presence heartbeat, if presence was configured. Held so
     /// `close` can stop it rather than wait out the next tick's liveness probe.
     presence: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// How long a pairing step waits. Generous: a person is reading digits off
+/// another screen and typing them, which is not a network round trip.
+const PAIRING_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Send a proof and wait for the verifier's answer: `(verified, attempts_left)`.
+pub async fn send_pairing_proof(session: &Session, proof: &[u8]) -> Option<(bool, u8)> {
+    let channel = session
+        .handle
+        .open_channel(ChannelType::PAIRING)
+        .await
+        .ok()?;
+    let msg = peerbeam_pairing::PairingMsg::Prove {
+        proof: proof.to_vec(),
+    };
+    let payload = peerbeam_pairing::encode(&msg);
+    session
+        .handle
+        .send_on_channel(
+            channel,
+            MessageType::new(peerbeam_pairing::wire::message_type(&msg)),
+            MessageFlags::default(),
+            payload.into(),
+        )
+        .await
+        .ok()?;
+
+    let rx = session.pairing_rx.clone();
+    let msg = tokio::time::timeout(PAIRING_WAIT, async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()??;
+    match msg {
+        peerbeam_pairing::PairingMsg::Result {
+            verified,
+            attempts_left,
+        } => Some((verified, attempts_left)),
+        // Anything else here is a peer that did not answer the question asked.
+        _ => None,
+    }
+}
+
+/// Wait for the peer's proof.
+pub async fn await_pairing_proof(session: &Session) -> Option<Vec<u8>> {
+    let rx = session.pairing_rx.clone();
+    let msg = tokio::time::timeout(PAIRING_WAIT, async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    })
+    .await
+    .ok()??;
+    match msg {
+        peerbeam_pairing::PairingMsg::Prove { proof } => Some(proof),
+        _ => None,
+    }
+}
+
+/// Tell the peer how its attempt went.
+pub async fn send_pairing_result(session: &Session, verified: bool, attempts_left: u8) {
+    let Ok(channel) = session.handle.open_channel(ChannelType::PAIRING).await else {
+        return;
+    };
+    let msg = peerbeam_pairing::PairingMsg::Result {
+        verified,
+        attempts_left,
+    };
+    let payload = peerbeam_pairing::encode(&msg);
+    let _ = session
+        .handle
+        .send_on_channel(
+            channel,
+            MessageType::new(peerbeam_pairing::wire::message_type(&msg)),
+            MessageFlags::default(),
+            payload.into(),
+        )
+        .await;
 }
 
 /// Ask a peer for a manifest and wait for it, bounded.
@@ -473,6 +558,7 @@ async fn establish(
     // forget it. The CLI serves nothing (its share list is empty — a terminal
     // session is not a file server) but must still receive the answers to its
     // own requests.
+    let (pairing_tx, pairing_rx) = unbounded_channel();
     let (browse_tx, browse_rx) = unbounded_channel();
     let (sync_tx, sync_rx) = unbounded_channel();
     // The CLI serves no shares — a terminal session is not a file server — so
@@ -495,6 +581,13 @@ async fn establish(
             let _ = browse_tx.send(r);
         }),
     );
+    // PIN pairing: registered unconditionally, like clipboard and browsing, so
+    // no call site can forget it. It answers nothing on its own — it hands
+    // messages to whichever command is running the flow.
+    let pairing_handler = peerbeam_pairing::PairingHandler::new(std::sync::Arc::new(move |m| {
+        let _ = pairing_tx.send(m);
+    }));
+    handlers.push(pairing_handler as Arc<dyn MessageHandler>);
     handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
     handlers.push(browse_handler as Arc<dyn MessageHandler>);
     handlers.push(sync_handler as Arc<dyn MessageHandler>);
@@ -531,6 +624,7 @@ async fn establish(
     let peer_id = ps.peer().0.clone();
     let newly_trusted = ps.newly_trusted();
     let pairing_code = ps.pairing_code().to_string();
+    let transcript = ps.transcript().to_vec();
     // Read alongside the other post-handshake fields, before `ps` moves into
     // the run closure below — this is the negotiated (intersected) set, so it
     // already reflects what the *peer* advertised, not just what we asked for.
@@ -562,6 +656,8 @@ async fn establish(
         peer_id,
         newly_trusted,
         pairing_code,
+        transcript,
+        pairing_rx: Arc::new(tokio::sync::Mutex::new(pairing_rx)),
         capabilities,
         incoming,
         run,
