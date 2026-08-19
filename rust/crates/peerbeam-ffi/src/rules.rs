@@ -120,6 +120,20 @@ mod tests {
         json!({ "directory": dir })
     }
 
+    /// An absolute path on the platform the test is running on.
+    ///
+    /// `/tmp` is **not** absolute on Windows — `Path::is_absolute` wants a
+    /// prefix like `C:\\`, and a leading slash alone is root-*relative*. A
+    /// fixture that assumed otherwise made every "this one is fine, that one is
+    /// not" test fail on Windows for a reason having nothing to do with rules.
+    fn abs(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{name}")
+        } else {
+            format!("/{name}")
+        }
+    }
+
     /// A settings document with no rules key is "no rules" — the state every
     /// existing install is in.
     #[test]
@@ -141,14 +155,14 @@ mod tests {
     fn a_well_formed_list_is_read_back_in_order() {
         let rules = from_settings(&json!({
             RULES_KEY: [
-                { "extension": "pdf", "directory": "/srv/papers" },
-                rule("/srv/inbox"),
+                { "extension": "pdf", "directory": abs("srv/papers") },
+                rule(&abs("srv/inbox")),
             ]
         }));
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].extension.as_deref(), Some("pdf"));
-        assert_eq!(rules[0].directory, "/srv/papers");
-        assert_eq!(rules[1].directory, "/srv/inbox");
+        assert_eq!(rules[0].directory, abs("srv/papers"));
+        assert_eq!(rules[1].directory, abs("srv/inbox"));
         assert_eq!(rules[1].extension, None);
     }
 
@@ -166,7 +180,7 @@ mod tests {
     #[test]
     fn one_invalid_rule_refuses_the_whole_list() {
         let err = set(&json!({
-            "rules": [rule("/tmp"), rule("relative/path")]
+            "rules": [rule(&abs("tmp")), rule("relative/path")]
         }))
         .expect_err("must refuse");
         assert_eq!(err.0.as_str(), Code::InvalidArgument.as_str());

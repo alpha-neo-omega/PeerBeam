@@ -17,5 +17,7 @@ pub mod event;
 pub mod id;
 pub mod port;
 pub mod session;
+pub mod wire_path;
 
 pub use error::{DomainError, Result};
+pub use wire_path::wire_path;

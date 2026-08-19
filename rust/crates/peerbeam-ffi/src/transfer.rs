@@ -5679,7 +5679,7 @@ fn observe_folder(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observe
             } else if meta.is_file() {
                 if let Ok(rel) = path.strip_prefix(root) {
                     out.push((
-                        rel.to_string_lossy().into_owned(),
+                        peerbeam_domain::wire_path(rel),
                         peerbeam_sync::Observed {
                             size: meta.len(),
                             modified: meta
@@ -8224,6 +8224,7 @@ mod tests {
     #[test]
     fn average_speed_excludes_the_pre_transfer_wait() {
         let mut s = Stats::new();
+        let registered = Instant::now();
         // Registration-time idle wait (e.g. the up-to-180s accept/reject
         // prompt): real time passes with nothing transferred yet.
         std::thread::sleep(Duration::from_millis(150));
@@ -8235,15 +8236,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         s.update(7_000_000, 10_000_000);
 
-        // If average_speed were (wrongly) measured since registration,
-        // elapsed would be ~210ms giving 7,000,000/0.21 ≈ 33 MB/s. Measured
-        // correctly from the first byte (~60ms), it's ≈ 116 MB/s. Assert we
-        // land comfortably above the registration-baselined figure.
-        let wrong_if_from_registration = 7_000_000.0 / 0.21;
+        // **Measured, not assumed.** An earlier version hardcoded the elapsed
+        // time as 210 ms — the two sleeps added up — and asserted a rate above
+        // the figure that implied. On a loaded runner a 60 ms sleep is not
+        // 60 ms, so the arithmetic stopped describing the run and the test
+        // failed for reasons unrelated to what it checks. Timing the window
+        // with the same clock the code uses holds at any speed.
+        let since_registration = registered.elapsed().as_secs_f64();
+        let baselined_at_registration = 7_000_000.0 / since_registration;
         assert!(
-            s.average_speed > wrong_if_from_registration * 2.0,
-            "average_speed {} still looks baselined at registration, not \
-             at the first byte",
+            s.average_speed > baselined_at_registration * 1.2,
+            "average_speed {} is no better than the registration-baselined \
+             {baselined_at_registration}, so it still counts the idle wait",
             s.average_speed
         );
     }

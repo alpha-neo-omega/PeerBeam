@@ -278,7 +278,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, u64, i64)>) {
                 continue;
             };
             out.push((
-                rel.to_string_lossy().into_owned(),
+                peerbeam_domain::wire_path(rel),
                 meta.len(),
                 meta.modified()
                     .ok()

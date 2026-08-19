@@ -302,8 +302,17 @@ mod tests {
     #[serial_test::serial]
     fn a_file_that_cannot_be_opened_does_not_stop_logging() {
         // Losing the file copy must never stop the engine trying to write it.
+        //
+        // The unopenable path is built by putting a directory where a *file*
+        // already is, which fails on every platform. An earlier version used a
+        // hardcoded `/proc/...` path: on Windows that is simply a relative name
+        // and `create_dir_all` cheerfully created it, so the test asserted the
+        // opposite of what it meant and only failed once CI ran on Windows.
         clear();
-        assert!(!set_file(Some(PathBuf::from("/proc/nope/deeper/x.jsonl"))));
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        assert!(!set_file(Some(blocker.join("x.jsonl"))));
         record(line("still buffered"));
         assert_eq!(get(10)["logs"].as_array().unwrap().len(), 1);
         clear();

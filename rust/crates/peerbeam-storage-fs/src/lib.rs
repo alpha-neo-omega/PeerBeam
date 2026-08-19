@@ -187,11 +187,13 @@ impl StorageProvider for FsStorage {
 
                 if meta.is_file() {
                     let size = meta.len();
-                    let rel = path
-                        .strip_prefix(&root_path)
-                        .map_err(|e| DomainError::Storage(format!("strip prefix: {e}")))?
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    // `wire_path`, not `.replace('\\', "/")`: on Unix a
+                    // backslash is a legal filename character, and replacing it
+                    // invents a directory that does not exist.
+                    let rel = peerbeam_domain::wire_path(
+                        path.strip_prefix(&root_path)
+                            .map_err(|e| DomainError::Storage(format!("strip prefix: {e}")))?,
+                    );
                     out.push((rel, size));
                 } else if meta.is_dir() {
                     // A symlink to a directory inside root: still not

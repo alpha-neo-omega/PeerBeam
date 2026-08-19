@@ -359,7 +359,7 @@ fn walk(
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            let rel_path = rel.to_string_lossy().into_owned();
+            let rel_path = peerbeam_domain::wire_path(rel);
             let version = versions
                 .and_then(|v| v.get(&rel_path))
                 .cloned()

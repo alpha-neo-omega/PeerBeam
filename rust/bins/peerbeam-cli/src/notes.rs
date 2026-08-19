@@ -153,7 +153,7 @@ fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
         ctx.line(&format!(
             "{}  {}  {}",
             ctx.dim(&n.id),
-            &n.updated_at,
+            n.updated_at,
             ctx.bold(&heading)
         ));
     }

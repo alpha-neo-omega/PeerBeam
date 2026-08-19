@@ -217,7 +217,7 @@ fn observe(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observed)> {
             } else if meta.is_file() {
                 if let Ok(rel) = path.strip_prefix(root) {
                     out.push((
-                        rel.to_string_lossy().into_owned(),
+                        peerbeam_domain::wire_path(rel),
                         peerbeam_sync::Observed {
                             size: meta.len(),
                             modified: meta
