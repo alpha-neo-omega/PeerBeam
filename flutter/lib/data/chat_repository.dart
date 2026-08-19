@@ -50,6 +50,21 @@ class ChatRepository extends ChangeNotifier {
   bool _loadingConversations = false;
   bool _conversationsStale = false;
 
+  /// Why the last read of a conversation failed, keyed by peer id.
+  ///
+  /// A read that did not come back and a thread with nothing in it are
+  /// different facts that [_byPeer] alone cannot tell apart: a failed read
+  /// leaves exactly the missing entry an empty conversation does, so a surface
+  /// reading only that tells the user their history is gone when the truth is
+  /// that nobody answered. Kept per peer because every conversation lives in
+  /// here at once — a thread that failed must not make the one beside it look
+  /// broken.
+  final Map<String, Object> _loadErrors = {};
+
+  /// Why the last read of the conversation list failed. Same distinction as
+  /// [_loadErrors], for the list itself.
+  Object? _conversationsError;
+
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
   int _optimisticSeq = 0;
@@ -81,6 +96,16 @@ class ChatRepository extends ChangeNotifier {
   /// first moment of a share, and permanently so for one a restart interrupted.
   /// A surface must render that as an indeterminate bar, never as 0%.
   ({int done, int total})? stagingFor(String messageId) => _staging[messageId];
+
+  /// Why the last read of the conversation with [peerId] failed, or null when
+  /// it came back — including the ordinary case of a thread never read at all.
+  /// See [_loadErrors] for why an absence and a failure are kept apart.
+  Object? loadErrorFor(String peerId) => _loadErrors[peerId];
+
+  /// Why the last read of the conversation list failed, or null when it came
+  /// back. "No conversations yet" is a claim about this device's own disk, and
+  /// a read that failed has no standing to make it.
+  Object? get conversationsError => _conversationsError;
 
   /// Why the message with [messageId] failed, when the engine said so. Null
   /// for every message that hasn't failed (and for a failure this session
@@ -122,6 +147,12 @@ class ChatRepository extends ChangeNotifier {
   }
 
   /// Pull the persisted conversation with [peerId] from the engine.
+  ///
+  /// A failure keeps whatever is already on screen — a stale conversation is
+  /// still the user's conversation — but is remembered rather than swallowed
+  /// (see [loadErrorFor]): a thread that has never loaded is otherwise
+  /// indistinguishable from one with nothing in it, and only one of those two
+  /// is something the surface may state as fact.
   Future<void> refresh(String peerId) async {
     final api = _api;
     if (api == null) return;
@@ -138,9 +169,14 @@ class ChatRepository extends ChangeNotifier {
       // anything — so those rows are carried across, newest last (they were
       // created just now, and nothing will ever deliver them). See [_unsent].
       _byPeer[peerId] = [...msgs, ...?_unsent[peerId]];
+      _loadErrors.remove(peerId);
       notifyListeners();
-    } catch (_) {
-      // Keep the current view on transient errors.
+    } catch (e) {
+      // Keep the current view on transient errors — but say so, rather than
+      // leaving the surface to present the failure as an empty thread.
+      if (_disposed) return;
+      _loadErrors[peerId] = e;
+      notifyListeners();
     }
   }
 
@@ -167,10 +203,16 @@ class ChatRepository extends ChangeNotifier {
         final list = await api.chatConversations();
         if (_disposed) return;
         _conversations = list;
+        _conversationsError = null;
         notifyListeners();
       } while (_conversationsStale);
-    } catch (_) {
-      // Keep the current list on transient errors.
+    } catch (e) {
+      // Keep the current list on transient errors — and remember why, because
+      // an unread list renders exactly like a device that has never chatted,
+      // and the thread it would hide may be the only way back to a queued file.
+      if (_disposed) return;
+      _conversationsError = e;
+      notifyListeners();
     } finally {
       _loadingConversations = false;
     }
@@ -206,6 +248,10 @@ class ChatRepository extends ChangeNotifier {
     }
     _byPeer.remove(peerId);
     _unsent.remove(peerId);
+    // The thread is gone, so a failure to read it is no longer news about
+    // anything — left behind it would raise an error page over a conversation
+    // the user has just deleted.
+    _loadErrors.remove(peerId);
     notifyListeners();
     await refreshConversations();
     return result;
@@ -266,18 +312,21 @@ class ChatRepository extends ChangeNotifier {
   /// here would mean pulling every message of every conversation across the FFI
   /// to answer one query.
   ///
-  /// A transient failure comes back as [ChatSearchResults.empty] rather than
-  /// throwing, matching every other read in this repository; the surface shows
-  /// "no matches", which is the same thing the user sees for a query that
-  /// genuinely matched nothing.
+  /// A failure **throws**, and is deliberately not flattened to
+  /// [ChatSearchResults.empty]. An empty result set is the engine stating that
+  /// the message is not there; a search that never ran has stated nothing at
+  /// all. Returning the first for the second tells someone searching their own
+  /// history — authoritatively — that what they are looking for does not
+  /// exist, and that is the one answer a search cannot take back: they stop
+  /// looking. There is no repository state to protect here (nothing is cached,
+  /// nothing is notified), so the caller that owns the query owns the failure
+  /// too, and says which of the two it has.
   Future<ChatSearchResults> search(String query, {int? limit}) async {
     final api = _api;
+    // Not a failure: a build with no engine wired has nothing to search, the
+    // same null guard every other method here takes.
     if (api == null) return ChatSearchResults.empty;
-    try {
-      return await api.chatSearch(query, limit: limit);
-    } catch (_) {
-      return ChatSearchResults.empty;
-    }
+    return api.chatSearch(query, limit: limit);
   }
 
   /// Tell the peer we have read its messages, up to the newest one we hold.

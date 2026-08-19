@@ -337,9 +337,18 @@ class FakePeerBeam implements PeerBeamApi {
     return id;
   }
 
+  /// Every target `chatSend` was actually handed, in order.
+  ///
+  /// `calls` records the text alone, which cannot tell a send aimed at the
+  /// address discovery is advertising *now* from one aimed at whatever the
+  /// screen was pushed with — the difference a re-resolving chat screen exists
+  /// to make.
+  final List<PeerTarget> chatSendTargets = [];
+
   @override
   Future<String> chatSend(PeerTarget peer, String text) async {
     calls.add('chatSend:$text');
+    chatSendTargets.add(peer);
     final id = 'chat-${++_chatSeq}';
     // Mirrors the real engine's `device_from`: key by the peer's real id when
     // present, falling back to name only when it isn't (matching the one
@@ -359,6 +368,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<ChatMessage>> chatHistory(String peerId) async {
+    _maybeFail('chatHistory');
     calls.add('chatHistory:$peerId');
     return chatHistories[peerId] ?? const [];
   }
@@ -766,6 +776,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<ChatSearchResults> chatSearch(String query, {int? limit}) async {
+    _maybeFail('chatSearch');
     calls.add('chatSearch:$query');
     final cap = limit ?? searchDefaultLimit;
     // Mirrors `ChatStore::search`: a trimmed, empty query finds nothing rather
@@ -812,6 +823,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<ChatConversation>> chatConversations() async {
+    _maybeFail('chatConversations');
     calls.add('chatConversations');
     // Derived from the seeded histories, exactly as `Manager` derives it from
     // the conversation namespaces that exist: one row per thread, newest

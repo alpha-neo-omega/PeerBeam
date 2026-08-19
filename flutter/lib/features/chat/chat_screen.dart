@@ -27,12 +27,20 @@ import 'chat_drop_zone.dart';
 /// local, and since increment 2b both a text message and a file *share* queue
 /// in the engine's outbox for an offline peer rather than failing.
 ///
-/// One case is genuinely different, and is the reason for [_canSend]: a peer
-/// with no known address at all — a conversation opened from the Conversations
-/// list for a device discovery cannot currently see. The engine refuses such a
-/// send outright (`device_from` requires an address and a port), before
-/// anything is enqueued, so the composer says so instead of accepting messages
-/// that would silently never exist.
+/// One case is genuinely different, and is why the composer can be disabled at
+/// all (see [_ChatScreenState._canSend]): a peer with no known address — a
+/// conversation opened from the Conversations list for a device discovery
+/// cannot currently see. The engine refuses such a send outright (`device_from`
+/// requires an address and a port), before anything is enqueued, so the
+/// composer says so instead of accepting messages that would silently never
+/// exist.
+///
+/// That case is temporary, and the screen treats it as temporary: [peer] is
+/// only the target this thread was *pushed* with, and the live one is re-read
+/// from discovery on every build (see [_ChatScreenState._target]). A device
+/// that comes back while its thread is open re-enables the composer where it
+/// stands, which is what "Automatic reconnect" has to mean on the one surface
+/// that exists to be open before the peer is.
 class ChatScreen extends StatefulWidget {
   final String peerId;
   final PeerTarget peer;
@@ -92,7 +100,24 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  /// Whether this peer can be sent to at all.
+  /// The peer as discovery can see it **right now**, falling back to the target
+  /// this thread was opened with.
+  ///
+  /// [ChatScreen.peer] is frozen at push time, and the Conversations list
+  /// deliberately pushes an address-less placeholder for a peer discovery
+  /// cannot currently see — which is exactly the thread this screen exists to
+  /// keep reachable. Read once, that placeholder never expires: the device
+  /// appears on Home, the engine can reach it again, and the composer, the
+  /// attach button and the drop zone all stay dead until the user backs out and
+  /// comes in again, with nothing on screen suggesting they should.
+  ///
+  /// Discovery wins whenever it has an answer, rather than only filling a gap:
+  /// it carries the peer's *current* address and name, and the pushed target
+  /// may be minutes old.
+  PeerTarget _target(AppState state) =>
+      state.device.peerTarget(widget.peerId) ?? widget.peer;
+
+  /// Whether [peer] can be sent to at all.
   ///
   /// Mirrors the engine's own precondition (`device_from`: at least one address
   /// and a nonzero port) rather than guessing at reachability — an *offline*
@@ -101,7 +126,12 @@ class _ChatScreenState extends State<ChatScreen> {
   /// address for: that send is refused before it is enqueued, and the
   /// repository would be left holding an optimistic bubble that the next
   /// refresh silently deletes.
-  bool get _canSend => widget.peer.addresses.isNotEmpty && widget.peer.port > 0;
+  ///
+  /// Takes the peer rather than reading [ChatScreen.peer]: this question has to
+  /// be re-asked of the *live* target every build, or its answer outlives the
+  /// only condition that made it true.
+  static bool _canSend(PeerTarget peer) =>
+      peer.addresses.isNotEmpty && peer.port > 0;
 
   /// Fire-and-forget: `send` awaits a synchronous dial+handshake under the
   /// hood, so the button handler must not block on it — the optimistic
@@ -110,9 +140,11 @@ class _ChatScreenState extends State<ChatScreen> {
   void _send() {
     final text = _controller.text;
     if (text.trim().isEmpty) return;
-    final chat = AppScope.of(context).chat;
+    final state = AppScope.of(context);
     _controller.clear();
-    chat.send(widget.peerId, widget.peer, text);
+    // Resolved as the message goes out, not as the thread was opened: an
+    // address that arrived in between is the address this send needs.
+    state.chat.send(widget.peerId, _target(state), text);
   }
 
   /// Attach files to the conversation.
@@ -142,13 +174,16 @@ class _ChatScreenState extends State<ChatScreen> {
       () => pickFilesToStage(kind: kind, keep: scope.staging.paths),
     );
     if (picked.isEmpty || !mounted) return;
+    // After the picker, not before it: choosing files can take a while, and the
+    // peer may have been discovered (or moved) in the meantime.
+    final peer = _target(scope);
     for (final file in picked) {
       // Not awaited, and deliberately not sequential: each call appends its
       // optimistic row synchronously, so all of them appear at once.
       unawaited(
         chat.sendFile(
           widget.peerId,
-          widget.peer,
+          peer,
           file.path,
           name: file.name,
           size: file.size,
@@ -483,9 +518,17 @@ class _ChatScreenState extends State<ChatScreen> {
     // The whole screen rebuilds on a chat change, not just the list: the app
     // bar becomes the selection bar, and both it and the bubbles have to be
     // reading the same narrowed selection within one frame.
+    //
+    // Discovery is merged in for a second reason: the send target is re-read
+    // from it every build (see [_target]), and nothing else would ever notice
+    // it move. `AppScope` is a plain `InheritedWidget` around a state object
+    // whose identity never changes, so a peer coming back would otherwise leave
+    // this screen — the one disabled on its account — sitting on a snapshot
+    // taken before it existed. The same merge the device picker was fixed with.
     return AnimatedBuilder(
-      animation: state.chat,
+      animation: Listenable.merge([state.chat, state.device]),
       builder: (context, _) {
+        final peer = _target(state);
         final items = state.chat.messagesFor(widget.peerId);
         // Derived every build, never written back into state (see [_selected]).
         final present = items.map((m) => m.id).toSet();
@@ -501,7 +544,7 @@ class _ChatScreenState extends State<ChatScreen> {
           onPopInvokedWithResult: (didPop, _) {
             if (!didPop) _clearSelection();
           },
-          child: _body(state, items, selected, selecting),
+          child: _body(state, peer, items, selected, selecting),
         );
       },
     );
@@ -509,33 +552,53 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _body(
     AppState state,
+    PeerTarget peer,
     List<ChatMessage> items,
     Set<String> selected,
     bool selecting,
   ) {
+    final canSend = _canSend(peer);
+    // Why the thread is empty, when it is empty because a read failed.
+    final failure = state.chat.loadErrorFor(widget.peerId);
     return Scaffold(
       appBar: selecting
           ? _selectionBar(items, selected)
-          : AppBar(title: Text(widget.peer.name)),
+          : AppBar(title: Text(peer.name)),
       // Desktop-only drag & drop for this one conversation — a transparent
       // passthrough everywhere else, exactly like the Send flow's own
       // DropZone. Wraps the body (not the AppBar) so a drop anywhere over the
       // thread or composer sends straight to this peer.
       body: ChatDropZone(
         peerId: widget.peerId,
-        peer: widget.peer,
-        canSend: _canSend,
+        peer: peer,
+        canSend: canSend,
         child: SafeArea(
           child: ContentPane(
             child: Column(
               children: [
                 Expanded(
                   child: items.isEmpty
-                      ? const EmptyState(
-                          icon: Icons.chat_bubble_outline_rounded,
-                          title: 'No messages yet',
-                          message: 'Send a message to start the conversation.',
-                        )
+                      // A conversation this device could not read is not a
+                      // conversation with nothing in it, and "No messages yet"
+                      // is a statement about the user's own history that a
+                      // failed read has no grounds to make. Only when there is
+                      // genuinely nothing on screen: a thread that loaded once
+                      // and failed to reload keeps its messages, because stale
+                      // messages beat an error page over messages that are
+                      // right there.
+                      ? (failure != null
+                            ? ErrorState(
+                                error: failure,
+                                title: 'Could not open this conversation',
+                                onRetry: () =>
+                                    state.chat.openThread(widget.peerId),
+                              )
+                            : const EmptyState(
+                                icon: Icons.chat_bubble_outline_rounded,
+                                title: 'No messages yet',
+                                message:
+                                    'Send a message to start the conversation.',
+                              ))
                       // Reversed so the latest message stays pinned to the
                       // bottom without a manual scroll controller.
                       : ListView.builder(
@@ -572,7 +635,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           },
                         ),
                 ),
-                if (!_canSend)
+                if (!canSend)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(
                       AppSpace.md,
@@ -581,7 +644,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       AppSpace.xxs,
                     ),
                     child: Text(
-                      'No address known for ${widget.peer.name} yet — this '
+                      'No address known for ${peer.name} yet — this '
                       'conversation is readable, and sending works again as soon '
                       'as the device is discovered.',
                       style: Theme.of(context).textTheme.labelSmall?.copyWith(
@@ -593,7 +656,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   controller: _controller,
                   onSend: _send,
                   onAttach: _attach,
-                  enabled: _canSend,
+                  enabled: canSend,
                 ),
               ],
             ),

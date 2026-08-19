@@ -405,6 +405,42 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Confirm before removing a saved device.
+  ///
+  /// A prompt rather than an undo, and the only one on this screen. A saved
+  /// entry is a hand-typed `host:port` — routinely the sole route to a headless
+  /// server or a Tailscale peer discovery never surfaces — and its menu row
+  /// sits directly under "Edit". Nothing on the device can reconstruct the
+  /// address once it is gone, so an undo the user has a few seconds to notice
+  /// is the wrong shape: miss it and the cost is an address they have to
+  /// remember. The address is in the question so it can be read before it goes.
+  Future<void> _confirmRemoveSaved(BuildContext context, SavedDevice d) async {
+    final scope = AppScope.of(context);
+    final name = d.name.isEmpty ? d.host : d.name;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove $name?'),
+        content: Text(
+          'PeerBeam will stop listing ${d.host}:${d.port}. Nothing here '
+          'remembers the address afterwards — you would have to type it in '
+          'again.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await scope.saved.remove(d.id);
+  }
+
   /// Send to a saved device. Content-first (send the stack if non-empty).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
@@ -740,7 +776,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                 onShare: () => _shareSaved(context, saved[i]),
                                 onEdit: () =>
                                     _editSavedDevice(context, saved[i]),
-                                onRemove: () => state.saved.remove(saved[i].id),
+                                onRemove: () =>
+                                    _confirmRemoveSaved(context, saved[i]),
                               ),
                             ),
                           ),

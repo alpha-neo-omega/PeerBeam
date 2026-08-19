@@ -86,27 +86,68 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
     await _write([for (final f in _folders) f.path, picked]);
   }
 
-  Future<void> _remove(SharedFolder folder) => _write([
-    for (final f in _folders)
-      if (f.path != folder.path) f.path,
-  ]);
+  /// Stop sharing one folder, with an undo.
+  ///
+  /// An undo rather than a prompt, and deliberately not the other way round:
+  /// un-sharing is the *safe* direction here — the belief this card exists to
+  /// prevent is that a folder is private when it is still offered — so a dialog
+  /// in front of it would slow the one action that must never hesitate. What is
+  /// lost is a path, still legible on screen as the row goes, and putting it
+  /// back is a single write.
+  Future<void> _remove(SharedFolder folder) async {
+    final index = _folders.indexWhere((f) => f.path == folder.path);
+    // Only offer to take back what actually happened — a refused write has
+    // already reported itself, and an Undo beside it would be undoing nothing.
+    final removed = await _write([
+      for (final f in _folders)
+        if (f.path != folder.path) f.path,
+    ]);
+    if (!removed || !mounted) return;
+    // The name, not the path: the path is what the undo would restore, and
+    // repeating it in a snackbar makes it read as though it were still shared.
+    _say(
+      'Stopped sharing ${folder.name.isEmpty ? folder.path : folder.name}',
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () => _restore(folder, index),
+      ),
+    );
+  }
+
+  /// Put a share back where it was.
+  ///
+  /// Composed against the list as it stands now rather than a snapshot taken at
+  /// removal: two removals in a row would otherwise have the first undo
+  /// resurrect the second folder as well. Already-present is a no-op, since a
+  /// re-shared folder written twice would either duplicate the row or fail.
+  Future<void> _restore(SharedFolder folder, int index) async {
+    if (!mounted || _folders.any((f) => f.path == folder.path)) return;
+    final paths = [for (final f in _folders) f.path];
+    paths.insert(index.clamp(0, paths.length), folder.path);
+    await _write(paths);
+  }
 
   /// Persist, surface a refusal, then re-read whatever is actually in force.
-  Future<void> _write(List<String> paths) async {
+  /// Returns whether the engine took the list — the undo offered after a
+  /// removal must not appear beside a write that was refused.
+  Future<bool> _write(List<String> paths) async {
     final api = AppScope.of(context).api;
-    if (api == null) return;
+    if (api == null) return false;
+    var written = true;
     try {
       await api.setSharedFolders(paths);
     } catch (e) {
+      written = false;
       if (mounted) _say(friendlyError(e));
     }
     await _load();
+    return written;
   }
 
-  void _say(String message) {
+  void _say(String message, {SnackBarAction? action}) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+      ..showSnackBar(SnackBar(content: Text(message), action: action));
   }
 
   @override

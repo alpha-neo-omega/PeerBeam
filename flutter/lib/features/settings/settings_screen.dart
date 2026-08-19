@@ -960,10 +960,42 @@ class _SaveRulesCard extends StatelessWidget {
     await _save(context, settings, next);
   }
 
+  /// Remove a rule, with an undo.
+  ///
+  /// An undo rather than a prompt: a rule is fully described by the row that
+  /// was showing it, so putting it back is exact, and the delete button sits at
+  /// the end of every row in a list whose whole purpose is dragging — a dialog
+  /// on each tap would be dismissed unread by the third rule. What the undo has
+  /// to get right is the *position*: the first match wins here, so a rule
+  /// restored at the end would quietly claim different files than the one that
+  /// was removed. It goes back at the index it left.
   Future<void> _removeRule(BuildContext context, int i) async {
     final settings = AppScope.of(context).settings;
+    final messenger = ScaffoldMessenger.of(context);
+    final removed = settings.saveRules[i];
     final next = [...settings.saveRules]..removeAt(i);
-    await _save(context, settings, next);
+    // Only offer to undo what actually happened — a refused write has already
+    // reported itself, and an Undo beside it would be undoing nothing.
+    if (!await _write(messenger, settings, next)) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('Removed ${_criteria(removed)} → ${removed.directory}'),
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () {
+              // Re-inserted into the list as it stands now, not into the
+              // snapshot taken at removal: two removals in a row would
+              // otherwise have the first undo resurrect the second rule too.
+              // Clamped because a rule may have been added since.
+              final back = [...settings.saveRules];
+              back.insert(i.clamp(0, back.length), removed);
+              _write(messenger, settings, back);
+            },
+          ),
+        ),
+      );
   }
 
   Future<void> _addRule(BuildContext context) async {
@@ -986,14 +1018,26 @@ class _SaveRulesCard extends StatelessWidget {
     BuildContext context,
     SettingsStore settings,
     List<SaveRule> next,
+  ) => _write(ScaffoldMessenger.of(context), settings, next);
+
+  /// The same write for a caller holding a messenger rather than a context, and
+  /// reporting whether it landed. Both matter to the undo on a removal: its
+  /// action runs long after the row that raised it is gone, so there is no
+  /// context left to look one up from, and an undo must not be offered for a
+  /// write the engine refused. Returns true when the rules were adopted.
+  static Future<bool> _write(
+    ScaffoldMessengerState messenger,
+    SettingsStore settings,
+    List<SaveRule> next,
   ) async {
-    final messenger = ScaffoldMessenger.of(context);
     try {
       await settings.setSaveRules(next);
+      return true;
     } catch (e) {
       messenger
         ..hideCurrentSnackBar()
         ..showSnackBar(SnackBar(content: Text(_ruleError(e))));
+      return false;
     }
   }
 

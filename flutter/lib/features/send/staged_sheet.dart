@@ -49,6 +49,41 @@ Future<void> _addText(BuildContext context, StagingStore staging) async {
   if (text != null && text.trim().isNotEmpty) staging.addText(text);
 }
 
+/// Confirm before emptying the tray.
+///
+/// A prompt rather than an undo, for two reasons. A staged text message exists
+/// nowhere but this store — there is no file to pick again — so re-picking
+/// cannot rebuild a cleared stack the way it can rebuild a list of files. And
+/// the undo that would otherwise belong here cannot be offered: a snackbar
+/// raised from inside a modal sheet is drawn beneath it, under the sheet's own
+/// barrier, so its action is neither visible nor tappable. Per-item removal
+/// stays instant and unprompted, which is what keeps this dialog rare enough to
+/// still be read.
+Future<void> _confirmClear(BuildContext context, StagingStore staging) async {
+  final count = staging.count;
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('Clear $count ${count == 1 ? 'item' : 'items'}?'),
+      content: const Text(
+        'Files and folders can be added again. Any text you typed is only '
+        'here, and cannot.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Clear'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed == true) staging.clear();
+}
+
 class _StagedSheet extends StatelessWidget {
   final StagingStore staging;
   const _StagedSheet({required this.staging});
@@ -88,7 +123,7 @@ class _StagedSheet extends StatelessWidget {
                       const Spacer(),
                       if (items.isNotEmpty)
                         TextButton(
-                          onPressed: staging.clear,
+                          onPressed: () => _confirmClear(context, staging),
                           child: const Text('Clear'),
                         ),
                     ],

@@ -47,6 +47,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   ChatSearchResults? _results;
   bool _searching = false;
 
+  /// Why the current query has no results on screen — a read that failed, not
+  /// a search that found nothing.
+  ///
+  /// The two must never render the same. "No messages match" is an answer about
+  /// the user's own history, and it is the answer they act on by giving up; a
+  /// search that never reached the engine has not earned it. Cleared the moment
+  /// the query changes, so a failure can never outlive the search it belongs
+  /// to.
+  Object? _error;
+
   /// Which search the results on screen came from.
   ///
   /// Searches are dispatched per keystroke-burst and answered out of order:
@@ -87,12 +97,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
       setState(() {
         _query = '';
         _results = null;
+        _error = null;
         _searching = false;
       });
       return;
     }
     setState(() {
       _query = query;
+      _error = null;
       _searching = true;
     });
     _timer = Timer(_debounce, () => _run(query));
@@ -101,14 +113,36 @@ class _ChatsScreenState extends State<ChatsScreen> {
   Future<void> _run(String query) async {
     final chat = AppScope.of(context).chat;
     final seq = ++_seq;
-    final results = await chat.search(query);
+    ChatSearchResults? results;
+    Object? failure;
+    try {
+      results = await chat.search(query);
+    } catch (e) {
+      // Held, not swallowed. The repository stopped flattening a failed search
+      // to an empty result set precisely so this screen could tell the user
+      // which of the two it is; catching it back into silence here would
+      // restore the false negative one layer up.
+      failure = e;
+    }
     // Stale: the user has typed again, or cleared the field, since this went
     // out.
     if (!mounted || seq != _seq) return;
     setState(() {
       _results = results;
+      _error = failure;
       _searching = false;
     });
+  }
+
+  /// Run the query that is already on screen again. The field is untouched, so
+  /// this is the same search retried rather than a new one — the user asked for
+  /// these results once and should not have to retype to ask again.
+  void _retrySearch() {
+    setState(() {
+      _error = null;
+      _searching = true;
+    });
+    unawaited(_run(_query));
   }
 
   /// Group hits by conversation, keeping the engine's newest-first order: the
@@ -158,7 +192,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
   /// The send target is discovery's when it has one and an address-less
   /// placeholder otherwise — the thread stays readable either way, and the chat
   /// screen disables its composer rather than accepting messages the engine
-  /// would refuse.
+  /// would refuse. The placeholder is a starting point, not a verdict: the chat
+  /// screen re-resolves the target against discovery while it is open, so a
+  /// peer that turns up afterwards is sendable there and then.
   void _open(String peerId) {
     final state = AppScope.of(context);
     final target =
@@ -298,6 +334,19 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   Widget _conversationList(List<ChatConversation> conversations) {
     if (conversations.isEmpty) {
+      // A list that could not be read is not a device that has never chatted.
+      // This screen is the only way to a thread whose peer is offline — the
+      // queued file inside it included — so presenting a failed read as "no
+      // conversations yet" hides the very threads it exists to surface, and
+      // does it in the voice of a fact.
+      final failure = AppScope.of(context).chat.conversationsError;
+      if (failure != null) {
+        return ErrorState(
+          error: failure,
+          title: 'Could not read your conversations',
+          onRetry: () => AppScope.of(context).chat.refreshConversations(),
+        );
+      }
       return const EmptyState(
         icon: Icons.forum_outlined,
         title: 'No conversations yet',
@@ -331,6 +380,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
   /// concluding that what they were looking for is not there, and a footer
   /// under fifty rows is read after that conclusion has already been drawn.
   Widget _resultList() {
+    final failure = _error;
+    if (failure != null) {
+      // Checked before emptiness, because a failed search has no result set to
+      // be empty. See [_error] for why the two may not share a screen.
+      return ErrorState(
+        error: failure,
+        title: 'Could not search your messages',
+        onRetry: _retrySearch,
+      );
+    }
     final results = _results;
     if (results == null) {
       // Nothing has answered for this query yet.
