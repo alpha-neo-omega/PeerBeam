@@ -96,7 +96,14 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         await _android.start();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
-      } catch (_) {}
+        _state.engine.started();
+      } catch (e) {
+        // **Kept, not swallowed.** This used to be `catch (_) {}`, and a failed
+        // boot then looked exactly like a quiet network: every screen showed
+        // its empty state and the user blamed their wifi for something that
+        // never reached the wifi. The shell reads this and says so.
+        _state.engine.failed(e);
+      }
     }();
 
     // Surface transfer failures as snackbars (reactive; never polled).

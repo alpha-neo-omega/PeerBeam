@@ -361,9 +361,52 @@ class RingAlert extends ChangeNotifier {
   }
 }
 
+/// Whether the engine came up, and what went wrong if it did not.
+///
+/// # Why this has to be visible
+///
+/// The whole boot sequence in `main.dart` sits inside one `catch (_) {}`. If
+/// `initialize()` fails — a missing native library, an engine that refused to
+/// start — every screen renders its calm empty state instead: "No nearby
+/// devices. Devices on your network appear here." Nothing is wrong with that
+/// sentence except that it is not true, and the user blames their network for
+/// something that never got as far as the network.
+///
+/// The honest copy already exists (`sdk/error_text.dart` knows about
+/// `NotInitialisedException` and `PeerBeamUnavailable`); nothing was reaching
+/// it. This carries the failure to the one place every screen shares.
+class EngineStatus extends ChangeNotifier {
+  /// True until the boot sequence finishes, either way.
+  bool booting = true;
+
+  /// What stopped the engine coming up, or null if nothing did.
+  Object? failure;
+
+  /// Whether the engine is up and usable.
+  bool get ready => !booting && failure == null;
+
+  /// The engine started.
+  void started() {
+    booting = false;
+    failure = null;
+    notifyListeners();
+  }
+
+  /// The engine did not start. [error] is kept for the user, not just logged.
+  void failed(Object error) {
+    booting = false;
+    failure = error;
+    notifyListeners();
+  }
+}
+
 /// Top-level container of all state, created once and shared via [AppScope].
 class AppState {
   final ThemeController theme;
+
+  /// Whether the engine came up. Screens ask this before blaming the network.
+  final EngineStatus engine = EngineStatus();
+
   final DiscoveryRepository device;
   final TransferRepository transfer;
   final HistoryRepository history;

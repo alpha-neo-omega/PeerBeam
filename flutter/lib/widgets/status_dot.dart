@@ -38,7 +38,9 @@ class _StatusDotState extends State<StatusDot>
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final color = widget.online ? AppColors.online : scheme.outline;
+    final color = widget.online
+        ? AppColors.online(scheme.brightness)
+        : scheme.outline;
 
     // Pulse only when online AND the OS isn't asking for reduced motion.
     final pulse = widget.online && AppMotion.enabled(context);

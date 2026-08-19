@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../features/send/drop_zone.dart';
 import '../state/app_scope.dart';
+import '../sdk/error_text.dart';
 import '../state/stores.dart';
 import '../widgets/brand_mark.dart';
 import 'theme.dart';
@@ -51,6 +52,7 @@ class AppShell extends StatelessWidget {
     // whatever screen happens to be open is the wrong place to hide it.
     final body = Column(
       children: [
+        _EngineBanner(status: state.engine),
         _RingBanner(alert: state.ring),
         Expanded(
           child: DropZone(staging: state.staging, child: navigationShell),
@@ -205,6 +207,57 @@ class _RailLeading extends StatelessWidget {
 /// the moment the user has the device in their hand the banner is noise. It
 /// clears itself when the ring expires, so a device nobody reaches stops
 /// shouting on its own.
+/// Says so when the engine never came up.
+///
+/// Shown once, in the shell, rather than by rewriting eleven empty states: the
+/// failure is the same on every screen, and a message that appears wherever the
+/// user happens to be beats one they have to navigate to. Silence here is what
+/// made a dead engine indistinguishable from an idle network.
+class _EngineBanner extends StatelessWidget {
+  final EngineStatus status;
+  const _EngineBanner({required this.status});
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: status,
+    builder: (context, _) {
+      final failure = status.failure;
+      if (failure == null) return const SizedBox.shrink();
+      final scheme = Theme.of(context).colorScheme;
+      return Material(
+        color: scheme.errorContainer,
+        child: SafeArea(
+          bottom: false,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpace.md,
+              vertical: AppSpace.sm,
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.error_outline_rounded,
+                  color: scheme.onErrorContainer,
+                ),
+                const Gap(AppSpace.sm),
+                Expanded(
+                  child: Text(
+                    // Named as the engine's problem, so nobody spends the
+                    // evening on their router. The detail comes from the same
+                    // friendly text every other failure uses.
+                    'PeerBeam’s engine did not start — ${friendlyError(failure)}',
+                    style: TextStyle(color: scheme.onErrorContainer),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
+
 class _RingBanner extends StatelessWidget {
   final RingAlert alert;
   const _RingBanner({required this.alert});

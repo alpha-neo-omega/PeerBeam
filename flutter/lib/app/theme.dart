@@ -307,11 +307,16 @@ class AppMotion {
 class AppColors {
   AppColors._();
 
-  /// Online / success presence indicator. Single-valued, unlike [success]:
-  /// `StatusDot` carries the state in a `Semantics` label and the caller's
-  /// adjacent text, so the dot is decoration over a label rather than a
-  /// graphic the user has to read off the surface.
-  static const Color online = Color(0xFF22C55E);
+  /// Online presence indicator, for [brightness].
+  ///
+  /// Resolved like [success] even though `StatusDot` already carries its state
+  /// in a `Semantics` label and the caller's adjacent text — so nothing here is
+  /// conveyed by colour alone, and WCAG 1.4.1 was already satisfied. The vivid
+  /// green measured 2.07:1 on a light surface all the same, which is a dot a
+  /// low-vision user has to hunt for. Being legible is worth more than being
+  /// technically permitted to be faint.
+  static Color online(Brightness brightness) =>
+      brightness == Brightness.dark ? _successDark : _successLight;
 
   /// Success (completed transfer), for [brightness]. See the class note.
   static Color success(Brightness brightness) =>
