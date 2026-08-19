@@ -131,6 +131,33 @@ limit, see below). Add a one-line affordance in Nearby on mobile pointing to
 - **Intel-mac CLI** binary not yet attached to releases (only `macos-arm64`);
   desktop app is universal.
 
+## From the 2026-08 feature brainstorm (unbuilt items only)
+
+The full brainstorm is archived at
+[`docs/archive/FEATURE_BRAINSTORM_2026-08.md`](archive/FEATURE_BRAINSTORM_2026-08.md).
+Most of what it proposed is now built — presence, chat with attachments,
+clipboard history, remote folder browsing, device identity and QR pairing,
+per-device permissions, smart route selection, and folder sync (bidirectional,
+with delta transfer and rename detection). What follows is the remainder.
+
+- **Group conversations / "Spaces"** — named sets of trusted peers you can
+  message or send to at once, kept peer-to-peer rather than via a hub (I3).
+  The largest genuinely-new idea in the document.
+- **Offline message and file queue** — hold an encrypted message locally for a
+  device that is away and deliver it on reconnect. Chat is currently
+  send-if-reachable.
+- **Time-limited trust** — "trust this device for 30 minutes", or allow one
+  transfer. The permission system exists; expiry does not.
+- **Remote shell** and **remote commands** — already scheduled as Phase D and
+  channel `0x0106`, and constitutionally constrained by I6 (explicit,
+  revocable, per-capability consent — never remote control).
+- **Latency and route quality in the peer list** — presence reports the route;
+  it does not report round-trip time or direct-vs-relay quality.
+
+Explicitly **not** wanted, per the brainstorm and consistent with I4: cloud
+accounts, a central messaging server, social profiles, public user discovery,
+cloud storage.
+
 ## Already strong (don't re-add)
 
 Tailscale-native reach, first-class CLI, QUIC + receiver-confirmed progress
