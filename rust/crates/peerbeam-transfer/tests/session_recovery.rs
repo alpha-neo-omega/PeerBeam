@@ -339,7 +339,13 @@ async fn next_channel(
 /// signature of a clock, not a defect. A wait long enough to be unreachable
 /// unless something is genuinely stuck says the same thing without lying about
 /// what broke.
-const WAIT: Duration = Duration::from_secs(60);
+/// **Longer than the worst case `resilient()` allows.** That config permits 30
+/// attempts of up to 3 s each plus linear backoff — about 92 s before recovery
+/// legitimately gives up. A 60 s wait sat *inside* that window, so a run where
+/// several attempts genuinely timed out failed the test while the engine was
+/// still doing exactly what it was configured to do. The deadline that observes
+/// a retry policy has to outlast the policy.
+const WAIT: Duration = Duration::from_secs(180);
 
 /// Timing for the tests that assert recovery **succeeds**.
 ///

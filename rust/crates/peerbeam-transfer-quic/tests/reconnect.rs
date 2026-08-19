@@ -127,12 +127,23 @@ fn wiring() -> (
     )
 }
 
+/// How long a helper waits for something the engine is expected to do.
+///
+/// **Must outlast the retry policy it is watching.** This file's
+/// `RecoveryConfig` permits 5 attempts of up to 10 s each plus backoff — about
+/// 51 s before recovery legitimately gives up. The previous 15 s sat well
+/// inside that window, so a run where a few attempts genuinely timed out failed
+/// the test while the engine was still doing exactly what it was configured to
+/// do. These helpers assert *behaviour*, never latency, so a generous bound
+/// costs nothing on success and only fires when something is truly stuck.
+const WAIT: Duration = Duration::from_secs(180);
+
 async fn next_event(
     rx: &mut UnboundedReceiver<SessionEvent>,
     pred: impl Fn(&SessionEvent) -> bool,
 ) -> SessionEvent {
     loop {
-        match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+        match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(ev)) if pred(&ev) => return ev,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("event stream ended"),
@@ -146,7 +157,7 @@ async fn next_channel(
     pred: impl Fn(&ChannelEvent) -> bool,
 ) -> ChannelEvent {
     loop {
-        match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+        match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(ev)) if pred(&ev) => return ev,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("channel event stream ended"),
@@ -160,7 +171,7 @@ async fn live_handle(rx: &mut watch::Receiver<Option<SessionHandle>>) -> Session
         if let Some(h) = rx.borrow_and_update().clone() {
             return h;
         }
-        tokio::time::timeout(Duration::from_secs(15), rx.changed())
+        tokio::time::timeout(WAIT, rx.changed())
             .await
             .expect("handle watch timed out")
             .expect("handle watch closed");
