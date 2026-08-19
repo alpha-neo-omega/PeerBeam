@@ -187,6 +187,12 @@ fn dial_meta(device: &Device, id: &str) -> TransferSession {
 pub struct Session {
     /// Manifests this side asked for.
     pub sync_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::Manifest>>>,
+    /// Chunk maps this side asked for.
+    pub chunkmap_rx:
+        Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkMapResponse>>>,
+    /// Chunk bytes this side asked for.
+    pub chunk_rx:
+        Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkData>>>,
     /// Answers to listings this side asked for.
     pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
     /// Control handle for opening channels / closing.
@@ -292,6 +298,83 @@ pub async fn send_pairing_result(session: &Session, verified: bool, attempts_lef
             payload.into(),
         )
         .await;
+}
+
+/// Ask how a file chunks. `None` if the peer cannot say — it predates delta
+/// transfer, refused, or the file is too large to chunk — in which case the
+/// caller falls back to fetching the whole file.
+pub async fn request_chunk_map(
+    session: &Session,
+    path: &str,
+) -> Option<peerbeam_sync::manifest_wire::ChunkMapResponse> {
+    use tokio::time::{timeout, Duration};
+    let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
+    let req = peerbeam_sync::manifest_wire::ChunkMapRequest {
+        path: path.to_string(),
+    };
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+        .await
+        .ok()?;
+    let rx = session.chunkmap_rx.clone();
+    timeout(Duration::from_secs(30), async move {
+        rx.lock().await.recv().await
+    })
+    .await
+    .ok()?
+}
+
+/// Ask for specific chunks and collect what comes back.
+///
+/// Requested in batches, because the peer bounds how many it will serve per
+/// message — asking for a thousand in one frame would silently get sixty-four.
+pub async fn request_chunks(
+    session: &Session,
+    path: &str,
+    hashes: &[String],
+) -> std::collections::HashMap<String, Vec<u8>> {
+    use tokio::time::{timeout, Duration};
+    const BATCH: usize = 64;
+    let mut out = std::collections::HashMap::new();
+    for group in hashes.chunks(BATCH) {
+        let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
+            break;
+        };
+        let req = peerbeam_sync::manifest_wire::ChunkRequest {
+            path: path.to_string(),
+            hashes: group.to_vec(),
+        };
+        let Ok(frame) = req.to_frame(channel) else {
+            break;
+        };
+        if session
+            .handle
+            .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        // One answer per requested hash, or a timeout. A missing chunk is not
+        // fatal here: the caller checks it has everything before writing, and
+        // falls back to the whole file if not.
+        for _ in 0..group.len() {
+            let rx = session.chunk_rx.clone();
+            let got = timeout(Duration::from_secs(30), async move {
+                rx.lock().await.recv().await
+            })
+            .await;
+            match got {
+                Ok(Some(d)) => {
+                    out.insert(d.hash, d.bytes);
+                }
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 /// Ask a peer for a manifest and wait for it, bounded.
@@ -561,16 +644,28 @@ async fn establish(
     let (pairing_tx, pairing_rx) = unbounded_channel();
     let (browse_tx, browse_rx) = unbounded_channel();
     let (sync_tx, sync_rx) = unbounded_channel();
+    let (cmap_tx, chunkmap_rx) = unbounded_channel();
+    let (cdata_tx, chunk_rx) = unbounded_channel();
     // The CLI serves no shares — a terminal session is not a file server — so
     // its sync handler answers nothing and only routes back the manifests it
     // asked for.
-    let (sync_handler, sync_slot) = peerbeam_sync::SyncHandler::new(
+    let (sync_handler, sync_slot) = peerbeam_sync::SyncHandler::with_chunks(
         peerbeam_browse::Shares::default(),
         trust.clone(),
         std::sync::Arc::new(|_| {}),
         std::sync::Arc::new(|_| {}),
         std::sync::Arc::new(move |m| {
             let _ = sync_tx.send(m);
+        }),
+        // The CLI serves no shares, so it answers no chunk questions — it only
+        // routes back the answers to its own.
+        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(move |m| {
+            let _ = cmap_tx.send(m);
+        }),
+        std::sync::Arc::new(move |d| {
+            let _ = cdata_tx.send(d);
         }),
     );
     let (browse_handler, browse_slot) = peerbeam_browse::BrowseHandler::new(
@@ -658,6 +753,8 @@ async fn establish(
         pairing_code,
         transcript,
         pairing_rx: Arc::new(tokio::sync::Mutex::new(pairing_rx)),
+        chunkmap_rx: Arc::new(tokio::sync::Mutex::new(chunkmap_rx)),
+        chunk_rx: Arc::new(tokio::sync::Mutex::new(chunk_rx)),
         capabilities,
         incoming,
         run,

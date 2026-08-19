@@ -143,6 +143,57 @@ pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&
     }
 }
 
+/// Fetch one file by chunks, writing it locally. Returns bytes saved, or `None`
+/// if delta transfer could not be used and the caller should ask for the whole
+/// file instead.
+///
+/// **Falls back rather than fails.** Every reason this can give up — the peer
+/// has no chunk map, a chunk never arrived, the rebuilt bytes did not verify —
+/// is a reason to send the file the slow way, not a reason for the sync to stop.
+async fn fetch_by_delta(
+    session: &session_transfer::Session,
+    index: &peerbeam_sync::SyncIndex,
+    folder: &str,
+    into: &std::path::Path,
+    remote_path: &str,
+    write_to: &str,
+) -> Option<u64> {
+    let answer = session_transfer::request_chunk_map(session, remote_path).await?;
+    if answer.denied || answer.chunks.is_empty() {
+        return None;
+    }
+    let map = peerbeam_sync::ChunkMap {
+        path: remote_path.to_string(),
+        chunks: answer.chunks,
+    };
+
+    let have = index.chunks().have(folder);
+    let need = peerbeam_sync::plan_delta(&map, &have);
+    let fetched = if need.fetch.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        session_transfer::request_chunks(session, remote_path, &need.fetch).await
+    };
+
+    let local = index.load(folder).ok()?;
+    let rebuilt = peerbeam_sync::reassemble(&map, |h| {
+        // What just arrived, else what is already on disk somewhere in this
+        // folder. `reassemble` verifies every chunk either way, so a stale
+        // local file cannot corrupt the result.
+        fetched
+            .get(h)
+            .cloned()
+            .or_else(|| index.chunks().read(folder, into, &local, h))
+    })?;
+
+    let dest = into.join(write_to);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&dest, &rebuilt).ok()?;
+    Some(need.reuse_bytes)
+}
+
 /// Every file under `root`, as the settling rule wants to see it.
 fn observe(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observed)> {
     fn walk(
@@ -272,15 +323,25 @@ async fn sync_once(
     let outcome = peerbeam_sync::apply_local(&index, &args.path, &into, &actions, &remote_versions)
         .map_err(|e| CliError::Other(e.to_string()))?;
 
+    let mut delta_saved: u64 = 0;
     for a in &actions {
-        let want = match a {
-            peerbeam_sync::Action::Fetch { path } => Some(path),
-            // A conflict is fetched too: keeping both copies means having both.
-            peerbeam_sync::Action::Conflict { path, .. } => Some(path),
-            _ => None,
+        // A conflict is fetched too — keeping both copies means having both —
+        // but under its conflict name, so the local file is never touched.
+        let (want, write_to) = match a {
+            peerbeam_sync::Action::Fetch { path } => (Some(path), path.clone()),
+            peerbeam_sync::Action::Conflict { path, keep_as } => (Some(path), keep_as.clone()),
+            _ => (None, String::new()),
         };
-        if let Some(rel) = want {
-            session_transfer::request_file(&session, &format!("{}/{rel}", args.path)).await;
+        let Some(rel) = want else { continue };
+        let remote_path = format!("{}/{rel}", args.path);
+
+        match fetch_by_delta(&session, &index, &args.path, &into, &remote_path, &write_to).await {
+            Some(saved) => delta_saved += saved,
+            // No chunk map, a missing chunk, or an unwritable file: ask for the
+            // whole thing. Slower, and always correct.
+            None => {
+                session_transfer::request_file(&session, &remote_path).await;
+            }
         }
     }
     session.close().await;
@@ -313,6 +374,12 @@ async fn sync_once(
         for name in &outcome.conflicts {
             ctx.line(&format!("  {name}"));
         }
+    }
+    if delta_saved > 0 {
+        ctx.line(&ctx.dim(&format!(
+            "{} reused from what you already had",
+            commands::human_bytes(delta_saved)
+        )));
     }
     if outcome.fetching > 0 || !outcome.conflicts.is_empty() {
         ctx.line(&ctx.dim(
