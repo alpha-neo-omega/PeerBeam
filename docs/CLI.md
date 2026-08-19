@@ -259,6 +259,15 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `pair <peer> [--pin 123456 | --show]` — PIN-pair with a device. One side runs
+  `--show` and reads six digits aloud; the other types them. **The PIN is never
+  sent** — only a proof over this handshake's transcript, which is worthless to
+  anyone relaying between two connections. Three wrong guesses ends the pairing;
+  a fresh PIN is needed rather than another try.
+
+  Turn `encryption.require_pin_pairing` on to require this before any new device
+  can be approved. It is **off by default**: on, nothing pairs without a person
+  at both ends.
 - `snippet --to <peer> [--title T]` — send piped text as a message:
   `cargo test 2>&1 | peerbeam snippet --to laptop`. Oversized input is
   truncated rather than refused — a long log piped by accident should not fail

@@ -47,7 +47,8 @@ near-term). Assignments are stable once published.
 | `0x0106` | Command | C/D | consent-gated automation / permissioned actions |
 | `0x0107` | Pipe | B | `peerbeam pipe` — an unbounded stdin↔stdout byte stream; a **stream** channel like Transfer, implemented |
 | `0x0108` | Browse | C | **implemented** — read-only listing of shared folders |
-| `0x0109 – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
+| `0x0109` | Pairing | A | **implemented** — PIN pairing; carries a proof, never a PIN |
+| `0x010A – 0x0FFF` | *(reserved)* | — | future first-party capabilities |
 
 ## 3. Control channel (0x0000) message set
 
@@ -86,6 +87,11 @@ Each ChannelType defines its own messages. Entries marked **implemented** are li
 the wire today and are binding; the rest are reserved and illustrative, with detail
 belonging to each capability's future spec:
 
+- **Pairing (0x0109):** `Prove`, `Result`. The PIN itself has no field to
+  travel in — a PIN sent over the connection it authenticates proves nothing
+  about who is on the other end, so the wire format gives it nowhere to go.
+  A proof is `HMAC(pin, handshake transcript)`, which makes it worthless on any
+  other connection — including the second leg of a machine-in-the-middle.
 - **Transfer (0x0100):** `Meta`, `ResumeAck`, `Chunk`, `Complete`, `Verify`,
   `Cancel`, `Pause`, `Resume` (implemented) — i.e. today's [transfer
   protocol](TRANSFER_PROTOCOL.md), unchanged, now scoped to this channel.

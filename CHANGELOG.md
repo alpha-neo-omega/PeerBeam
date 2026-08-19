@@ -7,6 +7,20 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **PIN pairing** (`peerbeam pair`, `encryption.require_pin_pairing`). Trust-on-
+  first-use pins whatever key answers first; someone on the path during that
+  first handshake gets pinned instead of your device, and every later connection
+  looks perfectly consistent. PIN pairing closes that window: one device shows
+  six digits, a person reads them across, and the other proves it knows them.
+
+  **The PIN is never sent, and the six digits are not a shortened fingerprint.**
+  A short code derived from the two keys could be forged — an attacker generates
+  keypairs until one produces the digits you expect, which takes seconds. This
+  PIN is a fresh random secret used to sign *this* handshake, so a proof is
+  worthless on any other connection. Three wrong guesses ends the pairing.
+
+  Off by default: turning it on means nothing pairs without a person at both
+  ends.
 - **Browse and mirror a device's shared folders.** Point `device.shared_directories`
   at what you want to offer (**empty by default**), grant a device the new
   **Browse** permission, and it can list what is there — in the app from a
