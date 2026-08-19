@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-app"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-appstore-fs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "peerbeam-crypto",
  "peerbeam-domain",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-browse"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-chat"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-chunk"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "serde",
  "sha2",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-cli"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-clipboard"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-clipboard-mem"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-config"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "peerbeam-platform",
  "serde",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-crypto"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "peerbeam-domain",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-discovery-mdns"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-discovery-tailscale"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-discovery-udp"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-domain"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-engine"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-ffi"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-identity-fs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "peerbeam-domain",
  "serde_json",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-logs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "serde_json",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-notes"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-pairing"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "hmac",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-platform"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "dirs",
  "fs4",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-presence"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-reliability-fs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "peerbeam-domain",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-storage-fs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-sync"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-telemetry"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "peerbeam-config",
  "tracing",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-transfer"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-transfer-quic"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "peerbeam-trust-fs"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "peerbeam-domain",

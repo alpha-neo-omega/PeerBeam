@@ -4,7 +4,7 @@ All notable changes to PeerBeam. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); the project is pre-1.0 and
 versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
-## [Unreleased]
+## [0.9.0] - 2026-08-19
 
 ### Added
 - **Logs you can actually read.** The engine has always captured structured
