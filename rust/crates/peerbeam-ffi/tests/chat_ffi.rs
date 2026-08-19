@@ -1381,7 +1381,37 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
         // disagree — a failing test's captured output is shown by cargo, so one
         // CI run answers what no amount of reading locally could.
         if row["file"]["name"] != landed_name {
-            let logs = call_json(pb_logs_get, &json!({ "limit": 200 }));
+            // **Does it converge?** This is the question the log dump could not
+            // answer: the ring buffer is flooded by QUIC trace, so the one line
+            // that mattered had already been evicted. Polling the row instead
+            // separates the two possible causes without any logging at all —
+            // if the name arrives a moment later, the reconcile ran and the
+            // event simply raced ahead of the store; if it never arrives, the
+            // write was lost.
+            let mut converged_after = None;
+            for i in 1..=30 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let h = call_json(pb_chat_history, &json!({ "peer_id": sender_device_id }));
+                let later = h["data"]["messages"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|m| m["id"] == expected_id).cloned());
+                if later
+                    .as_ref()
+                    .map(|r| r["file"]["name"] == landed_name)
+                    .unwrap_or(false)
+                {
+                    converged_after = Some(i * 500);
+                    break;
+                }
+            }
+            eprintln!(
+                "converged after: {}",
+                match converged_after {
+                    Some(ms) => format!("{ms}ms — the write happened, the event raced it"),
+                    None => "never (15s) — the write was lost, not late".to_string(),
+                }
+            );
+            let logs = call_json(pb_logs_get, &json!({ "limit": 500 }));
             // Unfiltered. The first diagnostic round filtered for "landing"
             // and got an empty list, which could mean either "the reconcile
             // never ran" or "it ran, logged at debug, and the default
@@ -1391,6 +1421,12 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
                 .as_array()
                 .map(|a| {
                     a.iter()
+                        .filter(|l| {
+                            // QUIC/TLS trace floods this buffer; keep only what
+                            // this investigation is about.
+                            let m = l["message"].as_str().unwrap_or("");
+                            m.contains("landing") || m.contains("chat row")
+                        })
                         .map(|l| format!("{} {}", l["level"], l["message"]))
                         .collect()
                 })
