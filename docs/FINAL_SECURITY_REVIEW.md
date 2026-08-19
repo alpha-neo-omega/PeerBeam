@@ -79,8 +79,15 @@ sensitive data" requirement.
 ## Configuration
 
 Settings and trust are stored under the platform app dir / FFI-provided base
-path; no cloud, no telemetry, no analytics (confirmed by absence of any network
-telemetry client). ✓
+path; no cloud, no telemetry, no analytics. ✓
+
+**One outbound request exists, and it is not telemetry.** Under amendment A1
+([ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments)) the app
+can check for a newer release — **only** when a person asks, off by default,
+carrying no identifier, and acting on the answer in no way beyond showing it.
+There is still no telemetry client, no beacon, and nothing reporting usage. A
+build that checks on its own, or that acts on what the server says, is outside
+A1.
 
 ## Dependency vulnerabilities
 

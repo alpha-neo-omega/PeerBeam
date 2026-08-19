@@ -65,6 +65,15 @@ Working now:
 - `doctor [--json]` — environment checks (config/save dirs writable, UDP
   bindable, mDNS daemon, Tailscale CLI, crypto) with ✓/!/✗; non-zero exit if
   any fail.
+- `check-updates [--json]` — asks whether a newer release exists, **once, because
+  you ran it**. This is the only request PeerBeam makes to anything that is not a
+  peer. It sends no device id, no install id, and nothing identifying; it
+  downloads nothing and installs nothing; and there is no automatic check on
+  launch or on a timer. Being unable to reach the feed exits **0** with
+  `reachable: false` — a machine with no route out is not a machine with a
+  problem, and a script running this must not fail because of it. Permitted by
+  amendment A1 in [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments),
+  which lists the conditions it is allowed on.
 - `benchmark crypto|hash|loopback|quic [--size N] [--chunk KiB]` — AES-256-GCM
   seal/open and SHA-256 throughput (MiB/s); `loopback` = end-to-end transfer
   over an in-process link; `quic` = end-to-end over a **real QUIC connection**

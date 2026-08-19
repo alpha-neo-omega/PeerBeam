@@ -14,7 +14,9 @@ import '../../platform/saf.dart';
 import '../../platform/services.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/exceptions.dart';
-import '../../sdk/models.dart' show PeerBeamPermission, SaveRule, TrustedDevice;
+import '../../sdk/models.dart'
+    show PeerBeamPermission, SaveRule, TrustedDevice, UpdateCheck;
+import '../../sdk/peerbeam.dart' show PeerBeamApi;
 import '../../state/app_scope.dart';
 import '../../state/stores.dart' show SettingsStore;
 import '../../widgets/common.dart';
@@ -454,6 +456,13 @@ class SettingsScreen extends StatelessWidget {
                         },
                       ),
                     ),
+                    const Divider(height: 1),
+                    // **Runs only when pressed.** Amendment A1 permits this one
+                    // outbound request on the condition that it is never
+                    // automatic — no launch check, no timer, nothing that turns
+                    // using the app into telling a server you are using it. The
+                    // button is the opt-in, every time.
+                    _CheckUpdatesTile(api: state.api),
                   ],
                 ),
               ),
@@ -1253,4 +1262,81 @@ class _AndroidSaveToTileState extends State<_AndroidSaveToTile> {
       onTap: _pick,
     );
   }
+}
+
+/// "Check for updates", and the answer.
+///
+/// Stateful for one reason: the request must not start until someone presses
+/// the button, so the result cannot come from anything the screen builds
+/// eagerly. Failure is reported as plainly as success — an app that cannot
+/// reach the internet is working normally, and amendment A1 makes "never a
+/// precondition" a term of the check being allowed to exist.
+class _CheckUpdatesTile extends StatefulWidget {
+  final PeerBeamApi? api;
+  const _CheckUpdatesTile({required this.api});
+
+  @override
+  State<_CheckUpdatesTile> createState() => _CheckUpdatesTileState();
+}
+
+class _CheckUpdatesTileState extends State<_CheckUpdatesTile> {
+  bool _busy = false;
+  UpdateCheck? _result;
+  Object? _error;
+
+  Future<void> _check() async {
+    final api = widget.api;
+    if (api == null || _busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final r = await api.checkForUpdates();
+      if (!mounted) return;
+      setState(() {
+        _result = r;
+        _busy = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _busy = false;
+      });
+    }
+  }
+
+  String get _subtitle {
+    if (_busy) return 'Asking…';
+    final e = _error;
+    if (e != null) return 'Could not check — ${friendlyError(e)}';
+    final r = _result;
+    if (r == null) {
+      return 'PeerBeam does not check on its own. Ask, and it will look once.';
+    }
+    if (!r.reachable) {
+      return 'Could not reach the release list. You have ${r.current}.';
+    }
+    if (r.updateAvailable) {
+      return '${r.latest} is available — you have ${r.current}.';
+    }
+    return 'You have ${r.current}, which is the newest.';
+  }
+
+  @override
+  Widget build(BuildContext context) => ListTile(
+    leading: const Icon(Icons.system_update_alt_rounded),
+    title: const Text('Check for updates'),
+    subtitle: Text(_subtitle),
+    trailing: _busy
+        ? const SizedBox.square(
+            dimension: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          )
+        : FilledButton.tonal(
+            onPressed: widget.api == null ? null : _check,
+            child: const Text('Check'),
+          ),
+  );
 }

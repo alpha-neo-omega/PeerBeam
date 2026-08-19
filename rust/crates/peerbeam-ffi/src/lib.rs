@@ -103,6 +103,44 @@ pub extern "C" fn pb_version_json() -> *mut c_char {
     }))
 }
 
+/// Ask whether a newer release exists. **Requires an explicit request.**
+///
+/// The only outbound request this app makes to anything but a peer, permitted
+/// by amendment A1 in `docs/ARCHITECTURAL_INVARIANTS.md` on terms this function
+/// has to keep: it runs when a person asks and never on a timer or at startup;
+/// it sends no device id, install id, or anything identifying; and the answer is
+/// a version string that nothing acts on. There is no download and no install.
+///
+/// Being unable to reach the feed is reported as `reachable: false`, not as an
+/// error — offline is an ordinary state for this app, and nothing here is
+/// allowed to become a precondition for using it.
+#[no_mangle]
+pub extern "C" fn pb_check_updates() -> *mut c_char {
+    guard(|| {
+        let current = env!("CARGO_PKG_VERSION");
+        error::envelope(Ok(match runtime::block_on(peerbeam_update::check()) {
+            Ok(Some(r)) => json!({
+                "reachable": true,
+                "current": current,
+                "latest": r.version,
+                "update_available": peerbeam_update::is_newer(&r.version, current),
+                "url": r.url,
+            }),
+            Ok(None) => json!({
+                "reachable": true,
+                "current": current,
+                "latest": Value::Null,
+                "update_available": false,
+            }),
+            Err(e) => json!({
+                "reachable": false,
+                "current": current,
+                "reason": e.to_string(),
+            }),
+        }))
+    })
+}
+
 /// Initialise the engine. `config_json` may be empty for defaults.
 ///
 /// # Safety

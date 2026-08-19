@@ -1201,3 +1201,47 @@ class SaveRule {
     directory: directory ?? this.directory,
   );
 }
+
+/// The answer to "is there a newer release?".
+///
+/// [reachable] is false when the feed could not be asked at all — offline, DNS,
+/// a refused connection. That is not an error and must not be shown as one:
+/// this app is expected to work with no route out, and amendment A1 makes
+/// "never a precondition" a condition of the check existing at all.
+class UpdateCheck {
+  /// Whether the release feed answered.
+  final bool reachable;
+
+  /// The version this build is.
+  final String current;
+
+  /// The newest published version, or null when unknown or none exists.
+  final String? latest;
+
+  /// Whether [latest] is newer than [current].
+  final bool updateAvailable;
+
+  /// Where to read about the release.
+  final String? url;
+
+  /// Why the feed could not be asked, when [reachable] is false.
+  final String? reason;
+
+  const UpdateCheck({
+    required this.reachable,
+    required this.current,
+    this.latest,
+    this.updateAvailable = false,
+    this.url,
+    this.reason,
+  });
+
+  factory UpdateCheck.fromJson(Map<String, dynamic> j) => UpdateCheck(
+    reachable: (j['reachable'] as bool?) ?? false,
+    current: (j['current'] as String?) ?? 'unknown',
+    latest: j['latest'] as String?,
+    updateAvailable: (j['update_available'] as bool?) ?? false,
+    url: j['url'] as String?,
+    reason: j['reason'] as String?,
+  );
+}

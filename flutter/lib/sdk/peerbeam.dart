@@ -363,6 +363,15 @@ abstract class PeerBeamApi {
   /// Bounded and in-memory: logs are for diagnosing the session you are in.
   Future<List<LogLine>> logs({int limit});
 
+  /// Ask whether a newer release exists. **Only ever when a person asks.**
+  ///
+  /// The one outbound request this app makes to anything but a peer, permitted
+  /// by amendment A1 on terms every caller has to keep: never on a timer or at
+  /// launch, no identifiers sent, and the answer is shown rather than acted on.
+  /// An unreachable feed comes back as [UpdateCheck.reachable] false, not as a
+  /// thrown error — offline is ordinary here.
+  Future<UpdateCheck> checkForUpdates();
+
   /// Copy the buffered logs to a file and return where they went.
   ///
   /// Pass [path] to choose the destination; omit it for a temporary file. Use
@@ -784,6 +793,10 @@ class PeerBeam implements PeerBeamApi {
   Future<void> setSharedFolders(List<String> paths) async {
     await settingsSet({'shared_directories': paths});
   }
+
+  @override
+  Future<UpdateCheck> checkForUpdates() async =>
+      UpdateCheck.fromJson(_data(_req().checkUpdates()));
 
   @override
   Future<List<LogLine>> logs({int limit = 200}) async {

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/features/settings/settings_screen.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
@@ -66,5 +67,66 @@ void main() {
 
     expect(copied, ['https://github.com/alpha-neo-omega/PeerBeam/releases']);
     expect(find.text('Releases address copied'), findsOneWidget);
+  });
+
+  testWidgets('nothing is checked until the button is pressed', (tester) async {
+    // The condition amendment A1 was granted on: using the app must never
+    // amount to telling a server you are using it.
+    final fake = FakePeerBeam();
+    await pump(tester, fake);
+    expect(
+      fake.calls.where((c) => c == 'checkForUpdates'),
+      isEmpty,
+      reason: 'the app reached out without being asked',
+    );
+    expect(find.text('Check'), findsOneWidget);
+  });
+
+  testWidgets('pressing Check asks once and reports the answer', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..updateCheck = const UpdateCheck(
+        reachable: true,
+        current: '0.9.0',
+        latest: '1.0.0',
+        updateAvailable: true,
+      );
+    await pump(tester, fake);
+
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+
+    expect(fake.calls.where((c) => c == 'checkForUpdates').length, 1);
+    expect(find.textContaining('1.0.0 is available'), findsOneWidget);
+  });
+
+  testWidgets('an unreachable feed is stated, not raised as an error', (
+    tester,
+  ) async {
+    // Offline is an ordinary state for this app; A1 forbids the check becoming
+    // a precondition for anything.
+    final fake = FakePeerBeam()
+      ..updateCheck = const UpdateCheck(
+        reachable: false,
+        current: '0.9.0',
+        reason: 'dns',
+      );
+    await pump(tester, fake);
+
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('Could not reach the release list'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('being current says so plainly', (tester) async {
+    await pump(tester, FakePeerBeam());
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('which is the newest'), findsOneWidget);
   });
 }

@@ -13,6 +13,7 @@ members = [
     "crates/peerbeam-storage-fs",
     "crates/peerbeam-sync",
     "crates/peerbeam-transfer",
+    "crates/peerbeam-update",
     "crates/peerbeam-transfer-quic",
     "crates/peerbeam-ffi",
     "crates/peerbeam-clipboard-mem",

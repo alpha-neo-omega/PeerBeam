@@ -36,6 +36,7 @@ class NativeLoadError implements Exception {
 class Bindings {
   final _AbiDart _abiVersion;
   final _RetDart _versionJson;
+  final _RetDart _checkUpdates;
   final _ArgRetDart _init;
   final _VoidDart _shutdown;
   final _SetCbDart _setEventCallback;
@@ -100,6 +101,7 @@ class Bindings {
   Bindings._(DynamicLibrary lib)
     : _abiVersion = lib.lookupFunction<_AbiC, _AbiDart>('pb_abi_version'),
       _versionJson = lib.lookupFunction<_RetC, _RetDart>('pb_version_json'),
+      _checkUpdates = lib.lookupFunction<_RetC, _RetDart>('pb_check_updates'),
       _init = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_init'),
       _shutdown = lib.lookupFunction<_VoidC, _VoidDart>('pb_shutdown'),
       _setEventCallback = lib.lookupFunction<_SetCbC, _SetCbDart>(
@@ -234,6 +236,10 @@ class Bindings {
 
   int abiVersion() => _abiVersion();
   String versionJson() => _consume(_versionJson());
+
+  /// Blocking: the engine makes one HTTPS request. Callers keep it off the UI
+  /// path, which is why it only runs when a person presses the button.
+  String checkUpdates() => _consume(_checkUpdates());
   String init(String configJson) => _withArg(configJson, _init);
   void shutdown() => _shutdown();
   void freeString(Pointer<Utf8> ptr) => _freeString(ptr);

@@ -627,6 +627,21 @@ class FakePeerBeam implements PeerBeamApi {
   /// Whether log streaming has been switched on.
   bool logsSubscribed = false;
 
+  /// What [checkForUpdates] answers. Defaults to "reachable, and current" so
+  /// no existing test has to care.
+  UpdateCheck updateCheck = const UpdateCheck(
+    reachable: true,
+    current: '0.9.0',
+    latest: '0.9.0',
+  );
+
+  @override
+  Future<UpdateCheck> checkForUpdates() async {
+    _maybeFail('checkForUpdates');
+    calls.add('checkForUpdates');
+    return updateCheck;
+  }
+
   @override
   Future<List<LogLine>> logs({int limit = 200}) async {
     _maybeFail('logs');

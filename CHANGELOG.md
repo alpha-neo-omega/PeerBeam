@@ -63,6 +63,23 @@ downloads do not contain it; it ships in the next release.
   treats `--json` as consent because it *grants* standing, but a delete destroys
   history, so silence is refused rather than assumed.
 
+- **Check for updates — only when you ask.** `peerbeam check-updates`, and a
+  button in Settings → About. There is no check on launch, none on a timer, and
+  the request carries no device id, install id, or anything else identifying. It
+  downloads and installs nothing: it tells you a version and stops.
+
+  This needed a **constitutional amendment**, recorded as A1 in
+  `docs/ARCHITECTURAL_INVARIANTS.md`. Invariant I4 forbids phone-home without
+  qualification, and reading it narrowly to permit a check — rather than
+  recording that reading — is exactly what this project's rules forbid. The
+  amendment lists six binding conditions; a build that drops any of them is back
+  in conflict with I4. `docs/FINAL_SECURITY_REVIEW.md` is amended in the same
+  change, because it certified the absence of any network client and that
+  sentence would otherwise have become false.
+
+  Offline is not an error: the CLI exits 0 saying it could not reach the feed,
+  and the app says the same rather than raising anything.
+
 ### Fixed
 - **A sender's claimed filename could outrank what actually lands.** The peer's
   claim rides the chat channel and the bytes ride the transfer channel, and

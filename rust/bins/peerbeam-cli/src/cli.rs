@@ -91,6 +91,14 @@ pub enum Command {
     Config(ConfigArgs),
     /// Diagnose the environment.
     Doctor,
+    /// Ask whether a newer release exists.
+    ///
+    /// **The only outbound request PeerBeam makes to anyone but a peer**, and
+    /// it happens because you ran this — never on a timer, never at startup.
+    /// It sends no device id, no install id, and nothing identifying; it
+    /// downloads nothing and installs nothing. See amendment A1 in
+    /// `docs/ARCHITECTURAL_INVARIANTS.md`.
+    CheckUpdates,
     /// Measure crypto / transfer throughput.
     Benchmark(BenchmarkArgs),
     /// Show overall status.

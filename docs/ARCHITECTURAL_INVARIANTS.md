@@ -153,7 +153,56 @@ approval before implementation.
 
 ## Amendments
 
-*None.*
+### A1 — A user-initiated release check, narrowly permitted (2026-08-20)
+
+**Invariant amended:** I4 — *No mandatory cloud, no account, no tracking*, whose
+Forbids line reads "phone-home, usage beacons, remote feature flags, mandatory
+sign-in". Also narrows the corresponding permanent non-goal in
+[VISION.md](VISION.md) — *"Not a surveillance surface."*
+
+**The conflict.** A release check contacts a vendor-designated server. Read
+plainly, "phone-home" covers it, and the request discloses an IP, an
+approximate location, a version, and — by its timing — when the app is used.
+That is a server-side record of a user, which is the thing this project exists
+not to create.
+
+**Rationale for amending rather than refusing.** A user running a build with a
+known security fix missing is also a harm, and PeerBeam ships no auto-update.
+The narrow reading — that I4's Forbids clause targets *unattended, ongoing*
+disclosure (beacons, analytics, remote control of the client) rather than a
+single request a person deliberately makes — is available and coherent. What
+was not permissible was adopting that reading silently, which CLAUDE.md forbids.
+This records it instead.
+
+**What A1 permits:** exactly one HTTPS GET, made only when a person asks for it,
+returning a version string that the app renders and acts on in no other way.
+
+**Binding conditions.** All six hold together; a build that drops any one of
+them is outside A1 and back in conflict with I4.
+
+1. **Off by default, and opt-in per use.** No check on launch, on a timer, or as
+   a side effect of anything else. (I11 — secure-by-default; "Forbids: insecure
+   defaults 'for convenience'".)
+2. **No identifiers.** No device id, install id, keypair-derived value, cookie,
+   or persistent client state. Nothing beyond what a bare HTTPS GET
+   unavoidably discloses. The request carries no PeerBeam-specific header.
+3. **The response is inert.** A version string is displayed. No download, no
+   install, no behaviour anywhere changes on the strength of what the server
+   said. (I4 — "Forbids: … remote feature flags".)
+4. **Never a precondition.** Offline is a normal state for this app, not an
+   error. Failure is quiet, nothing is gated on the result, and nothing nags.
+   (I11 — "functions offline … never a precondition for use".)
+5. **Reachable from the CLI, not GUI-only.** (I7 — "Every capability is
+   reachable headless through the engine and the CLI".)
+6. **The security review says so.** [FINAL_SECURITY_REVIEW.md](FINAL_SECURITY_REVIEW.md)
+   certified "no telemetry (confirmed by absence of any network telemetry
+   client)". That sentence is amended in the same change; shipping a checker
+   while it stood would leave a published security claim false.
+
+**Approval:** granted by the repository owner, 2026-08-20.
+
+**Scope.** A1 covers a release check and nothing else. It is not a precedent for
+any other outbound request; a second one needs its own amendment.
 
 <!--
 Future amendments must include:

@@ -34,6 +34,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
     match cmd {
         Command::Config(a) => config(ctx, a, cfg_override.as_deref()),
         Command::Doctor => doctor(ctx, cfg_override.as_deref()),
+        Command::CheckUpdates => check_updates(ctx).await,
         Command::Benchmark(a) => benchmark(ctx, a).await,
         Command::Discover(a) => discover(ctx, a, cfg_override.as_deref()).await,
         Command::List(a) => list(ctx, a, cfg_override.as_deref()).await,
@@ -238,6 +239,78 @@ fn render_scalar(v: &serde_json::Value) -> String {
 }
 
 // ── doctor ──────────────────────────────────────────────────────
+
+/// Ask the release feed what the newest published version is.
+///
+/// Deliberately thin: it prints what it was told and stops. Amendment A1 permits
+/// a check, not an updater — nothing here downloads, installs, or changes
+/// behaviour on the strength of the answer.
+///
+/// Being unable to reach the feed is **not an error exit**. Offline is an
+/// ordinary state for this app, and a script that runs `peerbeam check-updates`
+/// on a machine with no route out should not fail because of it; the JSON says
+/// `reachable: false` and the human text says so plainly.
+async fn check_updates(ctx: &Ctx) -> CliResult {
+    let current = env!("CARGO_PKG_VERSION");
+    // Awaited on the dispatcher's runtime rather than building one. An earlier
+    // version called `block_on` here and panicked outright — "Cannot start a
+    // runtime from within a runtime" — because `dispatch` is already async.
+    let outcome = peerbeam_update::check().await;
+
+    match outcome {
+        Ok(Some(release)) => {
+            let newer = peerbeam_update::is_newer(&release.version, current);
+            if ctx.json {
+                ctx.json_line(&serde_json::json!({
+                    "event": "update_check",
+                    "reachable": true,
+                    "current": current,
+                    "latest": release.version,
+                    "update_available": newer,
+                    "url": release.url,
+                }));
+            } else if newer {
+                ctx.line(&format!(
+                    "{} is available — you have {}\n{}",
+                    release.version, current, release.url
+                ));
+            } else {
+                ctx.line(&format!("{current} is the newest release"));
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            if ctx.json {
+                ctx.json_line(&serde_json::json!({
+                    "event": "update_check",
+                    "reachable": true,
+                    "current": current,
+                    "latest": serde_json::Value::Null,
+                    "update_available": false,
+                }));
+            } else {
+                ctx.line("no releases published yet");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if ctx.json {
+                ctx.json_line(&serde_json::json!({
+                    "event": "update_check",
+                    "reachable": false,
+                    "current": current,
+                    "reason": e.to_string(),
+                }));
+            } else {
+                ctx.line(&format!(
+                    "could not check for updates — {e}\nyou have {current}; see {}",
+                    peerbeam_update::RELEASES_PAGE
+                ));
+            }
+            Ok(())
+        }
+    }
+}
 
 fn doctor(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     let cfg = load_config(path_override).unwrap_or_default();

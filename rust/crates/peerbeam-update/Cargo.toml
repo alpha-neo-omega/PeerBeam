@@ -1,0 +1,22 @@
+[package]
+name = "peerbeam-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# One HTTPS GET, and rustls only — no OpenSSL, no system TLS.
+#
+# A dependency is added here reluctantly (CLAUDE.md: "Avoid unnecessary
+# dependencies") and the alternative was worse: hand-rolling TLS and HTTP/1.1
+# parsing over the `rustls` already in the tree would put a bespoke,
+# unaudited network parser in a privacy-sensitive app to save a crate.
+# `default-features = false` keeps the default OpenSSL stack out.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
