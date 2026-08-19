@@ -61,6 +61,7 @@ use crate::commands::{self, SecureCtx};
 use crate::engine::{build_engine, me};
 use crate::exit::{CliError, CliResult};
 use crate::output::Ctx;
+use crate::prompt;
 use crate::session_transfer;
 
 pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) -> CliResult {
@@ -85,6 +86,7 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
             )),
         },
         ChatAction::Cancel { peer, id } => cancel(ctx, peer, id, path_override).await,
+        ChatAction::Delete { peer } => delete(ctx, peer, path_override).await,
         ChatAction::React {
             peer,
             id,
@@ -1292,6 +1294,179 @@ fn settle_cancelled(store: &ChatStore, peer_id: &DeviceId, id: &str) -> Result<b
     Ok(true)
 }
 
+// ── delete ──────────────────────────────────────────────────────────────────
+
+/// What a `chat delete` may do, given how it was invoked and what — if
+/// anything — the operator answered.
+///
+/// The same shape as [`trust::approval_gate`], and for the same reason: the
+/// decision is a pure function of its inputs, so it is testable without a
+/// terminal and there is one confirmation idiom in this CLI rather than two.
+///
+/// It differs in the one place that matters. `approve` treats `--json` as
+/// consent, because it *grants* standing and a machine consuming NDJSON has no
+/// way to reply. This erases history nothing else on the device keeps a second
+/// copy of, so silence is never consent here: a script has to say `--yes` out
+/// loud before anything is destroyed.
+///
+/// [`trust::approval_gate`]: crate::trust::approval_gate
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteGate {
+    /// `--yes`, or an explicit "yes" at the prompt.
+    Proceed,
+    /// Someone was asked and said no.
+    Declined,
+    /// Nobody could be asked (`--json`, no TTY, redirected stdin, EOF) and
+    /// `--yes` was not given. Told apart from [`DeleteGate::Declined`] so the
+    /// refusal can name the flag that would have worked, instead of reporting
+    /// a "no" nobody actually said.
+    Unanswerable,
+}
+
+/// Decide whether `chat delete` may proceed. See [`DeleteGate`].
+pub fn delete_gate(assume_yes: bool, answer: Option<bool>) -> DeleteGate {
+    if assume_yes {
+        return DeleteGate::Proceed;
+    }
+    match answer {
+        Some(true) => DeleteGate::Proceed,
+        Some(false) => DeleteGate::Declined,
+        None => DeleteGate::Unanswerable,
+    }
+}
+
+/// The question an interactive `chat delete` asks — **the count first**.
+///
+/// The number is inside the question rather than printed above it because
+/// `prompt::confirm` writes its argument unconditionally while [`Ctx::line`]
+/// honours `--quiet`: this way there is no combination of flags under which
+/// somebody confirms a delete without having been told how much it takes.
+///
+/// It also says what the delete is *not*. Every other messenger's "delete
+/// conversation" reaches the other person's screen too, and someone who
+/// assumes that here would be deleting their own evidence of a thread the peer
+/// still has in full.
+fn delete_question(peer: &DeviceId, records: usize) -> String {
+    format!(
+        "  peer      {}\n  messages  {records}\nThis erases them from **this device only** — \
+         the peer keeps its own copy, and there is no undo.\nA message still queued to send is \
+         kept, along with the file it owns.\nDelete this conversation?",
+        peer.0,
+    )
+}
+
+/// `peerbeam chat delete <PEER>` — forget a whole conversation on this device.
+///
+/// The engine call is [`ChatStore::delete_conversation`] — the same one the app
+/// reaches through `pb_chat_delete`, not a second implementation of it, so the
+/// keep rule that saves a queued file's record cannot drift between the two
+/// surfaces (I7).
+///
+/// **Not [`cancel`], in either direction.** That calls off *one file we are
+/// still sharing*: it dequeues the entry, unlinks the bytes the outbox staged,
+/// and settles the row. This deletes *history* — every message in the thread,
+/// text rows and file rows alike — and deliberately leaves the queue alone.
+/// Cancelling does not forget the thread; deleting does not stop a send.
+///
+/// `kept` is counted off the store **after** the delete rather than from the
+/// rule that chose what to keep, exactly as the FFI's `Manager::chat_delete`
+/// counts it: a number the user is shown should be an observation, not a
+/// restatement of the intent. Both counts go through
+/// [`ChatStore::record_count`], which counts by stored key — a row written by a
+/// newer schema is real and present even though this build cannot decode it,
+/// and counting through `history` (which skips exactly those) would describe a
+/// thread as empty to somebody deciding whether to erase it.
+///
+/// [`ChatStore::delete_conversation`]: peerbeam_chat::ChatStore::delete_conversation
+/// [`ChatStore::record_count`]: peerbeam_chat::ChatStore::record_count
+async fn delete(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    // The same resolution `chat history` and `chat cancel` use, so a thread
+    // read with `chat history bob` is deleted with the same word `bob`.
+    let peer_id = resolve_history_peer(ctx, &config, &store, peer).await;
+
+    let before = store
+        .record_count(&peer_id)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    // Nothing to lose, so nothing to ask about — and a clean exit, not an
+    // error. Re-running a delete must converge rather than fail the second
+    // time, the way `trust approve` already treats an already-approved device;
+    // it is also the honest answer for a name that resolved to a peer this
+    // device has never spoken to.
+    if before > 0 {
+        let answer = if ctx.interactive {
+            Some(prompt::confirm(
+                ctx,
+                &delete_question(&peer_id, before),
+                false,
+            ))
+        } else {
+            None
+        };
+        match delete_gate(ctx.assume_yes, answer) {
+            DeleteGate::Proceed => {}
+            DeleteGate::Declined => return Err(CliError::Cancelled),
+            DeleteGate::Unanswerable => {
+                return Err(CliError::Usage(format!(
+                    "deleting the conversation with {} cannot be undone and nobody could be \
+                     asked here — re-run with `--yes` to confirm it in advance",
+                    peer_id.0
+                )))
+            }
+        }
+    }
+
+    let removed = store
+        .delete_conversation(&peer_id)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    let kept = store
+        .record_count(&peer_id)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "chat_deleted",
+            "peer": peer_id.0,
+            "removed": removed,
+            "kept": kept,
+        }));
+    } else if removed == 0 && kept == 0 {
+        ctx.line(&ctx.dim(&format!(
+            "no conversation with {} on this device",
+            peer_id.0
+        )));
+    } else if removed == 0 {
+        // Every row was kept. Leading with "deleted 0" would read as a failure
+        // of the command rather than what it is — a thread that is still on its
+        // way out — so the kept rows are the whole sentence here. A thread of
+        // nothing but queued messages is the ordinary shape of this: `chat
+        // send` to an offline peer enqueues, and enqueued rows are exactly the
+        // ones the keep rule protects.
+        ctx.line(&ctx.dim(&format!(
+            "nothing deleted from the conversation with {} — all {kept} message(s) are \
+             still waiting to send",
+            peer_id.0
+        )));
+    } else {
+        ctx.line(&ctx.green(&format!(
+            "deleted {removed} message(s) from the conversation with {}",
+            peer_id.0
+        )));
+        if kept > 0 {
+            // Named, not silently subtracted: the user asked for the whole
+            // thread and did not get all of it, and the reason is a send still
+            // on its way out rather than a failure.
+            ctx.line(&ctx.dim(&format!(
+                "  {kept} kept — still waiting to send; removing them would drop the \
+                 files they own"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `chat history <peer>` — print a conversation's persisted history. `peer`
 /// may be a raw device id (`pb-<fingerprint>`) or a friendly name; see
 /// [`resolve_history_peer`] for how the two are told apart.
@@ -1787,6 +1962,7 @@ mod tests {
     use super::{
         reachable_targets, render_file_line, render_history_json, render_search_json,
         resolve_history_peer, search, search_row_cells, send, send_file, spawn_single_flight,
+        DeleteGate,
     };
     use crate::commands::{self, SecureCtx};
     use crate::exit::CliError;
@@ -2815,6 +2991,232 @@ mod tests {
                 "still untouched after the public call: {why}"
             );
         }
+    }
+
+    // ── chat delete ─────────────────────────────────────────────────────────
+
+    // The gate is where "irreversible" is enforced, so it is tested as the pure
+    // function it is: `--yes` proceeds, an explicit "no" declines, and — the
+    // arm that separates this from `trust approve` — nobody-to-ask is neither.
+    #[test]
+    fn delete_gate_treats_only_yes_as_consent_and_silence_as_neither() {
+        assert_eq!(super::delete_gate(true, None), DeleteGate::Proceed);
+        assert_eq!(super::delete_gate(true, Some(false)), DeleteGate::Proceed);
+        assert_eq!(super::delete_gate(false, Some(true)), DeleteGate::Proceed);
+        assert_eq!(super::delete_gate(false, Some(false)), DeleteGate::Declined);
+        assert_eq!(super::delete_gate(false, None), DeleteGate::Unanswerable);
+    }
+
+    // The count and the "this device only" caveat must be inside the question,
+    // not printed beside it: `--quiet` suppresses `Ctx::line` but cannot
+    // suppress what `prompt::confirm` writes.
+    #[test]
+    fn delete_question_carries_the_count_and_says_the_peer_keeps_its_copy() {
+        let q = super::delete_question(&DeviceId::from("pb-bob"), 7);
+        assert!(q.contains("pb-bob"), "the question names the peer: {q}");
+        assert!(q.contains('7'), "the question names the count: {q}");
+        assert!(
+            q.contains("this device only"),
+            "the question says it is not an unsend: {q}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_delete_removes_a_conversations_history_from_this_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx(); // `--yes` is implied: the gate is proved above.
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("pb-bob");
+        let other = DeviceId::from("pb-ann");
+        for body in ["hi", "there"] {
+            let m = ChatMessage::new(body).expect("message");
+            store.append(&ChatRecord::sent(&peer, &m)).expect("append");
+        }
+        let keep = ChatMessage::new("untouched").expect("message");
+        store
+            .append(&ChatRecord::sent(&other, &keep))
+            .expect("append");
+
+        super::delete(
+            &ctx,
+            "pb-bob".to_string(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("deleting our own history is allowed");
+
+        assert_eq!(
+            store.record_count(&peer).expect("record_count"),
+            0,
+            "every row in the named thread is gone"
+        );
+        assert_eq!(
+            store.record_count(&other).expect("record_count"),
+            1,
+            "a delete is scoped to one conversation, never the store"
+        );
+    }
+
+    // The safety property: a script that never says `--yes` must not be able to
+    // destroy a thread by accident. `--json` is non-interactive by construction,
+    // so there is nobody to ask — and unlike `trust approve`, that is refused
+    // rather than taken as consent.
+    #[tokio::test]
+    async fn chat_delete_without_yes_refuses_and_leaves_the_conversation_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        // `quiet_ctx` but with `--yes` withheld: json ⇒ not interactive.
+        let ctx = Ctx::new(true, true, 0, true, false);
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("pb-bob");
+        let m = ChatMessage::new("hi").expect("message");
+        store.append(&ChatRecord::sent(&peer, &m)).expect("append");
+
+        let err = super::delete(
+            &ctx,
+            "pb-bob".to_string(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect_err("an unconfirmed delete must refuse");
+        match err {
+            CliError::Usage(m) => assert!(
+                m.contains("--yes"),
+                "the refusal names the flag that would have worked: {m}"
+            ),
+            other => panic!("expected a usage refusal, got {other:?}"),
+        }
+        assert_eq!(
+            store.record_count(&peer).expect("record_count"),
+            1,
+            "a refused delete rewrites nothing"
+        );
+    }
+
+    // `delete` and `cancel` are not two words for one thing, and this is the
+    // half that costs a file if they are conflated: the row backing a **queued**
+    // send survives, along with the bytes the outbox staged for it. Dropping the
+    // record would make the next drain read "nothing will ever settle this" and
+    // release the blob — the file would vanish without ever being sent.
+    #[tokio::test]
+    async fn chat_delete_keeps_the_row_backing_a_queued_file_and_its_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let (store, id, staged) = queue_one_file(&ctx, dir.path(), &config, &cfg_path).await;
+
+        // A settled text row in the same thread, to prove the delete still does
+        // its job around the one row it must keep.
+        let peer = DeviceId::from("addr");
+        let m = ChatMessage::new("chatter").expect("message");
+        store.append(&ChatRecord::sent(&peer, &m)).expect("append");
+
+        super::delete(
+            &ctx,
+            "addr".to_string(), // `--addr`'s routing placeholder id
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("deleting a thread with a queued file is allowed");
+
+        assert!(
+            store.get(&peer, &id).expect("get").is_some(),
+            "the row a queued send depends on must survive"
+        );
+        assert!(
+            store.get(&peer, &m.id).expect("get").is_none(),
+            "the settled row around it is still deleted"
+        );
+        assert_eq!(
+            store
+                .outbox_for(&peer)
+                .expect("outbox_for")
+                .into_iter()
+                .filter(|e| e.message_id == id)
+                .count(),
+            1,
+            "delete leaves the queue alone — that is `chat cancel`'s job"
+        );
+        assert!(
+            std::path::Path::new(&staged).exists(),
+            "the staged bytes must still be there: {staged}"
+        );
+    }
+
+    // The ordinary shape of a thread with an offline peer, and the one that
+    // looks like a bug until you know the rule: `chat send` to an unreachable
+    // device *enqueues*, and an enqueued row is exactly what the keep rule
+    // protects — so a delete here removes nothing and keeps everything. It must
+    // still succeed, and the rows must survive intact: they are what the drain
+    // settles when the peer comes back.
+    #[tokio::test]
+    async fn chat_delete_of_an_all_queued_thread_keeps_everything_and_still_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        let ctx = quiet_ctx();
+        let cfg_str = cfg_path.to_str().expect("utf8 path");
+
+        send(
+            &ctx,
+            None,
+            Some("127.0.0.1:1".to_string()),
+            "still on its way".to_string(),
+            Some(cfg_str),
+        )
+        .await
+        .expect("an unreachable peer queues rather than erroring");
+
+        super::delete(&ctx, "addr".to_string(), Some(cfg_str))
+            .await
+            .expect("a thread of queued messages is still a legal delete");
+
+        let sc = SecureCtx::build(&config).expect("secure ctx");
+        let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+        let peer = DeviceId::from("addr");
+        assert_eq!(
+            store.record_count(&peer).expect("record_count"),
+            1,
+            "a queued message's row is kept, not deleted"
+        );
+        assert_eq!(
+            store.outbox_for(&peer).expect("outbox_for").len(),
+            1,
+            "and the queue entry it belongs to is untouched"
+        );
+    }
+
+    // Converging, not failing: a second `delete` — or one aimed at a peer this
+    // device has never spoken to — has nothing to remove and says so.
+    #[tokio::test]
+    async fn chat_delete_of_a_conversation_that_is_not_there_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = isolated_config(dir.path());
+        let cfg_path = dir.path().join("config.json");
+        config.save(&cfg_path).expect("save config");
+        // No `--yes`: with nothing to lose there is nothing to confirm, so this
+        // must not be refused either.
+        let ctx = Ctx::new(true, true, 0, true, false);
+
+        super::delete(
+            &ctx,
+            "pb-nobody".to_string(),
+            Some(cfg_path.to_str().expect("utf8 path")),
+        )
+        .await
+        .expect("deleting nothing is a clean no-op, not an error");
     }
 
     // **The refusal.** A peer whose build predates file-in-chat advertises

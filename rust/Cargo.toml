@@ -38,7 +38,7 @@ edition = "2021"
 rust-version = "1.80"
 authors = ["PeerBeam Contributors"]
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/peerbeam/PeerBeam"
+repository = "https://github.com/alpha-neo-omega/PeerBeam"
 
 # Shared dependency versions. Individual crates opt in by name so the
 # dependency graph stays explicit and auditable.

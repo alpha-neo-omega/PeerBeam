@@ -2,6 +2,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../clipboard/clipboard_history_screen.dart';
+import 'logs_screen.dart';
+import 'shared_folders_card.dart';
 
 import '../../app/theme.dart';
 import '../../platform/bridge.dart';
@@ -283,6 +285,13 @@ class SettingsScreen extends StatelessWidget {
               ),
               const Gap(AppSpace.md),
 
+              // Directly beneath trusted devices, because Browse is one of the
+              // permissions listed there: what a folder here is exposed to is
+              // decided one card up.
+              const _GroupLabel('Shared folders'),
+              const SharedFoldersCard(),
+              const Gap(AppSpace.md),
+
               // Android-only background/battery controls.
               if (_isAndroid) ...[
                 const _GroupLabel('Background (Android)'),
@@ -319,6 +328,26 @@ class SettingsScreen extends StatelessWidget {
                 ),
                 const Gap(AppSpace.md),
               ],
+
+              const _GroupLabel('Diagnostics'),
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.article_outlined),
+                  title: const Text('Logs'),
+                  // Says what they cover and what they are for. The engine has
+                  // always captured these; until now nothing in the app could
+                  // reach them, which is the same as not having them.
+                  subtitle: const Text(
+                    'What this device recorded this session — read them, or '
+                    'export them for a bug report',
+                  ),
+                  trailing: const Icon(Icons.chevron_right_rounded),
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(builder: (_) => const LogsScreen()),
+                  ),
+                ),
+              ),
+              const Gap(AppSpace.md),
 
               const _GroupLabel('About'),
               Card(

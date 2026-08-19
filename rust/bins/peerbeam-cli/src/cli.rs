@@ -288,11 +288,35 @@ pub enum ChatAction {
     },
     /// Call off a file we are sharing: drop it from the queue and delete the
     /// copy the outbox made of it.
+    ///
+    /// One share, named by its message id — **not** the conversation it sits
+    /// in. To forget the whole thread, see `chat delete`.
     Cancel {
         /// Peer device id (`pb-…`), or a name that is discoverable right now.
         peer: String,
         /// The share's message id, as shown by `chat history --json`.
         id: String,
+    },
+    /// Forget a whole conversation on this device: every message in it.
+    ///
+    /// **Not `chat cancel`.** That calls off one file we are still sharing and
+    /// leaves the conversation alone; this erases the conversation and leaves
+    /// the queue alone. The two words are not interchangeable in either
+    /// direction.
+    ///
+    /// **Local only.** Nothing goes on the wire and the peer keeps its own
+    /// copy — this is "forget these messages here", never "unsend".
+    ///
+    /// A row still backing a **queued** outbound message survives, along with
+    /// the file it owns: the drain reads a missing record as "nothing will ever
+    /// settle this" and would throw those bytes away. The receipt says how many
+    /// were kept for that reason.
+    ///
+    /// Irreversible and unprompted-for by anything else on the device, so it
+    /// asks first; `--yes` answers in advance for a script.
+    Delete {
+        /// Peer device id (`pb-…`), or a name that is discoverable right now.
+        peer: String,
     },
     /// React to a message with an emoji — or withdraw a reaction.
     ///

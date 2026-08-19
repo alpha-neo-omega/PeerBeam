@@ -330,10 +330,22 @@ jobs:
             echo "::warning::${notes_file} is missing — publishing with generated notes. Add it and re-push the tag to replace them."
             notes=(--generate-notes)
           fi
+          # **Not `--prerelease`.** GitHub excludes prereleases from
+          # `/releases/latest`, and `docs/CLI.md` tells people to install with
+          # `curl -LO .../releases/latest/download/peerbeam-linux-x64`. Every
+          # release having carried that flag meant the documented install
+          # command answered 404 — verified against the live repo, where
+          # `/releases/latest` returned "Not Found" with five releases
+          # published.
+          #
+          # Maturity belongs in the notes, which already say "Beta"; the flag is
+          # a *distribution* switch that decides whether the standard download
+          # URL resolves at all. Add it back only for a genuine pre-release
+          # (an -rc tag), not for every build.
           if ! gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
-            --prerelease --verify-tag \
+            --verify-tag \
             "${notes[@]}" \
             "${files[@]}" 2> /tmp/gh-err.txt; then
             # Surface the real error as annotations (readable without log auth).

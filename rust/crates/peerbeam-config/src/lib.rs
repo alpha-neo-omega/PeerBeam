@@ -161,6 +161,16 @@ pub struct TransferConfig {
     pub enable_resume: bool,
     /// Port the transfer server (QUIC) listens on and advertises.
     pub port: u16,
+    /// Ceiling on outbound transfer speed, in bytes per second. `0` is
+    /// unlimited.
+    ///
+    /// **Sending only, and deliberately.** A receiver cannot slow a sender that
+    /// ignores it, so a "download limit" would be a promise this side cannot
+    /// keep; the honest control is over what this device sends. On a shared
+    /// home link an unthrottled QUIC transfer takes everything, which is the
+    /// difference between an app someone keeps and one they uninstall.
+    #[serde(default)]
+    pub max_send_bytes_per_sec: u64,
 }
 
 /// Encryption configuration.
@@ -276,6 +286,9 @@ impl Default for TransferConfig {
             enable_compression: true,
             enable_resume: true,
             port: 49600,
+            // Unlimited by default: a limit nobody asked for is a slow transfer
+            // nobody can explain.
+            max_send_bytes_per_sec: 0,
         }
     }
 }

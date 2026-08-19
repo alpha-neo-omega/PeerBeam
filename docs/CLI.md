@@ -255,7 +255,49 @@ Working now:
   no CLI-to-CLI IPC); it stops everything that outlives that process, including
   a row stranded by a Ctrl-C mid-stage. Cancelling a row whose queue entry has
   already gone still succeeds (`— nothing was still queued`), so it is safe to
-  re-run.
+  re-run. It is **one share**, named by its message id — to forget the whole
+  thread, see `chat delete`.
+- `chat delete <peer>` — forget a whole conversation on **this device**: every
+  message in it, text rows and file rows alike. `<peer>` is a device id or a
+  discoverable name (same resolution as `chat history`).
+
+  **Not `chat cancel`, in either direction.** That calls off one file we are
+  still sharing and leaves the conversation alone; this erases the conversation
+  and leaves the queue alone. Cancelling does not forget a thread, and deleting
+  does not stop a send.
+
+  **Local only, and not an unsend.** Nothing goes on the wire and the other
+  device keeps its own copy of every message. Every other messenger's "delete
+  conversation" reaches both screens; someone who assumes that here would be
+  erasing only their own record of a thread the peer still holds in full.
+
+  A row still backing a **queued** outbound message survives, along with the
+  file it owns. The drain reads a missing record as "nothing will ever settle
+  this" and releases the staged bytes with it, so dropping the row would make
+  the file vanish without ever being sent. The receipt names how many were kept
+  for that reason; `chat cancel` is what actually lets those go.
+
+  That rule bites hardest on a thread with an **offline** peer, and it is not a
+  bug: `chat send` to an unreachable device enqueues, so a conversation whose
+  messages have not gone out yet deletes *nothing* and reports every row as
+  kept (`nothing deleted … all N message(s) are still waiting to send`). Let
+  them drain — or cancel them — and the delete then takes the thread.
+
+  **It asks first, and silence is not consent.** The delete cannot be undone and
+  nothing else on the device holds a second copy, so a non-interactive run
+  (`--json`, no TTY, redirected stdin) with no `-y/--yes` is refused — **exit
+  2**, naming the flag that would have worked — rather than proceeding the way
+  `trust approve` does under `--json`. That command *grants* standing and can
+  safely assume a machine that cannot answer; this one destroys history.
+  Answering "no" at the prompt is **exit 6**. Deleting a conversation that is
+  not there removes nothing and exits `0`, so a re-run converges instead of
+  failing the second time.
+
+  The engine call is the same one the desktop app's "Delete conversation"
+  reaches (`ChatStore::delete_conversation` via `pb_chat_delete`), not a second
+  implementation of it, so the keep rule cannot drift between the two surfaces.
+  Under `--json` it emits one `chat_deleted` event carrying
+  `{"peer","removed","kept"}`.
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.

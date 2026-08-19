@@ -159,6 +159,20 @@ pub async fn send_file(
             break;
         }
         buf.truncate(n);
+
+        // Meter *after* reading and *before* sending: the wait must delay the
+        // wire, not the disk, and it must cover the bytes actually read rather
+        // than the chunk size asked for — a short read at end-of-file should
+        // not be charged for a full chunk. Zero-cost when unlimited, which is
+        // the default and the common case.
+        let wait = ctrl.throttle(n as u64);
+        if !wait.is_zero() {
+            // `cancel_or_pause` is checked again on the next iteration, so a
+            // cancel arriving mid-wait is honoured one chunk later at worst —
+            // and the wait is bounded by one chunk's worth of budget.
+            tokio::time::sleep(wait).await;
+        }
+
         hasher.update(&buf);
         send_with_retry(link, chunk_frame_owned(Bytes::from(buf)), retries).await?;
         sent += n as u64;

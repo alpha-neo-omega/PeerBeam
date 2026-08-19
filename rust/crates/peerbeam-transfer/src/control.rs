@@ -4,8 +4,9 @@
 //! while the transfer task holds another. The send loop consults it every
 //! chunk: it blocks while paused and aborts promptly on cancel.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -15,6 +16,36 @@ struct State {
     cancelled: AtomicBool,
     /// Wakes the send loop when resumed or cancelled.
     wake: Notify,
+    /// Outbound speed ceiling in bytes per second; `0` is unlimited.
+    ///
+    /// Lives beside pause and cancel because it is the same kind of thing: a
+    /// knob the user turns while a transfer is already running, which the send
+    /// loop must notice without being restarted.
+    rate: AtomicU64,
+    /// The bucket the send loop meters against, and when it last did.
+    ///
+    /// A `Mutex` rather than more atomics: the allowance and the timestamp are
+    /// only meaningful together, and updating them separately would let two
+    /// chunks each believe they had the same credit.
+    meter: Mutex<Meter>,
+}
+
+/// The rate bucket plus the instant it was last charged.
+struct Meter {
+    bucket: crate::ratelimit::Bucket,
+    last: Option<Instant>,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        // Unlimited until someone says otherwise; `set_rate_limit` replaces the
+        // bucket's rate rather than the bucket, so the accrual logic has one
+        // home.
+        Meter {
+            bucket: crate::ratelimit::Bucket::new(0),
+            last: None,
+        }
+    }
 }
 
 /// Controls the lifecycle of a running transfer.
@@ -27,6 +58,42 @@ impl TransferControl {
     /// Create a fresh control (not paused, not cancelled).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the outbound ceiling in bytes per second; `0` is unlimited.
+    ///
+    /// Takes effect on the next chunk, not the next transfer — someone turning
+    /// this down is usually doing it because a transfer is saturating their
+    /// link right now.
+    pub fn set_rate_limit(&self, bytes_per_sec: u64) {
+        self.state.rate.store(bytes_per_sec, Ordering::SeqCst);
+        self.state
+            .meter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bucket
+            .set_rate(bytes_per_sec);
+    }
+
+    /// The current ceiling; `0` is unlimited.
+    #[must_use]
+    pub fn rate_limit(&self) -> u64 {
+        self.state.rate.load(Ordering::SeqCst)
+    }
+
+    /// How long the send loop must wait before putting `bytes` on the wire.
+    ///
+    /// [`Duration::ZERO`] when unlimited or within budget, which is the common
+    /// case — an unthrottled transfer pays one atomic load for this.
+    pub fn throttle(&self, bytes: u64) -> Duration {
+        if self.state.rate.load(Ordering::SeqCst) == 0 {
+            return Duration::ZERO;
+        }
+        let mut meter = self.state.meter.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let elapsed = meter.last.map_or(Duration::ZERO, |t| now.duration_since(t));
+        meter.last = Some(now);
+        meter.bucket.take(bytes, elapsed)
     }
 
     /// Request a pause. The send loop stops before its next chunk.
@@ -225,5 +292,64 @@ mod tests {
                 .expect("cancel racing cancelled() must not be lost")
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    const KB: u64 = 1024;
+
+    #[test]
+    fn a_control_is_unlimited_until_asked_otherwise() {
+        // A limit nobody set is a slow transfer nobody can explain.
+        let c = TransferControl::new();
+        assert_eq!(c.rate_limit(), 0);
+        assert_eq!(c.throttle(64 * KB), Duration::ZERO);
+        assert_eq!(c.throttle(u64::MAX), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_limit_eventually_costs_time() {
+        let c = TransferControl::new();
+        c.set_rate_limit(100 * KB);
+        // The bucket starts full, so the first second's worth is free.
+        assert_eq!(c.throttle(100 * KB), Duration::ZERO);
+        assert!(
+            c.throttle(100 * KB) > Duration::ZERO,
+            "a set limit never made anything wait"
+        );
+    }
+
+    #[test]
+    fn clearing_the_limit_restores_full_speed() {
+        let c = TransferControl::new();
+        c.set_rate_limit(KB);
+        c.throttle(KB);
+        assert!(c.throttle(KB) > Duration::ZERO);
+
+        c.set_rate_limit(0);
+        assert_eq!(c.rate_limit(), 0);
+        assert_eq!(
+            c.throttle(100 * 1024 * KB),
+            Duration::ZERO,
+            "clearing the limit left the transfer throttled"
+        );
+    }
+
+    /// The control is cloned into the send task; a limit set through one handle
+    /// must be seen by the other, or changing it mid-transfer would do nothing.
+    #[test]
+    fn a_limit_set_on_one_clone_is_seen_by_the_others() {
+        let a = TransferControl::new();
+        let b = a.clone();
+        a.set_rate_limit(50 * KB);
+        assert_eq!(b.rate_limit(), 50 * KB);
+        b.throttle(50 * KB);
+        assert!(
+            a.throttle(50 * KB) > Duration::ZERO,
+            "the two handles are metering separate buckets"
+        );
     }
 }

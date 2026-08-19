@@ -24,6 +24,7 @@ mod identity;
 mod peek;
 mod pipe;
 mod protocol;
+mod ratelimit;
 mod recover;
 mod secure;
 mod session;
@@ -43,6 +44,7 @@ pub use pipe::{
     caps_support_stream, may_accept_pipe, receive_pipe, send_pipe, PipeStats, PIPE_CHUNK,
 };
 pub use protocol::{Control, TransferMeta, BACK_PAUSE, BACK_RESUME};
+pub use ratelimit::Bucket;
 pub use recover::{receive_file_recover, send_file_recover, LinkFactory};
 pub use secure::SecureLink;
 pub use session::{
