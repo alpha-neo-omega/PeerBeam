@@ -699,8 +699,14 @@ fn sanitize_rel(rel: &str) -> Option<String> {
     }
 }
 
+/// A destination path under `root` for a `/`-separated relative path.
+///
+/// Native separators: `rel` arrives in wire form (always `/`), and what comes
+/// out is a location on this machine.
 fn join(root: &str, rel: &str) -> String {
-    format!("{}/{}", root.trim_end_matches('/'), rel)
+    peerbeam_domain::local_path(std::path::Path::new(root), rel)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

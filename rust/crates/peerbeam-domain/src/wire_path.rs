@@ -38,6 +38,30 @@ pub fn wire_path(rel: &Path) -> String {
         .join("/")
 }
 
+/// Turn a `/`-separated **wire** path into a native path under `root`.
+///
+/// The exact inverse of [`wire_path`], and needed for the same reason read the
+/// other way: a local path is a location on *this* machine, so it must use this
+/// machine's separator. Gluing segments on with `format!("{root}/{rel}")` yields
+/// `C:\Users\me\recv/photo.jpg` on Windows — which opens, because Windows
+/// accepts both, but is what gets stored as the file's `local_path` and shown
+/// as the tap-to-open target. A consumer that splits on `\` sees one segment
+/// where there are two.
+///
+/// `.` and `..` segments are dropped, so a relative path can never climb out of
+/// `root` however it was built.
+#[must_use]
+pub fn local_path(root: &Path, rel: &str) -> std::path::PathBuf {
+    let mut out = root.to_path_buf();
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        out.push(seg);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +108,35 @@ mod tests {
 
     /// An absolute path should never be passed here, but if one is, no host
     /// location leaks to the peer.
+    #[test]
+    fn local_path_uses_the_platform_separator() {
+        let got = local_path(Path::new("root"), "a/b/c.txt");
+        let want: PathBuf = ["root", "a", "b", "c.txt"].iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn local_path_round_trips_with_wire_path() {
+        let rel = "photos/june/a.jpg";
+        let joined = local_path(Path::new("root"), rel);
+        let back = wire_path(joined.strip_prefix("root").unwrap());
+        assert_eq!(back, rel, "the two must be exact inverses");
+    }
+
+    #[test]
+    fn local_path_cannot_climb_out_of_its_root() {
+        let got = local_path(Path::new("root"), "../../etc/passwd");
+        let want: PathBuf = ["root", "etc", "passwd"].iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn local_path_tolerates_empty_and_dot_segments() {
+        let got = local_path(Path::new("root"), "a//./b");
+        let want: PathBuf = ["root", "a", "b"].iter().collect();
+        assert_eq!(got, want);
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_absolute_path_loses_its_root() {

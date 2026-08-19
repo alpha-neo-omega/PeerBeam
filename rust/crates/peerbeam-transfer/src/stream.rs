@@ -211,7 +211,13 @@ pub async fn receive_file(
 
     // Sanitize: only the base name, never an attacker-chosen path.
     let base = sanitize_file_name(&meta.name);
-    let dest = format!("{}/{}", dest_dir.trim_end_matches('/'), base);
+    // `local_path`, not `format!("{dir}/{base}")`: this string is stored as the
+    // file's `local_path` and shown as the tap-to-open target, so it must use
+    // this machine's separator. Gluing on a `/` yields `C:\dir/file` on Windows
+    // — which opens, but is not a path anyone can render or split sensibly.
+    let dest = peerbeam_domain::local_path(std::path::Path::new(dest_dir), &base)
+        .to_string_lossy()
+        .into_owned();
     // Data is written to a `.part` file; the final name only appears once the
     // whole file is received and verified (safe, atomic, no partial clobber).
     //
