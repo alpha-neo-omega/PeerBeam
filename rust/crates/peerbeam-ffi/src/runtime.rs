@@ -138,6 +138,15 @@ pub fn apply_live_settings(partial: &Value) {
     if let Some(a) = partial.get("auto_accept").and_then(|v| v.as_bool()) {
         m.set_auto_accept(a);
     }
+    // Reaches transfers already in flight. Someone moves this because something
+    // is saturating their link *now*; applying it only to the next transfer
+    // would arrive after the problem had passed.
+    if let Some(bps) = partial
+        .get("max_send_bytes_per_sec")
+        .and_then(serde_json::Value::as_u64)
+    {
+        m.set_send_limit(bps);
+    }
     // Shared folders, applied **now**. Waiting for a restart would mean a
     // person who has just un-shared a private folder is still sharing it, which
     // is the one direction this setting must never lag in.
@@ -507,6 +516,11 @@ pub fn init(config_json: &str) -> OpResult {
             std::path::Path::new(&config.storage.data_directory).join("checkpoints"),
         )),
     ));
+
+    // The configured outbound ceiling, applied once the manager exists rather
+    // than threaded through its constructor. `0` is unlimited, which is the
+    // default — a limit nobody set is a slow transfer nobody can explain.
+    manager.set_send_limit(config.transfer.max_send_bytes_per_sec);
 
     // Startup is the only moment at which nothing is running, so it is the
     // only moment at which every checkpoint on disk is genuinely stale rather

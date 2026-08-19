@@ -477,15 +477,18 @@ Working now:
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
-- `trust list` / `trust approve <device>` / `trust revoke <device>` /
-  `trust permit <device> <permission>…` /
+- `trust list` / `trust approve <device> [--for DURATION]` /
+  `trust revoke <device>` / `trust permit <device> <permission>…` /
   `trust revoke-permission <device> <permission>…` — the devices this machine
-  trusts, **which of them the user actually chose**, and **what each may do**.
+  trusts, **which of them the user actually chose**, **for how long**, and
+  **what each may do**.
 
   ```
-  STATUS    DEVICE           NAME          FINGERPRINT          PINNED            PERMISSIONS
-  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11  none
-  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30  files,chat,presence,pipe
+  STATUS    DEVICE           NAME          FINGERPRINT          PINNED            EXPIRES   PERMISSIONS
+  pinned    pb-91ab33cd1122  Unknown Peer  77b2ccddeeff0011…    2026-08-18 02:11  never     none
+  approved  pb-f4e4d56fce98  laptop        3f9a1b2c4d5e6f70…    2026-08-17 10:30  never     files,chat,presence,pipe
+  approved  pb-0d19aa73be40  Loaner        b1c2d3e4f5a60718…    2026-08-19 09:02  in 24m    files,chat,clipboard,presence,pipe
+  expired   pb-77c410ee9a35  Guest         5e6f7081a2b3c4d5…    2026-08-19 08:15  12m ago   none
   ```
 
   Two states, and the difference is the point. A device is **pinned** by the
@@ -520,6 +523,34 @@ Working now:
   refuses (exit `6`) rather than approving unasked. Approving an
   already-approved device is a no-op that says so and exits `0`, so a
   provisioning script is safe to re-run.
+
+  **`--for DURATION` approves for a while.** `45s`, `30m`, `2h`, `7d` — one
+  number and one unit; a bare `30` is exit `2` rather than a guess between half
+  a minute and half an hour, and so is `0m` (the error names `--for`'s omission
+  and `trust revoke` as the two things that were probably meant). The deadline is
+  stored as an **absolute instant**, so a machine asleep through the whole window
+  wakes with it shut.
+
+  ```bash
+  peerbeam trust approve guest-laptop --for 30m --yes
+  peerbeam trust list                      # EXPIRES: in 29m
+  ```
+
+  When the window closes the device is back to being merely **pinned**: it may
+  nothing, `is_trusted`/`is_approved`/`may` all answer false, and `list` shows it
+  as `expired` with when it lapsed. **Nothing has to run for that to happen** —
+  no daemon, no sweeper, no reconnect. Every gate re-reads the store per
+  operation, so the verdict is recomputed from the clock each time somebody asks,
+  and a fresh `peerbeam` process reaches the same one.
+
+  The **pin survives**: its key is still remembered, so a key change is still
+  caught. `revoke` is what forgets a device. Approving an expired device renews
+  it and gives back the permissions it was actually left, not the five it started
+  with; a plain `approve` (no `--for`) means indefinitely, and lifts a window set
+  earlier. Re-running `--for` on a device that still holds standing just rewrites
+  the window and asks nothing — it is not a new grant. With
+  `encryption.require_pin_pairing` on, renewing an *expired* device goes through
+  `peerbeam pair`, exactly as a first approval does.
 
   `revoke` removes the **whole record**, not just the approval, so the next
   connection is a fresh first contact: re-pinned, and unapproved until someone
@@ -556,10 +587,14 @@ Working now:
   [Security](SECURITY.md#the-upgrade-rule).
 
   Under `--json`, `list` emits one object per line
-  (`{"id","name","fingerprint","trusted_at","approved","permissions"}`,
+  (`{"id","name","fingerprint","trusted_at","approved","expires_at","expired","permissions"}`,
   `approved` an explicit bool, `permissions` an explicit array — empty included —
-  and the fingerprint in full); `approve` and `revoke` emit one
-  `trust_approved` / `trust_revoked` event; `permit` and `revoke-permission`
+  and the fingerprint in full). `approved` is the **effective** answer, so
+  `select(.approved | not)` catches a device whose window has closed instead of
+  skipping it; `expired` tells that device apart from a stranger nobody ever
+  approved, and `expires_at` is the absolute instant or `null`.
+
+  `approve` and `revoke` emit one `trust_approved` / `trust_revoked` event; `permit` and `revoke-permission`
   emit one `trust_permissions_changed` carrying `granted`, `requested`,
   `changed` (what actually moved) and the resulting `permissions`.
 - `rules list` / `rules add <DIRECTORY> [criteria]` / `rules remove <INDEX>` —

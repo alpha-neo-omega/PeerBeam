@@ -457,6 +457,15 @@ pub enum TrustAction {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
         device: String,
+        /// Approve for a limited time (`45s`, `30m`, `2h`, `7d`), after which
+        /// the device may nothing until it is approved again. Without this the
+        /// approval lasts until it is revoked; with it on an already-approved
+        /// device, the window is replaced.
+        ///
+        /// The field is `duration` because `for` is a Rust keyword; the flag a
+        /// person types is `--for`.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
     },
     /// Forget a device entirely: its pin, its approval and its permissions. The
     /// next connection from it is a fresh first contact.

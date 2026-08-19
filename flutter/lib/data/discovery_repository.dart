@@ -176,6 +176,9 @@ class DiscoveryRepository extends ChangeNotifier {
   static Device _withOnline(Device d, bool online) =>
       d.copyWith(online: online);
 
+  /// An explicit null clears the reading rather than keeping the last one —
+  /// the engine sends one when it holds a live link it cannot characterise,
+  /// and continuing to show the old number would present it as current.
   static Device _withLatency(Device d, int? latencyMs) =>
       d.copyWith(latencyMs: latencyMs);
 

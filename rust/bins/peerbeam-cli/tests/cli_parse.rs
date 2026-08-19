@@ -321,7 +321,10 @@ fn trust_subcommands_parse() {
     let cli = Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop"]).unwrap();
     match cli.command {
         Command::Trust(a) => match a.action {
-            TrustAction::Approve { device } => assert_eq!(device, "laptop"),
+            TrustAction::Approve { device, duration } => {
+                assert_eq!(device, "laptop");
+                assert_eq!(duration, None, "no `--for` means until revoked");
+            }
             _ => panic!("expected approve"),
         },
         _ => panic!("expected trust"),
@@ -346,6 +349,27 @@ fn trust_approve_and_revoke_require_a_device() {
     assert!(Cli::try_parse_from(["peerbeam", "trust", "revoke"]).is_err());
     // `list` takes none.
     assert!(Cli::try_parse_from(["peerbeam", "trust", "list", "extra"]).is_err());
+}
+
+/// `--for` carries the window through as typed; the duration is parsed by the
+/// command, not by clap, so that an unreadable one is a `peerbeam` usage error
+/// naming the four units rather than a clap message about a value.
+#[test]
+fn trust_approve_takes_an_optional_window() {
+    let cli =
+        Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop", "--for", "30m"]).unwrap();
+    match cli.command {
+        Command::Trust(a) => match a.action {
+            TrustAction::Approve { device, duration } => {
+                assert_eq!(device, "laptop");
+                assert_eq!(duration.as_deref(), Some("30m"));
+            }
+            _ => panic!("expected approve"),
+        },
+        _ => panic!("expected trust"),
+    }
+    // The flag needs a value: a bare `--for` must not silently mean "forever".
+    assert!(Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop", "--for"]).is_err());
 }
 
 /// `--yes` is what makes approval scriptable on a headless box; it is a global

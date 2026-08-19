@@ -130,6 +130,7 @@ mod tests {
             approved: true,
             permissions: PermissionSet::granted_on_approval()
                 .set(Permission::Notes, notes_permitted),
+            expires_at: None,
         })))
     }
 

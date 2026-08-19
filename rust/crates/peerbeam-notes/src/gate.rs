@@ -58,6 +58,7 @@ mod tests {
             trusted_at: chrono::Utc::now(),
             approved,
             permissions,
+            expires_at: None,
         }
     }
 

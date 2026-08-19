@@ -935,7 +935,13 @@ pub async fn dial(
         let kind = route.kind;
         match quic.dial_channels(&route, meta).await {
             Ok(qc) => {
-                let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+                // Kept as a concrete `Arc<QuicChannels>` alongside the erased
+                // transport so the link's round-trip time can still be read
+                // after the session is up. `Arc<dyn ChannelTransport>` cannot
+                // answer that question, and re-measuring by any other means
+                // would be a probe this connection does not need.
+                let qc = Arc::new(qc);
+                let transport: Arc<dyn ChannelTransport> = qc.clone();
                 match establish(
                     transport,
                     SessionRole::Initiator,
@@ -948,7 +954,20 @@ pub async fn dial(
                 )
                 .await
                 {
-                    Ok(session) => return Ok(session),
+                    Ok(session) => {
+                        // Read here rather than straight after the dial: by
+                        // now the QUIC handshake *and* the PeerSession auth
+                        // exchange have both completed, so quinn's estimator
+                        // is running on several real samples instead of the
+                        // one the transport handshake alone would give it.
+                        //
+                        // Keyed by the **discovery** id, not the authenticated
+                        // one: this is the row the user acted on, and for a
+                        // Tailscale-discovered peer the two genuinely differ
+                        // (`ts:<node>` against the device's own id).
+                        routes.record_link_rtt(&device.id, qc.rtt());
+                        return Ok(session);
+                    }
                     Err(e) => last = Some(e),
                 }
             }
@@ -977,11 +996,12 @@ pub async fn accept(
     chat: Option<ChatWiring>,
     presence: Option<PresenceWiring>,
 ) -> Result<Session, (Code, String)> {
+    let qc = Arc::new(qc);
     let route = presence
         .is_some()
         .then(|| routes.classify(&qc.remote().ip().to_string()));
-    let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
-    establish(
+    let transport: Arc<dyn ChannelTransport> = qc.clone();
+    let session = establish(
         transport,
         SessionRole::Responder,
         ident,
@@ -991,7 +1011,14 @@ pub async fn accept(
         presence,
         route,
     )
-    .await
+    .await?;
+    // Keyed by the authenticated peer id, because it is the only id an inbound
+    // connection carries — there is no discovery record behind it — and it is
+    // the id the LAN and mDNS rows are keyed by. A Tailscale-discovered row is
+    // keyed by `ts:<node>` instead and is simply not updated by this side,
+    // which is honest: nothing here can prove the two name one machine.
+    routes.record_link_rtt(&session.peer_device, qc.rtt());
+    Ok(session)
 }
 
 #[cfg(test)]

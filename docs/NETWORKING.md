@@ -57,6 +57,13 @@ LAN  →  USB tethering  →  Ethernet  →  Wi-Fi  →  Tailscale direct
   with interface info — an interface-aware classifier can be injected.
 - `RouteProvider` remains the domain port for pluggable candidate sources; the
   engine records per-device latency (`record_device_latency`) to inform ranking.
+- **Measured link quality.** `RouteManager::reporting_to(&engine)` points the
+  manager at the device list, and `record_link_rtt` puts a round trip on the
+  peer's row. The number is quinn's own smoothed RTT for the live connection —
+  read after the PeerSession handshake, so the estimator is running on real
+  samples rather than the 333 ms initial constant — which is why there is no
+  PeerBeam-level ping. See `docs/DEVICES.md` for why direct-vs-relay is *not*
+  reported alongside it.
 
 ## 3. Link layer — moving bytes
 

@@ -255,6 +255,7 @@ Messages and files queue for an offline peer and are delivered when it returns.
 peerbeam trust list                              # pinned vs approved, per device
 peerbeam trust approve laptop                    # shows the fingerprint, asks first
 peerbeam trust approve laptop --yes              # scriptable
+peerbeam trust approve guest --for 30m           # and it lapses on its own
 peerbeam trust revoke-permission laptop clipboard
 peerbeam trust permit laptop clipboard
 peerbeam trust revoke laptop                     # forget it entirely

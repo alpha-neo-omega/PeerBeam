@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use chrono::{DateTime, Utc};
 use peerbeam_domain::entity::{Permission, PermissionSet, TrustRecord};
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::id::DeviceId;
@@ -136,10 +137,10 @@ impl FsTrust {
         Ok(existed)
     }
 
-    /// Mark a pinned device as approved for auto-accept. Called only after
-    /// the user explicitly accepts an incoming transfer from it — a declined
-    /// transfer must never call this. A no-op (returning `Ok`) if the device
-    /// isn't pinned; a device is always pinned before it can be approved.
+    /// Mark a pinned device as approved for auto-accept, indefinitely. Called
+    /// only after the user explicitly accepts an incoming transfer from it — a
+    /// declined transfer must never call this. A no-op (returning `Ok`) if the
+    /// device isn't pinned; a device is always pinned before it can be approved.
     ///
     /// Approving also writes the device's **initial permission set**
     /// ([`PermissionSet::granted_on_approval`]): the five that existed when
@@ -153,10 +154,30 @@ impl FsTrust {
     ///
     /// [`set_permission`]: FsTrust::set_permission
     pub fn approve(&self, device: &DeviceId) -> Result<()> {
-        self.approve_gated(device, true)
+        self.approve_for(device, None)
     }
 
-    /// [`approve`](Self::approve), refusing unless PIN pairing has been
+    /// [`approve`](Self::approve) with a deadline: *"trust this device for 30
+    /// minutes"*.
+    ///
+    /// `expires_at` is an **absolute instant**, not a duration, and it is the
+    /// caller's `now + window`. Storing the instant is what lets the window be
+    /// enforced by a read rather than by a countdown somebody has to keep
+    /// running: a store reopened tomorrow reaches the same verdict as this
+    /// process would, and a machine that was asleep through the whole window
+    /// wakes up with it closed.
+    ///
+    /// `None` means indefinite, and it **clears** any window already on the
+    /// record — that is what a plain `peerbeam trust approve` asks for. The
+    /// deadline is always written, even for a device that is already approved,
+    /// because sliding or lifting the window is the whole point of asking
+    /// again; the *permissions* still are not, so re-approving cannot undo a
+    /// revoke.
+    pub fn approve_for(&self, device: &DeviceId, expires_at: Option<DateTime<Utc>>) -> Result<()> {
+        self.approve_gated(device, true, expires_at)
+    }
+
+    /// [`approve_for`](Self::approve_for), refusing unless PIN pairing has been
     /// satisfied for this device.
     ///
     /// `pin_satisfied` is the caller's answer to "may this device be approved?"
@@ -169,7 +190,12 @@ impl FsTrust {
     /// **Refuses rather than silently doing nothing.** An approval that quietly
     /// fails leaves a surface showing a device as trusted when it is not, which
     /// is a worse outcome than an error the user can read.
-    pub fn approve_gated(&self, device: &DeviceId, pin_satisfied: bool) -> Result<()> {
+    pub fn approve_gated(
+        &self,
+        device: &DeviceId,
+        pin_satisfied: bool,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
         if !pin_satisfied {
             return Err(DomainError::Encryption(format!(
                 "device {} cannot be approved: PIN pairing is required and has \
@@ -179,9 +205,21 @@ impl FsTrust {
         }
         let mut cache = self.cache.lock().unwrap();
         if let Some(record) = cache.get_mut(&device.0) {
+            let mut changed = false;
+            // Keyed on the stored bit, not on whether the grant is *live*: an
+            // expired device is still one the user approved once, so renewing it
+            // must restore the permissions they actually left it rather than
+            // resurrecting the frozen five they had narrowed.
             if !record.approved {
                 record.approved = true;
                 record.permissions = PermissionSet::granted_on_approval();
+                changed = true;
+            }
+            if record.expires_at != expires_at {
+                record.expires_at = expires_at;
+                changed = true;
+            }
+            if changed {
                 self.persist(&mut cache, &[])?;
             }
         }
@@ -238,13 +276,20 @@ impl TrustStore for FsTrust {
         self.persist(&mut cache, &[])
     }
 
+    /// The record as stored — **expired or not**. The pin is a memory of a key
+    /// and must survive the grant that was built on it: `peerbeam_transfer::auth`
+    /// compares a presented fingerprint against this, so hiding an expired
+    /// record here would let a device whose window closed re-pin any key it
+    /// liked on its next handshake.
     fn lookup(&self, device: &DeviceId) -> Result<Option<TrustRecord>> {
         Ok(self.cache.lock().unwrap().get(&device.0).cloned())
     }
 
-    fn is_trusted(&self, device: &DeviceId) -> bool {
-        self.cache.lock().unwrap().contains_key(&device.0)
-    }
+    // `is_trusted` is deliberately **not** overridden. It used to be a
+    // `contains_key`, which is now the wrong answer: a record whose window has
+    // closed is present and not trusted. Inheriting `TrustStore`'s default
+    // keeps the expiry rule in exactly one place instead of giving this store
+    // its own copy to fall out of step with.
 }
 
 #[cfg(test)]
@@ -260,6 +305,7 @@ mod tests {
             trusted_at: Utc::now(),
             approved: false,
             permissions: PermissionSet::none(),
+            expires_at: None,
         }
     }
 
@@ -442,7 +488,7 @@ mod tests {
         trust.record(record("pb-new", "fp")).unwrap();
 
         let err = trust
-            .approve_gated(&device, false)
+            .approve_gated(&device, false, None)
             .expect_err("an unsatisfied PIN must refuse approval");
         assert!(
             format!("{err}").contains("PIN pairing"),
@@ -465,7 +511,7 @@ mod tests {
         let device = DeviceId::from("pb-new");
         trust.record(record("pb-new", "fp")).unwrap();
 
-        trust.approve_gated(&device, true).unwrap();
+        trust.approve_gated(&device, true, None).unwrap();
         assert!(trust.lookup(&device).unwrap().unwrap().approved);
         assert!(trust.may(&device, Permission::Files));
     }
@@ -809,5 +855,206 @@ mod tests {
         let store = FsTrust::open(&path).unwrap();
         assert!(!store.may(&id, Permission::Presence));
         assert!(store.may(&id, Permission::Clipboard));
+    }
+
+    // ── time-limited trust ──────────────────────────────────────────────────
+
+    /// Approve `device` with a window that closed an hour ago.
+    ///
+    /// Written as a **past** instant rather than a short future one that the
+    /// test then waits out: a sleep makes the assertion a statement about the
+    /// scheduler, and the whole point of enforcing expiry on read is that no
+    /// time has to pass for it to take effect.
+    fn approve_expired(store: &FsTrust, device: &DeviceId) {
+        store
+            .approve_for(device, Some(Utc::now() - chrono::Duration::hours(1)))
+            .unwrap();
+    }
+
+    /// **Read time, not sweep time.** Nothing runs between approving and asking
+    /// — no reaper, no reopen, no reconnect — and the store already refuses.
+    #[test]
+    fn a_closed_window_is_refused_by_the_very_next_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-timed");
+        store.record(record("dev-timed", "fp")).unwrap();
+
+        store
+            .approve_for(&id, Some(Utc::now() + chrono::Duration::hours(1)))
+            .unwrap();
+        assert!(store.is_trusted(&id), "the window is open");
+        assert!(store.is_approved(&id));
+        assert!(store.may(&id, Permission::Files));
+
+        approve_expired(&store, &id);
+        assert!(!store.is_trusted(&id), "the window closed");
+        assert!(!store.is_approved(&id));
+        for p in Permission::ALL {
+            assert!(!store.may(&id, p), "an expired device may not {p}");
+        }
+    }
+
+    /// The verdict is a property of the file, not of the process that wrote it:
+    /// a store reopened after the window closed reaches the same answer with
+    /// nothing having run in between.
+    #[test]
+    fn a_closed_window_survives_a_reopen_without_any_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let id = DeviceId::from("dev-timed");
+        {
+            let store = FsTrust::open(&path).unwrap();
+            store.record(record("dev-timed", "fp")).unwrap();
+            approve_expired(&store, &id);
+        }
+        let reopened = FsTrust::open(&path).unwrap();
+        assert!(!reopened.is_approved(&id));
+        assert!(!reopened.may(&id, Permission::Files));
+    }
+
+    /// **The pin outlives the grant.** An expired record must still be found by
+    /// `lookup`, because that is what `peerbeam_transfer::auth` compares a
+    /// presented fingerprint against. Dropping it would make the next handshake
+    /// a fresh first contact and pin whatever key answered.
+    #[test]
+    fn an_expired_record_still_holds_its_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-timed");
+        store.record(record("dev-timed", "fp-original")).unwrap();
+        approve_expired(&store, &id);
+
+        let stored = store
+            .lookup(&id)
+            .unwrap()
+            .expect("the record is still there");
+        assert_eq!(stored.fingerprint, "fp-original");
+        assert!(stored.approved, "and it remembers that it was approved");
+        assert!(store.list().iter().any(|r| r.device == id), "and it lists");
+    }
+
+    /// Re-approving an expired device renews it — and gives back the
+    /// permissions the user actually left it, not the frozen five it started
+    /// with. Resetting the set here would silently undo a revoke every time a
+    /// window lapsed.
+    #[test]
+    fn renewing_an_expired_device_keeps_its_narrowed_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-timed");
+        store.record(record("dev-timed", "fp")).unwrap();
+        store.approve(&id).unwrap();
+        assert!(store
+            .set_permission(&id, Permission::Clipboard, false)
+            .unwrap());
+
+        approve_expired(&store, &id);
+        assert!(!store.may(&id, Permission::Files), "the window closed");
+
+        store.approve(&id).unwrap(); // plain `approve`: indefinite again
+        assert!(store.may(&id, Permission::Files), "renewed");
+        assert!(
+            !store.may(&id, Permission::Clipboard),
+            "and the revoke the user made still stands"
+        );
+        assert_eq!(store.lookup(&id).unwrap().unwrap().expires_at, None);
+    }
+
+    /// A plain `approve` on a device that currently has a window **lifts** it —
+    /// that is what "approve, no `--for`" asks for — and a fresh `--for` slides
+    /// it. Both must be written even though the device is already approved.
+    #[test]
+    fn approving_again_rewrites_the_window_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-timed");
+        store.record(record("dev-timed", "fp")).unwrap();
+
+        let soon = Utc::now() + chrono::Duration::minutes(30);
+        store.approve_for(&id, Some(soon)).unwrap();
+        assert_eq!(store.lookup(&id).unwrap().unwrap().expires_at, Some(soon));
+
+        let later = Utc::now() + chrono::Duration::hours(8);
+        store.approve_for(&id, Some(later)).unwrap();
+        assert_eq!(store.lookup(&id).unwrap().unwrap().expires_at, Some(later));
+
+        store.approve(&id).unwrap();
+        assert_eq!(
+            store.lookup(&id).unwrap().unwrap().expires_at,
+            None,
+            "a plain approve means indefinitely"
+        );
+    }
+
+    /// A window is only written by approval, never by a pin: the handshake
+    /// records a stranger with nothing for a clock to end.
+    #[test]
+    fn a_pin_carries_no_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        assert_eq!(store.lookup(&id).unwrap().unwrap().expires_at, None);
+        assert!(store.is_trusted(&id), "a pin with no window is a live pin");
+    }
+
+    /// **A `trust.json` exactly as the build before this one wrote it**: an
+    /// approved device with `permissions` and no `expires_at`. It must load,
+    /// and it must stay trusted — reading the absent deadline as "expired"
+    /// would revoke every device on the machine the moment the user upgraded.
+    #[test]
+    fn a_record_written_before_expiry_existed_is_trusted_indefinitely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(
+            &path,
+            r#"[
+  {
+    "device": "pb-laptop00001",
+    "fingerprint": "3f9a1b2c4d5e6f70",
+    "name": "laptop",
+    "trusted_at": "2026-08-17T10:30:00Z",
+    "approved": true,
+    "permissions": ["files", "chat", "clipboard", "presence", "pipe"]
+  }
+]"#,
+        );
+        let id = DeviceId::from("pb-laptop00001");
+        assert_eq!(store.lookup(&id).unwrap().unwrap().expires_at, None);
+        assert!(store.is_trusted(&id));
+        assert!(store.is_approved(&id));
+        for p in PermissionSet::granted_on_approval().granted() {
+            assert!(store.may(&id, p), "{p} must survive the upgrade");
+        }
+    }
+
+    /// A store with nothing time-limited is written exactly as it was before
+    /// this field existed, so upgrading does not churn a file whose devices
+    /// nobody put a clock on — and an older build reads it back unchanged.
+    #[test]
+    fn an_indefinite_record_writes_no_expiry_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        store.approve(&id).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("expires_at"),
+            "an indefinitely-trusted store grew a key it does not need"
+        );
+
+        store
+            .approve_for(&id, Some(Utc::now() + chrono::Duration::minutes(30)))
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("expires_at"),
+            "but a window must be on disk, or a restart would forget it"
+        );
     }
 }

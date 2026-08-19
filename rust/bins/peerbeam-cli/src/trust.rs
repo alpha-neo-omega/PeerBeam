@@ -24,6 +24,14 @@
 //! revoke here stops that device's next message, clip, heartbeat or accept —
 //! not its next connection.
 //!
+//! An approval can also be **time-limited**: `approve --for 30m` writes a
+//! deadline, and once it passes the device is back to being merely pinned — it
+//! may nothing, and `list` says `expired`. Because every gate re-reads the
+//! store, that happens on time with nothing running: there is no sweeper, and a
+//! sweeper that had not run yet would be a device still trusted after its
+//! window closed. The pin survives, so its key is still remembered and a key
+//! change is still caught; `revoke` is what forgets a device.
+//!
 //! # Why this is a CLI command
 //!
 //! Until now `FsTrust::approve` was reachable only from the app's
@@ -41,14 +49,14 @@
 //! `<device>`, `3` for one that matches nothing, `6` for a declined
 //! confirmation.
 
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
 
 use peerbeam_domain::entity::{Permission, PermissionSet, TrustRecord};
 use peerbeam_domain::port::TrustStore;
 
 use crate::cli::TrustAction;
-use crate::commands::{load_config, open_trust, resolve_peer};
+use crate::commands::{humantime, load_config, open_trust, parse_duration, resolve_peer};
 use crate::exit::{CliError, CliResult};
 use crate::output::Ctx;
 use crate::prompt;
@@ -66,7 +74,9 @@ const FP_PREVIEW: usize = 16;
 pub fn trust(ctx: &Ctx, action: TrustAction, path_override: Option<&str>) -> CliResult {
     match action {
         TrustAction::List => list(ctx, path_override),
-        TrustAction::Approve { device } => approve(ctx, &device, path_override),
+        TrustAction::Approve { device, duration } => {
+            approve(ctx, &device, duration.as_deref(), path_override)
+        }
         TrustAction::Revoke { device } => revoke(ctx, &device, path_override),
         TrustAction::Permit {
             device,
@@ -85,10 +95,15 @@ pub fn trust(ctx: &Ctx, action: TrustAction, path_override: Option<&str>) -> Cli
 fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
     let records = open_trust(&config)?.list();
+    // **One clock read for the whole listing.** Asking `Utc::now()` per row
+    // would let a window close between two rows and report two devices as of
+    // two different presents — a table that contradicts itself, on the one
+    // command whose job is to say what is true right now.
+    let now = Utc::now();
 
     if ctx.json {
         for r in &records {
-            ctx.json_line(&row_json(r));
+            ctx.json_line(&row_json(r, now));
         }
         return Ok(());
     }
@@ -105,7 +120,7 @@ fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     // that makes a long list scannable for a cue that `--no-color`, a pipe, a
     // dumb terminal and a screen reader all discard anyway. "approved" versus
     // "pinned" is legible without either.
-    let rows: Vec<Vec<String>> = records.iter().map(row_cells).collect();
+    let rows: Vec<Vec<String>> = records.iter().map(|r| row_cells(r, now)).collect();
     ctx.table(
         &[
             "STATUS",
@@ -113,6 +128,7 @@ fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
             "NAME",
             "FINGERPRINT",
             "PINNED",
+            "EXPIRES",
             "PERMISSIONS",
         ],
         &rows,
@@ -127,6 +143,19 @@ fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
             "`pinned` means only that this device's key was recorded when it first \
              connected.\nA device receives this machine's presence status, clipboard \
              or a pipe only once\napproved: `peerbeam trust approve <device>`.",
+        ));
+    }
+    // Same rule again: only when a window has actually run out. It explains the
+    // half of `expired` that is easy to get wrong — the device is *not* gone,
+    // its key is still pinned, so this is not a device to re-verify from
+    // scratch, it is one to approve again.
+    if records.iter().any(|r| r.approved && r.has_expired(now)) {
+        ctx.line("");
+        ctx.line(&ctx.dim(
+            "`expired` means a time-limited approval ran out; the device may nothing \
+             until it is\napproved again with `peerbeam trust approve <device>`. Its key \
+             is still pinned, so\na key change is still caught — `trust revoke` is what \
+             forgets a device.",
         ));
     }
     // Said only when a device has actually been narrowed, so it reads as a fact
@@ -158,17 +187,28 @@ fn list(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
 /// have, and an array it can `contains` is that question. It is emitted even
 /// when empty, so an absent key never has to be interpreted.
 ///
+/// `approved` is the **effective** answer, as of `now`: a device whose window
+/// has closed reports `false`, with `expired: true` and `expires_at` saying why.
+/// The alternative — reporting the stored bit — would leave the documented
+/// one-liner `jq 'select(.approved | not)'` quietly ignoring exactly the devices
+/// this feature exists to catch, and would disagree with `permissions` on the
+/// same row, which has always been the effective set.
+///
 /// Field names match the FFI's `pb_trust_list` (`id`/`name`/`fingerprint`/
-/// `trusted_at`) so tooling can read either surface uniformly.
-fn row_json(r: &TrustRecord) -> serde_json::Value {
+/// `trusted_at`/`expires_at`) so tooling can read either surface uniformly.
+fn row_json(r: &TrustRecord, now: DateTime<Utc>) -> serde_json::Value {
     json!({
         "id": r.device.0,
         "name": r.name,
         "fingerprint": r.fingerprint,
         "trusted_at": r.trusted_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-        "approved": r.approved,
+        "approved": r.is_approved_at(now),
+        "expires_at": r
+            .expires_at
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        "expired": r.approved && r.has_expired(now),
         "permissions": r
-            .effective_permissions()
+            .effective_permissions_at(now)
             .granted()
             .into_iter()
             .map(|p| p.as_str())
@@ -178,14 +218,15 @@ fn row_json(r: &TrustRecord) -> serde_json::Value {
 
 /// One human table row: status first, because it is the column the command
 /// exists to show.
-fn row_cells(r: &TrustRecord) -> Vec<String> {
+fn row_cells(r: &TrustRecord, now: DateTime<Utc>) -> Vec<String> {
     vec![
-        status_word(r).to_string(),
+        status_word(r, now).to_string(),
         r.device.0.clone(),
         r.name.clone(),
         short_fingerprint(&r.fingerprint),
         r.trusted_at.format("%Y-%m-%d %H:%M").to_string(),
-        permission_cell(r),
+        expiry_cell(r, now),
+        permission_cell(r, now),
     ]
 }
 
@@ -198,8 +239,8 @@ fn row_cells(r: &TrustRecord) -> Vec<String> {
 /// **last** column so its variable width disturbs nothing to its left, and
 /// `none` is a word rather than a dash because a dash reads as "unknown" and
 /// this is a fact.
-fn permission_cell(r: &TrustRecord) -> String {
-    let granted = r.effective_permissions().granted();
+fn permission_cell(r: &TrustRecord, now: DateTime<Utc>) -> String {
+    let granted = r.effective_permissions_at(now).granted();
     if granted.is_empty() {
         return "none".to_string();
     }
@@ -210,12 +251,45 @@ fn permission_cell(r: &TrustRecord) -> String {
         .join(",")
 }
 
-/// The two states, named.
-fn status_word(r: &TrustRecord) -> &'static str {
-    if r.approved {
+/// The three states, named.
+///
+/// `expired` is its own word rather than a flavour of `pinned`, because the two
+/// need different things said about them and have different fixes: a stranger
+/// nobody chose is a device to look at, while a device whose half-hour ran out
+/// is one somebody already vouched for and can simply approve again.
+fn status_word(r: &TrustRecord, now: DateTime<Utc>) -> &'static str {
+    if r.is_approved_at(now) {
         "approved"
+    } else if r.approved {
+        "expired"
     } else {
         "pinned"
+    }
+}
+
+/// The `EXPIRES` cell: `never`, `in 29m`, or `12m ago`.
+///
+/// **Relative, not a timestamp.** The question a person runs this to answer is
+/// "how long have I got"; `2026-08-19 11:00` makes them do the subtraction, and
+/// do it in whatever timezone they guess the column is in. The absolute instant
+/// is in `--json`, where a script wants it and a clock is not being read aloud.
+///
+/// Rendered for every row, including the ones with no deadline: a column that
+/// appeared only when some device happened to be time-limited would change the
+/// table's shape depending on its contents, and `never` is a fact worth stating
+/// on a screen about how long trust lasts.
+fn expiry_cell(r: &TrustRecord, now: DateTime<Utc>) -> String {
+    let Some(deadline) = r.expires_at else {
+        return "never".to_string();
+    };
+    let delta = deadline - now;
+    let span = humantime(std::time::Duration::from_secs(
+        delta.num_seconds().unsigned_abs(),
+    ));
+    if r.has_expired(now) {
+        format!("{span} ago")
+    } else {
+        format!("in {span}")
     }
 }
 
@@ -277,33 +351,66 @@ pub fn approval_gate(assume_yes: bool, json: bool, answer: Option<bool>) -> Appr
 /// honours `--quiet`. Putting it here means there is no combination of flags
 /// under which someone is asked to approve a key they were not shown.
 ///
-/// It also says what approval *does*. "Trust this device?" invites yes; naming
-/// the clipboard invites a look at the hex.
-pub fn approval_question(record: &TrustRecord) -> String {
+/// It also says what approval *does*, and for **how long**. "Trust this
+/// device?" invites yes; naming the clipboard invites a look at the hex, and
+/// naming the deadline — or its absence — is the difference between the two
+/// grants this command can write.
+pub fn approval_question(record: &TrustRecord, expires_at: Option<DateTime<Utc>>) -> String {
+    let window = match expires_at {
+        None => "until revoked".to_string(),
+        Some(at) => format!(
+            "until {}, after which it may nothing again",
+            at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
+    };
     format!(
-        "  fingerprint  {}\n  pinned       {}\nApproving lets this device receive this \
-         machine's presence status, clipboard and pipes,\nand exchange files and messages \
-         with it — every permission. Narrow it afterwards\nwith `trust \
+        "  fingerprint  {}\n  pinned       {}\n  for          {}\nApproving lets this device \
+         receive this machine's presence status, clipboard and pipes,\nand exchange files and \
+         messages with it — every permission. Narrow it afterwards\nwith `trust \
          revoke-permission`.\nApprove {} ({})?",
         record.fingerprint,
         record.trusted_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        window,
         record.name,
         record.device.0,
     )
 }
 
-/// `peerbeam trust approve <device>` — grant a pinned device standing.
-fn approve(ctx: &Ctx, query: &str, path_override: Option<&str>) -> CliResult {
+/// `peerbeam trust approve <device> [--for DURATION]` — grant a pinned device
+/// standing, for a while or until it is revoked.
+fn approve(ctx: &Ctx, query: &str, window: Option<&str>, path_override: Option<&str>) -> CliResult {
+    // Parsed before the store is opened or a device resolved, so `--for 30mn`
+    // fails as a usage error immediately rather than after a prompt has been
+    // answered — the same rule `permit` follows for permission names.
+    let window = window.map(parse_duration).transpose()?;
     let config = load_config(path_override)?;
     let store = open_trust(&config)?;
     let records = store.list();
     let record = pick(ctx, &records, query)?;
 
-    // Already approved: say so and succeed. Re-running a provisioning script
-    // must not fail, and an error here would say something untrue — the state
-    // the operator asked for is the state on disk.
-    if record.approved {
-        return report(ctx, record, "already approved", false);
+    let now = Utc::now();
+    // An **absolute deadline**, computed once here. Storing "30 minutes from
+    // whenever you read this" would restart the window on every read; storing
+    // the instant means a machine asleep through the whole window wakes with it
+    // shut.
+    let expires_at =
+        match window {
+            None => None,
+            Some(w) => Some(now.checked_add_signed(w).ok_or_else(|| {
+                CliError::Usage("that window ends past the end of time".to_string())
+            })?),
+        };
+
+    // Already exactly what was asked for: say so and succeed. Re-running a
+    // provisioning script must not fail, and an error here would say something
+    // untrue — the state the operator asked for is the state on disk.
+    //
+    // The window is part of "what was asked for", so this is deliberately
+    // narrower than `record.approved`: a device that is approved-but-expired, or
+    // approved-until-11:00 when the operator just asked for indefinitely, is not
+    // in the state they requested and must fall through and be written.
+    if record.is_approved_at(now) && record.expires_at.is_none() && expires_at.is_none() {
+        return report(ctx, record, "already approved", false, now);
     }
 
     // With PIN pairing required, approving from here would be a lie. A PIN
@@ -312,7 +419,12 @@ fn approve(ctx: &Ctx, query: &str, path_override: Option<&str>) -> CliResult {
     // on disk. Approving anyway would satisfy the setting's letter while
     // proving nothing, which is worse than refusing: the operator would believe
     // a check had happened.
-    if config.encryption.require_pin_pairing && !record.approved {
+    //
+    // Asked of the *live* standing, not the stored bit: renewing a device whose
+    // window has closed is granting standing again, and must go through the same
+    // proof the first grant did. Narrowing a window on a device that still holds
+    // standing is not, so it stays allowed.
+    if config.encryption.require_pin_pairing && !record.is_approved_at(now) {
         return Err(CliError::Usage(format!(
             "{} requires PIN pairing, which needs a live connection — run \
              `peerbeam pair {}` instead",
@@ -325,16 +437,29 @@ fn approve(ctx: &Ctx, query: &str, path_override: Option<&str>) -> CliResult {
         )));
     }
 
-    let answer = if ctx.interactive {
-        Some(prompt::confirm(ctx, &approval_question(record), false))
-    } else {
-        None
-    };
-    if approval_gate(ctx.assume_yes, ctx.json, answer) == ApprovalGate::Abort {
-        return Err(CliError::Cancelled);
+    // Confirmation is for **granting** standing, which is the direction that
+    // cannot be taken back once a clipboard has crossed. A device that already
+    // holds it is only having its window rewritten — usually shortened — and
+    // that is no more dangerous than `revoke-permission`, which asks nothing
+    // either. Prompting there would also make `trust approve x --for 30m` in a
+    // cron job need `--yes` to shorten a window it is trying to shorten.
+    let granting = !record.is_approved_at(now);
+    if granting {
+        let answer = if ctx.interactive {
+            Some(prompt::confirm(
+                ctx,
+                &approval_question(record, expires_at),
+                false,
+            ))
+        } else {
+            None
+        };
+        if approval_gate(ctx.assume_yes, ctx.json, answer) == ApprovalGate::Abort {
+            return Err(CliError::Cancelled);
+        }
     }
 
-    store.approve(&record.device)?;
+    store.approve_for(&record.device, expires_at)?;
     // Report the store, not the request. `FsTrust::approve` is documented as a
     // silent no-op for a device it does not hold — which is exactly what a
     // concurrent `trust revoke` in another process leaves behind — so without
@@ -349,21 +474,32 @@ fn approve(ctx: &Ctx, query: &str, path_override: Option<&str>) -> CliResult {
                 record.device.0
             ))
         })?;
-    if !stored.approved {
+    if !stored.is_approved_at(now) {
         return Err(CliError::Other(format!(
             "{} is still not approved after approving it",
             stored.device.0
         )));
     }
-    report(ctx, &stored, "approved", true)
+    report(ctx, &stored, "approved", true, now)
 }
 
 /// The receipt for an `approve`. Carries the fingerprint in every mode — a
 /// scripted run never sees the prompt, so this is where its record of *what*
-/// was approved comes from.
-fn report(ctx: &Ctx, record: &TrustRecord, verb: &str, changed: bool) -> CliResult {
+/// was approved comes from — and the deadline whenever there is one, because
+/// *for how long* is the other half of what was just granted.
+///
+/// The window is named only when the grant has one, following the same rule as
+/// this command's footnotes: a store where nothing is time-limited should not
+/// have to read the word.
+fn report(
+    ctx: &Ctx,
+    record: &TrustRecord,
+    verb: &str,
+    changed: bool,
+    now: DateTime<Utc>,
+) -> CliResult {
     if ctx.json {
-        let mut value = row_json(record);
+        let mut value = row_json(record, now);
         if let Some(obj) = value.as_object_mut() {
             obj.insert("event".into(), json!("trust_approved"));
             obj.insert("changed".into(), json!(changed));
@@ -371,8 +507,16 @@ fn report(ctx: &Ctx, record: &TrustRecord, verb: &str, changed: bool) -> CliResu
         ctx.json_line(&value);
         return Ok(());
     }
+    let window = match record.expires_at {
+        None => String::new(),
+        Some(at) => format!(
+            " {} — until {}",
+            expiry_cell(record, now),
+            at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
+    };
     ctx.line(&format!(
-        "{} {} ({}) — fingerprint {}",
+        "{} {} ({}){window} — fingerprint {}",
         ctx.green(verb),
         record.name,
         record.device.0,
@@ -459,16 +603,30 @@ fn set_permissions(
     let store = open_trust(&config)?;
     let records = store.list();
     let record = pick(ctx, &records, query)?;
+    let now = Utc::now();
     // Permissions narrow a standing; without one there is nothing to narrow, and
     // `TrustStore::may` would answer `false` for every bit written here. Saying
     // so is better than a receipt for a change with no effect — and it stops a
     // "staged" grant that the next `approve` would silently overwrite anyway.
-    if !record.approved {
-        return Err(CliError::Usage(format!(
-            "{} is pinned but not approved, so it may nothing to begin with — \
-             `peerbeam trust approve {}` first",
-            record.device.0, record.device.0
-        )));
+    //
+    // A closed window is the same situation reached from the other direction, so
+    // it is refused too — but named separately, because the two have different
+    // stories and the same fix would otherwise read as a non-sequitur against a
+    // device the operator knows perfectly well they approved.
+    if !record.is_approved_at(now) {
+        return Err(CliError::Usage(if record.approved {
+            format!(
+                "{}'s approval expired, so it may nothing to begin with — \
+                 `peerbeam trust approve {}` first",
+                record.device.0, record.device.0
+            )
+        } else {
+            format!(
+                "{} is pinned but not approved, so it may nothing to begin with — \
+                 `peerbeam trust approve {}` first",
+                record.device.0, record.device.0
+            )
+        }));
     }
     let device = record.device.clone();
 
@@ -502,7 +660,7 @@ fn set_permissions(
         }
     }
 
-    report_permissions(ctx, &stored, &permissions, granted, &changed)
+    report_permissions(ctx, &stored, &permissions, granted, &changed, now)
 }
 
 /// Parse every name up front, rejecting the whole invocation on the first bad
@@ -531,10 +689,11 @@ fn report_permissions(
     asked: &[Permission],
     granted: bool,
     changed: &[Permission],
+    now: DateTime<Utc>,
 ) -> CliResult {
     let verb = if granted { "permitted" } else { "revoked" };
     if ctx.json {
-        let mut value = row_json(record);
+        let mut value = row_json(record, now);
         if let Some(obj) = value.as_object_mut() {
             obj.insert("event".into(), json!("trust_permissions_changed"));
             obj.insert("granted".into(), json!(granted));
@@ -564,7 +723,7 @@ fn report_permissions(
         "{painted} {list} for {} ({}) — it may now: {}",
         record.name,
         record.device.0,
-        permission_cell(record)
+        permission_cell(record, now)
     ));
     Ok(())
 }
@@ -597,8 +756,16 @@ fn pick<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone};
     use peerbeam_domain::id::DeviceId;
+
+    /// A fixed instant to read the records at, so every assertion here is about
+    /// the predicate rather than about when the test happened to run.
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+            .single()
+            .unwrap_or_else(Utc::now)
+    }
 
     fn record(id: &str, name: &str, approved: bool) -> TrustRecord {
         permissive(id, name, approved, PermissionSet::granted_on_approval())
@@ -615,13 +782,37 @@ mod tests {
                 .unwrap_or_else(Utc::now),
             approved,
             permissions,
+            expires_at: None,
         }
     }
 
+    /// An approved device whose window closes `after` [`now`] — negative for one
+    /// that has already run out.
+    fn expiring(id: &str, name: &str, after: Duration) -> TrustRecord {
+        let mut r = record(id, name, true);
+        r.expires_at = Some(now() + after);
+        r
+    }
+
     #[test]
-    fn the_status_word_names_the_two_states() {
-        assert_eq!(status_word(&record("pb-a", "Laptop", true)), "approved");
-        assert_eq!(status_word(&record("pb-b", "Stranger", false)), "pinned");
+    fn the_status_word_names_the_three_states() {
+        assert_eq!(
+            status_word(&record("pb-a", "Laptop", true), now()),
+            "approved"
+        );
+        assert_eq!(
+            status_word(&record("pb-b", "Stranger", false), now()),
+            "pinned"
+        );
+        assert_eq!(
+            status_word(&expiring("pb-c", "Loaner", Duration::minutes(30)), now()),
+            "approved",
+            "a window still open is just approved"
+        );
+        assert_eq!(
+            status_word(&expiring("pb-c", "Loaner", Duration::minutes(-1)), now()),
+            "expired"
+        );
     }
 
     /// The `--json` row must carry `approved` as a **bool**, not as the mere
@@ -629,11 +820,11 @@ mod tests {
     /// be asking the question this whole change exists to stop asking.
     #[test]
     fn json_rows_carry_approved_as_an_explicit_bool() {
-        let approved = row_json(&record("pb-a", "Laptop", true));
+        let approved = row_json(&record("pb-a", "Laptop", true), now());
         assert_eq!(approved["approved"], json!(true));
         assert_eq!(approved["id"], json!("pb-a"));
 
-        let pinned = row_json(&record("pb-b", "Stranger", false));
+        let pinned = row_json(&record("pb-b", "Stranger", false), now());
         assert_eq!(pinned["approved"], json!(false));
         assert!(
             pinned["approved"].is_boolean(),
@@ -646,7 +837,7 @@ mod tests {
     #[test]
     fn json_carries_the_whole_fingerprint_even_though_the_table_abbreviates() {
         let r = record("pb-a", "Laptop", true);
-        assert_eq!(row_json(&r)["fingerprint"], json!(r.fingerprint));
+        assert_eq!(row_json(&r, now())["fingerprint"], json!(r.fingerprint));
         assert_eq!(r.fingerprint.len(), 64);
 
         let short = short_fingerprint(&r.fingerprint);
@@ -668,7 +859,7 @@ mod tests {
     #[test]
     fn the_question_shows_the_full_fingerprint_and_what_approval_grants() {
         let r = record("pb-a", "Laptop", false);
-        let q = approval_question(&r);
+        let q = approval_question(&r, None);
         assert!(
             q.contains(&r.fingerprint),
             "the fingerprint must be in it: {q}"
@@ -717,30 +908,31 @@ mod tests {
     /// than infer it from the row existing.
     #[test]
     fn json_rows_carry_permissions_as_an_explicit_array() {
-        let full = row_json(&record("pb-a", "Laptop", true));
+        let full = row_json(&record("pb-a", "Laptop", true), now());
         assert_eq!(
             full["permissions"],
             json!(["files", "chat", "clipboard", "presence", "pipe"]),
             "in slot order, by name"
         );
 
-        let narrowed = row_json(&permissive(
-            "pb-a",
-            "Laptop",
-            true,
-            PermissionSet::granted_on_approval().set(Permission::Clipboard, false),
-        ));
+        let narrowed = row_json(
+            &permissive(
+                "pb-a",
+                "Laptop",
+                true,
+                PermissionSet::granted_on_approval().set(Permission::Clipboard, false),
+            ),
+            now(),
+        );
         assert_eq!(
             narrowed["permissions"],
             json!(["files", "chat", "presence", "pipe"])
         );
 
-        let stranger = row_json(&permissive(
-            "pb-b",
-            "Stranger",
-            false,
-            PermissionSet::none(),
-        ));
+        let stranger = row_json(
+            &permissive("pb-b", "Stranger", false, PermissionSet::none()),
+            now(),
+        );
         assert_eq!(stranger["permissions"], json!([]));
         assert!(
             stranger["permissions"].is_array(),
@@ -753,25 +945,26 @@ mod tests {
     #[test]
     fn the_permission_cell_names_the_grants_or_says_none() {
         assert_eq!(
-            permission_cell(&record("pb-a", "Laptop", true)),
+            permission_cell(&record("pb-a", "Laptop", true), now()),
             "files,chat,clipboard,presence,pipe"
         );
         assert_eq!(
-            permission_cell(&permissive(
-                "pb-a",
-                "Laptop",
-                true,
-                PermissionSet::granted_on_approval().set(Permission::Pipe, false)
-            )),
+            permission_cell(
+                &permissive(
+                    "pb-a",
+                    "Laptop",
+                    true,
+                    PermissionSet::granted_on_approval().set(Permission::Pipe, false)
+                ),
+                now()
+            ),
             "files,chat,clipboard,presence"
         );
         assert_eq!(
-            permission_cell(&permissive(
-                "pb-b",
-                "Stranger",
-                false,
-                PermissionSet::none()
-            )),
+            permission_cell(
+                &permissive("pb-b", "Stranger", false, PermissionSet::none()),
+                now()
+            ),
             "none"
         );
     }
@@ -808,11 +1001,146 @@ mod tests {
     /// that is now a list rather than a single implied bundle.
     #[test]
     fn the_question_says_approval_grants_every_permission() {
-        let q = approval_question(&record("pb-a", "Laptop", false));
+        let q = approval_question(&record("pb-a", "Laptop", false), None);
         assert!(
             q.contains("every permission"),
             "the question must say how much it grants: {q}"
         );
         assert!(q.contains("revoke-permission"), "and how to narrow it: {q}");
+    }
+
+    // ── time-limited trust ──────────────────────────────────────────────────
+
+    /// **An expired device is visibly expired, never silently absent.** The row
+    /// is still rendered — the device is still pinned, and hiding it would make
+    /// a store look like it had lost a machine — but every cell that speaks for
+    /// it says the grant is gone.
+    #[test]
+    fn an_expired_row_reads_as_expired_and_grants_nothing() {
+        let r = expiring("pb-c", "Loaner", Duration::minutes(-12));
+        let cells = row_cells(&r, now());
+
+        assert_eq!(cells[0], "expired", "the status column says so");
+        assert_eq!(cells[1], "pb-c", "and the device is still listed");
+        assert_eq!(cells[5], "12m ago", "and says when it lapsed");
+        assert_eq!(
+            cells[6], "none",
+            "and it may nothing, however its stored bits read"
+        );
+        assert_eq!(
+            r.permissions,
+            PermissionSet::granted_on_approval(),
+            "precondition: the stored grant is untouched, so `none` is the \
+             predicate's doing and not the record's"
+        );
+    }
+
+    /// The `EXPIRES` cell answers "how long have I got" in the CLI's own
+    /// vocabulary, in both directions, and says `never` for the ordinary case.
+    #[test]
+    fn the_expiry_cell_counts_toward_the_deadline_and_away_from_it() {
+        assert_eq!(expiry_cell(&record("pb-a", "Laptop", true), now()), "never");
+        assert_eq!(
+            expiry_cell(&expiring("pb-c", "Loaner", Duration::minutes(29)), now()),
+            "in 29m"
+        );
+        assert_eq!(
+            expiry_cell(&expiring("pb-c", "Loaner", Duration::hours(6)), now()),
+            "in 6h00m"
+        );
+        assert_eq!(
+            expiry_cell(&expiring("pb-c", "Loaner", Duration::days(7)), now()),
+            "in 7d00h",
+            "a week must not be printed as 168h00m"
+        );
+        assert_eq!(
+            expiry_cell(&expiring("pb-c", "Loaner", Duration::minutes(-90)), now()),
+            "1h30m ago"
+        );
+        assert_eq!(
+            expiry_cell(&expiring("pb-c", "Loaner", Duration::zero()), now()),
+            "0s ago",
+            "the deadline instant is already past — `>=`, not `>`"
+        );
+    }
+
+    /// **The `--json` row fails closed.** `approved` is the effective answer, so
+    /// the documented `select(.approved | not)` one-liner catches a device whose
+    /// window has closed rather than skipping exactly the case that matters;
+    /// `expired` and `expires_at` are there to say why, and to tell an expired
+    /// device apart from a stranger nobody ever chose.
+    #[test]
+    fn json_rows_report_expiry_and_report_it_fail_closed() {
+        let live = row_json(&expiring("pb-c", "Loaner", Duration::minutes(30)), now());
+        assert_eq!(live["approved"], json!(true));
+        assert_eq!(live["expired"], json!(false));
+        assert_eq!(live["expires_at"], json!("2026-08-17T12:30:00Z"));
+        assert_eq!(
+            live["permissions"],
+            json!(["files", "chat", "clipboard", "presence", "pipe"])
+        );
+
+        let lapsed = row_json(&expiring("pb-c", "Loaner", Duration::minutes(-1)), now());
+        assert_eq!(
+            lapsed["approved"],
+            json!(false),
+            "an expired device must not read as approved"
+        );
+        assert_eq!(lapsed["expired"], json!(true));
+        assert_eq!(lapsed["permissions"], json!([]));
+
+        let stranger = row_json(&record("pb-b", "Stranger", false), now());
+        assert_eq!(stranger["approved"], json!(false));
+        assert_eq!(
+            stranger["expired"],
+            json!(false),
+            "never approved is not the same as expired, and a script must be \
+             able to tell them apart"
+        );
+        assert_eq!(stranger["expires_at"], json!(null));
+    }
+
+    /// A device with no deadline is untouched by any of this — the ordinary
+    /// case, and the one every store written before this feature is in.
+    #[test]
+    fn a_record_with_no_window_reads_exactly_as_it_did_before() {
+        let r = record("pb-a", "Laptop", true);
+        assert_eq!(status_word(&r, now()), "approved");
+        assert_eq!(expiry_cell(&r, now()), "never");
+        assert_eq!(row_json(&r, now())["expires_at"], json!(null));
+        assert_eq!(row_json(&r, now())["expired"], json!(false));
+        // ...and it is still approved at an instant far beyond any window a
+        // person would have set.
+        let far = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).single().unwrap();
+        assert_eq!(status_word(&r, far), "approved");
+        assert_eq!(
+            permission_cell(&r, far),
+            "files,chat,clipboard,presence,pipe"
+        );
+    }
+
+    /// The prompt says **how long**, in both directions. An operator answering
+    /// "y" to a 30-minute loan and an operator answering "y" to permanent
+    /// access must not be shown the same question.
+    #[test]
+    fn the_question_names_the_window_or_says_there_is_none() {
+        let r = record("pb-a", "Laptop", false);
+
+        let forever = approval_question(&r, None);
+        assert!(
+            forever.contains("until revoked"),
+            "an unlimited grant must say so: {forever}"
+        );
+
+        let deadline = now() + Duration::minutes(30);
+        let limited = approval_question(&r, Some(deadline));
+        assert!(
+            limited.contains("2026-08-17T12:30:00Z"),
+            "a limited grant must name the instant it ends: {limited}"
+        );
+        assert!(
+            limited.contains("may nothing again"),
+            "and say what happens then: {limited}"
+        );
     }
 }

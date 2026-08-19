@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 
 use peerbeam_domain::entity::{
     Device, DeviceType, Direction, Platform, Route, RouteKind, TransferSession, TransferStatus,
@@ -267,4 +268,117 @@ async fn migrates_to_next_route_on_reconnect() {
         vec![RouteKind::Lan, RouteKind::Ethernet],
         "reconnect re-selects and migrates to the next best route"
     );
+}
+
+// ── link quality ────────────────────────────────────────────────
+
+/// A discovery provider that reports one device and then goes quiet — enough
+/// for the device list to have a row a measurement can land on.
+struct OneDevice(Device);
+
+#[async_trait]
+impl peerbeam_domain::port::DiscoveryProvider for OneDevice {
+    fn id(&self) -> ProviderId {
+        ProviderId::from("fake")
+    }
+    fn capabilities(&self) -> peerbeam_domain::port::DiscoveryCaps {
+        peerbeam_domain::port::DiscoveryCaps {
+            can_advertise: true,
+            can_scan: true,
+            crosses_subnet: false,
+            requires_tailscale: false,
+        }
+    }
+    async fn advertise(&self, _me: &Device) -> Result<()> {
+        Ok(())
+    }
+    async fn scan(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+    fn events(&self) -> BoxStream<'static, peerbeam_domain::port::DiscoveryEvent> {
+        futures::stream::iter(vec![peerbeam_domain::port::DiscoveryEvent::Found(
+            self.0.clone(),
+        )])
+        .boxed()
+    }
+}
+
+/// The whole point of the feature, end to end: a round trip the transport
+/// measured lands on the peer's row in the device list *and* is announced, so
+/// a surface re-renders instead of polling.
+///
+/// The rounding is asserted on the way through rather than in isolation —
+/// 2.7 ms must arrive as 3 ms, because a floor would quietly turn every fast
+/// LAN link into the same number.
+#[tokio::test]
+async fn a_measured_round_trip_reaches_the_device_list_and_is_announced() {
+    let bob = peer(&["10.0.0.5"]);
+    let engine = std::sync::Arc::new(
+        peerbeam_engine::EngineBuilder::with_defaults()
+            .with_discovery(Arc::new(OneDevice(bob.clone())))
+            .build()
+            .expect("engine builds"),
+    );
+    let mut changes = engine.device_changes();
+    engine
+        .start_discovery(peer(&["10.0.0.99"]))
+        .await
+        .expect("discovery starts");
+    // Wait for the row itself to exist; a measurement against an unknown
+    // device is a no-op, so asserting before it lands would pass for the
+    // wrong reason.
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), changes.recv()).await {
+            Ok(Ok(peerbeam_engine::DeviceChange::Added(_))) => break,
+            Ok(Ok(_)) => continue,
+            other => panic!("device never appeared: {other:?}"),
+        }
+    }
+
+    let transport = Arc::new(FakeTransport::new(&[]));
+    let rm = RouteManager::new(transport).reporting_to(&engine);
+    rm.record_link_rtt(&bob.id, Some(std::time::Duration::from_micros(2_700)));
+
+    assert_eq!(
+        engine
+            .devices()
+            .into_iter()
+            .find(|m| m.device.id == bob.id)
+            .expect("the peer is tracked")
+            .latency_ms,
+        Some(3),
+        "2.7 ms must arrive as 3 ms, not floored to 2"
+    );
+
+    let announced = tokio::time::timeout(std::time::Duration::from_secs(2), changes.recv())
+        .await
+        .expect("a change was announced")
+        .expect("the change stream is live");
+    assert!(
+        matches!(
+            announced,
+            peerbeam_engine::DeviceChange::LatencyChanged { ref id, latency_ms: Some(3) }
+                if *id == bob.id
+        ),
+        "expected a LatencyChanged for {:?}, got {announced:?}",
+        bob.id
+    );
+
+    // Nothing measurable clears the row rather than leaving a figure that is
+    // no longer about any link we hold.
+    rm.record_link_rtt(&bob.id, None);
+    assert_eq!(
+        engine
+            .devices()
+            .into_iter()
+            .find(|m| m.device.id == bob.id)
+            .unwrap()
+            .latency_ms,
+        None
+    );
+
+    engine.stop_discovery().await.expect("discovery stops");
 }

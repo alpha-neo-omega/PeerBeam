@@ -430,6 +430,7 @@ mod tests {
             permissions: PermissionSet::granted_on_approval()
                 .set(Permission::Browse, browse)
                 .set(Permission::Files, files),
+            expires_at: None,
         }))
     }
 

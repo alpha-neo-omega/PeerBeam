@@ -133,6 +133,12 @@ class _SharingBanner extends StatelessWidget {
 /// (often absent). A device that shares nothing renders the first half and one
 /// line of explanation — **never a row of zeroed gauges**, which would claim a
 /// dead battery and a full disk that were never measured.
+///
+/// The round-trip chip belongs to the first half even though it sits among the
+/// second's, and the distinction matters: it is **our** measurement of **our**
+/// link to that device, taken by the transport, not something the peer
+/// disclosed. So it renders for a device that shares nothing at all, and it is
+/// absent — never zero, never a guess — for a device we have not connected to.
 class DeviceStatusCard extends StatelessWidget {
   final Device device;
   final SdkPresence? presence;
@@ -195,41 +201,55 @@ class DeviceStatusCard extends StatelessWidget {
               ],
             ),
             const Gap(AppSpace.sm),
-            if (shared)
-              Wrap(
-                spacing: AppSpace.xs,
-                runSpacing: AppSpace.xs,
-                children: [
-                  // Each chip is rendered only when its field actually arrived.
-                  // Absent is absent — there is no zero fallback anywhere here.
-                  if (p.batteryPercent != null)
-                    _Chip(
-                      icon: p.charging == true
-                          ? Icons.battery_charging_full_rounded
-                          : _batteryIcon(p.batteryPercent!),
-                      label: p.charging == true
-                          ? '${p.batteryPercent}% charging'
-                          : '${p.batteryPercent}%',
-                    ),
-                  if (p.storageFreeBytes != null)
-                    _Chip(
-                      icon: Icons.sd_storage_rounded,
-                      label: '${formatBytes(p.storageFreeBytes!)} free',
-                    ),
-                  if (p.network != null)
-                    _Chip(
-                      icon: _networkIcon(p.network!),
-                      label: networkLabel(p.network!),
-                    ),
-                  if (p.appVersion != null)
-                    _Chip(icon: Icons.tag_rounded, label: 'v${p.appVersion}'),
-                ],
-              )
-            else
+            Wrap(
+              spacing: AppSpace.xs,
+              runSpacing: AppSpace.xs,
+              children: [
+                // Ours, not the peer's: the round trip the transport measured
+                // on the last connection to this device. Outside the `shared`
+                // branch on purpose — a device that discloses nothing can
+                // still be one we have measured a link to.
+                if (device.latencyMs != null)
+                  _Chip(
+                    icon: Icons.speed_rounded,
+                    label: '${formatLatency(device.latencyMs!)} round trip',
+                    tooltip:
+                        'Measured by this device on its last connection to '
+                        '${device.name}.',
+                  ),
+                // Each chip below is rendered only when its field actually
+                // arrived. Absent is absent — there is no zero fallback
+                // anywhere here.
+                if (shared && p.batteryPercent != null)
+                  _Chip(
+                    icon: p.charging == true
+                        ? Icons.battery_charging_full_rounded
+                        : _batteryIcon(p.batteryPercent!),
+                    label: p.charging == true
+                        ? '${p.batteryPercent}% charging'
+                        : '${p.batteryPercent}%',
+                  ),
+                if (shared && p.storageFreeBytes != null)
+                  _Chip(
+                    icon: Icons.sd_storage_rounded,
+                    label: '${formatBytes(p.storageFreeBytes!)} free',
+                  ),
+                if (shared && p.network != null)
+                  _Chip(
+                    icon: _networkIcon(p.network!),
+                    label: networkLabel(p.network!),
+                  ),
+                if (shared && p.appVersion != null)
+                  _Chip(icon: Icons.tag_rounded, label: 'v${p.appVersion}'),
+              ],
+            ),
+            if (!shared) ...[
+              if (device.latencyMs != null) const Gap(AppSpace.xs),
               Text(
                 'Status not shared',
                 style: text.bodySmall?.copyWith(color: scheme.outline),
               ),
+            ],
             if (shared) ...[
               const Gap(AppSpace.xs),
               Text(
@@ -248,12 +268,14 @@ class DeviceStatusCard extends StatelessWidget {
 
 /// Form factor, platform, and how the device is reachable — the facts that
 /// hold whether or not the device shares anything.
+///
+/// The round trip used to be appended here as a bare "23 ms", which said
+/// nothing about what was measured or by whom; it is a labelled chip now.
 String _identityLine(Device d) {
   final parts = <String>[
     d.kind.label,
     platformLabel(d.platform),
     if (d.online) ...d.reach.map((r) => r.label) else 'Offline',
-    if (d.online && d.latencyMs != null) '${d.latencyMs} ms',
   ];
   return parts.join(' · ');
 }
@@ -322,12 +344,17 @@ String formatAge(int seconds) {
 class _Chip extends StatelessWidget {
   final IconData icon;
   final String label;
-  const _Chip({required this.icon, required this.label});
+
+  /// Where the number came from, for a chip whose provenance is not obvious
+  /// from its wording. Null for the chips that simply restate what a peer
+  /// sent.
+  final String? tooltip;
+  const _Chip({required this.icon, required this.label, this.tooltip});
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
+    final chip = Container(
       padding: const EdgeInsets.symmetric(
         horizontal: AppSpace.xs,
         vertical: AppSpace.xxs,
@@ -350,5 +377,7 @@ class _Chip extends StatelessWidget {
         ],
       ),
     );
+    final message = tooltip;
+    return message == null ? chip : Tooltip(message: message, child: chip);
   }
 }

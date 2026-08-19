@@ -79,7 +79,7 @@ async fn show_and_verify(ctx: &Ctx, session: &session_transfer::Session, peer: &
                 // exists to gate.
                 let device = peerbeam_domain::id::DeviceId::from(session.peer_id.clone());
                 crate::commands::open_trust(&crate::commands::load_config(None)?)?
-                    .approve_gated(&device, true)?;
+                    .approve_gated(&device, true, None)?;
                 ctx.line(&format!("{peer} {}", ctx.bold("paired and approved")));
                 return Ok(());
             }

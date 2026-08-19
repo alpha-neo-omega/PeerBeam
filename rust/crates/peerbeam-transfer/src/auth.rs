@@ -188,6 +188,11 @@ pub async fn authenticate(
     // is moved into the trust record on first contact).
     let peer_name_display = peer_name.clone();
     let fingerprint = enc.fingerprint(&PublicKey(peer_pub)).0;
+    // `lookup`, deliberately, and never `is_trusted`: this is the MITM
+    // question, and it must keep working after a time-limited approval has run
+    // out. `is_trusted` answers `false` for an expired record, so asking it here
+    // would treat a device whose window closed as never-seen and re-pin
+    // whatever key answered — turning a 30-minute grant into a TOFU reset.
     let newly_trusted = match trust.lookup(&peer_id)? {
         Some(rec) if rec.fingerprint != fingerprint => {
             return Err(DomainError::Encryption(format!(
@@ -214,6 +219,10 @@ pub async fn authenticate(
                 trusted_at: Utc::now(),
                 approved: false,
                 permissions: PermissionSet::none(),
+                // No window: a pin is not a grant, so there is nothing for a
+                // clock to end. A deadline is written by approval, which is the
+                // act a person performs.
+                expires_at: None,
             })?;
             true
         }

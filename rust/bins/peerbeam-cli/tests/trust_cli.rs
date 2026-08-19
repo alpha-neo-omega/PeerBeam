@@ -43,6 +43,10 @@ fn store(dir: &Path, records: Value) -> PathBuf {
     path
 }
 
+/// A record in the shape a build **before time-limited trust** wrote one: no
+/// `expires_at` key at all. Every test in this file that is not about expiry
+/// therefore also exercises the upgrade path, which is the one a real user's
+/// `trust.json` takes.
 fn record(id: &str, name: &str, fp: char, approved: bool) -> Value {
     json!({
         "device": id,
@@ -51,6 +55,18 @@ fn record(id: &str, name: &str, fp: char, approved: bool) -> Value {
         "trusted_at": "2026-08-17T10:30:00Z",
         "approved": approved,
     })
+}
+
+/// An approved record whose window closes `after` from now — negative for one
+/// that has already run out.
+///
+/// A past instant rather than a short future one the test then waits out: a
+/// sleep would make the assertion a statement about the scheduler, and the whole
+/// claim being tested is that no time has to pass for expiry to take effect.
+fn expiring(id: &str, name: &str, fp: char, after: chrono::Duration) -> Value {
+    let mut r = record(id, name, fp, true);
+    r["expires_at"] = json!((chrono::Utc::now() + after).to_rfc3339());
+    r
 }
 
 /// Two devices: one the user chose, one that merely connected once.
@@ -634,4 +650,232 @@ fn revoking_a_device_takes_its_permissions_with_it() {
             .all(|r| r["id"] != json!("pb-laptop00001")),
         "the whole record is gone"
     );
+}
+
+// ── time-limited trust ──────────────────────────────────────────────────────
+
+/// **`--for` writes a window, and `list` says how much is left.** The receipt
+/// names the deadline too: a scripted run never sees the prompt, so this is
+/// where its record of *for how long* comes from.
+#[test]
+fn approve_for_writes_a_window_and_the_listing_counts_it_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let o = run(
+        &cfg,
+        &["-y", "trust", "approve", "pb-stranger001", "--for", "30m"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let receipt = out(&o);
+    assert!(
+        receipt.contains("in 29m") || receipt.contains("in 30m"),
+        "the receipt must say how long was granted: {receipt}"
+    );
+
+    let stranger = row(&rows(&cfg), "pb-stranger001").clone();
+    assert_eq!(stranger["approved"], json!(true), "it is approved for now");
+    assert_eq!(stranger["expired"], json!(false));
+    assert!(
+        stranger["expires_at"].is_string(),
+        "the deadline must be an absolute instant a script can read: {stranger}"
+    );
+    assert_eq!(
+        stranger["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"]),
+        "a time-limited approval still grants what approval grants"
+    );
+
+    let text = out(&run(&cfg, &["trust", "list"]));
+    let row_text = text
+        .lines()
+        .find(|l| l.contains("pb-stranger001"))
+        .unwrap_or_else(|| panic!("the row is missing: {text}"));
+    assert!(
+        row_text.contains("in 29m") || row_text.contains("in 30m"),
+        "the row must count down: {row_text}"
+    );
+    assert!(row_text.contains("approved"), "and still be approved");
+}
+
+/// **Expired is visible, not absent.** The device is still pinned — hiding it
+/// would make the store look like it had lost a machine — and every column that
+/// speaks for it says the grant is gone. Nothing swept, nothing reconnected: the
+/// binary is started fresh and reads the deadline off the file.
+#[test]
+fn an_expired_device_is_listed_as_expired_and_may_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = store(
+        dir.path(),
+        json!([expiring(
+            "pb-loaner00001",
+            "Loaner",
+            'c',
+            -chrono::Duration::minutes(12)
+        )]),
+    );
+
+    let text = out(&run(&cfg, &["trust", "list"]));
+    let row_text = text
+        .lines()
+        .find(|l| l.contains("pb-loaner00001"))
+        .unwrap_or_else(|| panic!("an expired device must still be listed: {text}"));
+    assert!(row_text.contains("expired"), "{row_text}");
+    assert!(
+        row_text.contains("12m ago"),
+        "and when it lapsed: {row_text}"
+    );
+    assert!(row_text.contains("none"), "and grant nothing: {row_text}");
+    assert!(
+        text.contains("trust approve"),
+        "and the operator is told the fix: {text}"
+    );
+
+    let loaner = row(&rows(&cfg), "pb-loaner00001").clone();
+    assert_eq!(
+        loaner["approved"],
+        json!(false),
+        "`select(.approved | not)` must catch this device, not skip it"
+    );
+    assert_eq!(loaner["expired"], json!(true));
+    assert_eq!(loaner["permissions"], json!([]));
+}
+
+/// **A store written before this existed loads and stays trusted.** Reading an
+/// absent deadline as "expired" would revoke every device on the machine the
+/// moment the user upgraded, which is the opposite of the fail-closed reading
+/// `approved` gets — and deliberately so.
+#[test]
+fn a_trust_file_written_before_expiry_existed_is_trusted_indefinitely() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    let laptop = row(&rows(&cfg), "pb-laptop00001").clone();
+    assert_eq!(laptop["approved"], json!(true), "still approved");
+    assert_eq!(laptop["expired"], json!(false));
+    assert_eq!(laptop["expires_at"], json!(null));
+    assert_eq!(
+        laptop["permissions"],
+        json!(["files", "chat", "clipboard", "presence", "pipe"]),
+        "and keeps everything the upgrade found it holding"
+    );
+
+    let text = out(&run(&cfg, &["trust", "list"]));
+    let row_text = text.lines().find(|l| l.contains("pb-laptop00001")).unwrap();
+    assert!(
+        row_text.contains("never"),
+        "and says so plainly: {row_text}"
+    );
+}
+
+/// Approving an expired device renews it, and a plain `approve` means
+/// indefinitely — which is how an operator lifts a window they set earlier.
+#[test]
+fn approving_an_expired_device_renews_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = store(
+        dir.path(),
+        json!([expiring(
+            "pb-loaner00001",
+            "Loaner",
+            'c',
+            -chrono::Duration::hours(1)
+        )]),
+    );
+
+    let o = run(&cfg, &["-y", "trust", "approve", "pb-loaner00001"]);
+    assert!(o.status.success(), "{}", err(&o));
+
+    let loaner = row(&rows(&cfg), "pb-loaner00001").clone();
+    assert_eq!(loaner["approved"], json!(true));
+    assert_eq!(loaner["expired"], json!(false));
+    assert_eq!(
+        loaner["expires_at"],
+        json!(null),
+        "a plain approve lifts the window rather than leaving a dead one behind"
+    );
+}
+
+/// Narrowing an existing window is not a *new* grant, so a re-run needs no
+/// `--yes` and no terminal: `trust approve x --for 30m` from cron must be able
+/// to keep shortening the window it is there to shorten.
+#[test]
+fn shortening_a_live_window_needs_no_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = store(
+        dir.path(),
+        json!([expiring(
+            "pb-loaner00001",
+            "Loaner",
+            'c',
+            chrono::Duration::hours(8)
+        )]),
+    );
+
+    // No `-y`, and no TTY under `cargo test`: an unanswerable question would
+    // abort with exit 6.
+    let o = run(
+        &cfg,
+        &["trust", "approve", "pb-loaner00001", "--for", "30m"],
+    );
+    assert!(o.status.success(), "{} {}", out(&o), err(&o));
+    assert!(
+        out(&o).contains("in 29m") || out(&o).contains("in 30m"),
+        "the window must have been shortened: {}",
+        out(&o)
+    );
+}
+
+/// Permissions narrow a standing, and an expired device has none to narrow. The
+/// refusal names *which* of the two reasons it is, because "pinned but not
+/// approved" would read as a non-sequitur about a device the operator knows
+/// perfectly well they approved.
+#[test]
+fn permit_on_an_expired_device_is_refused_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = store(
+        dir.path(),
+        json!([expiring(
+            "pb-loaner00001",
+            "Loaner",
+            'c',
+            -chrono::Duration::minutes(5)
+        )]),
+    );
+
+    let o = run(&cfg, &["trust", "permit", "pb-loaner00001", "notes"]);
+    assert!(!o.status.success(), "an expired device must be refused");
+    assert_eq!(o.status.code(), Some(2), "usage error");
+    let message = err(&o);
+    assert!(
+        message.contains("expired"),
+        "the refusal must name the reason: {message}"
+    );
+    assert!(
+        message.contains("trust approve"),
+        "and the next step: {message}"
+    );
+}
+
+/// **An unreadable window is refused before anything is written.** A typo must
+/// not resolve a device, ask a question, and then fail — and must certainly not
+/// approve indefinitely because the duration could not be read.
+#[test]
+fn an_unreadable_window_is_a_usage_error_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = laptop_and_stranger(dir.path());
+
+    for spec in ["30", "30mn", "0m", "-5m"] {
+        let o = run(
+            &cfg,
+            &["-y", "trust", "approve", "pb-stranger001", "--for", spec],
+        );
+        assert!(!o.status.success(), "`{spec}` must not be accepted");
+        assert_eq!(o.status.code(), Some(2), "`{spec}`: usage error");
+        assert_eq!(
+            row(&rows(&cfg), "pb-stranger001")["approved"],
+            json!(false),
+            "`{spec}` approved the device anyway"
+        );
+    }
 }

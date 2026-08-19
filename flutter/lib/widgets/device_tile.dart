@@ -23,7 +23,11 @@ class DeviceTile extends StatelessWidget {
     final text = Theme.of(context).textTheme;
 
     final reachText = device.reach.map((r) => r.label).join(' and ');
-    final latency = device.latencyMs != null ? ', ${device.latencyMs} ms' : '';
+    // The measured round trip, phrased through the shared formatter so a
+    // sub-millisecond link reads "<1 ms" here exactly as it does on the device
+    // dashboard — a bare "0 ms" would look like the absence that a null means.
+    final ms = device.latencyMs;
+    final latency = ms != null ? ', ${formatLatency(ms)} round trip' : '';
     final semantic =
         '${device.name}, ${device.kind.label}, ${device.online ? 'online' : 'offline'}, '
         'reachable via $reachText$latency';
@@ -32,7 +36,7 @@ class DeviceTile extends StatelessWidget {
         ? [
             device.kind.label,
             ...device.reach.map((r) => r.label),
-            if (device.latencyMs != null) '${device.latencyMs} ms',
+            if (ms != null) formatLatency(ms),
           ].join(' · ')
         : '${device.kind.label} · Offline';
 

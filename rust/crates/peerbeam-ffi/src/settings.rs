@@ -107,6 +107,10 @@ pub fn overlay(config: &mut EngineConfig) {
                 json!(config.device.shared_directories),
             );
             m.insert(
+                "max_send_bytes_per_sec".into(),
+                json!(config.transfer.max_send_bytes_per_sec),
+            );
+            m.insert(
                 "auto_accept".into(),
                 json!(config.device.auto_accept_trusted),
             );
@@ -135,6 +139,12 @@ pub fn overlay(config: &mut EngineConfig) {
             .map(str::to_string)
             .collect();
         config.device.shared_directories = dirs;
+    }
+    if let Some(bps) = s
+        .get("max_send_bytes_per_sec")
+        .and_then(serde_json::Value::as_u64)
+    {
+        config.transfer.max_send_bytes_per_sec = bps;
     }
     if let Some(auto) = s.get("auto_accept").and_then(|v| v.as_bool()) {
         config.device.auto_accept_trusted = auto;

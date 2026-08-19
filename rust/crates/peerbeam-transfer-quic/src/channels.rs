@@ -5,6 +5,8 @@
 //! existing [`QuicLink`]. There is no custom multiplexing protocol — the
 //! transport already multiplexes.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use quinn::Connection;
 
@@ -33,6 +35,28 @@ impl QuicChannels {
     #[must_use]
     pub fn remote(&self) -> std::net::SocketAddr {
         self.conn.remote_address()
+    }
+
+    /// The round-trip time QUIC has measured on this connection, or `None`
+    /// while it has measured none.
+    ///
+    /// This is quinn's own smoothed RTT — the estimate its loss recovery
+    /// already runs on — so reading it costs one lock and adds no probe
+    /// traffic of its own. There is no PeerBeam-level ping, and there does not
+    /// need to be one.
+    ///
+    /// **The `None` is the whole point of the signature.**
+    /// [`quinn::Connection::rtt`] never fails: before the first ACK-driven
+    /// sample it returns the *configured initial* RTT (333 ms, RFC 9002
+    /// §6.2.2), which is a constant every connection starts life holding and
+    /// not a measurement of anything. Reporting that would put "333 ms" beside
+    /// a device on the same desk. `frame_rx.acks` counts ACK frames actually
+    /// received, and an ACK is what drives quinn's estimator, so a zero there
+    /// means no sample can have been taken and there is nothing honest to say.
+    #[must_use]
+    pub fn rtt(&self) -> Option<Duration> {
+        let stats = self.conn.stats();
+        (stats.frame_rx.acks > 0).then_some(stats.path.rtt)
     }
 }
 

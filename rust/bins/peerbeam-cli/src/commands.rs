@@ -911,15 +911,69 @@ pub(crate) async fn send_paths(
 }
 
 /// A duration in the words people use for one.
-fn humantime(d: std::time::Duration) -> String {
+///
+/// Shared with `trust list`, which prints how long a time-limited approval has
+/// left: the CLI must say a duration the same way everywhere, or `--for 2h` and
+/// the row it produces would not obviously be about the same thing.
+pub(crate) fn humantime(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
         format!("{}m", secs / 60)
-    } else {
+    } else if secs < 86_400 {
         format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        // Days once there are any. A week-long trust window rendered as
+        // `168h00m` is a number nobody reads as a week.
+        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
     }
+}
+
+/// A duration in the words people **type** for one: `45s`, `30m`, `2h`, `7d`.
+///
+/// The inverse of [`humantime`], on purpose and with the same four units: a
+/// vocabulary the CLI already prints is one a person can guess without reading
+/// `--help`. Used by `trust approve --for`.
+///
+/// Deliberately narrow. No compound forms (`1h30m`), because supporting them
+/// means deciding what `1h30` and `1h30s` mean; and **no bare numbers**, because
+/// `--for 30` is thirty of something the reader and the writer have to agree on
+/// out of band, and on this flag the two obvious candidates — half a minute and
+/// half an hour — differ by sixty times in how long a stranger keeps access.
+///
+/// Zero and negative are refused rather than rounded to "already over": a window
+/// that has expired before it is written is not what anyone meant by approving,
+/// and the error says which of the two things they probably wanted.
+pub(crate) fn parse_duration(spec: &str) -> Result<chrono::Duration, CliError> {
+    let spec = spec.trim();
+    let unreadable = || {
+        CliError::Usage(format!(
+            "could not read `{spec}` as a duration — use a number and one of \
+             s, m, h, d (for example `30m` or `2h`)"
+        ))
+    };
+    // Split on the last *character*, not the last byte: a multi-byte unit is
+    // not a unit this understands, but slicing mid-character would panic
+    // instead of saying so.
+    let (cut, unit) = spec.char_indices().next_back().ok_or_else(unreadable)?;
+    let count: i64 = spec[..cut].parse().map_err(|_| unreadable())?;
+    let per_unit: i64 = match unit {
+        's' | 'S' => 1,
+        'm' | 'M' => 60,
+        'h' | 'H' => 3_600,
+        'd' | 'D' => 86_400,
+        _ => return Err(unreadable()),
+    };
+    if count <= 0 {
+        return Err(CliError::Usage(format!(
+            "`{spec}` is not a window — omit `--for` to approve until revoked, \
+             or use `trust revoke` to withdraw"
+        )));
+    }
+    let too_long = || CliError::Usage(format!("`{spec}` is longer than a window can be"));
+    let seconds = count.checked_mul(per_unit).ok_or_else(too_long)?;
+    chrono::Duration::try_seconds(seconds).ok_or_else(too_long)
 }
 
 /// How long to wait before a `--at` send, or an error naming what was expected.
@@ -3324,5 +3378,103 @@ mod scheduled_send_tests {
             msg.contains("HH:MM"),
             "the error did not name a format: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::{humantime, parse_duration};
+
+    #[test]
+    fn the_four_units_parse() {
+        assert_eq!(parse_duration("45s").unwrap().num_seconds(), 45);
+        assert_eq!(parse_duration("30m").unwrap().num_seconds(), 30 * 60);
+        assert_eq!(parse_duration("2h").unwrap().num_seconds(), 2 * 3600);
+        assert_eq!(parse_duration("7d").unwrap().num_seconds(), 7 * 86_400);
+    }
+
+    /// Case is forgiving and surrounding whitespace is trimmed, because a shell
+    /// quoting accident should not cost an operator a second attempt.
+    #[test]
+    fn case_and_padding_are_forgiven() {
+        assert_eq!(parse_duration("30M").unwrap().num_seconds(), 30 * 60);
+        assert_eq!(parse_duration(" 2H ").unwrap().num_seconds(), 2 * 3600);
+    }
+
+    /// **A bare number is refused.** `--for 30` is thirty of something, and on
+    /// this flag the two obvious readings differ by sixty times in how long a
+    /// device keeps access to a clipboard. Guessing is the one thing this must
+    /// not do.
+    #[test]
+    fn a_bare_number_is_refused_rather_than_guessed_at() {
+        let err = parse_duration("30").expect_err("no unit");
+        assert_eq!(err.code(), 2, "a bad duration is a usage error");
+        let msg = format!("{err}");
+        assert!(msg.contains("30m"), "the error must show the shape: {msg}");
+    }
+
+    /// Everything that is not `<number><unit>` is refused, including the
+    /// compound form (`1h30m`) this deliberately does not support: accepting it
+    /// halfway would mean deciding what `1h30` and `1h30s` mean.
+    #[test]
+    fn nonsense_is_refused_and_names_the_units() {
+        for spec in ["", "m", "abc", "1w", "1 h", "1h30m", "--for", "30mn"] {
+            let err = parse_duration(spec).expect_err("`{spec}` is not a duration");
+            assert_eq!(err.code(), 2, "{spec}");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("s, m, h, d"),
+                "{spec}: the error must name the units: {msg}"
+            );
+        }
+    }
+
+    /// Zero and negative are not windows. Rounding them to "already expired"
+    /// would write a grant that was over before the receipt printed; saying so
+    /// points at the two things the operator probably meant instead.
+    #[test]
+    fn zero_and_negative_are_refused_with_the_alternatives_named() {
+        for spec in ["0m", "0s", "-5m"] {
+            let err = parse_duration(spec).expect_err("{spec} is not a window");
+            assert_eq!(err.code(), 2);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("revoke") && msg.contains("`--for`"),
+                "{spec}: the error must name the alternatives: {msg}"
+            );
+        }
+    }
+
+    /// A window nobody could mean must not panic on the multiply — `chrono`
+    /// saturates or wraps depending on the call, and this one has to say no.
+    #[test]
+    fn an_absurd_window_is_an_error_not_a_panic() {
+        let err = parse_duration("9223372036854775807d").expect_err("far too long");
+        assert_eq!(err.code(), 2);
+    }
+
+    /// A multi-byte final character is not a unit, and must be reported as such
+    /// rather than panicking on a slice that lands mid-character.
+    #[test]
+    fn a_multibyte_unit_is_refused_without_panicking() {
+        assert!(parse_duration("30µ").is_err());
+        assert!(parse_duration("30日").is_err());
+    }
+
+    /// [`parse_duration`] and [`humantime`] are inverses in the vocabulary they
+    /// share, which is what lets `--for 2h` and the row it produces obviously be
+    /// about the same thing.
+    #[test]
+    fn what_is_typed_reads_back_as_what_is_printed() {
+        for (spec, printed) in [
+            ("45s", "45s"),
+            ("30m", "30m"),
+            ("2h", "2h00m"),
+            ("7d", "7d00h"),
+        ] {
+            let parsed = parse_duration(spec).unwrap();
+            let seconds = std::time::Duration::from_secs(parsed.num_seconds() as u64);
+            assert_eq!(humantime(seconds), printed, "{spec}");
+        }
     }
 }

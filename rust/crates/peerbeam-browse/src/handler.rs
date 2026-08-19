@@ -195,6 +195,7 @@ mod tests {
             trusted_at: chrono::Utc::now(),
             approved: true,
             permissions: PermissionSet::granted_on_approval().set(Permission::Browse, browse),
+            expires_at: None,
         })))
     }
 

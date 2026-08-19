@@ -66,16 +66,35 @@ class Device {
   /// they used to re-list every one by hand, which meant every field added to
   /// this class had to be remembered in two more places or it would vanish the
   /// first time a device went offline.
-  Device copyWith({bool? online, int? latencyMs}) => Device(
+  ///
+  /// [latencyMs] takes a sentinel rather than defaulting to null, because
+  /// **null is a meaningful value here**: the engine clears a device's
+  /// round-trip time by sending `latency_ms: null`, and a plain
+  /// `latencyMs ?? this.latencyMs` cannot tell that apart from "not supplied"
+  /// — so the stale figure survived a clear and went on being displayed as if
+  /// it were current.
+  Device copyWith({bool? online, Object? latencyMs = _keep}) => Device(
     id: id,
     name: name,
     kind: kind,
     online: online ?? this.online,
     reach: reach,
-    latencyMs: latencyMs ?? this.latencyMs,
+    latencyMs: identical(latencyMs, _keep) ? this.latencyMs : latencyMs as int?,
     platform: platform,
   );
 }
+
+/// "Leave this field as it is" — distinct from an explicit null, which means
+/// *clear it*. See [Device.copyWith].
+const Object _keep = Object();
+
+/// A measured round-trip time, phrased for a person.
+///
+/// A zero is a real reading of a link too fast to round to a whole
+/// millisecond, not a missing one, so it reads "<1 ms" rather than "0 ms" —
+/// which would look like the absence the engine expresses with null.
+String formatLatency(int milliseconds) =>
+    milliseconds == 0 ? '<1 ms' : '$milliseconds ms';
 
 enum TransferDirection { sending, receiving }
 

@@ -216,6 +216,41 @@ Two smaller consequences, recorded because they are choices:
   pinned-but-unapproved one is refused with the next step (`trust approve`)
   rather than writing a bit that would grant nothing.
 
+### Trust that runs out
+
+An approval can carry a deadline: `peerbeam trust approve <device> --for 30m`
+stores an absolute instant in the record's `expires_at`. At and after it, the
+record is worth exactly what it was before anyone approved it — a pin.
+`is_trusted`, `is_approved` and `may` all answer `false`, and every permission
+reads as withheld.
+
+**Enforced where it is read, never by a sweeper.** The three predicates above
+consult the deadline themselves, and every gate in the workspace already asks
+them per operation, so the window shuts on time whether or not anything has run
+since. A background cleaner would be a second source of truth and the slower
+one: the interval between sweeps is exactly the interval in which a device is
+still trusted after its window closed. A store reopened tomorrow reaches the same
+verdict, and a machine asleep through the window wakes with it shut.
+
+**The pin outlives the grant.** Expiry ends what the *user* granted; it does not
+forget the key. The record stays on disk and `TrustStore::lookup` keeps returning
+it, which is what `auth.rs` compares a presented fingerprint against. Deleting it
+on expiry would turn a 30-minute window into a TOFU reset — the device's next
+handshake would pin whatever key answered, and a key change would no longer be
+detectable. Forgetting a device is what `revoke` is for; `auth.rs` therefore
+reads `lookup`, deliberately, and never `is_trusted`.
+
+Renewing an expired device restores the permissions it was actually left rather
+than the five approval starts with, so a lapsed window cannot silently undo a
+revoke. With `encryption.require_pin_pairing` on, renewing an expired approval
+needs `peerbeam pair` exactly as a first approval does — the grant has ended, so
+granting it again is a new decision.
+
+A `trust.json` written before this existed has no `expires_at` and is trusted
+**indefinitely**, which is what those records meant when they were written. That
+is deliberately the opposite of `approved`'s upgrade rule: reading a missing
+deadline as "expired" would revoke every device on the machine on upgrade.
+
 ## Device identity
 
 Each device has a long-term X25519 identity keypair, generated on first run and

@@ -7,6 +7,30 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [0.9.0] - 2026-08-19
 
 ### Added
+- **Trust that runs out.** `peerbeam trust approve <device> --for 30m` (also
+  `45s`, `2h`, `7d`) approves a device for a while. When the window closes it is
+  back to being merely pinned: it may nothing, and `trust list` shows it as
+  `expired` with how long ago — visibly expired, never silently missing.
+
+  **Nothing has to run for that to happen.** There is no sweeper and no daemon:
+  the deadline is checked wherever trust is *read*, and every gate already
+  re-reads the store per operation. A sweep that has not happened yet is a device
+  still trusted after its window closed, which is precisely the gap this must not
+  have. A fresh process, a reopened store and a machine that slept through the
+  whole window all reach the same verdict.
+
+  The **pin survives the window** — the device's key is still remembered, so a
+  key change is still caught as a possible MITM. `trust revoke` is what forgets a
+  device. Re-approving an expired one renews it and gives back the permissions it
+  was actually left, not the five approval starts with; a plain `approve` means
+  indefinitely and lifts a window set earlier.
+
+  Existing trust stores are unaffected: a record written before this has no
+  deadline and is trusted indefinitely, which is what it always meant. Under
+  `--json`, `trust list` gains `expires_at` and `expired`, and `approved` is now
+  the **effective** answer — the documented
+  `jq 'select(.approved | not)'` one-liner catches an expired device rather than
+  skipping exactly the case that matters.
 - **Logs you can actually read.** The engine has always captured structured
   logs; nothing could reach them. `peerbeam logs [--export PATH]` reads them,
   and the app can list, export and stream them. Logs are now written to

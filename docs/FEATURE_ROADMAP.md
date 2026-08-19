@@ -137,8 +137,9 @@ The full brainstorm is archived at
 [`docs/archive/FEATURE_BRAINSTORM_2026-08.md`](archive/FEATURE_BRAINSTORM_2026-08.md).
 Most of what it proposed is now built — presence, chat with attachments,
 clipboard history, remote folder browsing, device identity and QR pairing,
-per-device permissions, smart route selection, and folder sync (bidirectional,
-with delta transfer and rename detection). What follows is the remainder.
+per-device permissions, time-limited trust, smart route selection, and folder
+sync (bidirectional, with delta transfer and rename detection). What follows is
+the remainder.
 
 - **Group conversations / "Spaces"** — named sets of trusted peers you can
   message or send to at once, kept peer-to-peer rather than via a hub (I3).
@@ -146,13 +147,17 @@ with delta transfer and rename detection). What follows is the remainder.
 - **Offline message and file queue** — hold an encrypted message locally for a
   device that is away and deliver it on reconnect. Chat is currently
   send-if-reachable.
-- **Time-limited trust** — "trust this device for 30 minutes", or allow one
-  transfer. The permission system exists; expiry does not.
 - **Remote shell** and **remote commands** — already scheduled as Phase D and
   channel `0x0106`, and constitutionally constrained by I6 (explicit,
   revocable, per-capability consent — never remote control).
-- **Latency and route quality in the peer list** — presence reports the route;
-  it does not report round-trip time or direct-vs-relay quality.
+- **Direct-vs-relay quality in the peer list** — round-trip time now lands on
+  each device's row (quinn's own estimate for the live connection, see
+  `docs/DEVICES.md`). Whether a connection is *relayed* remains unreported, and
+  not for want of plumbing: QUIC cannot see a relay, PeerBeam constructs no
+  `RouteKind::Relay` route, and Tailscale's DERP hop happens below our socket.
+  Reporting it would mean parsing `tailscale status --json`'s `CurAddr`/`Relay`
+  and carrying a per-device field for one discovery provider's opinion of a path
+  route selection may not even have chosen.
 
 Explicitly **not** wanted, per the brainstorm and consistent with I4: cloud
 accounts, a central messaging server, social profiles, public user discovery,

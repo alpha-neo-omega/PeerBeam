@@ -561,6 +561,14 @@ pub struct Manager {
     save_rules: RwLock<Vec<peerbeam_config::SaveRule>>,
     /// Approval policy. Interior-mutable so toggling auto-accept applies live.
     auto_accept: AtomicBool,
+    /// Outbound ceiling in bytes per second, `0` unlimited.
+    ///
+    /// Held on the manager rather than on each transfer because it is a
+    /// *device* setting: a person who turns it down means "this machine should
+    /// stop saturating my link", not "this one transfer should". Every new
+    /// transfer's control is seeded from it, and every running one is updated
+    /// when it changes.
+    send_limit: AtomicU64,
     /// The optional first-contact pairing check
     /// (`device.require_pairing_confirmation`). Interior-mutable for the same
     /// reason `auto_accept` is: turning it on in Settings must protect the very
@@ -656,6 +664,11 @@ impl Manager {
             save_dir: RwLock::new(save_dir),
             save_rules: RwLock::new(save_rules),
             auto_accept: AtomicBool::new(auto_accept),
+            // Unlimited here; `runtime::init` applies the configured ceiling
+            // through `set_send_limit` immediately after construction, the same
+            // way the other live settings are applied. Threading it through
+            // this already-long signature would buy nothing.
+            send_limit: AtomicU64::new(0),
             require_pairing_confirmation: AtomicBool::new(require_pairing_confirmation),
             chunk_size: chunk_size.max(1),
             daemon_port,
@@ -709,6 +722,18 @@ impl Manager {
     /// Apply the auto-accept policy live (persisted settings change; no restart).
     pub fn set_auto_accept(&self, v: bool) {
         self.auto_accept.store(v, Ordering::SeqCst);
+    }
+
+    /// Apply the outbound speed ceiling live, to new **and running** transfers.
+    ///
+    /// Reaching the running ones is the point. Someone moves this slider
+    /// because something is saturating their link *now*; a limit that applied
+    /// only to the next transfer would arrive after the problem had passed.
+    pub fn set_send_limit(&self, bytes_per_sec: u64) {
+        self.send_limit.store(bytes_per_sec, Ordering::SeqCst);
+        for active in self.active.lock().unwrap().values() {
+            active.ctrl.set_rate_limit(bytes_per_sec);
+        }
     }
 
     /// Turn the optional first-contact pairing check on or off, live.
@@ -1286,7 +1311,13 @@ impl Manager {
             direction,
             peer: peer.to_string(),
             peer_id: peer_id.to_string(),
-            ctrl: TransferControl::new(),
+            ctrl: {
+                // Seeded, not left unlimited: a transfer starting while a limit
+                // is in force must respect it from its first chunk.
+                let c = TransferControl::new();
+                c.set_rate_limit(self.send_limit.load(Ordering::SeqCst));
+                c
+            },
             stats: Arc::new(Mutex::new(Stats::new())),
             file: Arc::new(Mutex::new(file.to_string())),
             status: Mutex::new("queued".to_string()),
@@ -2354,7 +2385,19 @@ impl Manager {
     /// and a surface renders one toggle per entry. It is emitted for pinned
     /// devices too (where it is typically empty), so a surface never has to
     /// guess what an absent key means.
+    ///
+    /// `approved` is the **effective** answer, not the stored bit: a device
+    /// whose time-limited approval has run out reports `false` here, with
+    /// `expired: true` and `expires_at` saying why. Reporting the stored bit
+    /// would leave a surface showing a device as trusted after its window shut,
+    /// which is the one thing time-limited trust exists to prevent — and the
+    /// permissions array has always been the effective set, so the two would
+    /// have disagreed on the same row.
+    ///
+    /// One clock read for the whole list, so a long listing cannot straddle a
+    /// deadline and report two devices as of two different instants.
     pub fn trust_list(&self) -> Op {
+        let now = chrono::Utc::now();
         let devices: Vec<Value> = self
             .trust
             .list()
@@ -2365,9 +2408,11 @@ impl Manager {
                     "name": r.name,
                     "fingerprint": r.fingerprint,
                     "trusted_at": r.trusted_at.to_rfc3339(),
-                    "approved": r.approved,
+                    "approved": r.is_approved_at(now),
+                    "expires_at": r.expires_at.map(|at| at.to_rfc3339()),
+                    "expired": r.approved && r.has_expired(now),
                     "permissions": r
-                        .effective_permissions()
+                        .effective_permissions_at(now)
                         .granted()
                         .into_iter()
                         .map(|p| p.as_str())
@@ -5777,6 +5822,59 @@ mod tests {
         test_manager_with_port(name, 0)
     }
 
+    const SEND_LIMIT_KB: u64 = 1024;
+
+    #[tokio::test]
+    async fn a_manager_starts_unlimited() {
+        // A limit nobody set is a slow transfer nobody can explain. Asserted
+        // through a transfer's control rather than a getter on the manager:
+        // what matters is that nothing throttles, not what a field holds.
+        let mgr = test_manager("limit-default");
+        let (_id, active) = mgr.register_fresh("sending", "bob", "pb-bob", "big.bin", None);
+        assert_eq!(active.ctrl.rate_limit(), 0);
+    }
+
+    /// **The property that makes the setting useful.** Someone moves this
+    /// slider because a transfer is saturating their link *now*; a limit that
+    /// only applied to the next transfer would arrive after the problem had
+    /// passed.
+    #[tokio::test]
+    async fn lowering_the_limit_reaches_a_transfer_already_running() {
+        let mgr = test_manager("limit-live");
+        let (_id, active) = mgr.register_fresh("sending", "bob", "pb-bob", "big.bin", None);
+        assert_eq!(active.ctrl.rate_limit(), 0, "starts unlimited");
+
+        mgr.set_send_limit(50 * SEND_LIMIT_KB);
+        assert_eq!(
+            active.ctrl.rate_limit(),
+            50 * SEND_LIMIT_KB,
+            "the running transfer never heard about the new limit"
+        );
+    }
+
+    /// A transfer that starts while a limit is in force must respect it from
+    /// its first chunk, not from whenever the setting next changes.
+    #[tokio::test]
+    async fn a_transfer_started_under_a_limit_is_born_limited() {
+        let mgr = test_manager("limit-seeded");
+        mgr.set_send_limit(100 * SEND_LIMIT_KB);
+        let (_id, active) = mgr.register_fresh("sending", "bob", "pb-bob", "big.bin", None);
+        assert_eq!(active.ctrl.rate_limit(), 100 * SEND_LIMIT_KB);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_limit_reaches_running_transfers_too() {
+        let mgr = test_manager("limit-clear");
+        mgr.set_send_limit(10 * SEND_LIMIT_KB);
+        let (_id, active) = mgr.register_fresh("sending", "bob", "pb-bob", "big.bin", None);
+        mgr.set_send_limit(0);
+        assert_eq!(
+            active.ctrl.rate_limit(),
+            0,
+            "a transfer stayed throttled after the limit was removed"
+        );
+    }
+
     /// Like [`test_manager`], but with an explicit `daemon_port` — needed by
     /// tests that exercise `start_daemon()`/`serve()` against a port they
     /// control (e.g. one already occupied, to force a bind failure).
@@ -6993,6 +7091,7 @@ mod tests {
                 trusted_at: chrono::Utc::now(),
                 approved: false,
                 permissions: peerbeam_domain::entity::PermissionSet::none(),
+                expires_at: None,
             })
             .expect("pin device");
     }
@@ -7666,6 +7765,7 @@ mod tests {
                 trusted_at: chrono::Utc::now(),
                 approved: self.approved,
                 permissions: self.permissions,
+                expires_at: None,
             }))
         }
         fn is_trusted(&self, _d: &DeviceId) -> bool {
