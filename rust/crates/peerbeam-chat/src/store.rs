@@ -123,6 +123,16 @@ impl ChatStore {
             .map_err(|e| ChatError::Serialization(e.to_string()))
     }
 
+    /// Forget a parked landing nothing will ever claim.
+    ///
+    /// Every incoming transfer parks one when its chat row has not appeared,
+    /// and most transfers are not chat files at all — so without this, an
+    /// ordinary send would leave a small record behind for good. Called when a
+    /// transfer reaches its end with still no row to apply it to.
+    pub fn drop_pending_landing(&self, peer: &str, id: &str) {
+        let _ = self.store.delete(&Self::landing_ns(peer), id);
+    }
+
     /// Park a landing whose row does not exist yet.
     fn park_pending_landing(
         &self,

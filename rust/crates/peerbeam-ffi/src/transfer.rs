@@ -1782,10 +1782,32 @@ impl Manager {
     /// The approval *decision* is untouched: this only makes the metadata the
     /// decision is shown with accurate.
     fn chat_set_landing(&self, a: &Active, name: &str, size: u64) {
-        if !self.is_settleable_chat_row(a) {
+        let peer = DeviceId::from(a.peer_id.clone());
+        // **A missing row is not a reason to stop.** This used to begin with
+        // `if !is_settleable_chat_row(a) { return }`, and that helper answers
+        // `false` when the row simply is not there yet — which is exactly the
+        // case worth handling. The peer's claim rides CHAT and what actually
+        // lands rides TRANSFER; nothing orders them, and when the transfer wins
+        // the race the row has not been written yet. The guard turned that into
+        // a silent no-op, so the approval prompt kept the sender's chosen name.
+        //
+        // `set_file_row_landing` distinguishes the three cases properly: it
+        // parks the landing when the row is absent (applied by `append` when
+        // the row appears), declines when the row exists but is not a
+        // settleable file row, and writes otherwise. A row that exists and is
+        // not settleable is still skipped — just by the store, which can tell
+        // the difference, rather than by a guard that cannot.
+        if self.chat.get(&peer, &a.id).is_ok_and(|r| {
+            r.is_some_and(|rec| {
+                !rec.is_settleable_file_row(if a.direction == "sending" {
+                    ChatDirection::Out
+                } else {
+                    ChatDirection::In
+                })
+            })
+        }) {
             return;
         }
-        let peer = DeviceId::from(a.peer_id.clone());
         let expected = if a.direction == "sending" {
             ChatDirection::Out
         } else {
@@ -1801,8 +1823,11 @@ impl Manager {
             .chat
             .set_file_row_landing(&peer, &a.id, expected, name, size)
         {
+            // `info`, not `debug`: the default filter is `peerbeam=info`, so a
+            // debug line never reaches the log buffer and "applied" becomes
+            // indistinguishable from "never ran" when reading a report.
             Ok(true) => {
-                tracing::debug!(transfer_id = %a.id, peer = %peer.0, "chat row landing applied")
+                tracing::info!(transfer_id = %a.id, peer = %peer.0, "chat row landing applied")
             }
             Ok(false) => tracing::warn!(
                 transfer_id = %a.id,
@@ -1864,6 +1889,19 @@ impl Manager {
             }
         }
         events::transfer(id, event, payload);
+        // The transfer is over. If it never had a chat row, any landing parked
+        // for it is waiting for something that will not arrive — most transfers
+        // are not chat files, so leaving them would grow a record per transfer
+        // forever. A row that *does* exist has already consumed it.
+        if self
+            .chat
+            .get(&DeviceId::from(a.peer_id.clone()), id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            self.chat.drop_pending_landing(&a.peer_id, id);
+        }
         self.record_history(id, &a, success);
         if success {
             // A completed chat file reads as `Sent` in our own thread when we
@@ -6158,6 +6196,56 @@ mod tests {
     /// Both write points are exercised: the pre-approval reconcile against the
     /// peeked preview (the moment the user actually decides) and the
     /// settle-time write of what genuinely landed.
+    /// **The transfer can arrive before the conversation row.** The peer's
+    /// claim rides CHAT and what actually lands rides TRANSFER; nothing orders
+    /// them, and under load the transfer wins often enough to matter.
+    ///
+    /// This used to be a silent no-op: `chat_set_landing` began by asking
+    /// whether the row was settleable, that check answered "no" for a row that
+    /// did not exist yet, and it returned without recording anything. The row
+    /// then appeared carrying the sender's chosen name, and the user approved
+    /// against a claim nothing had checked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_landing_that_beats_its_chat_row_is_applied_when_the_row_arrives() {
+        let (mgr, chat, _dir) = test_manager_full("recv-landing-first", 0);
+        let peer = DeviceId::from("pb-bob");
+        let offered = peerbeam_chat::FileRef::new("holiday.jpg", 184_320).expect("file ref");
+
+        // TRANSFER first — no row exists yet.
+        let active = mgr
+            .register_vacant(
+                &offered.id,
+                "receiving",
+                "bob",
+                &peer.0,
+                "invoice-2026.pdf.exe",
+                None,
+            )
+            .expect("id vacant");
+        mgr.chat_set_landing(&active, "invoice-2026.pdf.exe", 4_096);
+        assert!(
+            chat.get(&peer, &offered.id).expect("get").is_none(),
+            "no row should exist yet"
+        );
+
+        // CHAT second — the row arrives, and must carry what lands.
+        chat.append(&peerbeam_chat::ChatRecord::file_in(&peer, &offered))
+            .expect("row arrives late");
+
+        let meta = chat
+            .get(&peer, &offered.id)
+            .expect("get")
+            .expect("row")
+            .file
+            .expect("file meta");
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the peer's claim outranked what actually lands"
+        );
+        assert_eq!(meta.size, 4_096, "and its size");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn a_receiving_row_is_relabelled_with_what_the_transfer_actually_lands() {
