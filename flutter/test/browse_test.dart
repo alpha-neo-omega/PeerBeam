@@ -44,9 +44,7 @@ void main() {
 
   testWidgets('shares are listed and a folder can be opened', (tester) async {
     final fake = FakePeerBeam()
-      ..shared[''] = [
-        const BrowseEntry(name: 'photos', isDir: true, size: 0),
-      ]
+      ..shared[''] = [const BrowseEntry(name: 'photos', isDir: true, size: 0)]
       ..shared['photos'] = [
         const BrowseEntry(name: 'holiday.jpg', isDir: false, size: 2048),
       ];
@@ -80,5 +78,21 @@ void main() {
     expect(find.text('docs'), findsOneWidget);
     expect(find.textContaining('/home/'), findsNothing);
     expect(find.textContaining('/Users/'), findsNothing);
+  });
+
+  /// **Syncing is offered inside a share, not at the top of one.** At the top
+  /// level there is no single folder to sync, and a button there would promise
+  /// "everything they share" — a much larger commitment than it can keep.
+  testWidgets('the sync action appears only once inside a folder', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    expect(
+      find.byIcon(Icons.sync),
+      findsNothing,
+      reason: 'the share list is not a folder to sync',
+    );
   });
 }

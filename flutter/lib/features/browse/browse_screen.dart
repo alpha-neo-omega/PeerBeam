@@ -1,3 +1,4 @@
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
@@ -5,7 +6,7 @@ import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
 
-/// What another device shares, read-only.
+/// What another device shares, read-only — and where a folder sync is started.
 ///
 /// Navigation is by share-relative path, because that is what the wire carries:
 /// a device's real filesystem layout is not this device's business, and there
@@ -23,11 +24,54 @@ class _BrowseScreenState extends State<BrowseScreen> {
   String _path = '';
   BrowseListing? _listing;
   bool _loading = true;
+  bool _syncing = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) => _load(''));
+  }
+
+  /// Ask where to put it, then sync.
+  ///
+  /// Two-way, and the result says so: a sync that reported only "12 files" —
+  /// while quietly deleting one and leaving two conflicts — would be a summary
+  /// that hides the parts a person needs to act on.
+  Future<void> _startSync() async {
+    final api = AppScope.of(context).api;
+    if (api == null) return;
+    final into = await getDirectoryPath(confirmButtonText: 'Sync here');
+    if (into == null || !mounted) return;
+
+    setState(() => _syncing = true);
+    String message;
+    try {
+      final r = await api.syncFolder(widget.peer, _path, into);
+      if (r.isIdle) {
+        message = 'Already in sync';
+      } else {
+        final parts = <String>[
+          if (r.fetching > 0) '${r.fetching} in',
+          if (r.pushing > 0) '${r.pushing} out',
+          if (r.renamed > 0) '${r.renamed} moved',
+          if (r.deleted > 0) '${r.deleted} deleted',
+        ];
+        message = parts.isEmpty ? 'Syncing' : 'Syncing: ${parts.join(', ')}';
+        if (r.conflicts.isNotEmpty) {
+          // Named, not counted: a conflict is a decision, and "2 conflicts"
+          // tells nobody which files to look at.
+          message +=
+              ' — kept both copies of ${r.conflicts.length == 1 ? r.conflicts.single : r.conflicts.join(', ')}';
+        }
+      }
+    } catch (e) {
+      message = 'Sync failed: $e';
+    }
+    if (!mounted) return;
+    setState(() => _syncing = false);
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _load(String path) async {
@@ -59,6 +103,23 @@ class _BrowseScreenState extends State<BrowseScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.peer.name),
+        actions: [
+          // Offered only inside a share. At the top level `_path` is empty and
+          // there is no single folder to sync — syncing "everything they share"
+          // would be a much larger promise than this button can make.
+          if (_path.isNotEmpty)
+            IconButton(
+              onPressed: _syncing ? null : _startSync,
+              icon: _syncing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync),
+              tooltip: 'Sync this folder to a local directory',
+            ),
+        ],
         // The path, not a filesystem location — see the class doc.
         bottom: _path.isEmpty
             ? null
