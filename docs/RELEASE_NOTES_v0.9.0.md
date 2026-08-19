@@ -88,6 +88,9 @@ test runs and never once in isolation.
 | Android | APK | — |
 
 Signed installers (notarized DMG, signed MSIX) still await their signing secrets.
-The arm64 Windows and Linux GUI builds are new in this release; if one is missing
-from the assets, that leg did not build and the rest of the release went out
-without it rather than being withheld.
+
+**The arm64 GUI builds are not in this release.** Flutter publishes no arm64 SDK
+archive for Linux or Windows — its release manifest lists `x64` only — so the
+build could not start. The arm64 **CLI** for Linux and Windows did build and is
+attached, as is the macOS x64 CLI. The GUI on arm64 is being worked on; the
+release went out without it rather than being withheld.

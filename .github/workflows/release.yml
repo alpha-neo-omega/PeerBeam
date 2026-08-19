@@ -34,7 +34,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: subosito/flutter-action@v2
+        if: matrix.artifact != 'linux-arm64'
         with: { channel: stable }
+      # Flutter publishes **no arm64 SDK archive** — its release manifest lists
+      # `x64` only for Linux and Windows — so the setup action cannot install
+      # one and fails with "Unable to determine Flutter version ... architecture:
+      # arm64". A git checkout works instead: Flutter then downloads a Dart SDK
+      # matching the host, and Dart *does* publish linux-arm64.
+      - name: Flutter from source (arm64)
+        if: matrix.artifact == 'linux-arm64'
+        run: |
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+      - run: flutter --version
       - name: System deps
         run: |
           sudo apt-get update
@@ -79,7 +91,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: subosito/flutter-action@v2
+        if: matrix.artifact != 'windows-arm64'
         with: { channel: stable }
+      # Same missing-archive problem as Linux arm64, same workaround. Whether
+      # Flutter's Windows arm64 host support is complete enough to build is the
+      # open question this leg exists to answer — which is why it may fail
+      # without taking the release with it.
+      - name: Flutter from source (arm64)
+        if: matrix.artifact == 'windows-arm64'
+        run: |
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$env:USERPROFILE\flutter"
+          "$env:USERPROFILE\flutter\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: flutter --version
       - run: flutter config --enable-windows-desktop; cd flutter; flutter pub get
       - name: Package (MSIX)
         env:
