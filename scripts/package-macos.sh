@@ -4,7 +4,20 @@
 #   PB_NOTARY_PROFILE (a stored notarytool keychain profile).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VER="$(cat VERSION)"
+# In CI the tag is the source of truth; VERSION is the local fallback — the
+# same derivation `package-linux.sh` and `package-android.sh` use. Reading
+# VERSION *alone* is how v0.9.0 shipped a DMG named `PeerBeam-0.8.2.dmg`: the
+# file had been left behind by a hand-edited version bump, and macOS was the one
+# packager with no tag to correct it.
+VER="${GITHUB_REF_NAME:-}"
+VER="${VER#v}"
+# Only when the ref really is a version — `workflow_dispatch` passes a branch
+# name, which would produce `PeerBeam-main.dmg`.
+case "$VER" in
+  [0-9]*) ;;
+  *) VER="" ;;
+esac
+[ -n "$VER" ] || VER="$(cat VERSION)"
 
 echo "== build engine (universal: x86_64 + arm64) =="
 # The Flutter macOS app is a universal binary; the embedded engine must be too,
