@@ -1791,11 +1791,29 @@ impl Manager {
         } else {
             ChatDirection::In
         };
-        if let Err(e) = self
+        // Logged either way, and deliberately without the name: this reconcile
+        // is what stops a peer's claim standing unchallenged at the approval
+        // prompt, so "it did not apply" is a security-relevant outcome and
+        // silence about it is how a platform-specific failure hides. The name
+        // itself is not logged — a filename can be sensitive, and the ids are
+        // enough to follow what happened.
+        match self
             .chat
             .set_file_row_landing(&peer, &a.id, expected, name, size)
         {
-            tracing::warn!(error = %e, transfer_id = %a.id, "chat row landing not persisted");
+            Ok(true) => {
+                tracing::debug!(transfer_id = %a.id, peer = %peer.0, "chat row landing applied")
+            }
+            Ok(false) => tracing::warn!(
+                transfer_id = %a.id,
+                peer = %peer.0,
+                direction = ?expected,
+                name_empty = name.is_empty(),
+                "chat row landing did NOT apply — the row will keep the peer's claim"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, transfer_id = %a.id, peer = %peer.0, "chat row landing not persisted");
+            }
         }
     }
 

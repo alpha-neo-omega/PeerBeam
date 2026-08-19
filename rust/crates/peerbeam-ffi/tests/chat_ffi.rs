@@ -1374,6 +1374,33 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
             .find(|m| m["id"] == expected_id)
             .unwrap_or_else(|| panic!("no chat row under the shared id: {msgs:?}"));
         assert_eq!(row["status"], "pendingapproval", "still awaiting us");
+        // Diagnostics before the assertion, not after: this has failed on
+        // Windows while passing on Linux and macOS, and "left != right" alone
+        // says nothing about *which* step declined. The engine logs whether the
+        // reconcile applied and why, so print that with the row when they
+        // disagree — a failing test's captured output is shown by cargo, so one
+        // CI run answers what no amount of reading locally could.
+        if row["file"]["name"] != landed_name {
+            let logs = call_json(pb_logs_get, &json!({ "limit": 200 }));
+            let lines: Vec<String> = logs["data"]["logs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|l| {
+                            let m = l["message"].as_str().unwrap_or("");
+                            m.contains("landing") || m.contains("chat row")
+                        })
+                        .map(|l| format!("{} {}", l["level"], l["message"]))
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!("--- landing diagnostics ---");
+            eprintln!("peer read as: {sender_device_id}");
+            eprintln!("row: {row}");
+            eprintln!("landing log lines: {lines:#?}");
+            eprintln!("all rows: {msgs:#?}");
+            eprintln!("--- end diagnostics ---");
+        }
         assert_eq!(
             row["file"]["name"], landed_name,
             "the row must name the file that will land, not the one advertised"
