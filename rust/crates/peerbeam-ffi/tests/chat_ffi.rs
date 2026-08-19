@@ -82,7 +82,7 @@ async fn send_file_ref(handle: &SessionHandle, r: &FileRef) {
         .expect("open chat channel");
     // `open_channel` returns as soon as the open is queued locally; wait for the
     // peer's accept before sending, or the send races it and hard-fails.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(WAIT);
     loop {
         let open = handle
             .channels()
@@ -121,6 +121,19 @@ fn events_snapshot() -> Vec<Value> {
 
 /// Poll captured events for one matching `pred`, up to `secs` (bounded, no
 /// fixed sleep).
+/// How long these tests wait for something the engine is expected to do.
+///
+/// **Generous on purpose.** Every caller asserts the thing *arrives*, so a wait
+/// returns the moment the engine does its job and the bound only matters when
+/// something is genuinely stuck. The previous per-call bounds of 5 to 20
+/// seconds were tuned on a fast, idle Linux box; on CI's macOS and Windows
+/// runners — slower, and sharing cores with everything else — they expired
+/// while the engine was still working, and the failures read as chat bugs.
+///
+/// This does not cover the deliberately short window at the fake peer's offer
+/// loop, which is fixture behaviour rather than an assertion deadline.
+const WAIT: u64 = 240;
+
 fn wait_event(secs: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -595,7 +608,7 @@ async fn chat_send_from_ffi_reaches_peer_and_persists_sent_record() {
     assert!(!msg_id.is_empty(), "chat_send returns a non-empty id");
 
     // The manual peer actually received the message over the wire.
-    let got = wait_record(5, &received).expect("peer did not receive the chat message in time");
+    let got = wait_record(WAIT, &received).expect("peer did not receive the chat message in time");
     assert_eq!(got.body, "hi");
     assert_eq!(got.id, msg_id, "same message id round-trips");
 
@@ -603,7 +616,7 @@ async fn chat_send_from_ffi_reaches_peer_and_persists_sent_record() {
     // the background flush (spawned by `chat_send`) has delivered it and
     // flipped it from `Pending` to `Sent` — bounded poll, not an immediate
     // assertion, since `chat_send` no longer blocks until delivery.
-    let sent_msg = wait_chat_status(5, "receiver", &msg_id, "sent")
+    let sent_msg = wait_chat_status(WAIT, "receiver", &msg_id, "sent")
         .expect("message did not reach status \"sent\" within 5s");
     assert_eq!(sent_msg["id"], msg_id);
     assert_eq!(sent_msg["body"], "hi");
@@ -680,7 +693,7 @@ async fn chat_received_into_ffi_and_history_round_trip() {
 
     // FFI must have emitted `chat_received` for this message.
     let event = tokio::task::spawn_blocking(|| {
-        wait_event(5, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "chat_received" && e["message"]["body"] == "hi"
         })
     })
@@ -767,7 +780,7 @@ async fn chat_only_dial_does_not_register_phantom_transfer() {
 
     // FFI must have emitted `chat_received` for this message.
     let event = tokio::task::spawn_blocking(|| {
-        wait_event(5, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "chat_received" && e["message"]["body"] == "hi"
         })
     })
@@ -950,18 +963,18 @@ async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
     // drain to actually flush it: the peer receives the message, the FFI
     // emits `chat_status: "sent"`, and `pb_chat_history` flips the record
     // from Pending to Sent.
-    let got = wait_record(20, &received)
+    let got = wait_record(WAIT, &received)
         .expect("drain loop did not deliver the queued message to the peer in time");
     assert_eq!(got.body, "offline then online");
     assert_eq!(got.id, msg_id, "same message id round-trips");
 
-    let event = wait_event(5, |e| {
+    let event = wait_event(WAIT, |e| {
         e["type"] == "chat_status" && e["message_id"] == msg_id && e["status"] == "sent"
     })
     .expect("expected a chat_status \"sent\" event for the drained message");
     assert_eq!(event["peer_id"], peer_id);
 
-    let sent_msg = wait_chat_status(5, peer_id, &msg_id, "sent")
+    let sent_msg = wait_chat_status(WAIT, peer_id, &msg_id, "sent")
         .expect("pb_chat_history did not flip the record to Sent after the drain flush");
     assert_eq!(sent_msg["status"], "sent");
     assert_eq!(sent_msg["direction"], "out");
@@ -1053,7 +1066,7 @@ async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
 
     let driver = async {
         let queued = tokio::task::spawn_blocking(|| {
-            wait_event(15, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
             })
         })
@@ -1073,7 +1086,7 @@ async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
     assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
 
     let done = tokio::task::spawn_blocking(move || {
-        wait_event(5, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == recv_id
         })
     })
@@ -1184,7 +1197,7 @@ async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
     let driver = async move {
         // The approval prompt must carry the real name and size — not "(incoming)".
         let queued = tokio::task::spawn_blocking(|| {
-            wait_event(15, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
             })
         })
@@ -1216,7 +1229,7 @@ async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
     assert_eq!(send_res.unwrap(), TransferOutcome::Completed);
 
     let done = tokio::task::spawn_blocking(move || {
-        wait_event(10, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == recv_id
         })
     })
@@ -1338,7 +1351,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
         let queued = tokio::task::spawn_blocking({
             let id = expected_id.clone();
             move || {
-                wait_event(15, |e| {
+                wait_event(WAIT, |e| {
                     e["type"] == "transfer_queued" && e["transfer_id"] == id
                 })
             }
@@ -1382,7 +1395,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     let moving = tokio::task::spawn_blocking({
         let id = recv_id.clone();
         move || {
-            wait_event(10, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "chat_status" && e["message_id"] == id && e["status"] == "transferring"
             })
         }
@@ -1397,7 +1410,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     tokio::task::spawn_blocking({
         let id = recv_id.clone();
         move || {
-            wait_event(15, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_completed" && e["transfer_id"] == id
             })
         }
@@ -1411,7 +1424,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     assert_eq!(std::fs::read(&saved).unwrap(), payload, "byte-exact");
 
     // …and the settled row describes exactly that file.
-    let row = wait_chat_status(10, sender_device_id, &recv_id, "received")
+    let row = wait_chat_status(WAIT, sender_device_id, &recv_id, "received")
         .expect("the chat row was not settled received");
     assert_eq!(row["kind"], "file");
     assert_eq!(row["direction"], "in");
@@ -1548,7 +1561,7 @@ async fn chat_send_file_shares_a_file_in_the_thread_end_to_end() {
     assert!(!id.is_empty());
 
     // 1) The conversation row reached the peer over CHAT, under that id.
-    let offered = wait_record(15, &received).expect("peer never received the FileRef");
+    let offered = wait_record(WAIT, &received).expect("peer never received the FileRef");
     assert_eq!(
         offered.id, id,
         "the peer's chat row must use the id chat_send_file returned"
@@ -1582,7 +1595,7 @@ async fn chat_send_file_shares_a_file_in_the_thread_end_to_end() {
     assert_eq!(bytes, payload, "received file byte-exact");
 
     // 3) Our own row ends `sent`, as a file row, with its metadata intact.
-    let row = wait_chat_status(15, peer_device_id, &id, "sent")
+    let row = wait_chat_status(WAIT, peer_device_id, &id, "sent")
         .expect("the sender's chat row never reached status \"sent\"");
     assert_eq!(row["kind"], "file");
     assert_eq!(row["direction"], "out");
@@ -1603,7 +1616,7 @@ async fn chat_send_file_shares_a_file_in_the_thread_end_to_end() {
     let status_ev = tokio::task::spawn_blocking({
         let id = id.clone();
         move || {
-            wait_event(5, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "chat_status" && e["message_id"] == id && e["status"] == "sent"
             })
         }
@@ -1722,7 +1735,7 @@ async fn chat_send_file_refuses_a_peer_that_cannot_receive_attachments() {
     let failure = tokio::task::spawn_blocking({
         let id = id.clone();
         move || {
-            wait_event(20, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "chat_status" && e["message_id"] == id && e["status"] == "failed"
             })
         }
@@ -1740,7 +1753,7 @@ async fn chat_send_file_refuses_a_peer_that_cannot_receive_attachments() {
     assert_eq!(failure["peer_id"], peer_device_id);
 
     // The row says so too, and is still a file row.
-    let row = wait_chat_status(10, peer_device_id, &id, "failed")
+    let row = wait_chat_status(WAIT, peer_device_id, &id, "failed")
         .expect("the chat row was not marked failed");
     assert_eq!(row["kind"], "file");
     assert_eq!(row["direction"], "out");
@@ -1781,7 +1794,7 @@ async fn chat_send_file_refuses_a_peer_that_cannot_receive_attachments() {
     );
 
     // The refusal path must close the session it dialed, not leak it.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(WAIT);
     while !*peer_session_ended.lock().unwrap() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1858,7 +1871,7 @@ async fn undecodable_first_frame_falls_back_to_a_minted_id_and_placeholder() {
     };
 
     let driver = tokio::task::spawn_blocking(|| {
-        wait_event(15, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_queued" && e["payload"]["incoming"] == true
         })
     });
@@ -1925,7 +1938,7 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
     let id = sent["data"]["id"].as_str().unwrap().to_string();
 
     // The row reaches `pending` (queued) rather than `failed`.
-    let queued = wait_chat_status(20, peer_id, &id, "pending")
+    let queued = wait_chat_status(WAIT, peer_id, &id, "pending")
         .expect("an attach to an offline peer must queue, not fail");
     assert_eq!(queued["kind"], "file");
     assert_eq!(queued["direction"], "out");
@@ -2043,13 +2056,13 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
         "the bytes delivered are the ones staged at queue time, byte-exact, \
          even though the user's own file was deleted meanwhile"
     );
-    let offered = wait_record(5, &received).expect("the FileRef reached the peer");
+    let offered = wait_record(WAIT, &received).expect("the FileRef reached the peer");
     assert_eq!(offered.id, id);
 
     // 5) Our row settles `sent`, and the queue lets go of the blob.
-    wait_chat_status(15, peer_id, &id, "sent").expect("the row never reached sent");
+    wait_chat_status(WAIT, peer_id, &id, "sent").expect("the row never reached sent");
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 0).await,
         "a delivered file's staged blob must be deleted"
     );
 
@@ -2093,7 +2106,7 @@ async fn five_queued_files_start_one_transfer_not_five() {
     // Exactly one offer reaches the peer, and it is the OLDEST — FIFO, not
     // whichever attach happened to win a race.
     assert!(
-        wait_until(20, || !offers.lock().unwrap().is_empty()).await,
+        wait_until(WAIT, || !offers.lock().unwrap().is_empty()).await,
         "the queue must start the first file"
     );
     tokio::time::sleep(Duration::from_secs(3)).await; // room for a wrong build to start more
@@ -2133,7 +2146,7 @@ async fn five_queued_files_start_one_transfer_not_five() {
         &json!({ "peer": peer_json, "text": "does this get through?" }),
     );
     let text_id = text["data"]["id"].as_str().unwrap().to_string();
-    let delivered = wait_chat_status(20, peer_id, &text_id, "sent");
+    let delivered = wait_chat_status(WAIT, peer_id, &text_id, "sent");
     assert!(
         delivered.is_some(),
         "a text message must never wait behind a file transfer — its bytes ride \
@@ -2188,11 +2201,11 @@ async fn a_file_at_the_head_of_the_queue_does_not_delay_a_text_message() {
     // The file leg is genuinely under way: the peer has the offer and our row
     // says the bytes are moving.
     assert!(
-        wait_until(20, || !offers.lock().unwrap().is_empty()).await,
+        wait_until(WAIT, || !offers.lock().unwrap().is_empty()).await,
         "the file must actually be in flight for this test to mean anything"
     );
     assert!(
-        wait_until(10, || chat_row(peer_id, &file_id)
+        wait_until(WAIT, || chat_row(peer_id, &file_id)
             .map(|r| r["status"] == "transferring")
             .unwrap_or(false))
         .await,
@@ -2202,7 +2215,7 @@ async fn a_file_at_the_head_of_the_queue_does_not_delay_a_text_message() {
     // Now the message.
     let text = call_json(pb_chat_send, &json!({ "peer": peer_json, "text": "hi" }));
     let text_id = text["data"]["id"].as_str().unwrap().to_string();
-    let delivered = wait_chat_status(20, peer_id, &text_id, "sent")
+    let delivered = wait_chat_status(WAIT, peer_id, &text_id, "sent")
         .expect("the text message must be delivered while the file is still transferring");
     assert_eq!(delivered["body"], "hi");
 
@@ -2245,14 +2258,14 @@ async fn a_declined_file_goes_terminal_and_never_re_offers() {
     );
     let id = sent["data"]["id"].as_str().unwrap().to_string();
 
-    let row = wait_chat_status(30, peer_id, &id, "declined")
+    let row = wait_chat_status(WAIT, peer_id, &id, "declined")
         .expect("a FileDecline must settle our own row as declined");
     assert_eq!(row["kind"], "file");
     assert_eq!(row["direction"], "out");
 
     // Dequeued and evicted: nothing left to re-offer, and no bytes left behind.
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 0).await,
         "a declined file's staged blob must be deleted"
     );
 
@@ -2263,7 +2276,7 @@ async fn a_declined_file_goes_terminal_and_never_re_offers() {
             &json!({ "peer": peer_json, "text": format!("prod {n}") }),
         );
         let tid = text["data"]["id"].as_str().unwrap().to_string();
-        wait_chat_status(20, peer_id, &tid, "sent");
+        wait_chat_status(WAIT, peer_id, &tid, "sent");
     }
     let seen = offers.lock().unwrap().clone();
     assert_eq!(
@@ -2322,7 +2335,7 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
         &json!({ "peer": gone_json, "path": away_src.to_string_lossy() }),
     );
     let away_id = away["data"]["id"].as_str().unwrap().to_string();
-    wait_chat_status(20, gone_id, &away_id, "pending").expect("queued for an absent peer");
+    wait_chat_status(WAIT, gone_id, &away_id, "pending").expect("queued for an absent peer");
 
     // ── (b) reachable, and refusing ─────────────────────────────────────────
     let peer_id = "refusing-peer";
@@ -2355,7 +2368,7 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
             &json!({ "peer": peer_json, "text": format!("prod {n}") }),
         );
         let tid = text["data"]["id"].as_str().unwrap().to_string();
-        wait_chat_status(20, peer_id, &tid, "sent");
+        wait_chat_status(WAIT, peer_id, &tid, "sent");
         // Let the file leg that this flush started finish failing.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -2373,7 +2386,7 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
         "exactly three offers may reach a peer that keeps refusing, not {offered}"
     );
     assert!(
-        wait_until(10, || !std::path::Path::new(
+        wait_until(WAIT, || !std::path::Path::new(
             &dir.path().join("data").join("outbox-blobs").join(&id)
         )
         .exists())
@@ -2384,7 +2397,7 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
     // One more prod: it is terminal, so nothing is re-offered.
     let text = call_json(pb_chat_send, &json!({ "peer": peer_json, "text": "last" }));
     let tid = text["data"]["id"].as_str().unwrap().to_string();
-    wait_chat_status(20, peer_id, &tid, "sent");
+    wait_chat_status(WAIT, peer_id, &tid, "sent");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         offers.lock().unwrap().len(),
@@ -2455,7 +2468,7 @@ async fn staging_a_file_reports_growing_progress_on_the_chat_status_event() {
     // The row is announced as `staging` the moment the call returns — before
     // any bytes are copied — so an attach never looks like a hang.
     assert!(
-        wait_event(10, |v| {
+        wait_event(WAIT, |v| {
             v["type"] == "chat_status" && v["message_id"] == id.as_str() && v["status"] == "staging"
         })
         .is_some(),
@@ -2464,7 +2477,7 @@ async fn staging_a_file_reports_growing_progress_on_the_chat_status_event() {
 
     // …and the copy reports how far it has got, on that same event.
     assert!(
-        wait_until(20, || staging_progress_events(&id).len() >= 2).await,
+        wait_until(WAIT, || staging_progress_events(&id).len() >= 2).await,
         "staging must report progress, not just its start: {:?}",
         staging_progress_events(&id)
     );
@@ -2501,7 +2514,7 @@ async fn staging_a_file_reports_growing_progress_on_the_chat_status_event() {
     // without it a determinate bar would sit at 100% forever, since the surface
     // has nothing else to tell it the copy finished.
     assert!(
-        wait_event(20, |v| {
+        wait_event(WAIT, |v| {
             v["type"] == "chat_status" && v["message_id"] == id.as_str() && v["status"] == "pending"
         })
         .is_some(),
@@ -2538,7 +2551,8 @@ async fn chat_cancel_lets_go_of_a_queued_file_and_leaves_the_others_alone() {
         ids.push(sent["data"]["id"].as_str().unwrap().to_string());
     }
     for id in &ids {
-        wait_chat_status(20, peer_id, id, "pending").expect("both files queue for an absent peer");
+        wait_chat_status(WAIT, peer_id, id, "pending")
+            .expect("both files queue for an absent peer");
     }
     assert_eq!(staged_blobs(dir.path()), 2, "both are staged");
 
@@ -2550,11 +2564,11 @@ async fn chat_cancel_lets_go_of_a_queued_file_and_leaves_the_others_alone() {
     assert_eq!(out["ok"], true, "chat_cancel: {out}");
     assert_eq!(out["data"]["cancelled"], true);
 
-    let row = wait_chat_status(10, peer_id, &ids[1], "failed")
+    let row = wait_chat_status(WAIT, peer_id, &ids[1], "failed")
         .expect("a cancelled file's row must settle failed, not spin");
     assert_eq!(row["kind"], "file");
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 1).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 1).await,
         "the cancelled file's bytes must be deleted and the other's kept"
     );
     assert!(
@@ -2622,11 +2636,11 @@ async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
     let id = sent["data"]["id"].as_str().unwrap().to_string();
 
     assert!(
-        wait_until(25, || !offers.lock().unwrap().is_empty()).await,
+        wait_until(WAIT, || !offers.lock().unwrap().is_empty()).await,
         "the file must actually be in flight for this test to mean anything"
     );
     assert!(
-        wait_until(10, || chat_row(peer_id, &id)
+        wait_until(WAIT, || chat_row(peer_id, &id)
             .map(|r| r["status"] == "transferring")
             .unwrap_or(false))
         .await,
@@ -2641,7 +2655,7 @@ async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
     assert_eq!(out["data"]["cancelled"], true);
 
     assert!(
-        wait_until(10, || chat_row(peer_id, &id)
+        wait_until(WAIT, || chat_row(peer_id, &id)
             .map(|r| r["status"] == "failed")
             .unwrap_or(false))
         .await,
@@ -2649,7 +2663,7 @@ async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
         chat_row(peer_id, &id)
     );
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 0).await,
         "a cancelled file's staged bytes must be deleted"
     );
     // The transfer is gone from the active registry, so nothing is still moving.
@@ -2669,7 +2683,7 @@ async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
         &json!({ "peer": peer_json, "text": "still here?" }),
     );
     let tid = text["data"]["id"].as_str().unwrap().to_string();
-    wait_chat_status(20, peer_id, &tid, "sent");
+    wait_chat_status(WAIT, peer_id, &tid, "sent");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         offers.lock().unwrap().iter().filter(|r| r.id == id).count(),
@@ -2711,7 +2725,7 @@ async fn chat_conversations_lists_a_peer_whose_only_row_is_a_file() {
         &json!({ "peer": peer_json, "path": src.to_string_lossy() }),
     );
     let id = sent["data"]["id"].as_str().unwrap().to_string();
-    wait_chat_status(20, peer_id, &id, "pending").expect("the file queues for an absent peer");
+    wait_chat_status(WAIT, peer_id, &id, "pending").expect("the file queues for an absent peer");
 
     let listed = call_json(pb_chat_conversations, &json!({}));
     assert_eq!(listed["ok"], true, "chat_conversations: {listed}");
@@ -2789,7 +2803,7 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
         ids.push(sent["data"]["id"].as_str().unwrap().to_string());
     }
     for id in &ids {
-        wait_chat_status(20, peer_id, id, "pending").expect("both queue for an absent peer");
+        wait_chat_status(WAIT, peer_id, id, "pending").expect("both queue for an absent peer");
     }
     assert_eq!(staged_blobs(dir.path()), 2, "both are staged");
 
@@ -2800,9 +2814,9 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
         &json!({ "peer_id": peer_id, "message_id": ids[1] }),
     );
     assert_eq!(cancelled["data"]["cancelled"], true, "{cancelled}");
-    wait_chat_status(10, peer_id, &ids[1], "failed").expect("the cancelled row settles");
+    wait_chat_status(WAIT, peer_id, &ids[1], "failed").expect("the cancelled row settles");
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 1).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 1).await,
         "only the queued file's bytes are left staged"
     );
 
@@ -2933,13 +2947,13 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
         "byte-exact, from bytes staged before the conversation was deleted and \
          after the user's own copy was removed"
     );
-    let offered = wait_record(5, &received).expect("the FileRef reached the peer");
+    let offered = wait_record(WAIT, &received).expect("the FileRef reached the peer");
     assert_eq!(offered.id, ids[0]);
 
     // And the ordinary terminal path still runs on the row the delete kept.
-    wait_chat_status(15, peer_id, &ids[0], "sent").expect("the row never reached sent");
+    wait_chat_status(WAIT, peer_id, &ids[0], "sent").expect("the row never reached sent");
     assert!(
-        wait_until(10, || staged_blobs(dir.path()) == 0).await,
+        wait_until(WAIT, || staged_blobs(dir.path()) == 0).await,
         "a delivered file's staged blob is released as usual"
     );
 

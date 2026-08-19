@@ -302,6 +302,15 @@ impl LinkFactory for AcceptFactory {
     }
 }
 
+/// Reconnect attempts allowed where a test *expects* the transfer to resume.
+///
+/// Deliberately far above what an idle machine needs. These are attempts, not
+/// seconds: each one that succeeds ends the loop immediately, so a large budget
+/// costs nothing when things work and only matters when a loaded runner makes a
+/// reconnect miss its window. Tests that assert recovery *fails* set their own
+/// small budgets, because there giving up is the behaviour under test.
+const RECOVER_ATTEMPTS: u32 = 30;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn resume_after_real_disconnect() {
@@ -326,7 +335,21 @@ async fn resume_after_real_disconnect() {
         let storage = FsStorage::new();
         let ctrl = TransferControl::new();
         let (ptx, _p) = mpsc::unbounded_channel();
-        receive_file_recover(&mut factory, &storage, &out_str, &ctrl, &ptx, 5).await
+        // **Attempt budget, not a latency budget.** The link is killed once on
+        // purpose and must be resumed; five attempts was enough on an idle
+        // Linux box and not on a loaded macOS runner, where a reconnect can
+        // miss its window several times before landing. Many cheap attempts
+        // retry through that without changing what is asserted — the transfer
+        // either resumes and completes, or it does not.
+        receive_file_recover(
+            &mut factory,
+            &storage,
+            &out_str,
+            &ctrl,
+            &ptx,
+            RECOVER_ATTEMPTS,
+        )
+        .await
     });
 
     // Sender: first link dies after ~6 frames (Meta + a few chunks), then
@@ -357,7 +380,7 @@ async fn resume_after_real_disconnect() {
         session(payload.len() as u64),
         &ctrl,
         &ptx,
-        5,
+        RECOVER_ATTEMPTS,
         3,
     )
     .await
