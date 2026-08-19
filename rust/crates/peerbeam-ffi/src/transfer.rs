@@ -3374,6 +3374,7 @@ impl Manager {
                 path: f.path.clone(),
                 size: f.size,
                 version: f.version.clone(),
+                content: f.content.clone(),
                 deleted: f.deleted,
             })
             .collect();
@@ -3412,6 +3413,7 @@ impl Manager {
 
         Ok(json!({
             "fetching": outcome.fetching,
+            "renamed": outcome.renamed,
             "pushing": outcome.pushing,
             "deleted": outcome.deleted,
             "conflicts": outcome.conflicts,

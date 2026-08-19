@@ -26,6 +26,12 @@ pub enum Action {
     /// under a conflict name and ours is left exactly where it is — see
     /// [`conflict_name`].
     Conflict { path: String, keep_as: String },
+    /// The peer has this file under a new name and we already hold the bytes.
+    ///
+    /// Moving a local file costs nothing; fetching it again costs the whole
+    /// file. Emitted instead of a `Fetch`/`Delete` pair when the content hashes
+    /// say they are the same bytes.
+    Rename { from: String, to: String },
 }
 
 /// One file as a peer describes it.
@@ -34,6 +40,11 @@ pub struct RemoteFile {
     pub path: String,
     pub size: u64,
     pub version: VersionVector,
+    /// The peer's content hash, if it sent one. Empty means "cannot say", and
+    /// an empty hash never pairs — a re-send costs bandwidth, a wrong pairing
+    /// costs the file.
+    #[serde(default)]
+    pub content: String,
     #[serde(default)]
     pub deleted: bool,
 }
@@ -63,6 +74,87 @@ pub fn conflict_name(path: &str, peer: &str) -> String {
 /// the peer, for conflict file names.
 #[must_use]
 pub fn reconcile(
+    local: &BTreeMap<String, IndexEntry>,
+    remote: &[RemoteFile],
+    peer: &str,
+) -> Vec<Action> {
+    let actions = reconcile_raw(local, remote, peer);
+    collapse_renames(local, remote, actions)
+}
+
+/// Turn a `Fetch` and a `Delete` that describe the same bytes into a `Rename`.
+///
+/// Run **after** reconciliation rather than inside it: whether two paths hold
+/// the same content is a question about bytes, and whether a file should move
+/// at all is a question about versions. Keeping them apart means the version
+/// logic never has to know about hashes, and this pass never has to know about
+/// vectors.
+#[must_use]
+fn collapse_renames(
+    local: &BTreeMap<String, IndexEntry>,
+    remote: &[RemoteFile],
+    actions: Vec<Action>,
+) -> Vec<Action> {
+    let remote_hash: BTreeMap<&str, &str> = remote
+        .iter()
+        .map(|f| (f.path.as_str(), f.content.as_str()))
+        .collect();
+
+    // Candidates: files we are about to delete, and files we are about to
+    // fetch, each with the content hash of the bytes involved.
+    let deleting: Vec<(String, String)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Delete { path } => {
+                let h = local.get(path).map(|e| e.content.clone())?;
+                (!h.is_empty()).then(|| (path.clone(), h))
+            }
+            _ => None,
+        })
+        .collect();
+    let fetching: Vec<(String, String)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Fetch { path } => {
+                let h = remote_hash.get(path.as_str())?;
+                (!h.is_empty()).then(|| (path.clone(), (*h).to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let (renames, _, _) = crate::rename::detect(&deleting, &fetching);
+    if renames.is_empty() {
+        return actions;
+    }
+
+    let moved_from: BTreeMap<&str, &str> = renames
+        .iter()
+        .map(|r| (r.from.as_str(), r.to.as_str()))
+        .collect();
+    let moved_to: std::collections::BTreeSet<&str> =
+        renames.iter().map(|r| r.to.as_str()).collect();
+
+    let mut out = Vec::with_capacity(actions.len());
+    for action in actions {
+        match &action {
+            // The delete becomes the rename; the matching fetch disappears.
+            Action::Delete { path } if moved_from.contains_key(path.as_str()) => {
+                out.push(Action::Rename {
+                    from: path.clone(),
+                    to: moved_from[path.as_str()].to_string(),
+                });
+            }
+            Action::Fetch { path } if moved_to.contains(path.as_str()) => {}
+            _ => out.push(action),
+        }
+    }
+    out
+}
+
+/// Reconciliation proper, before renames are collapsed.
+#[must_use]
+fn reconcile_raw(
     local: &BTreeMap<String, IndexEntry>,
     remote: &[RemoteFile],
     peer: &str,
@@ -174,8 +266,39 @@ mod tests {
             path: path.to_string(),
             size: 1,
             version: v,
+            content: String::new(),
             deleted,
         }
+    }
+
+    /// A remote file that also states its content hash.
+    fn remote_with(path: &str, v: VersionVector, content: &str) -> RemoteFile {
+        RemoteFile {
+            path: path.to_string(),
+            size: 1,
+            version: v,
+            content: content.to_string(),
+            deleted: false,
+        }
+    }
+
+    fn local_with(entries: &[(&str, VersionVector, bool, &str)]) -> BTreeMap<String, IndexEntry> {
+        entries
+            .iter()
+            .map(|(p, v, deleted, content)| {
+                (
+                    (*p).to_string(),
+                    IndexEntry {
+                        path: (*p).to_string(),
+                        size: 1,
+                        modified: 0,
+                        content: (*content).to_string(),
+                        version: v.clone(),
+                        deleted: *deleted,
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -290,6 +413,75 @@ mod tests {
         // Telling a peer "this file you never had is gone" is noise.
         let acts = reconcile(&local(&[("a", vv(&[("me", 2)]), true)]), &[], "bob");
         assert!(acts.is_empty());
+    }
+
+    /// **A move is a move, not a re-download.** The peer deleted `old` and has
+    /// `new` with the same bytes; we already hold those bytes, so the file is
+    /// renamed rather than fetched.
+    #[test]
+    fn a_delete_and_a_fetch_of_the_same_bytes_become_a_rename() {
+        let acts = reconcile(
+            &local_with(&[("old.txt", vv(&[("bob", 1)]), false, "sha-of-bytes")]),
+            &[
+                remote("old.txt", vv(&[("bob", 2)]), true),
+                remote_with("new.txt", vv(&[("bob", 2)]), "sha-of-bytes"),
+            ],
+            "bob",
+        );
+        assert_eq!(
+            acts,
+            vec![Action::Rename {
+                from: "old.txt".to_string(),
+                to: "new.txt".to_string(),
+            }],
+            "the move was not collapsed: {acts:?}"
+        );
+    }
+
+    /// Different bytes are never collapsed, however suggestive the timing. A
+    /// wrong pairing costs the file; a re-send costs bandwidth.
+    #[test]
+    fn a_delete_and_a_fetch_of_different_bytes_stay_separate() {
+        let acts = reconcile(
+            &local_with(&[("old.txt", vv(&[("bob", 1)]), false, "hash-a")]),
+            &[
+                remote("old.txt", vv(&[("bob", 2)]), true),
+                remote_with("new.txt", vv(&[("bob", 2)]), "hash-b"),
+            ],
+            "bob",
+        );
+        assert!(
+            acts.contains(&Action::Delete {
+                path: "old.txt".to_string()
+            }),
+            "{acts:?}"
+        );
+        assert!(
+            acts.contains(&Action::Fetch {
+                path: "new.txt".to_string()
+            }),
+            "{acts:?}"
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::Rename { .. })));
+    }
+
+    /// A peer that cannot state a content hash sends an empty one, and an empty
+    /// hash must never pair — otherwise every unhashed delete/fetch pair in one
+    /// sync would collapse into an arbitrary move.
+    #[test]
+    fn an_empty_content_hash_never_pairs() {
+        let acts = reconcile(
+            &local_with(&[("old.txt", vv(&[("bob", 1)]), false, "")]),
+            &[
+                remote("old.txt", vv(&[("bob", 2)]), true),
+                remote_with("new.txt", vv(&[("bob", 2)]), ""),
+            ],
+            "bob",
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::Rename { .. })),
+            "{acts:?}"
+        );
     }
 
     #[test]

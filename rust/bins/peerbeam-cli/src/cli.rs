@@ -514,8 +514,14 @@ pub struct SnippetArgs {
     pub title: Option<String>,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct SyncArgs {
+    /// Keep syncing, re-checking every INTERVAL seconds.
+    ///
+    /// A file is only acted on once it has stopped changing, so saving a large
+    /// file mid-poll does not sync a half-written copy.
+    #[arg(long, value_name = "SECONDS")]
+    pub watch: Option<u64>,
     /// Target device (id, name, or unambiguous name prefix).
     pub peer: String,
     /// Share-relative path on the device, e.g. `photos`.

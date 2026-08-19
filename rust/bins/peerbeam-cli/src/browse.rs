@@ -103,7 +103,93 @@ fn human_size(bytes: u64) -> String {
 /// transfers — so a `peerbeam receive` or daemon must be running to accept
 /// them, exactly as for any other file. Said plainly here because a sync that
 /// reported "12 files" and then delivered nothing would be baffling.
+/// `peerbeam sync`, once or continuously.
+///
+/// With `--watch` this runs until interrupted, re-checking on an interval. The
+/// **settling rule** is what makes that safe: a file is only acted on once its
+/// size and mtime have held still across two consecutive passes, so saving a
+/// large file part-way through a poll does not sync a half-written copy — and,
+/// more subtly, does not raise the version vector once per observation and
+/// manufacture a conflict out of an ordinary save.
 pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&str>) -> CliResult {
+    let Some(interval) = args.watch else {
+        return sync_once(ctx, args, path_override).await;
+    };
+    // Clamped: a zero or one-second poll would rescan and re-hash the folder
+    // continuously, costing more than the sync it is trying to notice.
+    let period = std::time::Duration::from_secs(interval.max(5));
+    ctx.line(&ctx.dim(&format!(
+        "watching every {}s — Ctrl-C to stop",
+        period.as_secs()
+    )));
+
+    let mut settling = peerbeam_sync::Settling::new();
+    loop {
+        let into = std::path::PathBuf::from(&args.into);
+        let observed = observe(&into);
+        let settled = settling.observe(&observed);
+        if settled.is_empty() && settling.unsettled() > 0 {
+            // Something is still being written. Waiting is the whole point.
+            tokio::time::sleep(period).await;
+            continue;
+        }
+        if let Err(e) = sync_once(ctx, args.clone(), path_override).await {
+            // A failed pass must not end the watch: the peer may simply be
+            // asleep, and a watcher that quits on the first unreachable device
+            // is one nobody can leave running.
+            ctx.line(&ctx.dim(&format!("sync failed, will retry: {e}")));
+        }
+        tokio::time::sleep(period).await;
+    }
+}
+
+/// Every file under `root`, as the settling rule wants to see it.
+fn observe(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observed)> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, peerbeam_sync::Observed)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else if meta.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push((
+                        rel.to_string_lossy().into_owned(),
+                        peerbeam_sync::Observed {
+                            size: meta.len(),
+                            modified: meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map_or(0, |d| d.as_secs() as i64),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+async fn sync_once(
+    ctx: &Ctx,
+    args: crate::cli::SyncArgs,
+    path_override: Option<&str>,
+) -> CliResult {
     let into = std::path::PathBuf::from(&args.into);
     if !into.is_dir() {
         return Err(CliError::NotFound(format!(
@@ -174,6 +260,7 @@ pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&
             path: f.path.clone(),
             size: f.size,
             version: f.version.clone(),
+            content: f.content.clone(),
             deleted: f.deleted,
         })
         .collect();
@@ -201,6 +288,7 @@ pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&
     if ctx.json {
         ctx.json_line(&serde_json::json!({
             "fetching": outcome.fetching,
+            "renamed": outcome.renamed,
             "pushing": outcome.pushing,
             "deleted": outcome.deleted,
             "conflicts": outcome.conflicts,
@@ -209,10 +297,11 @@ pub async fn sync(ctx: &Ctx, args: crate::cli::SyncArgs, path_override: Option<&
         return Ok(());
     }
     ctx.line(&format!(
-        "{} to fetch, {} to send, {} deleted",
+        "{} to fetch, {} to send, {} deleted, {} moved",
         ctx.bold(&outcome.fetching.to_string()),
         outcome.pushing,
-        outcome.deleted
+        outcome.deleted,
+        outcome.renamed
     ));
     if !outcome.conflicts.is_empty() {
         // Named individually, not counted. A conflict is a decision the user

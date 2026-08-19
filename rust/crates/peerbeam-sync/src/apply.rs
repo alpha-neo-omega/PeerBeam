@@ -13,6 +13,8 @@ use crate::version::VersionVector;
 /// What actually happened, for reporting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
+    /// Files moved locally instead of re-fetched.
+    pub renamed: usize,
     /// Files asked for from the peer.
     pub fetching: usize,
     /// Files offered to the peer.
@@ -45,6 +47,44 @@ pub fn apply_local(
 
     for action in actions {
         match action {
+            Action::Rename { from, to } => {
+                // Moving what we already hold, instead of fetching it again.
+                let src = root.join(from);
+                let dst = root.join(to);
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::rename(&src, &dst).is_ok() {
+                    // The index follows the bytes: the old path becomes a
+                    // tombstone and the new one inherits the content hash, so
+                    // the next scan sees a move rather than a delete and a
+                    // create all over again.
+                    if let Some(mut e) = known.get(from).cloned() {
+                        let content = e.content.clone();
+                        let version = e.version.clone();
+                        e.deleted = true;
+                        e.size = 0;
+                        index.put(folder, &e)?;
+                        index.put(
+                            folder,
+                            &IndexEntry {
+                                path: to.clone(),
+                                size: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                                modified: 0,
+                                content,
+                                version,
+                                deleted: false,
+                            },
+                        )?;
+                    }
+                    outcome.renamed += 1;
+                } else {
+                    // The move failed — a permission problem, a vanished
+                    // source. Fall back to fetching it, which is slower and
+                    // always works.
+                    outcome.fetching += 1;
+                }
+            }
             Action::Fetch { .. } => outcome.fetching += 1,
             Action::Push { .. } => outcome.pushing += 1,
             Action::Conflict { path, keep_as } => {

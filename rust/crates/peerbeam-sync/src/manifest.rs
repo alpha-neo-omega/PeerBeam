@@ -70,6 +70,13 @@ pub struct FileEntry {
     /// what it changed.
     #[serde(default)]
     pub version: crate::version::VersionVector,
+    /// SHA-256 of the file's bytes, hex, when the sender can state one.
+    ///
+    /// What makes a move recognisable across devices. `default` so a manifest
+    /// from a build without it still decodes — with an empty hash, which never
+    /// pairs, so the file is re-sent rather than wrongly matched.
+    #[serde(default)]
+    pub content: String,
     /// Whether this records a deletion rather than a file.
     #[serde(default)]
     pub deleted: bool,
@@ -284,6 +291,7 @@ mod tests {
             path: path.to_string(),
             size,
             modified,
+            content: String::new(),
             version: crate::version::VersionVector::new(),
             deleted: false,
         }

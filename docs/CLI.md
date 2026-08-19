@@ -285,6 +285,12 @@ Working now:
   now have to make. Needs both `browse` and `files` permissions from the peer,
   and incoming files arrive as ordinary transfers, so `peerbeam receive` or the
   daemon must be running to accept them.
+
+  Only the **changed parts** of a file cross the wire, reused from wherever you
+  already hold them. A file that was merely **moved or renamed** is moved
+  locally rather than fetched again. Add `--watch <seconds>` to keep syncing;
+  a file is acted on only once it has stopped changing, so saving a large file
+  mid-poll never syncs a half-written copy.
 - `browse <peer> [path]` — list what a device shares, read-only. Paths are
   share-relative (`photos/2026`). An empty listing is the same answer whether
   the device shares nothing, has not granted this machine the `browse`

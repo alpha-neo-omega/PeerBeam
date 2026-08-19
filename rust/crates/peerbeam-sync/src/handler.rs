@@ -296,12 +296,24 @@ pub fn build_with(
     path: &str,
     versions: Option<&std::collections::BTreeMap<String, crate::version::VersionVector>>,
 ) -> Manifest {
+    build_full(shares, path, versions, None)
+}
+
+/// [`build_with`], also stating each file's content hash so a peer can spot a
+/// move.
+#[must_use]
+pub fn build_full(
+    shares: &Shares,
+    path: &str,
+    versions: Option<&std::collections::BTreeMap<String, crate::version::VersionVector>>,
+    hashes: Option<&std::collections::BTreeMap<String, String>>,
+) -> Manifest {
     let Ok(root) = shares.resolve(path) else {
         return Manifest::denied(path);
     };
     let mut files = Vec::new();
     let mut truncated = false;
-    walk(&root, &root, &mut files, &mut truncated, versions);
+    walk(&root, &root, &mut files, &mut truncated, versions, hashes);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Manifest {
         path: path.to_string(),
@@ -317,6 +329,7 @@ fn walk(
     out: &mut Vec<FileEntry>,
     truncated: &mut bool,
     versions: Option<&std::collections::BTreeMap<String, crate::version::VersionVector>>,
+    hashes: Option<&std::collections::BTreeMap<String, String>>,
 ) {
     if *truncated {
         return;
@@ -341,7 +354,7 @@ fn walk(
             continue;
         }
         if meta.is_dir() {
-            walk(root, &path, out, truncated, versions);
+            walk(root, &path, out, truncated, versions, hashes);
         } else if meta.is_file() {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
@@ -349,6 +362,13 @@ fn walk(
             let rel_path = rel.to_string_lossy().into_owned();
             let version = versions
                 .and_then(|v| v.get(&rel_path))
+                .cloned()
+                .unwrap_or_default();
+            // Hashed from the chunk map when one is available — the map already
+            // covers every byte, so this costs a read the manifest was going to
+            // need anyway rather than a second pass over the file.
+            let content = hashes
+                .and_then(|h| h.get(&rel_path))
                 .cloned()
                 .unwrap_or_default();
             out.push(FileEntry {
@@ -359,6 +379,7 @@ fn walk(
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs() as i64),
+                content,
                 version,
                 deleted: false,
             });
