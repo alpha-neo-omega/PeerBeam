@@ -17,6 +17,7 @@ mod index;
 mod manifest;
 mod reconcile;
 mod rename;
+mod scan;
 mod version;
 
 pub use apply::{apply_local, Outcome};
@@ -29,4 +30,5 @@ pub use manifest::{
 };
 pub use reconcile::{conflict_name, reconcile, Action, RemoteFile};
 pub use rename::{detect as detect_renames, Rename};
+pub use scan::{Observed, Settling};
 pub use version::{Relation, VersionVector};
