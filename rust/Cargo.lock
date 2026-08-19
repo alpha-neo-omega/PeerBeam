@@ -1138,6 +1138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-chunk"
+version = "0.8.2"
+dependencies = [
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "peerbeam-cli"
 version = "0.8.2"
 dependencies = [
