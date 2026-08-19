@@ -22,15 +22,26 @@
 ///
 /// `path` is where the file landed; `peer` is the authenticated sender's device
 /// id. Both are passed as separate arguments, never interpolated into a string.
-pub fn run(hook: &str, path: &str, peer: &str) {
+/// Returns the spawned child, which production callers **ignore** — the hook is
+/// fire-and-forget, and nothing waits on it. It is returned only so a test can
+/// wait for the process it started instead of polling the filesystem and hoping:
+/// a test that sleeps is a test that fails under load for reasons unrelated to
+/// what it checks, which this one did.
+pub fn run(hook: &str, path: &str, peer: &str) -> Option<std::process::Child> {
     if hook.trim().is_empty() {
-        return;
+        return None;
     }
     // `spawn`, not `output`: a hook that blocks forever must not hold the
     // receive path open behind it.
     match std::process::Command::new(hook).arg(path).arg(peer).spawn() {
-        Ok(_) => tracing::debug!(hook, path, "receive hook started"),
-        Err(e) => tracing::warn!(error = %e, hook, "receive hook could not be started"),
+        Ok(child) => {
+            tracing::debug!(hook, path, "receive hook started");
+            Some(child)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, hook, "receive hook could not be started");
+            None
+        }
     }
 }
 
@@ -42,15 +53,15 @@ mod tests {
     fn an_empty_hook_is_a_no_op() {
         // The default. Nothing configured means nothing runs, and calling it is
         // not an error.
-        run("", "/tmp/x", "pb-bob");
-        run("   ", "/tmp/x", "pb-bob");
+        assert!(run("", "/tmp/x", "pb-bob").is_none());
+        assert!(run("   ", "/tmp/x", "pb-bob").is_none());
     }
 
     #[test]
     fn a_missing_program_does_not_panic_or_fail_the_receive() {
         // The file is already on disk. A hook that cannot start is a warning,
         // never a failure — failing the receive would be the worse outcome.
-        run("/definitely/not/a/program", "/tmp/x", "pb-bob");
+        assert!(run("/definitely/not/a/program", "/tmp/x", "pb-bob").is_none());
     }
 
     /// **The argument is an argument.** A file named like a shell command must
@@ -70,23 +81,15 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let hostile = "; rm -rf ~ #.txt";
-        run(script.to_str().unwrap(), hostile, "pb-bob");
+        let mut child = run(script.to_str().unwrap(), hostile, "pb-bob").expect("spawned");
+        // **Waited on, not polled.** An earlier version slept in a loop for the
+        // file to appear; under a full-workspace run a freshly spawned shell can
+        // take far longer than it does alone, so the test failed intermittently
+        // for reasons that had nothing to do with argument passing. Waiting is
+        // exact at any load.
+        let status = child.wait().expect("the hook could not be waited on");
+        assert!(status.success(), "the hook script itself failed: {status}");
 
-        // The hook runs detached, so this waits for it. Generously: under a
-        // full parallel test run a freshly spawned shell can take far longer
-        // than it does alone, and a tight window here made the test fail for
-        // reasons that had nothing to do with what it checks.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if out.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            out.exists(),
-            "the hook never ran — this test proves nothing if it times out"
-        );
         let seen = std::fs::read_to_string(&out).unwrap_or_default();
         assert_eq!(
             seen, hostile,

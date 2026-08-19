@@ -58,6 +58,8 @@ pub struct IndexEntry {
 #[derive(Clone)]
 pub struct SyncIndex {
     store: Arc<dyn AppStore>,
+    /// Chunk maps, so a rescan populates what delta transfer reads from.
+    chunks: crate::store::ChunkStore,
     /// This device's own id — the counter `bump` raises.
     device: String,
 }
@@ -66,9 +68,16 @@ impl SyncIndex {
     #[must_use]
     pub fn new(store: Arc<dyn AppStore>, device: &str) -> Self {
         SyncIndex {
+            chunks: crate::store::ChunkStore::new(store.clone()),
             store,
             device: device.to_string(),
         }
+    }
+
+    /// The chunk maps this index records as it scans.
+    #[must_use]
+    pub fn chunks(&self) -> &crate::store::ChunkStore {
+        &self.chunks
     }
 
     fn namespace(folder: &str) -> String {
@@ -98,6 +107,21 @@ impl SyncIndex {
             .map_err(|e| SyncError::Serialization(e.to_string()))
     }
 
+    /// Hash a file, record how it chunks, and return the content hash.
+    ///
+    /// A failure to store the map is not fatal: the file still syncs, just
+    /// whole rather than by delta. Losing an optimisation is a far better
+    /// outcome than failing a scan.
+    fn record_chunks(&self, folder: &str, path: &Path) -> String {
+        let Some((content, chunks)) = hash_and_chunk(path) else {
+            return String::new();
+        };
+        if !chunks.is_empty() {
+            let _ = self.chunks.put(folder, &content, &chunks);
+        }
+        content
+    }
+
     /// Bring the index in line with what is actually on disk, and report the
     /// paths this device is now responsible for having changed.
     ///
@@ -121,7 +145,7 @@ impl SyncIndex {
                     // Edited outside PeerBeam, or resurrected after a delete.
                     e.size = size;
                     e.modified = modified;
-                    e.content = content_hash(&root.join(&path));
+                    e.content = self.record_chunks(folder, &root.join(&path));
                     e.deleted = false;
                     e.version.bump(&self.device);
                     self.put(folder, &e)?;
@@ -136,7 +160,7 @@ impl SyncIndex {
                             path: path.clone(),
                             size,
                             modified,
-                            content: content_hash(&root.join(&path)),
+                            content: self.record_chunks(folder, &root.join(&path)),
                             version,
                             deleted: false,
                         },
@@ -162,6 +186,25 @@ impl SyncIndex {
         }
         Ok(changed)
     }
+}
+
+/// SHA-256 of a file's bytes **and** its chunk map, or `None` if unreadable.
+///
+/// Hashed and chunked in one pass: both need every byte of the file, and
+/// reading it twice would double the cost of a rescan for no benefit.
+fn hash_and_chunk(path: &Path) -> Option<(String, Vec<peerbeam_chunk::Chunk>)> {
+    // Chunking needs the whole file in memory to find content boundaries.
+    // Bounded deliberately: above the limit the file is hashed by streaming and
+    // no chunk map is produced, so it syncs whole rather than by delta. A
+    // multi-gigabyte file must never be loaded to save bandwidth on it.
+    const MAX_CHUNKABLE: u64 = 256 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_CHUNKABLE {
+        let h = content_hash(path);
+        return (!h.is_empty()).then_some((h, Vec::new()));
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some((peerbeam_chunk::hash(&bytes), peerbeam_chunk::split(&bytes)))
 }
 
 /// SHA-256 of a file's bytes, or empty if it cannot be read.
@@ -433,6 +476,49 @@ mod tests {
         );
         assert_eq!(renames.len(), 1, "the rename was not recognised");
         assert!(deleted.is_empty() && created.is_empty());
+    }
+
+    /// A rescan must leave behind everything delta transfer needs: without the
+    /// chunk map, a peer's request for "the parts I am missing" has nothing to
+    /// answer from and the file syncs whole.
+    #[test]
+    fn a_rescan_records_the_chunk_map_delta_transfer_reads_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        // Comfortably more than one average chunk, or it is a single chunk and
+        // proves nothing about mapping.
+        let mut bytes = Vec::new();
+        let mut x: u32 = 12345;
+        for _ in 0..(peerbeam_chunk::AVG_CHUNK * 8) {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            bytes.push((x >> 16) as u8);
+        }
+        std::fs::write(root.join("big.bin"), &bytes).unwrap();
+
+        let idx = index(dir.path());
+        idx.rescan("f", &root).unwrap();
+
+        let content = idx.load("f").unwrap()["big.bin"].content.clone();
+        let map = idx
+            .chunks()
+            .get("f", &content)
+            .expect("the rescan recorded no chunk map");
+        assert!(
+            map.len() > 1,
+            "a multi-chunk file mapped to {} chunk(s)",
+            map.len()
+        );
+        assert!(idx.chunks().have("f").contains(&map[0].hash));
+
+        // And the bytes are findable through the store, which is what a delta
+        // fetch actually calls.
+        let loaded = idx.load("f").unwrap();
+        let got = idx
+            .chunks()
+            .read("f", &root, &loaded, &map[1].hash)
+            .expect("a recorded chunk could not be read back");
+        assert_eq!(peerbeam_chunk::hash(&got), map[1].hash);
     }
 
     #[test]

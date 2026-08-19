@@ -1913,7 +1913,9 @@ impl Manager {
                 entry.get("path").and_then(Value::as_str),
                 entry.get("peer_id").and_then(Value::as_str),
             ) {
-                crate::hook::run(&hook, p, peer);
+                // Fire and forget: the child is dropped deliberately, since
+                // nothing about the completed transfer depends on it.
+                let _ = crate::hook::run(&hook, p, peer);
             }
         }
         {

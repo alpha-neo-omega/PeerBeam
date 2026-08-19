@@ -12,7 +12,8 @@ use peerbeam_domain::port::TrustStore;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
 use crate::manifest::{
-    FileEntry, FileRequest, Manifest, ManifestRequest, MAX_FILES, MSG_FILE_REQUEST, MSG_MANIFEST,
+    FileEntry, FileRequest, Manifest, ManifestRequest, MAX_FILES, MSG_CHUNKMAP,
+    MSG_CHUNKMAP_REQUEST, MSG_CHUNK_DATA, MSG_CHUNK_REQUEST, MSG_FILE_REQUEST, MSG_MANIFEST,
     MSG_MANIFEST_REQUEST,
 };
 
@@ -29,6 +30,11 @@ pub type SendFile = Arc<dyn Fn(std::path::PathBuf) + Send + Sync>;
 /// Delivers a manifest *this* device asked for to whoever is waiting.
 pub type IncomingSink = Arc<dyn Fn(Manifest) + Send + Sync>;
 
+/// Sends a chunk map back to the asking peer.
+pub type ChunkMapSink = Arc<dyn Fn(crate::manifest::ChunkMapResponse) + Send + Sync>;
+/// Sends one chunk's bytes back to the asking peer.
+pub type ChunkDataSink = Arc<dyn Fn(crate::manifest::ChunkData) + Send + Sync>;
+
 pub struct SyncHandler {
     shares: Shares,
     trust: Arc<dyn TrustStore>,
@@ -36,6 +42,12 @@ pub struct SyncHandler {
     answer: ManifestSink,
     send_file: SendFile,
     incoming: IncomingSink,
+    /// Answers to chunk questions the peer asked us.
+    chunk_map: ChunkMapSink,
+    chunk_data: ChunkDataSink,
+    /// Answers to chunk questions *we* asked, routed to whoever is waiting.
+    incoming_chunk_map: ChunkMapSink,
+    incoming_chunk: ChunkDataSink,
 }
 
 impl SyncHandler {
@@ -47,6 +59,38 @@ impl SyncHandler {
         send_file: SendFile,
         incoming: IncomingSink,
     ) -> (Arc<SyncHandler>, Arc<OnceLock<DeviceId>>) {
+        Self::with_chunks(
+            shares,
+            trust,
+            answer,
+            send_file,
+            incoming,
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        )
+    }
+
+    /// As [`new`](Self::new), plus the four chunk sinks that make delta
+    /// transfer work.
+    ///
+    /// Separate constructor rather than four more arguments on `new`: a caller
+    /// that does not do delta transfer — the CLI serving nothing, a test —
+    /// should not have to name four no-op closures to say so.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_chunks(
+        shares: Shares,
+        trust: Arc<dyn TrustStore>,
+        answer: ManifestSink,
+        send_file: SendFile,
+        incoming: IncomingSink,
+        chunk_map: ChunkMapSink,
+        chunk_data: ChunkDataSink,
+        incoming_chunk_map: ChunkMapSink,
+        incoming_chunk: ChunkDataSink,
+    ) -> (Arc<SyncHandler>, Arc<OnceLock<DeviceId>>) {
         let peer = Arc::new(OnceLock::new());
         let handler = Arc::new(SyncHandler {
             shares,
@@ -55,9 +99,38 @@ impl SyncHandler {
             answer,
             send_file,
             incoming,
+            chunk_map,
+            chunk_data,
+            incoming_chunk_map,
+            incoming_chunk,
         });
         (handler, peer)
     }
+}
+
+/// Split a file into chunks, or `None` if it cannot be read or is too large to
+/// hold in memory.
+///
+/// The ceiling is the same judgement the index makes: above it a file syncs
+/// whole rather than by delta, because loading a multi-gigabyte file to save
+/// bandwidth on it trades a real problem for a worse one.
+fn chunk_file(path: &std::path::Path) -> Option<Vec<peerbeam_chunk::Chunk>> {
+    const MAX_CHUNKABLE: u64 = 256 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_CHUNKABLE {
+        return None;
+    }
+    Some(peerbeam_chunk::split(&std::fs::read(path).ok()?))
+}
+
+/// Read `len` bytes at `offset`.
+fn read_range(path: &std::path::Path, offset: u64, len: u32) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 #[async_trait]
@@ -111,6 +184,84 @@ impl MessageHandler for SyncHandler {
                 };
                 if real.is_file() {
                     (self.send_file)(real);
+                }
+                Ok(())
+            }
+            MSG_CHUNKMAP_REQUEST => {
+                let req = crate::manifest::ChunkMapRequest::from_frame(&frame)
+                    .map_err(|e| SessionError::FrameDecode(e.to_string()))?;
+                // Describing a file by chunks says how big its pieces are and
+                // where they repeat, which is information about content — so it
+                // takes the same two grants as fetching the bytes, not the
+                // weaker browse-only one.
+                if !self.trust.may(peer, Permission::Browse)
+                    || !self.trust.may(peer, Permission::Files)
+                {
+                    (self.chunk_map)(crate::manifest::ChunkMapResponse {
+                        path: req.path.clone(),
+                        chunks: Vec::new(),
+                        denied: true,
+                    });
+                    return Ok(());
+                }
+                let chunks = self
+                    .shares
+                    .resolve(&req.path)
+                    .ok()
+                    .filter(|p| p.is_file())
+                    .and_then(|p| chunk_file(&p))
+                    .unwrap_or_default();
+                (self.chunk_map)(crate::manifest::ChunkMapResponse {
+                    path: req.path,
+                    chunks,
+                    denied: false,
+                });
+                Ok(())
+            }
+            MSG_CHUNK_REQUEST => {
+                let req = crate::manifest::ChunkRequest::from_frame(&frame)
+                    .map_err(|e| SessionError::FrameDecode(e.to_string()))?;
+                if !self.trust.may(peer, Permission::Browse)
+                    || !self.trust.may(peer, Permission::Files)
+                {
+                    return Ok(());
+                }
+                let Ok(real) = self.shares.resolve(&req.path) else {
+                    return Ok(());
+                };
+                if !real.is_file() {
+                    return Ok(());
+                }
+                // Bounded per request, so one message cannot ask a peer to read
+                // an unbounded amount of its own disk back at the asker.
+                const MAX_PER_REQUEST: usize = 64;
+                let Some(chunks) = chunk_file(&real) else {
+                    return Ok(());
+                };
+                for hash in req.hashes.iter().take(MAX_PER_REQUEST) {
+                    // Served **only** from the file that was asked about. A
+                    // request naming one path must never return bytes from
+                    // another, or the path check above would mean nothing.
+                    if let Some(c) = chunks.iter().find(|c| &c.hash == hash) {
+                        if let Some(bytes) = read_range(&real, c.offset, c.len) {
+                            (self.chunk_data)(crate::manifest::ChunkData {
+                                hash: hash.clone(),
+                                bytes,
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+            MSG_CHUNKMAP => {
+                if let Ok(m) = crate::manifest::ChunkMapResponse::from_frame(&frame) {
+                    (self.incoming_chunk_map)(m);
+                }
+                Ok(())
+            }
+            MSG_CHUNK_DATA => {
+                if let Ok(d) = crate::manifest::ChunkData::from_frame(&frame) {
+                    (self.incoming_chunk)(d);
                 }
                 Ok(())
             }

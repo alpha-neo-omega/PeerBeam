@@ -8,6 +8,14 @@ use peerbeam_domain::session::{ChannelId, MessageFlags, MessageType, SessionFram
 /// MessageType ids within the Sync channel namespace.
 pub const MSG_MANIFEST_REQUEST: u16 = 1;
 pub const MSG_MANIFEST: u16 = 2;
+/// Ask how a file splits into chunks.
+pub const MSG_CHUNKMAP_REQUEST: u16 = 4;
+/// The answer: the file's chunk map.
+pub const MSG_CHUNKMAP: u16 = 5;
+/// Ask for specific chunks by content hash.
+pub const MSG_CHUNK_REQUEST: u16 = 6;
+/// One chunk's bytes.
+pub const MSG_CHUNK_DATA: u16 = 7;
 pub const MSG_FILE_REQUEST: u16 = 3;
 
 /// Most files one manifest describes.
@@ -154,6 +162,77 @@ pub fn plan(manifest: &Manifest, local_root: &std::path::Path) -> Plan {
     Plan { fetch, up_to_date }
 }
 
+/// Ask a peer how one of its files splits into chunks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkMapRequest {
+    /// Share-relative path of the file.
+    pub path: String,
+}
+
+/// A peer's answer: how a file is built from chunks.
+///
+/// An **empty** map is a valid answer meaning "I cannot describe this by
+/// chunks" — the file is too large to chunk in memory, or the peer predates
+/// delta transfer. The requester falls back to fetching the whole file, which
+/// is slower and always correct.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkMapResponse {
+    pub path: String,
+    pub chunks: Vec<peerbeam_chunk::Chunk>,
+    /// Whether the peer refused. Indistinguishable from "no such file" on
+    /// purpose, exactly as a denied listing is: a caller able to tell them
+    /// apart could map a filesystem it may never see.
+    #[serde(default)]
+    pub denied: bool,
+}
+
+/// Ask for specific chunks, by content hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkRequest {
+    pub path: String,
+    /// Hashes wanted. Bounded by the sender so one request cannot ask a peer to
+    /// read an unbounded amount of its disk.
+    pub hashes: Vec<String>,
+}
+
+/// One chunk's bytes, in answer to a [`ChunkRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkData {
+    /// The content hash these bytes claim to be. **Claims**: a receiver must
+    /// verify rather than trust it, which is why `reassemble` re-hashes every
+    /// chunk before writing it.
+    pub hash: String,
+    /// Base64 would cost a third more; hex is used everywhere else in this
+    /// protocol and reads the same in a log.
+    #[serde(with = "hex_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+/// Hex encoding for chunk payloads.
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(v.len() * 2);
+        for b in v {
+            let _ = write!(out, "{b:02x}");
+        }
+        s.serialize_str(&out)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() % 2 != 0 {
+            return Err(serde::de::Error::custom("odd-length hex"));
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 macro_rules! wire {
     ($t:ty, $id:expr) => {
         impl $t {
@@ -190,6 +269,10 @@ macro_rules! wire {
 wire!(ManifestRequest, MSG_MANIFEST_REQUEST);
 wire!(Manifest, MSG_MANIFEST);
 wire!(FileRequest, MSG_FILE_REQUEST);
+wire!(ChunkMapRequest, MSG_CHUNKMAP_REQUEST);
+wire!(ChunkMapResponse, MSG_CHUNKMAP);
+wire!(ChunkRequest, MSG_CHUNK_REQUEST);
+wire!(ChunkData, MSG_CHUNK_DATA);
 
 #[cfg(test)]
 mod tests {
