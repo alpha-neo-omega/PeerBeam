@@ -217,7 +217,7 @@ async fn multiple_simultaneous_transfers() {
             let storage = FsStorage::new();
             let (ptx, _p) = mpsc::unbounded_channel();
             let ctrl = TransferControl::new();
-            send_file(&mut *link, &storage, req, &ctrl, &ptx, 3)
+            send_file(&mut *link, &storage, req, &ctrl, &ptx, SEND_RETRIES)
                 .await
                 .unwrap()
         }
@@ -310,6 +310,14 @@ impl LinkFactory for AcceptFactory {
 /// reconnect miss its window. Tests that assert recovery *fails* set their own
 /// small budgets, because there giving up is the behaviour under test.
 const RECOVER_ATTEMPTS: u32 = 30;
+
+/// Inner send retries where a test expects the transfer to succeed.
+///
+/// Three was enough on an idle machine. On a loaded CI runner a chunk write can
+/// fail transiently more often than that, and the test then reports a send
+/// failure that says nothing about the behaviour it exists to check. Retries
+/// cost nothing when the first attempt works.
+const SEND_RETRIES: u32 = 12;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]

@@ -1382,14 +1382,15 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
         // CI run answers what no amount of reading locally could.
         if row["file"]["name"] != landed_name {
             let logs = call_json(pb_logs_get, &json!({ "limit": 200 }));
+            // Unfiltered. The first diagnostic round filtered for "landing"
+            // and got an empty list, which could mean either "the reconcile
+            // never ran" or "it ran, logged at debug, and the default
+            // `peerbeam=info` filter dropped the line". Printing everything
+            // removes that ambiguity at the cost of some noise.
             let lines: Vec<String> = logs["data"]["logs"]
                 .as_array()
                 .map(|a| {
                     a.iter()
-                        .filter(|l| {
-                            let m = l["message"].as_str().unwrap_or("");
-                            m.contains("landing") || m.contains("chat row")
-                        })
                         .map(|l| format!("{} {}", l["level"], l["message"]))
                         .collect()
                 })
@@ -1397,7 +1398,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
             eprintln!("--- landing diagnostics ---");
             eprintln!("peer read as: {sender_device_id}");
             eprintln!("row: {row}");
-            eprintln!("landing log lines: {lines:#?}");
+            eprintln!("captured log lines ({}): {lines:#?}", lines.len());
             eprintln!("all rows: {msgs:#?}");
             eprintln!("--- end diagnostics ---");
         }

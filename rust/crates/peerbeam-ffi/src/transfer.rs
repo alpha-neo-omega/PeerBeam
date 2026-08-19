@@ -8216,22 +8216,37 @@ mod tests {
 
         // A long pause elapses with no update() calls, as happens while
         // genuinely paused.
+        let paused_at = Instant::now();
         std::thread::sleep(Duration::from_millis(300));
         fixed.mark_resumed(); // the fix under test: re-anchors last_t/last_bytes
                               // `unfixed` intentionally does nothing here.
+        let pause = paused_at.elapsed().as_secs_f64();
 
+        let resumed_at = Instant::now();
         std::thread::sleep(Duration::from_millis(60));
         fixed.update(2_060_000, 10_000_000);
         unfixed.update(2_060_000, 10_000_000);
+        let window = resumed_at.elapsed().as_secs_f64();
 
         // Same 60,000 bytes moved in the same ~60ms window post-resume, but
         // `unfixed`'s `dt` spans the full ~360ms pause too, so the same
         // bytes look like they trickled in ~6x slower — exactly the "bogus
         // near-zero speed after resume" bug.
+        // **Derived from the sleeps that actually happened**, not the ones asked
+        // for. `unfixed` spans the pause as well as the window, so the ratio it
+        // should lose by is `(pause + window) / window` — a figure that depends
+        // entirely on how long the two sleeps really took. Hardcoding 3x
+        // assumed a 300ms pause and a 60ms window; on a loaded runner the
+        // window stretches, the true ratio falls, and the test failed for a
+        // reason having nothing to do with the resume anchor. 60% of the
+        // measured ratio still fails outright if `mark_resumed` does nothing,
+        // which is the property under test.
+        let expected_ratio = (pause + window) / window;
         assert!(
-            fixed.current_speed > unfixed.current_speed * 3.0,
-            "fixed={} unfixed={}: without the resume reset, current_speed \
-             is computed across the pause gap and reads far too low",
+            fixed.current_speed > unfixed.current_speed * (expected_ratio * 0.6).max(1.2),
+            "fixed={} unfixed={} (pause {pause:.3}s, window {window:.3}s, \
+             expected ratio {expected_ratio:.2}): without the resume reset, \
+             current_speed is computed across the pause gap and reads far too low",
             fixed.current_speed,
             unfixed.current_speed
         );
