@@ -43,8 +43,12 @@ import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
-const _bob = PeerTarget(id: 'pb-bob', name: 'Bob', addresses: ['10.0.0.2'],
-    port: 4000);
+const _bob = PeerTarget(
+  id: 'pb-bob',
+  name: 'Bob',
+  addresses: ['10.0.0.2'],
+  port: 4000,
+);
 
 /// A fake system clipboard: what `Clipboard.getData`/`setData` would touch.
 class _FakeClipboard {
@@ -294,25 +298,28 @@ void main() {
       );
     });
 
-    test('whatever was already on the clipboard at start is not sent', () async {
-      // Flipping the toggle must not sync a buffer the user had forgotten
-      // about — quite possibly the password they pasted five minutes ago.
-      final f = _service(initialClipboard: 'a password from earlier');
-      addTearDown(f.svc.dispose);
-      f.svc.start();
-      await _settle();
+    test(
+      'whatever was already on the clipboard at start is not sent',
+      () async {
+        // Flipping the toggle must not sync a buffer the user had forgotten
+        // about — quite possibly the password they pasted five minutes ago.
+        final f = _service(initialClipboard: 'a password from earlier');
+        addTearDown(f.svc.dispose);
+        f.svc.start();
+        await _settle();
 
-      await f.svc.poll();
-      await _settle();
+        await f.svc.poll();
+        await _settle();
 
-      expect(f.api.clipboardPushes, isEmpty);
+        expect(f.api.clipboardPushes, isEmpty);
 
-      // The next genuine copy still syncs.
-      f.clip.text = 'something new';
-      await f.svc.poll();
-      await _settle();
-      expect(f.api.clipboardPushes.single.text, 'something new');
-    });
+        // The next genuine copy still syncs.
+        f.clip.text = 'something new';
+        await f.svc.poll();
+        await _settle();
+        expect(f.api.clipboardPushes.single.text, 'something new');
+      },
+    );
 
     test('with no peers, nothing is pushed', () async {
       final f = _service(peers: const []);
@@ -468,11 +475,7 @@ void main() {
       f.svc.notices.listen(seen.add);
 
       f.api.emit(
-        const ClipboardReceived(
-          deviceId: 'pb-bob',
-          text: secret,
-          sentAt: 't',
-        ),
+        const ClipboardReceived(deviceId: 'pb-bob', text: secret, sentAt: 't'),
       );
       await _settle();
 
@@ -522,10 +525,7 @@ void main() {
       await tester.pumpWidget(_settingsApp(settings));
       await tester.pumpAndSettle();
 
-      expect(
-        find.text('Sync clipboard with trusted devices'),
-        findsOneWidget,
-      );
+      expect(find.text('Sync clipboard with trusted devices'), findsOneWidget);
       // The warning, pinned verbatim. Asserting the whole sentence rather than
       // a keyword is deliberate: a softened rewrite that still happened to
       // contain "passwords" would slip past a looser check.

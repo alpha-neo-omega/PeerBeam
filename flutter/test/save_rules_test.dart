@@ -52,7 +52,10 @@ Future<AppState> _open(
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: SettingsScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: SettingsScreen()),
+    ),
   );
   await tester.pump();
   await state.settings.load(fake);
@@ -71,28 +74,29 @@ void main() {
   /// not choose whether. Softening this to "rules for received files" would let
   /// the section read as an acceptance filter sitting one card below the
   /// auto-accept switch.
-  testWidgets('the section says a rule never decides whether a file is accepted', (
-    tester,
-  ) async {
-    final fake = FakePeerBeam()
-      ..settings.addAll({'rules_supported': true, 'save_rules': const []});
-    await _open(tester, fake);
+  testWidgets(
+    'the section says a rule never decides whether a file is accepted',
+    (tester) async {
+      final fake = FakePeerBeam()
+        ..settings.addAll({'rules_supported': true, 'save_rules': const []});
+      await _open(tester, fake);
 
-    final copy = tester
-        .widgetList<Text>(find.byType(Text))
-        .map((t) => t.data ?? '')
-        .join(' ');
-    expect(
-      copy,
-      contains('never decide'),
-      reason: 'the section must disclaim acceptance in as many words',
-    );
-    expect(
-      copy,
-      contains('first rule that matches'),
-      reason: 'and state the tie-break, since ordering is the whole model',
-    );
-  });
+      final copy = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((t) => t.data ?? '')
+          .join(' ');
+      expect(
+        copy,
+        contains('never decide'),
+        reason: 'the section must disclaim acceptance in as many words',
+      );
+      expect(
+        copy,
+        contains('first rule that matches'),
+        reason: 'and state the tie-break, since ordering is the whole model',
+      );
+    },
+  );
 
   /// With no rules the section says where files go instead — the answer to
   /// "what happens to my files?" without needing to know rules exist.
@@ -160,10 +164,11 @@ void main() {
     ]);
     await tester.pumpAndSettle();
 
-    expect(fake.rulesWritten.map((r) => r.directory).toList(), [
-      '/srv/inbox',
-      '/srv/papers',
-    ], reason: 'the engine must receive the new order, not the old one');
+    expect(
+      fake.rulesWritten.map((r) => r.directory).toList(),
+      ['/srv/inbox', '/srv/papers'],
+      reason: 'the engine must receive the new order, not the old one',
+    );
     expect(state.settings.saveRules.first.directory, '/srv/inbox');
   });
 
@@ -189,7 +194,9 @@ void main() {
   /// destinations, and if it refuses, the list on screen must still be the list
   /// actually in force — otherwise the user believes files are being sorted
   /// that are not.
-  testWidgets('a rejected rule leaves the shown list unchanged', (tester) async {
+  testWidgets('a rejected rule leaves the shown list unchanged', (
+    tester,
+  ) async {
     final fake = FakePeerBeam()
       ..settings.addAll({
         'rules_supported': true,
@@ -221,25 +228,26 @@ void main() {
   /// Driven by the engine's `rules_supported`, not by a platform check in the
   /// UI: the engine is the one that knows whether it can write to an arbitrary
   /// absolute path, and a second opinion here could disagree with it.
-  testWidgets('an unsupported platform explains itself instead of showing an editor', (
-    tester,
-  ) async {
-    final fake = FakePeerBeam()
-      ..settings.addAll({'rules_supported': false, 'save_rules': const []});
-    await _open(tester, fake);
+  testWidgets(
+    'an unsupported platform explains itself instead of showing an editor',
+    (tester) async {
+      final fake = FakePeerBeam()
+        ..settings.addAll({'rules_supported': false, 'save_rules': const []});
+      await _open(tester, fake);
 
-    expect(find.text('Not available on this device'), findsOneWidget);
-    expect(find.text('Add rule'), findsNothing);
-    final copy = tester
-        .widgetList<Text>(find.byType(Text))
-        .map((t) => t.data ?? '')
-        .join(' ');
-    expect(
-      copy,
-      contains('cannot write to any other location'),
-      reason: 'the limitation must be explained, not merely applied',
-    );
-  });
+      expect(find.text('Not available on this device'), findsOneWidget);
+      expect(find.text('Add rule'), findsNothing);
+      final copy = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((t) => t.data ?? '')
+          .join(' ');
+      expect(
+        copy,
+        contains('cannot write to any other location'),
+        reason: 'the limitation must be explained, not merely applied',
+      );
+    },
+  );
 
   /// An engine that predates the field reports no `rules_supported`, and the
   /// UI must read that as "no", never as "yes". Offering an editor that cannot

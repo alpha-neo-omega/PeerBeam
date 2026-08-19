@@ -385,14 +385,20 @@ class _BulkApprovalBannerState extends State<_BulkApprovalBanner> {
 
 /// State → accent colour for the progress bar and status. Kept here (UI-only)
 /// so the shared model stays presentation-free.
+///
+/// [scheme] is read for its brightness as well as its roles: the success and
+/// warning greens/ambers are only legible on a light card once darkened, so
+/// asking `AppColors` for a fixed value here would put a 2:1 label back on the
+/// screen in light mode.
 Color _stateColor(TransferState s, ColorScheme scheme) => switch (s) {
-  TransferState.completed => AppColors.success,
+  TransferState.completed => AppColors.success(scheme.brightness),
   TransferState.failed => scheme.error,
   // Interrupted is a warning, not an error: nothing went wrong that the user
   // has to fix, and the bytes already moved are still there. Sharing the
   // paused colour is the honest reading — this is a transfer that stopped and
   // can go again.
-  TransferState.paused || TransferState.interrupted => AppColors.warning,
+  TransferState.paused ||
+  TransferState.interrupted => AppColors.warning(scheme.brightness),
   _ => scheme.primary,
 };
 

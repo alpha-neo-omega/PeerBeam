@@ -51,8 +51,11 @@ SdkPresence _presence(String id, {int? battery}) => SdkPresence(
   ageSeconds: 3,
 );
 
-Widget _card(Device d, [SdkPresence? p]) =>
-    MaterialApp(home: Scaffold(body: DeviceStatusCard(device: d, presence: p)));
+Widget _card(Device d, [SdkPresence? p]) => MaterialApp(
+  home: Scaffold(
+    body: DeviceStatusCard(device: d, presence: p),
+  ),
+);
 
 void main() {
   group('formatLatency', () {
@@ -78,39 +81,45 @@ void main() {
       expect(repo.devices.single.latencyMs, 12);
     });
 
-    test('a cleared measurement clears, rather than leaving the old one up', () async {
-      // The engine sends `latency_ms: null` when it holds a live link it
-      // cannot characterise. Keeping the previous figure would present a
-      // number from an earlier connection as if it described this one — and a
-      // `latencyMs ?? this.latencyMs` copy did exactly that, silently.
-      final fake = FakePeerBeam();
-      final repo = DiscoveryRepository(api: fake);
-      addTearDown(repo.dispose);
+    test(
+      'a cleared measurement clears, rather than leaving the old one up',
+      () async {
+        // The engine sends `latency_ms: null` when it holds a live link it
+        // cannot characterise. Keeping the previous figure would present a
+        // number from an earlier connection as if it described this one — and a
+        // `latencyMs ?? this.latencyMs` copy did exactly that, silently.
+        final fake = FakePeerBeam();
+        final repo = DiscoveryRepository(api: fake);
+        addTearDown(repo.dispose);
 
-      fake.emit(DeviceAdded(_sdkDevice('pb-bob')));
-      fake.emit(const DeviceLatencyChanged('pb-bob', 12));
-      await Future<void>.delayed(Duration.zero);
-      fake.emit(const DeviceLatencyChanged('pb-bob', null));
-      await Future<void>.delayed(Duration.zero);
+        fake.emit(DeviceAdded(_sdkDevice('pb-bob')));
+        fake.emit(const DeviceLatencyChanged('pb-bob', 12));
+        await Future<void>.delayed(Duration.zero);
+        fake.emit(const DeviceLatencyChanged('pb-bob', null));
+        await Future<void>.delayed(Duration.zero);
 
-      expect(repo.devices.single.latencyMs, isNull);
-    });
+        expect(repo.devices.single.latencyMs, isNull);
+      },
+    );
 
-    test('going offline does not discard the measurement of other fields', () async {
-      // `copyWith`'s sentinel must leave latency alone when only `online`
-      // moves — the whole reason the method exists is that update paths used
-      // to drop fields they forgot to re-list.
-      final fake = FakePeerBeam();
-      final repo = DiscoveryRepository(api: fake);
-      addTearDown(repo.dispose);
+    test(
+      'going offline does not discard the measurement of other fields',
+      () async {
+        // `copyWith`'s sentinel must leave latency alone when only `online`
+        // moves — the whole reason the method exists is that update paths used
+        // to drop fields they forgot to re-list.
+        final fake = FakePeerBeam();
+        final repo = DiscoveryRepository(api: fake);
+        addTearDown(repo.dispose);
 
-      fake.emit(DeviceAdded(_sdkDevice('pb-bob', latencyMs: 8)));
-      fake.emit(const DeviceStatusChanged('pb-bob', false));
-      await Future<void>.delayed(Duration.zero);
+        fake.emit(DeviceAdded(_sdkDevice('pb-bob', latencyMs: 8)));
+        fake.emit(const DeviceStatusChanged('pb-bob', false));
+        await Future<void>.delayed(Duration.zero);
 
-      expect(repo.devices.single.online, isFalse);
-      expect(repo.devices.single.latencyMs, 8);
-    });
+        expect(repo.devices.single.online, isFalse);
+        expect(repo.devices.single.latencyMs, 8);
+      },
+    );
   });
 
   group('DeviceStatusCard', () {
@@ -122,26 +131,30 @@ void main() {
       expect(find.text('12 ms round trip'), findsOneWidget);
     });
 
-    testWidgets('a device that shares nothing still shows the link we measured', (
-      tester,
-    ) async {
-      // The provenance split: the peer disclosed nothing, and this figure was
-      // never the peer's to disclose.
-      await tester.pumpWidget(_card(_device('pb-bob', latencyMs: 12)));
+    testWidgets(
+      'a device that shares nothing still shows the link we measured',
+      (tester) async {
+        // The provenance split: the peer disclosed nothing, and this figure was
+        // never the peer's to disclose.
+        await tester.pumpWidget(_card(_device('pb-bob', latencyMs: 12)));
 
-      expect(find.text('12 ms round trip'), findsOneWidget);
-      expect(find.text('Status not shared'), findsOneWidget);
-    });
+        expect(find.text('12 ms round trip'), findsOneWidget);
+        expect(find.text('Status not shared'), findsOneWidget);
+      },
+    );
 
-    testWidgets('a device we have not connected to shows no round trip at all', (
-      tester,
-    ) async {
-      // Not "0 ms", not "—". A link nobody measured has nothing to say.
-      await tester.pumpWidget(_card(_device('pb-bob'), _presence('pb-bob', battery: 64)));
+    testWidgets(
+      'a device we have not connected to shows no round trip at all',
+      (tester) async {
+        // Not "0 ms", not "—". A link nobody measured has nothing to say.
+        await tester.pumpWidget(
+          _card(_device('pb-bob'), _presence('pb-bob', battery: 64)),
+        );
 
-      expect(find.textContaining('round trip'), findsNothing);
-      expect(find.text('64%'), findsOneWidget);
-    });
+        expect(find.textContaining('round trip'), findsNothing);
+        expect(find.text('64%'), findsOneWidget);
+      },
+    );
 
     testWidgets('a sub-millisecond link reads as under a millisecond', (
       tester,
@@ -156,7 +169,10 @@ void main() {
       tester,
     ) async {
       await tester.pumpWidget(
-        _card(_device('pb-bob', latencyMs: 4), _presence('pb-bob', battery: 64)),
+        _card(
+          _device('pb-bob', latencyMs: 4),
+          _presence('pb-bob', battery: 64),
+        ),
       );
 
       expect(find.text('4 ms round trip'), findsOneWidget);

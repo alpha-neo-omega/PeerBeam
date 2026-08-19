@@ -74,8 +74,7 @@ class ChatRepository extends ChangeNotifier {
 
   /// Every conversation on disk, newest first. Empty until
   /// [refreshConversations] has run.
-  List<ChatConversation> get conversations =>
-      List.unmodifiable(_conversations);
+  List<ChatConversation> get conversations => List.unmodifiable(_conversations);
 
   /// How far the staging copy behind [messageId] has got, or null when this
   /// session has seen no progress for it — which is the ordinary state for the

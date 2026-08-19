@@ -25,10 +25,7 @@ const _laptop = SdkDevice(
 /// The [IconButton] carrying [tooltip] (which an IconButton renders as a
 /// descendant `Tooltip`, so `byTooltip` alone finds the wrong widget).
 IconButton _button(WidgetTester tester, String tooltip) => tester.widget(
-  find.ancestor(
-    of: find.byTooltip(tooltip),
-    matching: find.byType(IconButton),
-  ),
+  find.ancestor(of: find.byTooltip(tooltip), matching: find.byType(IconButton)),
 );
 
 void main() {
@@ -37,16 +34,17 @@ void main() {
   ) async {
     final state = AppState.live(FakePeerBeam());
     await tester.pumpWidget(
-      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: HomeScreen()),
+      ),
     );
     await tester.pump();
 
     // Empty stack → no bar.
     expect(find.textContaining('item'), findsNothing);
 
-    state.staging.add([
-      StagedFile(path: '/x/a.bin', name: 'a.bin', size: 5),
-    ]);
+    state.staging.add([StagedFile(path: '/x/a.bin', name: 'a.bin', size: 5)]);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 200)); // AnimatedSize
 
@@ -63,7 +61,10 @@ void main() {
     final state = AppState.live(fake);
     addTearDown(state.dispose);
     await tester.pumpWidget(
-      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: HomeScreen()),
+      ),
     );
     await tester.pump();
 
@@ -97,7 +98,10 @@ void main() {
     addTearDown(state.dispose);
     await state.saved.add(name: 'Server', host: '10.0.0.5', port: 49600);
     await tester.pumpWidget(
-      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: HomeScreen()),
+      ),
     );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
@@ -120,7 +124,10 @@ void main() {
       port: 49600,
     );
     await tester.pumpWidget(
-      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: HomeScreen()),
+      ),
     );
     await tester.pump();
 

@@ -185,7 +185,11 @@ void main() {
       final repo = TransferRepository(api: fake);
 
       fake.emit(ev('transfer_queued', 't1', {'peer': 'Bob', 'file': 'a.bin'}));
-      fake.emit(ev('transfer_failed', 't1', {'error': {'code': 'connection'}}));
+      fake.emit(
+        ev('transfer_failed', 't1', {
+          'error': {'code': 'connection'},
+        }),
+      );
       await flush();
       expect(repo.transfers, isEmpty);
 
@@ -466,7 +470,8 @@ void main() {
     // than as the ordinary race it is.
     test('a bulk decision counts what the engine actually answered, and keeps '
         'the per-failure errors off the error stream', () async {
-      final fake = FakePeerBeam()..noPendingDecisionIds.addAll(['in-2', 'in-4']);
+      final fake = FakePeerBeam()
+        ..noPendingDecisionIds.addAll(['in-2', 'in-4']);
       final repo = TransferRepository(api: fake);
       final errors = <String>[];
       repo.errors.listen(errors.add);
@@ -491,18 +496,21 @@ void main() {
       expect(errors, isEmpty);
     });
 
-    test('a bulk decision with nothing waiting asks the engine nothing', () async {
-      final fake = FakePeerBeam();
-      final repo = TransferRepository(api: fake);
+    test(
+      'a bulk decision with nothing waiting asks the engine nothing',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = TransferRepository(api: fake);
 
-      expect(await repo.acceptAll(), (
-        requested: 0,
-        settled: 0,
-        gone: 0,
-        failed: 0,
-      ));
-      expect(fake.calls, isEmpty);
-    });
+        expect(await repo.acceptAll(), (
+          requested: 0,
+          settled: 0,
+          gone: 0,
+          failed: 0,
+        ));
+        expect(fake.calls, isEmpty);
+      },
+    );
 
     // `settled + gone + failed == requested` is what `_bulkReport` reads to
     // decide what to tell the user, so it has to hold on every return —
@@ -652,24 +660,27 @@ void main() {
       );
     });
 
-    test('openThread still loads the conversation when the reconcile fails', () async {
-      final fake = _ReconcileFailsPeerBeam();
-      fake.chatHistories['pb-bob'] = [
-        ChatMessage(
-          id: 'm1',
-          peerId: 'pb-bob',
-          direction: 'in',
-          body: 'hi',
-          at: DateTime.now(),
-          status: ChatStatusValue.received,
-        ),
-      ];
-      final repo = ChatRepository(api: fake);
+    test(
+      'openThread still loads the conversation when the reconcile fails',
+      () async {
+        final fake = _ReconcileFailsPeerBeam();
+        fake.chatHistories['pb-bob'] = [
+          ChatMessage(
+            id: 'm1',
+            peerId: 'pb-bob',
+            direction: 'in',
+            body: 'hi',
+            at: DateTime.now(),
+            status: ChatStatusValue.received,
+          ),
+        ];
+        final repo = ChatRepository(api: fake);
 
-      await repo.openThread('pb-bob');
+        await repo.openThread('pb-bob');
 
-      expect(repo.messagesFor('pb-bob').single.body, 'hi');
-    });
+        expect(repo.messagesFor('pb-bob').single.body, 'hi');
+      },
+    );
 
     test(
       'a chat_received event appends to that peer\'s conversation',
@@ -830,72 +841,79 @@ void main() {
       expect(repo.messagesFor('alice').single.status, 'pending');
     });
 
-    test('sendFile shows the file row immediately, then reconciles with the '
-        'engine — keyed by the peer\'s real id, not its display name', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
-      const target = PeerTarget(
-        id: 'pb-carol',
-        name: 'carol',
-        addresses: ['127.0.0.1'],
-        port: 49600,
-      );
+    test(
+      'sendFile shows the file row immediately, then reconciles with the '
+      'engine — keyed by the peer\'s real id, not its display name',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
+        const target = PeerTarget(
+          id: 'pb-carol',
+          name: 'carol',
+          addresses: ['127.0.0.1'],
+          port: 49600,
+        );
 
-      // Not awaited: the optimistic row is appended synchronously, before
-      // chatSendFile's own await, exactly like the fire-and-forget call the
-      // attach button makes.
-      final pending = repo.sendFile(
-        'pb-carol',
-        target,
-        '/tmp/report.pdf',
-        name: 'report.pdf',
-        size: 4096,
-      );
-      final optimistic = repo.messagesFor('pb-carol').single;
-      expect(optimistic.isFile, isTrue);
-      expect(optimistic.fileName, 'report.pdf');
-      expect(optimistic.fileSize, 4096);
-      // `staging`, not `transferring`: the engine has not copied a byte yet,
-      // and claiming bytes are moving would render "Sending…" over a file it
-      // has not read — and hide the Cancel this row is entitled to.
-      expect(optimistic.status, ChatStatusValue.staging);
-      expect(optimistic.isMine, isTrue);
-      // A file row carries no text: rendering `body` would be a blank bubble.
-      expect(optimistic.body, isEmpty);
+        // Not awaited: the optimistic row is appended synchronously, before
+        // chatSendFile's own await, exactly like the fire-and-forget call the
+        // attach button makes.
+        final pending = repo.sendFile(
+          'pb-carol',
+          target,
+          '/tmp/report.pdf',
+          name: 'report.pdf',
+          size: 4096,
+        );
+        final optimistic = repo.messagesFor('pb-carol').single;
+        expect(optimistic.isFile, isTrue);
+        expect(optimistic.fileName, 'report.pdf');
+        expect(optimistic.fileSize, 4096);
+        // `staging`, not `transferring`: the engine has not copied a byte yet,
+        // and claiming bytes are moving would render "Sending…" over a file it
+        // has not read — and hide the Cancel this row is entitled to.
+        expect(optimistic.status, ChatStatusValue.staging);
+        expect(optimistic.isMine, isTrue);
+        // A file row carries no text: rendering `body` would be a blank bubble.
+        expect(optimistic.body, isEmpty);
 
-      await pending;
-      expect(fake.calls, contains('chatSendFile:/tmp/report.pdf'));
-      // Reconciled from chatHistory('pb-carol'): the persisted record (keyed
-      // by peer.id) replaces the optimistic placeholder.
-      final settled = repo.messagesFor('pb-carol').single;
-      expect(settled.id, 'file-1');
-      expect(settled.isFile, isTrue);
-      // The name is never used as a conversation key.
-      expect(repo.messagesFor('carol'), isEmpty);
-    });
+        await pending;
+        expect(fake.calls, contains('chatSendFile:/tmp/report.pdf'));
+        // Reconciled from chatHistory('pb-carol'): the persisted record (keyed
+        // by peer.id) replaces the optimistic placeholder.
+        final settled = repo.messagesFor('pb-carol').single;
+        expect(settled.id, 'file-1');
+        expect(settled.isFile, isTrue);
+        // The name is never used as a conversation key.
+        expect(repo.messagesFor('carol'), isEmpty);
+      },
+    );
 
-    test('sendFile is called once per file when several are attached', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
-      const target = PeerTarget(
-        id: 'pb-bob',
-        name: 'bob',
-        addresses: ['127.0.0.1'],
-        port: 49600,
-      );
+    test(
+      'sendFile is called once per file when several are attached',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
+        const target = PeerTarget(
+          id: 'pb-bob',
+          name: 'bob',
+          addresses: ['127.0.0.1'],
+          port: 49600,
+        );
 
-      await Future.wait([
-        repo.sendFile('pb-bob', target, '/tmp/a.bin', name: 'a.bin'),
-        repo.sendFile('pb-bob', target, '/tmp/b.bin', name: 'b.bin'),
-        repo.sendFile('pb-bob', target, '/tmp/c.bin', name: 'c.bin'),
-      ]);
+        await Future.wait([
+          repo.sendFile('pb-bob', target, '/tmp/a.bin', name: 'a.bin'),
+          repo.sendFile('pb-bob', target, '/tmp/b.bin', name: 'b.bin'),
+          repo.sendFile('pb-bob', target, '/tmp/c.bin', name: 'c.bin'),
+        ]);
 
-      expect(
-        fake.calls.where((c) => c.startsWith('chatSendFile:')),
-        ['chatSendFile:/tmp/a.bin', 'chatSendFile:/tmp/b.bin', 'chatSendFile:/tmp/c.bin'],
-      );
-      expect(repo.messagesFor('pb-bob'), hasLength(3));
-    });
+        expect(fake.calls.where((c) => c.startsWith('chatSendFile:')), [
+          'chatSendFile:/tmp/a.bin',
+          'chatSendFile:/tmp/b.bin',
+          'chatSendFile:/tmp/c.bin',
+        ]);
+        expect(repo.messagesFor('pb-bob'), hasLength(3));
+      },
+    );
 
     test('a local sendFile failure marks the row failed and keeps the reason '
         '(nothing was persisted, so it must not just vanish)', () async {
@@ -1173,89 +1191,98 @@ void main() {
     // Progress arrives for the engine's own message id while the conversation
     // still holds the optimistic row under a local one, so it cannot be
     // conditional on finding a row.
-    test('progress is kept even for a row this session has not read yet', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
+    test(
+      'progress is kept even for a row this session has not read yet',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
 
-      fake.emit(
-        const ChatStatus(
-          messageId: 'file-1',
-          peerId: 'pb-nobody',
-          status: ChatStatusValue.staging,
-          progress: (done: 1, total: 4),
-        ),
-      );
-      await flush();
+        fake.emit(
+          const ChatStatus(
+            messageId: 'file-1',
+            peerId: 'pb-nobody',
+            status: ChatStatusValue.staging,
+            progress: (done: 1, total: 4),
+          ),
+        );
+        await flush();
 
-      expect(repo.messagesFor('pb-nobody'), isEmpty);
-      expect(repo.stagingFor('file-1')?.done, 1);
-    });
+        expect(repo.messagesFor('pb-nobody'), isEmpty);
+        expect(repo.stagingFor('file-1')?.done, 1);
+      },
+    );
 
-    test('cancelFile stops a queued share and the engine settles the row', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
-      fake.chatHistories['pb-bob'] = [
-        ChatMessage(
-          id: 'fr-1',
-          peerId: 'pb-bob',
-          direction: 'out',
-          body: '',
-          at: DateTime.now(),
-          status: ChatStatusValue.pending,
-          kind: ChatMessageKind.file,
-          fileName: 'movie.mkv',
-          fileSize: 7,
-        ),
-      ];
-      await repo.refresh('pb-bob');
+    test(
+      'cancelFile stops a queued share and the engine settles the row',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
+        fake.chatHistories['pb-bob'] = [
+          ChatMessage(
+            id: 'fr-1',
+            peerId: 'pb-bob',
+            direction: 'out',
+            body: '',
+            at: DateTime.now(),
+            status: ChatStatusValue.pending,
+            kind: ChatMessageKind.file,
+            fileName: 'movie.mkv',
+            fileSize: 7,
+          ),
+        ];
+        await repo.refresh('pb-bob');
 
-      expect(await repo.cancelFile('pb-bob', 'fr-1'), isTrue);
-      await flush();
+        expect(await repo.cancelFile('pb-bob', 'fr-1'), isTrue);
+        await flush();
 
-      expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
-      final row = repo.messagesFor('pb-bob').single;
-      expect(row.status, ChatStatusValue.failed);
-      expect(repo.errorFor('fr-1'), 'cancelled');
-    });
+        expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
+        final row = repo.messagesFor('pb-bob').single;
+        expect(row.status, ChatStatusValue.failed);
+        expect(repo.errorFor('fr-1'), 'cancelled');
+      },
+    );
 
     // The honest false. The engine cancelled nothing because the file had
     // already gone — so the row must NOT be removed or relabelled as though
     // the user had stopped it, and the conversation is re-read instead.
-    test('a cancel the engine refuses leaves the row exactly as it is', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
-      fake.chatHistories['pb-bob'] = [
-        ChatMessage(
-          id: 'fr-1',
-          peerId: 'pb-bob',
-          direction: 'out',
-          body: '',
-          at: DateTime.now(),
-          // Already delivered: `is_cancellable_outgoing_file` refuses it.
-          status: ChatStatusValue.sent,
-          kind: ChatMessageKind.file,
-          fileName: 'movie.mkv',
-          fileSize: 7,
-        ),
-      ];
-      await repo.refresh('pb-bob');
+    test(
+      'a cancel the engine refuses leaves the row exactly as it is',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
+        fake.chatHistories['pb-bob'] = [
+          ChatMessage(
+            id: 'fr-1',
+            peerId: 'pb-bob',
+            direction: 'out',
+            body: '',
+            at: DateTime.now(),
+            // Already delivered: `is_cancellable_outgoing_file` refuses it.
+            status: ChatStatusValue.sent,
+            kind: ChatMessageKind.file,
+            fileName: 'movie.mkv',
+            fileSize: 7,
+          ),
+        ];
+        await repo.refresh('pb-bob');
 
-      expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
-      await flush();
+        expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
+        await flush();
 
-      final row = repo.messagesFor('pb-bob').single;
-      expect(row.id, 'fr-1', reason: 'the row is not removed');
-      expect(
-        row.status,
-        ChatStatusValue.sent,
-        reason: 'and it still reads sent',
-      );
-      // Re-read, so what is on screen is what the engine actually holds.
-      expect(
-        fake.calls.where((c) => c == 'chatHistory:pb-bob'),
-        hasLength(2),
-      );
-    });
+        final row = repo.messagesFor('pb-bob').single;
+        expect(row.id, 'fr-1', reason: 'the row is not removed');
+        expect(
+          row.status,
+          ChatStatusValue.sent,
+          reason: 'and it still reads sent',
+        );
+        // Re-read, so what is on screen is what the engine actually holds.
+        expect(
+          fake.calls.where((c) => c == 'chatHistory:pb-bob'),
+          hasLength(2),
+        );
+      },
+    );
 
     test('an inbound offer is never cancellable — that is the approval gate\'s '
         'business', () async {
@@ -1423,45 +1450,48 @@ void main() {
       expect(repo.conversations.single.peerId, 'pb-offline');
     });
 
-    test('messagesFor keeps text and file rows distinct in one thread', () async {
-      final fake = FakePeerBeam();
-      final repo = ChatRepository(api: fake);
+    test(
+      'messagesFor keeps text and file rows distinct in one thread',
+      () async {
+        final fake = FakePeerBeam();
+        final repo = ChatRepository(api: fake);
 
-      fake.emit(
-        ChatReceived(
-          ChatMessage(
-            id: 'm1',
-            peerId: 'pb-bob',
-            direction: 'in',
-            body: 'here you go',
-            at: DateTime.now(),
-            status: ChatStatusValue.received,
+        fake.emit(
+          ChatReceived(
+            ChatMessage(
+              id: 'm1',
+              peerId: 'pb-bob',
+              direction: 'in',
+              body: 'here you go',
+              at: DateTime.now(),
+              status: ChatStatusValue.received,
+            ),
           ),
-        ),
-      );
-      fake.emit(
-        ChatReceived(
-          ChatMessage(
-            id: 'fr-1',
-            peerId: 'pb-bob',
-            direction: 'in',
-            body: '',
-            at: DateTime.now(),
-            status: ChatStatusValue.pendingApproval,
-            kind: ChatMessageKind.file,
-            fileName: 'a.bin',
-            fileSize: 7,
+        );
+        fake.emit(
+          ChatReceived(
+            ChatMessage(
+              id: 'fr-1',
+              peerId: 'pb-bob',
+              direction: 'in',
+              body: '',
+              at: DateTime.now(),
+              status: ChatStatusValue.pendingApproval,
+              kind: ChatMessageKind.file,
+              fileName: 'a.bin',
+              fileSize: 7,
+            ),
           ),
-        ),
-      );
-      await flush();
+        );
+        await flush();
 
-      final rows = repo.messagesFor('pb-bob');
-      expect(rows, hasLength(2));
-      expect(rows.first.isFile, isFalse);
-      expect(rows.first.body, 'here you go');
-      expect(rows.last.isFile, isTrue);
-      expect(rows.last.fileName, 'a.bin');
-    });
+        final rows = repo.messagesFor('pb-bob');
+        expect(rows, hasLength(2));
+        expect(rows.first.isFile, isFalse);
+        expect(rows.first.body, 'here you go');
+        expect(rows.last.isFile, isTrue);
+        expect(rows.last.fileName, 'a.bin');
+      },
+    );
   });
 }

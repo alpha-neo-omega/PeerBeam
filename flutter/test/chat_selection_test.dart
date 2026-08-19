@@ -337,7 +337,9 @@ void main() {
     await _forwardTo(tester, 'Live Laptop');
     expect(
       fake.calls
-          .where((c) => c.startsWith('chatSend') || c.startsWith('chatSendFile'))
+          .where(
+            (c) => c.startsWith('chatSend') || c.startsWith('chatSendFile'),
+          )
           .toList(),
       ['chatSend:second'],
     );
@@ -648,7 +650,8 @@ void main() {
     expect(
       find.text('1 selected'),
       findsOneWidget,
-      reason: 'nothing was sent, so the selection is still the user\'s to act '
+      reason:
+          'nothing was sent, so the selection is still the user\'s to act '
           'on',
     );
   });

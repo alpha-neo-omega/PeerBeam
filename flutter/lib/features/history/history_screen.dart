@@ -146,7 +146,9 @@ class _HistoryRow extends StatelessWidget {
     final text = Theme.of(context).textTheme;
     final sending = item.direction == TransferDirection.sending;
     final message = _isMessage;
-    final statusColor = item.success ? AppColors.success : scheme.error;
+    final statusColor = item.success
+        ? AppColors.success(scheme.brightness)
+        : scheme.error;
     final icon = !item.success
         ? Icons.error_outline_rounded
         : message

@@ -7,31 +7,32 @@ import 'package:peerbeam/state/stores.dart';
 import 'sdk/fake_peerbeam.dart';
 
 void main() {
-  testWidgets('a ring shows a banner naming who is looking, anywhere in the app', (
-    tester,
-  ) async {
-    // The whole point is that the user cannot find the device, so they are not
-    // looking at any particular tab — the banner has to sit above the shell.
-    final fake = FakePeerBeam();
-    await tester.pumpWidget(PeerBeamApp(api: fake));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
+  testWidgets(
+    'a ring shows a banner naming who is looking, anywhere in the app',
+    (tester) async {
+      // The whole point is that the user cannot find the device, so they are not
+      // looking at any particular tab — the banner has to sit above the shell.
+      final fake = FakePeerBeam();
+      await tester.pumpWidget(PeerBeamApp(api: fake));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.textContaining('is looking for this device'), findsNothing);
+      expect(find.textContaining('is looking for this device'), findsNothing);
 
-    fake.emit(const DeviceRing('pb-bob', 'Bob', 5));
-    // The stream delivers asynchronously; one pump lets the listener run and
-    // the next rebuilds the banner.
-    await tester.pump();
-    await tester.pump();
+      fake.emit(const DeviceRing('pb-bob', 'Bob', 5));
+      // The stream delivers asynchronously; one pump lets the listener run and
+      // the next rebuilds the banner.
+      await tester.pump();
+      await tester.pump();
 
-    expect(find.text('Bob is looking for this device'), findsOneWidget);
+      expect(find.text('Bob is looking for this device'), findsOneWidget);
 
-    // Let the ring expire so no timer outlives the test — and prove it clears
-    // itself, which is what stops a device nobody reaches shouting forever.
-    await tester.pump(const Duration(seconds: 6));
-    expect(find.textContaining('is looking for this device'), findsNothing);
-  });
+      // Let the ring expire so no timer outlives the test — and prove it clears
+      // itself, which is what stops a device nobody reaches shouting forever.
+      await tester.pump(const Duration(seconds: 6));
+      expect(find.textContaining('is looking for this device'), findsNothing);
+    },
+  );
 
   testWidgets('the banner clears when the user says they found it', (
     tester,

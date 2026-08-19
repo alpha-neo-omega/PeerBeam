@@ -168,6 +168,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<void> settingsSet(Map<String, dynamic> partial) async {
+    _maybeFail('settingsSet');
     settings.addAll(partial);
   }
 

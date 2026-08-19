@@ -12,7 +12,10 @@ Future<void> _open(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: TimelineScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: TimelineScreen()),
+    ),
   );
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 300));

@@ -43,6 +43,7 @@ class FakeBridge implements PlatformBridge {
     lastActive = active;
     lastIncoming = incoming;
   }
+
   @override
   Future<void> stopForegroundService() async => stopCount++;
   @override
@@ -187,46 +188,49 @@ void main() {
   });
 
   group('ForegroundServiceController', () {
-    test('runs while there is work; wake-lock only while transferring', () async {
-      final bridge = FakeBridge();
-      final svc = ForegroundServiceController(bridge);
+    test(
+      'runs while there is work; wake-lock only while transferring',
+      () async {
+        final bridge = FakeBridge();
+        final svc = ForegroundServiceController(bridge);
 
-      await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
-      expect(svc.running, isFalse);
-      expect(bridge.startCount, 0);
+        await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
+        expect(svc.running, isFalse);
+        expect(bridge.startCount, 0);
 
-      // A transfer starts → running, active (wake lock), multicast held.
-      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
-      expect(svc.running, isTrue);
-      expect(bridge.startCount, 1);
-      expect(bridge.lastActive, isTrue);
-      expect(bridge.multicast, isTrue);
+        // A transfer starts → running, active (wake lock), multicast held.
+        await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+        expect(svc.running, isTrue);
+        expect(bridge.startCount, 1);
+        expect(bridge.lastActive, isTrue);
+        expect(bridge.multicast, isTrue);
 
-      // More work while running → re-delivered, still active, no re-latched
-      // multicast transition.
-      await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
-      expect(bridge.startCount, 2);
-      expect(bridge.lastActive, isTrue);
+        // More work while running → re-delivered, still active, no re-latched
+        // multicast transition.
+        await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
+        expect(bridge.startCount, 2);
+        expect(bridge.lastActive, isTrue);
 
-      // A repeated sync with unchanged state (same title/body/active/
-      // incoming) must NOT re-deliver — avoids spamming the platform channel
-      // + re-posting the notification on every transfer_progress tick.
-      await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
-      expect(bridge.startCount, 2);
+        // A repeated sync with unchanged state (same title/body/active/
+        // incoming) must NOT re-deliver — avoids spamming the platform channel
+        // + re-posting the notification on every transfer_progress tick.
+        await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
+        expect(bridge.startCount, 2);
 
-      // Transfers done but receiving on → stays running, now IDLE (no wake
-      // lock) rather than stopping.
-      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
-      expect(svc.running, isTrue);
-      expect(bridge.stopCount, 0);
-      expect(bridge.lastActive, isFalse);
+        // Transfers done but receiving on → stays running, now IDLE (no wake
+        // lock) rather than stopping.
+        await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
+        expect(svc.running, isTrue);
+        expect(bridge.stopCount, 0);
+        expect(bridge.lastActive, isFalse);
 
-      // Fully idle → stop once, multicast released.
-      await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
-      expect(svc.running, isFalse);
-      expect(bridge.stopCount, 1);
-      expect(bridge.multicast, isFalse);
-    });
+        // Fully idle → stop once, multicast released.
+        await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
+        expect(svc.running, isFalse);
+        expect(bridge.stopCount, 1);
+        expect(bridge.multicast, isFalse);
+      },
+    );
 
     test('threads incoming through to the bridge for the direction-aware '
         'small icon', () async {

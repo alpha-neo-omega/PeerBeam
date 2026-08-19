@@ -111,6 +111,5 @@ class TransferNotifications {
   /// A monotonically increasing, positive 31-bit id reserved for received-file
   /// notifications — distinct from both [idFor]'s hash-based ids and
   /// [serviceId].
-  static int _uniqueReceivedId() =>
-      0x40000000 + (_receivedSeq++ & 0x3fffffff);
+  static int _uniqueReceivedId() => 0x40000000 + (_receivedSeq++ & 0x3fffffff);
 }

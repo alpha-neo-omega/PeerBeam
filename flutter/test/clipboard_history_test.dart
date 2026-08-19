@@ -22,12 +22,8 @@ Future<AppState> _open(WidgetTester tester, FakePeerBeam fake) async {
   return state;
 }
 
-ClipEntry _entry(String text, {String? from}) => ClipEntry(
-  id: '1',
-  text: text,
-  from: from,
-  at: DateTime.now(),
-);
+ClipEntry _entry(String text, {String? from}) =>
+    ClipEntry(id: '1', text: text, from: from, at: DateTime.now());
 
 void main() {
   testWidgets('an empty screen says whether history is off or merely empty', (
@@ -59,10 +55,7 @@ void main() {
     tester,
   ) async {
     final fake = FakePeerBeam()
-      ..clipHistory.addAll([
-        _entry('mine'),
-        _entry('theirs', from: 'pb-bob'),
-      ]);
+      ..clipHistory.addAll([_entry('mine'), _entry('theirs', from: 'pb-bob')]);
     await _open(tester, fake);
 
     expect(find.text('Copied here'), findsOneWidget);

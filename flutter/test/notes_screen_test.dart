@@ -8,8 +8,10 @@ import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
-Widget _screen(AppState state) =>
-    AppScope(state: state, child: const MaterialApp(home: NotesScreen()));
+Widget _screen(AppState state) => AppScope(
+  state: state,
+  child: const MaterialApp(home: NotesScreen()),
+);
 
 Future<AppState> _open(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
@@ -165,9 +167,6 @@ void main() {
     await tester.tap(find.byIcon(Icons.sync_rounded));
     await tester.pumpAndSettle();
 
-    expect(
-      find.textContaining('No device may sync notes yet'),
-      findsOneWidget,
-    );
+    expect(find.textContaining('No device may sync notes yet'), findsOneWidget);
   });
 }

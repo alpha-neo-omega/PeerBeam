@@ -191,44 +191,66 @@ class SettingsStore extends ChangeNotifier {
     }
   }
 
-  void _persist(String key, Object value) {
-    unawaited(_api?.settingsSet({key: value}).catchError((_) {}));
+  /// Apply a setting locally, persist it, and **put it back if the write is
+  /// refused**.
+  ///
+  /// # Why the old version was worse than an unhandled error
+  ///
+  /// This used to be `unawaited(_api?.settingsSet(..).catchError((_) {}))` —
+  /// fire, forget, and swallow. The switch moved, the store reported the new
+  /// value, and nothing anywhere learned that the engine had refused it. For
+  /// most settings that is a stale preference; for two of them it is a lie
+  /// about the user's security posture. Turning off *Verify new devices with a
+  /// pairing code*, or turning off *Sync clipboard with trusted devices*, then
+  /// seeing the switch move, is a specific and false assurance.
+  ///
+  /// The update is still optimistic, because a switch that waits for a
+  /// round-trip before moving feels broken. But a refusal reverts it, so what is
+  /// on screen is what is actually in force — the rule
+  /// [`setSaveRules`](Self::setSaveRules) already followed — and the error is
+  /// rethrown so the caller can say so out loud.
+  Future<void> _apply<T>(
+    String key,
+    T value,
+    T previous,
+    void Function(T) assign,
+  ) async {
+    assign(value);
+    notifyListeners();
+    final api = _api;
+    if (api == null) return; // No engine (tests, desktop without the lib).
+    try {
+      await api.settingsSet({key: value as Object});
+    } catch (_) {
+      assign(previous);
+      notifyListeners();
+      rethrow;
+    }
   }
 
-  void setBackgroundReceive(bool v) {
-    backgroundReceive = v;
-    _persist('background_receive', v);
-    notifyListeners();
-  }
+  Future<void> setBackgroundReceive(bool v) => _apply(
+    'background_receive',
+    v,
+    backgroundReceive,
+    (x) => backgroundReceive = x,
+  );
 
-  void setDeviceName(String v) {
-    deviceName = v;
-    _persist('device_name', v);
-    notifyListeners();
-  }
+  Future<void> setDeviceName(String v) =>
+      _apply('device_name', v, deviceName, (x) => deviceName = x);
 
-  void setSaveDirectory(String v) {
-    saveDirectory = v;
-    _persist('transfer_directory', v);
-    notifyListeners();
-  }
+  Future<void> setSaveDirectory(String v) =>
+      _apply('transfer_directory', v, saveDirectory, (x) => saveDirectory = x);
 
-  void setAutoAccept(bool v) {
-    autoAcceptTrusted = v;
-    _persist('auto_accept', v);
-    notifyListeners();
-  }
+  Future<void> setAutoAccept(bool v) =>
+      _apply('auto_accept', v, autoAcceptTrusted, (x) => autoAcceptTrusted = x);
 
   /// Turn status sharing on or off.
   ///
   /// The engine re-reads this on every heartbeat, so turning it off stops an
   /// already-connected session's next beat rather than waiting for a
   /// reconnect. Turning it on likewise starts sharing without one.
-  void setSharePresence(bool v) {
-    sharePresence = v;
-    _persist('share_presence', v);
-    notifyListeners();
-  }
+  Future<void> setSharePresence(bool v) =>
+      _apply('share_presence', v, sharePresence, (x) => sharePresence = x);
 
   /// Turn read receipts on or off.
   ///
@@ -240,54 +262,45 @@ class SettingsStore extends ChangeNotifier {
   ///
   /// Turning it off stops new entries; it does **not** erase what was already
   /// recorded, which is why the settings tile offers a separate Clear.
-  void setClipboardHistory(bool v) {
-    clipboardHistory = v;
-    _persist('clipboard_history', v);
-    notifyListeners();
-  }
+  Future<void> setClipboardHistory(bool v) => _apply(
+    'clipboard_history',
+    v,
+    clipboardHistory,
+    (x) => clipboardHistory = x,
+  );
 
-  void setShareReadReceipts(bool v) {
-    shareReadReceipts = v;
-    _persist('share_read_receipts', v);
-    notifyListeners();
-  }
+  Future<void> setShareReadReceipts(bool v) => _apply(
+    'share_read_receipts',
+    v,
+    shareReadReceipts,
+    (x) => shareReadReceipts = x,
+  );
 
   /// Turn clipboard sync on or off.
   ///
   /// The engine re-reads this on every push, so turning it off stops the next
   /// clip rather than waiting for a reconnect; the desktop watcher starts and
   /// stops with it too, without an app restart.
-  void setSyncClipboard(bool v) {
-    syncClipboard = v;
-    _persist('sync_clipboard', v);
-    notifyListeners();
-  }
+  Future<void> setSyncClipboard(bool v) =>
+      _apply('sync_clipboard', v, syncClipboard, (x) => syncClipboard = x);
 
   /// Turn the first-contact pairing check on or off. The engine applies it
   /// live, so the next connection is already covered.
-  void setRequirePairingConfirmation(bool v) {
-    requirePairingConfirmation = v;
-    _persist('require_pairing_confirmation', v);
-    notifyListeners();
-  }
+  Future<void> setRequirePairingConfirmation(bool v) => _apply(
+    'require_pairing_confirmation',
+    v,
+    requirePairingConfirmation,
+    (x) => requirePairingConfirmation = x,
+  );
 
-  void setNotifications(bool v) {
-    notifications = v;
-    _persist('notifications', v);
-    notifyListeners();
-  }
+  Future<void> setNotifications(bool v) =>
+      _apply('notifications', v, notifications, (x) => notifications = x);
 
-  void setCompression(bool v) {
-    compression = v;
-    _persist('compression', v);
-    notifyListeners();
-  }
+  Future<void> setCompression(bool v) =>
+      _apply('compression', v, compression, (x) => compression = x);
 
-  void setTheme(String v) {
-    theme = v;
-    _persist('theme', v);
-    notifyListeners();
-  }
+  Future<void> setTheme(String v) =>
+      _apply('theme', v, theme, (x) => theme = x);
 
   /// Replace the whole ordered rule list.
   ///

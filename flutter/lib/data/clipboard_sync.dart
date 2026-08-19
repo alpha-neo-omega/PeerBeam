@@ -83,7 +83,8 @@ class ClipboardSyncService {
   final bool _desktop;
 
   final ClipboardEchoGuard _guard = ClipboardEchoGuard();
-  final StreamController<String> _notices = StreamController<String>.broadcast();
+  final StreamController<String> _notices =
+      StreamController<String>.broadcast();
   final StreamController<AppliedClip> _applied =
       StreamController<AppliedClip>.broadcast();
   StreamSubscription<BridgeEvent>? _sub;
@@ -137,9 +138,11 @@ class ClipboardSyncService {
   /// with the *next* copy.
   void start() {
     if (_disposed || !_desktop || _timer != null) return;
-    unawaited(_read().then((current) {
-      if (current != null && current.isNotEmpty) _guard.adopt(current);
-    }));
+    unawaited(
+      _read().then((current) {
+        if (current != null && current.isNotEmpty) _guard.adopt(current);
+      }),
+    );
     _timer = Timer.periodic(_interval, (_) => unawaited(poll()));
   }
 

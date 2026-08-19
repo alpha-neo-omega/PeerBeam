@@ -158,7 +158,9 @@ class PeerBeamTheme {
         backgroundColor: scheme.surfaceContainerLow,
         surfaceTintColor: Colors.transparent,
         shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.xxl)),
+          borderRadius: BorderRadius.vertical(
+            top: Radius.circular(AppRadius.xxl),
+          ),
         ),
         showDragHandle: true,
       ),
@@ -295,18 +297,37 @@ class AppMotion {
 }
 
 /// Semantic colours not carried by the [ColorScheme] (kept consistent in one
-/// place). These read the same in light and dark.
+/// place). [success] and [warning] resolve per [Brightness], because a single
+/// value cannot serve both: the vivid pair below reads at ~7.5–8:1 on the dark
+/// scheme's containers but only 1.7–2.1:1 on the light one's, so status labels
+/// and percentages drawn in them missed WCAG AA (4.5:1 for text) in light mode
+/// by more than a factor of two. Light mode therefore uses the darkened shade
+/// of the same hue ramp, which measures 5.5:1 or better against every surface
+/// these colours land on; dark mode keeps the values it already passed with.
 class AppColors {
   AppColors._();
 
-  /// Online / success presence indicator.
+  /// Online / success presence indicator. Single-valued, unlike [success]:
+  /// `StatusDot` carries the state in a `Semantics` label and the caller's
+  /// adjacent text, so the dot is decoration over a label rather than a
+  /// graphic the user has to read off the surface.
   static const Color online = Color(0xFF22C55E);
 
-  /// Success (completed transfer).
-  static const Color success = Color(0xFF22C55E);
+  /// Success (completed transfer), for [brightness]. See the class note.
+  static Color success(Brightness brightness) =>
+      brightness == Brightness.dark ? _successDark : _successLight;
 
-  /// Warning / attention.
-  static const Color warning = Color(0xFFF59E0B);
+  /// Warning / attention, for [brightness]. See the class note.
+  static Color warning(Brightness brightness) =>
+      brightness == Brightness.dark ? _warningDark : _warningLight;
+
+  // Two steps of one ramp each: the vivid 500 for dark surfaces, the 800 for
+  // light ones. Same hue either way, so "green = good" and "amber = needs a
+  // look" survive the darkening.
+  static const Color _successDark = Color(0xFF22C55E);
+  static const Color _successLight = Color(0xFF166534);
+  static const Color _warningDark = Color(0xFFF59E0B);
+  static const Color _warningLight = Color(0xFF92400E);
 }
 
 /// Layout breakpoints (Material 3 window size classes, simplified).

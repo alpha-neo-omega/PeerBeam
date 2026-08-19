@@ -75,7 +75,10 @@ Future<AppState> _pumpChats(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: ChatsScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: ChatsScreen()),
+    ),
   );
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 300));
@@ -107,7 +110,10 @@ void main() {
     expect(fake.calls, contains('chatHistory:pb-ghost'));
     // …and the thread is readable while the composer says why it cannot send.
     expect(find.text('movie.mkv'), findsOneWidget);
-    expect(find.textContaining('No address known for pb-ghost'), findsOneWidget);
+    expect(
+      find.textContaining('No address known for pb-ghost'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('a discovered peer\'s conversation shows its live name', (
@@ -118,7 +124,10 @@ void main() {
     final state = AppState.live(fake);
     addTearDown(state.dispose);
     await tester.pumpWidget(
-      AppScope(state: state, child: const MaterialApp(home: ChatsScreen())),
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: ChatsScreen()),
+      ),
     );
     await tester.pump();
     fake.emit(const DeviceAdded(_laptop));
@@ -279,8 +288,10 @@ void main() {
     // quoting a count it has not been given.
     expect(find.text('Delete "pb-bob"?'), findsOneWidget);
     expect(
-      find.textContaining('still waiting to be sent is kept and will still be '
-          'sent'),
+      find.textContaining(
+        'still waiting to be sent is kept and will still be '
+        'sent',
+      ),
       findsOneWidget,
     );
 

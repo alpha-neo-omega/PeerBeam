@@ -137,11 +137,8 @@ class TransferRepository extends ChangeNotifier {
   /// transfer stopped, in which case resuming would append the wrong bytes to
   /// the receiver's partial file. Silence would leave the user tapping a
   /// button that does nothing.
-  void resumeInterrupted(String id, {PeerTarget? peer}) => _decide(
-    id,
-    'resume',
-    _api?.resumeInterrupted(id, peer: peer),
-  );
+  void resumeInterrupted(String id, {PeerTarget? peer}) =>
+      _decide(id, 'resume', _api?.resumeInterrupted(id, peer: peer));
 
   /// Forget an interrupted transfer and the partial bytes it was holding.
   /// Without it an interrupted transfer is clutter nothing can ever clear.

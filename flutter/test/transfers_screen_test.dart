@@ -184,9 +184,7 @@ void main() {
       final fake = FakePeerBeam();
       await _pumpTransfers(tester, fake);
 
-      fake.emit(
-        _interrupted('t1', resumable: false, direction: 'receiving'),
-      );
+      fake.emit(_interrupted('t1', resumable: false, direction: 'receiving'));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 600));
 

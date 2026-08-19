@@ -10,12 +10,7 @@ class DeviceTile extends StatelessWidget {
   final Device device;
   final VoidCallback? onSend;
   final VoidCallback? onChat;
-  const DeviceTile({
-    super.key,
-    required this.device,
-    this.onSend,
-    this.onChat,
-  });
+  const DeviceTile({super.key, required this.device, this.onSend, this.onChat});
 
   @override
   Widget build(BuildContext context) {

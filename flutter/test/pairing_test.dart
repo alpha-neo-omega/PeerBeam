@@ -55,7 +55,10 @@ Future<AppState> _pumpTransfers(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: TransfersScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: TransfersScreen()),
+    ),
   );
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 600));
@@ -319,7 +322,10 @@ void main() {
       // updates the in-memory value and persists nothing.
       await state.settings.load(fake);
       await tester.pumpWidget(
-        AppScope(state: state, child: const MaterialApp(home: SettingsScreen())),
+        AppScope(
+          state: state,
+          child: const MaterialApp(home: SettingsScreen()),
+        ),
       );
       await tester.pumpAndSettle();
 

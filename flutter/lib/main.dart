@@ -88,9 +88,7 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // offer to. Started only if the opt-in is on and only on desktop —
         // `applySetting` and `start` both enforce that, so this call is safe
         // unconditionally.
-        _state.clipboard?.applySetting(
-          enabled: _state.settings.syncClipboard,
-        );
+        _state.clipboard?.applySetting(enabled: _state.settings.syncClipboard);
         // No-op off Android; routes share/receive intents and drives the
         // service. Started after history is loaded so the send-notify
         // baseline is seeded from real history, not an empty list — otherwise

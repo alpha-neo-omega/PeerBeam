@@ -24,6 +24,34 @@ bool get _isAndroid =>
 
 /// Settings. Listens to the settings + theme stores. Uses platform-adaptive
 /// controls (Switch.adaptive) for a native feel on each platform.
+/// Wrap a setting write so a refusal is *seen*.
+///
+/// The store reverts the value itself, so the control snaps back on its own —
+/// but a switch that moves and then quietly moves again reads as a glitch, not
+/// as a refusal. This says which setting failed and why, so the user knows
+/// their choice did not take. Silence here is how "clipboard sync is off"
+/// becomes something a person believes without it being true.
+ValueChanged<bool> _guardedSwitch(
+  BuildContext context,
+  String what,
+  Future<void> Function(bool) write,
+) {
+  final messenger = ScaffoldMessenger.of(context);
+  return (v) async {
+    try {
+      await write(v);
+    } catch (e) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text('Could not change $what: ${friendlyError(e)}'),
+          ),
+        );
+    }
+  };
+}
+
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
 
@@ -140,7 +168,11 @@ class SettingsScreen extends StatelessWidget {
                           'default.',
                         ),
                         value: state.settings.sharePresence,
-                        onChanged: state.settings.setSharePresence,
+                        onChanged: _guardedSwitch(
+                          context,
+                          'status sharing',
+                          state.settings.setSharePresence,
+                        ),
                       ),
                       const Divider(height: 1),
                       SwitchListTile(
@@ -155,7 +187,11 @@ class SettingsScreen extends StatelessWidget {
                           'seeing when others have read yours.',
                         ),
                         value: state.settings.shareReadReceipts,
-                        onChanged: state.settings.setShareReadReceipts,
+                        onChanged: _guardedSwitch(
+                          context,
+                          'read receipts',
+                          state.settings.setShareReadReceipts,
+                        ),
                       ),
                       const Divider(height: 1),
                       const _ClipboardSyncTile(),
@@ -178,7 +214,11 @@ class SettingsScreen extends StatelessWidget {
                           'Skip the prompt for pinned devices',
                         ),
                         value: state.settings.autoAcceptTrusted,
-                        onChanged: state.settings.setAutoAccept,
+                        onChanged: _guardedSwitch(
+                          context,
+                          'auto-accept',
+                          state.settings.setAutoAccept,
+                        ),
                       ),
                       const Divider(height: 1),
                       const _PairingConfirmationTile(),
@@ -187,7 +227,11 @@ class SettingsScreen extends StatelessWidget {
                         secondary: const Icon(Icons.notifications_rounded),
                         title: const Text('Notifications'),
                         value: state.settings.notifications,
-                        onChanged: state.settings.setNotifications,
+                        onChanged: _guardedSwitch(
+                          context,
+                          'notifications',
+                          state.settings.setNotifications,
+                        ),
                       ),
                     ],
                   ),
@@ -309,7 +353,11 @@ class SettingsScreen extends StatelessWidget {
                             'backgrounding',
                           ),
                           value: state.settings.backgroundReceive,
-                          onChanged: state.settings.setBackgroundReceive,
+                          onChanged: _guardedSwitch(
+                            context,
+                            'background receive',
+                            state.settings.setBackgroundReceive,
+                          ),
                         ),
                         const Divider(height: 1),
                         ListTile(
@@ -624,7 +672,11 @@ class _PairingConfirmationTile extends StatelessWidget {
           'intercepting that first connection. Off by default.',
         ),
         value: state.settings.requirePairingConfirmation,
-        onChanged: state.settings.setRequirePairingConfirmation,
+        onChanged: _guardedSwitch(
+          context,
+          'pairing confirmation',
+          state.settings.setRequirePairingConfirmation,
+        ),
       ),
     );
   }
@@ -670,7 +722,11 @@ class _ClipboardSyncTile extends StatelessWidget {
               'passwords — PeerBeam cannot tell them apart. Off by default.',
             ),
             value: state.settings.syncClipboard,
-            onChanged: state.settings.setSyncClipboard,
+            onChanged: _guardedSwitch(
+              context,
+              'clipboard sync',
+              state.settings.setSyncClipboard,
+            ),
           ),
           const Divider(height: 1),
           SwitchListTile.adaptive(
@@ -685,7 +741,11 @@ class _ClipboardSyncTile extends StatelessWidget {
               'but keeps what was already saved.',
             ),
             value: state.settings.clipboardHistory,
-            onChanged: state.settings.setClipboardHistory,
+            onChanged: _guardedSwitch(
+              context,
+              'clipboard history',
+              state.settings.setClipboardHistory,
+            ),
           ),
           ListTile(
             leading: const Icon(Icons.delete_sweep_outlined),
