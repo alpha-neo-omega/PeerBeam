@@ -4,7 +4,10 @@ All notable changes to PeerBeam. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); the project is pre-1.0 and
 versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
-## [0.9.0] - 2026-08-19
+## [Unreleased]
+
+Everything below landed **after** v0.9.0 was tagged and published. The v0.9.0
+downloads do not contain it; it ships in the next release.
 
 ### Added
 - **Trust that runs out.** `peerbeam trust approve <device> --for 30m` (also
@@ -31,16 +34,76 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   the **effective** answer — the documented
   `jq 'select(.approved | not)'` one-liner catches an expired device rather than
   skipping exactly the case that matters.
+- **A ceiling on outbound speed.** `transfer.max_send_bytes_per_sec` (`0`, the
+  default, is unlimited) holds sending to a chosen rate. It is a token bucket, so
+  the figure is an average rather than a cadence: a transfer that has been idle
+  gets credit for the time it did not use, up to one second's worth, instead of
+  stuttering when it resumes. Changing it reaches transfers **already running** —
+  someone turns this down because something is saturating their link now, and a
+  limit that waited for the next transfer would arrive after the problem passed.
+
+  Sending only, deliberately. A receiver cannot slow a sender that ignores it, so
+  a "download limit" would be a promise this side cannot keep.
+- **Round-trip time in the device list.** Taken from QUIC's own smoothed estimate,
+  so it costs no probe traffic. Shown only once a real sample exists: before the
+  first ACK the transport reports its *configured* 333 ms starting value, and
+  printing that beside a laptop on the same desk would be a fabricated number.
+  A sub-millisecond link reads `<1 ms`, never a bare `0 ms`.
+
+  Direct-versus-relay is **not** reported. It is not knowable from what exists
+  today, and inventing it would be worse than leaving it blank.
+- **Shared folders and logs, in the app.** Both were reachable only from a config
+  file or the CLI. Settings now has a shared-folders picker — a folder whose
+  directory has since been deleted is listed and marked rather than hidden,
+  because believing you share something you do not is the failure worth
+  preventing — and a Logs screen that lists, marks problems, and exports,
+  reporting where it wrote. The v0.9.0 notes claimed both; they were wrong.
+- **`peerbeam chat delete <peer>`** removes a conversation from the CLI; it was
+  previously reachable only from the app. It requires `--yes`: `trust approve`
+  treats `--json` as consent because it *grants* standing, but a delete destroys
+  history, so silence is refused rather than assumed.
+
+### Fixed
+- **A sender's claimed filename could outrank what actually lands.** The peer's
+  claim rides the chat channel and the bytes ride the transfer channel, and
+  nothing orders the two. When the transfer won that race the reconcile found no
+  row yet and gave up silently, so the approval prompt kept showing the name the
+  *sender* chose for a file that would arrive under a different one. Seen on
+  Windows, reproducible anywhere under load.
+- **The documented install command returned 404.** `docs/CLI.md` tells people to
+  fetch `/releases/latest/download/…`, every release was published
+  `--prerelease`, and GitHub excludes those from `latest`. Releases are no longer
+  marked pre-release; maturity is stated in the notes, which already say Beta.
+- **Logs recorded every dependency's trace.** The capture layer had no filter, so
+  one QUIC handshake filled the buffer and evicted anything the engine itself
+  said. Structured fields were dropped too, leaving `warn!(peer = …, reason = …)`
+  as a bare sentence. `log.filter` (default `peerbeam=info`) now applies, and
+  fields are kept.
+- **A concurrent reader could lose a write on Windows**, where `rename` fails
+  while any handle to the destination is open. The commit now retries.
+- **Wire paths used the host separator.** A Windows device put `photos\june.jpg`
+  on the wire where every other device said `photos/june.jpg`, so folder sync
+  between Windows and anything else lost every file below the top level. Local
+  paths had the mirror-image bug and now use the platform separator.
+- Three URLs named a repository that is not this one; two of them routed security
+  advisories there.
+
+## [0.9.0] - 2026-08-19
+
+### Added
 - **Logs you can actually read.** The engine has always captured structured
-  logs; nothing could reach them. `peerbeam logs [--export PATH]` reads them,
-  and the app can list, export and stream them. Logs are now written to
+  logs; nothing could reach them. `peerbeam logs [--export PATH]` reads them.
+  (The **app's** log screen is not in this release — see Unreleased. The note
+  here originally claimed it, and that was wrong: the SDK and engine sides
+  shipped, no screen called them.) Logs are now written to
   `<data>/logs/peerbeam.jsonl` as well as held in memory — bounded, rotated
   once, and switchable off with `log.to_file` — because a per-process buffer is
   gone the moment the process is, which is exactly when you want the logs.
-- **Choose your shared folders in the app.** What you share was config-file-only;
-  it is now a setting, applied **immediately** — un-sharing a folder that stays
-  shared until the next restart is the one direction this must never lag in.
-  Still empty by default, and a peer still needs the Browse permission.
+- **Shared folders are a setting**, applied **immediately** — un-sharing a folder
+  that stays shared until the next restart is the one direction this must never
+  lag in. Still empty by default, and a peer still needs the Browse permission.
+  (This release reaches it through `peerbeam config` only. The note originally
+  said "in the app"; the picker landed after the tag — see Unreleased.)
 - **PIN pairing** (`peerbeam pair`, `encryption.require_pin_pairing`). Trust-on-
   first-use pins whatever key answers first; someone on the path during that
   first handshake gets pinned instead of your device, and every later connection
