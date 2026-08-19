@@ -3407,8 +3407,10 @@ impl Manager {
             .collect();
         let me = self.clone();
         let request_path = path.clone();
+        let into_for_fetch = into.clone();
         crate::runtime::block_on(async move {
-            me.request_files(device, request_path, wanted).await;
+            me.request_files(device, request_path, into_for_fetch, wanted)
+                .await;
         });
 
         Ok(json!({
@@ -3440,12 +3442,29 @@ impl Manager {
 
     /// Ask the peer for each wanted file. Best effort: the bytes arrive as
     /// ordinary transfers, so nothing here waits for them.
-    async fn request_files(self: &Arc<Self>, device: Device, folder: String, wanted: Vec<String>) {
+    async fn request_files(
+        self: &Arc<Self>,
+        device: Device,
+        folder: String,
+        into: std::path::PathBuf,
+        wanted: Vec<String>,
+    ) {
         let Some(session) = self.sync_session(&device).await else {
             return;
         };
+        let index = self.sync_index();
         for rel in wanted {
-            crate::session_exec::request_file(&session, &format!("{folder}/{rel}")).await;
+            let remote = format!("{folder}/{rel}");
+            // Delta first; the whole file only when it cannot be used. Every
+            // reason to give up — no chunk map, a chunk that never arrived,
+            // bytes that did not verify — is a reason to send the file the slow
+            // way, never a reason to stop the sync.
+            if fetch_by_delta(&session, &index, &folder, &into, &remote, &rel)
+                .await
+                .is_none()
+            {
+                crate::session_exec::request_file(&session, &remote).await;
+            }
         }
     }
 
@@ -5452,6 +5471,53 @@ pub(crate) fn device_from(peer: Option<&Value>) -> Result<Device, (Code, String)
         port,
         last_seen: chrono::Utc::now(),
     })
+}
+
+/// Fetch one file by chunks, writing it into `into`. Returns bytes reused, or
+/// `None` if delta transfer could not be used.
+///
+/// Free function rather than a method: it needs no `Manager` state, and keeping
+/// it out of the impl makes it obvious that a delta fetch touches nothing but
+/// the session, the index and the destination.
+async fn fetch_by_delta(
+    session: &crate::session_exec::Session,
+    index: &peerbeam_sync::SyncIndex,
+    folder: &str,
+    into: &std::path::Path,
+    remote_path: &str,
+    write_to: &str,
+) -> Option<u64> {
+    let answer = crate::session_exec::request_chunk_map(session, remote_path).await?;
+    if answer.denied || answer.chunks.is_empty() {
+        return None;
+    }
+    let map = peerbeam_sync::ChunkMap {
+        path: remote_path.to_string(),
+        chunks: answer.chunks,
+    };
+
+    let have = index.chunks().have(folder);
+    let need = peerbeam_sync::plan_delta(&map, &have);
+    let fetched = if need.fetch.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        crate::session_exec::request_chunks(session, remote_path, &need.fetch).await
+    };
+
+    let local = index.load(folder).ok()?;
+    let rebuilt = peerbeam_sync::reassemble(&map, |h| {
+        fetched
+            .get(h)
+            .cloned()
+            .or_else(|| index.chunks().read(folder, into, &local, h))
+    })?;
+
+    let dest = into.join(write_to);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&dest, &rebuilt).ok()?;
+    Some(need.reuse_bytes)
 }
 
 #[cfg(test)]

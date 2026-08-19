@@ -255,6 +255,78 @@ pub async fn request_listing(
     .flatten()
 }
 
+/// Ask how a file chunks. `None` when the peer cannot say — it predates delta
+/// transfer, refused, or the file is too large to chunk — in which case the
+/// caller asks for the whole file instead.
+pub async fn request_chunk_map(
+    session: &Session,
+    path: &str,
+) -> Option<peerbeam_sync::manifest_wire::ChunkMapResponse> {
+    let channel = session.handle.open_channel(SYNC).await.ok()?;
+    let req = peerbeam_sync::manifest_wire::ChunkMapRequest {
+        path: path.to_string(),
+    };
+    let frame = req.to_frame(channel).ok()?;
+    session
+        .handle
+        .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+        .await
+        .ok()?;
+    let rx = session.chunkmap_rx.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        rx.lock().await.recv().await
+    })
+    .await
+    .ok()?
+}
+
+/// Ask for specific chunks and collect what arrives.
+///
+/// Batched, because the peer bounds how many it serves per message: asking for
+/// a thousand in one frame would silently get sixty-four.
+pub async fn request_chunks(
+    session: &Session,
+    path: &str,
+    hashes: &[String],
+) -> std::collections::HashMap<String, Vec<u8>> {
+    const BATCH: usize = 64;
+    let mut out = std::collections::HashMap::new();
+    for group in hashes.chunks(BATCH) {
+        let Ok(channel) = session.handle.open_channel(SYNC).await else {
+            break;
+        };
+        let req = peerbeam_sync::manifest_wire::ChunkRequest {
+            path: path.to_string(),
+            hashes: group.to_vec(),
+        };
+        let Ok(frame) = req.to_frame(channel) else {
+            break;
+        };
+        if session
+            .handle
+            .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        for _ in 0..group.len() {
+            let rx = session.chunk_rx.clone();
+            match tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+                rx.lock().await.recv().await
+            })
+            .await
+            {
+                Ok(Some(d)) => {
+                    out.insert(d.hash, d.bytes);
+                }
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
 /// Ask a peer for a manifest and wait for it, bounded.
 pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_sync::Manifest> {
     use tokio::time::{timeout, Duration};
@@ -380,6 +452,12 @@ pub struct Session {
     pub browse_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_browse::ListResponse>>>,
     /// Manifests **this side asked for**.
     pub sync_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::Manifest>>>,
+    /// Chunk maps **this side asked for**.
+    pub chunkmap_rx:
+        Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkMapResponse>>>,
+    /// Chunk bytes **this side asked for**.
+    pub chunk_rx:
+        Arc<tokio::sync::Mutex<UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkData>>>,
     /// The authenticated peer's device id.
     pub peer_id: String,
     /// The peer's presented human name (may be empty).
@@ -524,12 +602,22 @@ async fn establish(
     let sync_slot: Arc<OnceLock<DeviceId>>;
     let sync_answers: UnboundedReceiver<peerbeam_sync::Manifest>;
     let sync_incoming: UnboundedReceiver<peerbeam_sync::Manifest>;
+    let chunkmap_out: UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkMapResponse>;
+    let chunk_out: UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkData>;
     let sync_files: UnboundedReceiver<std::path::PathBuf>;
+    let chunkmap_answers: UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkMapResponse>;
+    let chunk_answers: UnboundedReceiver<peerbeam_sync::manifest_wire::ChunkData>;
     {
         let (tx, rx) = unbounded_channel();
         let (itx, irx) = unbounded_channel();
         let (ftx, frx) = unbounded_channel();
-        let (h, slot) = peerbeam_sync::SyncHandler::new(
+        // Answers this device *sends* go out over the session; answers it
+        // *receives* are routed to whoever asked.
+        let (cm_out, cm_out_rx) = unbounded_channel();
+        let (cd_out, cd_out_rx) = unbounded_channel();
+        let (cm_in, cm_in_rx) = unbounded_channel();
+        let (cd_in, cd_in_rx) = unbounded_channel();
+        let (h, slot) = peerbeam_sync::SyncHandler::with_chunks(
             crate::browse::shares(),
             trust.clone(),
             Arc::new(move |m| {
@@ -541,7 +629,23 @@ async fn establish(
             Arc::new(move |m| {
                 let _ = itx.send(m);
             }),
+            Arc::new(move |r| {
+                let _ = cm_out.send(r);
+            }),
+            Arc::new(move |d| {
+                let _ = cd_out.send(d);
+            }),
+            Arc::new(move |r| {
+                let _ = cm_in.send(r);
+            }),
+            Arc::new(move |d| {
+                let _ = cd_in.send(d);
+            }),
         );
+        chunkmap_answers = cm_in_rx;
+        chunk_answers = cd_in_rx;
+        chunkmap_out = cm_out_rx;
+        chunk_out = cd_out_rx;
         sync_slot = slot;
         sync_answers = rx;
         sync_incoming = irx;
@@ -649,6 +753,52 @@ async fn establish(
             }
         });
     }
+    // The same drain for chunk answers. Two loops rather than one over an enum:
+    // a chunk map is one small message per request and chunk bytes are many
+    // larger ones, so a slow chunk send must not hold up the map that tells the
+    // peer what to ask for next.
+    {
+        let mut rx = chunkmap_out;
+        let reply_handle = handle.clone();
+        crate::runtime::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
+                    break;
+                };
+                let Ok(frame) = m.to_frame(channel) else {
+                    continue;
+                };
+                if reply_handle
+                    .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let mut rx = chunk_out;
+        let reply_handle = handle.clone();
+        crate::runtime::spawn(async move {
+            while let Some(d) = rx.recv().await {
+                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
+                    break;
+                };
+                let Ok(frame) = d.to_frame(channel) else {
+                    continue;
+                };
+                if reply_handle
+                    .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     // A peer asked for a file it is allowed to have. Sending it is the Transfer
     // channel's job, so the request surfaces as an event rather than being
     // served here: this crate owns no second bulk path.
@@ -745,6 +895,8 @@ async fn establish(
         handle,
         browse_rx: Arc::new(tokio::sync::Mutex::new(browse_incoming)),
         sync_rx: Arc::new(tokio::sync::Mutex::new(sync_incoming)),
+        chunkmap_rx: Arc::new(tokio::sync::Mutex::new(chunkmap_answers)),
+        chunk_rx: Arc::new(tokio::sync::Mutex::new(chunk_answers)),
         peer_id,
         peer_name,
         peer_device,
