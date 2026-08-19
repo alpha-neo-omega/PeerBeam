@@ -335,6 +335,35 @@ abstract class PeerBeamApi {
   /// the device shares at all.
   Future<BrowseListing> browse(PeerTarget peer, {String path = ''});
 
+  /// Sync a folder with a device, **both ways**.
+  ///
+  /// Files only they changed are fetched, files only you changed are pushed,
+  /// and their deletions are applied when they follow from your copy. When both
+  /// sides changed a file, their copy arrives beside yours under a
+  /// `.sync-conflict-` name and **yours is untouched** — no automatic rule can
+  /// pick correctly, and every one of them loses somebody's work.
+  ///
+  /// Returns once the work is planned and requested; bytes arrive as ordinary
+  /// inbound transfers through the usual approval path.
+  Future<SyncResult> syncFolder(PeerTarget peer, String path, String into);
+
+  /// Keep syncing [path] into [into] until [unwatchFolder] is called.
+  ///
+  /// A file is only acted on once it has stopped changing, so saving a large
+  /// file mid-poll never syncs a half-written copy.
+  Future<void> watchFolder(
+    PeerTarget peer,
+    String path,
+    String into, {
+    int intervalSeconds,
+  });
+
+  /// Stop watching a folder.
+  Future<void> unwatchFolder(String path, String into);
+
+  /// Which folders are currently being watched.
+  Future<List<WatchedFolder>> watchedFolders();
+
   /// This device's activity, newest first. A pure local read.
   Future<List<TimelineEvent>> timeline({int? limit});
 
@@ -623,9 +652,7 @@ class PeerBeam implements PeerBeamApi {
     // for one: the engine refuses an out-of-range limit rather than clamping
     // it, and "no opinion" must reach it as no key at all.
     final data = _data(
-      _req().chatSearch(
-        jsonEncode({'query': query, 'limit': ?limit}),
-      ),
+      _req().chatSearch(jsonEncode({'query': query, 'limit': ?limit})),
     );
     return ChatSearchResults(
       hits: _list(data['hits']).map(ChatSearchHit.fromJson).toList(),
@@ -697,9 +724,7 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<bool> notesSync(PeerTarget peer) async {
-    final data = _data(
-      _req().notesSync(jsonEncode({'peer': peer.toJson()})),
-    );
+    final data = _data(_req().notesSync(jsonEncode({'peer': peer.toJson()})));
     return data['sent'] == true;
   }
 
@@ -719,6 +744,53 @@ class PeerBeam implements PeerBeamApi {
       _req().browseList(jsonEncode({'peer': peer.toJson(), 'path': path})),
     );
     return BrowseListing.fromJson(data);
+  }
+
+  @override
+  Future<SyncResult> syncFolder(
+    PeerTarget peer,
+    String path,
+    String into,
+  ) async {
+    final data = _data(
+      _req().syncPull(
+        jsonEncode({'peer': peer.toJson(), 'path': path, 'into': into}),
+      ),
+    );
+    return SyncResult.fromJson(data);
+  }
+
+  @override
+  Future<void> watchFolder(
+    PeerTarget peer,
+    String path,
+    String into, {
+    int intervalSeconds = 30,
+  }) async {
+    _data(
+      _req().syncWatch(
+        jsonEncode({
+          'peer': peer.toJson(),
+          'path': path,
+          'into': into,
+          'interval': intervalSeconds,
+        }),
+      ),
+    );
+  }
+
+  @override
+  Future<void> unwatchFolder(String path, String into) async {
+    _data(_req().syncUnwatch(jsonEncode({'path': path, 'into': into})));
+  }
+
+  @override
+  Future<List<WatchedFolder>> watchedFolders() async {
+    final data = _data(_req().syncWatches('{}'));
+    final list = (data['watching'] as List?) ?? const [];
+    return list
+        .map((e) => WatchedFolder.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
 
   @override

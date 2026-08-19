@@ -509,6 +509,9 @@ pub struct Manager {
     /// The encrypted store every capability shares, kept so folder sync can
     /// open its own index namespace without a second key derivation.
     appstore: Arc<dyn peerbeam_domain::port::AppStore>,
+    /// Folders being watched, keyed by path-and-destination, each holding the
+    /// flag its thread checks to know when to stop.
+    watches: Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     /// A program to run after a received file lands, or empty for none.
     /// Behind a lock so a settings change reaches the next file rather than the
     /// next restart.
@@ -641,6 +644,7 @@ impl Manager {
             notes,
             clip_history,
             appstore,
+            watches: Mutex::new(std::collections::HashMap::new()),
             receive_hook: RwLock::new(receive_hook),
             staging,
             staging_limits,
@@ -3423,6 +3427,106 @@ impl Manager {
         }))
     }
 
+    /// Keep a folder in sync until told to stop:
+    /// `{peer, path, into, interval?}` → `{watching:true}`.
+    ///
+    /// **A thread, not a task.** [`sync_pull`](Self::sync_pull) blocks on the
+    /// runtime internally, and blocking on a runtime from inside it deadlocks —
+    /// so the loop gets its own thread and the async work stays where it
+    /// already worked.
+    ///
+    /// A file is only synced once it has stopped changing, so saving a large
+    /// file part-way through a poll neither syncs a half-written copy nor
+    /// raises the version vector once per observation and manufactures a
+    /// conflict out of an ordinary save.
+    pub fn sync_watch(self: &Arc<Self>, req: &Value) -> Op {
+        let path = req
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "path required".into()))?
+            .to_string();
+        let into = req
+            .get("into")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "into required".into()))?
+            .to_string();
+        if !std::path::Path::new(&into).is_dir() {
+            return Err((Code::InvalidArgument, format!("{into} is not a directory")));
+        }
+        // Clamped: a one-second poll would re-hash the folder continuously and
+        // cost more than the change it is trying to notice.
+        let interval = req
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .max(5);
+        let key = watch_key(&path, &into);
+
+        let mut watches = self.watches.lock().unwrap();
+        if watches.contains_key(&key) {
+            // Already watching. Succeeding is right: the state the caller asked
+            // for is the state that holds, and a second toggle should not error.
+            return Ok(json!({ "watching": true, "already": true }));
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        watches.insert(key, stop.clone());
+        drop(watches);
+
+        let me = self.clone();
+        let request = req.clone();
+        let root = std::path::PathBuf::from(&into);
+        std::thread::spawn(move || {
+            let mut settling = peerbeam_sync::Settling::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let settled = settling.observe(&observe_folder(&root));
+                if settled.is_empty() && settling.unsettled() > 0 {
+                    // Something is still being written. Waiting is the point.
+                    std::thread::sleep(std::time::Duration::from_secs(interval));
+                    continue;
+                }
+                // A failed pass must not end the watch: the peer may simply be
+                // asleep, and a watch that quits on the first unreachable
+                // device is one nobody can leave running.
+                if let Err((_, e)) = me.sync_pull(&request) {
+                    tracing::debug!(error = %e, "watched sync pass failed; will retry");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
+        });
+        Ok(json!({ "watching": true }))
+    }
+
+    /// Stop watching a folder: `{path, into}` → `{watching:false}`.
+    pub fn sync_unwatch(self: &Arc<Self>, req: &Value) -> Op {
+        let path = req
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "path required".into()))?;
+        let into = req
+            .get("into")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "into required".into()))?;
+        let existed = self
+            .watches
+            .lock()
+            .unwrap()
+            .remove(&watch_key(path, into))
+            .map(|stop| stop.store(true, std::sync::atomic::Ordering::Relaxed))
+            .is_some();
+        Ok(json!({ "watching": false, "was_watching": existed }))
+    }
+
+    /// Which folders are being watched: `{watching:[{path,into}]}`.
+    pub fn sync_watches(self: &Arc<Self>) -> Op {
+        let watches = self.watches.lock().unwrap();
+        let list: Vec<Value> = watches
+            .keys()
+            .filter_map(|k| k.split_once('\u{1}'))
+            .map(|(p, i)| json!({ "path": p, "into": i }))
+            .collect();
+        Ok(json!({ "watching": list }))
+    }
+
     /// The per-device sync index, keyed by this device's own id — the counter
     /// its own edits raise.
     fn sync_index(&self) -> peerbeam_sync::SyncIndex {
@@ -5518,6 +5622,59 @@ async fn fetch_by_delta(
     }
     std::fs::write(&dest, &rebuilt).ok()?;
     Some(need.reuse_bytes)
+}
+
+/// A stable key for one watched (share path → local directory) pair.
+///
+/// Joined with a control character rather than a slash or a dash: both appear
+/// in real paths, and a separator that can occur in the values it separates is
+/// a collision waiting to happen.
+fn watch_key(path: &str, into: &str) -> String {
+    format!("{path}\u{1}{into}")
+}
+
+/// Every file under `root`, as the settling rule wants to see it.
+fn observe_folder(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observed)> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, peerbeam_sync::Observed)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Symlinks are skipped for the reason the index skips them:
+            // following one can leave the folder or loop.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else if meta.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push((
+                        rel.to_string_lossy().into_owned(),
+                        peerbeam_sync::Observed {
+                            size: meta.len(),
+                            modified: meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map_or(0, |d| d.as_secs() as i64),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -9757,5 +9914,71 @@ mod tests {
                 "a platform that cannot write an absolute path must consult no rules"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[test]
+    fn a_watch_key_cannot_be_forged_by_a_path_containing_the_separator() {
+        // Joined on a control character precisely because slashes and dashes
+        // occur in real paths: a separator that can appear in the values it
+        // separates is a collision waiting to happen.
+        assert_ne!(watch_key("a", "b/c"), watch_key("a/b", "c"));
+        assert_ne!(watch_key("a", "b-c"), watch_key("a-b", "c"));
+        assert_eq!(watch_key("a", "b"), watch_key("a", "b"));
+    }
+
+    #[test]
+    fn observing_a_folder_reports_files_by_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        std::fs::write(dir.path().join("sub").join("b.txt"), b"two").unwrap();
+
+        let mut seen: Vec<String> = observe_folder(dir.path())
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        seen.sort();
+        assert_eq!(seen, vec!["a.txt", "sub/b.txt"]);
+    }
+
+    #[test]
+    fn an_observation_carries_the_size_the_settling_rule_compares() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"12345").unwrap();
+        let seen = observe_folder(dir.path());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.size, 5);
+    }
+
+    /// A growing file must never settle, which is what stops a watch from
+    /// syncing a half-written copy. Checked here against the real observer
+    /// rather than only against hand-made fixtures.
+    #[test]
+    fn a_file_still_being_written_does_not_settle_through_the_real_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.bin");
+        let mut settling = peerbeam_sync::Settling::new();
+
+        for n in [10usize, 200, 4000] {
+            std::fs::write(&path, vec![0u8; n]).unwrap();
+            assert!(
+                settling.observe(&observe_folder(dir.path())).is_empty(),
+                "a file still growing settled at {n} bytes"
+            );
+        }
+        // The loop's last pass already recorded the file at 4000 bytes, so the
+        // next identical observation is its *second* consecutive hold and it
+        // settles there. Getting this off by one is easy — the count is of
+        // consecutive matching observations, not of calls after the writing
+        // stops.
+        assert_eq!(
+            settling.observe(&observe_folder(dir.path())),
+            vec!["growing.bin"]
+        );
     }
 }

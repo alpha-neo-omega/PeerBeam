@@ -560,19 +560,57 @@ pub unsafe extern "C" fn pb_chat_search(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.chat_search(&read_json(json)?))()))
 }
 
-/// Mirror a peer's shared folder into a local directory:
-/// `{peer, path, into}` → `{fetching, up_to_date, truncated}`.
+/// Sync a folder with a peer, both ways:
+/// `{peer, path, into}` → `{fetching, pushing, deleted, renamed, conflicts:[…]}`.
 ///
-/// **A one-way pull.** Nothing is deleted, nothing is pushed, and a local file
-/// newer than the peer's is left alone. Returns once the files have been asked
-/// for; the bytes arrive as ordinary inbound transfers through the usual
-/// approval path, because that is what they are.
+/// **Bidirectional, with conflicts kept rather than resolved.** Per-file version
+/// vectors distinguish "their copy is newer" from "we both changed it"; when
+/// both did, their copy arrives as `name.sync-conflict-<peer>.ext` and the local
+/// file is untouched. Only the changed parts of a file cross the wire, and a
+/// file that merely moved is renamed locally rather than fetched again.
+///
+/// Returns once the work has been planned and requested; bytes arrive as
+/// ordinary inbound transfers through the usual approval path, because that is
+/// what they are.
 ///
 /// # Safety
 /// `json` must be null or a valid NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn pb_sync_pull(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.sync_pull(&read_json(json)?))()))
+}
+
+/// Keep a folder in sync until stopped:
+/// `{peer, path, into, interval?}` → `{watching:true}`.
+///
+/// A file is only acted on once it has stopped changing, so saving a large file
+/// mid-poll never syncs a half-written copy. The interval is in seconds and
+/// clamped to a floor: a one-second poll would re-hash the folder continuously
+/// and cost more than the change it is trying to notice.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_sync_watch(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.sync_watch(&read_json(json)?))()))
+}
+
+/// Stop watching a folder: `{path, into}` → `{watching:false, was_watching}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_sync_unwatch(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.sync_unwatch(&read_json(json)?))()))
+}
+
+/// Which folders are being watched: `{}` → `{watching:[{path,into}]}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_sync_watches(_json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.sync_watches())()))
 }
 
 /// Ask a device what is in one of its shared folders:

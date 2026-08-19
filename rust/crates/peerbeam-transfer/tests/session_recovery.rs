@@ -341,6 +341,31 @@ async fn next_channel(
 /// what broke.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// Timing for the tests that assert recovery **succeeds**.
+///
+/// Deliberately **not** `RecoveryConfig::default()`. The production default
+/// gives up after five attempts, each bounded at ten seconds — so under
+/// `cargo test --workspace`, with a hundred binaries competing for cores, an
+/// in-process reconnect can miss its window five times and the session
+/// genuinely stops trying. The test then reports "recovery never happened",
+/// which is *true* and is a fact about the machine rather than about the code.
+///
+/// Many cheap attempts retry through that starvation. Nothing about the
+/// behaviour under test changes — does a severed session resume, bump its
+/// epoch, and re-attach its channels? — only how much transient unluckiness it
+/// tolerates before concluding the answer is no.
+///
+/// The tests that assert recovery *fails* keep their own tight configs: for
+/// those, giving up is the behaviour being checked.
+fn resilient() -> RecoveryConfig {
+    RecoveryConfig {
+        max_attempts: 30,
+        backoff_base: Duration::from_millis(5),
+        attempt_timeout: Duration::from_secs(3),
+        ..RecoveryConfig::default()
+    }
+}
+
 async fn live_handle(rx: &mut watch::Receiver<Option<SessionHandle>>) -> SessionHandle {
     loop {
         if let Some(h) = rx.borrow_and_update().clone() {
@@ -357,7 +382,7 @@ async fn live_handle(rx: &mut watch::Receiver<Option<SessionHandle>>) -> Session
 
 #[tokio::test]
 async fn reconnect_resumes_and_reattaches_a_channel_with_message_continuity() {
-    let (mut ep, log) = harness(RecoveryConfig::default(), None).await;
+    let (mut ep, log) = harness(resilient(), None).await;
 
     let h0 = live_handle(&mut ep.handle).await;
     let c1 = h0.open_channel(CHAT).await.expect("open c1");
@@ -425,7 +450,7 @@ async fn reconnect_resumes_and_reattaches_a_channel_with_message_continuity() {
 
 #[tokio::test]
 async fn multiple_reconnects_bump_the_epoch_each_time() {
-    let (mut ep, _log) = harness(RecoveryConfig::default(), None).await;
+    let (mut ep, _log) = harness(resilient(), None).await;
     let _ = live_handle(&mut ep.handle).await;
 
     for expected_epoch in 1..=3u64 {

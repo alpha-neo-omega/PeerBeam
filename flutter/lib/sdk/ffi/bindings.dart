@@ -85,6 +85,10 @@ class Bindings {
   final _ArgRetDart _clipHistoryClear;
   final _ArgRetDart _timeline;
   final _ArgRetDart _browseList;
+  final _ArgRetDart _syncPull;
+  final _ArgRetDart _syncWatch;
+  final _ArgRetDart _syncUnwatch;
+  final _ArgRetDart _syncWatches;
   final _RetDart _presence;
   final _ArgRetDart _presenceBattery;
   final _ArgRetDart _clipboardSync;
@@ -165,13 +169,21 @@ class Bindings {
       ),
       _chatSearch = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_search'),
       _chatReact = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_react'),
-      _chatMarkRead = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_mark_read'),
+      _chatMarkRead = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_mark_read',
+      ),
       _notesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_list'),
-      _notesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_create'),
+      _notesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_notes_create',
+      ),
       _notesEdit = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_edit'),
-      _notesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_delete'),
+      _notesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_notes_delete',
+      ),
       _notesSync = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_sync'),
-      _presenceRing = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_presence_ring'),
+      _presenceRing = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_presence_ring',
+      ),
       _clipHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_clipboard_history',
       ),
@@ -180,6 +192,14 @@ class Bindings {
       ),
       _timeline = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_timeline'),
       _browseList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_browse_list'),
+      _syncPull = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_sync_pull'),
+      _syncWatch = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_sync_watch'),
+      _syncUnwatch = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_sync_unwatch',
+      ),
+      _syncWatches = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_sync_watches',
+      ),
       _presence = lib.lookupFunction<_RetC, _RetDart>('pb_presence_json'),
       _presenceBattery = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_presence_battery',
@@ -223,14 +243,12 @@ class Bindings {
   String active() => _consume(_active());
   String interrupted() => _consume(_interrupted());
   String resumeInterrupted(String json) => _withArg(json, _resumeInterrupted);
-  String discardInterrupted(String json) =>
-      _withArg(json, _discardInterrupted);
+  String discardInterrupted(String json) => _withArg(json, _discardInterrupted);
   String get(String json) => _withArg(json, _get);
   String history() => _consume(_history());
   String trustList() => _consume(_trustList());
   String trustRemove(String json) => _withArg(json, _trustRemove);
-  String trustSetPermission(String json) =>
-      _withArg(json, _trustSetPermission);
+  String trustSetPermission(String json) => _withArg(json, _trustSetPermission);
   String rulesSet(String json) => _withArg(json, _rulesSet);
   String historyClear() => _consume(_historyClear());
   String settingsGet() => _consume(_settingsGet());
@@ -242,8 +260,7 @@ class Bindings {
   String chatCancel(String json) => _withArg(json, _chatCancel);
   String chatConversations(String json) => _withArg(json, _chatConversations);
   String chatDelete(String json) => _withArg(json, _chatDelete);
-  String chatDeleteMessages(String json) =>
-      _withArg(json, _chatDeleteMessages);
+  String chatDeleteMessages(String json) => _withArg(json, _chatDeleteMessages);
   String chatSearch(String json) => _withArg(json, _chatSearch);
   String chatReact(String json) => _withArg(json, _chatReact);
   String chatMarkRead(String json) => _withArg(json, _chatMarkRead);
@@ -257,6 +274,10 @@ class Bindings {
   String clipHistoryClear(String json) => _withArg(json, _clipHistoryClear);
   String timeline(String json) => _withArg(json, _timeline);
   String browseList(String json) => _withArg(json, _browseList);
+  String syncPull(String json) => _withArg(json, _syncPull);
+  String syncWatch(String json) => _withArg(json, _syncWatch);
+  String syncUnwatch(String json) => _withArg(json, _syncUnwatch);
+  String syncWatches(String json) => _withArg(json, _syncWatches);
 
   String presence() => _consume(_presence());
   String presenceBattery(String json) => _withArg(json, _presenceBattery);

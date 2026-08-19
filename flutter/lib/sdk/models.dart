@@ -889,6 +889,73 @@ class BrowseEntry {
 /// nothing here, may not have granted this device permission, or the path may
 /// not exist. **Those are deliberately indistinguishable**, so a surface must
 /// say all three rather than guess.
+/// What one folder sync did.
+class SyncResult {
+  const SyncResult({
+    required this.fetching,
+    required this.pushing,
+    required this.deleted,
+    required this.renamed,
+    required this.conflicts,
+    required this.truncated,
+  });
+
+  /// Files being fetched from the peer.
+  final int fetching;
+
+  /// Files offered to the peer.
+  final int pushing;
+
+  /// Files deleted locally because the peer's deletion followed from our copy.
+  final int deleted;
+
+  /// Files moved locally instead of re-fetched.
+  final int renamed;
+
+  /// Names their copies arrived under because **both** sides changed the file.
+  /// The local file was not touched — each entry is a decision the user now has
+  /// to make, which is why these are named rather than counted.
+  final List<String> conflicts;
+
+  /// Whether the folder held more files than one manifest carries.
+  final bool truncated;
+
+  factory SyncResult.fromJson(Map<String, dynamic> json) => SyncResult(
+    fetching: (json['fetching'] as num?)?.toInt() ?? 0,
+    pushing: (json['pushing'] as num?)?.toInt() ?? 0,
+    deleted: (json['deleted'] as num?)?.toInt() ?? 0,
+    renamed: (json['renamed'] as num?)?.toInt() ?? 0,
+    conflicts: ((json['conflicts'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList(),
+    truncated: json['truncated'] as bool? ?? false,
+  );
+
+  /// Whether anything at all needs to happen.
+  bool get isIdle =>
+      fetching == 0 &&
+      pushing == 0 &&
+      deleted == 0 &&
+      renamed == 0 &&
+      conflicts.isEmpty;
+}
+
+/// A folder being kept in sync continuously.
+class WatchedFolder {
+  const WatchedFolder({required this.path, required this.into});
+
+  /// The peer's share-relative path.
+  final String path;
+
+  /// The local directory it mirrors into.
+  final String into;
+
+  factory WatchedFolder.fromJson(Map<String, dynamic> json) => WatchedFolder(
+    path: json['path'] as String? ?? '',
+    into: json['into'] as String? ?? '',
+  );
+}
+
 class BrowseListing {
   final String path;
   final List<BrowseEntry> entries;

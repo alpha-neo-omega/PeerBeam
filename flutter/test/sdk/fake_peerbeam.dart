@@ -570,6 +570,54 @@ class FakePeerBeam implements PeerBeamApi {
   /// nothing, or has not granted permission, actually sends.
   bool browseDenied = false;
 
+  /// Folders this fake is "watching", so a test can assert a toggle stuck.
+  final Set<String> watching = <String>{};
+
+  /// What [syncFolder] should report.
+  SyncResult syncResult = const SyncResult(
+    fetching: 0,
+    pushing: 0,
+    deleted: 0,
+    renamed: 0,
+    conflicts: [],
+    truncated: false,
+  );
+
+  @override
+  Future<SyncResult> syncFolder(
+    PeerTarget peer,
+    String path,
+    String into,
+  ) async {
+    calls.add('syncFolder:${peer.id}:$path:$into');
+    return syncResult;
+  }
+
+  @override
+  Future<void> watchFolder(
+    PeerTarget peer,
+    String path,
+    String into, {
+    int intervalSeconds = 30,
+  }) async {
+    calls.add('watchFolder:${peer.id}:$path:$into:$intervalSeconds');
+    watching.add('$path\u0001$into');
+  }
+
+  @override
+  Future<void> unwatchFolder(String path, String into) async {
+    calls.add('unwatchFolder:$path:$into');
+    watching.remove('$path\u0001$into');
+  }
+
+  @override
+  Future<List<WatchedFolder>> watchedFolders() async {
+    return watching.map((k) {
+      final parts = k.split('\u0001');
+      return WatchedFolder(path: parts.first, into: parts.last);
+    }).toList();
+  }
+
   @override
   Future<BrowseListing> browse(PeerTarget peer, {String path = ''}) async {
     calls.add('browse:${peer.id}:$path');
