@@ -77,6 +77,16 @@ impl CheckpointWriter {
         }
     }
 
+    /// A clearer for this writer's checkpoint, to be used **after** the
+    /// progress pump has stopped — see [`CheckpointClearer`].
+    #[must_use]
+    pub fn clearer(&self) -> CheckpointClearer {
+        CheckpointClearer {
+            store: self.store.clone(),
+            id: self.session.id.as_str().to_string(),
+        }
+    }
+
     /// Note that `transferred` bytes have moved, persisting at most once per
     /// [`CHECKPOINT_INTERVAL`].
     pub fn record(&mut self, transferred: u64) {
@@ -87,6 +97,35 @@ impl CheckpointWriter {
         self.session.transferred_bytes = transferred;
         if let Err(e) = self.store.save_checkpoint(&self.session) {
             tracing::debug!(error = %e, transfer_id = %self.session.id.as_str(), "checkpoint not updated");
+        }
+    }
+}
+
+/// Deletes one transfer's checkpoint once nothing can write it again.
+///
+/// **Why this is separate from the writer.** A completed transfer clears its
+/// own checkpoint from inside the transfer task, while the progress pump is
+/// still draining a backlog of `Progress` messages on an unbounded channel.
+/// Each of those can call [`CheckpointWriter::record`], so a write can land
+/// *after* the delete and resurrect the file — leaving a finished transfer
+/// looking interrupted, and offering the user a resume for a file they already
+/// have. Only the code that has joined the pump knows the last write is past,
+/// so that is where the final delete belongs.
+pub struct CheckpointClearer {
+    store: Arc<dyn ReliabilityStore>,
+    id: String,
+}
+
+impl CheckpointClearer {
+    /// Remove the checkpoint. Idempotent: an already-cleared checkpoint is not
+    /// an error, because the transfer task usually cleared it first and this is
+    /// the belt to that braces.
+    pub fn clear(&self) {
+        if let Err(e) = self
+            .store
+            .clear_checkpoint(&TransferId::from(self.id.as_str()))
+        {
+            tracing::debug!(error = %e, transfer_id = %self.id, "checkpoint not cleared");
         }
     }
 }
@@ -499,5 +538,154 @@ impl Manager {
             Code::Connection,
             format!("{} is not reachable right now", peer.0),
         ))
+    }
+}
+
+#[cfg(test)]
+mod clearer_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// An in-memory checkpoint store that records the order of operations, so a
+    /// test can prove *when* a write happened relative to a delete.
+    #[derive(Default)]
+    struct Recording {
+        live: Mutex<HashMap<String, TransferSession>>,
+        ops: Mutex<Vec<String>>,
+    }
+
+    impl peerbeam_domain::port::ReliabilityStore for Recording {
+        fn checksum(&self, _data: &[u8]) -> String {
+            String::new()
+        }
+        fn save_checkpoint(&self, session: &TransferSession) -> peerbeam_domain::error::Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("save:{}", session.id.as_str()));
+            self.live
+                .lock()
+                .unwrap()
+                .insert(session.id.as_str().to_string(), session.clone());
+            Ok(())
+        }
+        fn load_checkpoint(
+            &self,
+            transfer: &TransferId,
+        ) -> peerbeam_domain::error::Result<Option<TransferSession>> {
+            Ok(self.live.lock().unwrap().get(transfer.as_str()).cloned())
+        }
+        fn list_checkpoints(&self) -> peerbeam_domain::error::Result<Vec<TransferSession>> {
+            Ok(self.live.lock().unwrap().values().cloned().collect())
+        }
+        fn resumable_offset(&self, _transfer: &TransferId) -> peerbeam_domain::error::Result<u64> {
+            Ok(0)
+        }
+        fn clear_checkpoint(&self, transfer: &TransferId) -> peerbeam_domain::error::Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("clear:{}", transfer.as_str()));
+            self.live.lock().unwrap().remove(transfer.as_str());
+            Ok(())
+        }
+    }
+
+    fn session(id: &str) -> TransferSession {
+        TransferSession {
+            id: TransferId::from(id),
+            peer: DeviceId::from("pb-bob"),
+            direction: Direction::Sending,
+            status: peerbeam_domain::entity::TransferStatus::Transferring,
+            files: vec![peerbeam_domain::entity::FileEntry {
+                path: std::path::PathBuf::from("/tmp/f.bin"),
+                name: "f.bin".into(),
+                size: 100,
+                mime_type: String::new(),
+                checksum: None,
+            }],
+            total_bytes: 100,
+            transferred_bytes: 0,
+            started_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            completed_at: None,
+            is_resume: false,
+            accepted: true,
+        }
+    }
+
+    /// **The bug this exists for.** A completed send clears its checkpoint from
+    /// inside the transfer task while the progress pump is still draining an
+    /// unbounded backlog — and every drained message can write it back. Deleting
+    /// once, from the transfer, is not enough.
+    #[test]
+    fn a_write_after_the_clear_resurrects_the_checkpoint() {
+        let store = Arc::new(Recording::default());
+        let s = session("res-1");
+        let mut writer = CheckpointWriter::new(store.clone(), s.clone());
+
+        // The transfer finishes and clears, exactly as `recover.rs` does.
+        store.clear_checkpoint(&s.id).unwrap();
+        assert!(store.load_checkpoint(&s.id).unwrap().is_none());
+
+        // A backlogged progress message lands afterwards. The writer's throttle
+        // has never fired, so this one writes.
+        writer.record(64);
+        assert!(
+            store.load_checkpoint(&s.id).unwrap().is_some(),
+            "the race this guards against is no longer reproducible — if the \
+             writer can no longer resurrect a cleared checkpoint, this test \
+             should be replaced rather than deleted"
+        );
+    }
+
+    /// And the fix: a clear taken *after* the pump has stopped is the final
+    /// word, whatever the writer did in between.
+    #[test]
+    fn a_clear_after_the_last_write_is_final() {
+        let store = Arc::new(Recording::default());
+        let s = session("res-2");
+        let mut writer = CheckpointWriter::new(store.clone(), s.clone());
+        let clearer = writer.clearer();
+
+        store.clear_checkpoint(&s.id).unwrap();
+        writer.record(64); // the late, resurrecting write
+        clearer.clear(); // what `drive` now does after joining the pump
+
+        assert!(
+            store.load_checkpoint(&s.id).unwrap().is_none(),
+            "a completed transfer still left a checkpoint behind"
+        );
+    }
+
+    #[test]
+    fn clearing_twice_is_not_an_error() {
+        // The transfer task usually cleared it first; this is the belt to that
+        // braces and must stay quiet when there is nothing left to remove.
+        let store = Arc::new(Recording::default());
+        let s = session("res-3");
+        let clearer = CheckpointWriter::new(store.clone(), s.clone()).clearer();
+        clearer.clear();
+        clearer.clear();
+        assert!(store.load_checkpoint(&s.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_clearer_only_clears_its_own_transfer() {
+        let store = Arc::new(Recording::default());
+        let mine = session("res-4");
+        let other = session("res-5");
+        store.save_checkpoint(&mine).unwrap();
+        store.save_checkpoint(&other).unwrap();
+
+        CheckpointWriter::new(store.clone(), mine.clone())
+            .clearer()
+            .clear();
+
+        assert!(store.load_checkpoint(&mine.id).unwrap().is_none());
+        assert!(
+            store.load_checkpoint(&other.id).unwrap().is_some(),
+            "another transfer's checkpoint was removed"
+        );
     }
 }

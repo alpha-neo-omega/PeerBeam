@@ -5292,6 +5292,13 @@ where
     let pump_id = id.clone();
     let pump_driving = peer_driving.clone();
     let pump_fell_back = fell_back.clone();
+    // Captured before the writer moves into the pump below: after the join
+    // there is no writer left to ask, and this is the only place that knows the
+    // last checkpoint write is past.
+    let clearer = checkpoint
+        .as_ref()
+        .map(crate::resume::CheckpointWriter::clearer);
+
     let pump = async move {
         // Throttle emission/mirroring to ~20/s so small chunks stay smooth
         // without flooding the event bridge; always let the final update through.
@@ -5386,6 +5393,20 @@ where
 
     let work = run(ptx);
     let (r, _, _, _) = tokio::join!(work, pump, in_task, out_task);
+
+    // **The final word on the checkpoint.** A completed send clears its own
+    // checkpoint from inside the transfer task, while the pump is still
+    // draining a backlog of `Progress` on an unbounded channel — and every one
+    // of those can write the checkpoint back. Deleting again here, with the
+    // pump joined and no writer left alive, is what makes the deletion stick.
+    // Without it a finished transfer intermittently stays on disk as an
+    // interrupted one, and the user is offered a resume for a file they
+    // already have.
+    if matches!(r, Ok(TransferOutcome::Completed)) {
+        if let Some(c) = clearer {
+            c.clear();
+        }
+    }
     r
 }
 

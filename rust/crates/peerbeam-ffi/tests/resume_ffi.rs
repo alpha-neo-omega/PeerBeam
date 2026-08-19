@@ -68,7 +68,14 @@ fn events_snapshot() -> Vec<Value> {
 /// previous ad-hoc bounds of 10 to 60 seconds turned that contention into four
 /// simultaneous failures that read like a resume bug and were a fact about the
 /// machine.
-const WAIT: u64 = 180;
+///
+/// **Strictly longer than the engine's own `ACCEPT_TIMEOUT` (180 s).** An
+/// earlier value of exactly 180 made the test's wait and the engine's accept
+/// deadline expire together, so which one fired first was a coin toss: the test
+/// could give up in the same instant the engine was about to emit the event it
+/// was waiting for. A bound meant to catch "genuinely stuck" must sit outside
+/// every timeout the code under test can legitimately reach.
+const WAIT: u64 = 240;
 
 fn wait_event(secs: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
