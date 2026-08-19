@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../clipboard/clipboard_history_screen.dart';
 import 'logs_screen.dart';
@@ -351,14 +352,61 @@ class SettingsScreen extends StatelessWidget {
 
               const _GroupLabel('About'),
               Card(
-                child: ListTile(
-                  leading: const Icon(Icons.info_outline_rounded),
-                  title: const Text('PeerBeam'),
-                  // Asked of the engine, never written down here. The previous
-                  // hardcoded string sat under a comment asking whoever bumped
-                  // the version to keep it in sync, and it was three releases
-                  // stale by the time anyone noticed.
-                  subtitle: Text(_aboutLine(state.api?.engineVersion)),
+                child: Column(
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.info_outline_rounded),
+                      title: const Text('PeerBeam'),
+                      // Asked of the engine, never written down here. The
+                      // previous hardcoded string sat under a comment asking
+                      // whoever bumped the version to keep it in sync, and it
+                      // was three releases stale by the time anyone noticed.
+                      subtitle: Text(_aboutLine(state.api?.engineVersion)),
+                    ),
+                    const Divider(height: 1),
+                    // **PeerBeam does not check for updates, by construction.**
+                    //
+                    // Invariant I4 forbids phone-home without qualification, and
+                    // VISION.md restates it as a permanent non-goal: "No
+                    // analytics, telemetry, tracking, or phone-home, in any
+                    // build." An app that contacts a vendor server on its own
+                    // initiative — even to ask one question — discloses an IP, a
+                    // version, and the times somebody uses it. That is a
+                    // server-side record of this user, which is the thing this
+                    // project exists not to create.
+                    //
+                    // So the address is shown and the person goes there
+                    // themselves, in a browser they already trust. No launcher
+                    // dependency either: this is copyable text, so nothing here
+                    // can open anything on its own.
+                    ListTile(
+                      leading: const Icon(Icons.open_in_new_rounded),
+                      title: const Text('Releases'),
+                      subtitle: const Text(
+                        '$_releasesUrl\n'
+                        'PeerBeam never checks for updates on its own — that '
+                        'would mean contacting a server about you. Open this to '
+                        'see what is current.',
+                      ),
+                      isThreeLine: true,
+                      trailing: IconButton(
+                        icon: const Icon(Icons.copy_rounded),
+                        tooltip: 'Copy the releases address',
+                        onPressed: () {
+                          Clipboard.setData(
+                            const ClipboardData(text: _releasesUrl),
+                          );
+                          ScaffoldMessenger.of(context)
+                            ..hideCurrentSnackBar()
+                            ..showSnackBar(
+                              const SnackBar(
+                                content: Text('Releases address copied'),
+                              ),
+                            );
+                        },
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -427,6 +475,13 @@ class SettingsScreen extends StatelessWidget {
     );
     if (confirmed == true) await state.trust.remove(d.id);
   }
+
+  /// Where releases are published.
+  ///
+  /// A constant rather than something derived at runtime: deriving it would
+  /// mean asking somewhere, and not asking is the point.
+  static const String _releasesUrl =
+      'https://github.com/alpha-neo-omega/PeerBeam/releases';
 
   /// The About line. The version is whatever the engine reports; with no engine
   /// to ask, it says so rather than inventing a number — an app stating a

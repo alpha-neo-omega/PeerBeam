@@ -142,6 +142,15 @@ impl ChatStore {
                 }
             }
         }
+        self.write(&rec)
+    }
+
+    /// Persist a record exactly as given, with no landing reconciliation.
+    ///
+    /// Separate from [`append`](Self::append) so [`with_landing`](Self::with_landing)
+    /// can write a record it has *just* corrected without re-entering the
+    /// reconcile it is already inside.
+    fn write(&self, rec: &ChatRecord) -> Result<(), ChatError> {
         let ns = format!("chat-{}", rec.peer_id);
         self.store
             .put(&ns, &rec.id, &rec.encode())
@@ -180,7 +189,15 @@ impl ChatStore {
         id: &str,
     ) -> Result<Option<(String, u64)>, ChatError> {
         let ns = Self::landing_ns(peer);
-        let Ok(Some(blob)) = self.store.get(&ns, id) else {
+        // The read error is *propagated*, not folded into `None`. An earlier
+        // version used `let Ok(Some(..)) = .. else { return Ok(None) }`, which
+        // made an unreadable store indistinguishable from an empty one — the
+        // caller then reported "nothing was parked" and moved on.
+        let Some(blob) = self
+            .store
+            .get(&ns, id)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        else {
             return Ok(None);
         };
         // Removed whether or not it decodes: a landing that cannot be read is
@@ -232,7 +249,10 @@ impl ChatStore {
         let mut out = Vec::with_capacity(raw.len());
         for (key, value) in raw {
             match ChatRecord::decode(&value) {
-                Ok(rec) => out.push(rec),
+                // Through `with_landing` like `get`: the conversation view is
+                // where a person reads the filename they are about to approve,
+                // so it must not be the one path that shows the peer's claim.
+                Ok(rec) => out.push(self.with_landing(rec)),
                 // A row this build cannot read — most likely written by a newer
                 // version whose schema grew. Skipping it loses one row; failing
                 // the call loses the entire conversation, including every row
@@ -273,8 +293,61 @@ impl ChatStore {
             .get(&ns, id)
             .map_err(|e| ChatError::Serialization(e.to_string()))?
         {
-            Some(bytes) => ChatRecord::decode(&bytes).map(Some),
+            Some(bytes) => ChatRecord::decode(&bytes).map(|r| Some(self.with_landing(r))),
             None => Ok(None),
+        }
+    }
+
+    /// Apply a landing parked for this row, if one is waiting.
+    ///
+    /// # Why this happens on *read* and not only on write
+    ///
+    /// The peer's claimed filename arrives on the CHAT channel and what really
+    /// lands arrives on TRANSFER, and nothing orders the two. Applying a parked
+    /// landing only in [`append`](Self::append) assumed the row is written
+    /// *after* the landing is parked — but both sides read the other before
+    /// they write, and each read can fall inside the other's write window
+    /// (records are committed tmp-file-then-rename, so a read landing between
+    /// the two sees nothing). When that happens the landing is parked against a
+    /// row that already exists and nothing ever looks again: the approval
+    /// prompt keeps the name the *sender* chose for a file that will arrive
+    /// under a different one.
+    ///
+    /// There is no ordering that fixes this, because there is no ordering.
+    /// Applying at read makes arrival order irrelevant — the same reason trust
+    /// expiry is enforced where trust is read rather than by a sweeper.
+    ///
+    /// Best-effort persistence: the corrected record is written back so the fix
+    /// is not recomputed forever, but a failed write costs only that, since the
+    /// next read corrects it again. The value returned is corrected either way.
+    fn with_landing(&self, mut rec: ChatRecord) -> ChatRecord {
+        if !rec.is_settleable_file_row(Direction::In) {
+            return rec;
+        }
+        match self.take_pending_landing(&rec.peer_id, &rec.id) {
+            Ok(Some((name, size))) => {
+                let Some(file) = rec.file.as_mut() else {
+                    return rec;
+                };
+                file.name = crate::display_name(&name);
+                file.size = size;
+                tracing::info!(
+                    id = %rec.id,
+                    peer = %rec.peer_id,
+                    "landing applied when the row was read"
+                );
+                if let Err(e) = self.write(&rec) {
+                    tracing::warn!(error = %e, id = %rec.id, "corrected row not persisted");
+                }
+                rec
+            }
+            Ok(None) => rec,
+            Err(e) => {
+                // Never silently: a read error here is indistinguishable from
+                // "nothing was parked", and that confusion is what hid this bug.
+                tracing::warn!(error = %e, id = %rec.id, "parked landing unreadable");
+                rec
+            }
         }
     }
 
@@ -1921,6 +1994,88 @@ mod tests {
     /// one thing, the TRANSFER stream lands another, and the two are
     /// correlated by id alone. The settled row must describe what is on disk,
     /// not what was advertised — and the name must be render-safe.
+    /// **The interleaving that actually shipped broken.**
+    ///
+    /// Both sides read the other before they write, and a record is committed
+    /// tmp-file-then-rename, so the reconcile's "is there a row?" check can fall
+    /// inside the row's own write window and see nothing. The landing is then
+    /// parked against a row that already exists — and when the only place that
+    /// applied a parked landing was `append`, which had already run, nothing
+    /// ever looked again. The approval prompt kept the sender's chosen name.
+    ///
+    /// Simulated here by parking directly, which is exactly the state that race
+    /// leaves behind: a row on disk and a landing parked for it.
+    #[test]
+    fn a_landing_parked_after_its_row_exists_is_applied_when_the_row_is_read() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("holiday.jpg", 184_320).unwrap();
+        r.name = "holiday.jpg".into();
+
+        // The row is already on disk...
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+        // ...and a landing gets parked anyway, as the race leaves it.
+        cs.park_pending_landing(&peer.0, &r.id, "invoice-2026.pdf.exe", 4_096)
+            .unwrap();
+
+        let meta = cs
+            .get(&peer, &r.id)
+            .unwrap()
+            .expect("row")
+            .file
+            .expect("file meta");
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the peer's claim outranked what actually lands"
+        );
+        assert_eq!(meta.size, 4_096);
+    }
+
+    /// The conversation view is where the filename is actually read before
+    /// approving, so it must not be the one path still showing the claim.
+    #[test]
+    fn history_shows_what_lands_not_what_was_claimed() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("holiday.jpg", 184_320).unwrap();
+        r.name = "holiday.jpg".into();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+        cs.park_pending_landing(&peer.0, &r.id, "invoice-2026.pdf.exe", 4_096)
+            .unwrap();
+
+        let rows = cs.history(&peer).unwrap();
+        assert_eq!(
+            rows[0].file.as_ref().unwrap().name,
+            "invoice-2026.pdf.exe",
+            "history still showed the peer's claim"
+        );
+    }
+
+    /// Applying on read must persist, or every reader recomputes it forever and
+    /// a reader that cannot write would keep showing the claim.
+    #[test]
+    fn a_landing_applied_on_read_is_written_back_once() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("holiday.jpg", 1).unwrap();
+        r.name = "holiday.jpg".into();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+        cs.park_pending_landing(&peer.0, &r.id, "real.bin", 4_096)
+            .unwrap();
+
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().name,
+            "real.bin"
+        );
+        // The park is consumed; a second read returns the same corrected row
+        // from disk rather than re-applying anything.
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().name,
+            "real.bin",
+            "the correction did not survive the first read"
+        );
+    }
+
     /// **The claim must lose whichever frame arrives first.**
     ///
     /// The peer's claim rides CHAT and what actually lands rides TRANSFER;
