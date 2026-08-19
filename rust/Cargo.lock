@@ -1379,6 +1379,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-pairing"
+version = "0.8.2"
+dependencies = [
+ "hmac",
+ "rand 0.8.7",
+ "serde",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
 name = "peerbeam-platform"
 version = "0.8.2"
 dependencies = [
