@@ -81,6 +81,23 @@ impl OutboxEntry {
     }
 }
 
+/// What [`ChatStore::set_file_row_landing`] did.
+///
+/// Three outcomes, not a bool. `Parked` is a **success** — the landing is held
+/// for a row that has not arrived yet — but it shares `false` with the genuine
+/// refusals, so a caller reading a bool logged "did not apply" for the ordinary
+/// case and buried the real one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// Written onto an existing row.
+    Applied,
+    /// Held until its row appears — the claim and the bytes race, and this is
+    /// the side of the race where the bytes won.
+    Parked,
+    /// Refused: no name to write, or a row that is not an in-flight file row.
+    Declined,
+}
+
 /// Reads/writes chat records via the encrypted [`AppStore`].
 #[derive(Clone)]
 pub struct ChatStore {
@@ -110,7 +127,15 @@ impl ChatStore {
     pub fn append(&self, rec: &ChatRecord) -> Result<(), ChatError> {
         let mut rec = rec.clone();
         if rec.is_settleable_file_row(Direction::In) {
+            // Only the applied case is logged. "Nothing was parked" is the
+            // ordinary outcome for every incoming file row, and a line per
+            // append would bury the one that matters.
             if let Some((name, size)) = self.take_pending_landing(&rec.peer_id, &rec.id)? {
+                tracing::info!(
+                    id = %rec.id,
+                    peer = %rec.peer_id,
+                    "landing applied to a row that arrived after it"
+                );
                 if let Some(file) = rec.file.as_mut() {
                     file.name = crate::display_name(&name);
                     file.size = size;
@@ -827,9 +852,10 @@ impl ChatStore {
         expected_direction: Direction,
         name: &str,
         size: u64,
-    ) -> Result<bool, ChatError> {
+    ) -> Result<Landing, ChatError> {
         if name.is_empty() {
-            return Ok(false);
+            tracing::warn!(id, "landing declined: the caller learned no name");
+            return Ok(Landing::Declined);
         }
         let Some(mut rec) = self.get(peer, id)? else {
             // The row has not been created yet — the peer's CHAT frame is still
@@ -837,18 +863,27 @@ impl ChatStore {
             // the sender's claim would stand unchallenged at the approval
             // prompt, which is the whole thing this reconcile prevents.
             self.park_pending_landing(&peer.0, id, name, size)?;
-            return Ok(false);
+            tracing::info!(id, peer = %peer.0, "landing parked: its row has not arrived yet");
+            return Ok(Landing::Parked);
         };
         if !rec.is_settleable_file_row(expected_direction) {
-            return Ok(false);
+            tracing::warn!(
+                id,
+                status = ?rec.status,
+                kind = ?rec.kind,
+                direction = ?rec.direction,
+                "landing declined: the row exists but is not an in-flight file row"
+            );
+            return Ok(Landing::Declined);
         }
         let Some(file) = rec.file.as_mut() else {
-            return Ok(false); // a File row always has one; belt and braces
+            tracing::warn!(id, "landing declined: a file row with no file metadata");
+            return Ok(Landing::Declined); // a File row always has one; belt and braces
         };
         file.name = crate::display_name(name);
         file.size = size;
         self.append(&rec)?;
-        Ok(true)
+        Ok(Landing::Applied)
     }
 
     /// Settle records left mid-flight by a crash or restart. Transfer ids are
@@ -1906,7 +1941,11 @@ mod tests {
         let wrote = cs
             .set_file_row_landing(&peer, &r.id, Direction::In, "invoice-2026.pdf.exe", 4_096)
             .unwrap();
-        assert!(!wrote, "there is no row yet, so nothing was written");
+        assert_eq!(
+            wrote,
+            Landing::Parked,
+            "no row yet, so the landing must be parked rather than dropped"
+        );
 
         // CHAT second: the row is created, and must carry what lands.
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
@@ -1997,7 +2036,7 @@ mod tests {
                 4_096,
             )
             .unwrap();
-        assert!(wrote);
+        assert_eq!(wrote, Landing::Applied);
         // Ordering: landing first, then settle (both share the in-flight leg).
         assert!(cs
             .set_file_row_path(&peer, &r.id, Direction::In, "/home/me/Downloads/x")
@@ -2024,9 +2063,12 @@ mod tests {
         // (a) A text row.
         let msg = ChatMessage::new("hello there").unwrap();
         cs.append(&ChatRecord::sent(&peer, &msg)).unwrap();
-        assert!(!cs
-            .set_file_row_landing(&peer, &msg.id, Direction::In, "evil.exe", 1)
-            .unwrap());
+        assert_eq!(
+            cs.set_file_row_landing(&peer, &msg.id, Direction::In, "evil.exe", 1)
+                .unwrap(),
+            Landing::Declined,
+            "a text row is not a file row and must be refused"
+        );
         let text = cs.get(&peer, &msg.id).unwrap().unwrap();
         assert_eq!(text.body, "hello there");
         assert!(text.file.is_none(), "no phantom FileMeta");
@@ -2036,9 +2078,12 @@ mod tests {
         let mut declined = ChatRecord::file_in(&peer, &declined_ref);
         declined.status = Status::Declined;
         cs.append(&declined).unwrap();
-        assert!(!cs
-            .set_file_row_landing(&peer, &declined_ref.id, Direction::In, "evil.exe", 1)
-            .unwrap());
+        assert_eq!(
+            cs.set_file_row_landing(&peer, &declined_ref.id, Direction::In, "evil.exe", 1)
+                .unwrap(),
+            Landing::Declined,
+            "a settled row is not in flight and must be refused"
+        );
         assert_eq!(
             cs.get(&peer, &declined_ref.id)
                 .unwrap()
@@ -2058,9 +2103,12 @@ mod tests {
             Status::Transferring,
         ))
         .unwrap();
-        assert!(!cs
-            .set_file_row_landing(&peer, &out_ref.id, Direction::In, "evil.exe", 1)
-            .unwrap());
+        assert_eq!(
+            cs.set_file_row_landing(&peer, &out_ref.id, Direction::In, "evil.exe", 1)
+                .unwrap(),
+            Landing::Declined,
+            "an outgoing row must not take an incoming landing"
+        );
         assert_eq!(
             cs.get(&peer, &out_ref.id)
                 .unwrap()
@@ -2071,11 +2119,21 @@ mod tests {
             "mine.pdf"
         );
 
-        // (d) No row at all — the ordinary transfer, by far the common case.
-        assert!(!cs
-            .set_file_row_landing(&peer, "tx-plain", Direction::In, "x.bin", 1)
-            .unwrap());
+        // (d) No row at all. **Parked, not declined** — the row may simply not
+        // have arrived yet, and dropping the landing here is precisely the bug
+        // that let a sender's claimed filename stand at the approval prompt.
+        // An ordinary transfer parks one too and never claims it, which is why
+        // the transfer's terminal path drops what nothing came for.
+        assert_eq!(
+            cs.set_file_row_landing(&peer, "tx-plain", Direction::In, "x.bin", 1)
+                .unwrap(),
+            Landing::Parked
+        );
+        // Parking must not conjure a conversation row.
         assert!(cs.get(&peer, "tx-plain").unwrap().is_none());
+
+        // And nothing claims it, so the transfer's end sweeps it away.
+        cs.drop_pending_landing(&peer.0, "tx-plain");
     }
 
     /// "Learned nothing" must never blank a row: an empty name is a no-op, so
@@ -2087,9 +2145,11 @@ mod tests {
         let r = FileRef::new("report.pdf", 4096).unwrap();
         cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
 
-        assert!(!cs
-            .set_file_row_landing(&peer, &r.id, Direction::In, "", 0)
-            .unwrap());
+        assert_eq!(
+            cs.set_file_row_landing(&peer, &r.id, Direction::In, "", 0)
+                .unwrap(),
+            Landing::Declined
+        );
         let meta = cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap();
         assert_eq!(meta.name, "report.pdf");
         assert_eq!(meta.size, 4096);

@@ -182,6 +182,12 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
             "level": meta.level().to_string(),
             "target": meta.target(),
             "message": visitor.message,
+            // Structured fields, kept rather than discarded. `warn!(peer = %id,
+            // reason = ?r, "…")` carries most of its meaning in those fields;
+            // recording only the message throws away the part that says *which*
+            // peer and *why*, which is exactly what someone reading a log is
+            // looking for.
+            "fields": visitor.fields,
         }));
     }
 }
@@ -189,18 +195,39 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
+    fields: serde_json::Map<String, Value>,
+}
+
+impl MessageVisitor {
+    /// `message` is the line itself and is stored separately; everything else
+    /// is a field.
+    fn put(&mut self, field: &Field, value: Value) {
+        if field.name() == "message" {
+            self.message = match value {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+        } else {
+            self.fields.insert(field.name().to_string(), value);
+        }
+    }
 }
 
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
-        }
+        self.put(field, Value::String(format!("{value:?}")));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        }
+        self.put(field, Value::String(value.to_string()));
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.put(field, Value::Bool(value));
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.put(field, Value::from(value));
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.put(field, Value::from(value));
     }
 }
 
@@ -409,6 +436,41 @@ mod filter_tests {
             logs.len()
         );
         assert_eq!(logs[0]["message"], "the line that matters");
+        clear();
+    }
+
+    /// **A log line's fields carry most of its meaning.** `warn!(peer = %id,
+    /// reason = ?r, "…")` says *which* peer and *why*; recording only the
+    /// message throws that away and leaves a reader with a sentence they cannot
+    /// act on. This was found the hard way, reading a CI report that said a
+    /// reconcile "did NOT apply" without the field saying which branch declined.
+    #[test]
+    #[serial_test::serial]
+    fn structured_fields_are_recorded_alongside_the_message() {
+        clear();
+        let env = tracing_subscriber::EnvFilter::new("peerbeam=info");
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer.with_filter(env));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(
+                target: "peerbeam_ffi",
+                tracing::Level::WARN,
+                peer = "pb-bob",
+                attempts = 3u64,
+                gave_up = true,
+                "could not deliver"
+            );
+        });
+
+        let out = get(10);
+        let line = &out["logs"].as_array().unwrap()[0];
+        assert_eq!(line["message"], "could not deliver");
+        assert_eq!(line["fields"]["peer"], "pb-bob");
+        assert_eq!(line["fields"]["attempts"], 3);
+        assert_eq!(line["fields"]["gave_up"], true);
+        assert!(
+            line["fields"].get("message").is_none(),
+            "the message must not be duplicated into the fields"
+        );
         clear();
     }
 

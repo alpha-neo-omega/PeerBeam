@@ -1367,8 +1367,25 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
         // (1) …and so, now, does the conversation row the user is looking at
         // while deciding. `transfer_queued` is emitted after the reconcile, so
         // by here the write has landed.
-        let hist = call_json(pb_chat_history, &json!({ "peer_id": sender_device_id }));
-        let msgs = hist["data"]["messages"].as_array().unwrap().clone();
+        // **Waited for, not assumed.** The claim rides CHAT and the bytes ride
+        // TRANSFER, and nothing orders the two — so `transfer_queued` firing
+        // says nothing about whether the conversation row exists yet. This used
+        // to read history once and panic with an empty list when the transfer
+        // won the race, which is a fact about arrival order rather than about
+        // the property under test: whichever arrives first, the row must end up
+        // naming what lands.
+        let mut msgs = Vec::new();
+        for _ in 0..(WAIT * 4) {
+            let hist = call_json(pb_chat_history, &json!({ "peer_id": sender_device_id }));
+            msgs = hist["data"]["messages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if msgs.iter().any(|m| m["id"] == expected_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
         let row = msgs
             .iter()
             .find(|m| m["id"] == expected_id)
@@ -1425,9 +1442,12 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
                             // QUIC/TLS trace floods this buffer; keep only what
                             // this investigation is about.
                             let m = l["message"].as_str().unwrap_or("");
-                            m.contains("landing") || m.contains("chat row")
+                            m.contains("landing")
+                                || m.contains("chat row")
+                                || m.contains("parked")
+                                || m.contains("row appended")
                         })
-                        .map(|l| format!("{} {}", l["level"], l["message"]))
+                        .map(|l| format!("{} {} {}", l["level"], l["message"], l["fields"]))
                         .collect()
                 })
                 .unwrap_or_default();

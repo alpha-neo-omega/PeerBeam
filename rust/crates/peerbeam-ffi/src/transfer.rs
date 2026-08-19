@@ -1826,15 +1826,23 @@ impl Manager {
             // `info`, not `debug`: the default filter is `peerbeam=info`, so a
             // debug line never reaches the log buffer and "applied" becomes
             // indistinguishable from "never ran" when reading a report.
-            Ok(true) => {
+            Ok(peerbeam_chat::Landing::Applied) => {
                 tracing::info!(transfer_id = %a.id, peer = %peer.0, "chat row landing applied")
             }
-            Ok(false) => tracing::warn!(
+            // Parked is a success: the row has not arrived yet and `append`
+            // will apply this when it does. Warning here would fire on the
+            // ordinary side of a race and train a reader to ignore the line.
+            Ok(peerbeam_chat::Landing::Parked) => tracing::debug!(
+                transfer_id = %a.id,
+                peer = %peer.0,
+                "chat row landing parked until its row arrives"
+            ),
+            Ok(peerbeam_chat::Landing::Declined) => tracing::warn!(
                 transfer_id = %a.id,
                 peer = %peer.0,
                 direction = ?expected,
                 name_empty = name.is_empty(),
-                "chat row landing did NOT apply — the row will keep the peer's claim"
+                "chat row landing declined — the row will keep the peer's claim"
             ),
             Err(e) => {
                 tracing::warn!(error = %e, transfer_id = %a.id, peer = %peer.0, "chat row landing not persisted");

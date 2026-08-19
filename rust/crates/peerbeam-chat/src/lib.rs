@@ -23,4 +23,4 @@ pub use send::{
     SendError,
 };
 pub use staging::{StagingError, StagingLimits, StagingStore};
-pub use store::{namespace, ChatStore, OutboxEntry, StagedFile, OUTBOX_NS};
+pub use store::{namespace, ChatStore, Landing, OutboxEntry, StagedFile, OUTBOX_NS};
