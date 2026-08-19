@@ -37,8 +37,14 @@ transport with receiver-confirmed progress, zero-config multi-transport discover
 file/folder/clipboard/text transfer, resume infrastructure, a first-class CLI, and
 CI-built artifacts for Linux, Android, Windows (portable), and macOS.
 
-The next work is **not** more transport. It is growing the productivity platform on
-top of PeerSession, in constitutional order.
+**Phases A, B and C are complete** (Amendment 1). The platform substrate is
+frozen, and the productivity capabilities that sit on it are built: nine
+first-party channels are allocated and eight implemented, with seven revocable
+per-device permissions. The one allocated channel not yet built is Command
+(`0x0106`), which belongs to Phase D.
+
+The next work is **Phase D** — reach and extensibility, once the core is proven
+and versioned.
 
 ## ✅ Done (historical milestones — never removed)
 
@@ -52,6 +58,19 @@ Preserved from prior roadmaps and releases; see release notes in `docs/`.
   receiver sees a message dialog with Copy.
 - **Stacking selection** *(LocalSend-style)* — build one selection from files,
   folders, text, and clipboard; send the batch to one device.
+- **Phase A — Foundation** *(complete)* — PeerSession typed message channels;
+  persistent device identity; protocol version + capability negotiation (I9);
+  the encrypted `AppStore` every capability shares; resumable transfers surfaced
+  in the UI; trust hardening and optional PIN pairing.
+- **Phase B — First platform capabilities** *(complete)* — peer-to-peer chat with
+  file references and declines; device dashboard and presence; opt-in clipboard
+  sync; `peerbeam pipe`; rules-based auto-save.
+- **Phase C — Power-user capabilities** *(complete)* — clipboard history;
+  delivery/read receipts; chat search and reactions; shared folders with
+  bidirectional sync (per-file version vectors, conflicts kept rather than
+  resolved); read-only remote file browser; local notes; activity timeline;
+  watch-folder, scheduled sends and receive-hooks; find/ring my device; snippet
+  and terminal-output sharing.
 
 ## Phase A — Foundation (must-have after v1.0)
 
@@ -116,7 +135,22 @@ constitutional set, the constitutional set governs.
 
 ## Amendments
 
-*None.*
+### Amendment 1 — Phases A–C recorded complete (2026-08-19)
+
+**What changed.** The Status section described growing the productivity platform
+as the *next* work, and the Done list stopped at the v0.2.x line. Phases A, B and
+C are built, so both statements had become false.
+
+**Why an amendment.** This file is constitutional. The phases, their order and
+their rationale are unchanged — only the record of which are finished. Nothing
+here reorders a phase, moves a feature between phases, or alters a rationale.
+
+**What did not change.** Phase D is untouched and unstarted. The Command channel
+(`0x0106`) remains allocated but unbuilt, in Phase D where it was placed.
+
+**Date.** 2026-08-19.
+
+**Approval.** Approved by the repository owner (althaf@curanova.ai).
 
 <!--
 Future amendments must include:
