@@ -121,21 +121,24 @@ void main() {
       expect(msg.fileName, isNull);
     });
 
-    test('a file record with a malformed file object degrades, not crashes', () {
-      final msg = ChatMessage.fromJson(const {
-        'id': 'fr-3',
-        'peer_id': 'pb-bob',
-        'direction': 'in',
-        'body': '',
-        'status': 'transferring',
-        'kind': 'file',
-        'file': 'not-an-object',
-      });
+    test(
+      'a file record with a malformed file object degrades, not crashes',
+      () {
+        final msg = ChatMessage.fromJson(const {
+          'id': 'fr-3',
+          'peer_id': 'pb-bob',
+          'direction': 'in',
+          'body': '',
+          'status': 'transferring',
+          'kind': 'file',
+          'file': 'not-an-object',
+        });
 
-      expect(msg.isFile, isTrue);
-      expect(msg.fileName, isNull);
-      expect(msg.fileSize, isNull);
-    });
+        expect(msg.isFile, isTrue);
+        expect(msg.fileName, isNull);
+        expect(msg.fileSize, isNull);
+      },
+    );
   });
 
   // The statuses are the Rust `peerbeam_chat::Status` enum under
@@ -536,7 +539,10 @@ void main() {
         fileSize: 7,
       );
 
-      expect(original.copyWith(localPath: '/tmp/a.bin').localPath, '/tmp/a.bin');
+      expect(
+        original.copyWith(localPath: '/tmp/a.bin').localPath,
+        '/tmp/a.bin',
+      );
     });
   });
 }

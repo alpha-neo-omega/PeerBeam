@@ -58,6 +58,18 @@ fn events_snapshot() -> Vec<Value> {
     EVENTS.lock().unwrap().clone()
 }
 
+/// How long these tests wait for something the engine is expected to do.
+///
+/// **Generous on purpose, and one number rather than a dozen.** Every caller
+/// asserts the event *arrives* — none expects a timeout — so a wait returns the
+/// instant the engine does its job and the bound only matters when something is
+/// genuinely stuck. These tests drive real transfers, and under
+/// `cargo test --workspace` they run alongside a hundred other binaries; the
+/// previous ad-hoc bounds of 10 to 60 seconds turned that contention into four
+/// simultaneous failures that read like a resume bug and were a fact about the
+/// machine.
+const WAIT: u64 = 180;
+
 fn wait_event(secs: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -304,7 +316,7 @@ async fn a_completed_send_leaves_no_checkpoint_and_an_interrupted_one_does() {
     );
     assert_eq!(v["ok"], true, "send: {v}");
     let done = tokio::task::spawn_blocking(|| {
-        wait_event(20, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == "done-1"
         })
     })
@@ -335,7 +347,7 @@ async fn a_completed_send_leaves_no_checkpoint_and_an_interrupted_one_does() {
     );
     assert_eq!(v["ok"], true, "send: {v}");
     let ended = tokio::task::spawn_blocking(|| {
-        wait_event(30, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "cut-1"
                 && (e["type"] == "transfer_failed" || e["type"] == "transfer_cancelled")
         })
@@ -415,7 +427,7 @@ async fn a_resumed_send_continues_from_the_receivers_offset() {
     );
     assert_eq!(v["ok"], true, "send: {v}");
     let ended = tokio::task::spawn_blocking(|| {
-        wait_event(30, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "res-1"
                 && matches!(
                     e["type"].as_str(),
@@ -453,7 +465,7 @@ async fn a_resumed_send_continues_from_the_receivers_offset() {
     assert_eq!(v["data"]["resumed"], true);
 
     let done = tokio::task::spawn_blocking(|| {
-        wait_event(60, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == "res-1"
         })
     })
@@ -527,7 +539,7 @@ async fn a_resumed_receive_continues_in_its_own_directory_after_the_save_dir_mov
     );
     let driver = async {
         let q = tokio::task::spawn_blocking(|| {
-            wait_event(10, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["transfer_id"] == "move-1"
             })
         })
@@ -540,7 +552,7 @@ async fn a_resumed_receive_continues_in_its_own_directory_after_the_save_dir_mov
     let (_r, ()) = tokio::join!(cut, driver);
 
     let ended = tokio::task::spawn_blocking(|| {
-        wait_event(20, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "move-1"
                 && matches!(
                     e["type"].as_str(),
@@ -578,7 +590,7 @@ async fn a_resumed_receive_continues_in_its_own_directory_after_the_save_dir_mov
         payload.len() as u64,
     );
     let watcher = tokio::task::spawn_blocking(|| {
-        wait_event(30, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == "move-1"
         })
     });
@@ -656,7 +668,7 @@ async fn a_resumed_transfer_with_a_corrupted_prefix_fails_its_checksum() {
     );
     assert_eq!(v["ok"], true, "send: {v}");
     let ended = tokio::task::spawn_blocking(|| {
-        wait_event(30, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "poison-1"
                 && matches!(
                     e["type"].as_str(),
@@ -689,7 +701,7 @@ async fn a_resumed_transfer_with_a_corrupted_prefix_fails_its_checksum() {
     assert_eq!(v["ok"], true, "resume: {v}");
 
     let failed = tokio::task::spawn_blocking(|| {
-        wait_event(60, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "poison-1" && e["type"] == "transfer_failed"
         })
     })
@@ -764,7 +776,7 @@ fn a_checkpoint_survives_a_restart_with_its_partial_progress() {
 
     // And it is announced, so a surface that only listens for events still
     // learns about it.
-    let announced = wait_event(5, |e| {
+    let announced = wait_event(WAIT, |e| {
         e["type"] == "transfer_interrupted" && e["transfer_id"] == "prev-run"
     });
     assert!(
@@ -1045,7 +1057,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
     );
     let driver = async {
         let q = tokio::task::spawn_blocking(|| {
-            wait_event(10, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["transfer_id"] == "reject-me"
             })
         })
@@ -1078,7 +1090,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
     );
     let driver = async {
         let q = tokio::task::spawn_blocking(|| {
-            wait_event(10, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["transfer_id"] == "reject-me"
             })
         })
@@ -1111,7 +1123,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
     );
     let driver = async {
         let q = tokio::task::spawn_blocking(|| {
-            wait_event(10, |e| {
+            wait_event(WAIT, |e| {
                 e["type"] == "transfer_queued" && e["transfer_id"] == "keep-me"
             })
         })
@@ -1128,7 +1140,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
     // under a fresh one, and it would (correctly, if uselessly for this test)
     // be treated as a new transfer rather than a resume.
     let ended = tokio::task::spawn_blocking(|| {
-        wait_event(20, |e| {
+        wait_event(WAIT, |e| {
             e["transfer_id"] == "keep-me"
                 && matches!(
                     e["type"].as_str(),
@@ -1146,7 +1158,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
     // The accepted-then-interrupted receive left a checkpoint, and it records
     // the consent.
     let cp_path = checkpoint_file(dir.path(), "keep-me");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(WAIT);
     while !cp_path.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1171,7 +1183,7 @@ async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unpr
         payload.len() as u64,
     );
     let watcher = tokio::task::spawn_blocking(|| {
-        wait_event(30, |e| {
+        wait_event(WAIT, |e| {
             e["type"] == "transfer_completed" && e["transfer_id"] == "keep-me"
         })
     });

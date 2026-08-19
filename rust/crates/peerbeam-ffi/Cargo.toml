@@ -31,6 +31,7 @@ peerbeam-reliability-fs = { path = "../peerbeam-reliability-fs" }
 peerbeam-browse = { path = "../peerbeam-browse" }
 peerbeam-sync = { path = "../peerbeam-sync" }
 peerbeam-chat = { path = "../peerbeam-chat" }
+peerbeam-logs = { path = "../peerbeam-logs" }
 peerbeam-notes = { path = "../peerbeam-notes" }
 peerbeam-clipboard = { path = "../peerbeam-clipboard" }
 peerbeam-presence = { path = "../peerbeam-presence" }

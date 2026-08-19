@@ -570,6 +570,55 @@ class FakePeerBeam implements PeerBeamApi {
   /// nothing, or has not granted permission, actually sends.
   bool browseDenied = false;
 
+  /// Folders this fake reports as shared.
+  List<SharedFolder> shares = const [];
+
+  @override
+  Future<List<SharedFolder>> sharedFolders() async {
+    calls.add('sharedFolders');
+    return shares;
+  }
+
+  @override
+  Future<void> setSharedFolders(List<String> paths) async {
+    calls.add('setSharedFolders:${paths.join(",")}');
+    shares = paths
+        .map(
+          (p) => SharedFolder(
+            name: p.split('/').where((s) => s.isNotEmpty).lastOrNull ?? p,
+            path: p,
+            exists: true,
+          ),
+        )
+        .toList();
+  }
+
+  /// Log lines this fake will hand back.
+  List<LogLine> logLines = const [];
+
+  /// Whether log streaming has been switched on.
+  bool logsSubscribed = false;
+
+  @override
+  Future<List<LogLine>> logs({int limit = 200}) async {
+    calls.add('logs:$limit');
+    return logLines.length <= limit
+        ? logLines
+        : logLines.sublist(logLines.length - limit);
+  }
+
+  @override
+  Future<String> exportLogs({String? path}) async {
+    calls.add('exportLogs:${path ?? ''}');
+    return path ?? '/tmp/peerbeam-logs.jsonl';
+  }
+
+  @override
+  Future<void> subscribeLogs(bool enabled) async {
+    calls.add('subscribeLogs:$enabled');
+    logsSubscribed = enabled;
+  }
+
   /// Folders this fake is "watching", so a test can assert a toggle stuck.
   final Set<String> watching = <String>{};
 

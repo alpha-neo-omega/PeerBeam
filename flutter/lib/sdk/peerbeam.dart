@@ -347,6 +347,31 @@ abstract class PeerBeamApi {
   /// inbound transfers through the usual approval path.
   Future<SyncResult> syncFolder(PeerTarget peer, String path, String into);
 
+  /// The folders this device offers to peers.
+  ///
+  /// **Empty by default** — nothing is shared until someone chooses it — and a
+  /// peer still needs the Browse permission to see any of it.
+  Future<List<SharedFolder>> sharedFolders();
+
+  /// Replace the set of shared folders. Takes effect immediately, because
+  /// un-sharing a folder that stays shared until the next restart is the one
+  /// direction this must never lag in.
+  Future<void> setSharedFolders(List<String> paths);
+
+  /// This device's recent log lines, newest last.
+  ///
+  /// Bounded and in-memory: logs are for diagnosing the session you are in.
+  Future<List<LogLine>> logs({int limit});
+
+  /// Copy the buffered logs to a file and return where they went.
+  ///
+  /// Pass [path] to choose the destination; omit it for a temporary file. Use
+  /// this for a bug report rather than asking someone to find a log directory.
+  Future<String> exportLogs({String? path});
+
+  /// Start or stop receiving `log_received` events as they happen.
+  Future<void> subscribeLogs(bool enabled);
+
   /// Keep syncing [path] into [into] until [unwatchFolder] is called.
   ///
   /// A file is only acted on once it has stopped changing, so saving a large
@@ -744,6 +769,42 @@ class PeerBeam implements PeerBeamApi {
       _req().browseList(jsonEncode({'peer': peer.toJson(), 'path': path})),
     );
     return BrowseListing.fromJson(data);
+  }
+
+  @override
+  Future<List<SharedFolder>> sharedFolders() async {
+    final data = _data(_req().browseShares('{}'));
+    final list = (data['entries'] as List?) ?? const [];
+    return list
+        .map((e) => SharedFolder.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  @override
+  Future<void> setSharedFolders(List<String> paths) async {
+    await settingsSet({'shared_directories': paths});
+  }
+
+  @override
+  Future<List<LogLine>> logs({int limit = 200}) async {
+    final data = _data(_req().logsGet(jsonEncode({'limit': limit})));
+    final list = (data['logs'] as List?) ?? const [];
+    return list
+        .map((e) => LogLine.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  @override
+  Future<String> exportLogs({String? path}) async {
+    final data = _data(
+      _req().logsExport(jsonEncode(path == null ? {} : {'path': path})),
+    );
+    return data['path'] as String? ?? '';
+  }
+
+  @override
+  Future<void> subscribeLogs(bool enabled) async {
+    _data(_req().logsSubscribe(jsonEncode({'enabled': enabled})));
   }
 
   @override

@@ -25,6 +25,7 @@ members = [
     "crates/peerbeam-chat",
     "crates/peerbeam-notes",
   "crates/peerbeam-chunk",
+  "crates/peerbeam-logs",
   "crates/peerbeam-pairing",
     "crates/peerbeam-clipboard",
     "crates/peerbeam-presence",

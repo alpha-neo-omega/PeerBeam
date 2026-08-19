@@ -85,6 +85,10 @@ class Bindings {
   final _ArgRetDart _clipHistoryClear;
   final _ArgRetDart _timeline;
   final _ArgRetDart _browseList;
+  final _ArgRetDart _browseShares;
+  final _ArgRetDart _logsGet;
+  final _ArgRetDart _logsExport;
+  final _ArgRetDart _logsSubscribe;
   final _ArgRetDart _syncPull;
   final _ArgRetDart _syncWatch;
   final _ArgRetDart _syncUnwatch;
@@ -192,6 +196,14 @@ class Bindings {
       ),
       _timeline = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_timeline'),
       _browseList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_browse_list'),
+      _browseShares = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_browse_shares',
+      ),
+      _logsGet = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_logs_get'),
+      _logsExport = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_logs_export'),
+      _logsSubscribe = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_logs_subscribe',
+      ),
       _syncPull = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_sync_pull'),
       _syncWatch = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_sync_watch'),
       _syncUnwatch = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
@@ -274,6 +286,10 @@ class Bindings {
   String clipHistoryClear(String json) => _withArg(json, _clipHistoryClear);
   String timeline(String json) => _withArg(json, _timeline);
   String browseList(String json) => _withArg(json, _browseList);
+  String browseShares(String json) => _withArg(json, _browseShares);
+  String logsGet(String json) => _withArg(json, _logsGet);
+  String logsExport(String json) => _withArg(json, _logsExport);
+  String logsSubscribe(String json) => _withArg(json, _logsSubscribe);
   String syncPull(String json) => _withArg(json, _syncPull);
   String syncWatch(String json) => _withArg(json, _syncWatch);
   String syncUnwatch(String json) => _withArg(json, _syncUnwatch);

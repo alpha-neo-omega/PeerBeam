@@ -259,6 +259,10 @@ Working now:
 - `chat history <peer>` — print a conversation's stored history. Accepts a device
   id, or a name resolved via discovery. Messages are encrypted at rest. A file
   share's row shows its name, size, and status instead of message text.
+- `logs [--limit N] [--export PATH]` — recent engine log lines, read from the
+  **log file** rather than this process's memory: a one-shot command has its own
+  empty buffer, so answering from it would print nothing while looking like it
+  worked. Needs `log.to_file` (on by default).
 - `pair <peer> [--pin 123456 | --show]` — PIN-pair with a device. One side runs
   `--show` and reads six digits aloud; the other types them. **The PIN is never
   sent** — only a proof over this handshake's transcript, which is worthless to

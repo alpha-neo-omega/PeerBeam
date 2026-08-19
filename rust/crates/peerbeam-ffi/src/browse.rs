@@ -44,13 +44,28 @@ pub fn shares() -> peerbeam_browse::Shares {
 /// the UI cannot accidentally render a path it then sends somewhere.
 pub fn list_shares() -> Op {
     let shares = shares();
-    let names: Vec<String> = shares
+    // Name **and** path. The name is what a peer addresses the share by; the
+    // path is what the person choosing it needs to see, because two folders
+    // called `Documents` are indistinguishable by name and a UI that showed
+    // only names would ask someone to confirm a share they cannot identify.
+    let entries: Vec<Value> = shares
         .roots()
         .iter()
-        .filter_map(|r| r.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(|r| {
+            json!({
+                "name": r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                "path": r.to_string_lossy(),
+                "exists": r.is_dir(),
+            })
+        })
         .collect();
-    Ok(json!({ "shares": names }))
+    let names: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect();
+    // `shares` kept as names for callers that predate `entries`.
+    Ok(json!({ "shares": names, "entries": entries }))
 }
 
 /// Turn a peer's answer into the FFI's response shape.

@@ -103,6 +103,10 @@ pub fn overlay(config: &mut EngineConfig) {
                 json!(config.storage.save_directory),
             );
             m.insert(
+                "shared_directories".into(),
+                json!(config.device.shared_directories),
+            );
+            m.insert(
                 "auto_accept".into(),
                 json!(config.device.auto_accept_trusted),
             );
@@ -119,6 +123,18 @@ pub fn overlay(config: &mut EngineConfig) {
         if !dir.trim().is_empty() {
             config.storage.save_directory = dir.trim().to_string();
         }
+    }
+    // Shared folders, so a person can choose what they offer without editing a
+    // config file. **Applied live** via `browse::configure`, because the
+    // alternative — taking effect at the next restart — means someone who has
+    // just un-shared a private folder is still sharing it.
+    if let Some(dirs) = s.get("shared_directories").and_then(|v| v.as_array()) {
+        let dirs: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.as_str())
+            .map(str::to_string)
+            .collect();
+        config.device.shared_directories = dirs;
     }
     if let Some(auto) = s.get("auto_accept").and_then(|v| v.as_bool()) {
         config.device.auto_accept_trusted = auto;

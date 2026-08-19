@@ -55,6 +55,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Sync(a) => crate::browse::sync(ctx, a, cfg_override.as_deref()).await,
         Command::Snippet(a) => crate::chat::snippet(ctx, a, cfg_override.as_deref()).await,
         Command::Pair(a) => crate::pair::pair(ctx, a, cfg_override.as_deref()).await,
+        Command::Logs(a) => crate::logs::logs(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
         Command::Channels(a) => channels_cmd(ctx, a).await,

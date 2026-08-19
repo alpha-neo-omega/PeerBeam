@@ -23,8 +23,19 @@ void main() {
       final msg = friendlyErrorForCode(c);
       expect(msg.trim(), isNotEmpty, reason: c);
       // No internal/implementation detail leaks to the user.
-      for (final leak in ['quic', 'ffi', 'exception', 'panic', 'rust', 'dlopen']) {
-        expect(msg.toLowerCase(), isNot(contains(leak)), reason: '$c leaked "$leak"');
+      for (final leak in [
+        'quic',
+        'ffi',
+        'exception',
+        'panic',
+        'rust',
+        'dlopen',
+      ]) {
+        expect(
+          msg.toLowerCase(),
+          isNot(contains(leak)),
+          reason: '$c leaked "$leak"',
+        );
       }
     }
   });
@@ -38,24 +49,30 @@ void main() {
   });
 
   test('unknown errors get a safe generic message', () {
-    expect(friendlyError(StateError('boom')), 'Something went wrong. Please try again.');
-  });
-
-  test('queue_unreadable maps to QueueUnreadableException with its own sentence', () {
-    final ex = PeerBeamException.fromCode(
-      'queue_unreadable',
-      'outbox entry x is unreadable',
-    );
-    expect(ex, isA<QueueUnreadableException>());
-
-    final msg = friendlyError(ex);
     expect(
-      msg,
-      "Something still queued to send can't be read right now, so deleting "
-      "is on hold — that could discard it before it goes out.",
+      friendlyError(StateError('boom')),
+      'Something went wrong. Please try again.',
     );
-    // The whole point of a distinct code: it must never tell the user to
-    // retry, since retrying cannot clear this on its own.
-    expect(msg.toLowerCase(), isNot(contains('try again')));
   });
+
+  test(
+    'queue_unreadable maps to QueueUnreadableException with its own sentence',
+    () {
+      final ex = PeerBeamException.fromCode(
+        'queue_unreadable',
+        'outbox entry x is unreadable',
+      );
+      expect(ex, isA<QueueUnreadableException>());
+
+      final msg = friendlyError(ex);
+      expect(
+        msg,
+        "Something still queued to send can't be read right now, so deleting "
+        "is on hold — that could discard it before it goes out.",
+      );
+      // The whole point of a distinct code: it must never tell the user to
+      // retry, since retrying cannot clear this on its own.
+      expect(msg.toLowerCase(), isNot(contains('try again')));
+    },
+  );
 }

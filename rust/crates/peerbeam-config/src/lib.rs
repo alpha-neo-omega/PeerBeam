@@ -214,6 +214,17 @@ pub struct LogConfig {
     pub show_target: bool,
     /// Emit logs as JSON (useful for headless/daemon deployments).
     pub json: bool,
+    /// Also write logs to `<data_directory>/logs/peerbeam.jsonl`.
+    ///
+    /// **On by default.** Without a file the logs are a per-process ring, which
+    /// is fine for a running app and useless for `peerbeam logs` or for
+    /// diagnosing a crash after the fact — the process that held them is gone.
+    /// The file is bounded and rotated once, so it cannot become an archive of
+    /// everything a device ever did.
+    ///
+    /// Turn it off if the device's storage is untrusted; nothing else changes,
+    /// and the in-memory ring keeps working.
+    pub to_file: bool,
 }
 
 impl Default for DeviceConfig {
@@ -301,6 +312,7 @@ impl Default for LogConfig {
             filter: "peerbeam=info".to_string(),
             show_target: false,
             json: false,
+            to_file: true,
         }
     }
 }

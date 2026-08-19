@@ -138,6 +138,17 @@ pub fn apply_live_settings(partial: &Value) {
     if let Some(a) = partial.get("auto_accept").and_then(|v| v.as_bool()) {
         m.set_auto_accept(a);
     }
+    // Shared folders, applied **now**. Waiting for a restart would mean a
+    // person who has just un-shared a private folder is still sharing it, which
+    // is the one direction this setting must never lag in.
+    if let Some(dirs) = partial.get("shared_directories").and_then(|v| v.as_array()) {
+        let dirs: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.as_str())
+            .map(str::to_string)
+            .collect();
+        crate::browse::configure(&dirs);
+    }
     // Turning the pairing check on must protect the very next connection, not
     // the next launch — a user reaches for this setting because of a device
     // that is about to connect.
@@ -335,6 +346,19 @@ pub fn init(config_json: &str) -> OpResult {
     // then overlay the user's persisted settings (device name, save dir,
     // auto-accept) so they actually take effect.
     crate::logs::install();
+    // Logs on disk as well as in memory, unless turned off. Wired *after*
+    // install and *before* anything else runs, so the first lines of a startup
+    // problem are the ones a user can actually go and read.
+    if config.log.to_file {
+        let path = std::path::Path::new(&config.storage.data_directory)
+            .join("logs")
+            .join("peerbeam.jsonl");
+        if !crate::logs::set_file(Some(path)) {
+            // Reported, not fatal: an unwritable log file is a worse day, not a
+            // broken engine.
+            tracing::warn!("could not open the log file; logs stay in memory only");
+        }
+    }
     crate::settings::configure(&config.storage.data_directory);
     crate::settings::overlay(&mut config);
 

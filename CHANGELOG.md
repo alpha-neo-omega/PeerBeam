@@ -7,6 +7,16 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Logs you can actually read.** The engine has always captured structured
+  logs; nothing could reach them. `peerbeam logs [--export PATH]` reads them,
+  and the app can list, export and stream them. Logs are now written to
+  `<data>/logs/peerbeam.jsonl` as well as held in memory — bounded, rotated
+  once, and switchable off with `log.to_file` — because a per-process buffer is
+  gone the moment the process is, which is exactly when you want the logs.
+- **Choose your shared folders in the app.** What you share was config-file-only;
+  it is now a setting, applied **immediately** — un-sharing a folder that stays
+  shared until the next restart is the one direction this must never lag in.
+  Still empty by default, and a peer still needs the Browse permission.
 - **PIN pairing** (`peerbeam pair`, `encryption.require_pin_pairing`). Trust-on-
   first-use pins whatever key answers first; someone on the path during that
   first handshake gets pinned instead of your device, and every later connection

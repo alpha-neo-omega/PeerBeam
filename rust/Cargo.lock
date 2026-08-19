@@ -1169,6 +1169,7 @@ dependencies = [
  "peerbeam-domain",
  "peerbeam-engine",
  "peerbeam-identity-fs",
+ "peerbeam-logs",
  "peerbeam-notes",
  "peerbeam-pairing",
  "peerbeam-platform",
@@ -1342,6 +1343,7 @@ dependencies = [
  "peerbeam-domain",
  "peerbeam-engine",
  "peerbeam-identity-fs",
+ "peerbeam-logs",
  "peerbeam-notes",
  "peerbeam-platform",
  "peerbeam-presence",
@@ -1367,6 +1369,18 @@ dependencies = [
  "peerbeam-domain",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "peerbeam-logs"
+version = "0.8.2"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

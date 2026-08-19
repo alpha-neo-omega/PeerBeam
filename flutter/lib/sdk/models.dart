@@ -889,6 +889,66 @@ class BrowseEntry {
 /// nothing here, may not have granted this device permission, or the path may
 /// not exist. **Those are deliberately indistinguishable**, so a surface must
 /// say all three rather than guess.
+/// A folder this device offers to peers that hold the Browse permission.
+class SharedFolder {
+  const SharedFolder({
+    required this.name,
+    required this.path,
+    required this.exists,
+  });
+
+  /// What peers address it by — the folder's own directory name.
+  final String name;
+
+  /// Where it is on this machine. Shown because two folders called `Documents`
+  /// are indistinguishable by name, and nobody should confirm a share they
+  /// cannot identify.
+  final String path;
+
+  /// Whether the directory is still there. A share whose folder has been moved
+  /// or deleted is listed rather than hidden: silently dropping it would leave
+  /// someone believing they are sharing something they are not.
+  final bool exists;
+
+  factory SharedFolder.fromJson(Map<String, dynamic> json) => SharedFolder(
+    name: json['name'] as String? ?? '',
+    path: json['path'] as String? ?? '',
+    exists: json['exists'] as bool? ?? false,
+  );
+}
+
+/// One captured log line.
+class LogLine {
+  const LogLine({
+    required this.at,
+    required this.level,
+    required this.target,
+    required this.message,
+  });
+
+  /// RFC-3339 timestamp, or empty when the engine could not state one.
+  final String at;
+
+  /// `INFO`, `WARN`, `ERROR`, …
+  final String level;
+
+  /// The module that emitted it.
+  final String target;
+
+  final String message;
+
+  factory LogLine.fromJson(Map<String, dynamic> json) => LogLine(
+    at: json['at'] as String? ?? '',
+    level: json['level'] as String? ?? '',
+    target: json['target'] as String? ?? '',
+    message: json['message'] as String? ?? '',
+  );
+
+  /// Whether this line reports something going wrong — the reason someone
+  /// opened the log at all.
+  bool get isProblem => level == 'ERROR' || level == 'WARN';
+}
+
 /// What one folder sync did.
 class SyncResult {
   const SyncResult({

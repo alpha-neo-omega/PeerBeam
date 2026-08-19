@@ -83,6 +83,8 @@ pub enum Command {
     Snippet(SnippetArgs),
     /// PIN-pair with a device, proving first contact reached the right one.
     Pair(PairArgs),
+    /// Show or export this device's recent log lines.
+    Logs(LogsArgs),
     /// Run the background daemon.
     Daemon(DaemonArgs),
     /// Get or set configuration.
@@ -475,6 +477,25 @@ pub enum TrustAction {
 ///
 /// Requires the peer to have granted this machine both `browse` (to see what
 /// exists) and `files` (to receive any of it).
+/// Show or export recent log lines.
+///
+/// Reads the engine's **log file**, not a buffer in this process. A one-shot
+/// command has its own empty ring, so answering from memory would print nothing
+/// while looking like it worked — the file is what makes the logs of a running
+/// engine, or of one that has since crashed, readable at all.
+///
+/// Requires `log.to_file` (on by default). With it off there is nothing on disk
+/// to read, and this says so rather than printing an empty list.
+#[derive(Args)]
+pub struct LogsArgs {
+    /// How many of the most recent lines to show.
+    #[arg(long, default_value_t = 100)]
+    pub limit: u64,
+    /// Copy them to PATH and print where they went.
+    #[arg(long, value_name = "PATH")]
+    pub export: Option<String>,
+}
+
 /// PIN-pair with a device.
 ///
 /// Trust-on-first-use pins whatever key answers first; if someone is on the

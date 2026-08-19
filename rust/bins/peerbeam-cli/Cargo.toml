@@ -35,6 +35,7 @@ peerbeam-browse = { path = "../../crates/peerbeam-browse" }
 peerbeam-sync = { path = "../../crates/peerbeam-sync" }
 peerbeam-chat = { path = "../../crates/peerbeam-chat" }
 peerbeam-pairing = { path = "../../crates/peerbeam-pairing" }
+peerbeam-logs = { path = "../../crates/peerbeam-logs" }
 peerbeam-notes = { path = "../../crates/peerbeam-notes" }
 peerbeam-clipboard = { path = "../../crates/peerbeam-clipboard" }
 peerbeam-presence = { path = "../../crates/peerbeam-presence" }
