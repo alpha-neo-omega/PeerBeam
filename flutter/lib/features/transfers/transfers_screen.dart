@@ -659,9 +659,8 @@ class _TransferCard extends StatelessWidget {
                                   transfer,
                                   needsConfirmation: state.transfer
                                       .needsPairingConfirmation(transfer.id),
-                                  accept: ({required confirmed}) => state
-                                      .transfer
-                                      .accept(
+                                  accept: ({required confirmed}) =>
+                                      state.transfer.accept(
                                         transfer.id,
                                         confirmed: confirmed,
                                       ),
@@ -676,9 +675,8 @@ class _TransferCard extends StatelessWidget {
                                     transfer,
                                     needsConfirmation: state.transfer
                                         .needsPairingConfirmation(transfer.id),
-                                    accept: ({required confirmed}) => state
-                                        .transfer
-                                        .acceptTrust(
+                                    accept: ({required confirmed}) =>
+                                        state.transfer.acceptTrust(
                                           transfer.id,
                                           confirmed: confirmed,
                                         ),

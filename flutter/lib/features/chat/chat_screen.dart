@@ -162,7 +162,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// The reactions offered by the picker. Six, because the point is one tap on
   /// something already visible; anything longer is a search, and a message
   /// worth a rarer emoji is worth typing a reply.
-  static const _quickReactions = ['\u{1F44D}', '\u{2764}', '\u{1F602}', '\u{1F389}', '\u{1F440}', '\u{1F622}'];
+  static const _quickReactions = [
+    '\u{1F44D}',
+    '\u{2764}',
+    '\u{1F602}',
+    '\u{1F389}',
+    '\u{1F440}',
+    '\u{1F622}',
+  ];
 
   /// Apply a reaction and say so only when it did **not** reach the peer.
   ///
@@ -609,11 +616,7 @@ class _Reactions extends StatelessWidget {
   final Color fg;
   final void Function(String emoji, {required bool remove})? onTap;
 
-  const _Reactions({
-    required this.reactions,
-    required this.fg,
-    this.onTap,
-  });
+  const _Reactions({required this.reactions, required this.fg, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -1146,8 +1149,11 @@ class _FileBody extends StatelessWidget {
                               live,
                               needsConfirmation: state.transfer
                                   .needsPairingConfirmation(message.id),
-                              accept: ({required confirmed}) => state.transfer
-                                  .acceptTrust(message.id, confirmed: confirmed),
+                              accept: ({required confirmed}) =>
+                                  state.transfer.acceptTrust(
+                                    message.id,
+                                    confirmed: confirmed,
+                                  ),
                             ),
                             child: const Text('Trust'),
                           ),

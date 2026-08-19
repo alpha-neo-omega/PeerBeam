@@ -66,17 +66,17 @@ Future<void> showShareQrDialog(BuildContext context, QrPayload payload) {
           const Gap(AppSpace.md),
           Text(
             '${payload.host}:${payload.port}',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: scheme.onSurfaceVariant,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
           ),
           const Gap(AppSpace.xs),
           Text(
             'Scan this from another device to add it.',
             textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: scheme.onSurfaceVariant,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
           ),
         ],
       ),
@@ -93,9 +93,9 @@ Future<void> showShareQrDialog(BuildContext context, QrPayload payload) {
 /// Open the camera scanner; resolves to the first valid [QrPayload] scanned, or
 /// null if the user backs out.
 Future<QrPayload?> openQrScanner(BuildContext context) {
-  return Navigator.of(context).push<QrPayload>(
-    MaterialPageRoute(builder: (_) => const _QrScanScreen()),
-  );
+  return Navigator.of(
+    context,
+  ).push<QrPayload>(MaterialPageRoute(builder: (_) => const _QrScanScreen()));
 }
 
 class _QrScanScreen extends StatefulWidget {

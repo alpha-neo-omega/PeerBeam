@@ -23,6 +23,10 @@ class _TimelineScreenState extends State<TimelineScreen> {
   List<TimelineEvent> _events = const [];
   bool _loaded = false;
 
+  /// The last read's failure, or null. An absence and a failure must not
+  /// render the same: one is a fact about the world, the other about us.
+  Object? _error;
+
   @override
   void initState() {
     super.initState();
@@ -31,14 +35,23 @@ class _TimelineScreenState extends State<TimelineScreen> {
 
   Future<void> _load() async {
     final api = AppScope.of(context).api;
-    final events = api == null
-        ? <TimelineEvent>[]
-        : await api.timeline(limit: 200);
-    if (!mounted) return;
-    setState(() {
-      _events = events;
-      _loaded = true;
-    });
+    try {
+      final events = api == null
+          ? <TimelineEvent>[]
+          : await api.timeline(limit: 200);
+      if (!mounted) return;
+      setState(() {
+        _events = events;
+        _error = null;
+        _loaded = true;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loaded = true;
+      });
+    }
   }
 
   @override
@@ -55,7 +68,13 @@ class _TimelineScreenState extends State<TimelineScreen> {
         ],
       ),
       body: !_loaded
-          ? const SizedBox.shrink()
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+          ? ErrorState(
+              error: _error!,
+              title: 'Could not read activity',
+              onRetry: _load,
+            )
           : _events.isEmpty
           ? const EmptyState(
               icon: Icons.timeline_rounded,

@@ -37,6 +37,9 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
   List<SharedFolder> _folders = const [];
   bool _loaded = false;
 
+  /// The last read's failure, or null.
+  Object? _error;
+
   @override
   void initState() {
     super.initState();
@@ -45,12 +48,26 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
 
   Future<void> _load() async {
     final api = AppScope.of(context).api;
-    final folders = api == null ? <SharedFolder>[] : await api.sharedFolders();
-    if (!mounted) return;
-    setState(() {
-      _folders = folders;
-      _loaded = true;
-    });
+    try {
+      final folders = api == null
+          ? <SharedFolder>[]
+          : await api.sharedFolders();
+      if (!mounted) return;
+      setState(() {
+        _folders = folders;
+        _error = null;
+        _loaded = true;
+      });
+    } catch (e) {
+      // A read that failed must not render as "Nothing shared". That sentence
+      // is a claim about the engine's list, and stating it when no list came
+      // back tells someone they share nothing when they may share plenty.
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loaded = true;
+      });
+    }
   }
 
   /// Pick a folder with the native directory chooser — the same one the save
@@ -140,7 +157,39 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
   /// answered — "Nothing shared" is a claim about the engine's list, and
   /// showing it before there is one would state it of a list nobody has read.
   List<Widget> _rows(ThemeData theme) {
-    if (!_loaded) return const [];
+    if (!_loaded) {
+      return const [
+        ListTile(
+          leading: SizedBox.square(
+            dimension: 24,
+            child: Center(
+              child: SizedBox.square(
+                dimension: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          ),
+          title: Text('Reading shared folders…'),
+        ),
+      ];
+    }
+    if (_error != null) {
+      return [
+        ListTile(
+          leading: Icon(
+            Icons.error_outline_rounded,
+            color: theme.colorScheme.error,
+          ),
+          title: const Text('Could not read shared folders'),
+          subtitle: Text(friendlyError(_error!)),
+          trailing: IconButton(
+            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'Try again',
+            onPressed: _load,
+          ),
+        ),
+      ];
+    }
     if (_folders.isEmpty) {
       return const [
         ListTile(

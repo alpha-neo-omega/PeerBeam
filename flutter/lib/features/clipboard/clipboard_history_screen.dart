@@ -23,6 +23,10 @@ class _ClipboardHistoryScreenState extends State<ClipboardHistoryScreen> {
   List<ClipEntry> _entries = const [];
   bool _loaded = false;
 
+  /// The last read's failure, or null. An absence and a failure must not
+  /// render the same: one is a fact about the world, the other about us.
+  Object? _error;
+
   @override
   void initState() {
     super.initState();
@@ -31,12 +35,23 @@ class _ClipboardHistoryScreenState extends State<ClipboardHistoryScreen> {
 
   Future<void> _load() async {
     final api = AppScope.of(context).api;
-    final entries = api == null ? <ClipEntry>[] : await api.clipboardHistory();
-    if (!mounted) return;
-    setState(() {
-      _entries = entries;
-      _loaded = true;
-    });
+    try {
+      final entries = api == null
+          ? <ClipEntry>[]
+          : await api.clipboardHistory();
+      if (!mounted) return;
+      setState(() {
+        _entries = entries;
+        _error = null;
+        _loaded = true;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loaded = true;
+      });
+    }
   }
 
   Future<void> _clear() async {
@@ -87,7 +102,13 @@ class _ClipboardHistoryScreenState extends State<ClipboardHistoryScreen> {
       body: AnimatedBuilder(
         animation: settings,
         builder: (context, _) => !_loaded
-            ? const SizedBox.shrink()
+            ? const Center(child: CircularProgressIndicator())
+            : _error != null
+            ? ErrorState(
+                error: _error!,
+                title: 'Could not read clipboard history',
+                onRetry: _load,
+              )
             : _entries.isEmpty
             // "Off" and "nothing yet" are different facts, and a user staring at
             // an empty screen deserves to know which one they are looking at.

@@ -120,12 +120,16 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final order = <String>[];
     final byPeer = <String, List<ChatSearchHit>>{};
     for (final hit in hits) {
-      byPeer.putIfAbsent(hit.peerId, () {
-        order.add(hit.peerId);
-        return <ChatSearchHit>[];
-      }).add(hit);
+      byPeer
+          .putIfAbsent(hit.peerId, () {
+            order.add(hit.peerId);
+            return <ChatSearchHit>[];
+          })
+          .add(hit);
     }
-    return [for (final peerId in order) (peerId: peerId, hits: byPeer[peerId]!)];
+    return [
+      for (final peerId in order) (peerId: peerId, hits: byPeer[peerId]!),
+    ];
   }
 
   /// The best name we can put to a conversation's peer id.
@@ -639,7 +643,8 @@ class ConversationCard extends StatelessWidget {
                         // A null timestamp is a thread this build could not
                         // read — still listed, with nothing to say about
                         // itself, rather than a fabricated date.
-                        (_, final DateTime at) => 'Last message ${formatAgo(at)}',
+                        (_, final DateTime at) =>
+                          'Last message ${formatAgo(at)}',
                         _ => 'No messages to show',
                       },
                       maxLines: 1,

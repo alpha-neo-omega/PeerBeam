@@ -24,6 +24,10 @@ class _BrowseScreenState extends State<BrowseScreen> {
   String _path = '';
   BrowseListing? _listing;
   bool _loading = true;
+
+  /// The last read's failure, or null. Distinct from an empty listing: one
+  /// means the folder is empty, the other means we do not know.
+  Object? _error;
   bool _syncing = false;
 
   @override
@@ -77,17 +81,30 @@ class _BrowseScreenState extends State<BrowseScreen> {
   Future<void> _load(String path) async {
     setState(() {
       _loading = true;
+      _error = null;
       _path = path;
     });
     final api = AppScope.of(context).api;
-    final listing = api == null
-        ? null
-        : await api.browse(widget.peer, path: path);
-    if (!mounted) return;
-    setState(() {
-      _listing = listing;
-      _loading = false;
-    });
+    try {
+      final listing = api == null
+          ? null
+          : await api.browse(widget.peer, path: path);
+      if (!mounted) return;
+      setState(() {
+        _listing = listing;
+        _loading = false;
+      });
+    } catch (e) {
+      // **Caught, or the screen never comes back.** This throw used to escape
+      // the post-frame callback that started the load, so `_loading` stayed
+      // true and the body stayed an empty box — for good. A peer that has gone
+      // to sleep is the ordinary case here, not an exceptional one.
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loading = false;
+      });
+    }
   }
 
   void _up() {
@@ -145,7 +162,13 @@ class _BrowseScreenState extends State<BrowseScreen> {
               ),
       ),
       body: _loading
-          ? const SizedBox.shrink()
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+          ? ErrorState(
+              error: _error!,
+              title: 'Could not open that folder',
+              onRetry: () => _load(_path),
+            )
           : listing == null || listing.entries.isEmpty
           // One message for every reason, because the device sent one answer
           // for every reason. Naming a single cause would be inventing

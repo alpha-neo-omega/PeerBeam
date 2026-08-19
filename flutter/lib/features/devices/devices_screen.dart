@@ -76,7 +76,10 @@ class _Empty extends StatelessWidget {
           children: [
             Icon(Icons.devices_other_rounded, size: 48, color: scheme.outline),
             const Gap(AppSpace.md),
-            Text('No devices yet', style: Theme.of(context).textTheme.titleMedium),
+            Text(
+              'No devices yet',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
             const Gap(AppSpace.xs),
             Text(
               'Devices appear here as they are discovered on your network.',

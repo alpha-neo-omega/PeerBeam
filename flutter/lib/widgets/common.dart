@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app/theme.dart';
+import '../sdk/error_text.dart';
 
 /// Caps content width on large panes for readable line length and centres it.
 class ContentPane extends StatelessWidget {
@@ -98,4 +99,53 @@ class EmptyState extends StatelessWidget {
       ),
     );
   }
+}
+
+/// What a screen shows when the read it needed did not come back.
+///
+/// # Why this exists as its own thing
+///
+/// Five screens loaded their data in an unguarded `_load()`: the throw escaped
+/// the post-frame callback, the `_loading` flag never flipped back, and the
+/// body stayed an empty `SizedBox` — permanently. Browsing a device that has
+/// gone to sleep is the *normal* case for a peer-to-peer app on a LAN, and it
+/// produced a white page with a back arrow and no explanation. From the user's
+/// side that is indistinguishable from a crash.
+///
+/// An absence and a failure must never render the same. [`EmptyState`] says
+/// "there is nothing here", which is a fact about the world; this says "we
+/// could not find out", which is a fact about us — and unlike the first, it
+/// comes with something to do about it.
+class ErrorState extends StatelessWidget {
+  /// The failure, rendered through [friendlyError] so the user sees a sentence
+  /// rather than an exception.
+  final Object error;
+
+  /// Runs the read again. Required: an error the user can only stare at is
+  /// barely better than the blank page this replaced.
+  final VoidCallback onRetry;
+
+  /// What failed, in the user's terms — "Could not open that folder", not
+  /// "Error". Defaults to something honest but vague for callers with nothing
+  /// better to say.
+  final String title;
+
+  const ErrorState({
+    super.key,
+    required this.error,
+    required this.onRetry,
+    this.title = 'That did not load',
+  });
+
+  @override
+  Widget build(BuildContext context) => EmptyState(
+    icon: Icons.error_outline_rounded,
+    title: title,
+    message: friendlyError(error),
+    action: FilledButton.tonalIcon(
+      onPressed: onRetry,
+      icon: const Icon(Icons.refresh_rounded),
+      label: const Text('Try again'),
+    ),
+  );
 }

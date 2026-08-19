@@ -8,6 +8,21 @@ import 'package:peerbeam/sdk/peerbeam.dart';
 /// A mock [PeerBeamApi] for repository tests — records calls and lets the test
 /// push engine events, with no native library.
 class FakePeerBeam implements PeerBeamApi {
+  /// Method names that should throw instead of answering.
+  ///
+  /// Failure is not an exotic state for this app — a peer asleep, a folder
+  /// gone, an engine that did not start — and until these screens were guarded
+  /// a throw here left a permanently blank page. Tests need to produce that,
+  /// which means the fake needs to be able to fail on demand.
+  final Set<String> failing = <String>{};
+
+  /// Throws if [name] has been marked failing.
+  void _maybeFail(String name) {
+    if (failing.contains(name)) {
+      throw StateError('fake failure: $name');
+    }
+  }
+
   final _ctrl = StreamController<BridgeEvent>.broadcast();
   final List<String> calls = [];
   List<HistoryEntry> historyEntries = [];
@@ -575,6 +590,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<SharedFolder>> sharedFolders() async {
+    _maybeFail('sharedFolders');
     calls.add('sharedFolders');
     return shares;
   }
@@ -601,6 +617,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<LogLine>> logs({int limit = 200}) async {
+    _maybeFail('logs');
     calls.add('logs:$limit');
     return logLines.length <= limit
         ? logLines
@@ -669,6 +686,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<BrowseListing> browse(PeerTarget peer, {String path = ''}) async {
+    _maybeFail('browse');
     calls.add('browse:${peer.id}:$path');
     if (browseDenied) {
       return BrowseListing(
@@ -691,6 +709,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<TimelineEvent>> timeline({int? limit}) async {
+    _maybeFail('timeline');
     calls.add('timeline');
     final all = List.of(timelineEvents);
     return limit == null || all.length <= limit ? all : all.sublist(0, limit);
@@ -701,12 +720,14 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<ClipEntry>> clipboardHistory() async {
+    _maybeFail('clipboardHistory');
     calls.add('clipboardHistory');
     return List.of(clipHistory);
   }
 
   @override
   Future<int> clipboardHistoryClear() async {
+    _maybeFail('clipboardHistory');
     calls.add('clipboardHistoryClear');
     final n = clipHistory.length;
     clipHistory.clear();

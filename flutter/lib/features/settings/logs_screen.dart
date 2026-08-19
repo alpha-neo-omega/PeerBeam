@@ -45,6 +45,10 @@ class _LogsScreenState extends State<LogsScreen> {
   final _scroll = ScrollController();
   List<LogLine> _lines = const [];
   bool _loaded = false;
+
+  /// The last read's failure, or null. An absence and a failure must not
+  /// render the same: one is a fact about the world, the other about us.
+  Object? _error;
   bool _exporting = false;
 
   @override
@@ -61,12 +65,23 @@ class _LogsScreenState extends State<LogsScreen> {
 
   Future<void> _load() async {
     final api = AppScope.of(context).api;
-    final lines = api == null ? <LogLine>[] : await api.logs(limit: _limit);
-    if (!mounted) return;
-    setState(() {
-      _lines = lines;
-      _loaded = true;
-    });
+    try {
+      final lines = api == null ? <LogLine>[] : await api.logs(limit: _limit);
+      if (!mounted) return;
+      setState(() {
+        _lines = lines;
+        _error = null;
+        _loaded = true;
+      });
+    } catch (e) {
+      // Unguarded, this throw escaped the callback that started the load and
+      // left `_loaded` false for good — a blank page with no way back.
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loaded = true;
+      });
+    }
     // After layout, not during it: the extent is unknown until the list has
     // been built with the new lines in it.
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -138,7 +153,13 @@ class _LogsScreenState extends State<LogsScreen> {
       ),
       body: SafeArea(
         child: !_loaded
-            ? const SizedBox.shrink()
+            ? const Center(child: CircularProgressIndicator())
+            : _error != null
+            ? ErrorState(
+                error: _error!,
+                title: 'Could not read the logs',
+                onRetry: _load,
+              )
             : _lines.isEmpty
             // An empty buffer is a fact worth stating. A blank page reads as a
             // screen that failed to load, and the two are not the same news.
