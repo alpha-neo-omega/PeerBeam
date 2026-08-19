@@ -286,6 +286,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<List<HistoryEntry>> history() async {
+    _maybeFail('history');
     calls.add('history');
     return historyEntries;
   }

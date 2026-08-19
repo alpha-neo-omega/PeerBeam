@@ -31,6 +31,13 @@ class TransferRepository extends ChangeNotifier {
   /// Set in [dispose]: an in-flight fetch must not notify a dead listener.
   bool _disposed = false;
 
+  /// True once the interrupted-transfer read has completed, so an empty list
+  /// can be told apart from one nobody has fetched yet. A cold start otherwise
+  /// renders "No active transfers" before the engine has answered — and a
+  /// transfer interrupted by a restart is exactly what that screen exists to
+  /// surface.
+  bool loaded = false;
+
   /// Whether the first-contact pairing check is currently on, read live rather
   /// than captured, so toggling it in Settings applies to the prompt already on
   /// screen.
@@ -156,7 +163,11 @@ class TransferRepository extends ChangeNotifier {
   /// the map is left exactly as it is.
   Future<void> refreshInterrupted() async {
     final api = _api;
-    if (api == null) return;
+    if (api == null) {
+      loaded = true;
+      notifyListeners();
+      return;
+    }
     try {
       final rows = await api.interruptedTransfers();
       if (_disposed) return;
@@ -164,10 +175,16 @@ class TransferRepository extends ChangeNotifier {
         if (_byId.containsKey(r.id)) continue;
         _byId[r.id] = _fromCheckpoint(r);
       }
+      loaded = true;
       notifyListeners();
     } catch (_) {
       // A transient failure leaves the current view alone rather than
       // blanking it: an empty list is a claim, and this one would be false.
+      // The load is still *over*, though — staying "loading" forever is the
+      // same lie told the other way round.
+      if (_disposed) return;
+      loaded = true;
+      notifyListeners();
     }
   }
 

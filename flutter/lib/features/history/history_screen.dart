@@ -66,6 +66,12 @@ class HistoryScreen extends StatelessWidget {
             animation: state.history,
             builder: (context, _) {
               final items = state.history.items;
+              // "Not read yet" is not "nothing to show". Rendering the empty
+              // state before the first answer arrives tells someone with a full
+              // history that it is gone.
+              if (!state.history.loaded && items.isEmpty) {
+                return const Center(child: CircularProgressIndicator());
+              }
               if (items.isEmpty) {
                 return const EmptyState(
                   icon: Icons.history_rounded,

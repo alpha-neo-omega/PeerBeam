@@ -94,6 +94,16 @@ class _TransfersScreenState extends State<TransfersScreen> {
             animation: state.transfer,
             builder: (context, _) {
               final items = state.transfer.transfers;
+              // A transfer interrupted by a restart is precisely what this
+              // screen exists to surface, so claiming "none" before the read
+              // answers hides the one row that matters most.
+              //
+              // Conjunctive on purpose: rows also arrive as live events, and
+              // gating on the fetch alone would hide a transfer that started
+              // while it was still in flight.
+              if (!state.transfer.loaded && items.isEmpty) {
+                return const Center(child: CircularProgressIndicator());
+              }
               if (items.isEmpty) {
                 return const EmptyState(
                   icon: Icons.swap_horiz_rounded,

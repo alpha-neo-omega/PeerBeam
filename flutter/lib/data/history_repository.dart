@@ -30,17 +30,34 @@ class HistoryRepository extends ChangeNotifier {
 
   List<HistoryItem> get items => List.unmodifiable(_items);
 
+  /// True once a load has completed, so an empty list can be told apart from
+  /// "not read yet". Without it a cold start renders "Nothing here yet" before
+  /// the first answer arrives — a confident falsehood that makes a user with a
+  /// full history think it was lost. The same flag `NotesRepository` already
+  /// carries, for the same reason.
+  bool loaded = false;
+
   /// Pull the latest history from the engine.
   Future<void> refresh() async {
     final api = _api;
-    if (api == null) return;
+    if (api == null) {
+      loaded = true;
+      notifyListeners();
+      return;
+    }
     try {
       final entries = await api.history();
       if (_disposed) return; // disposed while the fetch was in flight
       _items = entries.map(_map).toList().reversed.toList();
+      loaded = true;
       notifyListeners();
     } catch (_) {
-      // Leave the current view on transient errors.
+      // Leave the current view on transient errors — but stop claiming to be
+      // mid-load, or a screen that renders "loading" forever is no better than
+      // one that renders a false "nothing here".
+      if (_disposed) return;
+      loaded = true;
+      notifyListeners();
     }
   }
 
