@@ -335,6 +335,22 @@ still decodes — with an **empty** vector, which relates as *behind* to anythin
 An older peer's files are taken rather than treated as conflicts, the safe
 reading when a device cannot say what it changed.
 
+**Only the changed parts of a file cross the wire.** Both sides split files into
+content-defined chunks and exchange chunk hashes, which are tiny; the receiver
+asks for only the chunks it lacks. Boundaries are chosen by content, so
+inserting a byte disturbs one chunk rather than shifting every boundary after
+it. Chunks are reused from anywhere the receiver already holds them — an older
+version, a copy under another name, an unrelated file — because identity is the
+content hash and provenance is irrelevant. Every chunk is verified against its
+hash before use: a peer sending wrong bytes under a right-looking name must not
+have them written into a file the user believes is a faithful copy.
+
+**A rename is recognised rather than re-sent.** A deletion and a creation in the
+same scan whose content hashes match are one file that moved. Pairing is on
+content alone — same size is not same content, and the name is the thing that
+changed — and each creation is claimed at most once, so nothing is reported as
+having moved somewhere it did not.
+
 Three rules make a pull safe, and each is tested:
 
 * **Nothing is ever deleted.** A pull that removed local files because a peer no

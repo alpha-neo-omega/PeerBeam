@@ -32,6 +32,13 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   the `files` permission as well as `browse` — being allowed to see that a file
   exists is not being allowed to take it.
 
+  **Only what changed is sent.** Files are split into content-defined chunks and
+  only the missing ones cross the wire, reused from wherever you already have
+  them — an older version, a copy under another name, even an unrelated file
+  that happens to share content. Editing one line of a large file costs one
+  line, not the file. Renaming or moving a file sends nothing at all: it is
+  recognised as a move rather than a delete-and-resend.
+
   **When both devices changed the same file, both copies are kept**: theirs
   arrives as `name.sync-conflict-<peer>.ext` and yours is untouched. PeerBeam
   tracks per-device edit counts rather than comparing clocks, so it can tell
