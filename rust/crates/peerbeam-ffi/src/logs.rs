@@ -18,7 +18,7 @@ type Op = Result<Value, (Code, String)>;
 ///
 /// Ignores failure if a global subscriber is already set: log capture degrades
 /// to nothing rather than crashing an engine that is otherwise fine.
-pub fn install() {
+pub fn install(filter: &str) {
     use std::sync::Once;
     use tracing_subscriber::prelude::*;
     static INSTALL: Once = Once::new();
@@ -29,8 +29,19 @@ pub fn install() {
                 "log": entry,
             }));
         }));
+        // **Filtered, or the buffer is worthless.** Without this the layer
+        // captured every event from every dependency at every level: one QUIC
+        // handshake emits hundreds of `TRACE` lines from quinn and rustls, so
+        // the 500-entry ring filled in milliseconds and anything the engine
+        // itself said was evicted before a person could read it. The log file
+        // got the same flood, rotating through megabytes of transport trace.
+        //
+        // `log.filter` (default `peerbeam=info`) already existed to say what
+        // should be recorded; it simply was not being applied here.
+        let env = tracing_subscriber::EnvFilter::try_new(filter)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("peerbeam=info"));
         let _ = tracing_subscriber::registry()
-            .with(peerbeam_logs::CaptureLayer)
+            .with(peerbeam_logs::CaptureLayer.with_filter(env))
             .try_init();
     });
 }

@@ -372,3 +372,70 @@ mod tests {
         clear();
     }
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use tracing_subscriber::prelude::*;
+
+    /// **A noisy dependency must not evict the engine's own logs.**
+    ///
+    /// The capture layer was installed unfiltered, so one QUIC handshake — a
+    /// few hundred `TRACE` lines from quinn and rustls — filled the ring before
+    /// anything the engine said could be read. Exporting logs then handed a
+    /// user transport trace instead of their own device's story.
+    #[test]
+    #[serial_test::serial]
+    fn a_flooding_dependency_cannot_push_out_engine_logs() {
+        clear();
+        let env = tracing_subscriber::EnvFilter::new("peerbeam=info");
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer.with_filter(env));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Stand-in for quinn/rustls: a target outside `peerbeam`, at a
+            // level the filter excludes, emitting far more than the ring holds.
+            for i in 0..(CAPACITY * 2) {
+                tracing::event!(target: "quinn_proto", tracing::Level::TRACE, "noise {}", i);
+            }
+            tracing::event!(target: "peerbeam_ffi", tracing::Level::INFO, "the line that matters");
+        });
+
+        let out = get(CAPACITY);
+        let logs = out["logs"].as_array().unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the dependency's trace was captured: {} lines held",
+            logs.len()
+        );
+        assert_eq!(logs[0]["message"], "the line that matters");
+        clear();
+    }
+
+    /// An unparseable filter must not disable logging altogether — a bad
+    /// setting should cost the setting, not the logs.
+    ///
+    /// `peerbeam=notalevel` is used because `EnvFilter::try_new` genuinely
+    /// rejects it. It is more lenient than one would expect: a string like
+    /// `"this is not a filter="` is *accepted* and yields a filter matching
+    /// nothing, so a typo of that shape quietly silences logging and no
+    /// fallback can catch it. Worth knowing when reading a report of missing
+    /// logs — check `log.filter` before suspecting the capture layer.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_filter_directive_falls_back_rather_than_silencing_everything() {
+        assert!(
+            tracing_subscriber::EnvFilter::try_new("peerbeam=notalevel").is_err(),
+            "the fixture must actually be rejected, or this tests nothing"
+        );
+        let bad = tracing_subscriber::EnvFilter::try_new("peerbeam=notalevel")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("peerbeam=info"));
+        clear();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer.with_filter(bad));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(target: "peerbeam_ffi", tracing::Level::INFO, "still recorded");
+        });
+        assert_eq!(get(10)["logs"].as_array().unwrap().len(), 1);
+        clear();
+    }
+}

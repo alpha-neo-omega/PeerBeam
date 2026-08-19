@@ -345,7 +345,7 @@ pub fn init(config_json: &str) -> OpResult {
     // Capture engine logs + point settings storage at the data directory,
     // then overlay the user's persisted settings (device name, save dir,
     // auto-accept) so they actually take effect.
-    crate::logs::install();
+    crate::logs::install(&config.log.filter);
     // Logs on disk as well as in memory, unless turned off. Wired *after*
     // install and *before* anything else runs, so the first lines of a startup
     // problem are the ones a user can actually go and read.
