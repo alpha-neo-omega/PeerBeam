@@ -93,12 +93,66 @@ impl ChatStore {
         ChatStore { store }
     }
 
+    /// The namespace holding landings that arrived before their row.
+    fn landing_ns(peer: &str) -> String {
+        format!("chat.landing-{peer}")
+    }
+
     /// Persist a record under its conversation namespace, keyed by its id.
+    ///
+    /// An incoming file row is reconciled against any **landing already known
+    /// for its id** before it is written. The two facts arrive on different
+    /// channels — the peer's claim on CHAT, what actually lands on TRANSFER —
+    /// and nothing orders them. When the transfer's meta wins the race, the
+    /// landing has nowhere to go yet; it is parked, and applied here. Without
+    /// that, whether the user is shown the real name or the sender's chosen one
+    /// depends on which frame arrives first, and on Windows the claim won.
     pub fn append(&self, rec: &ChatRecord) -> Result<(), ChatError> {
+        let mut rec = rec.clone();
+        if rec.is_settleable_file_row(Direction::In) {
+            if let Some((name, size)) = self.take_pending_landing(&rec.peer_id, &rec.id)? {
+                if let Some(file) = rec.file.as_mut() {
+                    file.name = crate::display_name(&name);
+                    file.size = size;
+                }
+            }
+        }
         let ns = format!("chat-{}", rec.peer_id);
         self.store
             .put(&ns, &rec.id, &rec.encode())
             .map_err(|e| ChatError::Serialization(e.to_string()))
+    }
+
+    /// Park a landing whose row does not exist yet.
+    fn park_pending_landing(
+        &self,
+        peer: &str,
+        id: &str,
+        name: &str,
+        size: u64,
+    ) -> Result<(), ChatError> {
+        let blob = serde_json::to_vec(&(name, size))
+            .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        self.store
+            .put(&Self::landing_ns(peer), id, &blob)
+            .map_err(|e| ChatError::Serialization(e.to_string()))
+    }
+
+    /// Take a parked landing, if one is waiting for this id.
+    fn take_pending_landing(
+        &self,
+        peer: &str,
+        id: &str,
+    ) -> Result<Option<(String, u64)>, ChatError> {
+        let ns = Self::landing_ns(peer);
+        let Ok(Some(blob)) = self.store.get(&ns, id) else {
+            return Ok(None);
+        };
+        // Removed whether or not it decodes: a landing that cannot be read is
+        // not going to become readable, and leaving it would re-apply nothing
+        // forever.
+        let _ = self.store.delete(&ns, id);
+        Ok(serde_json::from_slice::<(String, u64)>(&blob).ok())
     }
 
     /// Every peer this device has a conversation with, ascending by id.
@@ -768,6 +822,11 @@ impl ChatStore {
             return Ok(false);
         }
         let Some(mut rec) = self.get(peer, id)? else {
+            // The row has not been created yet — the peer's CHAT frame is still
+            // in flight. Park what actually lands so `append` can apply it, or
+            // the sender's claim would stand unchallenged at the approval
+            // prompt, which is the whole thing this reconcile prevents.
+            self.park_pending_landing(&peer.0, id, name, size)?;
             return Ok(false);
         };
         if !rec.is_settleable_file_row(expected_direction) {
@@ -1817,6 +1876,97 @@ mod tests {
     /// one thing, the TRANSFER stream lands another, and the two are
     /// correlated by id alone. The settled row must describe what is on disk,
     /// not what was advertised — and the name must be render-safe.
+    /// **The claim must lose whichever frame arrives first.**
+    ///
+    /// The peer's claim rides CHAT and what actually lands rides TRANSFER;
+    /// nothing orders the two. When the landing wins the race there is no row
+    /// to reconcile yet, and an earlier version simply dropped it — so on a
+    /// platform where that ordering happened to flip, the approval prompt
+    /// showed the sender's chosen name for a file that was going to arrive
+    /// under a very different one. This is the same assertion as the test
+    /// below, with the two steps swapped.
+    #[test]
+    fn a_landing_that_arrives_before_its_row_is_still_applied() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("holiday.jpg", 184_320).unwrap();
+        r.name = "holiday.jpg".into();
+
+        // TRANSFER first: nothing to reconcile yet, so it must be parked.
+        let wrote = cs
+            .set_file_row_landing(&peer, &r.id, Direction::In, "invoice-2026.pdf.exe", 4_096)
+            .unwrap();
+        assert!(!wrote, "there is no row yet, so nothing was written");
+
+        // CHAT second: the row is created, and must carry what lands.
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        let meta = cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap();
+        assert_eq!(
+            meta.name, "invoice-2026.pdf.exe",
+            "the peer's claim outranked what actually lands"
+        );
+        assert_eq!(meta.size, 4_096, "and its size");
+    }
+
+    /// A parked landing is consumed once, not replayed onto a later row that
+    /// happens to reuse the id.
+    #[test]
+    fn a_parked_landing_applies_once_and_is_then_gone() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("holiday.jpg", 1).unwrap();
+        r.name = "holiday.jpg".into();
+
+        cs.set_file_row_landing(&peer, &r.id, Direction::In, "real.bin", 4_096)
+            .unwrap();
+        cs.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().name,
+            "real.bin"
+        );
+
+        // A second row under the same id must not inherit it again.
+        let mut again = FileRef::new("second.jpg", 7).unwrap();
+        again.name = "second.jpg".into();
+        again.id = r.id.clone();
+        cs.append(&ChatRecord::file_in(&peer, &again)).unwrap();
+        assert_eq!(
+            cs.get(&peer, &r.id).unwrap().unwrap().file.unwrap().name,
+            "second.jpg",
+            "a consumed landing was replayed"
+        );
+    }
+
+    /// Parking is per peer **and** per id: one peer's landing must never be
+    /// applied to another peer's row.
+    #[test]
+    fn a_parked_landing_belongs_to_one_peer_only() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let eve = DeviceId::from("pb-eve");
+        let mut r = FileRef::new("holiday.jpg", 1).unwrap();
+        r.name = "holiday.jpg".into();
+
+        cs.set_file_row_landing(&bob, &r.id, Direction::In, "bobs-real.bin", 4_096)
+            .unwrap();
+
+        // Eve's row shares the id but not the peer.
+        cs.append(&ChatRecord::file_in(&eve, &r)).unwrap();
+        assert_eq!(
+            cs.get(&eve, &r.id).unwrap().unwrap().file.unwrap().name,
+            "holiday.jpg",
+            "another peer's landing was applied"
+        );
+
+        // Bob's own row still gets it.
+        cs.append(&ChatRecord::file_in(&bob, &r)).unwrap();
+        assert_eq!(
+            cs.get(&bob, &r.id).unwrap().unwrap().file.unwrap().name,
+            "bobs-real.bin"
+        );
+    }
+
     #[test]
     fn set_file_row_landing_replaces_the_peers_claim_with_what_actually_landed() {
         let (cs, _store, _dir) = new_store();

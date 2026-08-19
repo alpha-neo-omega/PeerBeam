@@ -130,10 +130,19 @@ mod tests {
         let free = storage_free(&path).expect("a real temp dir has measurable free space");
         assert!(free > 0, "free space on a writable volume must be nonzero");
 
-        // And it is the *volume's* figure, matching what the platform layer
-        // reports for the same path — the point being that it is measured, not
-        // invented here.
-        assert_eq!(Some(free), peerbeam_platform::available_bytes(&path));
+        // And it is the *volume's* figure, from the platform layer rather than
+        // invented here. Compared with a tolerance, not for equality: these are
+        // two separate live measurements, and on a busy machine the free space
+        // genuinely moves between them. Asserting they match to the byte tests
+        // whether anything else wrote to the disk, which is not the property
+        // this test is about.
+        let again = peerbeam_platform::available_bytes(&path).expect("a second reading");
+        let drift = free.abs_diff(again);
+        assert!(
+            drift < free / 10 + 64 * 1024 * 1024,
+            "storage_free {free} and available_bytes {again} disagree by {drift}, \
+             which is more than ordinary disk activity explains"
+        );
     }
 
     /// A path that does not exist walks up to its nearest existing ancestor
