@@ -258,8 +258,16 @@ jobs:
   # (notarized DMG / signed MSIX) await their signing secrets. Uses the built-in
   # GITHUB_TOKEN.
   release:
-    needs: [linux, windows, android, cli-linux, cli-macos, cli-windows]
-    # `linux` and `cli-linux` are matrices; needing them waits for every leg.
+    needs: [linux, windows, macos, android, cli-linux, cli-macos, cli-windows]
+    # `linux`, `windows` and both CLI matrices are matrices; needing them waits
+    # for every leg.
+    #
+    # `macos` is needed too, and was not before: without it the release could
+    # publish before the DMG existed and simply not attach it. It happened to be
+    # there every time only because that job finished first — a race nobody
+    # would notice until a slow macOS runner shipped a release with no macOS
+    # build. The job is `continue-on-error`, so needing it waits for the DMG
+    # without letting a signing failure withhold everyone else's artifacts.
     runs-on: ubuntu-latest
     permissions:
       contents: write
