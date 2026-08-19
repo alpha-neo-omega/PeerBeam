@@ -87,6 +87,18 @@ jobs:
               | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
             exit 1
           fi
+      # **Unit tests only** (`--lib --bins`), deliberately.
+      #
+      # This leg exists to prove the Intel-arch build compiles and its logic
+      # holds. It cannot prove anything about networking: the integration tests
+      # drive real QUIC over loopback with keep-alives and idle timeouts, and
+      # emulated x86 on Apple silicon starves the runtime long enough to drop
+      # connections — `quic: connection lost`, then a dozen tests waiting for
+      # events that will never arrive. Those failures describe Rosetta, not the
+      # Intel binaries users run, and they were drowning real signal.
+      #
+      # The native arm64 step above runs the whole suite, so integration
+      # coverage is not lost — only moved off the emulator.
       - name: Rust tests (x86_64 under Rosetta)
         if: runner.os == 'macOS'
         working-directory: rust
@@ -94,7 +106,7 @@ jobs:
         run: |
           set -o pipefail
           rustup target add x86_64-apple-darwin
-          if ! cargo test --workspace --no-fail-fast --target x86_64-apple-darwin 2>&1 | tee /tmp/test-x64.txt; then
+          if ! cargo test --workspace --lib --bins --no-fail-fast --target x86_64-apple-darwin 2>&1 | tee /tmp/test-x64.txt; then
             grep -E "^(test .+ \.\.\. FAILED|---- .+ ----|thread .+ panicked.*|error(\[[^]]+\])?:.*)" /tmp/test-x64.txt \
               | head -40 | while IFS= read -r line; do echo "::error::x86_64: ${line}"; done
             exit 1

@@ -199,15 +199,52 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
         .collect()
 }
 
+/// How many times a commit will retry before giving up, and how long it waits
+/// between attempts.
+///
+/// **Windows needs this; Unix never uses it.** `rename` over an existing file
+/// is atomic on both, but on Windows it fails outright if *any* handle to the
+/// destination is open — a reader mid-`get` is enough. Two threads doing
+/// ordinary work, one reading a record while another rewrites it, is not a
+/// rare interleaving; it is the normal case for a store read and written from
+/// several tasks.
+///
+/// The failure that motivated this was silent: a chat row's reconcile — the
+/// step that replaces a sender's *claimed* filename with what actually lands —
+/// hit a sharing violation, its caller logged and continued, and the approval
+/// prompt kept showing the sender's name. Nothing looked broken.
+const COMMIT_ATTEMPTS: u32 = 20;
+const COMMIT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Durable private write: temp (`0600`-at-creation on Unix) + fsync + atomic
 /// rename. Mirrors `peerbeam-identity-fs`.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = unique_tmp(path);
     write_tmp(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        DomainError::Storage(format!("commit record: {e}"))
-    })
+
+    let mut last = None;
+    for attempt in 0..COMMIT_ATTEMPTS {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Retried on every error rather than on a Windows-specific
+                // code: the ones worth retrying (sharing violation, access
+                // denied while a handle closes) are not distinguishable from
+                // the ones that are not without platform-specific matching,
+                // and a genuinely broken write fails all twenty attempts in a
+                // fifth of a second anyway.
+                last = Some(e);
+                if attempt + 1 < COMMIT_ATTEMPTS {
+                    std::thread::sleep(COMMIT_BACKOFF);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(DomainError::Storage(format!(
+        "commit record after {COMMIT_ATTEMPTS} attempts: {}",
+        last.expect("a failure is recorded before the loop ends")
+    )))
 }
 
 #[cfg(unix)]
@@ -272,6 +309,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         (s, dir)
+    }
+
+    /// **A reader must never cost a write.** On Windows `rename` fails while
+    /// any handle to the destination is open, so a `get` running alongside a
+    /// `put` can make the commit fail — and the callers of this store log and
+    /// carry on, so the loss is silent. This passes trivially on Unix and is
+    /// here to hold the invariant on the platform that does not.
+    #[test]
+    fn a_concurrent_reader_never_costs_a_write() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(store(dir.path()));
+        s.put("ns", "k", b"seed").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = s.get("ns", "k");
+                    }
+                })
+            })
+            .collect();
+
+        for i in 0..200u32 {
+            let want = format!("value-{i}");
+            s.put("ns", "k", want.as_bytes())
+                .unwrap_or_else(|e| panic!("write {i} lost to a concurrent reader: {e}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        assert_eq!(
+            s.get("ns", "k").unwrap().as_deref(),
+            Some(b"value-199".as_slice()),
+            "the last write is not what the store holds"
+        );
     }
 
     #[test]
