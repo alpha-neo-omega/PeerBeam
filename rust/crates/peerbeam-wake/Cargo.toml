@@ -1,0 +1,25 @@
+[package]
+name = "peerbeam-wake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No new third-party dependency. Wake-on-LAN is one 102-byte UDP datagram, so
+# the send path is `std::net::UdpSocket` rather than tokio: there is nothing to
+# await (a connectionless `send_to` does not block on a peer) and nothing to
+# stream. Pulling an async runtime in for one datagram would buy nothing and
+# would make this crate unusable from a plain `fn main`.
+[dependencies]
+peerbeam-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+tempfile = { workspace = true }

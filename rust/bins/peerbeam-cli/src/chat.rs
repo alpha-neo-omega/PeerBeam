@@ -42,8 +42,8 @@ use serde_json::json;
 
 use peerbeam_chat::{
     begin_file_send, flush_to_session, send_file_ref, stage_file_send, ChatRecord, ChatStore,
-    Direction, FileMeta, FileRef, Kind, ReceivedSink, SendError, StagedFile, StagingLimits,
-    StagingStore, Status,
+    Direction, FileMeta, FileRef, Kind, ReceivedSink, Retention, SendError, StagedFile,
+    StagingLimits, StagingStore, Status,
 };
 use peerbeam_config::EngineConfig;
 use peerbeam_domain::id::DeviceId;
@@ -87,6 +87,10 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
         },
         ChatAction::Cancel { peer, id } => cancel(ctx, peer, id, path_override).await,
         ChatAction::Delete { peer } => delete(ctx, peer, path_override).await,
+        ChatAction::Retention { peer, after, off } => {
+            retention(ctx, peer, after.as_deref(), off, path_override).await
+        }
+        ChatAction::Prune { peer } => prune(ctx, peer, path_override).await,
         ChatAction::React {
             peer,
             id,
@@ -1353,6 +1357,126 @@ fn delete_question(peer: &DeviceId, records: usize) -> String {
          kept, along with the file it owns.\nDelete this conversation?",
         peer.0,
     )
+}
+
+/// `peerbeam chat retention <PEER> [--after 30m | --off]`.
+///
+/// **A local window, not a protocol.** Nothing is sent to the peer, and the
+/// help text says so — a "disappearing message" feature that quietly relies on
+/// the other side deleting its copy is a promise this architecture cannot keep,
+/// and stating it would be worse than not having the feature.
+async fn retention(
+    ctx: &Ctx,
+    peer: String,
+    after: Option<&str>,
+    off: bool,
+    path_override: Option<&str>,
+) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    let id = resolve_history_peer(ctx, &config, &store, peer).await;
+
+    if !off && after.is_none() {
+        let current = store
+            .retention(&id)
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        if ctx.json {
+            ctx.json_line(&serde_json::json!({
+                "event": "chat_retention",
+                "peer": id.0,
+                "seconds": current.ttl_secs,
+            }));
+        } else if current.is_off() {
+            ctx.line("messages are kept until you delete them");
+        } else {
+            ctx.line(&format!(
+                "messages disappear from this device after {}",
+                commands::humantime(std::time::Duration::from_secs(
+                    current.ttl_secs.unwrap_or(0)
+                ))
+            ));
+        }
+        return Ok(());
+    }
+
+    let next = if off {
+        Retention::OFF
+    } else {
+        let secs = commands::parse_duration(after.unwrap_or_default())
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+        Retention::for_secs(
+            secs.num_seconds()
+                .try_into()
+                .map_err(|_| CliError::Usage("that window is not a length of time".into()))?,
+        )
+        .map_err(|e| CliError::Usage(e.to_string()))?
+    };
+    store
+        .set_retention(&id, next)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "event": "chat_retention_set",
+            "peer": id.0,
+            "seconds": next.ttl_secs,
+        }));
+        return Ok(());
+    }
+    if off {
+        // Said explicitly: turning the window off restores what was hidden but
+        // cannot restore what a prune already deleted.
+        ctx.line("disappearing messages off — anything already deleted is gone");
+    } else {
+        ctx.line(&format!(
+            "messages will disappear from this device after {}\n{}",
+            commands::humantime(std::time::Duration::from_secs(next.ttl_secs.unwrap_or(0))),
+            ctx.dim("the peer keeps its own copy — this device cannot delete that")
+        ));
+    }
+    Ok(())
+}
+
+/// `peerbeam chat prune [PEER]` — delete what the window has already hidden.
+async fn prune(ctx: &Ctx, peer: Option<String>, path_override: Option<&str>) -> CliResult {
+    let config = commands::load_config(path_override)?;
+    let sc = SecureCtx::build(&config)?;
+    let store = commands::chat_store(&config, &sc.enc, &sc.ident);
+    let now = chrono::Utc::now();
+
+    let pruned = match peer {
+        Some(p) => {
+            let id = resolve_history_peer(ctx, &config, &store, p).await;
+            store
+                .prune(&id, now)
+                .map_err(|e| CliError::Other(e.to_string()))?
+        }
+        None => {
+            // The staging store too: an expired file entry owns a copy of the
+            // bytes, and deleting only the row would leave them on disk.
+            let staging = commands::staging_store(&config);
+            peerbeam_chat::prune_all_conversations(&store, &staging, now)
+                .map_err(|e| CliError::Other(e.to_string()))?
+        }
+    };
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "event": "chat_pruned",
+            "messages": pruned.records,
+            "queued": pruned.queued,
+            "staged_blobs": pruned.staged.len(),
+        }));
+    } else if pruned.is_empty() {
+        ctx.line("nothing had aged out");
+    } else {
+        ctx.line(&format!(
+            "deleted {} message(s) and {} queued item(s)",
+            pruned.records, pruned.queued
+        ));
+    }
+    Ok(())
 }
 
 /// `peerbeam chat delete <PEER>` — forget a whole conversation on this device.

@@ -245,6 +245,69 @@ mod tests {
         assert_eq!(hist[0].body, "hello");
     }
 
+    /// An inbound reply survives the frame and the store, and resolves against
+    /// what the receiver can actually see — the whole path from wire to render,
+    /// on the side that did not write the message.
+    #[tokio::test]
+    async fn an_inbound_reply_persists_its_reference_and_resolves_to_a_quote() {
+        let (handler, peer_slot, cs, _rx, _dir) = new_handler();
+        let peer = DeviceId::from("pb-sender");
+        let _ = peer_slot.set(peer.clone());
+
+        let parent = ChatMessage::new("shall I delete the backups?").unwrap();
+        handler
+            .handle(parent.to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+        let reply = ChatMessage::replying("sure, go ahead", Some(&parent.id)).unwrap();
+        handler
+            .handle(reply.to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        let rows = cs.history(&peer).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].in_reply_to.as_deref(), Some(parent.id.as_str()));
+        match &crate::resolve_replies(&rows)[1] {
+            crate::ReplyContext::Quoting(quoted) => {
+                assert_eq!(quoted.id, parent.id);
+                assert_eq!(quoted.preview, "shall I delete the backups?");
+                assert_eq!(quoted.direction, Direction::In);
+            }
+            other => panic!("expected a resolved quote, got {other:?}"),
+        }
+    }
+
+    /// A peer answering a message this device has already deleted — or one it
+    /// never had — must still be persisted and shown. Dropping the reference,
+    /// or the row, would let one missing message silently change what the next
+    /// one appears to say.
+    #[tokio::test]
+    async fn an_inbound_reply_to_a_message_we_do_not_have_is_still_kept() {
+        let (handler, peer_slot, cs, _rx, _dir) = new_handler();
+        let peer = DeviceId::from("pb-sender");
+        let _ = peer_slot.set(peer.clone());
+
+        let reply = ChatMessage::replying("sure, go ahead", Some("0000000000001")).unwrap();
+        handler
+            .handle(reply.to_frame(ChannelId::new(1)).unwrap())
+            .await
+            .unwrap();
+
+        let rows = cs.history(&peer).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the reply is the user's message, not the parent's"
+        );
+        assert_eq!(
+            crate::resolve_replies(&rows)[0],
+            crate::ReplyContext::Orphaned {
+                id: "0000000000001".to_string()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn handle_dedups_same_message_id() {
         let (cs, _dir) = store(3);

@@ -3,7 +3,7 @@
 use chrono::Utc;
 
 use crate::entity::{Permission, TrustRecord};
-use crate::error::Result;
+use crate::error::{DomainError, Result};
 use crate::id::DeviceId;
 
 /// Stores and queries trusted-device records.
@@ -11,7 +11,9 @@ use crate::id::DeviceId;
 /// # The clock lives here
 ///
 /// A trust record may carry a deadline ([`TrustRecord::expires_at`]), and the
-/// three predicates below are the only place it is enforced. They read the
+/// three predicates that decide what a device may do —
+/// [`is_trusted`](TrustStore::is_trusted), [`is_approved`](TrustStore::is_approved)
+/// and [`may`](TrustStore::may) — are the only place it is enforced. They read the
 /// clock themselves rather than taking a `now`, because "is this device
 /// trusted?" is a question about the present by definition, and every one of
 /// the workspace's gates asks it per operation. Deferring the clock to the
@@ -19,6 +21,10 @@ use crate::id::DeviceId;
 /// forgot would keep a closed window open. The entity's predicates are the pure
 /// ones ([`TrustRecord::has_expired`] and friends take an explicit `now`), so
 /// the boundary can still be asserted exactly.
+///
+/// [`is_mine`](TrustStore::is_mine) is pointedly not among them and must not
+/// join them: it reports a word the user wrote about their own list, not a
+/// power they granted, so nothing that sends or accepts may branch on it.
 ///
 /// Note what is deliberately *not* here: nothing sweeps expired records away.
 /// A sweeper is a second source of truth and the slower one — the gap between
@@ -132,6 +138,63 @@ pub trait TrustStore: Send + Sync {
             Ok(Some(r)) if r.effective_permissions_at(Utc::now()).grants(permission)
         )
     }
+
+    /// Has the user called this device **one of their own**?
+    ///
+    /// Answers [`TrustRecord::mine`] and nothing else. It is deliberately not a
+    /// sibling of [`is_approved`] or [`may`] despite reading like one: those
+    /// decide whether something may leave this machine, and this decides how a
+    /// list is sorted and what a button is called. Nothing that sends, accepts,
+    /// or opens anything may branch on it — see [`TrustRecord::mine`] for what
+    /// it would cost if one did.
+    ///
+    /// # Not gated by the window, on purpose
+    ///
+    /// [`TrustRecord::expires_at`] ends a *grant*; a laptop is still the user's
+    /// laptop at 10:31. Gating this on expiry would make devices drop out of
+    /// "My devices" when a temporary approval lapsed — and would quietly make
+    /// the label permission-shaped, which is the one thing it must not be. The
+    /// surface that lists them and the gate that admits them ask different
+    /// questions, and this is the harmless one.
+    ///
+    /// Answers `false` for a store that cannot be read, like every predicate
+    /// here — not because silence is dangerous, but because inventing an
+    /// ownership claim out of an I/O error is worse than showing an empty list.
+    ///
+    /// [`is_approved`]: TrustStore::is_approved
+    /// [`may`]: TrustStore::may
+    fn is_mine(&self, device: &DeviceId) -> bool {
+        matches!(self.lookup(device), Ok(Some(r)) if r.mine)
+    }
+
+    /// The records the user has marked as their own, for a "My devices"
+    /// listing or a `--mine` filter.
+    ///
+    /// **Unfiltered by approval and by expiry**, matching [`is_mine`]: the list
+    /// answers *"which of these are mine?"*, not *"which may I use?"*. A device
+    /// the user marked but has not yet approved belongs on the screen — hiding
+    /// it is how a person concludes their phone is missing when it is merely
+    /// waiting for a tap. Whatever a caller then does with a listed device it
+    /// must still ask [`may`], which is where the two questions meet.
+    ///
+    /// # Provided, and its default refuses rather than answering "none"
+    ///
+    /// Enumeration is not something a trust store must be able to do — most
+    /// implementations in this workspace answer about one device at a time —
+    /// so this is provided rather than required, and the default says
+    /// [`Unsupported`] instead of `Ok(vec![])`. An empty list is a *statement*:
+    /// "you have marked no devices". A store that simply cannot enumerate would
+    /// be making that statement falsely, and a surface would render it as a
+    /// working, empty screen with nothing to debug.
+    ///
+    /// [`is_mine`]: TrustStore::is_mine
+    /// [`may`]: TrustStore::may
+    /// [`Unsupported`]: crate::error::DomainError::Unsupported
+    fn my_devices(&self) -> Result<Vec<TrustRecord>> {
+        Err(DomainError::Unsupported(
+            "this trust store does not enumerate its records".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +247,7 @@ mod tests {
             approved,
             permissions,
             expires_at,
+            mine: false,
         }
     }
 
@@ -342,5 +406,74 @@ mod tests {
         assert!(store.is_trusted(&bob()));
         assert!(store.is_approved(&bob()));
         assert!(store.may(&bob(), Permission::Files));
+    }
+
+    // ── "one of my devices" ─────────────────────────────────────────────────
+
+    /// A record marked mine is reported so; one that is not, is not. The label
+    /// is read straight off the record — there is no rule layered on it.
+    #[test]
+    fn is_mine_reports_the_stored_label() {
+        let mut rec = record(true, PermissionSet::granted_on_approval());
+        assert!(!Store::Holds(rec.clone()).is_mine(&bob()));
+        rec.mine = true;
+        assert!(Store::Holds(rec).is_mine(&bob()));
+    }
+
+    /// **The window ends a grant, not an ownership.** A laptop whose half-hour
+    /// lapsed is still the user's laptop, so it stays in "My devices" — while
+    /// answering `false` to every question that decides whether anything may
+    /// leave this machine. Both halves in one test, because it is their
+    /// combination that is the point.
+    #[test]
+    fn an_expired_device_is_still_mine_and_still_may_nothing() {
+        let mut rec = expiring(
+            true,
+            PermissionSet::granted_on_approval(),
+            Some(Utc::now() - Duration::hours(1)),
+        );
+        rec.mine = true;
+        let store = Store::Holds(rec);
+
+        assert!(store.is_mine(&bob()), "expiry must not un-own a device");
+        assert!(!store.is_approved(&bob()));
+        for p in Permission::ALL {
+            assert!(!store.may(&bob(), p), "an expired device may not {p}");
+        }
+    }
+
+    /// **The label is not an approval.** A merely-pinned device the user has
+    /// grouped is still a device nobody accepted — a `may` that had learned to
+    /// read the label would open every gate for it.
+    #[test]
+    fn marking_an_unapproved_device_mine_permits_it_nothing() {
+        let mut rec = record(false, PermissionSet::granted_on_approval());
+        rec.mine = true;
+        let store = Store::Holds(rec);
+
+        assert!(store.is_mine(&bob()));
+        assert!(!store.is_approved(&bob()));
+        for p in Permission::ALL {
+            assert!(!store.may(&bob(), p), "a marked stranger may not {p}");
+        }
+    }
+
+    /// No record and no readable store are both "the user has not said so" —
+    /// an I/O error must not be turned into an ownership claim.
+    #[test]
+    fn an_unknown_device_and_an_unreadable_store_are_not_mine() {
+        assert!(!Store::Empty.is_mine(&bob()));
+        assert!(!Store::Broken.is_mine(&bob()));
+    }
+
+    /// The default [`TrustStore::my_devices`] refuses instead of answering
+    /// "none": these doubles cannot enumerate, and an empty list would be them
+    /// asserting the user has marked nothing.
+    #[test]
+    fn a_store_that_cannot_enumerate_says_so_rather_than_reporting_none() {
+        let err = Store::Holds(record(true, PermissionSet::granted_on_approval()))
+            .my_devices()
+            .expect_err("a store with no enumeration must not answer `[]`");
+        assert!(matches!(err, DomainError::Unsupported(_)), "got {err:?}");
     }
 }

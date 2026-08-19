@@ -53,6 +53,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
 
 use peerbeam_domain::entity::{Permission, PermissionSet, TrustRecord};
+use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::TrustStore;
 
 use crate::cli::TrustAction;
@@ -86,7 +87,80 @@ pub fn trust(ctx: &Ctx, action: TrustAction, path_override: Option<&str>) -> Cli
             device,
             permissions,
         } => set_permissions(ctx, &device, &permissions, false, path_override),
+        TrustAction::Mine { device, no } => set_mine(ctx, &device, !no, path_override),
+        TrustAction::MyDevices => my_devices(ctx, path_override),
     }
+}
+
+// ── mine ────────────────────────────────────────────────────────────────────
+
+/// `peerbeam trust mine <DEVICE> [--no]`.
+///
+/// **A label, not a grant.** Marking a device as yours changes no permission,
+/// no approval, and nothing the device itself can observe — it is a note this
+/// machine keeps so it can answer "which of these are mine". The engine
+/// enforces that: `mine` is not among the fields `effective_permissions_at`
+/// reads.
+fn set_mine(ctx: &Ctx, device: &str, mine: bool, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let store = open_trust(&config)?;
+    let id = DeviceId::from(device.to_string());
+
+    let changed = store
+        .set_mine(&id, mine)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "event": "trust_mine",
+            "device": device,
+            "mine": mine,
+            "changed": changed,
+        }));
+        return Ok(());
+    }
+    // A device that was never pinned cannot be marked: there is no record to
+    // write the label on, and inventing one would pin a key nobody presented.
+    if !changed && !store.is_trusted(&id) {
+        return Err(CliError::NotFound(format!(
+            "no device {device} on this machine — it is marked as yours only after it has connected once"
+        )));
+    }
+    ctx.line(&if mine {
+        format!("{device} is one of yours")
+    } else {
+        format!("{device} is no longer marked as yours")
+    });
+    Ok(())
+}
+
+/// `peerbeam trust my-devices` — the machines the user calls their own.
+fn my_devices(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let devices = open_trust(&config)?
+        .my_devices()
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        for d in &devices {
+            ctx.json_line(&serde_json::json!({
+                "event": "my_device",
+                "device": d.device.0,
+                "name": d.name,
+            }));
+        }
+        return Ok(());
+    }
+    if devices.is_empty() {
+        ctx.line(&ctx.dim(
+            "none marked yet — `peerbeam trust mine <device>` marks one, and marks nothing else",
+        ));
+        return Ok(());
+    }
+    for d in &devices {
+        ctx.line(&format!("{}  {}", ctx.dim(&d.device.0), d.name));
+    }
+    Ok(())
 }
 
 // ── list ────────────────────────────────────────────────────────────────────
@@ -783,6 +857,7 @@ mod tests {
             approved,
             permissions,
             expires_at: None,
+            mine: false,
         }
     }
 

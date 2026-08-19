@@ -1,10 +1,12 @@
 //! The persisted chat record (distinct from the wire `ChatMessage`).
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use peerbeam_domain::id::DeviceId;
 
 use crate::message::{ChatError, ChatMessage, FileRef};
+use crate::retention::Retention;
 
 /// Whether a record was sent by us or received from the peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +179,62 @@ pub struct ChatRecord {
     /// history that nothing has reacted to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<StoredReaction>,
+    /// The id of the message this one answers, in this same conversation.
+    ///
+    /// Only ever a *reference*: no copy of the parent is kept here, so a quoted
+    /// message disappears on its own schedule and takes its text with it. See
+    /// [`crate::reply`] for what a reply whose parent is gone renders as, and
+    /// why keeping a snapshot would make a retention window unenforceable.
+    ///
+    /// `default` so every row written before replies existed decodes as
+    /// answering nothing, and `skip_serializing_if` so an ordinary message is
+    /// written exactly as it was before — an upgrade must not rewrite the shape
+    /// of history nobody has replied in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// When **this device** first put this row into its own history.
+    ///
+    /// This is the age a [disappearing-message window](crate::Retention) is
+    /// measured against, and it is deliberately not [`timestamp`](Self::timestamp).
+    ///
+    /// # Why not the timestamp the message already carries
+    ///
+    /// `timestamp` is minted by the *sender*, so on an inbound row it is the
+    /// peer's claim about its own clock, and two ordinary things go wrong if a
+    /// window is measured from it.
+    ///
+    /// The first is not an attack at all: a peer that was offline queues its
+    /// messages and flushes them when it comes back (`ChatStore::enqueue`,
+    /// `flush_to_session`). Those arrive stamped hours or days ago. Measured
+    /// from `timestamp`, every one of them is already past a short window and
+    /// vanishes on arrival — deleted before the user has seen it once, by a
+    /// feature they turned on to control how long they keep things, not whether
+    /// they receive them.
+    ///
+    /// The second is: a peer chooses that number, so a peer could keep its
+    /// messages alive on someone else's device by stamping them in the future.
+    ///
+    /// Stamping locally answers both, and lets the window be stated as
+    /// something this device can actually keep: *no message is readable here
+    /// for longer than the window, and it is then deleted from here.*
+    ///
+    /// # The upgrade rule
+    ///
+    /// `default`, so a row written before this field existed loads with `None`
+    /// and falls back to parsing `timestamp` — see
+    /// [`age_basis`](Self::age_basis). Absent must **not** be read as "new": a
+    /// row that has been on disk for a year would be treated as freshly stored
+    /// and would outlive the window the user just set, which is the one thing
+    /// they asked for. `skip_serializing_if` keeps a legacy row byte-identical
+    /// when something rewrites it in place.
+    ///
+    /// Set by the constructors below rather than by
+    /// [`ChatStore::append`](crate::ChatStore::append), on purpose: `append` is
+    /// also how an *existing* row is written back (a status change, a landing
+    /// correction, a receipt), and a stamp applied there would quietly reset a
+    /// legacy row's age to now every time anything touched it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_at: Option<DateTime<Utc>>,
 }
 
 impl ChatRecord {
@@ -194,6 +252,8 @@ impl ChatRecord {
             file: None,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: msg.in_reply_to.clone(),
+            stored_at: Some(Utc::now()),
         }
     }
 
@@ -211,6 +271,8 @@ impl ChatRecord {
             file: None,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: msg.in_reply_to.clone(),
+            stored_at: Some(Utc::now()),
         }
     }
 
@@ -229,6 +291,8 @@ impl ChatRecord {
             file: None,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: msg.in_reply_to.clone(),
+            stored_at: Some(Utc::now()),
         }
     }
 
@@ -245,7 +309,12 @@ impl ChatRecord {
             kind: Kind::File,
             file: Some(meta),
             read_at: None,
+            // A `FileRef` carries no reply reference on the wire yet; see
+            // `ChatMessage::in_reply_to` for why the field is general here
+            // anyway.
             reactions: Vec::new(),
+            in_reply_to: None,
+            stored_at: Some(Utc::now()),
         }
     }
 
@@ -268,7 +337,46 @@ impl ChatRecord {
             file: Some(FileMeta::new(&r.name, r.size, None)),
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: None,
+            stored_at: Some(Utc::now()),
         }
+    }
+
+    /// The instant this row's age is measured from, or `None` when this device
+    /// cannot establish one.
+    ///
+    /// [`stored_at`](Self::stored_at) when it is there — the local, unforgeable
+    /// answer. A row written before that field existed falls back to parsing
+    /// [`timestamp`](Self::timestamp), which is right for every row this crate
+    /// wrote (`Utc::now().to_rfc3339()`) and is the best available for an
+    /// inbound one, whose timestamp is the peer's own string and is not
+    /// validated anywhere on the wire. When that string is not RFC 3339 there
+    /// is nothing left to measure from, and [`Retention::closed_on`] says what
+    /// happens then and why it can only happen inside a conversation the user
+    /// has put a window on.
+    #[must_use]
+    pub fn age_basis(&self) -> Option<DateTime<Utc>> {
+        match self.stored_at {
+            Some(at) => Some(at),
+            None => DateTime::parse_from_rfc3339(&self.timestamp)
+                .ok()
+                .map(|t| t.with_timezone(&Utc)),
+        }
+    }
+
+    /// Whether this row's [disappearing-message window](Retention) has closed
+    /// as of `now`.
+    ///
+    /// `now` is a parameter rather than a clock read, exactly as
+    /// `TrustRecord::has_expired` takes one, so the boundary is asserted
+    /// precisely instead of by a test that sleeps and hopes. The layer that
+    /// *is* asking about the present reads the clock — see
+    /// [`ChatStore::history`](crate::ChatStore::history), which is where this
+    /// is consulted on every read so that a window shuts on time whether or not
+    /// a prune has ever run.
+    #[must_use]
+    pub fn has_disappeared(&self, retention: Retention, now: DateTime<Utc>) -> bool {
+        retention.closed_on(self.age_basis(), now)
     }
 
     /// Whether this record is genuinely an in-flight file-share row for
@@ -599,6 +707,98 @@ mod tests {
                 "an inbound offer in {status:?} is not ours to cancel"
             );
         }
+    }
+
+    /// **The upgrade rule, for both new fields.** A row written by any earlier
+    /// build has neither key, and must load as "answers nothing, dated by its
+    /// own timestamp" rather than failing to decode or being read as fresh.
+    #[test]
+    fn a_record_written_before_replies_and_windows_still_loads() {
+        let legacy = br#"{"id":"1","peer_id":"pb-a","direction":"out",
+            "timestamp":"2026-01-01T10:00:00Z","body":"hello","status":"sent"}"#;
+        let rec = ChatRecord::decode(legacy).unwrap();
+        assert_eq!(rec.in_reply_to, None, "a legacy row answers nothing");
+        assert_eq!(rec.stored_at, None);
+        // And it is still datable, from the timestamp it does carry — so a
+        // window the user sets later applies to it rather than skipping it.
+        assert_eq!(
+            rec.age_basis(),
+            Some(
+                DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    /// A row with nothing to say about replies or windows is written exactly as
+    /// earlier builds wrote it: an upgrade must not rewrite the shape of a
+    /// history nobody has replied in or put a clock on.
+    #[test]
+    fn an_ordinary_record_serializes_without_either_new_key() {
+        let mut rec = ChatRecord::sent(&DeviceId::from("pb-a"), &ChatMessage::new("hi").unwrap());
+        rec.stored_at = None;
+        let json = String::from_utf8(rec.encode()).unwrap();
+        assert!(!json.contains("in_reply_to"), "{json}");
+        assert!(!json.contains("stored_at"), "{json}");
+    }
+
+    /// A reply survives the store, carried from the wire message the record was
+    /// built from — the constructors are the only path production code takes.
+    #[test]
+    fn a_reply_round_trips_through_the_record() {
+        let peer = DeviceId::from("pb-bob");
+        let msg = ChatMessage::replying("sure", Some("0000000000001")).unwrap();
+        for rec in [
+            ChatRecord::sent(&peer, &msg),
+            ChatRecord::received(&peer, &msg),
+            ChatRecord::out(&peer, &msg, Status::Pending),
+        ] {
+            let back = ChatRecord::decode(&rec.encode()).unwrap();
+            assert_eq!(back, rec);
+            assert_eq!(back.in_reply_to.as_deref(), Some("0000000000001"));
+        }
+    }
+
+    /// The boundary, with an explicit `now` and no sleeping — the record side of
+    /// `Retention::closed_on`.
+    #[test]
+    fn a_record_disappears_at_its_deadline_and_not_before() {
+        let stored = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut rec = ChatRecord::sent(&DeviceId::from("pb-a"), &ChatMessage::new("hi").unwrap());
+        rec.stored_at = Some(stored);
+        let window = Retention::for_secs(600).unwrap();
+        assert!(!rec.has_disappeared(window, stored + chrono::Duration::seconds(599)));
+        assert!(rec.has_disappeared(window, stored + chrono::Duration::seconds(600)));
+        // And with no window at all, nothing ever disappears.
+        assert!(!rec.has_disappeared(
+            Retention::OFF,
+            stored + chrono::Duration::seconds(10_000_000)
+        ));
+    }
+
+    /// **Why `stored_at` exists rather than measuring from `timestamp`.** A
+    /// peer that was offline flushes its queue on reconnect, so its messages
+    /// arrive stamped hours ago. Measured from the sender's timestamp every one
+    /// of them is already past a short window and vanishes before the user has
+    /// read it once. Measured from when this device stored it — which is what
+    /// the constructors record — the window starts on arrival.
+    #[test]
+    fn a_message_that_waited_in_a_peers_queue_starts_its_window_on_arrival() {
+        let peer = DeviceId::from("pb-bob");
+        let mut msg = ChatMessage::new("sent to you three days ago").unwrap();
+        msg.timestamp = "2026-01-01T10:00:00Z".to_string();
+        let rec = ChatRecord::received(&peer, &msg);
+
+        let arrived = rec.stored_at.expect("an inbound row is stamped on arrival");
+        let window = Retention::for_secs(3600).unwrap();
+        assert!(
+            !rec.has_disappeared(window, arrived),
+            "a message must not vanish on arrival because its sender was offline"
+        );
+        assert!(rec.has_disappeared(window, arrived + chrono::Duration::seconds(3600)));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! An AppStore-backed conversation store: one namespace per peer.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use peerbeam_domain::id::DeviceId;
@@ -11,6 +11,7 @@ use peerbeam_domain::port::AppStore;
 
 use crate::message::{ChatError, ChatMessage, FileDecline, FileRef};
 use crate::record::{ChatRecord, Direction, FileMeta, Kind, Status, StoredReaction};
+use crate::retention::{Pruned, Retention, RETENTION_NS};
 
 /// The AppStore namespace for a conversation with `peer`.
 #[must_use]
@@ -70,6 +71,15 @@ pub struct OutboxEntry {
     /// the promise text already makes. See the backstop in Task 6.
     #[serde(default)]
     pub offers_refused: u32,
+    /// The id of the message this queued one answers, carried so a reply that
+    /// waited in the queue still arrives as a reply.
+    ///
+    /// `flush_to_session` rebuilds the wire [`ChatMessage`] from this entry
+    /// rather than from the record, so a field missing here is a field the peer
+    /// never sees — the reply link would survive locally and be silently
+    /// dropped for exactly the messages that were sent to an offline peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
 }
 
 impl OutboxEntry {
@@ -78,6 +88,22 @@ impl OutboxEntry {
     }
     fn decode(bytes: &[u8]) -> Result<OutboxEntry, ChatError> {
         serde_json::from_slice(bytes).map_err(|e| ChatError::Serialization(e.to_string()))
+    }
+
+    /// Whether this queued message's [disappearing-message
+    /// window](Retention) has closed as of `now`.
+    ///
+    /// Measured from [`timestamp`](Self::timestamp) and not from a stored-at
+    /// stamp, because every entry in the outbox is one **this** device queued:
+    /// the timestamp was minted here, a moment before the entry was written, so
+    /// it is already the local, unforgeable answer that `ChatRecord::stored_at`
+    /// has to exist to provide for an inbound row.
+    #[must_use]
+    pub fn has_disappeared(&self, retention: Retention, now: DateTime<Utc>) -> bool {
+        let basis = DateTime::parse_from_rfc3339(&self.timestamp)
+            .ok()
+            .map(|t| t.with_timezone(&Utc));
+        retention.closed_on(basis, now)
     }
 }
 
@@ -238,17 +264,95 @@ impl ChatStore {
             .collect())
     }
 
-    /// All records in the conversation with `peer`, chronological (AppStore
-    /// `list` returns ascending by key, and keys are time-ordered ids).
+    /// This conversation's [disappearing-message window](Retention), or
+    /// [`Retention::OFF`] when the user has not set one — which is every
+    /// conversation until somebody does.
+    ///
+    /// Read on each history/`get` call rather than cached: the window is a
+    /// setting a user may tighten at any moment, and a cache is a second copy
+    /// of it that can be stale exactly when it matters. It is one small
+    /// key/value read against a namespace holding one record per conversation.
+    pub fn retention(&self, peer: &DeviceId) -> Result<Retention, ChatError> {
+        match self
+            .store
+            .get(RETENTION_NS, &peer.0)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            Some(bytes) => Retention::decode(&bytes),
+            None => Ok(Retention::OFF),
+        }
+    }
+
+    /// Set (or clear) this conversation's disappearing-message window.
+    ///
+    /// **Local only**, like every other delete in this crate: nothing goes on
+    /// the wire, the peer is not told, and the peer's copy is unaffected. See
+    /// the [module doc](crate::retention) for why this project will not pretend
+    /// otherwise.
+    ///
+    /// [`Retention::OFF`] **deletes** the record rather than storing an empty
+    /// one, so "off" is byte-identical to "never configured" and turning the
+    /// feature off leaves nothing behind saying it was ever on.
+    ///
+    /// Takes effect on the next read. Existing messages are judged by the new
+    /// window immediately — see [`Retention`] for why a stamped-at-write design
+    /// was rejected: it would make *tightening* a window, the one direction a
+    /// worried user reaches for, do nothing to the messages they are worried
+    /// about.
+    pub fn set_retention(&self, peer: &DeviceId, retention: Retention) -> Result<(), ChatError> {
+        if retention.is_off() {
+            self.store
+                .delete(RETENTION_NS, &peer.0)
+                .map(|_| ())
+                .map_err(|e| ChatError::Serialization(e.to_string()))
+        } else {
+            self.store
+                .put(RETENTION_NS, &peer.0, &retention.encode()?)
+                .map_err(|e| ChatError::Serialization(e.to_string()))
+        }
+    }
+
+    /// All records in the conversation with `peer` that are still inside its
+    /// [disappearing-message window](Retention), chronological (AppStore `list`
+    /// returns ascending by key, and keys are time-ordered ids).
+    ///
+    /// # The window is enforced here, on the read
+    ///
+    /// A row whose window has closed is **not returned**, whether or not
+    /// [`prune`](Self::prune) has ever run. That is the guarantee, and it is
+    /// deliberately not left to a sweeper: a sweep that has not happened yet is
+    /// a message still readable after the user was promised it was gone, and
+    /// the interval between sweeps is exactly the window an attacker with the
+    /// device wants. `TrustRecord::expires_at` settled the same question the
+    /// same way, and its doc carries the argument in full.
+    ///
+    /// Because this is the one read every other reader goes through —
+    /// [`search`](Self::search), `apply_receipt`, `reconcile_peer`, and every
+    /// surface's transcript — there is no second path that could show a
+    /// disappeared message by forgetting to ask.
+    ///
+    /// Filtering happens **before** `with_landing`, so a row on its way out is
+    /// never written back on the way past.
     pub fn history(&self, peer: &DeviceId) -> Result<Vec<ChatRecord>, ChatError> {
         let ns = namespace(peer);
         let raw = self
             .store
             .list(&ns)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        let retention = self.retention(peer)?;
+        // One clock read for the whole conversation, so every row in one
+        // transcript is judged against one instant rather than against a
+        // moving one.
+        let now = Utc::now();
         let mut out = Vec::with_capacity(raw.len());
         for (key, value) in raw {
             match ChatRecord::decode(&value) {
+                Ok(rec) if rec.has_disappeared(retention, now) => {
+                    // No log line. This is the ordinary, expected outcome for
+                    // every old row in a conversation with a window, and one
+                    // line per filtered message would write the disappearing
+                    // conversation into the log file instead.
+                }
                 // Through `with_landing` like `get`: the conversation view is
                 // where a person reads the filename they are about to approve,
                 // so it must not be the one path that shows the peer's claim.
@@ -269,6 +373,19 @@ impl ChatStore {
 
     /// Whether a message id already exists in the conversation with `peer`
     /// (receiver-side dedup).
+    ///
+    /// **Deliberately not filtered by the [retention
+    /// window](Retention)**, unlike [`history`](Self::history) and
+    /// [`get`](Self::get). This answers "is this key taken", and a disappeared
+    /// row still takes its key. Filtering here would turn dedup off the moment
+    /// a message aged out: a peer re-delivering the same frame — which the
+    /// protocol allows, and which its own outbox does on every reconnect —
+    /// would find no record and write the message back into the thread, so a
+    /// message the user watched disappear would return. Once
+    /// [`prune`](Self::prune) has actually removed the row that is inherent and
+    /// unavoidable (it is equally true after a user's own delete), but it must
+    /// not also be true for the whole stretch between the window closing and
+    /// the prune running.
     pub fn contains(&self, peer: &DeviceId, id: &str) -> Result<bool, ChatError> {
         let ns = namespace(peer);
         self.store
@@ -286,6 +403,17 @@ impl ChatStore {
     /// and a chat message id is a wire field the peer already knows). A caller
     /// that intends to write must load the record and check that it is the one
     /// it means — see `Manager::chat_settle` in `peerbeam-ffi`.
+    ///
+    /// A row whose [retention window](Retention) has closed reads as `None`,
+    /// exactly as [`history`](Self::history) omits it. That is what makes the
+    /// window hold for every *write* path too, since each of them
+    /// ([`settle_file_row`](Self::settle_file_row),
+    /// [`apply_reaction`](Self::apply_reaction),
+    /// [`set_file_path`](Self::set_file_path),
+    /// [`reopen_for_retry`](Self::reopen_for_retry)) authorizes against the
+    /// record this returns: a disappeared message cannot be reacted to,
+    /// settled, or re-sent, and each of those already treats a missing record
+    /// as a silent no-op.
     pub fn get(&self, peer: &DeviceId, id: &str) -> Result<Option<ChatRecord>, ChatError> {
         let ns = namespace(peer);
         match self
@@ -293,7 +421,17 @@ impl ChatStore {
             .get(&ns, id)
             .map_err(|e| ChatError::Serialization(e.to_string()))?
         {
-            Some(bytes) => ChatRecord::decode(&bytes).map(|r| Some(self.with_landing(r))),
+            // The policy is read only once a record is actually in hand, so a
+            // lookup that misses — the common case for a dedup check or a
+            // settle for another conversation — costs no extra store round
+            // trip.
+            Some(bytes) => {
+                let rec = ChatRecord::decode(&bytes)?;
+                if rec.has_disappeared(self.retention(peer)?, Utc::now()) {
+                    return Ok(None);
+                }
+                Ok(Some(self.with_landing(rec)))
+            }
             None => Ok(None),
         }
     }
@@ -362,6 +500,7 @@ impl ChatStore {
             kind: Kind::Text,
             file: None,
             offers_refused: 0,
+            in_reply_to: msg.in_reply_to.clone(),
         };
         self.store
             .put(OUTBOX_NS, &msg.id, &entry.encode())
@@ -426,6 +565,9 @@ impl ChatStore {
             kind: Kind::File,
             file: Some(staged.clone()),
             offers_refused: 0,
+            // A `FileRef` carries no reply reference on the wire yet; see
+            // `ChatMessage::in_reply_to`.
+            in_reply_to: None,
         };
         self.store
             .put(OUTBOX_NS, &r.id, &entry.encode())
@@ -468,6 +610,9 @@ impl ChatStore {
             kind: Kind::Decline,
             file: None,
             offers_refused: 0,
+            // A decline answers nothing: it is a status change on a row that
+            // already exists, not a message in the thread.
+            in_reply_to: None,
         };
         self.store
             .put(OUTBOX_NS, &d.id, &entry.encode())
@@ -547,16 +692,55 @@ impl ChatStore {
         Ok(true)
     }
 
-    /// All queued entries, FIFO (ascending by message id).
+    /// All queued entries whose [disappearing-message window](Retention) is
+    /// still open, FIFO (ascending by message id).
+    ///
+    /// # Why a queued message is filtered too
+    ///
+    /// Without this, the promise breaks in the one case a user would most mind.
+    /// A message queued for a peer that is offline sits here until that peer
+    /// comes back. If the window closes in between, the row disappears from the
+    /// user's own history — they watch it go — and then the peer reconnects and
+    /// the message is delivered anyway, to a device the user has no window on
+    /// at all. Read-time filtering is what stops it from leaving: it is never
+    /// offered to [`flush_to_session`](crate::flush_to_session) or to
+    /// [`next_file_for`](crate::next_file_for), so the send simply does not
+    /// happen. [`prune`](Self::prune) then removes it — the entry holds a full
+    /// copy of the body, so filtering alone would leave the message on disk in
+    /// a second place.
+    ///
+    /// A [`Kind::Decline`] entry is **exempt**. It carries no content — an
+    /// empty body and the sender's own file id — and it exists to stop a file
+    /// the user refused from being re-offered on every drain tick, forever.
+    /// Expiring it would resurrect exactly that defect to delete nothing.
     pub fn outbox_pending(&self) -> Result<Vec<OutboxEntry>, ChatError> {
         let raw = self
             .store
             .list(OUTBOX_NS)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
+        // The outbox is shared across peers and each has its own window, so the
+        // policy is read once per peer rather than once per entry — a flush for
+        // one busy conversation is otherwise one extra store read per queued
+        // message.
+        let mut windows: HashMap<String, Retention> = HashMap::new();
+        let now = Utc::now();
         let mut out = Vec::with_capacity(raw.len());
         for (key, value) in raw {
             match OutboxEntry::decode(&value) {
-                Ok(entry) => out.push(entry),
+                Ok(entry) => {
+                    let retention = match windows.get(&entry.peer_id) {
+                        Some(r) => *r,
+                        None => {
+                            let r = self.retention(&DeviceId::from(entry.peer_id.clone()))?;
+                            windows.insert(entry.peer_id.clone(), r);
+                            r
+                        }
+                    };
+                    if entry.kind != Kind::Decline && entry.has_disappeared(retention, now) {
+                        continue;
+                    }
+                    out.push(entry);
+                }
                 // Same rationale as `history`, but the blast radius is wider:
                 // both `outbox_for` and `outbox_peers` read through this, so
                 // one unreadable row must not take down delivery for every
@@ -703,6 +887,13 @@ impl ChatStore {
             file,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: entry.in_reply_to.clone(),
+            // The row this rebuilds went missing, so "when this device first
+            // stored it" is genuinely unknown and now is the only honest
+            // answer: this is the moment the only surviving copy of the message
+            // came back into history. Its `timestamp` still says when it was
+            // written, so nothing about the conversation reads differently.
+            stored_at: Some(Utc::now()),
         })
     }
 
@@ -985,6 +1176,11 @@ impl ChatStore {
     /// row still present there is one the delete chose to keep, so a count that
     /// silently omitted the undecodable ones would tell the user nothing was
     /// kept while the thread stayed listed with a row in it.
+    ///
+    /// By the same rule it counts a row whose [retention window](Retention) has
+    /// closed but that [`prune`](Self::prune) has not yet removed: it is on
+    /// disk, and this call answers what is on disk. A surface reporting to the
+    /// user should prune first, which every one of them does anyway.
     pub fn record_count(&self, peer: &DeviceId) -> Result<usize, ChatError> {
         let ns = namespace(peer);
         self.store
@@ -1135,6 +1331,180 @@ impl ChatStore {
             }
         }
         Ok((removed, kept))
+    }
+
+    /// Delete everything in this conversation that its [disappearing-message
+    /// window](Retention) has closed on, as of `now`.
+    ///
+    /// This is the half of the feature that is about **bytes**.
+    /// [`history`](Self::history) already makes a message unreadable the moment
+    /// its window shuts, on time, with nothing scheduled; but an unreadable row
+    /// is still a row, sitting in a store whose key lives on the same machine,
+    /// for anyone who later has both. "Disappearing" that left the text on disk
+    /// would be a claim about privacy that a hex editor disproves.
+    ///
+    /// `now` is a parameter for the same reason
+    /// [`Retention::cutoff`](Retention::cutoff) takes one: the boundary a test
+    /// asserts is the boundary that ships, with no sleeping.
+    ///
+    /// # What it removes, and in what order
+    ///
+    /// **The queue entry first, then the record.** An entry holds its own full
+    /// copy of the message body, so leaving it would keep the text on disk and
+    /// — worse — `flush_to_session` would still deliver it, and
+    /// [`record_sent`](Self::record_sent) would rebuild the row it had just
+    /// deleted, putting a disappeared message back into the thread. Doing the
+    /// record first and stopping there (a crash, a store error) leaves exactly
+    /// that state; doing the entry first leaves at worst a row that is already
+    /// invisible and will go on the next pass.
+    ///
+    /// A [`Kind::Decline`] entry is exempt, for the reason
+    /// [`outbox_pending`](Self::outbox_pending) gives.
+    ///
+    /// The **staged blob** an expired file entry owned is reported in
+    /// [`Pruned::staged`] rather than deleted here, because this type holds an
+    /// `AppStore` and no storage provider.
+    /// [`prune_conversation`](crate::prune_conversation) is the call that
+    /// finishes the job, and is what a surface should use.
+    ///
+    /// It does **not** delete a received file from the user's disk. The row
+    /// describing it goes; the file the user accepted and chose a location for
+    /// is theirs. See the [module doc](crate::retention).
+    ///
+    /// # Two rows it deliberately leaves alone
+    ///
+    /// A record this build **cannot decode** is skipped. It is already
+    /// unreadable — [`history`](Self::history) skips it too, so the promise
+    /// that a disappeared message cannot be read is not at stake — and its age
+    /// is precisely what could not be read. The likely origin is a newer
+    /// schema, and deleting it would make running an older binary once destroy
+    /// history the newer one displays perfectly well. The cost of keeping it is
+    /// disk; the cost of guessing is the user's data, and this codebase has
+    /// already chosen that asymmetry everywhere else it appears
+    /// ([`outbox_owned_blobs`](Self::outbox_owned_blobs)).
+    ///
+    /// An **outbox entry** that cannot be decoded is skipped for a sharper
+    /// reason: its `peer_id` is exactly what could not be read, so there is no
+    /// way to know it belongs to this conversation, and deleting it would be
+    /// deleting some other peer's queued message on a guess.
+    ///
+    /// Note this is *not* subject to the keep-a-queued-message rule
+    /// ([`KeepRule`]) that guards the two user-initiated deletes. That rule
+    /// exists so a delete does not strand a message the user still expects to
+    /// be sent — but here it is the *user's own window* saying the message has
+    /// run out of time, and honouring the queue over the window would mean a
+    /// message the user watched disappear is still delivered later. The
+    /// blob-loss the rule protects against is the intended outcome rather than
+    /// a surprise: the bytes are a copy of a file the user still has, and
+    /// nothing else is lost.
+    pub fn prune(&self, peer: &DeviceId, now: DateTime<Utc>) -> Result<Pruned, ChatError> {
+        let retention = self.retention(peer)?;
+        let mut pruned = Pruned::default();
+        // The overwhelmingly common case, and it must stay free: a conversation
+        // with no window reads one small record and touches nothing.
+        if retention.is_off() {
+            return Ok(pruned);
+        }
+
+        for (key, value) in self
+            .store
+            .list(OUTBOX_NS)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            let entry = match OutboxEntry::decode(&value) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(error = %e, key = %key, "not pruning an unreadable outbox entry");
+                    continue;
+                }
+            };
+            if entry.peer_id != peer.0
+                || entry.kind == Kind::Decline
+                || !entry.has_disappeared(retention, now)
+            {
+                continue;
+            }
+            if self
+                .store
+                .delete(OUTBOX_NS, &key)
+                .map_err(|e| ChatError::Serialization(e.to_string()))?
+            {
+                pruned.queued += 1;
+                if let Some(file) = entry.file {
+                    pruned.staged.push(file.staged_path);
+                }
+            }
+        }
+
+        let ns = namespace(peer);
+        for (key, value) in self
+            .store
+            .list(&ns)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            let Ok(rec) = ChatRecord::decode(&value) else {
+                continue; // see "Two rows it deliberately leaves alone"
+            };
+            if !rec.has_disappeared(retention, now) {
+                continue;
+            }
+            if self
+                .store
+                .delete(&ns, &key)
+                .map_err(|e| ChatError::Serialization(e.to_string()))?
+            {
+                pruned.records += 1;
+            }
+        }
+
+        if !pruned.is_empty() {
+            // One line per prune, not per row: enough to see the feature
+            // working without writing the shape of a disappearing conversation
+            // into a log file that outlives it. No ids, no bodies.
+            tracing::info!(
+                peer = %peer.0,
+                records = pruned.records,
+                queued = pruned.queued,
+                "pruned messages past their retention window"
+            );
+        }
+        Ok(pruned)
+    }
+
+    /// Every peer whose conversation [`prune`](Self::prune) must be offered.
+    ///
+    /// The union of the threads that exist ([`conversations`](Self::conversations))
+    /// and the peers named by **raw** outbox entries. The second half is not
+    /// redundant: [`outbox_peers`](Self::outbox_peers) reads through the
+    /// filtered [`outbox_pending`](Self::outbox_pending), so a peer whose only
+    /// queued entries have already aged out would be missing from it — and
+    /// those are precisely the entries a prune exists to delete. A list that
+    /// hid what needs deleting would make the feature quietly incomplete for
+    /// the one case nobody would think to test.
+    pub(crate) fn prunable_peers(&self) -> Result<Vec<DeviceId>, ChatError> {
+        let mut peers: BTreeSet<String> = self
+            .conversations()?
+            .into_iter()
+            .map(|peer| peer.0)
+            .collect();
+        for (key, value) in self
+            .store
+            .list(OUTBOX_NS)
+            .map_err(|e| ChatError::Serialization(e.to_string()))?
+        {
+            match OutboxEntry::decode(&value) {
+                Ok(entry) => {
+                    peers.insert(entry.peer_id);
+                }
+                // Skipped, like everywhere else that reads this namespace
+                // leniently: an entry whose peer cannot be read names no
+                // conversation to prune.
+                Err(e) => {
+                    tracing::warn!(error = %e, key = %key, "skipping unreadable outbox entry");
+                }
+            }
+        }
+        Ok(peers.into_iter().map(DeviceId::from).collect())
     }
 }
 
@@ -1818,6 +2188,7 @@ mod tests {
             kind: Kind::Text,
             file: None,
             offers_refused: 0,
+            in_reply_to: None,
         };
         cs.record_sent(&entry).unwrap();
 
@@ -2376,6 +2747,8 @@ mod tests {
             file: None,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: None,
+            stored_at: None,
         };
         let later = ChatRecord {
             id: "0000000000003".into(),
@@ -2696,6 +3069,7 @@ mod tests {
                 staged_path: "/data/outbox-blobs/0000000000042".into(),
             }),
             offers_refused: 0,
+            in_reply_to: None,
         };
         assert!(
             cs.get(&peer, &entry.message_id).unwrap().is_none(),
@@ -2731,6 +3105,7 @@ mod tests {
             kind: Kind::Decline,
             file: None,
             offers_refused: 0,
+            in_reply_to: None,
         };
         cs.record_sent(&entry).unwrap();
         assert!(cs.history(&peer).unwrap().is_empty());
@@ -2750,6 +3125,7 @@ mod tests {
                 staged_path: "/data/outbox-blobs/0000000000002".into(),
             }),
             offers_refused: 2,
+            in_reply_to: None,
         };
         let back = OutboxEntry::decode(&e.encode()).unwrap();
         assert_eq!(back, e);
@@ -3934,5 +4310,466 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(kept, vec![pending.id.clone()]);
         assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "still queued");
+    }
+
+    // ---------------------------------------------------------------------
+    // Disappearing messages.
+    //
+    // Every one of these injects the age it is testing — `stored_at` on a row,
+    // a backdated timestamp on a queue entry, an explicit `now` for `prune` —
+    // rather than sleeping. The window boundary itself is asserted in
+    // `retention.rs` and `record.rs`; what these hold is the store's behaviour
+    // around it.
+    // ---------------------------------------------------------------------
+
+    use chrono::Duration;
+
+    /// Persist an outgoing text row that this device stored at `at`.
+    fn stored_at(cs: &ChatStore, peer: &DeviceId, body: &str, at: DateTime<Utc>) -> String {
+        let mut rec = ChatRecord::sent(peer, &ChatMessage::new(body).unwrap());
+        rec.stored_at = Some(at);
+        cs.append(&rec).unwrap();
+        rec.id
+    }
+
+    /// **Off by default.** Nothing about an upgrade may start deleting a user's
+    /// history, so a conversation nobody has configured keeps a row stored a
+    /// decade ago and prunes nothing.
+    #[test]
+    fn a_conversation_with_no_window_keeps_everything_and_prunes_nothing() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        assert_eq!(cs.retention(&peer).unwrap(), Retention::OFF);
+        stored_at(&cs, &peer, "ancient", Utc::now() - Duration::days(3650));
+
+        assert_eq!(cs.history(&peer).unwrap().len(), 1);
+        assert_eq!(
+            cs.prune(&peer, Utc::now()).unwrap(),
+            Pruned::default(),
+            "an unconfigured conversation must never lose a row"
+        );
+        assert_eq!(cs.history(&peer).unwrap().len(), 1);
+    }
+
+    /// A message inside its window reads exactly as it always did.
+    #[test]
+    fn a_message_inside_its_window_is_still_readable() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        let id = stored_at(&cs, &peer, "recent", Utc::now());
+
+        assert_eq!(cs.history(&peer).unwrap().len(), 1);
+        assert!(cs.get(&peer, &id).unwrap().is_some());
+        assert_eq!(cs.search("recent", 10).unwrap().hits.len(), 1);
+    }
+
+    /// **The guarantee.** A row past its window is unreadable on the next read,
+    /// with nothing swept and no background task alive — deleting the filter
+    /// and relying on `prune` alone must make this fail.
+    #[test]
+    fn a_message_past_its_window_is_unreadable_before_anything_has_pruned() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        let old = stored_at(
+            &cs,
+            &peer,
+            "ninety minutes ago",
+            Utc::now() - Duration::minutes(90),
+        );
+        let fresh = stored_at(&cs, &peer, "just now", Utc::now());
+
+        assert_eq!(
+            cs.history(&peer)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![fresh],
+        );
+        assert!(cs.get(&peer, &old).unwrap().is_none(), "nor by id");
+        assert!(
+            cs.search("ninety", 10).unwrap().hits.is_empty(),
+            "nor through search, which reads the same history"
+        );
+        assert!(
+            store.get(&namespace(&peer), &old).unwrap().is_some(),
+            "still on disk — this test is about the read, not the delete"
+        );
+    }
+
+    /// **Prune removes exactly what filtering hides.** The two halves must
+    /// agree: a row `history` still shows survives a prune at the same instant,
+    /// and a row it hides does not.
+    #[test]
+    fn prune_removes_exactly_what_history_had_stopped_showing() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        let old = stored_at(&cs, &peer, "old", Utc::now() - Duration::minutes(90));
+        let fresh = stored_at(&cs, &peer, "fresh", Utc::now());
+
+        let pruned = cs.prune(&peer, Utc::now()).unwrap();
+        assert_eq!((pruned.records, pruned.queued), (1, 0));
+        assert!(pruned.staged.is_empty());
+        assert!(
+            store.get(&namespace(&peer), &old).unwrap().is_none(),
+            "the bytes are gone, not merely hidden"
+        );
+        assert!(store.get(&namespace(&peer), &fresh).unwrap().is_some());
+        assert_eq!(cs.history(&peer).unwrap().len(), 1);
+        assert_eq!(
+            cs.prune(&peer, Utc::now()).unwrap().records,
+            0,
+            "nothing left to take"
+        );
+    }
+
+    /// Filtering is reversible until a prune runs, and pruning is not. Turning
+    /// the window off restores what was only hidden — which is what makes a
+    /// mistyped window recoverable right up until the bytes actually go.
+    #[test]
+    fn turning_the_window_off_restores_what_was_hidden_but_not_what_was_pruned() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let window = Retention::for_secs(3600).unwrap();
+        cs.set_retention(&peer, window).unwrap();
+        stored_at(&cs, &peer, "hidden", Utc::now() - Duration::minutes(90));
+        assert!(cs.history(&peer).unwrap().is_empty());
+
+        cs.set_retention(&peer, Retention::OFF).unwrap();
+        assert_eq!(cs.retention(&peer).unwrap(), Retention::OFF);
+        assert_eq!(cs.history(&peer).unwrap().len(), 1, "only hidden, not gone");
+
+        cs.set_retention(&peer, window).unwrap();
+        assert_eq!(cs.prune(&peer, Utc::now()).unwrap().records, 1);
+        cs.set_retention(&peer, Retention::OFF).unwrap();
+        assert!(cs.history(&peer).unwrap().is_empty(), "pruned is forever");
+    }
+
+    /// **Tightening a window must act on what is already there.** This is the
+    /// whole reason the window is read live rather than stamped onto each row
+    /// at write time: a user shortening it is telling this device to get rid of
+    /// what it is holding now.
+    #[test]
+    fn tightening_the_window_takes_effect_on_messages_already_stored() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(7 * 24 * 3600).unwrap())
+            .unwrap();
+        stored_at(&cs, &peer, "yesterday", Utc::now() - Duration::hours(24));
+        assert_eq!(cs.history(&peer).unwrap().len(), 1, "inside a week");
+
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        assert!(
+            cs.history(&peer).unwrap().is_empty(),
+            "a shorter window must reach the messages the user is worried about"
+        );
+        assert_eq!(cs.prune(&peer, Utc::now()).unwrap().records, 1);
+    }
+
+    /// A disappeared row still occupies its key, so a peer re-delivering the
+    /// same frame — which its own outbox does on every reconnect — cannot write
+    /// the message back into the thread.
+    #[test]
+    fn a_disappeared_message_still_dedups_so_a_replay_cannot_resurrect_it() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(60).unwrap())
+            .unwrap();
+        let id = stored_at(&cs, &peer, "gone", Utc::now() - Duration::hours(1));
+
+        assert!(cs.history(&peer).unwrap().is_empty(), "not readable");
+        assert!(
+            cs.contains(&peer, &id).unwrap(),
+            "but the key is still taken, or a replay would bring it back"
+        );
+    }
+
+    /// Every wire-driven write authorizes against `get`, so a row whose window
+    /// has closed cannot be reacted to, settled, or re-opened for a retry. The
+    /// control is the same row with no window, which all three accept.
+    #[test]
+    fn no_write_path_can_touch_a_row_whose_window_has_closed() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("a.bin", 7).unwrap();
+        let mut rec = ChatRecord::file_out(
+            &peer,
+            &r,
+            FileMeta::new(&r.name, r.size, None),
+            Status::Pending,
+        );
+        rec.stored_at = Some(Utc::now() - Duration::hours(1));
+        cs.append(&rec).unwrap();
+
+        assert!(
+            cs.reopen_for_retry(&peer, &r.id).unwrap(),
+            "the control: with no window this row is genuinely re-openable"
+        );
+        cs.set_status(&peer, &r.id, Status::Pending).unwrap();
+
+        cs.set_retention(&peer, Retention::for_secs(60).unwrap())
+            .unwrap();
+        assert!(
+            !cs.reopen_for_retry(&peer, &r.id).unwrap(),
+            "a message past its window is not re-sent"
+        );
+        assert!(!cs
+            .apply_reaction(&peer, &r.id, "\u{1F44D}", Direction::In, false)
+            .unwrap());
+        assert!(!cs
+            .settle_file_row(&peer, &r.id, Direction::Out, Status::Sent)
+            .unwrap());
+    }
+
+    /// **A queued message must not leave after its window closed.** The user
+    /// watched it disappear from their own history; delivering it later to a
+    /// device they have no window on is the failure this prevents. The entry
+    /// also holds its own copy of the body, so the prune must take both.
+    #[test]
+    fn a_queued_message_past_its_window_is_never_flushed_and_is_then_pruned() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut queued = ChatMessage::new("do not send this").unwrap();
+        queued.timestamp = (Utc::now() - Duration::hours(2)).to_rfc3339();
+        cs.enqueue(&peer, &queued).unwrap();
+        // The row and its entry are written a millisecond apart in real use, so
+        // age them together rather than leaving the row artificially young.
+        let mut rec = cs.get(&peer, &queued.id).unwrap().unwrap();
+        rec.stored_at = Some(Utc::now() - Duration::hours(2));
+        cs.append(&rec).unwrap();
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "queued, no window");
+
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        assert!(
+            cs.outbox_for(&peer).unwrap().is_empty(),
+            "nothing past its window is offered to a flush"
+        );
+
+        let pruned = cs.prune(&peer, Utc::now()).unwrap();
+        assert_eq!((pruned.records, pruned.queued), (1, 1));
+        assert!(
+            store.get(OUTBOX_NS, &queued.id).unwrap().is_none(),
+            "the entry holds its own copy of the body and must go too"
+        );
+    }
+
+    /// A queued *file* names a staged blob nothing owns once its entry goes.
+    /// `prune` cannot unlink it (it holds no storage provider), so it must
+    /// report it, or a full copy of the file survives until the next sweep.
+    #[test]
+    fn prune_reports_the_staged_blob_an_expired_file_entry_owned() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut r = FileRef::new("report.pdf", 4096).unwrap();
+        r.timestamp = (Utc::now() - Duration::hours(2)).to_rfc3339();
+        let mut rec = ChatRecord::file_out(
+            &peer,
+            &r,
+            FileMeta::new(&r.name, r.size, None),
+            Status::Staging,
+        );
+        rec.stored_at = Some(Utc::now() - Duration::hours(2));
+        cs.append(&rec).unwrap();
+        let staged = StagedFile {
+            name: "report.pdf".into(),
+            size: 4096,
+            staged_path: "/data/outbox-blobs/report".into(),
+        };
+        assert!(cs.enqueue_file(&peer, &r, &staged).unwrap());
+
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+        let pruned = cs.prune(&peer, Utc::now()).unwrap();
+        assert_eq!((pruned.records, pruned.queued), (1, 1));
+        assert_eq!(pruned.staged, vec!["/data/outbox-blobs/report".to_string()]);
+    }
+
+    /// A queued decline is exempt: it carries no content, and expiring it would
+    /// resurrect the defect it exists to fix — a refused file re-offered on
+    /// every drain tick, re-prompting its receiver forever.
+    #[test]
+    fn a_queued_decline_outlives_the_window() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let mut d = FileDecline::new("0000000000001");
+        d.timestamp = (Utc::now() - Duration::days(30)).to_rfc3339();
+        assert!(cs.enqueue_decline(&peer, &d).unwrap());
+        cs.set_retention(&peer, Retention::for_secs(60).unwrap())
+            .unwrap();
+
+        assert_eq!(cs.outbox_for(&peer).unwrap().len(), 1, "still deliverable");
+        assert_eq!(cs.prune(&peer, Utc::now()).unwrap().queued, 0);
+    }
+
+    /// A row this build cannot decode is left alone: it is already invisible to
+    /// `history`, its age is precisely what could not be read, and the likely
+    /// author is a newer schema. Running an older binary once must not destroy
+    /// history the newer one displays perfectly well.
+    #[test]
+    fn prune_leaves_a_row_this_build_cannot_read() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        store
+            .put(
+                &namespace(&peer),
+                "0000000000001",
+                br#"{"from":"the future"}"#,
+            )
+            .unwrap();
+        cs.set_retention(&peer, Retention::for_secs(60).unwrap())
+            .unwrap();
+
+        assert_eq!(cs.prune(&peer, Utc::now()).unwrap().records, 0);
+        assert!(store
+            .get(&namespace(&peer), "0000000000001")
+            .unwrap()
+            .is_some());
+    }
+
+    /// `prune_all_conversations` walks this list, so a peer whose only queued
+    /// entry has already aged out must still be on it — `outbox_peers` reads
+    /// through the filter and would not name them, and the entry would then be
+    /// the one thing a prune could never reach.
+    #[test]
+    fn prunable_peers_names_a_peer_whose_queue_has_entirely_aged_out() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-ghost");
+        let mut queued = ChatMessage::new("stale").unwrap();
+        queued.timestamp = (Utc::now() - Duration::days(2)).to_rfc3339();
+        cs.enqueue(&peer, &queued).unwrap();
+        // Leave the entry alone in the queue with no conversation behind it.
+        store.delete(&namespace(&peer), &queued.id).unwrap();
+        cs.set_retention(&peer, Retention::for_secs(60).unwrap())
+            .unwrap();
+
+        assert!(cs.conversations().unwrap().is_empty(), "no rows left");
+        assert!(
+            cs.outbox_peers().unwrap().is_empty(),
+            "filtered out of sight"
+        );
+        assert_eq!(cs.prunable_peers().unwrap(), vec![peer.clone()]);
+        assert_eq!(cs.prune(&peer, Utc::now()).unwrap().queued, 1);
+    }
+
+    /// A window is a setting about the thread, not content in it. Forgetting it
+    /// on a delete would silently turn disappearing messages off for the next
+    /// conversation with the same peer.
+    #[test]
+    fn deleting_a_conversation_keeps_its_window() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let window = Retention::for_secs(600).unwrap();
+        cs.set_retention(&peer, window).unwrap();
+        cs.append(&ChatRecord::sent(&peer, &ChatMessage::new("hi").unwrap()))
+            .unwrap();
+
+        cs.delete_conversation(&peer).unwrap();
+        assert_eq!(cs.retention(&peer).unwrap(), window);
+    }
+
+    /// A window belongs to one conversation and must not reach another.
+    #[test]
+    fn a_window_applies_to_one_conversation_only() {
+        let (cs, _store, _dir) = new_store();
+        let (bob, ada) = (DeviceId::from("pb-bob"), DeviceId::from("pb-ada"));
+        cs.set_retention(&bob, Retention::for_secs(60).unwrap())
+            .unwrap();
+        stored_at(&cs, &bob, "bob's", Utc::now() - Duration::hours(1));
+        stored_at(&cs, &ada, "ada's", Utc::now() - Duration::hours(1));
+
+        assert!(cs.history(&bob).unwrap().is_empty());
+        assert_eq!(cs.history(&ada).unwrap().len(), 1);
+        assert_eq!(cs.retention(&ada).unwrap(), Retention::OFF);
+    }
+
+    // ---------------------------------------------------------------------
+    // Replies.
+    // ---------------------------------------------------------------------
+
+    /// A reply survives the store *and* the queue. `flush_to_session` rebuilds
+    /// the wire message from the entry, so an entry that dropped the reference
+    /// would deliver a reply as an ordinary message to every offline peer.
+    #[test]
+    fn a_reply_round_trips_through_history_and_the_outbox() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let parent = ChatMessage::new("shall I delete the backups?").unwrap();
+        cs.append(&ChatRecord::received(&peer, &parent)).unwrap();
+
+        let reply = ChatMessage::replying("sure, go ahead", Some(&parent.id)).unwrap();
+        cs.enqueue(&peer, &reply).unwrap();
+
+        let entry = cs.outbox_for(&peer).unwrap()[0].clone();
+        assert_eq!(entry.in_reply_to.as_deref(), Some(parent.id.as_str()));
+        let stored = cs.get(&peer, &reply.id).unwrap().unwrap();
+        assert_eq!(stored.in_reply_to.as_deref(), Some(parent.id.as_str()));
+
+        // And the row left behind once it is delivered still answers the same
+        // message.
+        cs.record_sent(&entry).unwrap();
+        let sent = cs.get(&peer, &reply.id).unwrap().unwrap();
+        assert_eq!(sent.status, Status::Sent);
+        assert_eq!(sent.in_reply_to.as_deref(), Some(parent.id.as_str()));
+    }
+
+    /// `record_sent`'s rebuild path — the row went missing before delivery —
+    /// must keep the reference too, or a queued reply loses its parent exactly
+    /// when its own record is the thing that was lost.
+    #[test]
+    fn record_sents_rebuild_keeps_the_reply_reference() {
+        let (cs, store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        let reply = ChatMessage::replying("sure", Some("0000000000001")).unwrap();
+        cs.enqueue(&peer, &reply).unwrap();
+        let entry = cs.outbox_for(&peer).unwrap()[0].clone();
+        store.delete(&namespace(&peer), &reply.id).unwrap();
+        assert!(cs.get(&peer, &reply.id).unwrap().is_none());
+
+        cs.record_sent(&entry).unwrap();
+        let rebuilt = cs.get(&peer, &reply.id).unwrap().unwrap();
+        assert_eq!(rebuilt.in_reply_to.as_deref(), Some("0000000000001"));
+    }
+
+    /// The two features meeting: a reply outlives the message it answers, and
+    /// `resolve_replies` reads that off exactly the rows `history` returned —
+    /// so a message the user was told is gone can never be quoted back at them.
+    #[test]
+    fn a_reply_whose_parent_disappeared_renders_as_an_orphan() {
+        let (cs, _store, _dir) = new_store();
+        let peer = DeviceId::from("pb-bob");
+        cs.set_retention(&peer, Retention::for_secs(3600).unwrap())
+            .unwrap();
+
+        let parent = ChatMessage::new("shall I delete the backups?").unwrap();
+        let mut parent_rec = ChatRecord::received(&peer, &parent);
+        parent_rec.stored_at = Some(Utc::now() - Duration::hours(2));
+        cs.append(&parent_rec).unwrap();
+        cs.append(&ChatRecord::sent(
+            &peer,
+            &ChatMessage::replying("sure, go ahead", Some(&parent.id)).unwrap(),
+        ))
+        .unwrap();
+
+        let rows = cs.history(&peer).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the parent's window closed, the reply's did not"
+        );
+        assert_eq!(
+            crate::resolve_replies(&rows),
+            vec![crate::ReplyContext::Orphaned {
+                id: parent.id.clone()
+            }],
+            "the reply must still say it answered something"
+        );
     }
 }

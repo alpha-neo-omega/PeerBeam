@@ -49,6 +49,8 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
+        Command::Space(a) => crate::spaces::space(ctx, a.action, cfg_override.as_deref()),
+        Command::Wake(a) => crate::wake::wake(ctx, a.action, cfg_override.as_deref()),
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
         Command::Watch(a) => crate::watch::watch(ctx, a, cfg_override.as_deref()).await,
@@ -1553,6 +1555,34 @@ pub(crate) fn clip_history_store(
 /// Build the CLI's note store, over the same encrypted AppStore chat uses —
 /// notes live in their own namespace inside it, so one machine has one store
 /// rather than two that could disagree about the key.
+/// Build the CLI's Space store.
+///
+/// Same `AppStore` and key as every other record this device keeps, plus the
+/// trust store — because a Space read answers "is this member still trusted?"
+/// before it answers anything else, and a store that could not ask would have
+/// to guess.
+/// Build the CLI's wake store — the hardware addresses this device remembers.
+pub(crate) fn wake_store(config: &EngineConfig) -> Result<peerbeam_wake::WakeStore, CliError> {
+    let sc = SecureCtx::build(config)?;
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&sc.ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, sc.enc.clone()),
+    );
+    Ok(peerbeam_wake::WakeStore::new(app))
+}
+
+pub(crate) fn space_store(config: &EngineConfig) -> Result<peerbeam_spaces::SpaceStore, CliError> {
+    let sc = SecureCtx::build(config)?;
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&sc.ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, sc.enc.clone()),
+    );
+    let trust: Arc<dyn peerbeam_domain::port::TrustStore> = sc.trust.clone();
+    Ok(peerbeam_spaces::SpaceStore::new(app, trust))
+}
+
 pub(crate) fn note_store(
     config: &EngineConfig,
     enc: &Arc<AeadCrypto>,

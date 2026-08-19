@@ -223,6 +223,9 @@ pub async fn authenticate(
                 // clock to end. A deadline is written by approval, which is the
                 // act a person performs.
                 expires_at: None,
+                // Nor whose device it is: the handshake pins whoever answered,
+                // and "one of mine" is a word only the user gets to say.
+                mine: false,
             })?;
             true
         }

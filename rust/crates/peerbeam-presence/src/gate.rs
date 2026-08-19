@@ -130,6 +130,7 @@ mod tests {
                     PermissionSet::none()
                 },
                 expires_at: None,
+                mine: false,
             }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {

@@ -431,6 +431,7 @@ mod tests {
                 .set(Permission::Browse, browse)
                 .set(Permission::Files, files),
             expires_at: None,
+            mine: false,
         }))
     }
 

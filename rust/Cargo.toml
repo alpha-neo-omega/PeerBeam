@@ -30,6 +30,8 @@ members = [
   "crates/peerbeam-pairing",
     "crates/peerbeam-clipboard",
     "crates/peerbeam-presence",
+    "crates/peerbeam-spaces",
+    "crates/peerbeam-wake",
     "bins/peerbeam-cli",
 ]
 

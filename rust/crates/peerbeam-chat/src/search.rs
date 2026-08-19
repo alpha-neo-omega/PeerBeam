@@ -7,6 +7,13 @@
 //! whose device is sitting on the same desk, and a conversation the user
 //! deleted is not searchable at all, because the rows are simply gone.
 //!
+//! A message past its [disappearing-message window](crate::Retention) is not
+//! findable either, and does not need a rule of its own: this reads through
+//! [`ChatStore::history`], which is where the window is enforced. A search box
+//! that could still surface a message the transcript no longer shows would be
+//! the one hole in the promise, and it is closed by construction rather than by
+//! a second check that could be forgotten.
+//!
 //! # Why this lives in the engine
 //!
 //! The alternative — a filter in the surface — means loading every message of
@@ -356,6 +363,8 @@ mod tests {
             file: None,
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: None,
+            stored_at: None,
         }
     }
 
@@ -375,6 +384,8 @@ mod tests {
             }),
             read_at: None,
             reactions: Vec::new(),
+            in_reply_to: None,
+            stored_at: None,
         }
     }
 

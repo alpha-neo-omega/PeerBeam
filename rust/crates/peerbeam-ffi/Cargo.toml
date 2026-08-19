@@ -22,6 +22,7 @@ peerbeam-discovery-udp = { path = "../peerbeam-discovery-udp" }
 peerbeam-discovery-mdns = { path = "../peerbeam-discovery-mdns" }
 peerbeam-discovery-tailscale = { path = "../peerbeam-discovery-tailscale" }
 peerbeam-transfer = { path = "../peerbeam-transfer" }
+peerbeam-spaces = { path = "../peerbeam-spaces" }
 peerbeam-update = { path = "../peerbeam-update" }
 peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }
 peerbeam-crypto = { path = "../peerbeam-crypto" }

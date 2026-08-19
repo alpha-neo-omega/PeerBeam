@@ -196,6 +196,7 @@ mod tests {
             approved: true,
             permissions: PermissionSet::granted_on_approval().set(Permission::Browse, browse),
             expires_at: None,
+            mine: false,
         })))
     }
 

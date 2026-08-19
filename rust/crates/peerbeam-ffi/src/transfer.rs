@@ -504,6 +504,8 @@ pub struct Manager {
     chat: ChatStore,
     /// Notes, in the same encrypted AppStore under their own namespace.
     notes: peerbeam_notes::NoteStore,
+    /// Named local sets of trusted peers. Purely a label — see `peerbeam-spaces`.
+    spaces: peerbeam_spaces::SpaceStore,
     /// Clipboard history — empty and unwritten unless the user turned it on.
     clip_history: peerbeam_clipboard::ClipHistory,
     /// The encrypted store every capability shares, kept so folder sync can
@@ -613,6 +615,22 @@ pub struct Manager {
 
 pub(crate) type Op = Result<Value, (Code, String)>;
 
+/// A space refusal, mapped to the FFI's code space.
+///
+/// Validation problems are the caller's to fix and say so; a storage failure is
+/// ours. Collapsing them all to `Internal` would tell a user typing a duplicate
+/// name that the app broke.
+fn space_err(e: peerbeam_spaces::SpaceError) -> (Code, String) {
+    use peerbeam_spaces::SpaceError as E;
+    match e {
+        E::Storage(_) | E::TrustUnreadable { .. } => (Code::Storage, e.to_string()),
+        // No NotFound in this code space; a missing space is the caller
+        // naming one that is not there, which is an argument problem.
+        E::NotFound(_) => (Code::InvalidArgument, e.to_string()),
+        _ => (Code::InvalidArgument, e.to_string()),
+    }
+}
+
 impl Manager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -647,6 +665,8 @@ impl Manager {
             rm,
             quic,
             enc,
+            // Built before `trust` and `appstore` are moved into the struct.
+            spaces: peerbeam_spaces::SpaceStore::new(appstore.clone(), trust.clone()),
             trust,
             chat,
             notes,
@@ -3833,6 +3853,84 @@ impl Manager {
     ///
     /// Tombstones are not included. They exist so a deletion can reach a peer,
     /// not to be read back as notes.
+    /// A required string field, or a refusal naming which one is missing.
+    fn str_field(req: &Value, key: &str) -> Result<String, (Code, String)> {
+        req.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or((Code::InvalidArgument, format!("{key} required")))
+    }
+
+    /// `{}` → `{"spaces":[SpaceView…]}`.
+    ///
+    /// A Space is a label this device keeps over peers it already trusts. It is
+    /// never sent anywhere and no peer learns it exists, which is why there is
+    /// no "join" and no member list on the wire.
+    pub fn spaces_list(&self, _req: &Value) -> Op {
+        Ok(json!({ "spaces": self.spaces.list().map_err(space_err)? }))
+    }
+
+    /// `{"name"}` → `{"space":SpaceView}`.
+    pub fn spaces_create(&self, req: &Value) -> Op {
+        let name = Self::str_field(req, "name")?;
+        Ok(json!({ "space": self.spaces.create(&name).map_err(space_err)? }))
+    }
+
+    /// `{"id","name"}` → `{"space":SpaceView}`.
+    pub fn spaces_rename(&self, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let name = Self::str_field(req, "name")?;
+        Ok(json!({ "space": self.spaces.rename(&id, &name).map_err(space_err)? }))
+    }
+
+    /// `{"id"}` → `{"deleted":bool}`.
+    pub fn spaces_delete(&self, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        Ok(json!({ "deleted": self.spaces.delete(&id).map_err(space_err)? }))
+    }
+
+    /// `{"id","device"}` → `{"added":bool}`.
+    pub fn spaces_add_member(&self, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        Ok(json!({ "added": self.spaces.add_member(&id, &device).map_err(space_err)? }))
+    }
+
+    /// `{"id","device"}` → `{"removed":bool}`.
+    pub fn spaces_remove_member(&self, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        Ok(json!({ "removed": self.spaces.remove_member(&id, &device).map_err(space_err)? }))
+    }
+
+    /// `{"device","mine":bool}` → `{"changed":bool}`.
+    ///
+    /// A label, not a grant: marking a device as mine widens no permission and
+    /// tells that device nothing. See `TrustRecord::mine`.
+    pub fn trust_set_mine(&self, req: &Value) -> Op {
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        let mine = req.get("mine").and_then(Value::as_bool).ok_or((
+            Code::InvalidArgument,
+            "expected \"mine\": true|false".to_string(),
+        ))?;
+        let changed = self
+            .trust
+            .set_mine(&device, mine)
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        Ok(json!({ "changed": changed }))
+    }
+
+    /// `{}` → `{"devices":[…]}` — the devices the user marked as their own.
+    pub fn trust_my_devices(&self, _req: &Value) -> Op {
+        let devices = self
+            .trust
+            .my_devices()
+            .map_err(|e| (Code::Internal, e.to_string()))?;
+        Ok(json!({ "devices": devices }))
+    }
+
     pub fn notes_list(&self, _req: &Value) -> Op {
         let notes = self
             .notes
@@ -7085,6 +7183,7 @@ mod tests {
     fn pin(trust: &FsTrust, device: &DeviceId) {
         trust
             .record(peerbeam_domain::entity::TrustRecord {
+                mine: false,
                 device: device.clone(),
                 fingerprint: "test-fingerprint".into(),
                 name: "peer".into(),
@@ -7759,6 +7858,7 @@ mod tests {
                 return Ok(None);
             }
             Ok(Some(peerbeam_domain::entity::TrustRecord {
+                mine: false,
                 device: d.clone(),
                 fingerprint: "ff".into(),
                 name: "Peer".into(),

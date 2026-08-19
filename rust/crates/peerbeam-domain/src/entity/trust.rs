@@ -111,6 +111,51 @@ pub struct TrustRecord {
     /// [`TrustStore::is_approved`]: crate::port::TrustStore::is_approved
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// The user's own note that this is **one of their machines** — their
+    /// laptop, their phone, the desktop at work — so a surface can offer *"send
+    /// to my laptop"* and cut a device list down to the handful that matter.
+    ///
+    /// # A label, not a claim, and not a grant
+    ///
+    /// Marking a device says nothing **to** it: no message is sent, nothing is
+    /// negotiated, the peer neither learns nor sets this, and the device it
+    /// describes may well be marked on one machine and not on the next. It is a
+    /// word the user wrote about a record on their own disk.
+    ///
+    /// It therefore widens **nothing**. A device marked mine that nobody
+    /// approved is still approved for nothing; one whose `permissions` withhold
+    /// [`Permission::Browse`] still may not browse; one whose window has closed
+    /// is still expired. Every permission answer in the workspace is computed by
+    /// [`effective_permissions_at`](Self::effective_permissions_at), which does
+    /// not read this field — and must never learn to. The moment a gate consults
+    /// it, "mine" stops being a note and becomes a way to hand a device powers
+    /// nobody ever approved it for, settable by anything that can write one bool
+    /// into the local trust file. `marking_a_device_mine_grants_it_nothing`
+    /// holds that shut as a property rather than as a promise.
+    ///
+    /// # The upgrade rule
+    ///
+    /// `#[serde(default)]`, so a store written before this field existed loads
+    /// with `false`. Unlike `approved`, that is not the *fail-closed* direction
+    /// — there is no permission here to fail closed about — it is the only
+    /// **true** one. Nobody who wrote those records ever said a device was
+    /// theirs, and defaulting to `true` would sweep every stranger the TOFU
+    /// handshake pinned into the one list a user taps "send" on without reading
+    /// it. Absent means *unsaid*, and unsaid is not mine.
+    ///
+    /// Note this is a different reason from [`expires_at`](Self::expires_at),
+    /// where absent had to mean "no deadline" because the fail-closed reading
+    /// would have revoked every device on the machine on upgrade. Neither
+    /// direction revokes anything here, so the choice is settled by which
+    /// statement is factually right rather than by which is safer.
+    ///
+    /// `skip_serializing_if` keeps an unmarked record byte-identical to what
+    /// earlier builds wrote, so upgrading does not rewrite a file for a feature
+    /// the user has not touched.
+    ///
+    /// [`Permission::Browse`]: crate::entity::Permission::Browse
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mine: bool,
 }
 
 impl TrustRecord {
@@ -159,6 +204,11 @@ impl TrustRecord {
     /// for (an approved device keeps everything it had) and inert for the other
     /// (a stranger the handshake pinned may nothing), and this is where the
     /// second half is enforced instead of merely being true by luck.
+    ///
+    /// Three fields decide this and no others: [`approved`](Self::approved),
+    /// [`permissions`](Self::permissions), [`expires_at`](Self::expires_at).
+    /// [`mine`](Self::mine) is deliberately not among them — see its own note
+    /// for what adding it would cost.
     ///
     /// [`TrustStore::may`]: crate::port::TrustStore::may
     #[must_use]
@@ -228,6 +278,7 @@ mod tests {
             approved: false,
             permissions: PermissionSet::granted_on_approval(),
             expires_at: None,
+            mine: false,
         };
         assert_eq!(
             record.effective_permissions_at(at(10, 1)),
@@ -391,6 +442,119 @@ mod tests {
         assert!(
             json.contains("\"expires_at\""),
             "a window is written: {json}"
+        );
+        assert_eq!(serde_json::from_str::<TrustRecord>(&json).unwrap(), record);
+    }
+
+    // ── "one of my devices" ─────────────────────────────────────────────────
+
+    /// **The upgrade rule for the label.** A record written before it existed
+    /// said nothing about whose device it is, so it loads saying nothing —
+    /// `false`. Defaulting to `true` would put every stranger the handshake
+    /// ever pinned into the user's "My devices" list.
+    #[test]
+    fn a_record_without_the_field_is_not_mine() {
+        let record = parse(PRE_UPGRADE);
+        assert!(!record.mine, "an unsaid label must not read as a claim");
+    }
+
+    /// **The property most likely to rot.** The label is a note the user wrote
+    /// on their own disk; it must buy the device nothing. Every combination of
+    /// approval, grant and window is checked twice — once unmarked, once
+    /// marked, differing in that one field and nothing else — and both must
+    /// answer identically. A gate that starts reading `mine` fails here.
+    #[test]
+    fn marking_a_device_mine_grants_it_nothing() {
+        let now = at(11, 0);
+        let windows = [None, Some(at(10, 30)), Some(at(23, 0))];
+        let grants = [
+            PermissionSet::none(),
+            PermissionSet::granted_on_approval(),
+            PermissionSet::granted_on_approval().set(Permission::Clipboard, false),
+            Permission::ALL
+                .into_iter()
+                .fold(PermissionSet::none(), |set, p| set.set(p, true)),
+        ];
+        for approved in [false, true] {
+            for permissions in grants {
+                for expires_at in windows {
+                    let unmarked = TrustRecord {
+                        device: DeviceId::from("pb-laptop00001"),
+                        fingerprint: "3f9a".into(),
+                        name: "laptop".into(),
+                        trusted_at: at(10, 0),
+                        approved,
+                        permissions,
+                        expires_at,
+                        mine: false,
+                    };
+                    // Struct-update syntax, so "differs only in `mine`" is a
+                    // fact about the construction rather than a claim in a
+                    // comment that a new field could quietly falsify.
+                    let marked = TrustRecord {
+                        mine: true,
+                        ..unmarked.clone()
+                    };
+
+                    assert_eq!(
+                        marked.effective_permissions_at(now),
+                        unmarked.effective_permissions_at(now),
+                        "marking mine changed the permission set \
+                         (approved={approved}, expires_at={expires_at:?})"
+                    );
+                    assert_eq!(
+                        marked.is_approved_at(now),
+                        unmarked.is_approved_at(now),
+                        "marking mine changed approval"
+                    );
+                    assert_eq!(
+                        marked.has_expired(now),
+                        unmarked.has_expired(now),
+                        "marking mine changed the window"
+                    );
+                    for p in Permission::ALL {
+                        assert_eq!(
+                            marked.effective_permissions_at(now).grants(p),
+                            unmarked.effective_permissions_at(now).grants(p),
+                            "marking mine changed {p}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The label is not an approval in disguise either: a device the user calls
+    /// theirs but has never accepted may nothing, which is the case a "send to
+    /// my laptop" button will hit the first time somebody marks a fresh pin.
+    #[test]
+    fn a_device_that_is_mine_but_unapproved_may_nothing() {
+        let mut record = parse(PRE_UPGRADE);
+        record.approved = false;
+        record.mine = true;
+        assert!(record.mine);
+        assert!(!record.is_approved_at(at(11, 0)));
+        assert_eq!(
+            record.effective_permissions_at(at(11, 0)),
+            PermissionSet::none()
+        );
+    }
+
+    /// The label round-trips, and an unmarked record still writes no key — so
+    /// upgrading a store nobody has grouped leaves its bytes as they were.
+    #[test]
+    fn the_label_round_trips_and_an_unmarked_record_writes_no_key() {
+        let mut record = parse(PRE_UPGRADE);
+        assert!(
+            !serde_json::to_string(&record).unwrap().contains("mine"),
+            "an unmarked record must not grow a key"
+        );
+
+        record.mine = true;
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains("\"mine\":true"),
+            "the label is written: {json}"
         );
         assert_eq!(serde_json::from_str::<TrustRecord>(&json).unwrap(), record);
     }

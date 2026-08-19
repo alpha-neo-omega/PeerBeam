@@ -131,6 +131,7 @@ mod tests {
             permissions: PermissionSet::granted_on_approval()
                 .set(Permission::Notes, notes_permitted),
             expires_at: None,
+            mine: false,
         })))
     }
 

@@ -57,6 +57,15 @@ pub enum ChatError {
     BadReceipt(String),
     #[error("bad file id: {0}")]
     BadId(String),
+    #[error("bad reply reference: {0}")]
+    BadReply(String),
+    /// A disappearing-message window that has no honest reading — zero, or
+    /// longer than [`MAX_TTL_SECS`](crate::MAX_TTL_SECS). Distinct from
+    /// [`Serialization`](Self::Serialization) because nothing is wrong with the
+    /// store: the caller asked for a window this crate will not enforce, and
+    /// the fix is a different number rather than a retry.
+    #[error("bad retention window: {0}")]
+    BadRetention(String),
     /// An outbox entry exists but could not be decoded — most likely written
     /// by a newer schema. Deliberately distinct from
     /// [`Serialization`](Self::Serialization): that variant means the *store*
@@ -90,19 +99,52 @@ pub struct ChatMessage {
     pub timestamp: String,
     /// Markdown body (<= MAX_BODY bytes).
     pub body: String,
+    /// The id of the message this one answers, in the same conversation.
+    ///
+    /// `#[serde(default)]` so a message from a peer that predates replies
+    /// decodes as answering nothing — which is what it is — and
+    /// `skip_serializing_if` so an ordinary message is byte-identical on the
+    /// wire to what earlier builds sent, and costs a peer that has never heard
+    /// of replies exactly as many bytes as before. Nothing is negotiated for
+    /// it: an unknown *field* is ignored by `serde_json` on both sides, so this
+    /// is additive within `MSG_TEXT` and needs no new message type and no
+    /// version bump (MESSAGE_REGISTRY.md §7).
+    ///
+    /// **Text only, for now.** A `FileRef` deliberately carries no equivalent:
+    /// no surface offers "reply with a file" yet, and inventing a wire field
+    /// nothing sets would be a promise about a shape nobody has had to live
+    /// with. The *record* side is general
+    /// ([`ChatRecord::in_reply_to`](crate::ChatRecord::in_reply_to)), so adding
+    /// it later is additive rather than a migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
 }
 
 impl ChatMessage {
     /// Create a new message, minting a time-ordered id + timestamp. Rejects an
     /// over-cap body.
     pub fn new(body: &str) -> Result<ChatMessage, ChatError> {
+        ChatMessage::replying(body, None)
+    }
+
+    /// Create a message answering `in_reply_to`, minting a time-ordered id +
+    /// timestamp. `None` is an ordinary message — [`new`](Self::new) is that
+    /// call by another name, kept so every existing caller stays untouched.
+    ///
+    /// The reference is validated exactly as [`from_frame`](Self::from_frame)
+    /// validates one off the wire, so a message this device refuses to accept
+    /// is one it also refuses to send.
+    pub fn replying(body: &str, in_reply_to: Option<&str>) -> Result<ChatMessage, ChatError> {
         if body.len() > MAX_BODY {
             return Err(ChatError::TooLarge { len: body.len() });
         }
+        let id = mint_id();
+        validate_reply_ref(in_reply_to, &id)?;
         Ok(ChatMessage {
-            id: mint_id(),
+            id,
             timestamp: Utc::now().to_rfc3339(),
             body: body.to_string(),
+            in_reply_to: in_reply_to.map(str::to_string),
         })
     }
 
@@ -119,6 +161,11 @@ impl ChatMessage {
                 len: self.body.len(),
             });
         }
+        // Checked on the way out as well as on the way in, so this device never
+        // sends a message it would itself refuse — `flush_to_session` rebuilds
+        // a `ChatMessage` from a queued outbox entry rather than from this
+        // constructor, and a struct literal anywhere skips `replying` too.
+        validate_reply_ref(self.in_reply_to.as_deref(), &self.id)?;
         let payload = serde_json::to_vec(self)
             .map(Bytes::from)
             .map_err(|e| ChatError::Serialization(e.to_string()))?;
@@ -143,8 +190,47 @@ impl ChatMessage {
                 len: msg.body.len(),
             });
         }
+        validate_reply_ref(msg.in_reply_to.as_deref(), &msg.id)?;
         Ok(msg)
     }
+}
+
+/// Validate a reply reference against the id of the message carrying it.
+///
+/// Three rules, and no more:
+///
+/// * **absent is fine** — most messages answer nothing;
+/// * **bounded by [`MAX_ID`], non-empty** — it is a message id and is echoed
+///   into events, history and logs exactly as `Reaction::target_id` is, and is
+///   bounded here for the same reason. It is deliberately *not* put through
+///   [`validate_id`]: it is never a path and never a store key this crate
+///   writes to. It authorizes nothing at all — `resolve_replies` only ever
+///   *looks* for it among rows already loaded from this peer's own namespace,
+///   so an id naming nothing, or naming a message in another conversation,
+///   finds nothing and renders as an orphan. A stricter rule here would refuse
+///   a reply from a build whose ids are shaped differently, which is a
+///   compatibility break bought for no security;
+/// * **never its own id** — a message that answers itself is not a quotation,
+///   and every surface that draws a quote would have to decide what to do with
+///   it. Refusing the one malformed shape at the wire boundary means no
+///   renderer has to. A locally built reply cannot hit this (`replying` mints a
+///   fresh id the caller cannot have named), so this exists for the peer.
+fn validate_reply_ref(in_reply_to: Option<&str>, own_id: &str) -> Result<(), ChatError> {
+    let Some(parent) = in_reply_to else {
+        return Ok(());
+    };
+    if parent.is_empty() || parent.len() > MAX_ID {
+        return Err(ChatError::BadReply(format!(
+            "reply reference length {} (max {MAX_ID})",
+            parent.len()
+        )));
+    }
+    if parent == own_id {
+        return Err(ChatError::BadReply(format!(
+            "a message cannot answer itself: {parent}"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a peer- or user-supplied file name: a bare filename, nothing else.
@@ -540,6 +626,92 @@ pub fn mint_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A reply survives the wire unchanged, and an ordinary message still ships
+    /// exactly the bytes it always did — a peer that has never heard of replies
+    /// must not start paying for them.
+    #[test]
+    fn a_reply_round_trips_on_the_wire_and_costs_a_plain_message_nothing() {
+        let reply = ChatMessage::replying("sure, go ahead", Some("0000000000001")).unwrap();
+        let frame = reply.to_frame(ChannelId::new(2)).unwrap();
+        let back = ChatMessage::from_frame(&frame).unwrap();
+        assert_eq!(back, reply);
+        assert_eq!(back.in_reply_to.as_deref(), Some("0000000000001"));
+
+        let plain = ChatMessage::new("hello").unwrap();
+        let json =
+            String::from_utf8(plain.to_frame(ChannelId::new(2)).unwrap().payload.to_vec()).unwrap();
+        assert!(
+            !json.contains("in_reply_to"),
+            "an ordinary message must be byte-identical to what earlier builds sent: {json}"
+        );
+    }
+
+    /// The compatibility leg: a `MSG_TEXT` payload from a build that predates
+    /// replies has no such key, and must decode as answering nothing rather
+    /// than failing the channel.
+    #[test]
+    fn a_message_from_a_build_without_replies_decodes_as_answering_nothing() {
+        let legacy = SessionFrame::new(
+            ChannelId::new(2),
+            ChatMessage::message_type(),
+            MessageFlags::END_OF_MESSAGE,
+            Bytes::from_static(br#"{"id":"m1","timestamp":"2026-01-01T00:00:00Z","body":"hi"}"#),
+        );
+        let msg = ChatMessage::from_frame(&legacy).unwrap();
+        assert_eq!(msg.in_reply_to, None);
+        assert_eq!(msg.body, "hi");
+    }
+
+    /// The reference is peer-supplied and is echoed into events, history and
+    /// logs exactly as `Reaction::target_id` is, so it is bounded exactly as
+    /// that one is — refused rather than truncated.
+    #[test]
+    fn an_empty_or_oversized_reply_reference_is_refused() {
+        for bad in [String::new(), "i".repeat(MAX_ID + 1)] {
+            let mut msg = ChatMessage::new("body").unwrap();
+            msg.in_reply_to = Some(bad);
+            // Refused on the way out...
+            assert!(matches!(
+                msg.to_frame(ChannelId::new(1)),
+                Err(ChatError::BadReply(_))
+            ));
+            // ...and on the way in, from a peer that does not check.
+            let frame = SessionFrame::new(
+                ChannelId::new(1),
+                ChatMessage::message_type(),
+                MessageFlags::END_OF_MESSAGE,
+                Bytes::from(serde_json::to_vec(&msg).unwrap()),
+            );
+            assert!(matches!(
+                ChatMessage::from_frame(&frame),
+                Err(ChatError::BadReply(_))
+            ));
+        }
+        assert!(matches!(
+            ChatMessage::replying("body", Some("")),
+            Err(ChatError::BadReply(_))
+        ));
+    }
+
+    /// A message answering itself is not a quotation, and every surface that
+    /// draws one would have to decide what to do with it. Refused at the wire
+    /// boundary so no renderer has to.
+    #[test]
+    fn a_message_that_answers_itself_is_refused() {
+        let mut msg = ChatMessage::new("body").unwrap();
+        msg.in_reply_to = Some(msg.id.clone());
+        let frame = SessionFrame::new(
+            ChannelId::new(1),
+            ChatMessage::message_type(),
+            MessageFlags::END_OF_MESSAGE,
+            Bytes::from(serde_json::to_vec(&msg).unwrap()),
+        );
+        assert!(matches!(
+            ChatMessage::from_frame(&frame),
+            Err(ChatError::BadReply(_))
+        ));
+    }
+
     #[test]
     fn receipt_round_trips_and_ships_optional() {
         let r = Receipt::read_through("m-9");

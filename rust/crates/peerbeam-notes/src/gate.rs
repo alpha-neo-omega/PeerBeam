@@ -59,6 +59,7 @@ mod tests {
             approved,
             permissions,
             expires_at: None,
+            mine: false,
         }
     }
 

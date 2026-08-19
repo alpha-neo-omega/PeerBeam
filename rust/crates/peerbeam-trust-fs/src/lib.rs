@@ -257,6 +257,36 @@ impl FsTrust {
         self.persist(&mut cache, &[])?;
         Ok(true)
     }
+
+    /// Mark a pinned device as **one of the user's own**, or drop the mark.
+    ///
+    /// Returns whether a record was found and changed, so a surface can tell
+    /// "done" from "that device is not pinned" and from "it was already like
+    /// that" without a second lookup racing the first — the same three answers
+    /// [`set_permission`](Self::set_permission) gives.
+    ///
+    /// **Writes one bool and nothing else.** It does not approve, does not
+    /// touch [`TrustRecord::permissions`], and does not extend or clear a
+    /// window: marking a device the user's own is a note they made about their
+    /// own list, and a note that silently granted something would be the worst
+    /// kind. `marking_a_device_mine_leaves_every_permission_alone` holds the
+    /// three fields to what they were.
+    ///
+    /// It is refused for a device that is not pinned, rather than inventing a
+    /// record: "these are my devices" is a statement about devices this machine
+    /// has actually met.
+    pub fn set_mine(&self, device: &DeviceId, mine: bool) -> Result<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        let Some(record) = cache.get_mut(&device.0) else {
+            return Ok(false);
+        };
+        if record.mine == mine {
+            return Ok(false);
+        }
+        record.mine = mine;
+        self.persist(&mut cache, &[])?;
+        Ok(true)
+    }
 }
 
 /// A temp path next to `path`, unique per process and per call, so concurrent
@@ -285,6 +315,16 @@ impl TrustStore for FsTrust {
         Ok(self.cache.lock().unwrap().get(&device.0).cloned())
     }
 
+    /// [`list`](Self::list) narrowed to the marked records, so a "My devices"
+    /// screen and the full trust list can never disagree about a device's name,
+    /// order or grant — there is one read and one sort, filtered.
+    ///
+    /// Unfiltered by approval and by expiry, as the port specifies: this
+    /// answers which devices are the user's, not which they may use.
+    fn my_devices(&self) -> Result<Vec<TrustRecord>> {
+        Ok(self.list().into_iter().filter(|r| r.mine).collect())
+    }
+
     // `is_trusted` is deliberately **not** overridden. It used to be a
     // `contains_key`, which is now the wrong answer: a record whose window has
     // closed is present and not trusted. Inheriting `TrustStore`'s default
@@ -306,6 +346,7 @@ mod tests {
             approved: false,
             permissions: PermissionSet::none(),
             expires_at: None,
+            mine: false,
         }
     }
 
@@ -1055,6 +1096,191 @@ mod tests {
                 .unwrap()
                 .contains("expires_at"),
             "but a window must be on disk, or a restart would forget it"
+        );
+    }
+
+    // ── "one of my devices" ─────────────────────────────────────────────────
+
+    /// The mark is written, survives a restart, is reported as a change only
+    /// when it is one, and comes off again — a device sold or re-purposed
+    /// stops being the user's.
+    #[test]
+    fn marking_a_device_mine_persists_and_unmarking_undoes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        assert!(!store.is_mine(&id), "a fresh pin says nothing about whose");
+
+        assert!(store.set_mine(&id, true).unwrap(), "marked");
+        assert!(!store.set_mine(&id, true).unwrap(), "already like that");
+        assert!(store.is_mine(&id));
+
+        // Read back from disk, not from the cache that just wrote it.
+        let reopened = FsTrust::open(&path).unwrap();
+        assert!(reopened.is_mine(&id), "the mark must survive a restart");
+
+        assert!(reopened.set_mine(&id, false).unwrap(), "unmarked");
+        assert!(!reopened.is_mine(&id));
+        assert!(!FsTrust::open(&path).unwrap().is_mine(&id));
+    }
+
+    /// A device this machine has never met cannot be one of the user's —
+    /// reported as "nothing changed" rather than invented as a new record.
+    #[test]
+    fn marking_an_unpinned_device_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let ghost = DeviceId::from("dev-never-seen");
+        assert!(!store.set_mine(&ghost, true).unwrap());
+        assert!(store.lookup(&ghost).unwrap().is_none());
+        assert!(!store.is_mine(&ghost));
+    }
+
+    /// **The property most likely to rot, at the write path.** Marking must
+    /// move one bool: not approval, not the grant, not the window — and not
+    /// one `may` answer. Asserted against the record as it was, so a `set_mine`
+    /// that "helpfully" approved, or a gate that started reading the label,
+    /// fails here rather than in somebody's file listing.
+    #[test]
+    fn marking_a_device_mine_leaves_every_permission_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-laptop");
+        store.record(record("dev-laptop", "fp")).unwrap();
+        let window = Utc::now() + chrono::Duration::minutes(30);
+        store.approve_for(&id, Some(window)).unwrap();
+        store
+            .set_permission(&id, Permission::Clipboard, false)
+            .unwrap();
+
+        let before = store.lookup(&id).unwrap().unwrap();
+        let permitted_before: Vec<bool> =
+            Permission::ALL.iter().map(|p| store.may(&id, *p)).collect();
+
+        assert!(store.set_mine(&id, true).unwrap());
+
+        let after = store.lookup(&id).unwrap().unwrap();
+        assert!(after.mine, "precondition: the label did get written");
+        assert_eq!(
+            after.permissions, before.permissions,
+            "marking mine rewrote the grant"
+        );
+        assert_eq!(after.approved, before.approved, "marking mine approved it");
+        assert_eq!(
+            after.expires_at, before.expires_at,
+            "marking mine moved the window"
+        );
+        assert_eq!(
+            after,
+            TrustRecord {
+                mine: true,
+                ..before
+            },
+            "marking mine changed a field other than the label"
+        );
+        for (p, was) in Permission::ALL.into_iter().zip(permitted_before) {
+            assert_eq!(store.may(&id, p), was, "marking mine changed {p}");
+        }
+
+        // ...and taking the mark off is equally inert.
+        assert!(store.set_mine(&id, false).unwrap());
+        assert_eq!(
+            store.lookup(&id).unwrap().unwrap(),
+            TrustRecord {
+                mine: false,
+                ..after
+            },
+            "unmarking must be exactly as inert as marking"
+        );
+    }
+
+    /// **The upgrade rule.** The trust file every existing user has says
+    /// nothing about whose device is whose, and must load saying nothing —
+    /// not sweep two strangers into the list the user taps "send" on.
+    #[test]
+    fn a_record_written_before_the_label_existed_loads_unmarked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = store_with(&path, PRE_UPGRADE_TRUST_JSON);
+
+        for id in ["pb-laptop00001", "pb-stranger001"] {
+            let id = DeviceId::from(id);
+            assert!(!store.lookup(&id).unwrap().unwrap().mine);
+            assert!(!store.is_mine(&id), "{} was claimed by nobody", id.0);
+        }
+        assert!(
+            store.my_devices().unwrap().is_empty(),
+            "an upgraded store starts with an empty My devices list"
+        );
+        // The upgrade did not cost the laptop anything either.
+        assert!(store.is_approved(&DeviceId::from("pb-laptop00001")));
+    }
+
+    /// The filtered read: only marked records, in `list`'s order, and
+    /// **unfiltered by approval** — a phone the user marked but has not yet
+    /// accepted still belongs on their own list, or they will conclude it is
+    /// missing when it is merely waiting for a tap.
+    #[test]
+    fn my_devices_lists_the_marked_records_approved_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+
+        // Distinct `trusted_at`s, oldest first, so the newest-first order is a
+        // real assertion rather than whatever the map happened to yield.
+        for (i, id) in ["dev-desktop", "dev-phone", "dev-stranger"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut r = record(id, "fp");
+            r.trusted_at = Utc::now() + chrono::Duration::seconds(i as i64);
+            store.record(r).unwrap();
+        }
+        let desktop = DeviceId::from("dev-desktop");
+        let phone = DeviceId::from("dev-phone");
+        store.approve(&desktop).unwrap();
+        store.set_mine(&desktop, true).unwrap();
+        store.set_mine(&phone, true).unwrap(); // marked, never approved
+
+        let mine: Vec<String> = store
+            .my_devices()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.device.0)
+            .collect();
+        assert_eq!(mine, vec!["dev-phone", "dev-desktop"], "newest first");
+        assert!(
+            !store.is_approved(&phone),
+            "and listing the phone did not approve it"
+        );
+        assert_eq!(store.list().len(), 3, "the full list is untouched");
+    }
+
+    /// A store where nobody has grouped anything is written exactly as it was
+    /// before this field existed, so upgrading does not churn a file for a
+    /// feature the user has not touched — and an older build reads it back.
+    #[test]
+    fn an_unmarked_store_writes_no_mine_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        let id = DeviceId::from("dev-1");
+        store.record(record("dev-1", "fp")).unwrap();
+        store.approve(&id).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("mine"),
+            "an unmarked store grew a key it does not need"
+        );
+
+        store.set_mine(&id, true).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"mine\": true"),
+            "but a mark must be on disk, or a restart would forget it"
         );
     }
 }

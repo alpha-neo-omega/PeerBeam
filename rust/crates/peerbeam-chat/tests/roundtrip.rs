@@ -63,6 +63,8 @@ fn caps() -> CapabilitySet {
     CapabilitySet::new().with(Capability::new(ChannelType::CHAT))
 }
 
+/// One message, then an answer to it: both survive a real session, and the
+/// answer still points at what it answered once it is on the other side.
 #[tokio::test]
 async fn a_sends_b_receives_and_persists() {
     // ── B: receiver, registers a ChatHandler ────────────────────────────────
@@ -156,6 +158,41 @@ async fn a_sends_b_receives_and_persists() {
     assert_eq!(hist.len(), 1, "store_b persisted exactly one record");
     assert_eq!(hist[0].body, "hello");
     assert_eq!(hist[0].id, rec.id, "same message id round-trips");
+
+    // ── A answers its own first message; B must receive it *as an answer* ──
+    //
+    // The reply reference travels inside the same `MSG_TEXT` payload, so this
+    // is the one test that proves the whole path — `send_reply`, the frame, the
+    // receiver's decode, its store, and the render context — rather than any
+    // one leg of it.
+    let reply = peerbeam_chat::send_reply(
+        &a_handle,
+        &store_a,
+        &b_id,
+        "and this answers it",
+        Some(&rec.id),
+    )
+    .await
+    .expect("send_reply succeeds");
+    assert_eq!(reply.in_reply_to.as_deref(), Some(rec.id.as_str()));
+
+    let mut hist = Vec::new();
+    for _ in 0..200 {
+        hist = store_b.history(&a_id).expect("store_b history readable");
+        if hist.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hist.len(), 2, "B did not receive the reply within 2s");
+    assert_eq!(hist[1].in_reply_to.as_deref(), Some(rec.id.as_str()));
+    match &peerbeam_chat::resolve_replies(&hist)[1] {
+        peerbeam_chat::ReplyContext::Quoting(quoted) => {
+            assert_eq!(quoted.id, rec.id);
+            assert_eq!(quoted.preview, "hello");
+        }
+        other => panic!("the reply must resolve against B's own history, got {other:?}"),
+    }
 }
 
 /// Dedup at the handler level: delivering the same frame (same message id)
@@ -493,6 +530,7 @@ async fn reflush_is_idempotent_on_the_receiver() {
         id: m.id.clone(),
         timestamp: m.timestamp.clone(),
         body: m.body.clone(),
+        in_reply_to: None,
     };
     store_a.enqueue(&b_id, &dup).unwrap();
     let reflushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)

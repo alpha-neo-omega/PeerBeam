@@ -757,6 +757,96 @@ pub unsafe extern "C" fn pb_notes_sync(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.notes_sync(&read_json(json)?))()))
 }
 
+/// Every Space and its members: `{}` → `{spaces: [...]}`.
+///
+/// A Space is a label this device keeps over peers it already trusts. Nothing
+/// about it is ever sent, and no peer learns it exists — which is what keeps
+/// group send peer-to-peer rather than hub-brokered (I3).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_list(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.spaces_list(&read_json(json)?))()))
+}
+
+/// Create a Space: `{name}` → `{space}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_create(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.spaces_create(&read_json(json)?))()))
+}
+
+/// Rename a Space: `{id, name}` → `{space}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_rename(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.spaces_rename(&read_json(json)?))()))
+}
+
+/// Delete a Space: `{id}` → `{deleted}`. Members keep their trust.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_delete(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.spaces_delete(&read_json(json)?))()))
+}
+
+/// Add a trusted device to a Space: `{id, device}` → `{added}`.
+///
+/// Grants nothing. Each fan-out send passes the same per-capability gate a
+/// hand-typed send would (I6).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_add_member(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.spaces_add_member(&read_json(json)?)
+        })())
+    })
+}
+
+/// Remove a device from a Space: `{id, device}` → `{removed}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_spaces_remove_member(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.spaces_remove_member(&read_json(json)?)
+        })())
+    })
+}
+
+/// Mark a device as one of the user's own: `{device, mine}` → `{changed}`.
+///
+/// A local label, not a grant: it widens no permission and the device is never
+/// told.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_set_mine(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.trust_set_mine(&read_json(json)?))()))
+}
+
+/// The devices the user marked as their own: `{}` → `{devices: [...]}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_my_devices(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.trust_my_devices(&read_json(json)?))()))
+}
+
 /// Every live note, newest edit first: `{}` → `{notes: [...]}`.
 ///
 /// Deleted notes are not returned: a tombstone exists so a deletion can reach a

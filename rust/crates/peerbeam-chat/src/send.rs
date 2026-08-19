@@ -69,7 +69,30 @@ pub async fn send_message(
     peer: &DeviceId,
     body: &str,
 ) -> Result<ChatRecord, SendError> {
-    let msg = ChatMessage::new(body)?; // enforces MAX_BODY
+    send_reply(handle, store, peer, body, None).await
+}
+
+/// Send `body` to `peer` as an answer to `in_reply_to` — [`send_message`] with
+/// the one extra field, and its whole implementation.
+///
+/// Additive rather than a parameter on [`send_message`] so every existing
+/// caller (the FFI's `chat_send`, the CLI's `chat send`, the round-trip tests)
+/// keeps compiling untouched; `None` is exactly the old call.
+///
+/// The reference is not checked against local history, on purpose. A parent
+/// that has been deleted, or whose window has closed, is a normal state — see
+/// [`crate::reply`] — and refusing to send because of it would let one deleted
+/// message veto a reply the user has already written. What *is* checked is the
+/// shape (`ChatMessage::replying`), because a malformed reference is a
+/// malformed message rather than a missing one.
+pub async fn send_reply(
+    handle: &SessionHandle,
+    store: &ChatStore,
+    peer: &DeviceId,
+    body: &str,
+    in_reply_to: Option<&str>,
+) -> Result<ChatRecord, SendError> {
+    let msg = ChatMessage::replying(body, in_reply_to)?; // enforces MAX_BODY
     let channel = handle
         .open_channel(ChannelType::CHAT)
         .await
@@ -132,6 +155,11 @@ pub async fn flush_to_session(
                     id: entry.message_id.clone(),
                     timestamp: entry.timestamp.clone(),
                     body: entry.body.clone(),
+                    // Carried, or a reply that waited for an offline peer would
+                    // arrive as an ordinary message: the link would survive in
+                    // local history and be silently dropped on the wire for
+                    // exactly the messages that were queued.
+                    in_reply_to: entry.in_reply_to.clone(),
                 };
                 if send_on_open_channel(handle, channel, &msg).await.is_err() {
                     break; // peer went away mid-flush; remaining entries stay queued
@@ -295,10 +323,13 @@ pub fn begin_file_send(
 /// a determinate bar; `cancel` stops it within one 64 KiB buffer, leaving no
 /// blob and no queue entry.
 ///
-/// # `Ok(None)`: the conversation was deleted while we copied
+/// # `Ok(None)`: the row was gone by the time we finished copying
 ///
 /// A copy runs for as long as the file is big, and `chat_delete` can land in
-/// the middle of it. `ChatStore::delete_conversation` keeps a `Staging` row
+/// the middle of it — as can a [disappearing-message
+/// window](crate::Retention) short enough to close on a row that is still
+/// being staged, which `ChatStore::get` reports the same way for the same
+/// reason. `ChatStore::delete_conversation` keeps a `Staging` row
 /// precisely so that this is nearly impossible, but "nearly" is not a contract:
 /// the row is read inside [`ChatStore::enqueue_file`], and if it has gone by
 /// then nothing is queued. There is exactly one honest response, and it is the
@@ -337,7 +368,7 @@ pub async fn stage_file_send(
         tracing::info!(
             message_id = %r.id,
             peer_id = %peer.0,
-            "staged file dropped: its conversation was deleted while it was being copied"
+            "staged file dropped: its row was gone by the time the copy finished"
         );
         return Ok(None);
     }
@@ -937,6 +968,7 @@ mod tests {
             kind: Kind::File,
             file: None,
             offers_refused: 0,
+            in_reply_to: None,
         };
         raw.put(
             crate::store::OUTBOX_NS,

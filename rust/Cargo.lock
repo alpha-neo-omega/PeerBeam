@@ -1415,12 +1415,14 @@ dependencies = [
  "peerbeam-platform",
  "peerbeam-presence",
  "peerbeam-reliability-fs",
+ "peerbeam-spaces",
  "peerbeam-storage-fs",
  "peerbeam-sync",
  "peerbeam-transfer",
  "peerbeam-transfer-quic",
  "peerbeam-trust-fs",
  "peerbeam-update",
+ "peerbeam-wake",
  "serde",
  "serde_json",
  "sha2",
@@ -1589,6 +1591,7 @@ dependencies = [
  "peerbeam-platform",
  "peerbeam-presence",
  "peerbeam-reliability-fs",
+ "peerbeam-spaces",
  "peerbeam-storage-fs",
  "peerbeam-sync",
  "peerbeam-transfer",
@@ -1700,6 +1703,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-spaces"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "peerbeam-appstore-fs",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "peerbeam-trust-fs",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "peerbeam-storage-fs"
 version = "0.9.0"
 dependencies = [
@@ -1807,6 +1827,21 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "peerbeam-wake"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "peerbeam-appstore-fs",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

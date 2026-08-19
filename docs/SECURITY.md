@@ -251,6 +251,37 @@ A `trust.json` written before this existed has no `expires_at` and is trusted
 is deliberately the opposite of `approved`'s upgrade rule: reading a missing
 deadline as "expired" would revoke every device on the machine on upgrade.
 
+### "My devices" is a label, not a grant
+
+A record also carries `mine`: the user's own note that this is one of their
+machines, so a surface can offer *"send to my laptop"* and filter a device list
+down to the handful that matter.
+
+It is **local and inert**. Marking a device sends it nothing, tells it nothing,
+and asks it nothing — the peer neither reads nor sets the flag, and the same
+device may be marked on one machine and not on the next. It grants nothing
+either: a device marked mine that nobody approved is still approved for nothing,
+one whose permissions withhold `browse` still may not browse, and one whose
+window has closed is still expired. `TrustRecord::effective_permissions_at` —
+which is what every gate's answer is computed from — reads `approved`,
+`permissions` and `expires_at`, and does not read `mine`. Nothing that sends,
+accepts or opens anything may branch on it; if a gate ever did, "mine" would
+become a way to grant a device powers nobody approved it for, settable by
+anything that can write one bool into the local trust file.
+
+For the same reason the label is **not gated by the window**: a laptop is still
+the user's laptop at 10:31, so it stays in "My devices" while answering `false`
+to every question about what may leave this machine. `my_devices()` likewise
+lists marked records approved or not — it answers *which of these are mine*, not
+*which may I use*; a caller must still ask `may`.
+
+A `trust.json` written before this existed has no `mine` and loads with `false`.
+Unlike `approved` that is not the fail-closed direction — there is no permission
+here to fail closed about — it is the only truthful one: nobody who wrote those
+records said any device was theirs, and defaulting to `true` would sweep every
+stranger the TOFU handshake ever pinned into the one list a user taps "send" on
+without reading it.
+
 ## Device identity
 
 Each device has a long-term X25519 identity keypair, generated on first run and

@@ -69,6 +69,19 @@ pub enum Command {
     Rules(RulesArgs),
     /// Write and read notes kept on this device.
     Notes(NotesArgs),
+    /// Wake one of your devices on this network.
+    ///
+    /// Sends a Wake-on-LAN magic packet. **Local network only** — it does not
+    /// travel over Tailscale or a VPN, because the packet is a broadcast and
+    /// those are point-to-point. There is no acknowledgement in the protocol,
+    /// so this reports what it sent, never that the machine woke.
+    Wake(WakeArgs),
+    /// Named sets of trusted devices you can send to at once.
+    ///
+    /// A Space lives on this device only. It is never sent anywhere, no peer
+    /// learns it exists, and sending to one is just N ordinary sends — so no
+    /// member finds out who else is in it.
+    Space(SpaceArgs),
     /// Make one of your devices findable — *find my device*.
     Ring(RingArgs),
     /// One chronological view of this device's activity.
@@ -326,6 +339,35 @@ pub enum ChatAction {
         /// Peer device id (`pb-…`), or a name that is discoverable right now.
         peer: String,
     },
+    /// Make this conversation's messages disappear after a while.
+    ///
+    /// **This device only.** There is no frame that tells the peer to delete
+    /// its copy, and PeerBeam will not pretend otherwise: the promise it can
+    /// keep is that a message is readable *here* for at most the window, and is
+    /// then deleted from here. Received files are left on disk; only the
+    /// conversation row goes.
+    ///
+    /// Off by default, and off for every existing conversation.
+    Retention {
+        /// Peer device id (`pb-…`), or a name that is discoverable right now.
+        peer: String,
+        /// How long a message stays readable — `30m`, `2h`, `7d`. Omit to show
+        /// the current setting.
+        #[arg(long, value_name = "DURATION")]
+        after: Option<String>,
+        /// Turn disappearing messages off for this conversation. Messages
+        /// already deleted do not come back.
+        #[arg(long, conflicts_with = "after")]
+        off: bool,
+    },
+    /// Delete the messages whose window has already closed, now.
+    ///
+    /// Reading a conversation hides them anyway; this is what removes the bytes
+    /// without waiting for someone to open it.
+    Prune {
+        /// Peer device id, or omit for every conversation with a window set.
+        peer: Option<String>,
+    },
     /// React to a message with an emoji — or withdraw a reaction.
     ///
     /// Applies to this device's own history whether or not the peer can be
@@ -458,6 +500,22 @@ pub struct TrustArgs {
 pub enum TrustAction {
     /// List every pinned device, and whether it is approved or only pinned.
     List,
+    /// Mark a device as one of your own, or unmark it.
+    ///
+    /// A label kept on this device: it grants nothing, widens no permission,
+    /// and the device is never told. It exists so `trust mine` can answer
+    /// "which of these are my machines" — the question you ask before sending
+    /// yourself a file.
+    Mine {
+        /// The device id.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Unmark instead of mark.
+        #[arg(long)]
+        no: bool,
+    },
+    /// List the devices you have marked as your own.
+    MyDevices,
     /// Approve a device and grant it every permission this build has: files,
     /// chat, clipboard, presence, pipe. Narrow it afterwards with
     /// `trust revoke-permission`. Prints the fingerprint and asks, unless `--yes`.
@@ -667,6 +725,107 @@ pub struct RingArgs {
 /// tombstone rather than removing the row, so a deletion can reach the devices
 /// you have granted the `notes` permission once sync lands — a row that simply
 /// vanished would be indistinguishable from one they had not seen yet.
+#[derive(Args)]
+pub struct WakeArgs {
+    #[command(subcommand)]
+    pub action: WakeAction,
+}
+
+#[derive(Subcommand)]
+pub enum WakeAction {
+    /// Record a device's hardware address so it can be woken.
+    ///
+    /// Find it on the device itself: `ip link` on Linux, `ipconfig /all` on
+    /// Windows, System Settings → Network on macOS.
+    Set {
+        /// The device id.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Its MAC address — `aa:bb:cc:dd:ee:ff`, `AA-BB-CC-DD-EE-FF` or
+        /// `aabb.ccdd.eeff`.
+        #[arg(value_name = "MAC")]
+        mac: String,
+    },
+    /// Forget a device's hardware address.
+    Forget {
+        /// The device id.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Send the wake packet.
+    ///
+    /// Exits successfully once the packet is away. That is not a claim the
+    /// device woke: Wake-on-LAN has no reply, so the only real confirmation is
+    /// the device appearing in `peerbeam list`.
+    Send {
+        /// The device id.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Broadcast address to send to. Defaults to the all-networks
+        /// broadcast, which reaches the local segment.
+        #[arg(long, value_name = "ADDR", default_value = "255.255.255.255")]
+        broadcast: String,
+    },
+}
+
+#[derive(Args)]
+pub struct SpaceArgs {
+    #[command(subcommand)]
+    pub action: SpaceAction,
+}
+
+#[derive(Subcommand)]
+pub enum SpaceAction {
+    /// List every Space, with its members.
+    ///
+    /// Members this device no longer trusts are shown as stale rather than
+    /// dropped — a list that silently shrank would leave you wondering whether
+    /// you had ever added them.
+    List,
+    /// Create a Space.
+    Create {
+        /// What to call it. Names are unique ignoring case.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Rename a Space.
+    Rename {
+        /// The Space's id, as shown by `space list`.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// The new name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Delete a Space. The devices in it keep their trust.
+    Delete {
+        /// The Space's id, as shown by `space list`.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Add a trusted device to a Space.
+    ///
+    /// Grants nothing: every send still passes the same per-device permission
+    /// check it would if you had typed the device out by hand.
+    Add {
+        /// The Space's id.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// The device id to add.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Remove a device from a Space.
+    Remove {
+        /// The Space's id.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// The device id to remove.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+}
+
 #[derive(Args)]
 pub struct NotesArgs {
     #[command(subcommand)]
