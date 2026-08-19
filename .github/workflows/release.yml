@@ -21,8 +21,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest, appimage_arch: x86_64, artifact: linux }
+          - { runner: ubuntu-latest,    appimage_arch: x86_64,  artifact: linux }
+          # appimagetool publishes an aarch64 build, and the packaging script is
+          # arch-agnostic — only the tool download differs.
+          - { runner: ubuntu-24.04-arm, appimage_arch: aarch64, artifact: linux-arm64 }
     runs-on: ${{ matrix.runner }}
+    # `release` needs this job, and needing a matrix waits for every leg — so an
+    # unproven ARM leg failing would skip the release entirely and withhold the
+    # x86_64 artifacts that did build. x86_64 stays blocking, as it should.
+    continue-on-error: ${{ matrix.artifact == 'linux-arm64' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,8 +62,18 @@ jobs:
           path: dist/*
 
   windows:
-    runs-on: windows-latest
-    # Needs signing secrets; don't block the release if they're absent.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, artifact: windows }
+          # Flutter builds Windows for the *host* architecture — there is no
+          # cross-compile switch — so an ARM build means an ARM runner. Newer
+          # than the rest of this matrix and unproven here, which is why it is
+          # allowed to fail without withholding anyone else's artifacts.
+          - { runner: windows-11-arm, artifact: windows-arm64 }
+    runs-on: ${{ matrix.runner }}
+    # Also needs signing secrets; don't block the release if they're absent.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -69,11 +86,15 @@ jobs:
           PB_CERT_PATH: ${{ secrets.WINDOWS_CERT_PATH }}
           PB_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: powershell -File scripts/package-windows.ps1
+      # Both arch paths listed: the script builds whichever the host is, and a
+      # glob that matched only x64 would upload nothing from an ARM runner while
+      # still reporting success.
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          name: ${{ matrix.artifact }}
           path: |
             flutter/build/windows/x64/runner/Release/*.msix
+            flutter/build/windows/arm64/runner/Release/*.msix
             dist/*.zip
 
   macos:
@@ -159,13 +180,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli
-      - run: mkdir -p out && cp rust/target/release/peerbeam out/peerbeam-macos-arm64
+      # Both arches, cross-compiled from the arm64 runner. Shipping arm64 only
+      # left every Intel Mac without a CLI, while the desktop app has been
+      # universal all along — an inconsistency nobody would predict from the
+      # download page.
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - run: |
+          cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli \
+            --target aarch64-apple-darwin
+          cargo build --manifest-path rust/Cargo.toml --release -p peerbeam-cli \
+            --target x86_64-apple-darwin
+      - run: |
+          mkdir -p out
+          cp rust/target/aarch64-apple-darwin/release/peerbeam out/peerbeam-macos-arm64
+          cp rust/target/x86_64-apple-darwin/release/peerbeam out/peerbeam-macos-x64
+          # A universal binary too, so a script that cannot know the arch has
+          # one name to fetch.
+          lipo -create -output out/peerbeam-macos-universal \
+            out/peerbeam-macos-arm64 out/peerbeam-macos-x64
+          lipo -info out/peerbeam-macos-universal
       - uses: actions/upload-artifact@v4
         with: { name: cli-macos, path: out/* }
 
   cli-windows:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest,  suffix: x64,   artifact: cli-windows }
+          # Built natively on an ARM runner rather than cross-compiled: the
+          # toolchain action installs the host triple, so nothing here has to
+          # know which one that is.
+          - { runner: windows-11-arm,  suffix: arm64, artifact: cli-windows-arm64 }
+    runs-on: ${{ matrix.runner }}
+    # ARM Windows runners are newer than the rest of this matrix; a failure
+    # there must not withhold the artifacts everyone else is waiting for.
+    continue-on-error: ${{ matrix.suffix == 'arm64' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -173,9 +223,11 @@ jobs:
       - name: Stage CLI
         run: |
           New-Item -ItemType Directory -Force -Path out
-          Copy-Item rust\target\release\peerbeam.exe out\peerbeam-windows-x64.exe
+          Copy-Item rust\target\release\peerbeam.exe out\peerbeam-windows-${{ matrix.suffix }}.exe
       - uses: actions/upload-artifact@v4
-        with: { name: cli-windows, path: out/* }
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/*
 
   # Publish the GitHub Release. Requires the no-secret builds (Linux GUI +
   # Android + the three CLI jobs). Unsigned GUI artifacts (Linux tar/deb, Windows
@@ -214,14 +266,18 @@ jobs:
           # Top-level files only: artifact dirs also carry build-debris
           # subtrees (e.g. the deb staging tree), whose contents collide on
           # basename (gh names assets by basename -> 422 duplicate).
-          mapfile -t files < <(find artifacts/linux \
+          # ARM legs are `continue-on-error`, so their artifact directories may
+          # not exist. `find` skips a missing path with a warning rather than
+          # failing, and 2>/dev/null keeps the log readable — a release must not
+          # be withheld because one optional architecture did not build.
+          mapfile -t files < <(find artifacts/linux artifacts/linux-arm64 \
             artifacts/android artifacts/cli-linux artifacts/cli-linux-arm64 \
-            artifacts/cli-macos artifacts/cli-windows \
+            artifacts/cli-macos artifacts/cli-windows artifacts/cli-windows-arm64 \
             -maxdepth 1 -type f 2>/dev/null)
           # Windows GUI ships as the portable zip only (MSIX awaits signing).
           # The windows artifact preserves subdirs (multi-path upload), so
           # search at any depth; the basename is unique.
-          mapfile -t -O "${#files[@]}" files < <(find artifacts/windows \
+          mapfile -t -O "${#files[@]}" files < <(find artifacts/windows artifacts/windows-arm64 \
             -type f -name '*.zip' 2>/dev/null)
           # macOS GUI ships as the unsigned/un-notarized universal DMG (runs on
           # Intel + Apple Silicon); the notarized DMG awaits signing secrets.

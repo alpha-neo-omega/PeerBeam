@@ -11,9 +11,16 @@ Write-Host "== build flutter (release) =="
 Push-Location flutter
 flutter build windows --release
 
+# Flutter names the build directory after the architecture it built for, and
+# it builds for the host: `x64` on an Intel/AMD runner, `arm64` on an ARM one.
+# Discovered rather than hardcoded, so the same script packages both and an ARM
+# build does not silently produce an x64-shaped path that nothing wrote to.
+$arch = if (Test-Path "build\windows\arm64\runner\Release") { "arm64" } else { "x64" }
+Write-Host "== packaging windows-$arch =="
+
 # Copy the engine DLL beside the runner so it loads at runtime.
 $dll = "..\rust\target\release\peerbeam_ffi.dll"
-$runner = "build\windows\x64\runner\Release"
+$runner = "build\windows\$arch\runner\Release"
 if (Test-Path $dll) { Copy-Item $dll $runner -Force } else { Write-Warning "peerbeam_ffi.dll not found" }
 
 Write-Host "== create MSIX =="
@@ -33,8 +40,8 @@ if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME.StartsWith("v")) {
   $ver = $env:GITHUB_REF_NAME.Substring(1)
 }
 New-Item -ItemType Directory -Force -Path dist | Out-Null
-$release = "flutter\build\windows\x64\runner\Release"
-$zip = "dist\peerbeam-$ver-windows-x64-portable.zip"
+$release = "flutter\build\windows\$arch\runner\Release"
+$zip = "dist\peerbeam-$ver-windows-$arch-portable.zip"
 # Everything in the runner output except the MSIX (shipped separately).
 # (-Path with an array: piping into Compress-Archive -Force would recreate
 # the archive per item and keep only the last one.)
