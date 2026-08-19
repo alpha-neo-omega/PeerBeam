@@ -160,6 +160,7 @@ mod tests {
                         path: (*p).to_string(),
                         size: 1,
                         modified: 0,
+                        content: String::new(),
                         version: v.clone(),
                         deleted: *deleted,
                     },

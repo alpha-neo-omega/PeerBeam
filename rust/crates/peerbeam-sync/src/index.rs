@@ -39,6 +39,15 @@ pub struct IndexEntry {
     /// Mtime when last indexed, same purpose.
     pub modified: i64,
     pub version: VersionVector,
+    /// SHA-256 of the file's bytes when last indexed, hex.
+    ///
+    /// What makes a rename recognisable: a deletion and a creation carrying the
+    /// same hash are one file that moved, not a re-transfer waiting to happen.
+    /// `default` so an index written before hashing still loads — an entry with
+    /// no hash simply never pairs, which costs a re-send rather than risking a
+    /// wrong one.
+    #[serde(default)]
+    pub content: String,
     /// Whether this records a deletion. The entry stays so the deletion can
     /// reach peers; a removed record would look like a file nobody ever had.
     #[serde(default)]
@@ -112,6 +121,7 @@ impl SyncIndex {
                     // Edited outside PeerBeam, or resurrected after a delete.
                     e.size = size;
                     e.modified = modified;
+                    e.content = content_hash(&root.join(&path));
                     e.deleted = false;
                     e.version.bump(&self.device);
                     self.put(folder, &e)?;
@@ -126,6 +136,7 @@ impl SyncIndex {
                             path: path.clone(),
                             size,
                             modified,
+                            content: content_hash(&root.join(&path)),
                             version,
                             deleted: false,
                         },
@@ -142,12 +153,47 @@ impl SyncIndex {
             }
             e.deleted = true;
             e.size = 0;
+            // The hash is **kept**, not cleared: it is the only thing that can
+            // pair this deletion with a creation elsewhere and recognise a
+            // rename. Clearing it would turn every move back into a re-send.
             e.version.bump(&self.device);
             self.put(folder, &e)?;
             changed.push(path);
         }
         Ok(changed)
     }
+}
+
+/// SHA-256 of a file's bytes, or empty if it cannot be read.
+///
+/// Empty on failure rather than an error: a file that vanished between the walk
+/// and the hash is a race the next scan resolves, and failing the whole rescan
+/// over one unreadable file would strand the rest of the folder. An empty hash
+/// simply never pairs as a rename, which costs a re-send rather than risking a
+/// wrong pairing.
+fn content_hash(path: &Path) -> String {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    // Streamed in fixed blocks: a file must never be read into memory whole.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return String::new(),
+        }
+    }
+    let digest = hasher.finalize();
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// A storage key for a path.
@@ -317,6 +363,82 @@ mod tests {
         let loaded = idx.load("f").unwrap();
         assert!(!loaded["a.txt"].deleted);
         assert_eq!(loaded["a.txt"].version.get("pb-me"), 3);
+    }
+
+    #[test]
+    fn a_files_content_hash_is_recorded_and_tracks_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"first").unwrap();
+        let idx = index(dir.path());
+        idx.rescan("f", &root).unwrap();
+        let first = idx.load("f").unwrap()["a.txt"].content.clone();
+        assert_eq!(first.len(), 64, "not a sha-256 hex digest: {first}");
+
+        std::fs::write(root.join("a.txt"), b"second").unwrap();
+        idx.rescan("f", &root).unwrap();
+        assert_ne!(
+            idx.load("f").unwrap()["a.txt"].content,
+            first,
+            "the hash did not follow the edit"
+        );
+    }
+
+    /// **A tombstone keeps its hash.** It is the only thing that can pair the
+    /// deletion with a creation elsewhere and recognise a rename; clearing it
+    /// would turn every move back into a full re-send.
+    #[test]
+    fn a_deleted_entry_keeps_the_hash_that_makes_a_rename_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"contents").unwrap();
+        let idx = index(dir.path());
+        idx.rescan("f", &root).unwrap();
+        let hash = idx.load("f").unwrap()["a.txt"].content.clone();
+
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        idx.rescan("f", &root).unwrap();
+        let entry = &idx.load("f").unwrap()["a.txt"];
+        assert!(entry.deleted);
+        assert_eq!(entry.content, hash, "the tombstone lost its content hash");
+    }
+
+    /// A rename is a delete and a create in one scan, and the two entries carry
+    /// the same hash — which is exactly what `detect_renames` pairs on.
+    #[test]
+    fn renaming_a_file_leaves_two_entries_sharing_one_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("old.txt"), b"unchanged bytes").unwrap();
+        let idx = index(dir.path());
+        idx.rescan("f", &root).unwrap();
+
+        std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+        idx.rescan("f", &root).unwrap();
+
+        let loaded = idx.load("f").unwrap();
+        assert!(loaded["old.txt"].deleted);
+        assert!(!loaded["new.txt"].deleted);
+        assert_eq!(
+            loaded["old.txt"].content, loaded["new.txt"].content,
+            "the moved file's hash changed, so no rename could be detected"
+        );
+
+        let (renames, deleted, created) = crate::rename::detect(
+            &[("old.txt".to_string(), loaded["old.txt"].content.clone())],
+            &[("new.txt".to_string(), loaded["new.txt"].content.clone())],
+        );
+        assert_eq!(renames.len(), 1, "the rename was not recognised");
+        assert!(deleted.is_empty() && created.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_file_hashes_to_empty_rather_than_failing_the_scan() {
+        // One unreadable file must not strand the rest of the folder.
+        assert_eq!(content_hash(Path::new("/definitely/not/here")), "");
     }
 
     #[test]

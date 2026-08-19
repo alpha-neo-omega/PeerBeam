@@ -80,6 +80,10 @@ pub fn apply_local(
                             path: path.clone(),
                             size: 0,
                             modified: 0,
+                            // A tombstone for a file this device never held has
+                            // no content to hash, so it can never pair as a
+                            // rename — correct: nothing moved here.
+                            content: String::new(),
                             version: remote_versions.get(path).cloned().unwrap_or_default(),
                             deleted: true,
                         },
