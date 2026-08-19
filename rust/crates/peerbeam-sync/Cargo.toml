@@ -12,6 +12,7 @@ peerbeam-domain = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
+peerbeam-chunk = { path = "../peerbeam-chunk" }
 serde = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }

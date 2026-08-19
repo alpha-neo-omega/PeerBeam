@@ -11,6 +11,7 @@
 //! and progress semantics to keep in step with the first.
 
 mod apply;
+mod delta;
 mod handler;
 mod index;
 mod manifest;
@@ -19,6 +20,7 @@ mod rename;
 mod version;
 
 pub use apply::{apply_local, Outcome};
+pub use delta::{plan as plan_delta, reassemble, ChunkMap, Need};
 pub use handler::{build, build_with, IncomingSink, ManifestSink, SendFile, SyncHandler};
 pub use index::{IndexEntry, SyncIndex, NS as INDEX_NS};
 pub use manifest::{
