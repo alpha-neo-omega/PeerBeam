@@ -6,6 +6,7 @@ import '../features/devices/devices_screen.dart';
 import '../features/history/history_screen.dart';
 import '../features/home/home_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../features/spaces/spaces_screen.dart';
 import '../features/transfers/transfers_screen.dart';
 import 'shell.dart';
 import 'theme.dart';
@@ -71,6 +72,21 @@ GoRouter buildRouter() {
               GoRoute(
                 path: '/settings',
                 pageBuilder: (c, s) => _fade(const SettingsScreen()),
+              ),
+            ],
+          ),
+          // Appended, not slotted in beside Devices where it belongs by
+          // subject. Branch order is `AppShell._destinations` order is the
+          // Ctrl/⌘+1..N order — all three index-for-index — so inserting
+          // renumbers every shortcut after the insertion point. That has
+          // happened twice already; a Space is not something anyone reaches by
+          // reflex, and it is not worth moving four digits under the fingers of
+          // people who do.
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/spaces',
+                pageBuilder: (c, s) => _fade(const SpacesScreen()),
               ),
             ],
           ),

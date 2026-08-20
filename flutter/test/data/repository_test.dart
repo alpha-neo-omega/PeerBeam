@@ -652,8 +652,15 @@ void main() {
 
       await repo.openThread('pb-bob');
 
-      // Order matters: reading first would render a dead Accept button.
-      expect(fake.calls, ['chatReconcile:pb-bob', 'chatHistory:pb-bob']);
+      // Order matters: reading first would render a dead Accept button. The
+      // claim is the ORDER of these two, not that they are the only calls —
+      // opening a thread also reads its disappearing-message window (and
+      // prunes when one is set), and an exact-list assertion would fail on
+      // every honest addition rather than on the defect it is guarding.
+      expect(
+        fake.calls,
+        containsAllInOrder(['chatReconcile:pb-bob', 'chatHistory:pb-bob']),
+      );
       expect(
         repo.messagesFor('pb-bob').single.status,
         ChatStatusValue.interrupted,

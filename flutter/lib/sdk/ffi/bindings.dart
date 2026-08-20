@@ -77,6 +77,20 @@ class Bindings {
   final _ArgRetDart _chatReact;
   final _ArgRetDart _chatMarkRead;
   final _ArgRetDart _notesList;
+  final _ArgRetDart _spacesList;
+  final _ArgRetDart _spacesCreate;
+  final _ArgRetDart _spacesRename;
+  final _ArgRetDart _spacesDelete;
+  final _ArgRetDart _spacesAddMember;
+  final _ArgRetDart _spacesRemoveMember;
+  final _ArgRetDart _trustSetMine;
+  final _ArgRetDart _trustMyDevices;
+  final _ArgRetDart _wakeSet;
+  final _ArgRetDart _wakeForget;
+  final _ArgRetDart _wakeSend;
+  final _ArgRetDart _chatRetentionGet;
+  final _ArgRetDart _chatRetentionSet;
+  final _ArgRetDart _chatPrune;
   final _ArgRetDart _notesCreate;
   final _ArgRetDart _notesEdit;
   final _ArgRetDart _notesDelete;
@@ -179,6 +193,38 @@ class Bindings {
         'pb_chat_mark_read',
       ),
       _notesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_list'),
+      _spacesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_spaces_list'),
+      _spacesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_spaces_create',
+      ),
+      _spacesRename = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_spaces_rename',
+      ),
+      _spacesDelete = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_spaces_delete',
+      ),
+      _spacesAddMember = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_spaces_add_member',
+      ),
+      _spacesRemoveMember = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_spaces_remove_member',
+      ),
+      _trustSetMine = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_trust_set_mine',
+      ),
+      _trustMyDevices = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_trust_my_devices',
+      ),
+      _wakeSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_set'),
+      _wakeForget = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_forget'),
+      _wakeSend = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_send'),
+      _chatRetentionGet = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_retention_get',
+      ),
+      _chatRetentionSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_chat_retention_set',
+      ),
+      _chatPrune = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_chat_prune'),
       _notesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_notes_create',
       ),
@@ -283,6 +329,20 @@ class Bindings {
   String chatReact(String json) => _withArg(json, _chatReact);
   String chatMarkRead(String json) => _withArg(json, _chatMarkRead);
   String notesList(String json) => _withArg(json, _notesList);
+  String spacesList(String json) => _withArg(json, _spacesList);
+  String spacesCreate(String json) => _withArg(json, _spacesCreate);
+  String spacesRename(String json) => _withArg(json, _spacesRename);
+  String spacesDelete(String json) => _withArg(json, _spacesDelete);
+  String spacesAddMember(String json) => _withArg(json, _spacesAddMember);
+  String spacesRemoveMember(String json) => _withArg(json, _spacesRemoveMember);
+  String trustSetMine(String json) => _withArg(json, _trustSetMine);
+  String trustMyDevices(String json) => _withArg(json, _trustMyDevices);
+  String wakeSet(String json) => _withArg(json, _wakeSet);
+  String wakeForget(String json) => _withArg(json, _wakeForget);
+  String wakeSend(String json) => _withArg(json, _wakeSend);
+  String chatRetentionGet(String json) => _withArg(json, _chatRetentionGet);
+  String chatRetentionSet(String json) => _withArg(json, _chatRetentionSet);
+  String chatPrune(String json) => _withArg(json, _chatPrune);
   String notesCreate(String json) => _withArg(json, _notesCreate);
   String notesEdit(String json) => _withArg(json, _notesEdit);
   String notesDelete(String json) => _withArg(json, _notesDelete);

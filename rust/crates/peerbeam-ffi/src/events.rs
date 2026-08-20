@@ -90,6 +90,13 @@ pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
         // indistinguishable, because a peer that opted out owes no explanation
         // and a surface must not imply one was withheld.
         "read_at": rec.read_at,
+        // The message this one answers, or null. A *reference*, never a copy of
+        // the quoted text: a snapshot would outlive the message it quoted, so a
+        // disappearing-message window could be defeated by anyone replying to
+        // something. A surface resolves it against the rows it already holds,
+        // which is also why a parent that has gone renders as an orphan rather
+        // than being quoted from somewhere else.
+        "in_reply_to": rec.in_reply_to,
     })
 }
 

@@ -137,6 +137,29 @@ class _ChatScreenState extends State<ChatScreen> {
   /// hood, so the button handler must not block on it — the optimistic
   /// message (appended inside the repository, before its own await) is what
   /// keeps the tap responsive.
+  /// The message being answered, or null.
+  ///
+  /// Held as an id plus a preview rather than the whole row: the row can
+  /// disappear while the composer is open (a window can close mid-typing), and
+  /// keeping a copy of its body would be the snapshot the engine refuses to
+  /// take — the quoted text outliving the message it quoted is exactly how a
+  /// retention window gets defeated.
+  String? _replyToId;
+  String? _replyPreview;
+
+  void _startReply(ChatMessage m) {
+    setState(() {
+      _replyToId = m.id;
+      _replyPreview = m.isFile ? (m.fileName ?? 'a file') : m.body;
+    });
+    _clearSelection();
+  }
+
+  void _cancelReply() => setState(() {
+    _replyToId = null;
+    _replyPreview = null;
+  });
+
   void _send() {
     final text = _controller.text;
     if (text.trim().isEmpty) return;
@@ -144,7 +167,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.clear();
     // Resolved as the message goes out, not as the thread was opened: an
     // address that arrived in between is the address this send needs.
-    state.chat.send(widget.peerId, _target(state), text);
+    final replyTo = _replyToId;
+    _cancelReply();
+    state.chat.send(widget.peerId, _target(state), text, inReplyTo: replyTo);
   }
 
   /// Attach files to the conversation.
@@ -381,6 +406,117 @@ class _ChatScreenState extends State<ChatScreen> {
     return '$removed · $kept';
   }
 
+  /// Open the disappearing-messages sheet and apply what it returns.
+  ///
+  /// The engine's own counts are reported afterwards rather than predicted
+  /// before: a window shorter than the conversation is old deletes history the
+  /// moment it is chosen, and the user is told how much — including anything
+  /// that was still waiting to be sent and now never will be. Same rule as
+  /// [_deleteOutcome]; a restatement of what was asked would hide both.
+  Future<void> _openRetention() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final state = AppScope.of(context);
+    final chosen = await _pickRetention(
+      context,
+      peerName: _target(state).name,
+      current: state.chat.retentionFor(widget.peerId),
+    );
+    if (chosen == null || !mounted) return;
+    try {
+      final pruned = await state.chat.setRetention(
+        widget.peerId,
+        chosen.seconds,
+      );
+      if (!mounted) return;
+      _snack(messenger, _retentionOutcome(chosen.seconds, pruned));
+    } catch (e) {
+      // Never swallowed: the sheet closed on the tap, so silence here would
+      // leave someone believing their conversation is being deleted on a
+      // schedule that was never written.
+      if (!mounted) return;
+      _snack(
+        messenger,
+        'Could not change disappearing messages — ${friendlyError(e)}',
+      );
+    }
+  }
+
+  /// What actually happened, in the engine's own answer — and, for a window
+  /// turned off, the one thing off cannot do.
+  static String _retentionOutcome(
+    int? seconds,
+    ({int messages, int queued}) pruned,
+  ) {
+    if (seconds == null) {
+      return 'Disappearing messages off. Messages from here on are kept '
+          'until you delete them — anything already deleted is gone.';
+    }
+    final also = [
+      if (pruned.messages > 0)
+        pruned.messages == 1
+            ? '1 older message deleted now'
+            : '${pruned.messages} older messages deleted now',
+      // Worth its own clause, never folded into the count above: a queued
+      // message was going to be sent, and this is the user being told it will
+      // not be.
+      if (pruned.queued > 0)
+        pruned.queued == 1
+            ? '1 that was waiting to be sent will not be sent'
+            : '${pruned.queued} that were waiting to be sent will not be sent',
+    ];
+    final head =
+        'Messages here disappear from this device after '
+        '${_windowLabel(seconds)}';
+    return also.isEmpty ? head : '$head · ${also.join(' · ')}';
+  }
+
+  /// What this conversation says about its own disappearing-message window,
+  /// above the messages rather than behind a menu: a window that silently
+  /// deletes a conversation is the one setting a reader must be able to see
+  /// without going looking for it, and the sentence it most needs to carry is
+  /// the limit — **this device only** — because that is the belief a person
+  /// forms wrongly and cannot recover from.
+  ///
+  /// Three states, of which only two draw anything. A window that is **off**
+  /// draws nothing: off is the default, and no strip is exactly what it means.
+  /// A window not yet read draws nothing either — for the one frame before
+  /// `openThread` answers, this screen states nothing about it in either
+  /// direction. A read that **failed** draws the failure and a retry, because
+  /// rendering it as the default would state "nothing here disappears" about a
+  /// conversation that may be deleting itself hourly, which is the one wrong
+  /// answer this strip could give. A window read once and re-read
+  /// unsuccessfully keeps showing what it last knew: a stale window is still
+  /// the window, exactly as stale messages are still the messages.
+  Widget? _retentionStrip(AppState state, PeerTarget peer) {
+    final current = state.chat.retentionFor(widget.peerId);
+    if (!current.known) {
+      final error = current.error;
+      return error == null
+          ? null
+          : _RetentionStrip(
+              icon: Icons.error_outline_rounded,
+              iconColor: Theme.of(context).colorScheme.error,
+              title: 'Could not check whether messages here disappear',
+              detail: friendlyError(error),
+              onRetry: () => state.chat.refreshRetention(widget.peerId),
+            );
+    }
+    final seconds = current.seconds;
+    if (seconds == null) return null;
+    return _RetentionStrip(
+      icon: Icons.timer_outlined,
+      title:
+          'Messages disappear from this device after ${_windowLabel(seconds)}',
+      // Said here, not only in the sheet that set it: this is the line that
+      // stops "disappearing" being read as "deleted on both sides", and it has
+      // to be where the conversation is read.
+      detail:
+          '${peer.name} keeps its own copy — this device cannot delete '
+          'that. Received files are kept.',
+      onTap: _openRetention,
+    );
+  }
+
   /// Forward the selected messages to another device.
   ///
   /// [chosen] arrives in **thread order** and is sent in that order, one await
@@ -497,6 +633,15 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       title: Text('${selected.length} selected'),
       actions: [
+        // Only for one. A reply names a single message, so "reply to five" has
+        // no meaning; offering it disabled would just pose a question with no
+        // answer.
+        if (chosen.length == 1)
+          IconButton(
+            icon: const Icon(Icons.reply_rounded),
+            tooltip: 'Reply',
+            onPressed: () => _startReply(chosen.first),
+          ),
         IconButton(
           icon: const Icon(Icons.forward_rounded),
           tooltip: 'Forward',
@@ -563,7 +708,19 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       appBar: selecting
           ? _selectionBar(items, selected)
-          : AppBar(title: Text(peer.name)),
+          : AppBar(
+              title: Text(peer.name),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.timer_outlined),
+                  // Named for what it is rather than for the window in force:
+                  // the state belongs on the strip, where it is read, not in a
+                  // tooltip nobody hovers on a phone.
+                  tooltip: 'Disappearing messages',
+                  onPressed: _openRetention,
+                ),
+              ],
+            ),
       // Desktop-only drag & drop for this one conversation — a transparent
       // passthrough everywhere else, exactly like the Send flow's own
       // DropZone. Wraps the body (not the AppBar) so a drop anywhere over the
@@ -576,6 +733,7 @@ class _ChatScreenState extends State<ChatScreen> {
           child: ContentPane(
             child: Column(
               children: [
+                ?_retentionStrip(state, peer),
                 Expanded(
                   child: items.isEmpty
                       // A conversation this device could not read is not a
@@ -617,6 +775,18 @@ class _ChatScreenState extends State<ChatScreen> {
                               index: i,
                               child: _ChatBubble(
                                 message: message,
+                                // Resolved against the rows on screen only. A
+                                // parent that has disappeared resolves to null
+                                // and renders as an orphan — never fetched from
+                                // elsewhere, or a message the user was told had
+                                // gone could be quoted back at them.
+                                parent: message.inReplyTo == null
+                                    ? null
+                                    : items
+                                          .where(
+                                            (m) => m.id == message.inReplyTo,
+                                          )
+                                          .firstOrNull,
                                 error: state.chat.errorFor(message.id),
                                 selecting: selecting,
                                 selected: selected.contains(message.id),
@@ -651,6 +821,11 @@ class _ChatScreenState extends State<ChatScreen> {
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
+                  ),
+                if (_replyToId != null)
+                  _ReplyBanner(
+                    preview: _replyPreview ?? '',
+                    onCancel: _cancelReply,
                   ),
                 _Composer(
                   controller: _controller,
@@ -763,12 +938,21 @@ class _ChatBubble extends StatelessWidget {
 
   /// Open the quick-reaction picker for this message. Null while selecting.
   final VoidCallback? onPickReaction;
+
+  /// The message this one answers, when it is still among the rows on screen.
+  ///
+  /// Null covers both "not a reply" and "the answered message is gone", and the
+  /// bubble tells those apart by [ChatMessage.inReplyTo] rather than by this
+  /// being null — an orphan must still show its marker.
+  final ChatMessage? parent;
+
   const _ChatBubble({
     required this.message,
     required this.selecting,
     required this.selected,
     required this.onToggle,
     this.error,
+    this.parent,
     this.onDismiss,
     this.onReact,
     this.onPickReaction,
@@ -831,6 +1015,9 @@ class _ChatBubble extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      // Keyed off `inReplyTo`, not off `parent`: a reply whose
+                      // answered message has gone must still say it is a reply.
+                      if (message.isReply) _ReplyMarker(parent: parent),
                       if (message.isFile)
                         _FileBody(
                           message: message,
@@ -1332,6 +1519,269 @@ class _FileBody extends StatelessWidget {
   };
 }
 
+/// The windows offered, in seconds: an hour, a day, a week.
+///
+/// A short list of choices rather than a free-text duration. Someone typing a
+/// window is someone who can type `30` and get thirty seconds, and this is a
+/// setting whose mistakes delete a conversation. The engine accepts anything
+/// (`peerbeam chat retention --after 30m` still does), and a window set that
+/// way is shown here in its own words rather than snapped to one of these —
+/// see [_windowLabel].
+const _retentionWindows = <int>[3600, 86400, 604800];
+
+/// A window in words, exactly.
+///
+/// Never rounded. The offered windows are whole hours and days, but the CLI
+/// takes any duration, and a `90m` window shown as "1 hour" or "2 hours" would
+/// state that messages live for a length of time they do not — in the one place
+/// someone checks how long they have.
+String _windowLabel(int seconds) {
+  String plural(int n, String unit) => n == 1 ? '1 $unit' : '$n ${unit}s';
+  if (seconds % 86400 == 0) return plural(seconds ~/ 86400, 'day');
+  if (seconds % 3600 == 0) return plural(seconds ~/ 3600, 'hour');
+  if (seconds % 60 == 0) return plural(seconds ~/ 60, 'minute');
+  return plural(seconds, 'second');
+}
+
+/// The disappearing-messages sheet: what the window does, what it deliberately
+/// does **not** do, and the four choices. Returns null if it is dismissed
+/// without one — which is why the choice comes back wrapped, since "off" is
+/// itself a null number of seconds and must not read as "no answer".
+///
+/// # The limits are the feature, so they are stated here and not in a help page
+///
+/// Three of them, in the order someone forms the wrong belief:
+///
+///  1. **This device only.** No frame asks [peerName] to delete anything and
+///     there is no honest way to send one — that copy is on their disk, under
+///     their control. A user who believes "disappearing" means both sides has
+///     been misled by this sheet, and that is worse than not offering the
+///     setting at all, so the narrower true promise is spelled out instead.
+///  2. **Received files stay.** Only the conversation row goes. A file someone
+///     accepted is theirs, saved where they chose, and destroying it because a
+///     chat window closed would be data loss dressed as privacy.
+///  3. **Off is the default, and off is not an undo.** Turning a window off
+///     stops the deleting; it cannot bring back what has already gone.
+Future<({int? seconds})?> _pickRetention(
+  BuildContext context, {
+  required String peerName,
+  required ({bool known, int? seconds, Object? error}) current,
+}) {
+  return showModalBottomSheet<({int? seconds})>(
+    context: context,
+    showDragHandle: true,
+    // The copy is the point of this sheet and must not be a scroll stub on a
+    // phone: the limits above the choices are what stop the choices being
+    // misread.
+    isScrollControlled: true,
+    builder: (ctx) {
+      final theme = Theme.of(ctx);
+      final text = theme.textTheme;
+      final scheme = theme.colorScheme;
+      final body = text.bodySmall?.copyWith(color: scheme.onSurfaceVariant);
+      return SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpace.lg,
+                  AppSpace.xxs,
+                  AppSpace.lg,
+                  AppSpace.xs,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Disappearing messages',
+                      style: text.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const Gap(AppSpace.xs),
+                    Text(
+                      'This window is local to this device. Messages in this '
+                      'conversation are deleted from here once it passes.',
+                      style: text.bodyMedium,
+                    ),
+                    const Gap(AppSpace.xs),
+                    Text(
+                      'PeerBeam does not ask $peerName to delete its copy, and '
+                      'it cannot: that copy is on their device. What this '
+                      'device can promise is narrower and true — a message is '
+                      'readable here for at most the window, then removed from '
+                      'here.',
+                      style: body,
+                    ),
+                    const Gap(AppSpace.xs),
+                    Text(
+                      'Received files are not deleted. Only the conversation '
+                      'row goes; a file you accepted stays where it was saved.',
+                      style: body,
+                    ),
+                    const Gap(AppSpace.xs),
+                    Text(
+                      'Off by default. Turning a window back off keeps '
+                      'everything from then on, but cannot bring back what has '
+                      'already been deleted.',
+                      style: body,
+                    ),
+                    // Only when the read did not answer. Marking nothing as
+                    // current is deliberate: the alternative is a tick against
+                    // "Off", which is a claim about this conversation that
+                    // nothing here has established.
+                    if (!current.known) ...[
+                      const Gap(AppSpace.xs),
+                      Text(
+                        'PeerBeam could not read the window in force here, so '
+                        'nothing below is marked as current.',
+                        style: text.bodySmall?.copyWith(color: scheme.error),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              _RetentionChoice(
+                label: 'Off',
+                detail: 'Messages are kept until you delete them',
+                selected: current.known && current.seconds == null,
+                onTap: () => Navigator.pop(ctx, (seconds: null)),
+              ),
+              for (final seconds in _retentionWindows)
+                _RetentionChoice(
+                  label: _windowLabel(seconds),
+                  detail:
+                      'Deleted from this device after ${_windowLabel(seconds)}',
+                  selected: current.seconds == seconds,
+                  onTap: () => Navigator.pop(ctx, (seconds: seconds)),
+                ),
+              const Gap(AppSpace.xs),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+/// One window in the sheet. The current one is ticked as well as highlighted —
+/// a tint alone is a colour someone has to interpret, and this list has to
+/// answer "what is it set to now?" at a glance.
+class _RetentionChoice extends StatelessWidget {
+  final String label;
+  final String detail;
+  final bool selected;
+  final VoidCallback onTap;
+  const _RetentionChoice({
+    required this.label,
+    required this.detail,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListTile(
+      selected: selected,
+      leading: Icon(
+        selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+        color: selected ? scheme.primary : scheme.onSurfaceVariant,
+      ),
+      title: Text(label),
+      subtitle: Text(detail),
+      trailing: selected ? const Text('Current') : null,
+      onTap: onTap,
+    );
+  }
+}
+
+/// The strip above the thread: one line of state, one line of limit, and either
+/// somewhere to change it or somewhere to retry the read that failed. Built by
+/// [_ChatScreenState._retentionStrip], which decides which of the two it is.
+class _RetentionStrip extends StatelessWidget {
+  final IconData icon;
+  final Color? iconColor;
+  final String title;
+  final String detail;
+
+  /// Opens the sheet. Null on the failure variant: there is nothing to change
+  /// until the read comes back, and offering a picker there would invite
+  /// someone to set a window over a state PeerBeam could not read.
+  final VoidCallback? onTap;
+
+  /// Runs the window read again. Null on the ordinary variant.
+  final VoidCallback? onRetry;
+
+  const _RetentionStrip({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    this.iconColor,
+    this.onTap,
+    this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpace.md,
+        AppSpace.xs,
+        AppSpace.md,
+        0,
+      ),
+      child: Material(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(AppSpace.sm),
+            child: Row(
+              children: [
+                Icon(
+                  icon,
+                  size: AppIcons.sm,
+                  color: iconColor ?? scheme.onSurfaceVariant,
+                ),
+                const Gap(AppSpace.xs),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(title, style: text.labelLarge),
+                      Text(
+                        detail,
+                        style: text.labelSmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (onRetry != null)
+                  IconButton(
+                    icon: const Icon(Icons.refresh_rounded),
+                    tooltip: 'Try again',
+                    onPressed: onRetry,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Ask what kind of file to attach, in the shape WhatsApp uses: **Document**
 /// (no filter — today's picker, unchanged), **Photos & videos**, or **Audio**.
 /// Returns null if the sheet is dismissed without a choice.
@@ -1472,6 +1922,105 @@ class _Composer extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// What sits above the composer while a reply is being written.
+///
+/// Shows the preview it captured when Reply was pressed, and nothing more. The
+/// preview is not sent and is not stored: a reply carries only the answered
+/// message's id, so the quoted text cannot outlive the message it quotes. That
+/// is the property a disappearing-message window depends on.
+class _ReplyBanner extends StatelessWidget {
+  final String preview;
+  final VoidCallback onCancel;
+  const _ReplyBanner({required this.preview, required this.onCancel});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      color: scheme.surfaceContainerHighest,
+      padding: const EdgeInsets.fromLTRB(
+        AppSpace.md,
+        AppSpace.xs,
+        AppSpace.xs,
+        AppSpace.xs,
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.reply_rounded, size: AppIcons.sm, color: scheme.primary),
+          const Gap(AppSpace.xs),
+          Expanded(
+            child: Text(
+              preview.isEmpty ? 'Replying' : 'Replying to “$preview”',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close_rounded),
+            tooltip: 'Stop replying',
+            iconSize: AppIcons.sm,
+            onPressed: onCancel,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The marker on a message that answers another.
+///
+/// # Why an orphan still shows the marker
+///
+/// When the answered message is gone — deleted, or disappeared with a window —
+/// this renders "In reply to a message that is no longer here" rather than
+/// vanishing or falling silent.
+///
+/// Hiding the reply would delete one message because a *different* one was
+/// deleted, and on a short window that cascades. Dropping just the marker is
+/// worse: "sure, go ahead" answering *shall I delete the backups?* and *can I
+/// borrow a pen?* are the same seven characters, and a reader with no marker has
+/// no way to know which question was asked.
+class _ReplyMarker extends StatelessWidget {
+  /// The answered message, or null when it is no longer among the rows on
+  /// screen. Resolved against those rows only — never fetched from elsewhere,
+  /// so a message the user was told had gone cannot be quoted back at them.
+  final ChatMessage? parent;
+  const _ReplyMarker({required this.parent});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final p = parent;
+    final text = p == null
+        ? 'In reply to a message that is no longer here'
+        : (p.isFile ? (p.fileName ?? 'a file') : p.body);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpace.xxs),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.reply_rounded, size: 12, color: scheme.onSurfaceVariant),
+          const Gap(AppSpace.xxs),
+          Flexible(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                fontStyle: p == null ? FontStyle.italic : null,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

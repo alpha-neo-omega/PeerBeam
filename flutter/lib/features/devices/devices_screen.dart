@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../sdk/error_text.dart';
 import '../../sdk/models.dart';
+import '../../sdk/peerbeam.dart';
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
+import '../../state/stores.dart';
 import '../../widgets/appear.dart';
+import '../../widgets/common.dart';
 import '../../widgets/status_dot.dart';
+import 'device_actions.dart';
+import 'wake_dialog.dart';
 
 /// The device dashboard: every known device, what it can do, and whatever
 /// status it has chosen to share.
@@ -20,8 +26,97 @@ import '../../widgets/status_dot.dart';
 /// Splitting them keeps each view honest about its job, and it means a device
 /// that shares nothing still has somewhere to appear with its identity and
 /// reachability instead of being a row of blank gauges on the send screen.
-class DevicesScreen extends StatelessWidget {
+class DevicesScreen extends StatefulWidget {
   const DevicesScreen({super.key});
+
+  @override
+  State<DevicesScreen> createState() => _DevicesScreenState();
+}
+
+class _DevicesScreenState extends State<DevicesScreen> {
+  /// The ids the user has marked as their own, or null while that read has not
+  /// answered — see [_mineError] for why the two are not collapsed into an
+  /// empty set. "None of these are yours" is a claim about a list, and making
+  /// it before the list has arrived is precisely how a failed read starts
+  /// reading as a fact.
+  Set<String>? _mine;
+
+  /// The last failure of that read. Kept separate so the screen can say "we
+  /// could not find out" — an ungrouped list with a retry — instead of
+  /// rendering an empty **My devices** group, which would answer the question
+  /// the read failed to answer.
+  Object? _mineError;
+
+  @override
+  void initState() {
+    super.initState();
+    // Post-frame, not in initState: `AppScope.of` needs a mounted element, and
+    // the write path below reaches ScaffoldMessenger for the same reason.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMine());
+  }
+
+  Future<void> _loadMine() async {
+    final api = AppScope.of(context).api;
+    if (api == null) {
+      // No engine: nothing can be marked and nothing can be read, so an empty
+      // set is the truth here rather than a stand-in for one.
+      setState(() {
+        _mine = const {};
+        _mineError = null;
+      });
+      return;
+    }
+    setState(() {
+      _mine = null;
+      _mineError = null;
+    });
+    try {
+      final ids = await api.myDevices();
+      if (!mounted) return;
+      setState(() => _mine = ids.toSet());
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _mineError = e);
+    }
+  }
+
+  /// Add or drop the label, then re-read.
+  ///
+  /// Re-read rather than adopting the tap: the engine's list is what the
+  /// grouping claims to show, and a write it declined must not leave the screen
+  /// displaying something that did not happen.
+  Future<void> _setMine(Device device, bool mine) async {
+    final api = AppScope.of(context).api;
+    if (api == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await api.setDeviceMine(device.id, mine: mine);
+    } catch (e) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(friendlyError(e))));
+      return;
+    }
+    await _loadMine();
+    if (!mounted) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          // The confirmation carries the claim, because this is the moment a
+          // user is most likely to believe they just granted something: the
+          // word "mine" invites it, and nothing else on screen contradicts it.
+          content: Text(
+            mine
+                ? '${device.name} is grouped under My devices. That is a label '
+                      'kept on this device — it grants no permission, and '
+                      '${device.name} is not told.'
+                : '${device.name} is no longer under My devices. Nothing else '
+                      'changed; the label never granted anything.',
+          ),
+        ),
+      );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -36,29 +131,104 @@ class DevicesScreen extends StatelessWidget {
         ]),
         builder: (context, _) {
           final devices = state.device.devices;
-          if (devices.isEmpty) {
-            return const _Empty();
-          }
-          return ListView.builder(
-            padding: const EdgeInsets.all(AppSpace.md),
-            itemCount: devices.length + 1,
-            itemBuilder: (context, i) {
-              if (i == 0) {
-                return _SharingBanner(sharing: state.settings.sharePresence);
-              }
-              final device = devices[i - 1];
-              return Appear(
-                index: i - 1,
-                child: DeviceStatusCard(
-                  device: device,
-                  presence: state.presence.of(device.id),
-                ),
-              );
-            },
+          if (devices.isEmpty) return const _Empty();
+          // Composed as a flat list of rows — banner, headers, cards — so the
+          // section structure lives in one readable place instead of index
+          // arithmetic inside an item builder. The list is one network's worth
+          // of devices, and only the visible rows are mounted.
+          final rows = _rows(state, devices);
+          return ContentPane(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(AppSpace.md),
+              itemCount: rows.length,
+              itemBuilder: (context, i) => rows[i],
+            ),
           );
         },
       ),
     );
+  }
+
+  List<Widget> _rows(AppState state, List<Device> devices) {
+    final mine = _mine;
+    final rows = <Widget>[
+      _SharingBanner(sharing: state.settings.sharePresence),
+    ];
+
+    final error = _mineError;
+    if (error != null) {
+      rows.add(_GroupingUnavailable(error: error, onRetry: _loadMine));
+      rows.addAll(_cards(state, devices, mine: null, from: 0));
+      return rows;
+    }
+    if (mine == null) {
+      rows.add(const _CheckingOwnership());
+      rows.addAll(_cards(state, devices, mine: null, from: 0));
+      return rows;
+    }
+
+    final ours = [
+      for (final d in devices)
+        if (mine.contains(d.id)) d,
+    ];
+    if (ours.isEmpty) {
+      // No group yet, so no header for one: a heading over nothing reads as a
+      // section that failed to load. One line instead, which both makes the
+      // feature findable — it lives behind a row menu — and puts the label's
+      // "grants nothing" on screen before anyone uses it.
+      rows.add(const _NothingMarked());
+      rows.addAll(_cards(state, devices, mine: mine, from: 0));
+      return rows;
+    }
+    final theirs = [
+      for (final d in devices)
+        if (!mine.contains(d.id)) d,
+    ];
+    rows
+      ..add(const SectionHeader(title: 'My devices'))
+      ..add(const _MineExplanation())
+      ..addAll(_cards(state, ours, mine: mine, from: 0));
+    if (theirs.isNotEmpty) {
+      rows
+        ..add(const SectionHeader(title: 'Other devices'))
+        ..addAll(_cards(state, theirs, mine: mine, from: ours.length));
+    }
+    return rows;
+  }
+
+  /// One card per device. [from] continues the entrance stagger across a
+  /// section boundary so the two groups cascade as one list.
+  List<Widget> _cards(
+    AppState state,
+    List<Device> devices, {
+    required Set<String>? mine,
+    required int from,
+  }) {
+    final PeerBeamApi? api = state.api;
+    return [
+      for (var i = 0; i < devices.length; i++)
+        Padding(
+          padding: const EdgeInsets.only(bottom: AppSpace.xs),
+          child: Appear(
+            index: from + i,
+            child: DeviceStatusCard(
+              device: devices[i],
+              presence: state.presence.of(devices[i].id),
+              actions: DeviceActions(
+                device: devices[i],
+                mine: mine?.contains(devices[i].id),
+                onSetMine: api == null
+                    ? null
+                    : (value) => _setMine(devices[i], value),
+                onWake: api == null
+                    ? null
+                    : () =>
+                          showWakeDialog(context, api: api, device: devices[i]),
+              ),
+            ),
+          ),
+        ),
+    ];
   }
 }
 
@@ -66,30 +236,190 @@ class _Empty extends StatelessWidget {
   const _Empty();
 
   @override
+  Widget build(BuildContext context) => const EmptyState(
+    icon: Icons.devices_other_rounded,
+    title: 'No devices yet',
+    message: 'Devices appear here as they are discovered on your network.',
+  );
+}
+
+/// The **My devices** heading's one job beyond naming the group.
+///
+/// It is a label kept on this device: it grants nothing, widens no permission,
+/// and the devices in it are never told they are in it. A machine grouped here
+/// with no Browse permission still has no Browse permission. Stated in the
+/// group itself because grouping is the feature's whole visible effect, and a
+/// heading that implied more would break the most important claim PeerBeam
+/// makes about it.
+class _MineExplanation extends StatelessWidget {
+  const _MineExplanation();
+
+  @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(AppSpace.xl),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.devices_other_rounded, size: 48, color: scheme.outline),
-            const Gap(AppSpace.md),
-            Text(
-              'No devices yet',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const Gap(AppSpace.xs),
-            Text(
-              'Devices appear here as they are discovered on your network.',
-              textAlign: TextAlign.center,
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
-            ),
-          ],
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(
+        left: AppSpace.xxs,
+        right: AppSpace.xxs,
+        bottom: AppSpace.xs,
+      ),
+      child: Text(
+        'A label kept on this device. It grants nothing, widens no permission, '
+        'and these devices are never told.',
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
         ),
+      ),
+    );
+  }
+}
+
+/// The default: no machine marked as the user's own.
+class _NothingMarked extends StatelessWidget {
+  const _NothingMarked();
+
+  @override
+  Widget build(BuildContext context) => const _Line(
+    icon: Icons.label_outline_rounded,
+    text:
+        'None of these are marked as yours. Mark one from its menu to group it '
+        'under My devices — a label kept on this device that grants nothing '
+        'and is never sent anywhere.',
+  );
+}
+
+/// Shown while the ownership read is in flight, so the ungrouped list below is
+/// visibly provisional rather than an answer.
+class _CheckingOwnership extends StatelessWidget {
+  const _CheckingOwnership();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpace.sm),
+      child: Row(
+        children: [
+          const SizedBox.square(
+            dimension: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const Gap(AppSpace.xs),
+          Expanded(
+            child: Text(
+              'Checking which of these are yours…',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The ownership read failed.
+///
+/// A card rather than a full-page [ErrorState]: the device list itself arrived
+/// over the event stream and is perfectly good, so replacing it would hide
+/// working information to report a failed one. What must not happen is the
+/// grouping quietly claiming nothing is marked, which is why this says so in
+/// as many words and the list below carries no headers.
+class _GroupingUnavailable extends StatelessWidget {
+  final Object error;
+  final VoidCallback onRetry;
+
+  const _GroupingUnavailable({required this.error, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpace.sm),
+      child: Card(
+        color: theme.colorScheme.errorContainer,
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpace.sm),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                Icons.error_outline_rounded,
+                size: AppIcons.sm,
+                color: theme.colorScheme.onErrorContainer,
+              ),
+              const Gap(AppSpace.xs),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Could not read which devices are yours',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                    ),
+                    Text(
+                      '${friendlyError(error)} The list below is not grouped — '
+                      'this is not a claim that none of them are yours.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                    ),
+                    const Gap(AppSpace.xs),
+                    TextButton.icon(
+                      // Coloured explicitly: the button's default foreground is
+                      // `primary`, which is a colour chosen against `surface`
+                      // and not against the error tint this card is painted in.
+                      style: TextButton.styleFrom(
+                        foregroundColor: theme.colorScheme.onErrorContainer,
+                      ),
+                      onPressed: onRetry,
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('Try again'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A quiet icon + sentence row, the shape the list's non-card notes share.
+class _Line extends StatelessWidget {
+  final IconData icon;
+  final String text;
+
+  const _Line({required this.icon, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpace.sm),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            icon,
+            size: AppIcons.sm,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const Gap(AppSpace.xs),
+          Expanded(
+            child: Text(
+              text,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -146,7 +476,18 @@ class DeviceStatusCard extends StatelessWidget {
   final Device device;
   final SdkPresence? presence;
 
-  const DeviceStatusCard({super.key, required this.device, this.presence});
+  /// The row's menu (mark as mine, wake), or null for a card with nothing to
+  /// act on. Injected rather than built here so this stays a pure rendering of
+  /// facts about a device — it is also rendered in tests with no engine and no
+  /// [AppScope] above it.
+  final Widget? actions;
+
+  const DeviceStatusCard({
+    super.key,
+    required this.device,
+    this.presence,
+    this.actions,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -201,6 +542,7 @@ class DeviceStatusCard extends StatelessWidget {
                     ],
                   ),
                 ),
+                ?actions,
               ],
             ),
             const Gap(AppSpace.sm),

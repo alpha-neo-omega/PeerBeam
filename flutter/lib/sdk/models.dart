@@ -630,6 +630,15 @@ class ChatMessage {
   /// be a claim we cannot support.
   final DateTime? readAt;
 
+  /// The id of the message this one answers, or null.
+  ///
+  /// A **reference**, never a copy of the quoted text. A snapshot would outlive
+  /// the message it quoted, so a disappearing-message window could be defeated
+  /// by anyone replying to something. A surface resolves this against the rows
+  /// it already holds — which is also why a parent that has gone renders as an
+  /// orphan rather than being quoted from somewhere else.
+  final String? inReplyTo;
+
   const ChatMessage({
     required this.id,
     required this.peerId,
@@ -643,9 +652,13 @@ class ChatMessage {
     this.localPath,
     this.reactions = const [],
     this.readAt,
+    this.inReplyTo,
   });
 
   bool get isMine => direction == 'out';
+
+  /// Whether this message answers another.
+  bool get isReply => inReplyTo != null;
 
   /// Whether this row is a shared file rather than text.
   bool get isFile => kind == ChatMessageKind.file;
@@ -679,6 +692,7 @@ class ChatMessage {
               .toList() ??
           const [],
       readAt: DateTime.tryParse(j['read_at'] as String? ?? ''),
+      inReplyTo: j['in_reply_to'] as String?,
     );
   }
 
@@ -697,6 +711,7 @@ class ChatMessage {
     int? fileSize,
     List<ChatReaction>? reactions,
     DateTime? readAt,
+    String? inReplyTo,
   }) => ChatMessage(
     id: id,
     peerId: peerId,
@@ -710,6 +725,7 @@ class ChatMessage {
     localPath: localPath ?? this.localPath,
     reactions: reactions ?? this.reactions,
     readAt: readAt ?? this.readAt,
+    inReplyTo: inReplyTo ?? this.inReplyTo,
   );
 }
 
@@ -1243,5 +1259,64 @@ class UpdateCheck {
     updateAvailable: (j['update_available'] as bool?) ?? false,
     url: j['url'] as String?,
     reason: j['reason'] as String?,
+  );
+}
+
+/// A named local set of trusted devices.
+///
+/// A Space never leaves this device: no peer is told it exists and there is no
+/// group identity on the wire, so sending to one is N ordinary sends and **no
+/// member learns who else is in it**. That is what keeps group send
+/// peer-to-peer rather than hub-brokered.
+class Space {
+  final String id;
+  final String name;
+
+  /// Members this device still trusts — the ones a send actually reaches.
+  final List<String> live;
+
+  /// Members it no longer trusts: revoked, or past a time-limited grant. Kept
+  /// and shown rather than dropped, because a list that shrinks by itself
+  /// leaves someone wondering whether they ever added a device.
+  final List<String> stale;
+
+  const Space({
+    required this.id,
+    required this.name,
+    this.live = const [],
+    this.stale = const [],
+  });
+
+  factory Space.fromJson(Map<String, dynamic> j) => Space(
+    id: (j['id'] as String?) ?? '',
+    name: (j['name'] as String?) ?? '',
+    live: ((j['live'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList(growable: false),
+    stale: ((j['stale'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList(growable: false),
+  );
+
+  /// Whether a fan-out would reach anybody at all.
+  bool get canSend => live.isNotEmpty;
+}
+
+/// What a wake attempt actually did.
+///
+/// [sentTo] is where the packet went. There is deliberately no "woken" field:
+/// Wake-on-LAN carries no reply, so any such flag would be invented. The
+/// confirmation is the device appearing in the device list.
+class WakeAttempt {
+  final String mac;
+  final List<String> sentTo;
+
+  const WakeAttempt({required this.mac, this.sentTo = const []});
+
+  factory WakeAttempt.fromJson(Map<String, dynamic> j) => WakeAttempt(
+    mac: (j['mac'] as String?) ?? '',
+    sentTo: ((j['sent_to'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList(growable: false),
   );
 }

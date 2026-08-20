@@ -26,6 +26,13 @@ class AppShell extends StatelessWidget {
     _Dest(Icons.swap_horiz_outlined, Icons.swap_horiz_rounded, 'Transfers'),
     _Dest(Icons.history_outlined, Icons.history_rounded, 'History'),
     _Dest(Icons.settings_outlined, Icons.settings_rounded, 'Settings'),
+    // Last, rather than next to Devices where it belongs by subject: this list
+    // *is* the Ctrl/⌘+1..N order (see `_withShortcuts`), so anything inserted
+    // renumbers every shortcut below it. Chats and Devices each did that once
+    // already. Spaces is a place you go to arrange something, not one you flick
+    // between, so it takes the free digit at the end instead of shifting four
+    // that people have learned.
+    _Dest(Icons.workspaces_outlined, Icons.workspaces_rounded, 'Spaces'),
   ];
 
   /// The destination whose icon carries the active-transfer badge. Derived from
@@ -144,7 +151,10 @@ class AppShell extends StatelessWidget {
   /// shifted each of those one further, to Ctrl+3..6. `digit6` is added here at
   /// the same time — the guard below silently drops any destination past the
   /// end of this list, so a forgotten digit would leave the new tab reachable
-  /// by mouse and not by keyboard, with nothing failing to say so.
+  /// by mouse and not by keyboard, with nothing failing to say so. `digit7`
+  /// arrives with Spaces for that same reason, and Spaces sits at the end of
+  /// `_destinations` precisely so that it is the only digit this change adds
+  /// rather than the fourth it moves.
   Widget _withShortcuts(Widget child) {
     const keys = [
       LogicalKeyboardKey.digit1,
@@ -153,6 +163,7 @@ class AppShell extends StatelessWidget {
       LogicalKeyboardKey.digit4,
       LogicalKeyboardKey.digit5,
       LogicalKeyboardKey.digit6,
+      LogicalKeyboardKey.digit7,
     ];
     // Never bind past the end of either list: a digit with no destination
     // would jump to a branch `goBranch` does not have.

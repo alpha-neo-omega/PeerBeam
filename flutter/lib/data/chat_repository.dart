@@ -65,6 +65,20 @@ class ChatRepository extends ChangeNotifier {
   /// [_loadErrors], for the list itself.
   Object? _conversationsError;
 
+  /// Each conversation's disappearing-message window in seconds, as the engine
+  /// last answered it. A key that is **present with a null value** is a window
+  /// that is genuinely off; a key that is **absent** is one nothing has read
+  /// yet. Those are different facts and a single `int?` cannot hold both — and
+  /// the one that gets conflated is the dangerous one, because off is the
+  /// default, so "not read" collapsing into "off" states that nothing here
+  /// disappears about a conversation that may be deleting itself hourly.
+  final Map<String, int?> _retention = {};
+
+  /// Why the last window read failed, keyed by peer id. Per peer for the same
+  /// reason as [_loadErrors]: one conversation's failed read says nothing about
+  /// the thread beside it.
+  final Map<String, Object> _retentionErrors = {};
+
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
   int _optimisticSeq = 0;
@@ -107,6 +121,22 @@ class ChatRepository extends ChangeNotifier {
   /// a read that failed has no standing to make it.
   Object? get conversationsError => _conversationsError;
 
+  /// What this device knows about one conversation's disappearing-message
+  /// window: whether it has been read at all, the window itself in seconds
+  /// (null being kept-until-deleted), and why the last read failed.
+  ///
+  /// One value with three cases rather than an `int?` plus a flag, because a
+  /// surface would otherwise have to combine "is there a window" with "did the
+  /// read answer", and the case that gets forgotten when those are combined by
+  /// hand is exactly the one that matters: a failed read rendered as the
+  /// default tells the reader their messages are kept, which is the single
+  /// wrong answer this setting can give.
+  ({bool known, int? seconds, Object? error}) retentionFor(String peerId) => (
+    known: _retention.containsKey(peerId),
+    seconds: _retention[peerId],
+    error: _retentionErrors[peerId],
+  );
+
   /// Why the message with [messageId] failed, when the engine said so. Null
   /// for every message that hasn't failed (and for a failure this session
   /// never saw — the reason isn't persisted).
@@ -136,6 +166,16 @@ class ChatRepository extends ChangeNotifier {
   /// showing it as in-flight means an eternal progress bar and — worse — an
   /// Accept button for a transfer that no longer exists. A reconcile failure
   /// is not fatal: the conversation still loads.
+  ///
+  /// The conversation's disappearing-message window is read here too, and — when
+  /// one is set — the rows it has already closed over are deleted before the
+  /// thread is read. Opening is the only moment this app has to do that, and
+  /// the engine's own history read already hides what has aged out, so the
+  /// prune takes away nothing the user could still see or still send; it is
+  /// what turns "hidden from you" into "gone from this disk", which is the half
+  /// of the promise filtering cannot keep. Best-effort, like the reconcile: a
+  /// prune that failed leaves rows that are still filtered out of every read,
+  /// so the thread is stale on disk rather than wrong on screen.
   Future<void> openThread(String peerId) async {
     try {
       await _api?.chatReconcile(peerId);
@@ -143,6 +183,16 @@ class ChatRepository extends ChangeNotifier {
       // Best-effort: an unreconciled row is stale, not wrong to show.
     }
     if (_disposed) return;
+    await refreshRetention(peerId);
+    if (_disposed) return;
+    if (retentionFor(peerId).seconds != null) {
+      try {
+        await _api?.pruneChat(peerId: peerId);
+      } catch (_) {
+        // See the doc above: filtering still holds, so this is a disk fact.
+      }
+      if (_disposed) return;
+    }
     await refresh(peerId);
   }
 
@@ -300,6 +350,92 @@ class ChatRepository extends ChangeNotifier {
     return result;
   }
 
+  /// Re-read this conversation's disappearing-message window.
+  ///
+  /// A failure is remembered rather than swallowed (see [retentionFor]) and
+  /// deliberately does **not** fall back to "off". Off is the default, so a
+  /// swallowed failure would state — in the one place a person goes to check —
+  /// that nothing in this conversation disappears, about a conversation that
+  /// may be deleting itself every hour. A window read once and re-read
+  /// unsuccessfully keeps its last known value: a stale window is still a
+  /// window, and it is the surface's business which of the two it renders.
+  Future<void> refreshRetention(String peerId) async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      final seconds = await api.chatRetention(peerId);
+      if (_disposed) return;
+      _retention[peerId] = seconds;
+      _retentionErrors.remove(peerId);
+      notifyListeners();
+    } catch (e) {
+      if (_disposed) return;
+      _retentionErrors[peerId] = e;
+      notifyListeners();
+    }
+  }
+
+  /// Set this conversation's disappearing-message window, or pass null to turn
+  /// it off, and return what the engine deleted as a result.
+  ///
+  /// **Local, and only local.** Nothing goes on the wire: no frame asks the
+  /// peer to delete anything, the peer is never told a window exists, and its
+  /// copy is untouched. Every surface that offers this has to say so — a user
+  /// who believes "disappearing" means both sides has been misled by the UI,
+  /// which is worse than not offering it at all.
+  ///
+  /// Setting a window **prunes immediately**, and the engine's counts are
+  /// handed back rather than summarised here: a window shorter than the
+  /// conversation is old deletes history the moment it is chosen, and a
+  /// `queued` count is messages that were waiting to be sent and now never will
+  /// be. Both are things the caller has to be able to state, and neither can be
+  /// predicted before the call — so they are reported afterwards, from the
+  /// engine's own answer, exactly as [deleteMessages] does.
+  ///
+  /// Turning a window **off** prunes nothing: there is nothing left whose
+  /// window has closed, and nothing that was already deleted can come back.
+  /// The thread is re-read either way — the rows a new window closed over have
+  /// to leave the screen, and the rows an old window was hiding have to return
+  /// to it.
+  ///
+  /// A failure throws, with the cached window untouched: the caller says so,
+  /// and the surface goes on showing the window that is actually in force
+  /// rather than the one that was asked for.
+  Future<({int messages, int queued})> setRetention(
+    String peerId,
+    int? seconds,
+  ) async {
+    final api = _api;
+    if (api == null) return (messages: 0, queued: 0);
+    // The engine's answer, not the argument: what it stored is what governs the
+    // thread from here on, and a value it clamped or refused must not be
+    // cached as though it had been accepted.
+    final applied = await api.setChatRetention(peerId, seconds);
+    if (_disposed) return (messages: 0, queued: 0);
+    _retention[peerId] = applied;
+    _retentionErrors.remove(peerId);
+    notifyListeners();
+    var pruned = (messages: 0, queued: 0);
+    if (applied != null) {
+      try {
+        pruned = await api.pruneChat(peerId: peerId);
+      } catch (_) {
+        // The window IS set — that write succeeded — and the engine filters
+        // every read by it from now on. Failing the whole call here would tell
+        // the user their window was not applied when it was.
+      }
+    }
+    if (_disposed) return pruned;
+    await refresh(peerId);
+    // A conversation whose last row has just disappeared stops being a
+    // conversation, and a queued message that was deleted is no longer waiting
+    // on anybody — both change what the Conversations list says.
+    if (pruned.messages > 0 || pruned.queued > 0) {
+      unawaited(refreshConversations());
+    }
+    return pruned;
+  }
+
   /// Search this device's stored conversations, newest match first.
   ///
   /// A **passthrough**, deliberately: results belong to the query that asked
@@ -412,7 +548,12 @@ class ChatRepository extends ChangeNotifier {
   /// `refresh` reconciles with the persisted record once the call resolves,
   /// and a `chat_status` event later flips the message's status in place
   /// (via [_onStatus]) once it's actually delivered.
-  Future<void> send(String peerId, PeerTarget peer, String text) async {
+  Future<void> send(
+    String peerId,
+    PeerTarget peer,
+    String text, {
+    String? inReplyTo,
+  }) async {
     final body = text.trim();
     if (body.isEmpty) return;
     final optimistic = ChatMessage(
@@ -422,11 +563,14 @@ class ChatRepository extends ChangeNotifier {
       body: body,
       at: DateTime.now(),
       status: 'pending',
+      // Carried on the optimistic row too, so the reply marker appears the
+      // instant the message does rather than blinking in after the refresh.
+      inReplyTo: inReplyTo,
     );
     (_byPeer[peerId] ??= <ChatMessage>[]).add(optimistic);
     notifyListeners();
     try {
-      await _api?.chatSend(peer, body);
+      await _api?.chatSend(peer, body, inReplyTo: inReplyTo);
       await refresh(peerId);
       // The first message to a peer CREATES the conversation, and nothing else
       // will announce it: an offline peer sends back no record and settles no

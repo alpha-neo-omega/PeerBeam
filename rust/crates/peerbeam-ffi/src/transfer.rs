@@ -2531,7 +2531,12 @@ impl Manager {
             .get("text")
             .and_then(|v| v.as_str())
             .ok_or((Code::InvalidArgument, "text required".into()))?;
-        let msg = peerbeam_chat::ChatMessage::new(text)
+        // `in_reply_to` is optional and carries only the answered message's id.
+        // Nothing quotes text into the new body: a snapshot would survive the
+        // message it quoted, which is exactly how a retention window gets
+        // defeated by replying to something.
+        let in_reply_to = req.get("in_reply_to").and_then(|v| v.as_str());
+        let msg = peerbeam_chat::ChatMessage::replying(text, in_reply_to)
             .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
         // Refuse **before** persisting: a message that may never be sent has no
         // business sitting in the thread looking Pending. The gate is

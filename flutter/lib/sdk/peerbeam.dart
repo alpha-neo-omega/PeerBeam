@@ -168,7 +168,13 @@ abstract class PeerBeamApi {
   Future<int> rulesSet(List<SaveRule> rules);
 
   /// Send a chat text message to a peer. Returns the new message id.
-  Future<String> chatSend(PeerTarget peer, String text);
+  /// Send a text message, optionally answering [inReplyTo].
+  ///
+  /// The reply carries only the answered message's **id**. Nothing quotes text
+  /// into the new body: a snapshot would survive the message it quoted, which
+  /// is how a disappearing-message window gets defeated by replying to
+  /// something.
+  Future<String> chatSend(PeerTarget peer, String text, {String? inReplyTo});
 
   /// Share the file at [path] inside the conversation with [peer]. Returns the
   /// new message id — which is ALSO the id of the transfer carrying the bytes,
@@ -371,6 +377,57 @@ abstract class PeerBeamApi {
   /// An unreachable feed comes back as [UpdateCheck.reachable] false, not as a
   /// thrown error — offline is ordinary here.
   Future<UpdateCheck> checkForUpdates();
+
+  /// Every Space this device keeps.
+  Future<List<Space>> spaces();
+
+  /// Create a Space. Names are unique ignoring case.
+  Future<Space> createSpace(String name);
+
+  /// Rename a Space.
+  Future<Space> renameSpace(String id, String name);
+
+  /// Delete a Space. The devices in it keep their trust.
+  Future<bool> deleteSpace(String id);
+
+  /// Add a trusted device. Grants nothing: every send still passes the same
+  /// per-capability check a hand-typed one does.
+  Future<bool> addSpaceMember(String id, String device);
+
+  /// Remove a device from a Space.
+  Future<bool> removeSpaceMember(String id, String device);
+
+  /// Mark a device as one of the user's own, or unmark it.
+  ///
+  /// A local label. It widens no permission and the device is never told.
+  Future<bool> setDeviceMine(String device, {required bool mine});
+
+  /// The devices the user marked as their own.
+  Future<List<String>> myDevices();
+
+  /// Record where to send a wake packet.
+  Future<String> setWakeAddress(String device, String mac);
+
+  /// Forget a device's hardware address.
+  Future<bool> forgetWakeAddress(String device);
+
+  /// Send a wake packet. **Local network only**, and it reports what was sent
+  /// rather than that the device woke — the protocol has no reply.
+  Future<WakeAttempt> wakeDevice(String device);
+
+  /// This conversation's disappearing-message window in seconds, or null when
+  /// messages are kept until deleted.
+  Future<int?> chatRetention(String peerId);
+
+  /// Set the window, or pass null to turn it off.
+  ///
+  /// **Local.** Nothing is sent to the peer, and no surface may suggest the
+  /// peer's copy is affected.
+  Future<int?> setChatRetention(String peerId, int? seconds);
+
+  /// Delete messages whose window has closed. Omit [peerId] for every
+  /// conversation.
+  Future<({int messages, int queued})> pruneChat({String? peerId});
 
   /// Copy the buffered logs to a file and return where they went.
   ///
@@ -665,9 +722,19 @@ class PeerBeam implements PeerBeamApi {
   Future<void> historyClear() async => _data(_req().historyClear());
 
   @override
-  Future<String> chatSend(PeerTarget peer, String text) async {
+  Future<String> chatSend(
+    PeerTarget peer,
+    String text, {
+    String? inReplyTo,
+  }) async {
     final data = _data(
-      _req().chatSend(jsonEncode({'peer': peer.toJson(), 'text': text})),
+      _req().chatSend(
+        jsonEncode({
+          'peer': peer.toJson(),
+          'text': text,
+          'in_reply_to': ?inReplyTo,
+        }),
+      ),
     );
     return data['id'] as String;
   }
@@ -797,6 +864,106 @@ class PeerBeam implements PeerBeamApi {
   @override
   Future<UpdateCheck> checkForUpdates() async =>
       UpdateCheck.fromJson(_data(_req().checkUpdates()));
+
+  @override
+  Future<List<Space>> spaces() async {
+    final data = _data(_req().spacesList('{}'));
+    return ((data['spaces'] as List?) ?? const [])
+        .map((e) => Space.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  @override
+  Future<Space> createSpace(String name) async => Space.fromJson(
+    _data(_req().spacesCreate(jsonEncode({'name': name})))['space']
+        as Map<String, dynamic>,
+  );
+
+  @override
+  Future<Space> renameSpace(String id, String name) async => Space.fromJson(
+    _data(_req().spacesRename(jsonEncode({'id': id, 'name': name})))['space']
+        as Map<String, dynamic>,
+  );
+
+  @override
+  Future<bool> deleteSpace(String id) async =>
+      (_data(_req().spacesDelete(jsonEncode({'id': id})))['deleted']
+          as bool?) ??
+      false;
+
+  @override
+  Future<bool> addSpaceMember(String id, String device) async =>
+      (_data(
+            _req().spacesAddMember(jsonEncode({'id': id, 'device': device})),
+          )['added']
+          as bool?) ??
+      false;
+
+  @override
+  Future<bool> removeSpaceMember(String id, String device) async =>
+      (_data(
+            _req().spacesRemoveMember(jsonEncode({'id': id, 'device': device})),
+          )['removed']
+          as bool?) ??
+      false;
+
+  @override
+  Future<bool> setDeviceMine(String device, {required bool mine}) async =>
+      (_data(
+            _req().trustSetMine(jsonEncode({'device': device, 'mine': mine})),
+          )['changed']
+          as bool?) ??
+      false;
+
+  @override
+  Future<List<String>> myDevices() async {
+    final data = _data(_req().trustMyDevices('{}'));
+    return ((data['devices'] as List?) ?? const [])
+        .map((e) => (e as Map<String, dynamic>)['device'].toString())
+        .toList();
+  }
+
+  @override
+  Future<String> setWakeAddress(String device, String mac) async =>
+      (_data(_req().wakeSet(jsonEncode({'device': device, 'mac': mac})))['mac']
+          as String?) ??
+      mac;
+
+  @override
+  Future<bool> forgetWakeAddress(String device) async =>
+      (_data(_req().wakeForget(jsonEncode({'device': device})))['forgotten']
+          as bool?) ??
+      false;
+
+  @override
+  Future<WakeAttempt> wakeDevice(String device) async => WakeAttempt.fromJson(
+    _data(_req().wakeSend(jsonEncode({'device': device}))),
+  );
+
+  @override
+  Future<int?> chatRetention(String peerId) async =>
+      _data(_req().chatRetentionGet(jsonEncode({'peer_id': peerId})))['seconds']
+          as int?;
+
+  @override
+  Future<int?> setChatRetention(String peerId, int? seconds) async =>
+      _data(
+            _req().chatRetentionSet(
+              jsonEncode({'peer_id': peerId, 'seconds': ?seconds}),
+            ),
+          )['seconds']
+          as int?;
+
+  @override
+  Future<({int messages, int queued})> pruneChat({String? peerId}) async {
+    final data = _data(
+      _req().chatPrune(jsonEncode(peerId == null ? {} : {'peer_id': peerId})),
+    );
+    return (
+      messages: (data['messages'] as int?) ?? 0,
+      queued: (data['queued'] as int?) ?? 0,
+    );
+  }
 
   @override
   Future<List<LogLine>> logs({int limit = 200}) async {

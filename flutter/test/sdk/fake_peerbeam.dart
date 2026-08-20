@@ -346,8 +346,14 @@ class FakePeerBeam implements PeerBeamApi {
   final List<PeerTarget> chatSendTargets = [];
 
   @override
-  Future<String> chatSend(PeerTarget peer, String text) async {
-    calls.add('chatSend:$text');
+  Future<String> chatSend(
+    PeerTarget peer,
+    String text, {
+    String? inReplyTo,
+  }) async {
+    calls.add(
+      inReplyTo == null ? 'chatSend:$text' : 'chatSend:$text:reply=$inReplyTo',
+    );
     chatSendTargets.add(peer);
     final id = 'chat-${++_chatSeq}';
     // Mirrors the real engine's `device_from`: key by the peer's real id when
@@ -361,6 +367,7 @@ class FakePeerBeam implements PeerBeamApi {
       body: text,
       at: DateTime.now(),
       status: 'sent',
+      inReplyTo: inReplyTo,
     );
     chatHistories.putIfAbsent(peerId, () => []).add(msg);
     return id;
@@ -634,6 +641,161 @@ class FakePeerBeam implements PeerBeamApi {
     current: '0.9.0',
     latest: '0.9.0',
   );
+
+  /// The Spaces this fake holds. Tests mutate it directly.
+  List<Space> spaceList = <Space>[];
+
+  /// Devices marked as the user's own.
+  Set<String> mine = <String>{};
+
+  /// Recorded wake addresses, by device id.
+  Map<String, String> wakeAddresses = <String, String>{};
+
+  /// Per-conversation windows in seconds; absent means off.
+  Map<String, int> retention = <String, int>{};
+
+  var _spaceSeq = 0;
+
+  @override
+  Future<List<Space>> spaces() async {
+    _maybeFail('spaces');
+    calls.add('spaces');
+    return List.unmodifiable(spaceList);
+  }
+
+  @override
+  Future<Space> createSpace(String name) async {
+    _maybeFail('createSpace');
+    calls.add('createSpace:$name');
+    if (spaceList.any(
+      (s) => s.name.toLowerCase() == name.trim().toLowerCase(),
+    )) {
+      throw StateError('a space named "$name" already exists');
+    }
+    final s = Space(id: 'sp${_spaceSeq++}', name: name.trim());
+    spaceList = [...spaceList, s];
+    return s;
+  }
+
+  @override
+  Future<Space> renameSpace(String id, String name) async {
+    calls.add('renameSpace:$id:$name');
+    final i = spaceList.indexWhere((s) => s.id == id);
+    if (i < 0) throw StateError('no such space');
+    final next = Space(
+      id: id,
+      name: name.trim(),
+      live: spaceList[i].live,
+      stale: spaceList[i].stale,
+    );
+    spaceList = [...spaceList]..[i] = next;
+    return next;
+  }
+
+  @override
+  Future<bool> deleteSpace(String id) async {
+    calls.add('deleteSpace:$id');
+    final before = spaceList.length;
+    spaceList = spaceList.where((s) => s.id != id).toList();
+    return spaceList.length != before;
+  }
+
+  @override
+  Future<bool> addSpaceMember(String id, String device) async {
+    calls.add('addSpaceMember:$id:$device');
+    final i = spaceList.indexWhere((s) => s.id == id);
+    if (i < 0) throw StateError('no such space');
+    if (spaceList[i].live.contains(device)) return false;
+    spaceList = [...spaceList]
+      ..[i] = Space(
+        id: id,
+        name: spaceList[i].name,
+        live: [...spaceList[i].live, device],
+        stale: spaceList[i].stale,
+      );
+    return true;
+  }
+
+  @override
+  Future<bool> removeSpaceMember(String id, String device) async {
+    calls.add('removeSpaceMember:$id:$device');
+    final i = spaceList.indexWhere((s) => s.id == id);
+    if (i < 0) return false;
+    final live = spaceList[i].live.where((d) => d != device).toList();
+    final stale = spaceList[i].stale.where((d) => d != device).toList();
+    spaceList = [...spaceList]
+      ..[i] = Space(id: id, name: spaceList[i].name, live: live, stale: stale);
+    return true;
+  }
+
+  @override
+  Future<bool> setDeviceMine(String device, {required bool mine}) async {
+    _maybeFail('setDeviceMine');
+    calls.add('setDeviceMine:$device:$mine');
+    return mine ? this.mine.add(device) : this.mine.remove(device);
+  }
+
+  @override
+  Future<List<String>> myDevices() async {
+    _maybeFail('myDevices');
+    calls.add('myDevices');
+    return mine.toList()..sort();
+  }
+
+  @override
+  Future<String> setWakeAddress(String device, String mac) async {
+    _maybeFail('setWakeAddress');
+    calls.add('setWakeAddress:$device:$mac');
+    if (!RegExp(r'^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$').hasMatch(mac)) {
+      throw StateError('not a hardware address: $mac');
+    }
+    wakeAddresses[device] = mac.toLowerCase();
+    return wakeAddresses[device]!;
+  }
+
+  @override
+  Future<bool> forgetWakeAddress(String device) async {
+    calls.add('forgetWakeAddress:$device');
+    return wakeAddresses.remove(device) != null;
+  }
+
+  @override
+  Future<WakeAttempt> wakeDevice(String device) async {
+    _maybeFail('wakeDevice');
+    calls.add('wakeDevice:$device');
+    final mac = wakeAddresses[device];
+    if (mac == null) {
+      throw StateError('no address recorded for $device');
+    }
+    return WakeAttempt(
+      mac: mac,
+      sentTo: const ['255.255.255.255:9', '255.255.255.255:7'],
+    );
+  }
+
+  @override
+  Future<int?> chatRetention(String peerId) async {
+    calls.add('chatRetention:$peerId');
+    return retention[peerId];
+  }
+
+  @override
+  Future<int?> setChatRetention(String peerId, int? seconds) async {
+    _maybeFail('setChatRetention');
+    calls.add('setChatRetention:$peerId:${seconds ?? 'off'}');
+    if (seconds == null) {
+      retention.remove(peerId);
+    } else {
+      retention[peerId] = seconds;
+    }
+    return seconds;
+  }
+
+  @override
+  Future<({int messages, int queued})> pruneChat({String? peerId}) async {
+    calls.add('pruneChat:${peerId ?? 'all'}');
+    return (messages: 0, queued: 0);
+  }
 
   @override
   Future<UpdateCheck> checkForUpdates() async {
