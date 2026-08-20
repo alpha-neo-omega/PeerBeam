@@ -252,8 +252,10 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
   }
 
   Widget _tile(SharedFolder folder, ThemeData theme) => ListTile(
-    // Keyed by path, the only field guaranteed to be unique — two shares can
-    // and do carry the same name, which is the whole reason the path is shown.
+    // Keyed by path. Names are now assigned uniquely by the engine — a second
+    // `Documents` becomes `Documents (2)` — but the path is still the field
+    // that cannot collide, and it is still shown, because two folders with
+    // distinct names can be indistinguishable to the person who chose them.
     key: Key('shared-folder-${folder.path}'),
     leading: Icon(
       folder.exists
@@ -261,6 +263,9 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
           : Icons.report_problem_rounded,
       color: folder.exists ? null : theme.colorScheme.error,
     ),
+    // The fallback stays: an empty name meant an unaddressable root before the
+    // engine started assigning them, and a row that renders blank is worse than
+    // one that renders a path.
     title: Text(folder.name.isEmpty ? folder.path : folder.name),
     subtitle: Column(
       crossAxisAlignment: CrossAxisAlignment.start,

@@ -60,6 +60,22 @@ const CHANNEL_OPEN_POLL: Duration = Duration::from_millis(10);
 /// wait for it to actually reach `Open` (the peer's accept), send one
 /// `Message` frame, and only then persist + return the sent record.
 ///
+/// Every CHAT channel opened here is closed again before returning.
+///
+/// # Why closing, and not reuse
+///
+/// A channel per message that is never closed is bounded only by messages per
+/// session: `ChannelManager` counts live channels against a limit, so a long
+/// conversation eventually stops sending with nothing to show the user but a
+/// failure that arrives at message 257. Presence and clipboard solve the same
+/// problem by caching one channel per session, and sync now does too — but both
+/// have a struct to cache it in, and these are free functions over a borrowed
+/// handle with nowhere to keep it.
+///
+/// Closing costs one extra `ChannelClose`/`ChannelClosed` pair per message.
+/// That is invisible here because chat sends are **user-paced**: a person
+/// typing is orders of magnitude slower than the round trip, unlike a chunk
+/// request loop where the same cost was worth avoiding.
 /// Persisting happens strictly after a successful send: on any failure (the
 /// channel never opens, or the send itself errors) no record is written, so
 /// local history never shows a message as sent when it was not.
@@ -98,7 +114,11 @@ pub async fn send_reply(
         .await
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
-    send_on_open_channel(handle, channel, &msg).await?;
+    let sent = send_on_open_channel(handle, channel, &msg).await;
+    // Closed either way: a failed send leaks the channel just as surely as a
+    // successful one, and the failure is what a retry follows.
+    handle.close_channel(channel);
+    sent?;
     let rec = ChatRecord::sent(peer, &msg);
     store.append(&rec)?;
     Ok(rec)
@@ -187,6 +207,12 @@ pub async fn flush_to_session(
             Kind::File => continue,
         }
     }
+    // One channel for the whole batch, closed once at the end. A flush is the
+    // case where reuse is genuinely right — the entries are machine-paced, so
+    // an open per message would pay the accept round trip for each — but it
+    // still has to be given back, or a peer that reconnects repeatedly leaks
+    // one channel per reconnection.
+    handle.close_channel(channel);
     Ok(flushed)
 }
 
@@ -420,10 +446,12 @@ pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), Se
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
     let frame = r.to_frame(channel)?;
-    handle
+    let sent = handle
         .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
         .await
-        .map_err(|e| SendError::Session(e.to_string()))
+        .map_err(|e| SendError::Session(e.to_string()));
+    handle.close_channel(channel);
+    sent
 }
 
 /// Tell the sender we turned their file down, over the session's CHAT channel.
@@ -451,10 +479,12 @@ pub async fn send_receipt(handle: &SessionHandle, r: &Receipt) -> Result<(), Sen
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
     let frame = r.to_frame(channel)?;
-    handle
+    let sent = handle
         .send_on_channel(channel, Receipt::message_type(), frame.flags, frame.payload)
         .await
-        .map_err(|e| SendError::Session(e.to_string()))
+        .map_err(|e| SendError::Session(e.to_string()));
+    handle.close_channel(channel);
+    sent
 }
 
 /// Send one [`Reaction`] to a peer over its own CHAT channel.
@@ -469,7 +499,7 @@ pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), S
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
     let frame = r.to_frame(channel)?;
-    handle
+    let sent = handle
         .send_on_channel(
             channel,
             Reaction::message_type(),
@@ -477,7 +507,9 @@ pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), S
             frame.payload,
         )
         .await
-        .map_err(|e| SendError::Session(e.to_string()))
+        .map_err(|e| SendError::Session(e.to_string()));
+    handle.close_channel(channel);
+    sent
 }
 
 pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Result<(), SendError> {
@@ -486,7 +518,9 @@ pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Resul
         .await
         .map_err(|e| SendError::Session(e.to_string()))?;
     wait_for_channel_open(handle, channel).await?;
-    send_decline_on_open_channel(handle, channel, d).await
+    let sent = send_decline_on_open_channel(handle, channel, d).await;
+    handle.close_channel(channel);
+    sent
 }
 
 /// Send one [`FileDecline`] over a channel that has already reached

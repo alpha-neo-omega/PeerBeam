@@ -576,6 +576,99 @@ async fn reflush_is_idempotent_on_the_receiver() {
 /// B processes the open and rejects it — reproducing the real-transport case
 /// where local registration is visible well before a network round trip
 /// completes.
+/// **Every CHAT channel is given back.**
+///
+/// A channel per message that is never closed is bounded only by messages per
+/// session: `ChannelManager` counts live channels against a limit, so a long
+/// conversation used to stop sending at the cap with nothing to show the user
+/// but a failure arriving at message 257.
+///
+/// The assertion is on the *count* the session still holds, not on a hard-coded
+/// limit, so raising that limit later does not quietly retire this test.
+#[tokio::test]
+async fn a_long_conversation_does_not_accumulate_channels() {
+    // ── B: receiver, registers a ChatHandler ────────────────────────────────
+    let store_b = chat_store(2);
+    let received: Arc<Mutex<Vec<ChatRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cl = received.clone();
+    let sink: ReceivedSink = Arc::new(move |rec| received_cl.lock().unwrap().push(rec));
+    let (handler_b, peer_slot_b) = ChatHandler::new(store_b.clone(), sink);
+
+    // ── Build two real PeerSessions over an in-memory transport, exactly as
+    //    peerbeam-transfer/tests/session.rs's `open()` helper does. ─────────
+    let (ta, tb) = MemTransport::pair();
+    let (a_ev, _a_ev_rx) = unbounded_channel();
+    let (b_ev, _b_ev_rx) = unbounded_channel();
+    let (a_ch, _a_ch_rx) = unbounded_channel();
+    let (b_ch, _b_ch_rx) = unbounded_channel();
+    let (a_in, _a_in_rx) = unbounded_channel();
+    let (b_in, _b_in_rx) = unbounded_channel();
+
+    let (id_a, enc_a, trust_a) = security("device-a");
+    let (id_b, enc_b, trust_b) = security("device-b");
+    let a_id = id_a.device_id.clone();
+    let b_id = id_b.device_id.clone();
+
+    // Sender (A, Initiator): advertises CHAT, no chat handler.
+    let a_cfg = SessionConfig::new(caps());
+    // Receiver (B, Responder): advertises CHAT + registers the ChatHandler.
+    let b_cfg = SessionConfig::new(caps()).with_handlers(HandlerRegistry::new().with(handler_b));
+
+    let fa = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        a_cfg,
+        a_ev,
+        a_ch,
+        a_in,
+        None,
+        id_a,
+        enc_a,
+        trust_a,
+    );
+    let fb = PeerSession::open(
+        tb,
+        SessionRole::Responder,
+        b_cfg,
+        b_ev,
+        b_ch,
+        b_in,
+        None,
+        id_b,
+        enc_b,
+        trust_b,
+    );
+    let (ra, rb) = tokio::join!(fa, fb);
+    let mut a = ra.expect("initiator opens");
+    let mut b = rb.expect("responder opens");
+    let a_handle = a.handle();
+
+    // Bind the receiver's peer slot to the sender's device id BEFORE the run
+    // loops start dispatching frames (the sender only sends after both
+    // sessions are established, so setting it immediately after `open` is
+    // safe).
+    let _ = peer_slot_b.set(a_id.clone());
+
+    tokio::spawn(async move { a.run().await });
+    tokio::spawn(async move { b.run().await });
+
+    // ── A sends ──────────────────────────────────────────────────────────
+    let store_a = chat_store(1);
+    // Comfortably past the channel limit; before the close this stopped sending
+    // part-way through with "channel limit reached".
+    for i in 0..300 {
+        send_message(&a_handle, &store_a, &b_id, &format!("m{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("message {i} was not sent: {e}"));
+    }
+
+    let still_open = a_handle.channels().await.expect("channel snapshot").len();
+    assert!(
+        still_open <= 1,
+        "{still_open} channels are still open after 300 messages"
+    );
+}
+
 #[tokio::test]
 async fn send_message_fails_fast_when_the_peer_rejects_the_channel() {
     let (ta, tb) = MemTransport::pair();
