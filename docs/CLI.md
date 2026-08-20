@@ -65,6 +65,28 @@ Working now:
 - `doctor [--json]` — environment checks (config/save dirs writable, UDP
   bindable, mDNS daemon, Tailscale CLI, crypto) with ✓/!/✗; non-zero exit if
   any fail.
+- `space list|create|rename|delete|add|remove|send` — named local sets of trusted
+  devices. `space send <SPACE> <PATH…>` is **N ordinary sends**, one per member,
+  each through the same permission gate a hand-typed send passes. Nothing about a
+  Space reaches any peer, so **no member learns who else is in it**. A member this
+  device no longer trusts is named and skipped, never silently dropped. Every
+  command takes a Space by name or id. See [SPACES.md](SPACES.md).
+- `trust mine <DEVICE> [--no]` and `trust my-devices` — mark which machines are
+  yours, and list them. A label kept on this device: it grants nothing, widens no
+  permission, and the device is never told.
+- `wake set|forget|send` — start one of your own machines over the local network.
+  **LAN only** — a magic packet is a broadcast and does not travel over Tailscale
+  or a VPN. `wake send` reports what it sent; the protocol has no reply, so it
+  never claims the device woke. Only approved devices may be woken (I6). See
+  [WAKE.md](WAKE.md).
+- `chat retention <PEER> [--after 30m | --off]` and `chat prune [PEER]` —
+  disappearing messages, **on this device only**. There is no frame telling the
+  peer to delete its copy, and PeerBeam does not imply one: the promise it can
+  keep is that a message is readable here for at most the window, then deleted
+  from here. Off by default and off for every existing conversation. Reading a
+  conversation already hides what has aged out; `prune` is what removes the bytes
+  without waiting for someone to open it. Received files are left on disk — only
+  the conversation row goes.
 - `check-updates [--json]` — asks whether a newer release exists, **once, because
   you ran it**. This is the only request PeerBeam makes to anything that is not a
   peer. It sends no device id, no install id, and nothing identifying; it

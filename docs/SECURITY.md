@@ -251,6 +251,35 @@ A `trust.json` written before this existed has no `expires_at` and is trusted
 is deliberately the opposite of `approved`'s upgrade rule: reading a missing
 deadline as "expired" would revoke every device on the machine on upgrade.
 
+### Disappearing messages delete *this* device's copy
+
+A conversation can be given a window (`peerbeam chat retention <peer> --after
+30m`), after which its messages stop being readable here and are deleted.
+
+**Be precise about what that guarantees.** The window is local. PeerBeam sends no
+frame asking the peer to delete anything, and there is no honest way for it to:
+the peer's copy is on the peer's disk, under the peer's control, and a "delete on
+both sides" claim would be a promise this architecture cannot keep. What it does
+guarantee is narrower and true — a message is readable on this device for at most
+the window, and is then removed from this device.
+
+Two further limits, stated rather than discovered:
+
+- **Received files are not deleted.** Only the conversation row goes. A file the
+  user accepted is theirs, in their save directory, and destroying it because a
+  chat window closed would be data loss dressed as privacy.
+- **A row this build cannot decode is not pruned.** Its age cannot be read, and
+  it is already invisible; leaking disk beats destroying data whose contents are
+  unknown.
+
+Enforcement is at **read**, not by a sweeper. A window shuts on the next read
+whether or not anything has run — the same reasoning as *Trust that runs out*
+above, and for the same reason: the interval between sweeps is exactly the
+interval an attacker would want.
+
+Off by default, and off for every conversation that already exists. An upgrade
+never starts deleting history.
+
 ### "My devices" is a label, not a grant
 
 A record also carries `mine`: the user's own note that this is one of their

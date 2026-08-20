@@ -40,7 +40,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::List(a) => list(ctx, a, cfg_override.as_deref()).await,
         Command::Status => status(ctx, cfg_override.as_deref()),
         Command::Completions { shell } => completions(shell),
-        Command::Send(a) => send(ctx, a, cfg_override.as_deref()).await,
+        Command::Send(a) => send_files(ctx, a, cfg_override.as_deref()).await,
         Command::Receive(a) => receive(ctx, a, cfg_override.as_deref()).await,
         Command::Clipboard(a) => clipboard(ctx, a, cfg_override.as_deref()).await,
         Command::Chat(a) => crate::chat::chat(ctx, a.action, cfg_override.as_deref()).await,
@@ -49,7 +49,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Trust(a) => crate::trust::trust(ctx, a.action, cfg_override.as_deref()),
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
-        Command::Space(a) => crate::spaces::space(ctx, a.action, cfg_override.as_deref()),
+        Command::Space(a) => crate::spaces::space(ctx, a.action, cfg_override.as_deref()).await,
         Command::Wake(a) => crate::wake::wake(ctx, a.action, cfg_override.as_deref()),
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
@@ -982,7 +982,7 @@ pub(crate) async fn send_paths(
     args: SendArgs,
     path_override: Option<&str>,
 ) -> CliResult {
-    send(ctx, args, path_override).await
+    send_files(ctx, args, path_override).await
 }
 
 /// A duration in the words people use for one.
@@ -1103,7 +1103,11 @@ pub(crate) fn delay_until(
         .map_err(|_| CliError::Usage(format!("{when} is too far away")))
 }
 
-async fn send(ctx: &Ctx, args: SendArgs, path_override: Option<&str>) -> CliResult {
+pub(crate) async fn send_files(
+    ctx: &Ctx,
+    args: SendArgs,
+    path_override: Option<&str>,
+) -> CliResult {
     // Waited out **before** the peer is resolved: looking a device up now and
     // dialling it in six hours would use an address that has almost certainly
     // changed. Paths are validated first, though — a typo should fail at once
@@ -2632,7 +2636,7 @@ async fn clipboard_send(
         to,
         addr,
     };
-    let result = send(ctx, send_args, path_override).await;
+    let result = send_files(ctx, send_args, path_override).await;
     let _ = std::fs::remove_file(&tmp);
     result
 }

@@ -18,6 +18,29 @@ DiscoveryProviders (udp, mdns, tailscale, …)
    DeviceChange stream + devices() snapshot  →  UI
 ```
 
+## Your own devices
+
+`peerbeam trust mine <device>` marks a machine as yours; `trust my-devices` lists
+them. In the app the same devices are grouped under **My devices**.
+
+It is a **label kept on this device**. It grants nothing, widens no permission,
+and the device is never told — a machine you mark as yours that has no Browse
+permission still has no Browse permission. It exists so the app and the CLI can
+answer the question you actually ask most often: *which of these are mine?*
+
+### Waking one
+
+A device you have approved and recorded a hardware address for can be started
+over the local network:
+
+```
+peerbeam wake set pb-3f9a12cd48b1 aa:bb:cc:dd:ee:ff
+peerbeam wake send pb-3f9a12cd48b1
+```
+
+**Local network only**, and nothing confirms it — see [WAKE.md](WAKE.md) for what
+that means and why neither limit can be engineered away.
+
 ## Split
 
 | Layer | Type | Role |

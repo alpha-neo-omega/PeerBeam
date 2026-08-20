@@ -790,8 +790,8 @@ pub enum SpaceAction {
     },
     /// Rename a Space.
     Rename {
-        /// The Space's id, as shown by `space list`.
-        #[arg(value_name = "ID")]
+        /// The Space, by name or id.
+        #[arg(value_name = "SPACE")]
         id: String,
         /// The new name.
         #[arg(value_name = "NAME")]
@@ -799,8 +799,8 @@ pub enum SpaceAction {
     },
     /// Delete a Space. The devices in it keep their trust.
     Delete {
-        /// The Space's id, as shown by `space list`.
-        #[arg(value_name = "ID")]
+        /// The Space, by name or id.
+        #[arg(value_name = "SPACE")]
         id: String,
     },
     /// Add a trusted device to a Space.
@@ -808,17 +808,31 @@ pub enum SpaceAction {
     /// Grants nothing: every send still passes the same per-device permission
     /// check it would if you had typed the device out by hand.
     Add {
-        /// The Space's id.
-        #[arg(value_name = "ID")]
+        /// The Space, by name or id.
+        #[arg(value_name = "SPACE")]
         id: String,
         /// The device id to add.
         #[arg(value_name = "DEVICE")]
         device: String,
     },
+    /// Send files to every device in a Space.
+    ///
+    /// **N ordinary sends, one per member** — there is no group transfer and no
+    /// group identity on the wire, so no member learns who else received it.
+    /// A member this device no longer trusts is skipped and named, never
+    /// silently dropped.
+    Send {
+        /// The Space, by name or id.
+        #[arg(value_name = "SPACE")]
+        space: String,
+        /// Files to send.
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
     /// Remove a device from a Space.
     Remove {
-        /// The Space's id.
-        #[arg(value_name = "ID")]
+        /// The Space, by name or id.
+        #[arg(value_name = "SPACE")]
         id: String,
         /// The device id to remove.
         #[arg(value_name = "DEVICE")]

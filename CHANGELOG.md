@@ -63,6 +63,48 @@ downloads do not contain it; it ships in the next release.
   treats `--json` as consent because it *grants* standing, but a delete destroys
   history, so silence is refused rather than assumed.
 
+- **Spaces** — name a set of devices you already trust and send or message all of
+  them at once: `peerbeam space create "Work"`, `space add Work <device>`,
+  `space send Work report.pdf`.
+
+  A Space is a label this machine keeps. It is never sent anywhere, no peer is
+  told it exists, and a fan-out is N ordinary one-to-one sends over sessions that
+  already exist — so **no member learns who else is in it**. That is not a
+  simplification, it is what keeps group send peer-to-peer instead of
+  hub-brokered (I3), and the privacy property comes free with it.
+
+  Membership grants nothing (I6): every send passes the same per-capability check
+  a hand-typed one does. A member this device no longer trusts is reported as
+  stale and skipped, never quietly removed — a list that shrinks by itself leaves
+  you wondering whether you ever added someone.
+- **My devices** — `peerbeam trust mine <device>` marks a machine as yours, and
+  `trust my-devices` lists them. A local label: it widens no permission and the
+  device is never told.
+- **Disappearing messages** — `peerbeam chat retention <peer> --after 30m`. Off by
+  default, and off for every conversation that already exists.
+
+  **This device only.** There is no frame that tells the peer to delete its copy,
+  and PeerBeam will not pretend otherwise; the promise it can keep is that a
+  message stays readable *here* for at most the window and is then deleted from
+  here. Enforced where messages are read, so a window shuts whether or not
+  anything has swept, and `chat prune` removes the bytes without waiting for
+  someone to open the conversation. Received files stay on disk — only the row
+  goes.
+
+  Age is measured from when *this* device stored the message, not from the
+  sender's timestamp: a peer flushing its outbox on reconnect delivers messages
+  stamped hours old, and measuring from those would delete them before they had
+  been read once.
+- **Replies** — a message can answer another. A reply whose parent has gone (or
+  disappeared) is still shown, with its marker intact: hiding it would delete one
+  message because another was deleted, and dropping the marker silently is worse,
+  since "sure, go ahead" answering *shall I delete the backups?* and *can I borrow
+  a pen?* are the same seven characters.
+- **Wake your own devices** — `peerbeam wake set <device> <mac>` then
+  `wake send <device>`. **Local network only:** a magic packet is a broadcast, so
+  it does not travel over Tailscale or a VPN. It reports what it sent and never
+  claims the machine woke, because the protocol has no reply — watch
+  `peerbeam list` for it to appear. Only approved devices may be woken (I6).
 - **Check for updates — only when you ask.** `peerbeam check-updates`, and a
   button in Settings → About. There is no check on launch, none on a timer, and
   the request carries no device id, install id, or anything else identifying. It

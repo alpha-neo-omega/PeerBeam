@@ -102,10 +102,16 @@ Opt-in: copy on A → paste on B automatically (vs today's manual clipboard send
 ### 8. Desktop tray + global quick-send
 Drag a file onto the tray/menu-bar icon → pick device. No window needed.
 
-### 9. Send-to-self / "My devices"  *(AirDrop)*
+### 9. Send-to-self / "My devices"  *(AirDrop)* — **built**
+
+`peerbeam trust mine <device>` / `trust my-devices`. A local label that grants
+nothing; see SECURITY.md.
 Your own devices auto-grouped and auto-trusted; one tap.
 
-### 10. Bandwidth limit
+### 10. Bandwidth limit — **built**
+
+`transfer.max_send_bytes_per_sec`; a token bucket applied live to running
+transfers.
 CLAUDE.md lists it in the transfer-engine requirements; not wired yet. A
 throttle in the send loop + a Settings control.
 
@@ -141,12 +147,14 @@ per-device permissions, time-limited trust, smart route selection, and folder
 sync (bidirectional, with delta transfer and rename detection). What follows is
 the remainder.
 
-- **Group conversations / "Spaces"** — named sets of trusted peers you can
-  message or send to at once, kept peer-to-peer rather than via a hub (I3).
-  The largest genuinely-new idea in the document.
-- **Offline message and file queue** — hold an encrypted message locally for a
-  device that is away and deliver it on reconnect. Chat is currently
-  send-if-reachable.
+- ~~**Group conversations / "Spaces"**~~ — **built.** `peerbeam space …`, and a
+  local label rather than shared state: nothing about a Space reaches any peer, a
+  fan-out is N ordinary 1:1 sends, and no member learns who else is in it. See
+  [SPACES.md](SPACES.md).
+- ~~**Offline message and file queue**~~ — **already built** when this line was
+  written, and the line was wrong: the chat outbox holds queued messages *and*
+  staged files, and flushes on reconnect. Kept here only to record the
+  correction.
 - **Remote shell** and **remote commands** — already scheduled as Phase D and
   channel `0x0106`, and constitutionally constrained by I6 (explicit,
   revocable, per-capability consent — never remote control).
