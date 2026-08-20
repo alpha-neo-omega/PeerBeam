@@ -9,7 +9,7 @@
 //! send, and the session pump writes them. Failure of one channel is isolated to
 //! that channel — no method here tears down the session or unrelated channels.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -141,6 +141,9 @@ pub struct ChannelManager {
     // Responder-side FIFO pairing of received ChannelOpens with accepted streams.
     pending_opens: VecDeque<PendingOpen>,
     pending_streams: VecDeque<Box<dyn Link>>,
+    // Channels the application has been told it has and has not been told it
+    // lost: the set to re-attach on resume. See `reattachable_channels`.
+    resumable: BTreeMap<ChannelId, ChannelType>,
 }
 
 impl ChannelManager {
@@ -177,6 +180,7 @@ impl ChannelManager {
             incoming_stream_tx,
             pending_opens: VecDeque::new(),
             pending_streams: VecDeque::new(),
+            resumable: BTreeMap::new(),
         }
     }
 
@@ -205,17 +209,34 @@ impl ChannelManager {
         self.crypto.with_epoch(self.crypto.epoch())
     }
 
-    /// The open **message** channels (id + type) eligible for automatic
-    /// re-attachment on resume. Stream channels are excluded — their capability
-    /// (e.g. transfer) re-opens them and resumes their payload itself.
+    /// The **message** channels (id + type) eligible for automatic re-attachment
+    /// on resume. Stream channels are excluded — their capability (e.g. transfer)
+    /// re-opens them and resumes their payload itself.
+    ///
+    /// **Read from `resumable`, not from the live channel map, because by the time
+    /// this is asked the channels are usually already gone.** A transport loss is
+    /// observed twice over: the session pump's control link fails, *and* every
+    /// channel actor's stream hits EOF and reports `Closed`. Both arms of the
+    /// pump's `select!` are ready at once and the winner is arbitrary, so when an
+    /// actor won, `on_actor_event` had already removed the channel and a set
+    /// derived from live state came back empty — the session resumed with no
+    /// channels re-attached, for ever, on a coin flip. Losing a channel across a
+    /// reconnect is exactly what resume exists to prevent.
+    ///
+    /// `resumable` instead tracks what the *application* has been told: a channel
+    /// enters when it emits [`ChannelEvent::Opened`] and leaves only when
+    /// something explicitly closes it (either side closing, a reject, a peer
+    /// error). An actor dying does not remove it, because an actor dies precisely
+    /// when its stream vanishes — the case this must survive.
+    ///
+    /// Still only channels the peer has *accepted*: one still `Opening` was never
+    /// announced, so both sides re-opening it from scratch is correct.
     #[must_use]
     pub fn reattachable_channels(&self) -> Vec<(ChannelId, ChannelType)> {
-        self.channels
-            .values()
-            .filter(|ch| {
-                ch.state() == ChannelState::Open && !self.stream_types.contains(&ch.channel_type())
-            })
-            .map(|ch| (ch.id(), ch.channel_type()))
+        self.resumable
+            .iter()
+            .filter(|(_, ty)| !self.stream_types.contains(ty))
+            .map(|(id, ty)| (*id, *ty))
             .collect()
     }
 
@@ -381,10 +402,7 @@ impl ChannelManager {
         let sealed: Box<dyn Link> = Box::new(SealedLink::new(link, crypto, self.crypto.enc()));
         self.channels
             .insert(id, Channel::new_stream(id, channel_type));
-        self.emit(ChannelEvent::Opened {
-            channel: id,
-            channel_type,
-        });
+        self.announce_open(id, channel_type);
         Ok((
             id,
             sealed,
@@ -550,10 +568,7 @@ impl ChannelManager {
                 }
                 self.channels
                     .insert(id, Channel::new_stream(id, channel_type));
-                self.emit(ChannelEvent::Opened {
-                    channel: id,
-                    channel_type,
-                });
+                self.announce_open(id, channel_type);
                 out.push(ControlMessage::ChannelAccept { channel: id });
                 continue;
             }
@@ -569,10 +584,7 @@ impl ChannelManager {
                 self.crypto.enc(),
             );
             self.channels.insert(id, channel);
-            self.emit(ChannelEvent::Opened {
-                channel: id,
-                channel_type,
-            });
+            self.announce_open(id, channel_type);
             out.push(ControlMessage::ChannelAccept { channel: id });
         }
         out
@@ -584,12 +596,35 @@ impl ChannelManager {
             if ch.state() == ChannelState::Opening {
                 ch.set_state(ChannelState::Open);
                 let channel_type = ch.channel_type();
-                self.emit(ChannelEvent::Opened {
-                    channel,
-                    channel_type,
-                });
+                self.announce_open(channel, channel_type);
             }
         }
+    }
+
+    /// Tell the application a channel is open, and remember it as re-attachable.
+    ///
+    /// One method rather than an `emit` beside an insert at each of the four
+    /// sites that open a channel, so the record cannot drift from what the
+    /// application was told — a channel announced but not recorded is one that
+    /// silently fails to come back after a reconnect, which is not visible in
+    /// any single-connection test.
+    fn announce_open(&mut self, channel: ChannelId, channel_type: ChannelType) {
+        self.resumable.insert(channel, channel_type);
+        self.emit(ChannelEvent::Opened {
+            channel,
+            channel_type,
+        });
+    }
+
+    /// Forget a channel the application has been told is gone, so resume does not
+    /// bring it back.
+    ///
+    /// Unconditional, and deliberately not guarded on the channel still being in
+    /// `channels`: a peer's close or error routinely arrives *after* the local
+    /// actor already noticed the stream end and removed it, and a guarded forget
+    /// would leave the record behind to be re-attached on some later reconnect.
+    fn forget_resumable(&mut self, channel: ChannelId) {
+        self.resumable.remove(&channel);
     }
 
     /// Handle a peer `ChannelReject`: drop the pending channel.
@@ -600,6 +635,7 @@ impl ChannelManager {
     /// emit on presence would then swallow the reject a caller is waiting for. A
     /// benign duplicate lifecycle event is preferable to a lost one.
     pub fn handle_channel_reject(&mut self, channel: ChannelId, reason: String) {
+        self.forget_resumable(channel);
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();
         }
@@ -608,6 +644,7 @@ impl ChannelManager {
 
     /// Handle a peer `ChannelClose`: close locally and acknowledge.
     pub fn handle_channel_close(&mut self, channel: ChannelId) -> Vec<ControlMessage> {
+        self.forget_resumable(channel);
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();
             self.emit(ChannelEvent::Closed { channel });
@@ -618,6 +655,7 @@ impl ChannelManager {
 
     /// Handle a peer `ChannelClosed` acknowledgement of a close we initiated.
     pub fn handle_channel_closed(&mut self, channel: ChannelId) {
+        self.forget_resumable(channel);
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();
             self.emit(ChannelEvent::Closed { channel });
@@ -629,6 +667,7 @@ impl ChannelManager {
     /// error can arrive after the local actor already closed the channel, and a
     /// waiter must still observe it.
     pub fn handle_channel_error(&mut self, channel: ChannelId, detail: String) {
+        self.forget_resumable(channel);
         if let Some(ch) = self.channels.remove(&channel) {
             ch.signal_close();
         }
@@ -637,6 +676,7 @@ impl ChannelManager {
 
     /// Close a channel locally, returning the `ChannelClose` to send.
     pub fn close_channel(&mut self, channel: ChannelId) -> Option<ControlMessage> {
+        self.forget_resumable(channel);
         let ch = self.channels.remove(&channel)?;
         ch.signal_close();
         self.emit(ChannelEvent::Closed { channel });
@@ -697,6 +737,10 @@ impl ChannelManager {
         }
         self.pending_opens.clear();
         self.pending_streams.clear();
+        // Not a lost channel to be restored: shutdown is either a session closing
+        // for good, or `capture_loss` tearing down dead actors *after* it has
+        // already snapshotted this set.
+        self.resumable.clear();
     }
 }
 
@@ -716,7 +760,7 @@ mod pending_open_tests {
     /// A transport that opens nothing. Every method here is unreachable for the
     /// queue methods under test — they neither open nor accept — and a stub that
     /// says so is better than one that pretends to work.
-    struct NoTransport;
+    pub(super) struct NoTransport;
 
     #[async_trait::async_trait]
     impl ChannelTransport for NoTransport {
@@ -735,7 +779,7 @@ mod pending_open_tests {
 
     /// A stream that is already at EOF: enough to be *paired*, which is all
     /// these tests do with one.
-    struct DeadLink;
+    pub(super) struct DeadLink;
 
     #[async_trait::async_trait]
     impl Link for DeadLink {
@@ -750,14 +794,14 @@ mod pending_open_tests {
         }
     }
 
-    const OK_TYPE: ChannelType = ChannelType::CHAT;
+    pub(super) const OK_TYPE: ChannelType = ChannelType::CHAT;
     /// A capability the manager below never negotiates, so every open naming it
     /// is refused — the cheapest way to make a peer's open fail `permit`.
     fn refused_type() -> ChannelType {
         ChannelType::new(0x0f0f)
     }
 
-    fn manager(limit: usize) -> (ChannelManager, UnboundedReceiver<ChannelEvent>) {
+    pub(super) fn manager(limit: usize) -> (ChannelManager, UnboundedReceiver<ChannelEvent>) {
         let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> =
             Arc::new(peerbeam_crypto::AeadCrypto::new());
         // A zero master secret: these tests never seal or open a frame, and a
@@ -874,6 +918,132 @@ mod pending_open_tests {
             "the accepted open paired with the wrong stream: {out:?}"
         );
         assert!(m.pending_opens.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod resume_set_tests {
+    //! What resume brings back. Driven against [`ChannelManager`] directly
+    //! because the property is about the *order* two consequences of one
+    //! transport loss are processed in — an ordering a session-level test can
+    //! only reach by luck (it did, on CI, roughly one run in ten).
+
+    use super::pending_open_tests::{manager, DeadLink, OK_TYPE};
+    use super::*;
+
+    /// One open message channel, opened by the peer and paired.
+    async fn with_one_open_channel() -> (ChannelManager, ChannelId) {
+        let (mut m, events) = manager(DEFAULT_CHANNEL_LIMIT);
+        // Leaked for the same reason the harness leaks the others: a dropped
+        // receiver would make `emit` fail, which is a different test.
+        std::mem::forget(events);
+        let channel = ChannelId::new(2);
+        m.handle_channel_open(channel, OK_TYPE);
+        m.on_stream_accepted(Box::new(DeadLink));
+        assert_eq!(
+            m.reattachable_channels(),
+            vec![(channel, OK_TYPE)],
+            "a paired open should be re-attachable straight away"
+        );
+        (m, channel)
+    }
+
+    /// **The bug this set exists for.** A transport loss reaches the session
+    /// twice: its control link fails, and every channel actor's stream ends. The
+    /// pump's `select!` has both arms ready and picks arbitrarily, so when an
+    /// actor won, the channel was already removed by the time `preserve()` asked
+    /// what to re-attach — and the session resumed with nothing, permanently, on
+    /// a coin flip.
+    #[tokio::test]
+    async fn a_channel_whose_actor_died_is_still_re_attached() {
+        let (mut m, channel) = with_one_open_channel().await;
+
+        m.on_actor_event(ActorEvent::Closed { channel });
+
+        assert!(
+            !m.channels.contains_key(&channel),
+            "the actor's close should still remove the live channel"
+        );
+        assert_eq!(
+            m.reattachable_channels(),
+            vec![(channel, OK_TYPE)],
+            "an actor dying with its transport must not cancel re-attachment"
+        );
+    }
+
+    /// The same for an actor that failed rather than ended: a stream torn down
+    /// mid-frame reports `Errored`, and a transport loss is as likely to look
+    /// like that as like a clean end.
+    #[tokio::test]
+    async fn a_channel_whose_actor_errored_is_still_re_attached() {
+        let (mut m, channel) = with_one_open_channel().await;
+
+        m.on_actor_event(ActorEvent::Errored {
+            channel,
+            detail: "stream reset".into(),
+        });
+
+        assert_eq!(
+            m.reattachable_channels(),
+            vec![(channel, OK_TYPE)],
+            "a failed actor must not cancel re-attachment either"
+        );
+    }
+
+    /// The other half of the contract: a channel *deliberately* closed must stay
+    /// closed. Without this, resume would resurrect channels the application
+    /// already let go — each one costing an id and a slot against the limit.
+    #[tokio::test]
+    async fn every_deliberate_close_is_final() {
+        for (name, close) in [
+            (
+                "we closed it",
+                Box::new(|m: &mut ChannelManager, c| {
+                    m.close_channel(c);
+                }) as Box<dyn Fn(&mut ChannelManager, ChannelId)>,
+            ),
+            (
+                "the peer closed it",
+                Box::new(|m: &mut ChannelManager, c| {
+                    m.handle_channel_close(c);
+                }),
+            ),
+            (
+                "the peer acknowledged our close",
+                Box::new(|m: &mut ChannelManager, c| m.handle_channel_closed(c)),
+            ),
+            (
+                "the peer rejected it",
+                Box::new(|m: &mut ChannelManager, c| m.handle_channel_reject(c, "no".into())),
+            ),
+            (
+                "the peer reported it failed",
+                Box::new(|m: &mut ChannelManager, c| m.handle_channel_error(c, "boom".into())),
+            ),
+        ] {
+            let (mut m, channel) = with_one_open_channel().await;
+            close(&mut m, channel);
+            assert!(
+                m.reattachable_channels().is_empty(),
+                "re-attached a channel after {name}"
+            );
+        }
+    }
+
+    /// A close that arrives *after* the local actor already noticed the stream
+    /// end — the routine order over a real transport, and the reason
+    /// `forget_resumable` is not guarded on the channel still being live.
+    #[tokio::test]
+    async fn a_close_arriving_after_the_actor_died_is_still_final() {
+        let (mut m, channel) = with_one_open_channel().await;
+
+        m.on_actor_event(ActorEvent::Closed { channel });
+        m.handle_channel_close(channel);
+
+        assert!(
+            m.reattachable_channels().is_empty(),
+            "a peer's close was lost because the actor got there first"
+        );
     }
 }
 

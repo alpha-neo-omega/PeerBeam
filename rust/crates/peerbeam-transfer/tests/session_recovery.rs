@@ -315,16 +315,29 @@ async fn next_event(
     }
 }
 
+/// Wait for a channel event, naming *which* wait timed out and what arrived
+/// instead.
+///
+/// The label is not decoration. This file waits on the same event shape twice in
+/// one test, so a bare "timed out waiting for a channel event" said nothing about
+/// which half of a reconnect broke, and the events that *did* arrive — the ones
+/// that identify the failure — were discarded by the predicate. Reporting both
+/// turned a CI failure that reproduced once in ten runs into a one-line diagnosis.
 async fn next_channel(
+    what: &str,
     rx: &mut UnboundedReceiver<ChannelEvent>,
     pred: impl Fn(&ChannelEvent) -> bool,
 ) -> ChannelEvent {
+    let mut seen: Vec<String> = Vec::new();
     loop {
         match tokio::time::timeout(WAIT, rx.recv()).await {
             Ok(Some(ev)) if pred(&ev) => return ev,
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("channel event stream ended"),
-            Err(_) => panic!("timed out waiting for a channel event"),
+            Ok(Some(ev)) => {
+                seen.push(format!("{ev:?}"));
+                continue;
+            }
+            Ok(None) => panic!("channel event stream ended [{what}]"),
+            Err(_) => panic!("timed out waiting for a channel event [{what}] saw={seen:?}"),
         }
     }
 }
@@ -393,6 +406,7 @@ async fn reconnect_resumes_and_reattaches_a_channel_with_message_continuity() {
     let h0 = live_handle(&mut ep.handle).await;
     let c1 = h0.open_channel(CHAT).await.expect("open c1");
     next_channel(
+        "first-open",
         &mut ep.channels,
         |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
     )
@@ -422,6 +436,7 @@ async fn reconnect_resumes_and_reattaches_a_channel_with_message_continuity() {
 
     // Channel re-attached: a second Opened for the same id.
     next_channel(
+        "reattach-after-recover",
         &mut ep.channels,
         |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == c1),
     )
