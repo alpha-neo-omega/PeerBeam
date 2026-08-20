@@ -30,11 +30,26 @@ pub fn current() -> Platform {
     }
 }
 
-/// The host name, or a stable fallback when it cannot be read.
+/// The host name, or a stable fallback when it cannot be read — or when what
+/// it reads is not a name.
+///
+/// # Why `localhost` is rejected rather than used
+///
+/// Android returns `localhost` *successfully*, so the error fallback never
+/// fired: every Android install appeared in every peer's device list as
+/// "localhost". With two phones on one network the list read `localhost`,
+/// `localhost`, and the user had no way to tell which was theirs — the one
+/// thing a device list exists to do.
+///
+/// Treated as absent rather than special-cased per platform: a machine that
+/// genuinely calls itself `localhost` is not offering a name worth showing a
+/// person either.
 pub fn hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
         .unwrap_or_else(|| "PeerBeam Device".to_string())
 }
 
@@ -230,5 +245,41 @@ mod tests {
         // matters is that both calls answer at all, consistently about whether
         // this machine HAS one.
         assert_eq!(first.is_some(), second.is_some());
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    /// The rule `hostname()` applies, as a pure function so it can be asserted
+    /// without a machine that happens to be named badly.
+    fn usable(raw: Option<&str>) -> String {
+        raw.map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
+            .unwrap_or_else(|| "PeerBeam Device".to_string())
+    }
+
+    /// **Android returns this successfully**, so the error fallback never fired
+    /// and every Android install showed up as "localhost" in every peer's
+    /// device list. Two phones on one network were indistinguishable.
+    #[test]
+    fn localhost_is_not_a_name() {
+        assert_eq!(usable(Some("localhost")), "PeerBeam Device");
+        assert_eq!(usable(Some("LocalHost")), "PeerBeam Device");
+        assert_eq!(usable(Some("  localhost  ")), "PeerBeam Device");
+    }
+
+    #[test]
+    fn an_empty_or_absent_name_falls_back_too() {
+        assert_eq!(usable(Some("")), "PeerBeam Device");
+        assert_eq!(usable(Some("   ")), "PeerBeam Device");
+        assert_eq!(usable(None), "PeerBeam Device");
+    }
+
+    #[test]
+    fn a_real_name_is_kept_and_trimmed() {
+        assert_eq!(usable(Some("bobs-laptop")), "bobs-laptop");
+        assert_eq!(usable(Some(" Studio ")), "Studio");
+        // Not a prefix match: only the exact word is refused.
+        assert_eq!(usable(Some("localhost-2")), "localhost-2");
     }
 }

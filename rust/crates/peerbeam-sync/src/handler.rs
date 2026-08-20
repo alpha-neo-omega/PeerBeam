@@ -114,7 +114,26 @@ impl SyncHandler {
 /// The ceiling is the same judgement the index makes: above it a file syncs
 /// whole rather than by delta, because loading a multi-gigabyte file to save
 /// bandwidth on it trades a real problem for a worse one.
-fn chunk_file(path: &std::path::Path) -> Option<Vec<peerbeam_chunk::Chunk>> {
+///
+/// # Why this is awaited off the runtime
+///
+/// It reads the whole file and runs a content-defined chunking pass over it —
+/// up to 256 MiB of blocking I/O and CPU. Called inline from an async handler,
+/// that occupies a runtime worker for the duration: on a small executor it
+/// stalls *every* other session — heartbeats, transfers in flight, the accept
+/// loop — for as long as the pass takes, and a peer can ask for it once per
+/// file in a manifest. `spawn_blocking` moves it to the pool that exists for
+/// exactly this, so a large file costs one blocking thread instead of the
+/// engine's responsiveness.
+async fn chunk_file(path: &std::path::Path) -> Option<Vec<peerbeam_chunk::Chunk>> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || chunk_file_blocking(&owned))
+        .await
+        .ok()?
+}
+
+/// The blocking body, kept separate so it stays directly testable.
+fn chunk_file_blocking(path: &std::path::Path) -> Option<Vec<peerbeam_chunk::Chunk>> {
     const MAX_CHUNKABLE: u64 = 256 * 1024 * 1024;
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_CHUNKABLE {
@@ -204,13 +223,11 @@ impl MessageHandler for SyncHandler {
                     });
                     return Ok(());
                 }
-                let chunks = self
-                    .shares
-                    .resolve(&req.path)
-                    .ok()
-                    .filter(|p| p.is_file())
-                    .and_then(|p| chunk_file(&p))
-                    .unwrap_or_default();
+                let chunks = self.shares.resolve(&req.path).ok().filter(|p| p.is_file());
+                let chunks = match chunks {
+                    Some(p) => chunk_file(&p).await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 (self.chunk_map)(crate::manifest::ChunkMapResponse {
                     path: req.path,
                     chunks,
@@ -235,7 +252,7 @@ impl MessageHandler for SyncHandler {
                 // Bounded per request, so one message cannot ask a peer to read
                 // an unbounded amount of its own disk back at the asker.
                 const MAX_PER_REQUEST: usize = 64;
-                let Some(chunks) = chunk_file(&real) else {
+                let Some(chunks) = chunk_file(&real).await else {
                     return Ok(());
                 };
                 for hash in req.hashes.iter().take(MAX_PER_REQUEST) {

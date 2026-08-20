@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -158,8 +159,20 @@ class MainActivity : FlutterActivity() {
                     Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                     Uri.parse("package:$packageName"),
                 )
-                startActivity(request)
-                result.success(null)
+                // Guarded: this settings screen is not present on every build.
+                // Several vendor ROMs and most Android-TV/Go images ship without
+                // it, and `startActivity` then throws
+                // `ActivityNotFoundException` — which crossed the platform
+                // channel as an unhandled Kotlin exception and took the app down
+                // from a Settings tap. A device that cannot show the dialog is
+                // not a broken device; it is one where the user has nothing to
+                // grant, and the caller is told so.
+                try {
+                    startActivity(request)
+                    result.success(true)
+                } catch (e: ActivityNotFoundException) {
+                    result.success(false)
+                }
             }
             "requestNotificationPermission" -> {
                 requestNotificationPermission()
