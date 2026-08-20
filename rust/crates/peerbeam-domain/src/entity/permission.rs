@@ -255,6 +255,20 @@ impl PermissionSet {
             .collect()
     }
 
+    /// The permissions present in **both** sets.
+    ///
+    /// Used when two copies of one trust record have to be reconciled without
+    /// knowing which is newer — two processes editing the same store. The
+    /// intersection is the fail-closed answer: a permission revoked in either
+    /// copy stays revoked, so a stale cache can never resurrect a capability
+    /// the user took away. The cost is that a grant made in one copy and not
+    /// yet seen by the other is lost, which costs a re-approval rather than a
+    /// security property.
+    #[must_use]
+    pub fn intersect(self, other: PermissionSet) -> PermissionSet {
+        PermissionSet(self.0 & other.0)
+    }
+
     /// The raw bitmap. For tests and diagnostics; the stored form is names.
     #[must_use]
     pub const fn bits(self) -> u32 {

@@ -59,6 +59,41 @@ impl FsTrust {
     /// middle of removing from `cache`: without excluding them, the disk's
     /// (not-yet-updated) copy would immediately resurrect the record this
     /// call is trying to delete.
+    /// Replace one cached record with what is on disk, before changing it.
+    ///
+    /// # Why a mutator must read before it writes
+    ///
+    /// Two requirements pull against each other. A caller's own change must not
+    /// be merged away — so the record it writes is excluded from the merge. But
+    /// a *stale* cached copy must not be written back over another process's
+    /// narrowing, which excluding it would allow.
+    ///
+    /// Both hold if the mutation is applied to a **fresh** copy: re-read that
+    /// one record, layer the change on top, then write. A revocation another
+    /// process made a moment ago is therefore already present in the record
+    /// being edited, instead of being discovered too late by a merge.
+    ///
+    /// Still not atomic across processes — there is no file lock, and the
+    /// window between this read and the write remains. It is now a genuine
+    /// race rather than a certainty: before, *every* write from a
+    /// long-lived cache undid concurrent narrowing, because nothing that
+    /// narrows a record moves `trusted_at`.
+    fn refresh_one(&self, cache: &mut HashMap<String, TrustRecord>, id: &str) {
+        if let Ok(disk) = Self::read_records(&self.path) {
+            match disk.into_iter().find(|(k, _)| k == id) {
+                Some((k, fresh)) => {
+                    cache.insert(k, fresh);
+                }
+                // Absent on disk while present here means another process
+                // removed it. Dropping it locally is the fail-closed reading:
+                // a record nobody has is a device that is trusted by nobody.
+                None => {
+                    cache.remove(id);
+                }
+            }
+        }
+    }
+
     fn merge_from_disk(
         &self,
         cache: &mut HashMap<String, TrustRecord>,
@@ -70,11 +105,61 @@ impl FsTrust {
                 continue;
             }
             match cache.get(&id) {
-                Some(local) if local.trusted_at >= disk_rec.trusted_at => {
-                    // Our in-memory copy is at least as fresh — keep it.
-                }
-                _ => {
+                None => {
                     cache.insert(id, disk_rec);
+                }
+                Some(local) => {
+                    // **`trusted_at` cannot decide this, and relying on it was
+                    // a security bug.**
+                    //
+                    // Nothing that *narrows* a record touches `trusted_at`:
+                    // `set_permission`, `set_mine`, `approve_gated` and
+                    // `remove` all leave it at the moment the device was first
+                    // pinned. So two copies of the same record always compared
+                    // equal, "keep the local one" always won, and a process
+                    // holding a stale cache silently undid another process's
+                    // revocation the next time it wrote anything at all.
+                    //
+                    // Without a cross-process lock there is no way to know
+                    // which of two equal-looking copies is newer, so this stops
+                    // guessing and merges **fail-closed** instead: the narrower
+                    // of the two wins on every field that grants something.
+                    // Losing a grant costs the user one re-approval; losing a
+                    // revocation leaves a device they revoked still able to act.
+                    let merged = TrustRecord {
+                        device: disk_rec.device.clone(),
+                        fingerprint: disk_rec.fingerprint.clone(),
+                        name: if disk_rec.trusted_at >= local.trusted_at {
+                            disk_rec.name.clone()
+                        } else {
+                            local.name.clone()
+                        },
+                        trusted_at: local.trusted_at.min(disk_rec.trusted_at),
+                        // Approval is a grant: either side having withdrawn it
+                        // withdraws it.
+                        approved: local.approved && disk_rec.approved,
+                        // The intersection, so a permission revoked anywhere
+                        // cannot be resurrected by a stale copy that still
+                        // holds it.
+                        permissions: local.permissions.intersect(disk_rec.permissions),
+                        // The *earlier* deadline: a window someone shortened
+                        // must not be lengthened again by a copy that predates
+                        // the change. `None` means no deadline, so it loses to
+                        // any deadline at all.
+                        expires_at: match (local.expires_at, disk_rec.expires_at) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), None) | (None, Some(a)) => Some(a),
+                            (None, None) => None,
+                        },
+                        // Not a grant, so the freshest wins rather than the
+                        // narrowest — unmarking a device is not a security act.
+                        mine: if disk_rec.trusted_at >= local.trusted_at {
+                            disk_rec.mine
+                        } else {
+                            local.mine
+                        },
+                    };
+                    cache.insert(id, merged);
                 }
             }
         }
@@ -220,7 +305,7 @@ impl FsTrust {
                 changed = true;
             }
             if changed {
-                self.persist(&mut cache, &[])?;
+                self.persist(&mut cache, &[device.0.as_str()])?;
             }
         }
         Ok(())
@@ -246,6 +331,10 @@ impl FsTrust {
         granted: bool,
     ) -> Result<bool> {
         let mut cache = self.cache.lock().unwrap();
+        // Read this record fresh before changing it, so a narrowing another
+        // process just made is part of what we edit rather than something a
+        // merge has to rescue afterwards.
+        self.refresh_one(&mut cache, &device.0);
         let Some(record) = cache.get_mut(&device.0) else {
             return Ok(false);
         };
@@ -254,7 +343,7 @@ impl FsTrust {
             return Ok(false);
         }
         record.permissions = updated;
-        self.persist(&mut cache, &[])?;
+        self.persist(&mut cache, &[device.0.as_str()])?;
         Ok(true)
     }
 
@@ -277,6 +366,10 @@ impl FsTrust {
     /// has actually met.
     pub fn set_mine(&self, device: &DeviceId, mine: bool) -> Result<bool> {
         let mut cache = self.cache.lock().unwrap();
+        // Read this record fresh before changing it, so a narrowing another
+        // process just made is part of what we edit rather than something a
+        // merge has to rescue afterwards.
+        self.refresh_one(&mut cache, &device.0);
         let Some(record) = cache.get_mut(&device.0) else {
             return Ok(false);
         };
@@ -284,7 +377,7 @@ impl FsTrust {
             return Ok(false);
         }
         record.mine = mine;
-        self.persist(&mut cache, &[])?;
+        self.persist(&mut cache, &[device.0.as_str()])?;
         Ok(true)
     }
 }
@@ -302,8 +395,13 @@ fn unique_tmp(path: &Path) -> PathBuf {
 impl TrustStore for FsTrust {
     fn record(&self, record: TrustRecord) -> Result<()> {
         let mut cache = self.cache.lock().unwrap();
-        cache.insert(record.device.0.clone(), record);
-        self.persist(&mut cache, &[])
+        let id = record.device.0.clone();
+        cache.insert(id.clone(), record);
+        // Excluded from the merge: this record is what this call just wrote, so
+        // it is authoritative here. Merging it against the older copy on disk
+        // would intersect the change away — which is exactly what the
+        // fail-closed merge must not do to a caller's own write.
+        self.persist(&mut cache, &[id.as_str()])
     }
 
     /// The record as stored — **expired or not**. The pin is a memory of a key
@@ -1281,6 +1379,134 @@ mod tests {
                 .unwrap()
                 .contains("\"mine\": true"),
             "but a mark must be on disk, or a restart would forget it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use peerbeam_domain::entity::Permission;
+
+    /// **A stale cache must not resurrect a revoked capability.**
+    ///
+    /// Nothing that narrows a record touches `trusted_at` — not
+    /// `set_permission`, `set_mine`, `approve_gated` or `remove` — so two
+    /// copies always compared equal, "keep the local one" always won, and a
+    /// process holding a stale cache silently undid another process's
+    /// revocation the next time it wrote anything at all.
+    #[test]
+    fn a_permission_revoked_by_another_process_stays_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+
+        // Process A pins and approves, then B opens and caches the same state.
+        let a = FsTrust::open(path.clone()).unwrap();
+        let dev = DeviceId::from("pb-bob".to_string());
+        a.record(TrustRecord {
+            device: dev.clone(),
+            fingerprint: "ff".into(),
+            name: "Bob".into(),
+            trusted_at: chrono::Utc::now(),
+            approved: true,
+            permissions: PermissionSet::granted_on_approval(),
+            expires_at: None,
+            mine: false,
+        })
+        .unwrap();
+
+        let b = FsTrust::open(path.clone()).unwrap();
+        // B reads it into its cache and holds it.
+        assert!(b.is_trusted(&dev));
+
+        // A revokes Files. `trusted_at` does not move.
+        a.set_permission(&dev, Permission::Files, false).unwrap();
+        assert!(!a.may(&dev, Permission::Files));
+
+        // B now writes something unrelated. Before the merge was fail-closed,
+        // this wrote B's stale copy back and Files was granted again.
+        b.set_mine(&dev, true).unwrap();
+
+        let fresh = FsTrust::open(path).unwrap();
+        assert!(
+            !fresh.may(&dev, Permission::Files),
+            "a stale cache resurrected a revoked permission"
+        );
+    }
+
+    /// Approval withdrawn anywhere stays withdrawn.
+    #[test]
+    fn approval_withdrawn_by_another_process_is_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let a = FsTrust::open(path.clone()).unwrap();
+        let dev = DeviceId::from("pb-bob".to_string());
+        a.record(TrustRecord {
+            device: dev.clone(),
+            fingerprint: "ff".into(),
+            name: "Bob".into(),
+            trusted_at: chrono::Utc::now(),
+            approved: true,
+            permissions: PermissionSet::granted_on_approval(),
+            expires_at: None,
+            mine: false,
+        })
+        .unwrap();
+
+        let b = FsTrust::open(path.clone()).unwrap();
+        assert!(b.is_approved(&dev));
+
+        // A un-approves by writing a narrowed record directly.
+        let mut narrowed = a.lookup(&dev).unwrap().unwrap();
+        narrowed.approved = false;
+        narrowed.permissions = PermissionSet::none();
+        a.record(narrowed).unwrap();
+
+        b.set_mine(&dev, true).unwrap();
+
+        let fresh = FsTrust::open(path).unwrap();
+        assert!(
+            !fresh.is_approved(&dev),
+            "a stale cache restored an approval that had been withdrawn"
+        );
+    }
+
+    /// A shortened window must not be lengthened again by an older copy.
+    #[test]
+    fn the_earlier_deadline_survives_a_stale_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let a = FsTrust::open(path.clone()).unwrap();
+        let dev = DeviceId::from("pb-bob".to_string());
+        let far = chrono::Utc::now() + chrono::Duration::days(7);
+        a.record(TrustRecord {
+            device: dev.clone(),
+            fingerprint: "ff".into(),
+            name: "Bob".into(),
+            trusted_at: chrono::Utc::now(),
+            approved: true,
+            permissions: PermissionSet::granted_on_approval(),
+            expires_at: Some(far),
+            mine: false,
+        })
+        .unwrap();
+
+        let b = FsTrust::open(path.clone()).unwrap();
+        assert!(b.is_trusted(&dev));
+
+        // A shortens the window to ten minutes.
+        let soon = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let mut shortened = a.lookup(&dev).unwrap().unwrap();
+        shortened.expires_at = Some(soon);
+        a.record(shortened).unwrap();
+
+        b.set_mine(&dev, true).unwrap();
+
+        let fresh = FsTrust::open(path).unwrap();
+        let got = fresh.lookup(&dev).unwrap().unwrap().expires_at.unwrap();
+        assert!(
+            got <= soon,
+            "a stale copy lengthened a window that had been shortened"
         );
     }
 }

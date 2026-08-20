@@ -5961,7 +5961,18 @@ async fn fetch_by_delta(
             .or_else(|| index.chunks().read(folder, into, &local, h))
     })?;
 
-    let dest = into.join(write_to);
+    // **`local_path`, not `join`.** `write_to` is a path from the peer's
+    // manifest: `reconcile` emits a `Fetch` for any remote path absent from the
+    // local index, and nothing between `Manifest::from_frame` and here checks
+    // its shape — the manifest decoder bounds length and count, not content. So
+    // `into.join("../../../../.bashrc")` resolves outside the sync root and this
+    // `fs::write` would put peer-chosen bytes there, with the app's privileges.
+    // The reassembly hash proves nothing about that: the peer supplied the map
+    // it is checked against.
+    //
+    // `local_path` keeps only real components, so a hostile path lands inside
+    // the root or nowhere.
+    let dest = peerbeam_domain::local_path(into, write_to);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }

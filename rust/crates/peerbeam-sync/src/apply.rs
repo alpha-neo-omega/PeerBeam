@@ -49,8 +49,19 @@ pub fn apply_local(
         match action {
             Action::Rename { from, to } => {
                 // Moving what we already hold, instead of fetching it again.
-                let src = root.join(from);
-                let dst = root.join(to);
+                //
+                // **Both sides resolved, not joined.** `to` is a path the
+                // *peer* chose: `collapse_renames` pairs a local delete with a
+                // remote fetch on content hash alone, so the destination comes
+                // off the wire. `root.join("../../.bashrc")` resolves outside
+                // the sync root, and `fs::rename` would then move the user's
+                // file there — a peer picking the name of a file it never had.
+                // `local_path` drops `.` and `..` and keeps only real
+                // components, so a hostile `to` lands inside the root or not at
+                // all. `from` goes through it too: it is an index key today,
+                // but a key is only ever as trustworthy as whatever wrote it.
+                let src = peerbeam_domain::local_path(root, from);
+                let dst = peerbeam_domain::local_path(root, to);
                 if let Some(parent) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -96,7 +107,9 @@ pub fn apply_local(
                 let _ = path;
             }
             Action::Delete { path } => {
-                let target = root.join(path);
+                // Resolved, not joined: a delete names a path this device is
+                // about to remove, and `..` in it would remove somebody else's.
+                let target = peerbeam_domain::local_path(root, path);
                 // A missing file is success, not an error: the user may have
                 // deleted it themselves between the scan and now, and failing
                 // here would abort a sync over something already done.
@@ -137,6 +150,11 @@ pub fn apply_local(
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::setup as setup_for_containment;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -144,7 +162,7 @@ mod tests {
 
     use peerbeam_domain::port::{AppStore, EncryptionProvider};
 
-    fn setup() -> (tempfile::TempDir, SyncIndex, std::path::PathBuf) {
+    pub(crate) fn setup() -> (tempfile::TempDir, SyncIndex, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("folder");
         std::fs::create_dir(&root).unwrap();
@@ -268,5 +286,61 @@ mod tests {
         .unwrap();
         assert_eq!((out.fetching, out.pushing), (1, 1));
         assert!(index.load("f").unwrap().is_empty(), "the index was written");
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::tests_support::setup_for_containment as setup;
+    use super::*;
+
+    /// **A peer-chosen rename must not move a local file out of the root.**
+    ///
+    /// `collapse_renames` pairs a local delete with a remote fetch on content
+    /// hash alone, so the destination comes off the wire. Joined naively,
+    /// `../escaped.txt` resolves outside the sync root and `fs::rename` moves
+    /// the user's own file there.
+    #[test]
+    fn a_rename_cannot_move_a_file_outside_the_root() {
+        let (dir, index, root) = setup();
+        std::fs::write(root.join("secret.txt"), b"mine").unwrap();
+        let outside = dir.path().join("escaped.txt");
+
+        let _ = apply_local(
+            &index,
+            "folder",
+            &root,
+            &[Action::Rename {
+                from: "secret.txt".into(),
+                to: "../../escaped.txt".into(),
+            }],
+            &std::collections::BTreeMap::new(),
+        );
+
+        assert!(!outside.exists(), "the file was moved out of the sync root");
+        assert!(
+            root.join("escaped.txt").exists() || root.join("secret.txt").exists(),
+            "the file vanished entirely"
+        );
+    }
+
+    /// The same containment for a delete: `..` must not reach outside.
+    #[test]
+    fn a_delete_cannot_remove_a_file_outside_the_root() {
+        let (dir, index, root) = setup();
+        let outside = dir.path().join("keepme.txt");
+        std::fs::write(&outside, b"not yours").unwrap();
+
+        let _ = apply_local(
+            &index,
+            "folder",
+            &root,
+            &[Action::Delete {
+                path: "../keepme.txt".into(),
+            }],
+            &std::collections::BTreeMap::new(),
+        );
+
+        assert!(outside.exists(), "a file outside the sync root was deleted");
     }
 }

@@ -93,11 +93,34 @@ pub fn plan(want: &ChunkMap, have: &BTreeSet<String>) -> Need {
 /// name would otherwise have its content written into a file the user believes
 /// is a faithful copy. Checking is cheap; not checking makes the hash a label
 /// rather than a guarantee.
+/// The largest reassembly this code will attempt, matching the chunkable-file
+/// ceiling used by `index` and `handler`.
+///
+/// A bound rather than a hint: it is checked against a figure the peer chose.
+const MAX_REASSEMBLE: u64 = 256 * 1024 * 1024;
+
 pub fn reassemble(
     map: &ChunkMap,
     mut supply: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(map.total_bytes() as usize);
+    // **The declared size is refused before it is trusted, and never used to
+    // allocate.**
+    //
+    // `total_bytes()` sums `u32` chunk lengths off the wire into a `u64`, and
+    // the chunk-map decoder bounds neither the count nor the lengths. A peer
+    // can therefore declare terabytes in a frame of a few hundred bytes;
+    // `Vec::with_capacity` on that figure aborts the process on allocation
+    // failure, which is a remote crash for the cost of one message — and it
+    // happens before a single chunk has been supplied or verified.
+    //
+    // The same ceiling the rest of this crate uses for a chunkable file: a
+    // reassembly larger than that is not a file this code would ever have
+    // asked for. Capacity is left to the `extend_from_slice` growth below,
+    // which can only ever allocate what has actually been supplied and hashed.
+    if map.total_bytes() > MAX_REASSEMBLE {
+        return None;
+    }
+    let mut out = Vec::new();
     for chunk in &map.chunks {
         let bytes = supply(&chunk.hash)?;
         if bytes.len() != chunk.len as usize {
@@ -290,5 +313,59 @@ mod tests {
         let map = map_of("a", &data(200_000, 12));
         let json = serde_json::to_string(&map).unwrap();
         assert_eq!(serde_json::from_str::<ChunkMap>(&json).unwrap(), map);
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use peerbeam_chunk::Chunk;
+
+    /// **A declared size is refused, never allocated.**
+    ///
+    /// The chunk-map decoder bounds neither the count nor the lengths, so a
+    /// peer can declare terabytes in a frame of a few hundred bytes. Passing
+    /// that figure to `Vec::with_capacity` aborts the process on allocation
+    /// failure — a remote crash for the price of one message, before a single
+    /// chunk has been supplied or verified.
+    #[test]
+    fn a_map_declaring_more_than_the_ceiling_is_refused_not_allocated() {
+        // Four chunks of 1 GiB each: cheap to describe, impossible to hold.
+        let chunks: Vec<Chunk> = (0..4)
+            .map(|i| Chunk {
+                hash: format!("{i:064x}"),
+                len: 1024 * 1024 * 1024,
+                offset: i * 1024 * 1024 * 1024,
+            })
+            .collect();
+        let map = ChunkMap {
+            path: "big.bin".into(),
+            chunks,
+        };
+        assert!(map.total_bytes() > MAX_REASSEMBLE);
+
+        // Refused without ever asking for a chunk: the supply closure panics if
+        // it is called, so reaching for the bytes fails the test rather than
+        // the machine.
+        let out = reassemble(&map, |_| panic!("must refuse before supplying"));
+        assert!(out.is_none(), "an oversized map was accepted");
+    }
+
+    /// A map inside the ceiling still reassembles, so the bound is a bound and
+    /// not a wall.
+    #[test]
+    fn an_ordinary_map_still_reassembles() {
+        let body = b"hello".to_vec();
+        let hash = peerbeam_chunk::hash(&body);
+        let map = ChunkMap {
+            path: "small.txt".into(),
+            chunks: vec![Chunk {
+                hash: hash.clone(),
+                len: body.len() as u32,
+                offset: 0,
+            }],
+        };
+        let out = reassemble(&map, |h| (h == hash).then(|| body.clone()));
+        assert_eq!(out.as_deref(), Some(b"hello".as_slice()));
     }
 }
