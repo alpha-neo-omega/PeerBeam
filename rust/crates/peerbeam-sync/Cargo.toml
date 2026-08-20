@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 peerbeam-browse = { path = "../peerbeam-browse" }
 peerbeam-domain = { workspace = true }
+tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }

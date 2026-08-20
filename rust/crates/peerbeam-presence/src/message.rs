@@ -32,6 +32,15 @@ pub const NETWORK_KINDS: [&str; 5] = ["lan", "wifi", "ethernet", "tailscale", "u
 /// collector on the sender, not a very full battery.
 pub const MAX_BATTERY_PERCENT: u8 = 100;
 
+/// The longest `app_version` a peer may have rendered.
+///
+/// A ceiling, not a grammar. Unlike [`NETWORK_KINDS`] there is no closed set to
+/// check a version against — `0.9.0` and `1.2.3-rc.1+sha.5114f85` are both
+/// honest — but a string that reaches a dashboard chip verbatim needs *some*
+/// bound, and 40 characters is more than any version a build could truthfully
+/// carry.
+pub const MAX_APP_VERSION_LEN: usize = 40;
+
 /// "Make yourself findable" — the message behind *find my device*.
 ///
 /// Carries nothing but a duration, because there is nothing else to say: the
@@ -109,6 +118,10 @@ pub enum PresenceError {
     /// to `None` instead; the asymmetry is explained on [`Status::from_frame`].
     #[error("unknown network kind: {0:?}")]
     UnknownNetwork(String),
+    /// Raised on **encode only**, for the same reason as [`Self::UnknownNetwork`]:
+    /// on decode an implausible version is dropped to `None`.
+    #[error("implausible app_version: {0:?}")]
+    ImplausibleAppVersion(String),
 }
 
 impl From<PresenceError> for SessionError {
@@ -161,6 +174,23 @@ pub fn is_known_network(network: &str) -> bool {
     NETWORK_KINDS.contains(&network)
 }
 
+/// Whether `app_version` is shaped like a version a build could actually have.
+///
+/// [`is_known_network`]'s counterpart for the field that has no closed set:
+/// non-empty, within [`MAX_APP_VERSION_LEN`], and built only from the
+/// characters versions are written with. The character rule is the load-bearing
+/// half — it is what keeps markup, newlines, control characters and
+/// bidirectional overrides out of a string the dashboard prints beside a
+/// device's own name, where a peer could otherwise forge a whole status line.
+#[must_use]
+pub fn is_plausible_app_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= MAX_APP_VERSION_LEN
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+}
+
 impl Status {
     /// The presence MessageType (`Status` = 1).
     #[must_use]
@@ -184,6 +214,11 @@ impl Status {
         if let Some(net) = &self.network {
             if !is_known_network(net) {
                 return Err(PresenceError::UnknownNetwork(net.clone()));
+            }
+        }
+        if let Some(version) = &self.app_version {
+            if !is_plausible_app_version(version) {
+                return Err(PresenceError::ImplausibleAppVersion(version.clone()));
             }
         }
         let payload = serde_json::to_vec(self)
@@ -211,6 +246,13 @@ impl Status {
     ///   must never be rendered raw — but throwing away a perfectly good
     ///   battery and storage reading over one cosmetic label would be the wrong
     ///   trade. The field simply reads as unshared.
+    /// * **An implausible `app_version` is dropped to `None`.** The same trade
+    ///   as `network`, and for the same reason: it is peer text the dashboard
+    ///   prints verbatim in a chip, and a 4 KB string or one carrying markup is
+    ///   a sender bug or an attack, never a version. Dropped rather than
+    ///   truncated, because a truncated version *is* a wrong version, and
+    ///   showing one would be the same invention that clamping a 137% battery
+    ///   would be.
     pub fn from_frame(frame: &SessionFrame) -> Result<Status, PresenceError> {
         if frame.message_type.get() != MSG_STATUS {
             return Err(PresenceError::WrongType(frame.message_type.get()));
@@ -221,6 +263,11 @@ impl Status {
         if let Some(net) = &s.network {
             if !is_known_network(net) {
                 s.network = None;
+            }
+        }
+        if let Some(version) = &s.app_version {
+            if !is_plausible_app_version(version) {
+                s.app_version = None;
             }
         }
         Ok(s)
@@ -453,6 +500,125 @@ mod tests {
             s.to_frame(ChannelId::new(1)),
             Err(PresenceError::UnknownNetwork(_))
         ));
+    }
+
+    /// The version chip is the second string a peer controls, and until now the
+    /// only unbounded one: `network` was vetted against a closed set while
+    /// `app_version` passed through whatever arrived. A dashboard renders it
+    /// verbatim beside the device's own name, so a 4 KB string, a newline, or a
+    /// tag is dropped exactly the way an unknown network word is.
+    #[test]
+    fn an_implausible_app_version_decodes_as_absent_never_verbatim() {
+        let long = "9".repeat(MAX_APP_VERSION_LEN + 1);
+        for hostile in [
+            long.as_str(),
+            "<script>alert(1)</script>",
+            "",
+            "0.4.1\nBattery 100%",
+            "0.4.1 (patched)",
+            "0.4.1\u{0}",
+            "\u{202e}1.4.0",
+            "🎉",
+        ] {
+            let frame = SessionFrame::new(
+                ChannelId::new(1),
+                Status::message_type(),
+                MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+                Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "app_version": hostile,
+                        "battery_percent": 50u8,
+                        "sent_at": "2026-08-17T10:00:00Z",
+                    }))
+                    .unwrap(),
+                ),
+            );
+            let decoded = Status::from_frame(&frame)
+                .expect("an implausible app_version must not fail the message");
+            assert_eq!(
+                decoded.app_version, None,
+                "app_version {hostile:?} reached the surface"
+            );
+            // Same trade as `network`: one cosmetic label must not cost a real
+            // reading.
+            assert_eq!(decoded.battery_percent, Some(50));
+        }
+    }
+
+    /// The guard cannot pass by blanking every version: the shapes a build
+    /// actually carries survive, including a full pre-release with build
+    /// metadata, and the length limit itself is inclusive.
+    #[test]
+    fn a_real_version_survives_the_round_trip() {
+        let at_limit = format!("1.2.3-rc.1+{}", "a".repeat(MAX_APP_VERSION_LEN - 11));
+        assert_eq!(at_limit.len(), MAX_APP_VERSION_LEN);
+        for real in [
+            "0.9.0",
+            "0.4.1",
+            "1.2.3-rc.1+sha.5114f85",
+            "2026.08.19",
+            "0.9.0_nightly",
+            at_limit.as_str(),
+        ] {
+            let s = Status {
+                app_version: Some(real.to_string()),
+                ..empty()
+            };
+            let frame = s
+                .to_frame(ChannelId::new(1))
+                .expect("a real version must encode");
+            assert_eq!(
+                Status::from_frame(&frame).unwrap().app_version.as_deref(),
+                Some(real),
+                "real version {real:?} must survive"
+            );
+        }
+        // The version this build ships is the one that matters most: a bound
+        // that rejected our own would blank the field on every peer.
+        assert!(is_plausible_app_version(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// A version too long is dropped whole, never shortened. `0.4.1` truncated
+    /// out of `0.4.11` is a *wrong* version presented as a fact — the same
+    /// invention that clamping a 137% battery would be.
+    #[test]
+    fn an_over_long_app_version_is_dropped_not_truncated() {
+        let too_long = format!("{}xyz", "1.2.3-".repeat(8));
+        assert!(too_long.len() > MAX_APP_VERSION_LEN);
+        let frame = SessionFrame::new(
+            ChannelId::new(1),
+            Status::message_type(),
+            MessageFlags::OPTIONAL.with(MessageFlags::END_OF_MESSAGE),
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "app_version": too_long,
+                    "sent_at": "2026-08-17T10:00:00Z",
+                }))
+                .unwrap(),
+            ),
+        );
+        let decoded = Status::from_frame(&frame).unwrap();
+        assert_eq!(decoded.app_version, None);
+    }
+
+    /// Encode refuses what decode would blank, so a collector shipping a
+    /// malformed version fails on the side that can fix it rather than
+    /// broadcasting a field every peer silently drops (registry §7).
+    #[test]
+    fn to_frame_refuses_an_implausible_app_version() {
+        for bad in ["", "0.4.1 (dev)", &"9".repeat(MAX_APP_VERSION_LEN + 1)] {
+            let s = Status {
+                app_version: Some(bad.to_string()),
+                ..empty()
+            };
+            assert!(
+                matches!(
+                    s.to_frame(ChannelId::new(1)),
+                    Err(PresenceError::ImplausibleAppVersion(_))
+                ),
+                "encode must refuse {bad:?}"
+            );
+        }
     }
 
     /// The wire shape is exactly these six keys. A status is broadcast to every

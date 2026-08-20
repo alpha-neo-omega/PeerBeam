@@ -17,6 +17,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/features/transfers/transfers_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/state/app_scope.dart';
+import 'package:peerbeam/state/models.dart' show formatBytes;
 import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
@@ -143,7 +144,10 @@ void main() {
 
       // The progress line is `done / total`; a resumable transfer that claimed
       // zero progress would give the user no reason to resume it.
-      expect(find.textContaining('700 B / 1000 B'), findsOneWidget);
+      expect(
+        find.textContaining('${formatBytes(700)} / ${formatBytes(1000)}'),
+        findsOneWidget,
+      );
     });
 
     testWidgets('Resume calls resumeInterrupted, never resume', (tester) async {

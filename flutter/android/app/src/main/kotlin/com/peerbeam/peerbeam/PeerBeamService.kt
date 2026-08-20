@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationManagerCompat
 
 /**
@@ -19,6 +20,12 @@ import androidx.core.app.NotificationManagerCompat
 class PeerBeamService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /// Last `active` flag delivered by [onStartCommand] — a transfer is moving
+    /// bytes rather than the service sitting receive-ready. Kept as state
+    /// because [onTimeout] arrives out of band, hours later, with no intent of
+    /// its own to read it from.
+    private var transferActive = false
 
     // Status-bar icon animation. Android doesn't frame-animate a notification
     // small icon on its own, so while a transfer is active we cycle the icon
@@ -55,6 +62,7 @@ class PeerBeamService : Service() {
         // static notification and holds no CPU wake lock (battery-friendly).
         val active = intent.getBooleanExtra("active", false)
         val incoming = intent.getBooleanExtra("incoming", false)
+        transferActive = active
 
         Notifications.ensureChannel(this)
         val frames = if (incoming) dlFrames else ulFrames
@@ -86,6 +94,46 @@ class PeerBeamService : Service() {
         // Not sticky: don't let the OS resurrect the service without its engine
         // (see the null-intent guard above). The app re-starts it on relaunch.
         return START_NOT_STICKY
+    }
+
+    /// Android 15+ caps a `dataSync` foreground service at 6 cumulative hours
+    /// per 24 for apps targeting SDK 35+ — this one targets 36 — and calls this
+    /// when the cap is reached. Overriding it is mandatory, not optional: leave
+    /// the service running for a few seconds more and the framework raises
+    /// `ForegroundServiceDidNotStopInTimeException` against this process. The
+    /// decision of what to stop and what to say lives in
+    /// `handleForegroundTimeout`, which is testable off-device.
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        handleForegroundTimeout(
+            transferActive,
+            object : TimeoutOps {
+                override fun notice(notice: TimeoutNotice) {
+                    Notifications.ensureChannel(this@PeerBeamService)
+                    Notifications.show(
+                        this@PeerBeamService,
+                        TIMEOUT_NOTICE_ID,
+                        Notifications.build(
+                            this@PeerBeamService,
+                            notice.title,
+                            notice.body,
+                            ongoing = false,
+                            progress = null,
+                            // The neutral brand glyph, not a direction arrow:
+                            // nothing is transferring any more.
+                            iconRes = R.drawable.ic_stat_peerbeam,
+                        ),
+                    )
+                }
+
+                override fun stop() {
+                    stopIconAnimation()
+                    releaseLocks()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            },
+        )
     }
 
     /// While a transfer is active, cycle the small icon through frames (~2/s) so

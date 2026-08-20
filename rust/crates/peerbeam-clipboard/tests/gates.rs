@@ -107,7 +107,8 @@ async fn pair(a_trusts_b: bool, sync: bool, b_advertises: CapabilitySet) -> Pair
     let b_sink_log: Arc<Mutex<Vec<(DeviceId, Clip)>>> = Arc::new(Mutex::new(Vec::new()));
     let log = b_sink_log.clone();
     let sink: ClipboardSink = Arc::new(move |id, clip| log.lock().unwrap().push((id, clip)));
-    let (handler_b, peer_slot_b): (_, Arc<OnceLock<DeviceId>>) = ClipboardHandler::new(sink);
+    let (handler_b, peer_slot_b): (_, Arc<OnceLock<DeviceId>>) =
+        ClipboardHandler::new(sink, Arc::new(PermissiveTrust));
 
     let (ta, tb) = MemTransport::pair();
     let (a_ev, _a_ev_rx) = unbounded_channel();
@@ -237,6 +238,39 @@ async fn assert_nothing_arrives(p: &Pair, why: &str) {
 
 /// The baseline. Without this passing, every negative test below is vacuous —
 /// they would all "pass" against a build that simply never sends anything.
+/// A trust store that permits everything, for the tests that are about the
+/// *frame* path rather than the gate.
+///
+/// The gate itself is covered in `gate.rs`'s own tests, and separately below by
+/// `an_unapproved_peer_cannot_change_our_clipboard` — which is the case that
+/// used to be missing entirely.
+#[derive(Default)]
+struct PermissiveTrust;
+
+impl peerbeam_domain::port::TrustStore for PermissiveTrust {
+    fn record(&self, _r: peerbeam_domain::entity::TrustRecord) -> peerbeam_domain::Result<()> {
+        Ok(())
+    }
+    fn lookup(
+        &self,
+        device: &DeviceId,
+    ) -> peerbeam_domain::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+        Ok(Some(peerbeam_domain::entity::TrustRecord {
+            device: device.clone(),
+            fingerprint: "ff".into(),
+            name: "Peer".into(),
+            trusted_at: chrono::Utc::now(),
+            approved: true,
+            permissions: peerbeam_domain::entity::PermissionSet::granted_on_approval(),
+            expires_at: None,
+            mine: false,
+        }))
+    }
+    fn is_trusted(&self, _d: &DeviceId) -> bool {
+        true
+    }
+}
+
 #[tokio::test]
 async fn a_trusted_capable_peer_with_sync_on_receives_a_clip() {
     let mut p = pair(true, true, clipboard_caps()).await;
@@ -329,8 +363,10 @@ async fn sync_off_still_receives_and_applies_an_incoming_clip() {
     // consults no setting at all.
     let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log = applied.clone();
-    let (handler, slot) =
-        ClipboardHandler::new(Arc::new(move |_, c: Clip| log.lock().unwrap().push(c.text)));
+    let (handler, slot) = ClipboardHandler::new(
+        Arc::new(move |_, c: Clip| log.lock().unwrap().push(c.text)),
+        Arc::new(PermissiveTrust),
+    );
     let _ = slot.set(DeviceId::from("device-b"));
     let frame = Clip::new("from the other side")
         .expect("encode")

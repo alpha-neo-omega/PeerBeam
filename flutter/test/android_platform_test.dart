@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/data/history_repository.dart';
 import 'package:peerbeam/data/transfer_repository.dart';
@@ -23,10 +26,24 @@ class FakeBridge implements PlatformBridge {
   bool? lastActive;
   bool? lastIncoming;
   bool multicast = false;
+
+  /// Every multicast-lock transition asked of the platform, so a test can say
+  /// "the lock was never touched" and not merely "it ended up false".
+  final List<bool> multicastCalls = [];
   final List<NotificationContent> shown = [];
   bool exempt = false;
   int exemptionRequests = 0;
   int notificationPermissionRequests = 0;
+
+  /// When set, `startForegroundService` fails with it — how Android answers a
+  /// foreground-service start made from the background (`MainActivity` turns
+  /// `ForegroundServiceStartNotAllowedException` into this channel error).
+  PlatformException? refuseStart;
+
+  /// When set, `startForegroundService` waits on it — a stand-in for the
+  /// platform round-trip, so a test can inject a second `sync` while the first
+  /// is still travelling instead of sleeping and hoping.
+  Completer<void>? holdStart;
 
   @override
   Stream<Map<String, dynamic>> events() => const Stream.empty();
@@ -39,6 +56,10 @@ class FakeBridge implements PlatformBridge {
     bool active = false,
     bool incoming = false,
   }) async {
+    final refusal = refuseStart;
+    if (refusal != null) throw refusal;
+    final hold = holdStart;
+    if (hold != null) await hold.future;
     startCount++;
     lastActive = active;
     lastIncoming = incoming;
@@ -56,7 +77,11 @@ class FakeBridge implements PlatformBridge {
   @override
   Future<void> requestIgnoreBatteryOptimizations() async => exemptionRequests++;
   @override
-  Future<void> setMulticastLock(bool enabled) async => multicast = enabled;
+  Future<void> setMulticastLock(bool enabled) async {
+    multicastCalls.add(enabled);
+    multicast = enabled;
+  }
+
   @override
   Future<void> requestNotificationPermission() async =>
       notificationPermissionRequests++;
@@ -198,15 +223,13 @@ void main() {
         expect(svc.running, isFalse);
         expect(bridge.startCount, 0);
 
-        // A transfer starts → running, active (wake lock), multicast held.
+        // A transfer starts → running, active (wake lock).
         await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
         expect(svc.running, isTrue);
         expect(bridge.startCount, 1);
         expect(bridge.lastActive, isTrue);
-        expect(bridge.multicast, isTrue);
 
-        // More work while running → re-delivered, still active, no re-latched
-        // multicast transition.
+        // More work while running → re-delivered, still active.
         await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
         expect(bridge.startCount, 2);
         expect(bridge.lastActive, isTrue);
@@ -224,11 +247,15 @@ void main() {
         expect(bridge.stopCount, 0);
         expect(bridge.lastActive, isFalse);
 
-        // Fully idle → stop once, multicast released.
+        // Fully idle → stop once.
         await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
         expect(svc.running, isFalse);
         expect(bridge.stopCount, 1);
-        expect(bridge.multicast, isFalse);
+
+        // Across that whole lifecycle the multicast lock was never touched:
+        // it belongs to discovery, not to this notification (see the
+        // MulticastLockController group).
+        expect(bridge.multicastCalls, isEmpty);
       },
     );
 
@@ -244,6 +271,100 @@ void main() {
       // An active send → incoming=false.
       await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
       expect(bridge.lastIncoming, isFalse);
+    });
+
+    test('a refused start leaves the flag honest and is retried', () async {
+      final bridge = FakeBridge()
+        ..refuseStart = PlatformException(
+          code: 'fgs_denied',
+          message: 'startForegroundService() not allowed from background',
+        );
+      final svc = ForegroundServiceController(bridge);
+
+      // Android 12+ refuses a foreground-service start made from the
+      // background. The refusal must neither escape (it used to be dropped by
+      // an `unawaited` and reported nowhere) nor be recorded as a success.
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+      expect(svc.running, isFalse);
+      expect(svc.lastRefusal, contains('not allowed from background'));
+
+      // And it must not latch: with the flag set before the platform call, a
+      // single refusal convinced every later sync that a service was already
+      // running, so the app never started one again for the rest of its life.
+      bridge.refuseStart = null;
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+      expect(svc.running, isTrue);
+      expect(bridge.startCount, 1);
+      expect(svc.lastRefusal, isNull);
+
+      // Nothing was left half-recorded: the retry delivered a fresh state key,
+      // so the *next* identical sync is still correctly deduplicated.
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+      expect(bridge.startCount, 1);
+    });
+
+    test('concurrent syncs issue one start, not one each', () async {
+      final bridge = FakeBridge();
+      final svc = ForegroundServiceController(bridge);
+
+      // `sync` hangs off a ChangeNotifier that fires on every progress tick,
+      // so overlapping calls are normal. The in-flight guard is what replaced
+      // the old set-the-flag-before-awaiting trick.
+      await Future.wait([
+        svc.sync(activeTransfers: 1, receiving: false, incoming: false),
+        svc.sync(activeTransfers: 1, receiving: false, incoming: false),
+        svc.sync(activeTransfers: 1, receiving: false, incoming: false),
+      ]);
+      expect(bridge.startCount, 1);
+      expect(svc.running, isTrue);
+    });
+
+    test('a stop that arrives mid-start is not lost behind it', () async {
+      final bridge = FakeBridge()..holdStart = Completer<void>();
+      final svc = ForegroundServiceController(bridge);
+
+      // A transfer starts; the platform has not answered yet.
+      final starting = svc.sync(
+        activeTransfers: 1,
+        receiving: false,
+        incoming: false,
+      );
+
+      // It fails instantly and background-receive is off, so the very next
+      // store change says "idle". This has to survive the in-flight start:
+      // dropping it leaves an ongoing notification standing over nothing, with
+      // no later tick guaranteed to come along and clear it.
+      final stopping = svc.sync(
+        activeTransfers: 0,
+        receiving: false,
+        incoming: false,
+      );
+
+      bridge.holdStart!.complete();
+      await Future.wait([starting, stopping]);
+
+      expect(bridge.startCount, 1);
+      expect(bridge.stopCount, 1);
+      expect(svc.running, isFalse);
+    });
+  });
+
+  group('MulticastLockController', () {
+    test('follows discovery, and only on a transition', () async {
+      final bridge = FakeBridge();
+      final lock = MulticastLockController(bridge);
+
+      await lock.setDiscovering(true);
+      expect(lock.held, isTrue);
+      expect(bridge.multicastCalls, [true]);
+
+      // Idempotent: safe to call from a listener without re-latching.
+      await lock.setDiscovering(true);
+      expect(bridge.multicastCalls, [true]);
+
+      await lock.setDiscovering(false);
+      expect(lock.held, isFalse);
+      expect(bridge.multicastCalls, [true, false]);
     });
   });
 
@@ -350,6 +471,79 @@ void main() {
         hasLength(1),
       );
 
+      integration.dispose();
+    });
+  });
+
+  group('AndroidIntegration multicast lock', () {
+    AndroidIntegration build(FakeBridge bridge, SettingsStore settings) {
+      final fake = FakePeerBeam();
+      return AndroidIntegration(
+        bridge: bridge,
+        staging: StagingStore(),
+        transfer: TransferRepository(api: fake),
+        settings: settings,
+        history: HistoryRepository(api: fake),
+      );
+    }
+
+    SettingsStore newSettings() => SettingsStore(
+      deviceName: 'd',
+      saveDirectory: '/x',
+      autoAcceptTrusted: false,
+      notifications: true,
+      compression: true,
+    );
+
+    test('survives turning off background receive', () async {
+      final bridge = FakeBridge();
+      final settings = newSettings();
+      final integration = build(bridge, settings);
+
+      // Discovery starts in the same boot sequence, so the lock is up front:
+      // the engine's mDNS provider (224.0.0.251) and the UDP provider's
+      // broadcasts are both invisible to this device without it.
+      await integration.start();
+      await flush();
+      expect(integration.multicast.held, isTrue);
+      expect(bridge.multicast, isTrue);
+
+      // `backgroundReceive` defaults on, so the service is up too.
+      expect(integration.service.running, isTrue);
+
+      // The user turns off "Keep receiving in background" — a preference about
+      // an ongoing *notification*. The service stops, and that is all it may
+      // do: the lock used to come down with it, which silently emptied the
+      // device list and left nothing on screen connecting the two.
+      await settings.setBackgroundReceive(false);
+      await flush();
+      expect(integration.service.running, isFalse);
+      expect(integration.multicast.held, isTrue);
+      expect(bridge.multicast, isTrue);
+      expect(bridge.multicastCalls, [true]);
+
+      // Only teardown releases it.
+      integration.dispose();
+      await flush();
+      expect(bridge.multicastCalls, [true, false]);
+    });
+
+    test('a refused foreground-service start does not fail boot', () async {
+      final bridge = FakeBridge()
+        ..refuseStart = PlatformException(code: 'fgs_denied');
+      final integration = build(bridge, newSettings());
+
+      // `start` is awaited inside `main`'s boot block, whose catch marks the
+      // whole engine as failed — so a refusal reaching it would turn every
+      // screen into an error state over a notification that could not be
+      // posted. It must be handled where it happens instead.
+      await integration.start();
+      await flush();
+      expect(integration.service.running, isFalse);
+      expect(integration.service.lastRefusal, isNotNull);
+
+      // Discovery is unaffected: the lock is not the service's to hold.
+      expect(integration.multicast.held, isTrue);
       integration.dispose();
     });
   });

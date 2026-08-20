@@ -38,34 +38,38 @@ pub fn shares() -> peerbeam_browse::Shares {
 }
 
 /// What this device shares, for its own user: `{}` → `{shares:[…]}`.
-///
-/// Names only, the same view a peer gets. Reporting absolute paths would be
-/// harmless here — it is the user's own machine — but keeping one shape means
-/// the UI cannot accidentally render a path it then sends somewhere.
 pub fn list_shares() -> Op {
-    let shares = shares();
-    // Name **and** path. The name is what a peer addresses the share by; the
-    // path is what the person choosing it needs to see, because two folders
-    // called `Documents` are indistinguishable by name and a UI that showed
-    // only names would ask someone to confirm a share they cannot identify.
+    Ok(shares_dto(&shares()))
+}
+
+/// The share list as the FFI reports it.
+///
+/// Split from [`list_shares`] so the shape can be asserted without touching the
+/// process-global share list — the same reason `peerbeam_browse::list` is a free
+/// function rather than a method on the handler.
+///
+/// Name **and** path. The name is the one `Shares::new` assigned and the only
+/// thing a peer can address the share by, so the UI must show *that* rather than
+/// re-derive a basename: two folders called `Documents` are one share named
+/// `Documents` and one named `Documents (2)`, and a UI showing "Documents"
+/// twice would be offering a name only one of them answers to. The path is what
+/// the person choosing the folder needs in order to tell them apart at all.
+#[must_use]
+fn shares_dto(shares: &peerbeam_browse::Shares) -> Value {
     let entries: Vec<Value> = shares
-        .roots()
+        .shares()
         .iter()
-        .map(|r| {
+        .map(|s| {
             json!({
-                "name": r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                "path": r.to_string_lossy(),
-                "exists": r.is_dir(),
+                "name": s.name,
+                "path": s.root.to_string_lossy(),
+                "exists": s.root.is_dir(),
             })
         })
         .collect();
-    let names: Vec<String> = entries
-        .iter()
-        .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
-        .map(str::to_string)
-        .collect();
+    let names: Vec<&str> = shares.shares().iter().map(|s| s.name.as_str()).collect();
     // `shares` kept as names for callers that predate `entries`.
-    Ok(json!({ "shares": names, "entries": entries }))
+    json!({ "shares": names, "entries": entries })
 }
 
 /// Turn a peer's answer into the FFI's response shape.
@@ -93,4 +97,53 @@ pub fn unreachable(path: &str) -> (Code, String) {
         Code::Connection,
         format!("could not ask the device about {path}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The UI must show the name a peer can actually use.** Reporting each
+    /// root's basename showed two folders called `Documents` as two rows both
+    /// named `Documents`, only one of which any peer could open — and a root
+    /// with no basename (`/`, `D:\\`) as a nameless row that could never be
+    /// addressed at all while the row insisted it was shared.
+    #[test]
+    fn every_reported_share_carries_the_name_that_addresses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for parent in ["home", "nas"] {
+            std::fs::create_dir_all(dir.path().join(parent).join("Documents")).unwrap();
+        }
+        let shares = peerbeam_browse::Shares::new([
+            dir.path().join("home").join("Documents"),
+            dir.path().join("nas").join("Documents"),
+        ]);
+        let dto = shares_dto(&shares);
+        let entries = dto["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2);
+
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().expect("a name"))
+            .collect();
+        assert!(names.iter().all(|n| !n.is_empty()), "{names:?}");
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            2,
+            "two shares reported under one name: {names:?}"
+        );
+        // And the reported name is the one the peer-facing resolver accepts.
+        for name in names {
+            assert!(shares.resolve(name).is_ok(), "{name} is unaddressable");
+        }
+        // Both paths are still reported, so the user can tell them apart.
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|e| e["path"].as_str().expect("a path"))
+            .collect();
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            2
+        );
+    }
 }

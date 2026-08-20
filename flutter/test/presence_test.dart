@@ -191,6 +191,58 @@ void main() {
       expect(find.text('Wi-Fi'), findsOneWidget);
     });
 
+    /// **The one string on this card a peer supplies without a closed set to
+    /// check it against.** `network` is vetted against `NETWORK_KINDS` before it
+    /// ever arrives; `app_version` used to pass straight through into a chip
+    /// whose `Row` is `mainAxisSize.min` inside a `Wrap` — laid out against an
+    /// unbounded main axis, so a long enough version simply kept growing past
+    /// the card and overflowed the row. Rust bounds it on decode now, which
+    /// covers peers speaking the current wire; the surface that draws it caps it
+    /// as well, because the two ends fail independently.
+    testWidgets('a long peer version is capped, and ours are not', (
+      tester,
+    ) async {
+      final version = 'x' * 400;
+      const free = 999 * 1000 * 1000 * 1000;
+      await tester.pumpWidget(
+        _card(
+          const Device(
+            id: 'pb-bob',
+            name: 'Bob',
+            kind: DeviceKind.desktop,
+            online: true,
+            reach: {Reach.lan},
+            latencyMs: 12345,
+          ),
+          _presence('pb-bob', storage: free, version: version),
+        ),
+      );
+
+      final card = tester.getSize(find.byType(DeviceStatusCard)).width;
+      final capped = tester.getSize(find.text('v$version')).width;
+      expect(
+        capped,
+        lessThan(card),
+        reason: 'an uncapped version chip grows past the card holding it',
+      );
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: 'and overflows the row it sits in',
+      );
+
+      // The cap is only correct if it never bites a label the app composed
+      // itself: each of these must still be laid out at its natural width,
+      // narrower than the ceiling the peer's string was clipped to.
+      for (final ours in ['12345 ms round trip', '${formatBytes(free)} free']) {
+        expect(
+          tester.getSize(find.text(ours)).width,
+          lessThan(capped),
+          reason: '$ours must fit under the cap, not be ellipsised by it',
+        );
+      }
+    });
+
     testWidgets('a zero battery is shown, because zero is a real reading', (
       tester,
     ) async {

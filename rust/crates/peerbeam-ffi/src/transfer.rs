@@ -4764,7 +4764,23 @@ impl Manager {
                 // Explicit accept-and-trust: this device is now approved for
                 // auto-accept on future connections. Never set on a plain
                 // accept, a decline, a dropped sender, or a timeout.
-                let _ = self.trust.approve(peer_id);
+                //
+                // **The transfer proceeds either way; the approval is what can
+                // fail.** The user pressed a button meaning two things — take
+                // this file, and remember this device — and only the second
+                // needs the store. Refusing the transfer because the store
+                // could not be written would punish them for a disk problem
+                // they did not cause; saying nothing meant the next connection
+                // asked again with no hint why, which reads as the button not
+                // working.
+                if let Err(e) = self.trust.approve(peer_id) {
+                    tracing::warn!(
+                        error = %e,
+                        peer = %peer_id.0,
+                        "accepted the transfer but could not record the approval — \
+                         this device will be asked about again"
+                    );
+                }
                 AcceptOutcome::Accepted
             }
             // The user's own refusal — `reject()`, or `cancel()` firing the

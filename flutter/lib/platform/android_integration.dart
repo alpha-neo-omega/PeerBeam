@@ -29,6 +29,16 @@ class AndroidIntegration {
   late final ForegroundServiceController service = ForegroundServiceController(
     bridge,
   );
+
+  /// Held for as long as this integration is alive, which *is* the engine's
+  /// discovery session: `main` starts discovery in the same boot sequence that
+  /// calls [start] and stops it in the same teardown that calls [dispose].
+  /// Deliberately not driven by [service] — see [MulticastLockController] for
+  /// what tying it to the foreground service silently broke.
+  late final MulticastLockController multicast = MulticastLockController(
+    bridge,
+  );
+
   late final BatteryOptimization battery = BatteryOptimization(bridge);
 
   /// Latest text handed to us via a share intent (e.g. to send as clipboard).
@@ -58,6 +68,10 @@ class AndroidIntegration {
     // Fire-and-forget: no-op off Android / pre-13, and we don't need to await
     // the grant — a denial just means notifications keep silently no-oping.
     unawaited(bridge.requestNotificationPermission());
+
+    // Before anything else discovery-shaped happens: the engine's mDNS and UDP
+    // providers are unreachable without this lock.
+    await multicast.setDiscovering(true);
 
     _sub = bridge.events().listen(_onEvent);
     final initial = await bridge.initialIntent();
@@ -99,7 +113,26 @@ class AndroidIntegration {
     }
   }
 
-  void _onStoreChanged() => unawaited(_syncService());
+  /// Store listeners are synchronous, so the sync is necessarily
+  /// fire-and-forget — but a bare `unawaited` *discarded* whatever went wrong,
+  /// which is how a foreground-service start refused by Android 12+ managed to
+  /// leave no trace anywhere. Refusals are now the controller's business; what
+  /// reaches here is a defect, and defects get reported rather than dropped.
+  void _onStoreChanged() => unawaited(
+    _report(_syncService(), 'syncing the Android foreground service'),
+  );
+
+  static Future<void> _report(Future<void> work, String what) =>
+      work.catchError(
+        (Object error, StackTrace stack) => FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stack,
+            library: 'peerbeam',
+            context: ErrorDescription(what),
+          ),
+        ),
+      );
 
   Future<void> _syncService() => service.sync(
     activeTransfers: transfer.activeCount,
@@ -158,6 +191,12 @@ class AndroidIntegration {
   }
 
   void dispose() {
+    // Discovery is going away with the app; the lock has nothing left to keep
+    // reachable. Nothing awaits a teardown, so failures are reported, not
+    // dropped.
+    unawaited(
+      _report(multicast.setDiscovering(false), 'releasing the multicast lock'),
+    );
     _sub?.cancel();
     _filesShared.close();
     transfer.removeListener(_onStoreChanged);

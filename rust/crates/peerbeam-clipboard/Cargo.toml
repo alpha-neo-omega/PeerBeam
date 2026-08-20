@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 peerbeam-domain = { workspace = true }
+tracing = { workspace = true }
 peerbeam-transfer = { path = "../peerbeam-transfer" }
 serde = { workspace = true }
 serde_json = { workspace = true }

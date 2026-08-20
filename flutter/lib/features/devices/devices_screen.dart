@@ -664,18 +664,6 @@ IconData _batteryIcon(int percent) {
   return Icons.battery_alert_rounded;
 }
 
-/// Decimal bytes, matching the CLI's rendering.
-String formatBytes(int bytes) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  var v = bytes.toDouble();
-  var i = 0;
-  while (v >= 1000 && i < units.length - 1) {
-    v /= 1000;
-    i++;
-  }
-  return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
-}
-
 /// Seconds since we received a status, phrased relatively.
 String formatAge(int seconds) {
   if (seconds < 60) return 'just now';
@@ -696,6 +684,14 @@ class _Chip extends StatelessWidget {
   final String? tooltip;
   const _Chip({required this.icon, required this.label, this.tooltip});
 
+  /// Widest a chip label may draw at the default text size.
+  ///
+  /// Sized with headroom over the longest label the app composes for itself
+  /// ("12345 ms round trip") measured against the widest glyph metrics it could
+  /// meet, so a cap meant for a peer's string never ellipsises one of ours. It
+  /// is a ceiling, not a target — every label of ours lays out well under it.
+  static const double _maxLabelWidth = 240;
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -713,11 +709,29 @@ class _Chip extends StatelessWidget {
         children: [
           Icon(icon, size: 14, color: scheme.onSurfaceVariant),
           const Gap(AppSpace.xxs),
-          Text(
-            label,
-            style: Theme.of(
-              context,
-            ).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+          // Bounded, single line, ellipsised. This Row is `mainAxisSize.min`
+          // inside a Wrap, which lays its Text out against an *unbounded* main
+          // axis — so without a cap a long label simply keeps growing and
+          // overflows the card. Every label but one is text we compose; the
+          // exception is `v${p.appVersion}`, which is a peer's string, and
+          // bounding it on decode in Rust only covers peers speaking the
+          // current wire. The surface that draws it caps it too.
+          //
+          // The cap scales with the text scaler so that enlarging text never
+          // ellipsises a label that fitted at the default size: an
+          // accessibility setting must not cost the user information.
+          ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.textScalerOf(context).scale(_maxLabelWidth),
+            ),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(
+                context,
+              ).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
           ),
         ],
       ),

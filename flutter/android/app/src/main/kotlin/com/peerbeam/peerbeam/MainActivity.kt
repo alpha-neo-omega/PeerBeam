@@ -107,8 +107,26 @@ class MainActivity : FlutterActivity() {
                     .putExtra("body", call.argument<String>("body"))
                     .putExtra("active", call.argument<Boolean>("active") ?: false)
                     .putExtra("incoming", call.argument<Boolean>("incoming") ?: false)
-                ContextCompat.startForegroundService(this, svc)
-                result.success(null)
+                try {
+                    ContextCompat.startForegroundService(this, svc)
+                    result.success(null)
+                } catch (e: IllegalStateException) {
+                    // Android 12+ refuses a foreground-service start issued from
+                    // the background and throws
+                    // `ForegroundServiceStartNotAllowedException` (an
+                    // `IllegalStateException`); from 15 the same exception also
+                    // reports a spent `dataSync` allowance. Both are the platform
+                    // answering "no", not a defect, and both used to escape this
+                    // handler uncaught — killing the whole method-call handler and
+                    // leaving Dart's controller convinced it had started a service
+                    // that does not exist. Reported as a channel error so the
+                    // controller can record the refusal and retry later.
+                    result.error(
+                        "fgs_denied",
+                        e.message ?: "foreground service start refused",
+                        null,
+                    )
+                }
             }
             "stopForegroundService" -> {
                 stopService(Intent(this, PeerBeamService::class.java))

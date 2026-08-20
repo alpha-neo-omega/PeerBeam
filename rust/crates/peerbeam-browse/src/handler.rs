@@ -102,12 +102,16 @@ pub fn list(shares: &Shares, path: &str) -> ListResponse {
     // Empty path means "what do you share?" — the share names only, never the
     // paths they live at.
     if path.split('/').find(|p| !p.is_empty()).is_none() {
+        // The names `Shares::new` assigned, so every share is listed under the
+        // name `resolve` will actually accept. Deriving them here from
+        // `root.file_name()` instead listed two folders called `Documents` under
+        // one name — only one of which could be opened — and dropped a root with
+        // no basename from the listing altogether.
         let entries: Vec<Entry> = shares
-            .roots()
+            .shares()
             .iter()
-            .filter_map(|r| r.file_name())
-            .map(|n| Entry {
-                name: n.to_string_lossy().into_owned(),
+            .map(|s| Entry {
+                name: s.name.clone(),
                 is_dir: true,
                 size: 0,
             })
@@ -334,5 +338,51 @@ mod tests {
         let shares = Shares::new(Vec::<std::path::PathBuf>::new());
         assert!(list(&shares, "").entries.is_empty());
         assert!(list(&shares, "anything").denied);
+    }
+
+    /// **Every listed name must open.** Two folders with the same basename were
+    /// listed twice under one name, so a peer that clicked the second row got
+    /// the first folder's contents and the second share was unreachable.
+    #[test]
+    fn two_shares_with_the_same_basename_are_listed_under_names_that_both_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for (parent, marker) in [("home", "mine.txt"), ("nas", "theirs.txt")] {
+            let docs = dir.path().join(parent).join("Documents");
+            std::fs::create_dir_all(&docs).unwrap();
+            std::fs::write(docs.join(marker), b"x").unwrap();
+        }
+        let shares = Shares::new([
+            dir.path().join("home").join("Documents"),
+            dir.path().join("nas").join("Documents"),
+        ]);
+
+        let top = list(&shares, "");
+        let names: Vec<&str> = top.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "both shares are offered");
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            2,
+            "under two different names"
+        );
+
+        // And each name lists the file only *its* folder holds.
+        let first = list(&shares, names[0]);
+        let second = list(&shares, names[1]);
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["mine.txt"]
+        );
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["theirs.txt"]
+        );
     }
 }

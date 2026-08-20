@@ -26,6 +26,16 @@
 
 use std::sync::{Arc, OnceLock};
 
+/// How long to wait for a peer to accept a channel before giving up.
+///
+/// `open_channel` resolves as soon as the open is queued locally; the peer's
+/// `ChannelAccept` has not arrived. Sending on the next line races it and, over
+/// QUIC, hard-fails with "channel not open" — so every request the CLI made on
+/// a fresh channel failed on its first frame and was reported as a peer that
+/// did not answer. The wait is `SessionHandle::await_channel_open`, which is
+/// where the four existing copies of this loop should also end up.
+const CHANNEL_OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use peerbeam_chat::{ChatHandler, ChatStore, ReceivedSink};
@@ -232,6 +242,11 @@ pub async fn send_pairing_proof(session: &Session, proof: &[u8]) -> Option<(bool
         .open_channel(ChannelType::PAIRING)
         .await
         .ok()?;
+    session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .ok()?;
     let msg = peerbeam_pairing::PairingMsg::Prove {
         proof: proof.to_vec(),
     };
@@ -284,6 +299,14 @@ pub async fn send_pairing_result(session: &Session, verified: bool, attempts_lef
     let Ok(channel) = session.handle.open_channel(ChannelType::PAIRING).await else {
         return;
     };
+    if session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .is_err()
+    {
+        return;
+    }
     let msg = peerbeam_pairing::PairingMsg::Result {
         verified,
         attempts_left,
@@ -309,6 +332,11 @@ pub async fn request_chunk_map(
 ) -> Option<peerbeam_sync::manifest_wire::ChunkMapResponse> {
     use tokio::time::{timeout, Duration};
     let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
+    session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .ok()?;
     let req = peerbeam_sync::manifest_wire::ChunkMapRequest {
         path: path.to_string(),
     };
@@ -342,6 +370,14 @@ pub async fn request_chunks(
         let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
             break;
         };
+        if session
+            .handle
+            .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+            .await
+            .is_err()
+        {
+            break;
+        }
         let req = peerbeam_sync::manifest_wire::ChunkRequest {
             path: path.to_string(),
             hashes: group.to_vec(),
@@ -382,6 +418,11 @@ pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_
     use tokio::time::{timeout, Duration};
 
     let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
+    session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .ok()?;
     let req = peerbeam_sync::ManifestRequest {
         path: path.to_string(),
     };
@@ -412,6 +453,14 @@ pub async fn request_file(session: &Session, path: &str) -> bool {
     let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
         return false;
     };
+    if session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .is_err()
+    {
+        return false;
+    }
     let req = peerbeam_sync::FileRequest {
         path: path.to_string(),
     };
@@ -447,6 +496,11 @@ pub async fn request_listing(
         .open_channel(ChannelType::BROWSE)
         .await
         .ok()?;
+    session
+        .handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await
+        .ok()?;
     let req = peerbeam_browse::ListRequest::new(path);
     let frame = req.to_frame(channel).ok()?;
     session
@@ -478,6 +532,10 @@ pub async fn send_note_batches(
 ) -> Result<(), CliError> {
     let channel = handle
         .open_channel(ChannelType::NOTES)
+        .await
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
         .await
         .map_err(|e| CliError::Other(e.to_string()))?;
     for b in batches {
@@ -636,7 +694,8 @@ async fn establish(
     // silently rather than refusing it, so the peer would believe it synced.
     // Receiving is never gated; the CLI simply has no system clipboard to apply
     // the clip to, and says so.
-    let (clipboard_handler, clipboard_slot) = ClipboardHandler::new(crate::clipboard::sink());
+    let (clipboard_handler, clipboard_slot) =
+        ClipboardHandler::new(crate::clipboard::sink(), trust.clone());
     // Browsing: registered unconditionally like clipboard, so no call site can
     // forget it. The CLI serves nothing (its share list is empty — a terminal
     // session is not a file server) but must still receive the answers to its

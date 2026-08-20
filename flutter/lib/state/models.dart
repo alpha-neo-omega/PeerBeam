@@ -234,13 +234,27 @@ class HistoryItem {
   });
 }
 
-/// Human-readable byte size.
+/// Human-readable byte size in **decimal** units: 1 KB is 1000 bytes.
+///
+/// The formatter every surface renders a byte count through, and its divisor
+/// has to match the label it prints. This divided by 1024 while still saying
+/// `KB`, and the devices dashboard carried its own decimal copy that shadowed
+/// it — so one 1 GiB selection read "1.0 GB" in Home's selection bar and
+/// "1.1 GB" on the dashboard, and neither label was true to its own arithmetic.
+/// (`browse_screen.dart` still holds a private 1024-with-`KB` copy of the same
+/// shape; folding it in here is the outstanding half of this.)
+///
+/// Decimal is the survivor rather than 1024-with-`KiB` because the dashboard
+/// renders the very same presence status a `peerbeam status` run prints, and
+/// the CLI's `human_bytes` is decimal: relabelling to `KiB` here would have
+/// made the units honest at the cost of putting the GUI at odds with the CLI
+/// over identical numbers.
 String formatBytes(int bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   var size = bytes.toDouble();
   var unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
+  while (size >= 1000 && unit < units.length - 1) {
+    size /= 1000;
     unit++;
   }
   final rounded = unit == 0 ? size.toStringAsFixed(0) : size.toStringAsFixed(1);

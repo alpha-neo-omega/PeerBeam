@@ -248,6 +248,59 @@ impl SessionHandle {
     }
 
     /// A snapshot of every live channel's metadata and statistics.
+    /// Wait until `channel` is open, or say why it will never be.
+    ///
+    /// # Why every caller needs this
+    ///
+    /// [`open_channel`](Self::open_channel) resolves as soon as the open is
+    /// *queued locally*. The peer's `ChannelAccept` has not arrived, so a send
+    /// on the very next line races it — and over QUIC it does not merely
+    /// arrive early, it hard-fails with "channel not open". A caller that skips
+    /// this wait therefore fails on the **first frame of every channel it
+    /// opens**, and reports it as a peer that did not answer.
+    ///
+    /// This lives on the handle because four separate copies of the same loop
+    /// had already grown in `peerbeam-chat`, `peerbeam-presence`,
+    /// `peerbeam-clipboard` and the FFI's session executor — and the CLI, which
+    /// had none, was silently broken for browse, sync and pairing. Those four
+    /// are worth migrating here; this is the home they should migrate to.
+    ///
+    /// An absent channel is terminal, not "not yet": the pump registers it
+    /// before `open_channel` returns and this reads the same registry over the
+    /// same ordered queue, so missing means already removed — refused, or its
+    /// actor died.
+    pub async fn await_channel_open(
+        &self,
+        channel: ChannelId,
+        budget: std::time::Duration,
+    ) -> Result<(), SessionError> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match self
+                .channels()
+                .await?
+                .iter()
+                .find(|c| c.id == channel)
+                .map(|c| c.state)
+            {
+                Some(peerbeam_domain::session::ChannelState::Opening) => {}
+                Some(s) if s.is_open() => return Ok(()),
+                _ => {
+                    return Err(SessionError::Channel(
+                        "channel was refused by the device".into(),
+                    ))
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SessionError::Channel(format!(
+                    "channel did not open within {budget:?}"
+                )));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     pub async fn channels(&self) -> Result<Vec<ChannelInfo>, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.commands

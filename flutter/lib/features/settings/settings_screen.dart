@@ -18,6 +18,7 @@ import '../../sdk/models.dart'
     show PeerBeamPermission, SaveRule, TrustedDevice, UpdateCheck;
 import '../../sdk/peerbeam.dart' show PeerBeamApi;
 import '../../state/app_scope.dart';
+import '../../state/models.dart' show formatBytes;
 import '../../state/stores.dart' show SettingsStore;
 import '../../widgets/common.dart';
 
@@ -950,24 +951,13 @@ class _SaveRulesCard extends StatelessWidget {
     final min = rule.minBytes;
     final max = rule.maxBytes;
     if (min != null && max != null) {
-      parts.add('${_size(min)}–${_size(max)}');
+      parts.add('${formatBytes(min)}–${formatBytes(max)}');
     } else if (min != null) {
-      parts.add('≥ ${_size(min)}');
+      parts.add('≥ ${formatBytes(min)}');
     } else if (max != null) {
-      parts.add('≤ ${_size(max)}');
+      parts.add('≤ ${formatBytes(max)}');
     }
     return parts.join(' · ');
-  }
-
-  static String _size(int bytes) {
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    var v = bytes.toDouble();
-    var i = 0;
-    while (v >= 1000 && i < units.length - 1) {
-      v /= 1000;
-      i++;
-    }
-    return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
   }
 
   /// `onReorderItem` reports `to` already adjusted for the removal at `from`,
@@ -1068,6 +1058,23 @@ class _SaveRulesCard extends StatelessWidget {
       e is InvalidArgumentException ? e.message : friendlyError(e);
 }
 
+/// Why a size field's text cannot be used, or null when it can.
+///
+/// **Empty is not an error.** An empty size field means "no bound", which is
+/// how a rule deliberately matches every size. Text that fails to parse must
+/// *not* fold into that same null: a user who typed `10 MB` asked for a bound,
+/// and dropping it built the widest rule in the list out of the narrowest
+/// intent — a catch-all, discoverable only afterwards from the row reading
+/// "Everything".
+String? _sizeError(String raw) {
+  final text = raw.trim();
+  if (text.isEmpty) return null;
+  final value = int.tryParse(text);
+  if (value == null) return 'Whole number of bytes, digits only';
+  if (value < 0) return 'Cannot be negative';
+  return null;
+}
+
 /// The add-rule dialog: a destination, and any combination of criteria.
 ///
 /// The destination comes from the **native directory picker**, not a text
@@ -1084,10 +1091,32 @@ class _AddRuleDialogState extends State<_AddRuleDialog> {
   final _extension = TextEditingController();
   String? _deviceId;
   String? _directory;
-  int? _minBytes;
-  int? _maxBytes;
   final _min = TextEditingController();
   final _max = TextEditingController();
+
+  /// A size bound read straight back off its field, and only once the field is
+  /// valid. There is deliberately no cached `int?` beside the controller: the
+  /// pair used to drift — the cache took `int.tryParse`'s null on unparsable
+  /// text while the field went on showing what the user typed — and that drift
+  /// is the whole defect.
+  static int? _bound(TextEditingController c) =>
+      _sizeError(c.text) == null ? int.tryParse(c.text.trim()) : null;
+
+  /// Set when both bounds parse but describe an empty range. `min > max`
+  /// matches no file at all; the engine would store it without complaint, and
+  /// the row would read like a working filter.
+  String? get _rangeError {
+    final min = _bound(_min);
+    final max = _bound(_max);
+    if (min == null || max == null) return null;
+    return min > max ? 'Cannot be below the minimum' : null;
+  }
+
+  /// Whether the criteria as typed can become a rule at all.
+  bool get _criteriaParse =>
+      _sizeError(_min.text) == null &&
+      _sizeError(_max.text) == null &&
+      _rangeError == null;
 
   @override
   void dispose() {
@@ -1146,21 +1175,29 @@ class _AddRuleDialogState extends State<_AddRuleDialog> {
                 hintText: 'pdf',
               ),
             ),
+            // `onChanged` rebuilds rather than caching a parse: the error
+            // text and the Add button both have to follow what is in the
+            // field, and the value is read back off the controller when the
+            // rule is finally built.
             TextField(
               controller: _min,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'Minimum size (bytes)',
+                errorText: _sizeError(_min.text),
               ),
-              onChanged: (v) => _minBytes = int.tryParse(v.trim()),
+              onChanged: (_) => setState(() {}),
             ),
             TextField(
               controller: _max,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'Maximum size (bytes)',
+                // The range complaint belongs on the field the user is most
+                // likely still editing, and only once this field itself parses.
+                errorText: _sizeError(_max.text) ?? _rangeError,
               ),
-              onChanged: (v) => _maxBytes = int.tryParse(v.trim()),
+              onChanged: (_) => setState(() {}),
             ),
           ],
         ),
@@ -1171,9 +1208,12 @@ class _AddRuleDialogState extends State<_AddRuleDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(
-          // Disabled until a folder is chosen: a rule with no destination has
-          // nowhere to put anything, and the engine would refuse it anyway.
-          onPressed: dir == null
+          // Disabled until a folder is chosen *and* the criteria parse. A rule
+          // with no destination has nowhere to put anything and the engine
+          // would refuse it anyway; a rule whose size text did not parse used
+          // to be accepted with that criterion silently dropped, which handed
+          // the user a catch-all instead of the filter they described.
+          onPressed: dir == null || !_criteriaParse
               ? null
               : () => Navigator.pop(context, _build(dir)),
           child: const Text('Add'),
@@ -1187,8 +1227,8 @@ class _AddRuleDialogState extends State<_AddRuleDialog> {
     return SaveRule(
       deviceId: _deviceId,
       extension: ext.isEmpty ? null : ext,
-      minBytes: _minBytes,
-      maxBytes: _maxBytes,
+      minBytes: _bound(_min),
+      maxBytes: _bound(_max),
       directory: directory,
     );
   }

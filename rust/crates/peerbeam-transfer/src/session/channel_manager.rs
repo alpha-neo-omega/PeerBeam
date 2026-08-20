@@ -36,15 +36,23 @@ use super::sealed_link::SealedLink;
 pub const DEFAULT_CHANNEL_LIMIT: usize = 256;
 
 /// A queued peer `ChannelOpen` awaiting its stream. Every peer open — accepted
-/// **or** rejected — opened exactly one stream on the peer's side, so both are
+/// **or** refused — opened exactly one stream on the peer's side, so both are
 /// queued: `try_pair` consumes one stream per entry, keeping the FIFO
-/// open↔stream pairing aligned even when an open is rejected.
+/// open↔stream pairing aligned even when an open is refused.
 enum PendingOpen {
     /// A permitted open, to be paired with its stream and spawned.
     Accept(ChannelId, ChannelType),
-    /// A rejected open; its stream is consumed (dropped) on pairing and the
-    /// `ChannelReject` emitted, so the reject never desyncs later pairings.
-    Reject(ChannelId, String),
+    /// `n` refused opens whose streams are still owed; each is discarded in turn
+    /// so a refusal never desyncs later pairings.
+    ///
+    /// A count, not an id and a reason, because the `ChannelReject` for a
+    /// refused open is sent the moment it is refused (see
+    /// [`ChannelManager::refuse`]) — nothing about *which* channel it was is
+    /// still needed here. That is what lets consecutive refusals collapse into
+    /// one entry, and it is what bounds this queue: only accepted opens count
+    /// toward the channel limit, so a peer whose opens are all refused used to
+    /// grow one queue entry each, without limit, and be told nothing.
+    Skip(usize),
 }
 
 /// Allocates this side's channel ids, upholding two invariants the rest of the
@@ -268,18 +276,23 @@ impl ChannelManager {
     }
 
     /// Allocate the next own-parity id for a locally-opened channel, skipping any
-    /// id that is currently live or pending (as an Accept **or** a Reject — a
-    /// queued Reject for an our-parity id must not be reissued, or `try_pair`
-    /// would later reject the channel we just opened under it).
+    /// id that is currently live or pending.
+    ///
+    /// Only pending *accepts* carry an id to skip. A refusal used to be queued
+    /// with its id, and had to be skipped here too — otherwise `try_pair` would
+    /// later emit a `ChannelReject` naming the channel we had meanwhile opened
+    /// under that id. Refusals are now answered immediately, before an
+    /// allocation could collide, so a [`PendingOpen::Skip`] entry names no
+    /// channel and this scan is bounded by the channel limit.
     fn allocate_id(&mut self) -> Result<ChannelId, SessionError> {
         let channels = &self.channels;
         let pending = &self.pending_opens;
         self.ids
             .allocate(|cid| {
                 channels.contains_key(&cid)
-                    || pending.iter().any(|p| match p {
-                        PendingOpen::Accept(pid, _) | PendingOpen::Reject(pid, _) => *pid == cid,
-                    })
+                    || pending
+                        .iter()
+                        .any(|p| matches!(p, PendingOpen::Accept(pid, _) if *pid == cid))
             })
             .ok_or_else(|| SessionError::Channel("channel id space exhausted".into()))
     }
@@ -295,8 +308,10 @@ impl ChannelManager {
                 channel_type.get()
             ));
         }
-        // Count only pending *accepts* toward the limit — reject markers never
-        // become channels.
+        // Count only pending *accepts* toward the limit — a skip marker never
+        // becomes a channel. Scanned rather than counted alongside because the
+        // queue holds at most one entry per pending accept plus the skip runs
+        // between them, and an accept cannot be queued past this very limit.
         let pending_accepts = self
             .pending_opens
             .iter()
@@ -396,19 +411,10 @@ impl ChannelManager {
         // consumed — a two-time-pad break enabling control-channel forgery.
         // Refuse it before any crypto derivation.
         if channel.is_control() {
-            self.pending_opens.push_back(PendingOpen::Reject(
-                channel,
-                "reserved control channel id".to_string(),
-            ));
-            return self.try_pair();
+            return self.refuse(channel, "reserved control channel id");
         }
-        // Even a rejected open is queued (as a Reject marker): the peer opened a
-        // stream for it, and only by consuming that stream in FIFO order does the
-        // reject avoid orphaning a stream and desyncing every later pairing.
         if let Err(reason) = self.permit(channel_type) {
-            self.pending_opens
-                .push_back(PendingOpen::Reject(channel, reason));
-            return self.try_pair();
+            return self.refuse(channel, &reason);
         }
         if self.channels.contains_key(&channel)
             || self
@@ -416,15 +422,54 @@ impl ChannelManager {
                 .iter()
                 .any(|p| matches!(p, PendingOpen::Accept(id, _) if *id == channel))
         {
-            self.pending_opens.push_back(PendingOpen::Reject(
-                channel,
-                "duplicate channel id".to_string(),
-            ));
-            return self.try_pair();
+            return self.refuse(channel, "duplicate channel id");
         }
         self.pending_opens
             .push_back(PendingOpen::Accept(channel, channel_type));
         self.try_pair()
+    }
+
+    /// Refuse a peer `ChannelOpen`: tell the peer now, and remember that one
+    /// inbound stream is owed and must be discarded when it arrives.
+    ///
+    /// **Answering now is what bounds `pending_opens`.** A refusal used to be
+    /// queued whole — id and reason — and only became a `ChannelReject` once a
+    /// stream arrived to pair it with. A peer that sent `ChannelOpen`s and opened
+    /// no streams therefore added an entry per open, for ever: only accepted
+    /// opens count against the channel limit, so nothing refused it, and both
+    /// [`permit`](ChannelManager::permit) and
+    /// [`allocate_id`](ChannelManager::allocate_id) scan the queue, making the
+    /// cost quadratic in what a peer sends. Any peer past the TOFU handshake
+    /// could drive it, and the peer was never even told its opens had failed.
+    ///
+    /// The stream still has to be consumed in FIFO order — an orphan would
+    /// desync every later pairing — but that needs nothing more than a count,
+    /// which is why consecutive refusals collapse into one
+    /// [`PendingOpen::Skip`] entry. The queue is then bounded by the channel
+    /// limit: at most one accept per permitted open, and at most one skip run
+    /// between neighbouring accepts.
+    fn refuse(&mut self, channel: ChannelId, reason: &str) -> Vec<ControlMessage> {
+        self.emit(ChannelEvent::Rejected {
+            channel,
+            reason: reason.to_string(),
+        });
+        // Exact, not saturating: a count that stopped rising would owe fewer
+        // streams than the peer opened, and the surplus would pair with the next
+        // accepted open — the desync this queue exists to prevent. At the
+        // (unreachable) ceiling a second entry carries the overflow instead.
+        match self.pending_opens.back_mut() {
+            Some(PendingOpen::Skip(owed)) if *owed < usize::MAX => *owed += 1,
+            _ => self.pending_opens.push_back(PendingOpen::Skip(1)),
+        }
+        // The refusal first, then whatever the queued stream owed to it (or to
+        // an earlier open) let pair: the peer learns its open failed as soon as
+        // this method decided so, not whenever a stream happens to turn up.
+        let mut out = vec![ControlMessage::ChannelReject {
+            channel,
+            reason: reason.to_string(),
+        }];
+        out.extend(self.try_pair());
+        out
     }
 
     /// Handle a newly-accepted inbound stream (responder side): queue for pairing.
@@ -445,18 +490,14 @@ impl ChannelManager {
                 break;
             };
             let (id, channel_type) = match pending {
-                PendingOpen::Reject(id, reason) => {
-                    // Consume (drop) the stream the peer opened for this rejected
-                    // channel so the next open still lines up with its own stream.
+                PendingOpen::Skip(owed) => {
+                    // Consume (drop) the stream the peer opened for a refused
+                    // channel so the next open still lines up with its own
+                    // stream. Nothing is sent: `refuse` already told the peer.
                     drop(link);
-                    self.emit(ChannelEvent::Rejected {
-                        channel: id,
-                        reason: reason.clone(),
-                    });
-                    out.push(ControlMessage::ChannelReject {
-                        channel: id,
-                        reason,
-                    });
+                    if owed > 1 {
+                        self.pending_opens.push_front(PendingOpen::Skip(owed - 1));
+                    }
                     continue;
                 }
                 PendingOpen::Accept(id, channel_type) => (id, channel_type),
@@ -656,6 +697,183 @@ impl ChannelManager {
         }
         self.pending_opens.clear();
         self.pending_streams.clear();
+    }
+}
+
+#[cfg(test)]
+mod pending_open_tests {
+    //! The responder-side open queue. These drive [`ChannelManager`] directly,
+    //! because the property under test is about frames a peer sends and streams
+    //! it deliberately does *not* open — something no cooperating peer, and so
+    //! no session-level test, can produce.
+
+    use super::*;
+    use peerbeam_domain::error::Result as DomainResult;
+    use peerbeam_domain::port::Frame;
+    use peerbeam_domain::session::Capability;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    /// A transport that opens nothing. Every method here is unreachable for the
+    /// queue methods under test — they neither open nor accept — and a stub that
+    /// says so is better than one that pretends to work.
+    struct NoTransport;
+
+    #[async_trait::async_trait]
+    impl ChannelTransport for NoTransport {
+        async fn open_stream(&self) -> DomainResult<Box<dyn Link>> {
+            Err(peerbeam_domain::error::DomainError::Transfer(
+                "stub transport opens nothing".into(),
+            ))
+        }
+        async fn accept_stream(&self) -> DomainResult<Option<Box<dyn Link>>> {
+            Ok(None)
+        }
+        async fn close(&self) -> DomainResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A stream that is already at EOF: enough to be *paired*, which is all
+    /// these tests do with one.
+    struct DeadLink;
+
+    #[async_trait::async_trait]
+    impl Link for DeadLink {
+        async fn send_frame(&mut self, _frame: Frame) -> DomainResult<()> {
+            Ok(())
+        }
+        async fn recv_frame(&mut self) -> DomainResult<Option<Frame>> {
+            Ok(None)
+        }
+        async fn close(&mut self) -> DomainResult<()> {
+            Ok(())
+        }
+    }
+
+    const OK_TYPE: ChannelType = ChannelType::CHAT;
+    /// A capability the manager below never negotiates, so every open naming it
+    /// is refused — the cheapest way to make a peer's open fail `permit`.
+    fn refused_type() -> ChannelType {
+        ChannelType::new(0x0f0f)
+    }
+
+    fn manager(limit: usize) -> (ChannelManager, UnboundedReceiver<ChannelEvent>) {
+        let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> =
+            Arc::new(peerbeam_crypto::AeadCrypto::new());
+        // A zero master secret: these tests never seal or open a frame, and a
+        // real handshake would only make what they assert harder to see.
+        let auth = crate::auth::Session {
+            send_key: [0u8; 32],
+            recv_key: [0u8; 32],
+            send_prefix: [0u8; 4],
+            recv_prefix: [0u8; 4],
+            peer_id: peerbeam_domain::id::DeviceId::from("pb-peer"),
+            peer_name: String::new(),
+            newly_trusted: false,
+            pairing_code: String::new(),
+            transcript: Vec::new(),
+        };
+        let crypto = SessionCrypto::from_session(&auth, SessionRole::Responder, enc);
+        let (events, event_rx) = unbounded_channel();
+        let (actor_events, _actor_rx) = unbounded_channel();
+        let (incoming, _incoming_rx) = unbounded_channel();
+        // Leaked deliberately: a dropped receiver would make the manager treat
+        // every paired stream channel as unreceivable, which is a different test.
+        std::mem::forget(_actor_rx);
+        std::mem::forget(_incoming_rx);
+        let m = ChannelManager::new(
+            Arc::new(NoTransport),
+            crypto,
+            Version::CURRENT,
+            SessionRole::Responder,
+            HandlerRegistry::new(),
+            CapabilitySet::new().with(Capability::new(OK_TYPE)),
+            limit,
+            HashSet::new(),
+            events,
+            actor_events,
+            incoming,
+        );
+        (m, event_rx)
+    }
+
+    /// **The queue must not grow with what a peer refuses to follow through on.**
+    /// A refused open used to be parked until a stream arrived to pair it with,
+    /// so a peer that sent `ChannelOpen`s and opened no streams grew the queue by
+    /// one entry each, unboundedly — and was told nothing, because the
+    /// `ChannelReject` was only minted at pairing time. Only *accepted* opens
+    /// count against the channel limit, so nothing else stopped it either.
+    #[test]
+    fn a_peer_that_opens_no_stream_can_neither_grow_the_queue_nor_go_unanswered() {
+        let (mut m, _events) = manager(DEFAULT_CHANNEL_LIMIT);
+        const OPENS: u64 = 5_000;
+        for id in 0..OPENS {
+            // Even ids: the peer's own parity for an initiator peer, so nothing
+            // here is refused merely for being ours.
+            let out = m.handle_channel_open(ChannelId::new((id + 1) * 2), refused_type());
+            assert!(
+                matches!(out.as_slice(), [ControlMessage::ChannelReject { .. }]),
+                "open {id} was neither accepted nor refused: {out:?}"
+            );
+        }
+        assert_eq!(
+            m.pending_opens.len(),
+            1,
+            "{OPENS} refusals must collapse into one owed-stream run"
+        );
+    }
+
+    /// The same, mixed with opens that *are* accepted: the run splits around
+    /// each accept, so the queue stays bounded by the channel limit rather than
+    /// by what the peer chooses to send.
+    #[test]
+    fn interleaving_accepted_opens_keeps_the_queue_bounded_by_the_channel_limit() {
+        let (mut m, _events) = manager(4);
+        let mut id = 0u64;
+        let mut next = || {
+            id += 2;
+            ChannelId::new(id)
+        };
+        for _ in 0..1_000 {
+            m.handle_channel_open(next(), refused_type());
+            m.handle_channel_open(next(), OK_TYPE);
+        }
+        // 4 accepts fill the limit; every later open — of either type — is
+        // refused and folds into the run beside it.
+        assert!(
+            m.pending_opens.len() <= 9,
+            "queue grew to {} entries",
+            m.pending_opens.len()
+        );
+    }
+
+    /// A refusal still owes one stream, and discarding it in FIFO order is what
+    /// keeps a later accepted open paired with its *own* stream. Collapsing
+    /// refusals into a count must not lose one.
+    #[tokio::test]
+    async fn every_refused_open_still_consumes_exactly_one_stream() {
+        let (mut m, _events) = manager(DEFAULT_CHANNEL_LIMIT);
+        m.handle_channel_open(ChannelId::new(2), refused_type());
+        m.handle_channel_open(ChannelId::new(4), refused_type());
+        let accepted = ChannelId::new(6);
+        assert!(
+            m.handle_channel_open(accepted, OK_TYPE).is_empty(),
+            "nothing to send until a stream arrives"
+        );
+
+        // The first two streams belong to the refusals and are discarded.
+        assert!(m.on_stream_accepted(Box::new(DeadLink)).is_empty());
+        assert!(m.on_stream_accepted(Box::new(DeadLink)).is_empty());
+        // Only the third pairs with the accepted open.
+        let out = m.on_stream_accepted(Box::new(DeadLink));
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ControlMessage::ChannelAccept { channel }] if *channel == accepted
+            ),
+            "the accepted open paired with the wrong stream: {out:?}"
+        );
+        assert!(m.pending_opens.is_empty());
     }
 }
 

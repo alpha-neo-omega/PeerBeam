@@ -15,4 +15,4 @@ pub use message::{
     BrowseError, Entry, ListRequest, ListResponse, MAX_ENTRIES, MAX_PATH, MSG_LIST_REQUEST,
     MSG_LIST_RESPONSE,
 };
-pub use share::{ShareError, Shares};
+pub use share::{Share, ShareError, Shares};

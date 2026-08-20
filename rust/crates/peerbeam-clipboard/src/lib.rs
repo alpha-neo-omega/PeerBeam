@@ -54,7 +54,7 @@
 //! history of everything the user ever copied is precisely the artefact this
 //! feature must not create.
 
-mod gate;
+pub mod gate;
 mod handler;
 mod history;
 mod message;

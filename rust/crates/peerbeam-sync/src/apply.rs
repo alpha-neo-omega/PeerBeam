@@ -113,8 +113,30 @@ pub fn apply_local(
                 // A missing file is success, not an error: the user may have
                 // deleted it themselves between the scan and now, and failing
                 // here would abort a sync over something already done.
+                //
+                // **But "already gone" and "could not be removed" are different
+                // facts.** The old arm collapsed every error into success, so a
+                // permission problem or a file held open by another program was
+                // recorded as deleted — and the index below then marks it
+                // deleted, meaning this device stops offering a file it still
+                // has and no later scan puts it back. That is a silent
+                // divergence between the two peers, which is the one thing sync
+                // must not produce quietly.
                 match std::fs::remove_file(&target) {
-                    Ok(()) | Err(_) => {}
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %path,
+                            "sync could not delete a file the peer removed; it stays here \
+                             and will be offered again"
+                        );
+                        // Not indexed as deleted: the file is still on disk, and
+                        // claiming otherwise is what makes the divergence
+                        // permanent.
+                        continue;
+                    }
                 }
                 // The entry stays, marked deleted and carrying the peer's
                 // version, so this device does not later believe it still has
@@ -342,5 +364,93 @@ mod containment_tests {
         );
 
         assert!(outside.exists(), "a file outside the sync root was deleted");
+    }
+}
+
+#[cfg(test)]
+mod delete_failure_tests {
+    use super::tests_support::setup_for_containment as setup;
+    use super::*;
+
+    /// **"Already gone" and "could not be removed" are different facts.**
+    ///
+    /// The old arm collapsed every `remove_file` error into success, and the
+    /// index below then marked the entry deleted — so this device stopped
+    /// offering a file it still had, and no later scan put it back. A permanent
+    /// silent divergence between two peers, which is the one outcome sync must
+    /// never produce quietly.
+    ///
+    /// A directory stands in for the unremovable file: `remove_file` refuses it
+    /// on every platform, with no permissions games and nothing to clean up.
+    #[test]
+    fn a_file_that_cannot_be_removed_is_not_recorded_as_deleted() {
+        let (_dir, index, root) = setup();
+        std::fs::create_dir_all(root.join("stubborn")).unwrap();
+
+        // Seed the index as if we hold it, so "marked deleted" is observable.
+        index
+            .put(
+                "folder",
+                &IndexEntry {
+                    path: "stubborn".into(),
+                    size: 1,
+                    modified: 0,
+                    content: "abc".into(),
+                    version: VersionVector::new(),
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let _ = apply_local(
+            &index,
+            "folder",
+            &root,
+            &[Action::Delete {
+                path: "stubborn".into(),
+            }],
+            &std::collections::BTreeMap::new(),
+        );
+
+        let after = index.load("folder").unwrap();
+        let entry = after.get("stubborn").expect("the entry must survive");
+        assert!(
+            !entry.deleted,
+            "a file still on disk was recorded as deleted, so it will never be offered again"
+        );
+        assert!(root.join("stubborn").exists(), "and it is still there");
+    }
+
+    /// A file that really is gone is still success — the user may have deleted
+    /// it themselves between the scan and now.
+    #[test]
+    fn an_already_missing_file_is_still_a_successful_delete() {
+        let (_dir, index, root) = setup();
+        index
+            .put(
+                "folder",
+                &IndexEntry {
+                    path: "vanished.txt".into(),
+                    size: 1,
+                    modified: 0,
+                    content: "abc".into(),
+                    version: VersionVector::new(),
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let out = apply_local(
+            &index,
+            "folder",
+            &root,
+            &[Action::Delete {
+                path: "vanished.txt".into(),
+            }],
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("a missing file is not an error");
+        assert_eq!(out.deleted, 1);
+        assert!(index.load("folder").unwrap()["vanished.txt"].deleted);
     }
 }

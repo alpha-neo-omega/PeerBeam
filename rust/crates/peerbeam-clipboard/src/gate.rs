@@ -78,6 +78,31 @@ pub fn may_share_clip(
         && caps_support_clip(negotiated)
 }
 
+/// Whether a clip **arriving** from `peer` may be applied.
+///
+/// # Why the inbound gate is not the outbound one
+///
+/// [`may_share_clip`] asks four questions, two of which make no sense on the
+/// way in: `sync_enabled` is this device's decision about what it *sends*, and
+/// the negotiated capability set describes what the peer can understand, not
+/// what it is allowed to do to us. A clip that has already arrived has plainly
+/// been understood.
+///
+/// What remains is the part that was missing entirely: is this device approved,
+/// and does it hold the Clipboard permission. Inbound clips were applied with
+/// no check at all, and the TOFU handshake pins every stranger that completes
+/// it — so anyone who could reach the port could change the user's clipboard,
+/// while the permission the UI offers to revoke governed only the outbound
+/// direction. I6 requires explicit, revocable consent for live clipboard; a
+/// gate on one direction is not that.
+///
+/// Fails **closed**: [`TrustStore::may`] answers `false` on a store error, so a
+/// device whose record cannot be read is refused rather than trusted.
+#[must_use]
+pub fn may_apply_clip(trust: &dyn TrustStore, peer: &DeviceId) -> bool {
+    trust.is_approved(peer) && trust.may(peer, Permission::Clipboard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

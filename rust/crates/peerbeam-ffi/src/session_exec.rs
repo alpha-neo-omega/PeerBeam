@@ -16,9 +16,10 @@ use peerbeam_domain::entity::{Device, RouteKind, TransferSession};
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
-    Capability, CapabilitySet, ChannelType, MessageHandler, CHAT_FEAT_FILEDECLINE,
-    CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT, CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC,
-    PIPE_FEAT_STREAM, PRESENCE_FEAT_RING, PRESENCE_FEAT_STATUS,
+    Capability, CapabilitySet, ChannelId, ChannelState, ChannelType, MessageHandler, SessionFrame,
+    CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
+    CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
+    PRESENCE_FEAT_STATUS,
 };
 use peerbeam_domain::session::{BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
@@ -217,6 +218,255 @@ pub fn caps_support_ring(caps: &CapabilitySet) -> bool {
         .is_some_and(|f| f & PRESENCE_FEAT_RING != 0)
 }
 
+/// How long to wait for a peer's `ChannelAccept` before giving up on a lane.
+///
+/// Matches `peerbeam_chat::send`'s budget, and exists for the same reason: this
+/// side's `open_channel` resolves before the peer has answered, so the wait is
+/// one real network round trip, not a local one.
+const CHANNEL_OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while waiting for a lane's channel to reach `Open`.
+const CHANNEL_OPEN_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Which of a session's long-lived channels a frame travels on.
+///
+/// **One channel per lane, per session, for the session's life.** Every request
+/// helper and every reply pump in this module used to open a fresh channel and
+/// never close one, so a session that asked more than
+/// `DEFAULT_CHANNEL_LIMIT` (256) times reached the limit and stopped asking —
+/// silently, because the failures came back as `None` or a discarded `bool`. A
+/// folder sync issues a chunk-map request and several chunk requests *per file*,
+/// so a moderately sized folder was enough.
+///
+/// Reuse rather than close-after-each-request. Closing would also bound the
+/// count, and would not lose the request (a dropped quinn `SendStream` is
+/// `finish`ed, and the frame precedes the FIN on an ordered stream) — it is
+/// simply the wrong shape for this traffic:
+///
+/// * **It costs a round trip per request.** An open is a `ChannelOpen`, the
+///   peer's `ChannelAccept`, and — because a frame sent before that accept is
+///   refused locally, see [`Channels::await_open`] — a wait for it, plus a
+///   `ChannelClose`/`ChannelClosed` pair afterwards. A delta fetch is a chunk
+///   map plus a chunk request per 64 chunks *per file*, so paying an extra RTT
+///   on each roughly doubles the round trips of a folder sync. A lane pays it
+///   once per session.
+/// * **It only bounds the peer's count if the closes keep up.** The peer's
+///   `permit` counts the channels we open, and nothing rate-limits our requests
+///   against the close acknowledgements, so a burst can still reach its limit.
+///   A lane cannot.
+///
+/// It is also the shape the rest of the codebase already uses for message
+/// channels: `PresenceSender::ensure_channel` and its clipboard twin each cache
+/// one channel per session, and [`send_note_batches`] already argued the same
+/// for a batch sequence. `session/transfer.rs` and `session/pipe.rs` do close
+/// theirs, and should: a **stream** channel carries exactly one payload by
+/// design, so its lifetime *is* the transfer's and there is nothing to reuse.
+///
+/// Lanes rather than channel types, because a channel actor writes its queued
+/// frames serially down one stream: everything sharing a channel shares a
+/// head-of-line queue. One chunk request is answered with 64 frames of up to
+/// half a megabyte each (a chunk is at most `MAX_CHUNK`, hex-encoded on the
+/// wire), while a chunk map is the one small frame that tells the peer what to
+/// ask for next — sharing a channel, the frame that unblocks the next round trip
+/// would queue behind tens of megabytes of bytes. Keeping the SYNC reply lanes
+/// and the SYNC request lane apart is what preserves the independence the
+/// separate reply pumps were written for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Lane {
+    /// Listings this side asks for.
+    BrowseAsk,
+    /// Listings this side answers with.
+    BrowseAnswer,
+    /// Manifest, chunk-map, chunk and file requests this side makes — all small.
+    SyncAsk,
+    /// Manifests this side answers with.
+    SyncManifest,
+    /// Chunk maps this side answers with.
+    SyncChunkMap,
+    /// Chunk bytes this side answers with: the big, slow lane, and the reason
+    /// the other three are not it.
+    SyncChunks,
+    /// Note batches this side pushes.
+    Notes,
+}
+
+impl Lane {
+    fn channel_type(self) -> ChannelType {
+        match self {
+            Lane::BrowseAsk | Lane::BrowseAnswer => BROWSE,
+            Lane::SyncAsk | Lane::SyncManifest | Lane::SyncChunkMap | Lane::SyncChunks => SYNC,
+            Lane::Notes => NOTES,
+        }
+    }
+
+    /// How the lane names itself in a log line or an error a UI may show.
+    fn label(self) -> &'static str {
+        match self {
+            Lane::BrowseAsk => "browse request",
+            Lane::BrowseAnswer => "browse answer",
+            Lane::SyncAsk => "sync request",
+            Lane::SyncManifest => "manifest answer",
+            Lane::SyncChunkMap => "chunk map answer",
+            Lane::SyncChunks => "chunk answer",
+            Lane::Notes => "notes",
+        }
+    }
+}
+
+/// A session's long-lived channels, one per [`Lane`], each opened on first use.
+///
+/// Shared (via `Arc`) between the request helpers and the reply pumps, because
+/// both speak on the same session and a cache per caller would be no cache at
+/// all.
+struct Channels {
+    handle: SessionHandle,
+    /// An **async** mutex, held across the open it guards: two callers racing a
+    /// lane's first use must not each open a channel for it, which is the leak
+    /// this type exists to prevent. Contention costs nothing after that — a lane
+    /// is opened once per session, and every later send holds the lock only long
+    /// enough to read an id.
+    lanes: tokio::sync::Mutex<std::collections::HashMap<Lane, ChannelId>>,
+}
+
+impl Channels {
+    fn new(handle: SessionHandle) -> Self {
+        Channels {
+            handle,
+            lanes: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Send one frame on `lane`'s channel, opening it on first use.
+    ///
+    /// `build` takes the channel id because every wire type's `to_frame` does,
+    /// and is called again on the retry so the frame names the channel it
+    /// actually goes out on.
+    ///
+    /// Exactly two attempts. The first uses whatever channel the lane already
+    /// holds; a send that fails means the channel is gone — the peer closed it,
+    /// or its actor errored, and either way the manager has already dropped it —
+    /// so the lane is reopened and the frame sent once more. Without that, one
+    /// dead channel would end every later request on the lane, which is the same
+    /// silent stop as leaking a channel per request, arrived at from the other
+    /// direction.
+    async fn send<F>(&self, lane: Lane, build: F) -> Result<(), (Code, String)>
+    where
+        F: Fn(ChannelId) -> Result<SessionFrame, String>,
+    {
+        let mut stale: Option<ChannelId> = None;
+        loop {
+            let channel = self.lane_channel(lane, stale).await?;
+            let frame = build(channel).map_err(|e| (Code::Internal, e))?;
+            match self
+                .handle
+                .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if stale.is_none() => {
+                    // Debug, not warn: a channel the peer closed is ordinary,
+                    // and the retry below is expected to succeed. Logged at all
+                    // so a lane that reopens on every send is visible rather
+                    // than merely slow.
+                    tracing::debug!(lane = lane.label(), error = %e, "reopening a lane");
+                    stale = Some(channel);
+                }
+                Err(e) => return Err((Code::Connection, format!("{} channel: {e}", lane.label()))),
+            }
+        }
+    }
+
+    /// `lane`'s channel: the one it already holds, or a newly opened one when it
+    /// holds none or holds `stale` — the id a caller has just failed to send on.
+    ///
+    /// The stale id is *compared* rather than trusted, because two callers can
+    /// fail on the same dead channel at once and the second must not discard the
+    /// replacement the first just opened.
+    async fn lane_channel(
+        &self,
+        lane: Lane,
+        stale: Option<ChannelId>,
+    ) -> Result<ChannelId, (Code, String)> {
+        let mut lanes = self.lanes.lock().await;
+        match lanes.get(&lane).copied() {
+            Some(live) if Some(live) != stale => return Ok(live),
+            Some(dead) => {
+                lanes.remove(&lane);
+                // Best-effort, and lossless: the send on it already failed, so
+                // there is nothing queued to lose, and a channel this session
+                // will never speak on again must not go on counting against
+                // either side's 256-channel limit.
+                self.handle.close_channel(dead);
+            }
+            None => {}
+        }
+        let channel = self
+            .handle
+            .open_channel(lane.channel_type())
+            .await
+            .map_err(|e| {
+                (
+                    Code::Connection,
+                    format!("open {} channel: {e}", lane.label()),
+                )
+            })?;
+        self.await_open(lane, channel).await?;
+        lanes.insert(lane, channel);
+        Ok(channel)
+    }
+
+    /// Wait, bounded, for the peer to accept `channel`.
+    ///
+    /// [`SessionHandle::open_channel`] resolves as soon as *this* side has
+    /// allocated the channel and queued the open on the wire — it does not wait
+    /// for the peer's `ChannelAccept`. A frame sent straight after it therefore
+    /// races that accept and hard-fails with "channel not open". Every request in
+    /// this module did exactly that, so over any link with real latency the
+    /// first frame on each freshly-opened channel — which, before lanes, was
+    /// every frame — could be refused locally and reported as a peer that did
+    /// not answer.
+    ///
+    /// The same wait, for the same reason, as
+    /// `peerbeam_chat::send::wait_for_channel_open` and its clipboard and
+    /// presence twins. A fourth copy rather than a shared helper only because
+    /// the shared home is `SessionHandle` in `peerbeam-transfer`, and moving the
+    /// other three there is a change to three crates this one merely consumes.
+    async fn await_open(&self, lane: Lane, channel: ChannelId) -> Result<(), (Code, String)> {
+        let deadline = std::time::Instant::now() + CHANNEL_OPEN_BUDGET;
+        loop {
+            let snapshot = self
+                .handle
+                .channels()
+                .await
+                .map_err(|e| (Code::Connection, format!("{}: {e}", lane.label())))?;
+            match snapshot.iter().find(|c| c.id == channel).map(|c| c.state) {
+                Some(ChannelState::Opening) => {}
+                Some(s) if s.is_open() => return Ok(()),
+                // Terminal, or absent — and absent *is* terminal here: the pump
+                // registers the channel before `open_channel` returns and reads
+                // the snapshot from the same registry over the same ordered
+                // command queue, so the only way it can be missing is that it
+                // was already removed (refused, or its actor errored).
+                _ => {
+                    return Err((
+                        Code::Connection,
+                        format!("{} channel was refused by the device", lane.label()),
+                    ))
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err((
+                    Code::Connection,
+                    format!(
+                        "{} channel did not open within {CHANNEL_OPEN_BUDGET:?}",
+                        lane.label()
+                    ),
+                ));
+            }
+            tokio::time::sleep(CHANNEL_OPEN_POLL).await;
+        }
+    }
+}
+
 /// Send one `ListRequest` and wait for the answer, bounded.
 ///
 /// Bounded because a peer that never answers must not hold a caller forever:
@@ -228,31 +478,37 @@ pub async fn request_listing(
 ) -> Option<peerbeam_browse::ListResponse> {
     use tokio::time::{timeout, Duration};
 
-    let channel = session.handle.open_channel(BROWSE).await.ok()?;
     let req = peerbeam_browse::ListRequest::new(path);
-    let frame = req.to_frame(channel).ok()?;
-    session
-        .handle
-        .send_on_channel(
-            channel,
-            peerbeam_browse::ListRequest::message_type(),
-            frame.flags,
-            frame.payload,
-        )
+    // Logged rather than folded into the same `None` a silent peer produces:
+    // "we could not ask" and "it did not answer" are different faults, and only
+    // the first is ours. Discarding the error left a UI reporting an empty
+    // folder for a request that never left the machine.
+    if let Err((_, e)) = session
+        .channels
+        .send(Lane::BrowseAsk, |c| {
+            req.to_frame(c).map_err(|e| e.to_string())
+        })
         .await
-        .ok()?;
+    {
+        tracing::warn!(%path, error = %e, "browse request not sent");
+        return None;
+    }
 
     // The answer arrives through this session's own Browse handler, which
     // pushes it onto the answers channel; `browse_answers` is drained by the
     // reply pump on the *serving* side, so an asker reads it here instead.
     let rx = session.browse_rx.clone();
-    timeout(Duration::from_secs(10), async move {
+    let answer = timeout(Duration::from_secs(10), async move {
         let mut guard = rx.lock().await;
         guard.recv().await
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+    if answer.is_none() {
+        tracing::warn!(%path, "device did not answer a browse request");
+    }
+    answer
 }
 
 /// Ask how a file chunks. `None` when the peer cannot say — it predates delta
@@ -262,16 +518,22 @@ pub async fn request_chunk_map(
     session: &Session,
     path: &str,
 ) -> Option<peerbeam_sync::manifest_wire::ChunkMapResponse> {
-    let channel = session.handle.open_channel(SYNC).await.ok()?;
     let req = peerbeam_sync::manifest_wire::ChunkMapRequest {
         path: path.to_string(),
     };
-    let frame = req.to_frame(channel).ok()?;
-    session
-        .handle
-        .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+    if let Err((_, e)) = session
+        .channels
+        .send(Lane::SyncAsk, |c| {
+            req.to_frame(c).map_err(|e| e.to_string())
+        })
         .await
-        .ok()?;
+    {
+        // A caller reads `None` as "no delta available, send the whole file",
+        // which is the right fallback but the wrong diagnosis: without this the
+        // whole-file path looks like the peer's choice rather than our failure.
+        tracing::warn!(%path, error = %e, "chunk map request not sent");
+        return None;
+    }
     let rx = session.chunkmap_rx.clone();
     tokio::time::timeout(std::time::Duration::from_secs(30), async move {
         rx.lock().await.recv().await
@@ -292,22 +554,21 @@ pub async fn request_chunks(
     const BATCH: usize = 64;
     let mut out = std::collections::HashMap::new();
     for group in hashes.chunks(BATCH) {
-        let Ok(channel) = session.handle.open_channel(SYNC).await else {
-            break;
-        };
         let req = peerbeam_sync::manifest_wire::ChunkRequest {
             path: path.to_string(),
             hashes: group.to_vec(),
         };
-        let Ok(frame) = req.to_frame(channel) else {
-            break;
-        };
-        if session
-            .handle
-            .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
+        if let Err((_, e)) = session
+            .channels
+            .send(Lane::SyncAsk, |c| {
+                req.to_frame(c).map_err(|e| e.to_string())
+            })
             .await
-            .is_err()
         {
+            // Returning what arrived so far is deliberate — the caller falls
+            // back to the whole file — but a partial delta that came of *our*
+            // failure must say so, or the fallback reads as the peer's doing.
+            tracing::warn!(%path, error = %e, "chunk request not sent");
             break;
         }
         for _ in 0..group.len() {
@@ -331,21 +592,19 @@ pub async fn request_chunks(
 pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_sync::Manifest> {
     use tokio::time::{timeout, Duration};
 
-    let channel = session.handle.open_channel(SYNC).await.ok()?;
     let req = peerbeam_sync::ManifestRequest {
         path: path.to_string(),
     };
-    let frame = req.to_frame(channel).ok()?;
-    session
-        .handle
-        .send_on_channel(
-            channel,
-            peerbeam_sync::ManifestRequest::message_type(),
-            frame.flags,
-            frame.payload,
-        )
+    if let Err((_, e)) = session
+        .channels
+        .send(Lane::SyncAsk, |c| {
+            req.to_frame(c).map_err(|e| e.to_string())
+        })
         .await
-        .ok()?;
+    {
+        tracing::warn!(%path, error = %e, "manifest request not sent");
+        return None;
+    }
 
     let rx = session.sync_rx.clone();
     // A manifest can describe thousands of files, so this waits longer than a
@@ -366,25 +625,26 @@ pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_
 /// the same accept/approve path as any other file, because they *are* an
 /// ordinary transfer. Nothing here waits for them.
 pub async fn request_file(session: &Session, path: &str) -> bool {
-    let Ok(channel) = session.handle.open_channel(SYNC).await else {
-        return false;
-    };
     let req = peerbeam_sync::FileRequest {
         path: path.to_string(),
     };
-    let Ok(frame) = req.to_frame(channel) else {
-        return false;
-    };
-    session
-        .handle
-        .send_on_channel(
-            channel,
-            peerbeam_sync::FileRequest::message_type(),
-            frame.flags,
-            frame.payload,
-        )
+    match session
+        .channels
+        .send(Lane::SyncAsk, |c| {
+            req.to_frame(c).map_err(|e| e.to_string())
+        })
         .await
-        .is_ok()
+    {
+        Ok(()) => true,
+        Err((_, e)) => {
+            // The `bool` is the caller's contract, and its one caller drops it:
+            // nothing waits for these bytes, so a request that never left would
+            // otherwise be indistinguishable from a file the peer chose not to
+            // send. Logged here, where the reason is still known.
+            tracing::warn!(%path, error = %e, "file request not sent");
+            false
+        }
+    }
 }
 
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries
@@ -416,29 +676,60 @@ pub fn caps_support_notes(caps: &CapabilitySet) -> bool {
 /// sync of a large set is several frames of the same conversation, and a
 /// channel per frame would make the peer's side reassemble an exchange that was
 /// never meant to be split.
+///
+/// Takes a bare handle, so it gets a [`Channels`] of its own rather than the
+/// session's. Both callers dial a session for this one exchange and drop it, so
+/// a lane cache that lives only as long as the call costs nothing — and it is
+/// what buys the sequence a wait for the peer's accept (see
+/// [`Channels::await_open`]), which the hand-rolled open here did not do. The
+/// **reply pump**, whose session stays up, goes through the session's own lanes
+/// so it does not open a channel per answer.
 pub async fn send_note_batches(
     handle: &SessionHandle,
     batches: &[peerbeam_notes::NoteBatch],
 ) -> Result<(), (Code, String)> {
-    let channel = handle
-        .open_channel(NOTES)
-        .await
-        .map_err(|e| (Code::Connection, e.to_string()))?;
+    send_notes_on(&Channels::new(handle.clone()), batches).await
+}
+
+/// The batch loop both note senders share.
+async fn send_notes_on(
+    channels: &Channels,
+    batches: &[peerbeam_notes::NoteBatch],
+) -> Result<(), (Code, String)> {
     for b in batches {
-        let frame = b
-            .to_frame(channel)
-            .map_err(|e| (Code::Internal, e.to_string()))?;
-        handle
-            .send_on_channel(
-                channel,
-                peerbeam_notes::NoteBatch::message_type(),
-                frame.flags,
-                frame.payload,
-            )
-            .await
-            .map_err(|e| (Code::Connection, e.to_string()))?;
+        channels
+            .send(Lane::Notes, |c| b.to_frame(c).map_err(|e| e.to_string()))
+            .await?;
     }
     Ok(())
+}
+
+/// Send one answer a handler produced, and say whether its pump should carry on.
+///
+/// `false` only for a session that is gone. An answer that cannot be *encoded*
+/// is this one answer's problem and the pump keeps going, because the next
+/// request the peer makes is still answerable — the distinction the four hand-
+/// written pumps drew with `continue` versus `break`, kept here so one
+/// unencodable manifest cannot stop a session answering anything again.
+///
+/// `what` names the answer in the log line. It is not [`Lane::label`] because
+/// the lane is a channel and this is a message: "chunk map" reads better than
+/// "chunk map answer channel" in "chunk map answer not delivered".
+async fn answer_on<F>(channels: &Channels, lane: Lane, what: &str, build: F) -> bool
+where
+    F: Fn(ChannelId) -> Result<SessionFrame, String>,
+{
+    match channels.send(lane, build).await {
+        Ok(()) => true,
+        Err((Code::Internal, e)) => {
+            tracing::debug!(error = %e, "{what} answer could not be encoded");
+            true
+        }
+        Err((_, e)) => {
+            tracing::debug!(error = %e, "{what} answers stopped");
+            false
+        }
+    }
 }
 
 /// A live PeerSession with its pump running. Holds the incoming-channel receiver
@@ -446,6 +737,10 @@ pub async fn send_note_batches(
 pub struct Session {
     /// Control handle for opening channels / closing.
     pub handle: SessionHandle,
+    /// This session's long-lived channels, one per [`Lane`]. Shared with the
+    /// reply pumps, which speak on the same session — see [`Channels`] for why
+    /// there is one channel per lane rather than one per request.
+    channels: Arc<Channels>,
     /// Answers to listings **this side asked for**, delivered by the Browse
     /// handler. Behind a lock because a session is shared and only one caller
     /// waits on an answer at a time.
@@ -676,7 +971,8 @@ async fn establish(
     // handler; whether anything leaves is decided per push by
     // `may_share_clip`, and with the opt-in off (the default) no clipboard
     // channel is ever opened.
-    let (clipboard_handler, clipboard_slot) = ClipboardHandler::new(crate::clipboard::sink());
+    let (clipboard_handler, clipboard_slot) =
+        ClipboardHandler::new(crate::clipboard::sink(), trust.clone());
     handlers.push(clipboard_handler as Arc<dyn MessageHandler>);
     let (ev, _ev) = unbounded_channel();
     let (ch, _ch) = unbounded_channel();
@@ -724,29 +1020,23 @@ async fn establish(
     // already reflects what the *peer* advertised, not just what we asked for.
     let capabilities = ps.capabilities().clone();
     let handle = ps.handle();
+    // One lane set for the whole session, shared by the request helpers and
+    // every reply pump below. Built here, before any pump is spawned, so no pump
+    // can be given a cache of its own and quietly go back to a channel per
+    // answer.
+    let channels = Arc::new(Channels::new(handle.clone()));
     // Drain the notes handler's replies onto this session. Spawned rather than
     // awaited: an answer is owed *after* frames start arriving, which is long
     // after this function returns.
     {
         let mut rx = sync_answers;
-        let reply_handle = handle.clone();
+        let lanes = channels.clone();
         crate::runtime::spawn(async move {
             while let Some(m) = rx.recv().await {
-                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
-                    break;
-                };
-                let Ok(frame) = m.to_frame(channel) else {
-                    continue;
-                };
-                if reply_handle
-                    .send_on_channel(
-                        channel,
-                        peerbeam_sync::Manifest::message_type(),
-                        frame.flags,
-                        frame.payload,
-                    )
-                    .await
-                    .is_err()
+                if !answer_on(&lanes, Lane::SyncManifest, "manifest", |c| {
+                    m.to_frame(c).map_err(|e| e.to_string())
+                })
+                .await
                 {
                     break;
                 }
@@ -759,19 +1049,13 @@ async fn establish(
     // peer what to ask for next.
     {
         let mut rx = chunkmap_out;
-        let reply_handle = handle.clone();
+        let lanes = channels.clone();
         crate::runtime::spawn(async move {
             while let Some(m) = rx.recv().await {
-                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
-                    break;
-                };
-                let Ok(frame) = m.to_frame(channel) else {
-                    continue;
-                };
-                if reply_handle
-                    .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
-                    .await
-                    .is_err()
+                if !answer_on(&lanes, Lane::SyncChunkMap, "chunk map", |c| {
+                    m.to_frame(c).map_err(|e| e.to_string())
+                })
+                .await
                 {
                     break;
                 }
@@ -780,19 +1064,13 @@ async fn establish(
     }
     {
         let mut rx = chunk_out;
-        let reply_handle = handle.clone();
+        let lanes = channels.clone();
         crate::runtime::spawn(async move {
             while let Some(d) = rx.recv().await {
-                let Ok(channel) = reply_handle.open_channel(SYNC).await else {
-                    break;
-                };
-                let Ok(frame) = d.to_frame(channel) else {
-                    continue;
-                };
-                if reply_handle
-                    .send_on_channel(channel, frame.message_type, frame.flags, frame.payload)
-                    .await
-                    .is_err()
+                if !answer_on(&lanes, Lane::SyncChunks, "chunk", |c| {
+                    d.to_frame(c).map_err(|e| e.to_string())
+                })
+                .await
                 {
                     break;
                 }
@@ -820,24 +1098,13 @@ async fn establish(
     }
     {
         let mut rx = browse_answers;
-        let reply_handle = handle.clone();
+        let lanes = channels.clone();
         crate::runtime::spawn(async move {
             while let Some(answer) = rx.recv().await {
-                let Ok(channel) = reply_handle.open_channel(BROWSE).await else {
-                    break;
-                };
-                let Ok(frame) = answer.to_frame(channel) else {
-                    continue;
-                };
-                if reply_handle
-                    .send_on_channel(
-                        channel,
-                        peerbeam_browse::ListResponse::message_type(),
-                        frame.flags,
-                        frame.payload,
-                    )
-                    .await
-                    .is_err()
+                if !answer_on(&lanes, Lane::BrowseAnswer, "browse listing", |c| {
+                    answer.to_frame(c).map_err(|e| e.to_string())
+                })
+                .await
                 {
                     break;
                 }
@@ -845,10 +1112,14 @@ async fn establish(
         });
     }
     if let Some(mut rx) = notes_replies {
-        let reply_handle = handle.clone();
+        let lanes = channels.clone();
         crate::runtime::spawn(async move {
             while let Some(batches) = rx.recv().await {
-                if send_note_batches(&reply_handle, &batches).await.is_err() {
+                // The session's own Notes lane, not `send_note_batches`' bare
+                // handle: this pump answers every batch the peer pushes over a
+                // session that stays up, so a channel per answer is exactly the
+                // leak that stopped a long-lived session syncing.
+                if send_notes_on(&lanes, &batches).await.is_err() {
                     // The session is gone. A reply that cannot be delivered is
                     // exactly what an unreachable peer looks like, and the next
                     // sync starts from both sides' stored sets anyway.
@@ -893,6 +1164,7 @@ async fn establish(
     });
     Ok(Session {
         handle,
+        channels,
         browse_rx: Arc::new(tokio::sync::Mutex::new(browse_incoming)),
         sync_rx: Arc::new(tokio::sync::Mutex::new(sync_incoming)),
         chunkmap_rx: Arc::new(tokio::sync::Mutex::new(chunkmap_answers)),
@@ -1019,6 +1291,264 @@ pub async fn accept(
     // which is honest: nothing here can prove the two name one machine.
     routes.record_link_rtt(&session.peer_device, qc.rtt());
     Ok(session)
+}
+
+#[cfg(test)]
+mod lane_tests {
+    //! The session's long-lived channels, over a real QUIC session pair.
+    //!
+    //! Real QUIC and not the in-memory transport on purpose: both properties
+    //! under test are about a peer that answers over a network round trip
+    //! rather than instantly, and an in-memory pair hides exactly that.
+
+    use super::*;
+    use futures::StreamExt;
+    use peerbeam_crypto::AeadCrypto;
+    use peerbeam_domain::entity::{Direction, TransferStatus};
+    use peerbeam_domain::id::TransferId;
+    use peerbeam_transfer_quic::direct_route;
+
+    fn security(name: &str) -> (Identity, Arc<dyn EncryptionProvider>, Arc<dyn TrustStore>) {
+        let enc = AeadCrypto::new();
+        let keypair = enc.generate_keypair();
+        let identity = Identity {
+            device_id: DeviceId::from(name),
+            name: name.to_string(),
+            keypair,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trust =
+            peerbeam_trust_fs::FsTrust::open(dir.path().join("trust.json")).expect("trust store");
+        // The temp dir must outlive the session; leaking in a test is fine.
+        std::mem::forget(dir);
+        (identity, Arc::new(enc), Arc::new(trust))
+    }
+
+    fn meta() -> TransferSession {
+        TransferSession {
+            id: TransferId::from("lanes"),
+            peer: DeviceId::from("peer"),
+            direction: Direction::Sending,
+            status: TransferStatus::Transferring,
+            files: Vec::new(),
+            total_bytes: 0,
+            transferred_bytes: 0,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            is_resume: false,
+            accepted: true,
+        }
+    }
+
+    /// A running session pair over loopback QUIC, yielding the dialling side's
+    /// handle. Both sides advertise this build's real capability set, and
+    /// neither registers a handler: these tests count channels, not answers, and
+    /// a frame with no handler is decoded and dropped exactly as one on a
+    /// capability the peer does not serve would be.
+    async fn dialling_handle() -> SessionHandle {
+        let (server_id, server_enc, server_trust) = security("pb-server");
+        let server_quic = QuicTransport::new().expect("server quic");
+        let (addr, mut incoming) = server_quic
+            .serve_channels_on("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("listen");
+
+        let accepted = tokio::spawn(async move {
+            let qc = incoming.next().await.expect("a connection").expect("qc");
+            let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+            let (ev, _ev) = unbounded_channel();
+            let (ch, _ch) = unbounded_channel();
+            let (inc, _inc) = unbounded_channel();
+            let mut ps = PeerSession::open(
+                transport,
+                SessionRole::Responder,
+                session_cfg(Vec::new()),
+                ev,
+                ch,
+                inc,
+                None,
+                server_id,
+                server_enc,
+                server_trust,
+            )
+            .await
+            .expect("responder session");
+            // The receivers are held for the pump's whole life: dropping them
+            // would make the manager treat a paired channel as unreceivable and
+            // refuse it, which is a different test.
+            let held = (_ev, _ch, _inc);
+            let _ = ps.run().await;
+            drop(held);
+        });
+
+        let (client_id, client_enc, client_trust) = security("pb-client");
+        let client_quic = QuicTransport::new().expect("client quic");
+        let qc = client_quic
+            .dial_channels(&direct_route("127.0.0.1", addr.port()), &meta())
+            .await
+            .expect("dial");
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let (ev, _ev) = unbounded_channel();
+        let (ch, _ch) = unbounded_channel();
+        let (inc, _inc) = unbounded_channel();
+        let mut ps = PeerSession::open(
+            transport,
+            SessionRole::Initiator,
+            session_cfg(Vec::new()),
+            ev,
+            ch,
+            inc,
+            None,
+            client_id,
+            client_enc,
+            client_trust,
+        )
+        .await
+        .expect("initiator session");
+        let handle = ps.handle();
+        tokio::spawn(async move {
+            let held = (_ev, _ch, _inc, accepted, client_quic, server_quic);
+            let _ = ps.run().await;
+            drop(held);
+        });
+        handle
+    }
+
+    fn listing_request(path: &str) -> peerbeam_browse::ListRequest {
+        peerbeam_browse::ListRequest::new(path)
+    }
+
+    /// **A long-lived session must keep asking.** Every request helper here
+    /// opened a channel and closed none, so past `DEFAULT_CHANNEL_LIMIT` (256)
+    /// requests the session's own `permit` refused to open another and folder
+    /// sync stopped fetching — silently, the failure arriving as the `None` a
+    /// peer that did not answer produces. A folder sync issues a chunk-map
+    /// request plus several chunk requests per file, so this is a few hundred
+    /// files, not a pathological peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_reuses_one_channel_so_a_long_session_never_hits_the_limit() {
+        let handle = dialling_handle().await;
+        let channels = Channels::new(handle.clone());
+
+        // Comfortably past the 256-channel limit a channel-per-request hits.
+        for i in 0..400 {
+            let req = listing_request("share");
+            channels
+                .send(Lane::BrowseAsk, |c| {
+                    req.to_frame(c).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|(_, e)| panic!("request {i} was not sent: {e}"));
+        }
+
+        let live = handle.channels().await.expect("channel snapshot");
+        assert_eq!(
+            live.len(),
+            1,
+            "400 requests opened {} channels: {live:?}",
+            live.len()
+        );
+        assert_eq!(live[0].channel_type, BROWSE);
+        // And all 400 really rode that one channel. Awaited rather than read
+        // once: `send_on_channel` resolves when the frame is queued on the
+        // channel actor, and the actor counts it after the write, so a single
+        // read races the tail of the queue rather than measuring anything.
+        wait_for_frames_sent(&handle, live[0].id, 401).await;
+    }
+
+    /// Wait, bounded, until `channel` has sent `want` frames — the requests plus
+    /// the one probe frame `open_channel` uses to materialise the stream.
+    async fn wait_for_frames_sent(handle: &SessionHandle, channel: ChannelId, want: u64) {
+        let deadline = std::time::Instant::now() + CHANNEL_OPEN_BUDGET;
+        loop {
+            let sent = handle
+                .channels()
+                .await
+                .expect("channel snapshot")
+                .iter()
+                .find(|c| c.id == channel)
+                .map_or(0, |c| c.stats.frames_sent);
+            if sent >= want {
+                assert_eq!(sent, want, "an unexpected extra frame went out");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {sent} of {want} frames went out"
+            );
+            tokio::time::sleep(CHANNEL_OPEN_POLL).await;
+        }
+    }
+
+    /// Lanes are separate channels, which is what keeps a lane's traffic from
+    /// queueing behind another's: a channel actor writes its frames serially, so
+    /// megabytes of chunk bytes sharing a channel with the chunk map that tells
+    /// the peer what to ask for next would hold that map up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lanes_of_the_same_capability_get_separate_channels() {
+        let handle = dialling_handle().await;
+        let channels = Channels::new(handle.clone());
+        let req = listing_request("share");
+        for lane in [Lane::BrowseAsk, Lane::BrowseAnswer] {
+            channels
+                .send(lane, |c| req.to_frame(c).map_err(|e| e.to_string()))
+                .await
+                .expect("sent");
+        }
+        let live = handle.channels().await.expect("channel snapshot");
+        assert_eq!(live.len(), 2, "two lanes shared one channel: {live:?}");
+    }
+
+    /// A lane whose channel dies must reopen rather than fail for ever. Without
+    /// it, one closed channel ends every later request on the lane — the same
+    /// silent stop the limit produced, reached from the other direction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_whose_channel_dies_reopens_on_the_next_send() {
+        let handle = dialling_handle().await;
+        let channels = Channels::new(handle.clone());
+        let req = listing_request("share");
+
+        channels
+            .send(Lane::BrowseAsk, |c| {
+                req.to_frame(c).map_err(|e| e.to_string())
+            })
+            .await
+            .expect("first request sent");
+        let first = handle.channels().await.expect("snapshot");
+        assert_eq!(first.len(), 1);
+        let dead = first[0].id;
+
+        // Close it out from under the lane, exactly as a peer hanging up would.
+        handle.close_channel(dead);
+        let deadline = std::time::Instant::now() + CHANNEL_OPEN_BUDGET;
+        while handle
+            .channels()
+            .await
+            .expect("snapshot")
+            .iter()
+            .any(|c| c.id == dead)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel never closed"
+            );
+            tokio::time::sleep(CHANNEL_OPEN_POLL).await;
+        }
+
+        channels
+            .send(Lane::BrowseAsk, |c| {
+                req.to_frame(c).map_err(|e| e.to_string())
+            })
+            .await
+            .expect("the lane reopened and the request went out");
+        let live = handle.channels().await.expect("snapshot");
+        assert_eq!(
+            live.len(),
+            1,
+            "the lane holds exactly one channel: {live:?}"
+        );
+        assert_ne!(live[0].id, dead, "and it is a new one");
+    }
 }
 
 #[cfg(test)]

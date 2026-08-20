@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/state/models.dart' show formatBytes;
 import 'package:peerbeam/state/staging.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
@@ -55,12 +56,18 @@ Future<AppState> _open(WidgetTester tester, FakePeerBeam fake) async {
   return state;
 }
 
+/// The default attachment size. Named so the row assertion can state it
+/// through `formatBytes` rather than pinning a rendering: what matters is that
+/// a file row shows *its* size, not which unit convention the app happens to
+/// print it in.
+const _fixtureSize = 4096;
+
 ChatMessage _file({
   required String id,
   required String direction,
   required String status,
   String name = 'report.pdf',
-  int size = 4096,
+  int size = _fixtureSize,
   String? localPath,
 }) => ChatMessage(
   id: id,
@@ -255,7 +262,7 @@ void main() {
     await _open(tester, fake);
 
     expect(find.text('report.pdf'), findsOneWidget);
-    expect(find.textContaining('4.0 KB'), findsOneWidget);
+    expect(find.textContaining(formatBytes(_fixtureSize)), findsOneWidget);
     expect(find.textContaining('Sent'), findsWidgets);
   });
 

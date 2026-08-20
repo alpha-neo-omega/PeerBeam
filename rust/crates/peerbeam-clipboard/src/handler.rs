@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 
 use peerbeam_domain::id::DeviceId;
+use peerbeam_domain::port::TrustStore;
 use peerbeam_domain::session::{ChannelType, MessageHandler, SessionError, SessionFrame};
 
 use crate::message::{Clip, MSG_CLIP};
@@ -32,17 +33,36 @@ pub type ClipboardSink = Arc<dyn Fn(DeviceId, Clip) + Send + Sync>;
 pub struct ClipboardHandler {
     peer: Arc<OnceLock<DeviceId>>,
     sink: ClipboardSink,
+    /// Asked before every inbound clip is applied.
+    ///
+    /// # Why this is here at all
+    ///
+    /// Inbound clipboard used to be applied with **no trust check of any kind**
+    /// — not `is_approved`, not `may(_, Permission::Clipboard)`. The module docs
+    /// justified it as what "trusted peers" send, but nothing on the path asked
+    /// whether the peer was trusted, and the TOFU handshake pins *every*
+    /// stranger that completes it (with `approved: false`). So anyone who could
+    /// reach the port could write to the user's clipboard, and the permission
+    /// the UI offers to revoke governed only the outbound direction.
+    ///
+    /// I6 names live clipboard as a capability requiring explicit, revocable
+    /// consent. A gate that exists only on the way out is not that.
+    trust: Arc<dyn TrustStore>,
 }
 
 impl ClipboardHandler {
     /// Build a handler + the peer slot the caller must `set` after the
     /// handshake (before the session run loop dispatches any frame).
     #[must_use]
-    pub fn new(sink: ClipboardSink) -> (Arc<ClipboardHandler>, Arc<OnceLock<DeviceId>>) {
+    pub fn new(
+        sink: ClipboardSink,
+        trust: Arc<dyn TrustStore>,
+    ) -> (Arc<ClipboardHandler>, Arc<OnceLock<DeviceId>>) {
         let peer = Arc::new(OnceLock::new());
         let handler = Arc::new(ClipboardHandler {
             peer: peer.clone(),
             sink,
+            trust,
         });
         (handler, peer)
     }
@@ -70,6 +90,23 @@ impl MessageHandler for ClipboardHandler {
                 // is refused, so nothing past this line is peer-controlled
                 // beyond its documented domain: bounded UTF-8 text.
                 let clip = Clip::from_frame(&frame)?;
+                // **Gated on the way in, not only on the way out.** The same
+                // predicate the outbound path and the app's toggle use, so a
+                // user who revokes Clipboard for a device stops receiving from
+                // it as well as sending to it — which is what revoking it
+                // reads as.
+                //
+                // Dropped rather than failing the channel: a peer that is not
+                // permitted to change our clipboard is not a protocol error,
+                // and tearing the session down would take chat and transfers
+                // with it. Logged so the silence is explicable.
+                if !crate::gate::may_apply_clip(self.trust.as_ref(), peer) {
+                    tracing::warn!(
+                        peer = %peer.0,
+                        "clipboard from a device without the Clipboard permission — ignored"
+                    );
+                    return Ok(());
+                }
                 (self.sink)(peer.clone(), clip);
                 Ok(())
             }
@@ -98,13 +135,51 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<(DeviceId, Clip)>>>;
 
+    /// A trust store answering `approved` with the Clipboard permission, or
+    /// refusing outright — the two states the inbound gate turns on.
+    struct GateTrust {
+        allow: bool,
+    }
+
+    impl TrustStore for GateTrust {
+        fn record(&self, _r: peerbeam_domain::entity::TrustRecord) -> peerbeam_domain::Result<()> {
+            Ok(())
+        }
+        fn lookup(
+            &self,
+            device: &DeviceId,
+        ) -> peerbeam_domain::Result<Option<peerbeam_domain::entity::TrustRecord>> {
+            Ok(Some(peerbeam_domain::entity::TrustRecord {
+                device: device.clone(),
+                fingerprint: "ff".into(),
+                name: "Peer".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: self.allow,
+                permissions: if self.allow {
+                    peerbeam_domain::entity::PermissionSet::granted_on_approval()
+                } else {
+                    peerbeam_domain::entity::PermissionSet::none()
+                },
+                expires_at: None,
+                mine: false,
+            }))
+        }
+        fn is_trusted(&self, _d: &DeviceId) -> bool {
+            true
+        }
+    }
+
     fn new_handler() -> (Arc<ClipboardHandler>, Arc<OnceLock<DeviceId>>, Seen) {
+        new_handler_with(true)
+    }
+
+    fn new_handler_with(allow: bool) -> (Arc<ClipboardHandler>, Arc<OnceLock<DeviceId>>, Seen) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let seen_cl = seen.clone();
         let sink: ClipboardSink = Arc::new(move |id, clip| {
             seen_cl.lock().unwrap().push((id, clip));
         });
-        let (handler, slot) = ClipboardHandler::new(sink);
+        let (handler, slot) = ClipboardHandler::new(sink, Arc::new(GateTrust { allow }));
         (handler, slot, seen)
     }
 
@@ -235,5 +310,38 @@ mod tests {
     fn the_handler_serves_the_clipboard_channel() {
         let (handler, _slot, _seen) = new_handler();
         assert_eq!(handler.channel_type(), ChannelType::CLIPBOARD);
+    }
+
+    /// **The hole this closes.** Inbound clips were applied with no trust check
+    /// of any kind, and the TOFU handshake pins every stranger that completes
+    /// it with `approved: false`. So anyone who could reach the port could
+    /// change the user's clipboard, while the Clipboard permission the UI
+    /// offers to revoke governed only the outbound direction.
+    #[tokio::test]
+    async fn an_unapproved_peer_cannot_change_our_clipboard() {
+        let (handler, slot, seen) = new_handler_with(false);
+        slot.set(DeviceId::from("pb-bob")).unwrap();
+
+        // Accepted at the protocol level — this is not a malformed frame — and
+        // then dropped.
+        handler
+            .handle(frame_of("stolen"))
+            .await
+            .expect("a refused clip is not a channel error");
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a clip from a device without the Clipboard permission was applied"
+        );
+    }
+
+    /// And an approved peer that holds the permission still works, so the gate
+    /// is a gate rather than a wall.
+    #[tokio::test]
+    async fn an_approved_peer_still_sets_the_clipboard() {
+        let (handler, slot, seen) = new_handler_with(true);
+        slot.set(DeviceId::from("pb-bob")).unwrap();
+        handler.handle(frame_of("hello")).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
