@@ -345,6 +345,13 @@ class FakePeerBeam implements PeerBeamApi {
   /// to make.
   final List<PeerTarget> chatSendTargets = [];
 
+  /// When true, [chatSend] throws instead of enqueueing — the engine's own
+  /// behaviour for a message it refuses (an over-long body, an engine that
+  /// never started), where nothing is persisted and no drain will ever carry
+  /// it. Deliberately not the same as an unreachable peer, which enqueues
+  /// successfully and is retried.
+  bool failChatSend = false;
+
   @override
   Future<String> chatSend(
     PeerTarget peer,
@@ -354,6 +361,12 @@ class FakePeerBeam implements PeerBeamApi {
     calls.add(
       inReplyTo == null ? 'chatSend:$text' : 'chatSend:$text:reply=$inReplyTo',
     );
+    if (failChatSend) {
+      throw InvalidArgumentException('message is too long');
+    }
+    // A non-`PeerBeamException` throw (a malformed reply, a dead bridge) —
+    // the other half of what a caller has to survive.
+    _maybeFail('chatSend');
     chatSendTargets.add(peer);
     final id = 'chat-${++_chatSeq}';
     // Mirrors the real engine's `device_from`: key by the peer's real id when
@@ -838,6 +851,11 @@ class FakePeerBeam implements PeerBeamApi {
     truncated: false,
   );
 
+  /// When set, [syncFolder] throws it instead of answering. A sync reaches
+  /// across the network to a peer that may be asleep, so failing is ordinary
+  /// here — and what the screen then *says* is the thing worth testing.
+  Object? syncError;
+
   @override
   Future<SyncResult> syncFolder(
     PeerTarget peer,
@@ -845,6 +863,8 @@ class FakePeerBeam implements PeerBeamApi {
     String into,
   ) async {
     calls.add('syncFolder:${peer.id}:$path:$into');
+    final e = syncError;
+    if (e != null) throw e;
     return syncResult;
   }
 

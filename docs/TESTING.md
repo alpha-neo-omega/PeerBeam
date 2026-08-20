@@ -23,7 +23,7 @@ cd flutter && flutter test
 |---|---|---|
 | **Unit** | `peerbeam-cli` `commands::config_key_tests`; `peerbeam-domain` `entity::device` | dotted-key `navigate`/`set_path`/`parse_value`; `Device::same_identity` field-by-field |
 | **Integration** | `peerbeam-config/tests/config.rs`; `peerbeam-cli/tests/config_cli.rs` | config save/load round-trip, defaults, malformed/missing/unknown fields; CLI `config get/set/show/path` end-to-end through the compiled binary, incl. exit codes |
-| **Cross-platform** | `peerbeam-storage-fs` (0600 perms, `#[cfg(unix)]`); `peerbeam-transfer/tests/regression.rs` | owner-only permissions on finalized files; filename sanitization / traversal rejection independent of OS |
+| **Cross-platform** | `peerbeam-storage-fs` (0600 perms, `#[cfg(unix)]`); `peerbeam-transfer/tests/regression.rs`; `peerbeam-transfer` `stream::tests` | owner-only permissions on finalized files; filename sanitization / traversal rejection independent of OS; the Windows name rules (reserved devices, `< > : " \| ? *`, trailing dots/spaces) asserted on *every* platform — `safe_component` uses `cfg!`, not `#[cfg]`, so a Linux run still catches a break in the Windows-only path |
 | **Stress** | `peerbeam-transfer/tests/stress.rs` | 16 concurrent transfers, each distinct payload, all verify with no cross-talk |
 | **Resume** | `peerbeam-transfer/tests/resume.rs`; `tests/recovery.rs`; `tests/folder.rs` | partial `.part` continued not restarted; already-complete `.part`; reconnect-and-resume; per-file folder resume |
 | **Large file** | `peerbeam-transfer/tests/largefile.rs` | 128 MiB streamed through a generator→sink storage holding no full copy (constant memory); `#[ignore]`d 5 GiB proves 64-bit sizing |

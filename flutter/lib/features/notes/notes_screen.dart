@@ -243,6 +243,13 @@ class _NoteEditorState extends State<_NoteEditor> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
+      // Scrollable, because this dialog is two text fields and a phone keyboard
+      // takes half the screen. `AlertDialog` shrinks to the space the keyboard
+      // leaves and hands what is left to `content`; an unscrolled Column in
+      // there simply overflowed, and the field being typed into was the part
+      // that went missing. The keyboard is up whenever this dialog is useful,
+      // so this is the ordinary case and not an edge one.
+      scrollable: true,
       title: Text(widget.note == null ? 'New note' : 'Edit note'),
       content: SizedBox(
         width: 420,

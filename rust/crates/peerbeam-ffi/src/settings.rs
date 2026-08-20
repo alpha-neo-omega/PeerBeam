@@ -93,30 +93,33 @@ fn defaults() -> Value {
 /// Only an actually-persisted document applies — a missing settings file must
 /// never override the caller's explicit config with defaults. First run seeds
 /// the document from the effective config so `get` reflects reality.
+///
+/// A document that exists but cannot be read is a third case, not the second:
+/// the caller's config still stands, the reason is logged, and the file is kept
+/// (see [`preserve_unreadable`]) rather than written over.
 pub fn overlay(config: &mut EngineConfig) {
-    let Some(s) = load_persisted() else {
-        let mut seeded = defaults();
-        if let Value::Object(m) = &mut seeded {
-            m.insert("device_name".into(), json!(config.device.name));
-            m.insert(
-                "transfer_directory".into(),
-                json!(config.storage.save_directory),
-            );
-            m.insert(
-                "shared_directories".into(),
-                json!(config.device.shared_directories),
-            );
-            m.insert(
-                "max_send_bytes_per_sec".into(),
-                json!(config.transfer.max_send_bytes_per_sec),
-            );
-            m.insert(
-                "auto_accept".into(),
-                json!(config.device.auto_accept_trusted),
-            );
+    let s = match read_stored() {
+        Stored::Doc(s) => s,
+        Stored::Missing => {
+            seed(config);
+            return;
         }
-        let _ = save(&seeded);
-        return;
+        // **Not the same as no file.** A document with one bad byte used to
+        // arrive here as `None`, indistinguishable from a first run — and this
+        // function's answer to a first run is to write defaults, so a settings
+        // file a person had hand-edited was replaced, silently, by a launch
+        // that said nothing. The reason is now named out loud (this crate's
+        // `tracing` lines reach the surface's own log stream and the log file),
+        // and the seeding write below moves the old file aside instead of
+        // landing on top of it — see `preserve_unreadable`.
+        Stored::Unreadable(why) => {
+            tracing::warn!(
+                error = %why,
+                "the persisted settings could not be read; keeping the file aside and starting from defaults"
+            );
+            seed(config);
+            return;
+        }
     };
     if let Some(name) = s.get("device_name").and_then(|v| v.as_str()) {
         if !name.trim().is_empty() {
@@ -172,14 +175,123 @@ fn path() -> Option<PathBuf> {
 }
 
 fn load() -> Value {
-    load_persisted().unwrap_or_else(defaults)
+    match read_stored() {
+        Stored::Doc(v) => v,
+        Stored::Missing | Stored::Unreadable(_) => defaults(),
+    }
 }
 
-/// The persisted document only — None when no settings file exists yet (or it
-/// is unreadable). Callers that must not fall back to defaults use this.
-fn load_persisted() -> Option<Value> {
-    let bytes = path().and_then(|p| std::fs::read(p).ok())?;
-    serde_json::from_slice(&bytes).ok()
+/// What is actually on disk where the settings document should be.
+///
+/// The three cases are kept apart because two of them used to collapse into
+/// one: `load_persisted` was `fs::read(p).ok()? -> from_slice(..).ok()`, which
+/// answers `None` both for "this device has never had settings" and for "this
+/// document exists and I cannot read it". Only the first of those is an
+/// invitation to write defaults over the path.
+enum Stored {
+    /// No settings file yet — or no data directory configured at all. First run.
+    Missing,
+    /// The file is there and this build cannot turn it into settings: a parse
+    /// error, or an IO failure that is not "not found". Carries the reason so
+    /// something can say it out loud.
+    Unreadable(String),
+    /// A document that parsed.
+    Doc(Value),
+}
+
+fn read_stored() -> Stored {
+    match path() {
+        Some(p) => read_at(&p),
+        None => Stored::Missing,
+    }
+}
+
+/// [`read_stored`] against an explicit path — the whole classification, with no
+/// global state, so it can be tested for exactly the distinction it exists to
+/// make.
+fn read_at(p: &std::path::Path) -> Stored {
+    let bytes = match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stored::Missing,
+        Err(e) => return Stored::Unreadable(e.to_string()),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Stored::Doc(v),
+        Err(e) => Stored::Unreadable(e.to_string()),
+    }
+}
+
+/// Write the document a first run starts from: defaults, with the keys the
+/// caller's own config already decided stamped over them, so `get` reflects
+/// reality rather than what the defaults happen to say.
+///
+/// Best-effort by design (an unwritable data directory is not a reason to fail
+/// `init`), and shared by the missing and unreadable paths so the two cannot
+/// drift apart.
+fn seed(config: &EngineConfig) {
+    let mut seeded = defaults();
+    if let Value::Object(m) = &mut seeded {
+        m.insert("device_name".into(), json!(config.device.name));
+        m.insert(
+            "transfer_directory".into(),
+            json!(config.storage.save_directory),
+        );
+        m.insert(
+            "shared_directories".into(),
+            json!(config.device.shared_directories),
+        );
+        m.insert(
+            "max_send_bytes_per_sec".into(),
+            json!(config.transfer.max_send_bytes_per_sec),
+        );
+        m.insert(
+            "auto_accept".into(),
+            json!(config.device.auto_accept_trusted),
+        );
+    }
+    if let Err((_, e)) = save(&seeded) {
+        tracing::warn!(error = %e, "could not write the initial settings document");
+    }
+}
+
+/// Where an unreadable document is kept. Timestamped rather than a fixed
+/// `.corrupt` name: a second bad document must not silently delete the first
+/// one, which is the entire failure being fixed.
+fn quarantine_path(p: &std::path::Path, stamp: &str) -> PathBuf {
+    let mut name = p.as_os_str().to_owned();
+    name.push(format!(".corrupt-{stamp}"));
+    PathBuf::from(name)
+}
+
+/// Move a document this build cannot read out of the way, so the write that
+/// follows cannot destroy it.
+///
+/// Every write goes through [`save`], so this is the single place that has to
+/// hold — including `reset`, which is an explicit request for defaults but not
+/// an informed decision to throw away a file nobody could show the user.
+/// A no-op for the ordinary case (a document that parses) and for a first run.
+///
+/// A rename that fails **refuses the write**: the whole point is that these
+/// bytes survive, and overwriting them because the backup failed would be the
+/// original bug with an extra step.
+fn preserve_unreadable(p: &std::path::Path) -> Result<(), (Code, String)> {
+    let Stored::Unreadable(why) = read_at(p) else {
+        return Ok(());
+    };
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let kept = quarantine_path(p, &stamp);
+    std::fs::rename(p, &kept).map_err(|e| {
+        (
+            Code::Storage,
+            format!("refusing to overwrite unreadable settings: {e}"),
+        )
+    })?;
+    tracing::warn!(
+        error = %why,
+        kept_at = %kept.display(),
+        "the settings file could not be read; it has been kept aside and defaults written in its place"
+    );
+    Ok(())
 }
 
 fn save(value: &Value) -> Result<(), (Code, String)> {
@@ -188,6 +300,9 @@ fn save(value: &Value) -> Result<(), (Code, String)> {
         std::fs::create_dir_all(parent)
             .map_err(|e| (Code::Storage, format!("settings dir: {e}")))?;
     }
+    // Before the write, never after: what is on disk right now may be the only
+    // copy of something this build cannot read.
+    preserve_unreadable(&p)?;
     let json = serde_json::to_vec_pretty(value).expect("settings serializable");
     std::fs::write(&p, json).map_err(|e| (Code::Storage, format!("write settings: {e}")))
 }
@@ -258,4 +373,115 @@ fn emit_changed(settings: &Value) {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "payload": { "settings": settings },
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The settings path is a process-wide static, so every test here drives
+    /// the same one — `#[serial_test::serial]`, the same convention the
+    /// init/shutdown tests in this crate use.
+    fn point_at(dir: &std::path::Path) -> PathBuf {
+        configure(&dir.to_string_lossy());
+        path().expect("configured")
+    }
+
+    const BROKEN: &[u8] = b"{ \"device_name\": \"MyLaptop\", \"theme\": ";
+
+    /// The distinction the old reader could not make: a parse error and no file
+    /// at all were both `None`, and only one of them means "write defaults
+    /// here".
+    #[test]
+    #[serial_test::serial]
+    fn a_parse_error_is_not_the_same_answer_as_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nothing-here.json");
+        let broken = dir.path().join("broken.json");
+        let good = dir.path().join("good.json");
+        std::fs::write(&broken, BROKEN).unwrap();
+        std::fs::write(&good, br#"{"device_name":"MyLaptop"}"#).unwrap();
+
+        assert!(matches!(read_at(&missing), Stored::Missing));
+        assert!(matches!(read_at(&broken), Stored::Unreadable(_)));
+        assert!(matches!(read_at(&good), Stored::Doc(_)));
+    }
+
+    /// **The data loss.** A settings document this build cannot parse used to
+    /// be replaced by defaults on the very next launch, with nothing logged and
+    /// no copy kept — a file the user may have hand-edited, and which a later
+    /// build might well have read, gone for good.
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_settings_document_is_kept_rather_than_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = point_at(dir.path());
+        std::fs::write(&p, BROKEN).unwrap();
+
+        let mut config = EngineConfig::default();
+        config.device.name = "Chosen By The Caller".into();
+        overlay(&mut config);
+
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|q| {
+                q.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".corrupt-"))
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "the unreadable document must still exist");
+        assert_eq!(
+            std::fs::read(&kept[0]).unwrap(),
+            BROKEN,
+            "kept byte for byte — a later build, or the user, may still read it"
+        );
+        assert!(
+            matches!(read_at(&p), Stored::Doc(_)),
+            "and the live document is usable again"
+        );
+        assert_eq!(
+            config.device.name, "Chosen By The Caller",
+            "an unreadable document must not overrule the config it could not be read against"
+        );
+    }
+
+    /// The same protection on the `set` path, which is the other way the
+    /// document gets written: every write goes through `save`, so a settings
+    /// change made while a corrupt file is on disk must not be what destroys
+    /// it.
+    #[test]
+    #[serial_test::serial]
+    fn a_settings_change_preserves_a_document_it_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = point_at(dir.path());
+        std::fs::write(&p, BROKEN).unwrap();
+
+        set(&json!({ "theme": "dark" })).expect("a change must still be possible");
+
+        let kept = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .expect("the unreadable document must still exist");
+        assert_eq!(std::fs::read(kept.path()).unwrap(), BROKEN);
+        assert_eq!(load()["theme"], json!("dark"), "and the change took effect");
+    }
+
+    /// A second bad document must not delete the first one's copy — the
+    /// quarantine name carries when it happened.
+    #[test]
+    fn quarantine_names_are_per_incident() {
+        let p = std::path::Path::new("/data/ffi_settings.json");
+        assert_eq!(
+            quarantine_path(p, "20260819T101500Z"),
+            PathBuf::from("/data/ffi_settings.json.corrupt-20260819T101500Z")
+        );
+        assert_ne!(
+            quarantine_path(p, "20260819T101500Z"),
+            quarantine_path(p, "20260820T090000Z")
+        );
+    }
 }

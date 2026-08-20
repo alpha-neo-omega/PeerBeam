@@ -146,6 +146,49 @@ downloads do not contain it; it ships in the next release.
   paths had the mirror-image bug and now use the platform separator.
 - Three URLs named a repository that is not this one; two of them routed security
   advisories there.
+- **"No devices found" could mean the engine never started.** Every
+  discovery-backed command — `list`, `discover`, `send --to`, `chat send`,
+  `pipe --from`, `pair`, `notes sync`, `browse`, `sync` — folded a failure to
+  *start* discovery (an unreadable `identity.json`, a discovery port already
+  held) into an empty device list, which reads as a statement about your
+  network. They now fail with the reason. The three best-effort paths (a
+  reaction, a read receipt, resolving a name for local history) print it on
+  stderr and carry on, since their work has already succeeded locally.
+- **`doctor` had nothing to say about the file most likely to be wrong.** A
+  `config.json` it could not parse silently became the defaults, so every check
+  below it answered for a config you do not have. There is now a `Config` row:
+  it names the parse error and fails the run, and says plainly when there is no
+  config file yet (which is not a fault).
+- **Renaming this device could kill discovery silently.** A rename restarts
+  discovery so peers see the new name; when the restart failed, discovery stayed
+  down, the flag tracking it still said "running", and nothing was logged — an
+  empty device list for the rest of the session with no reason anywhere to find.
+  The failure is now logged (Settings → Logs, and the log file) and the flag
+  tells the truth.
+- **A settings file with one bad byte was replaced by defaults.** A parse error
+  and a missing file were the same answer, so a document you may have
+  hand-edited was overwritten on the next launch with nothing said. An
+  unreadable settings document is now kept next to its own path as
+  `ffi_settings.json.corrupt-<when>` and the reason is logged; no write goes
+  over it, Reset included.
+- **A folder receive could report success for files that never reached the
+  disk.** Each file's `flush` and `close` were discarded, so a disk that filled
+  up mid-folder still finished with "received folder X (N files)" — and a sender
+  free to delete its copy. Single-file receives have always propagated both;
+  folder receives now do too. A cancelled folder still ends as cancelled, with
+  the failure logged rather than renamed.
+- **A chat file that arrived could stay "waiting" forever.** The three writes
+  that settle a conversation row after a receive were discarded, so a store that
+  could not write left the row offering Accept for a transfer that had already
+  finished. The failure is now reported and the row left in flight, where the
+  next start settles it — rather than settled under the name the sender merely
+  claimed.
+- **A chat message the app could not send disappeared.** It stayed on screen as
+  "waiting" and was then erased by the next refresh, so the last thing you saw
+  was a message that looked like it had gone. A refused message is now marked
+  failed in place with the engine's own reason and stays until you dismiss it —
+  the same treatment a refused file already got. An unreachable peer is still
+  not a failure: that message is queued and retried.
 
 ## [0.9.0] - 2026-08-19
 

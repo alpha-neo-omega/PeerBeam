@@ -3539,11 +3539,22 @@ impl Manager {
         // fetched too — under its conflict name — because keeping both copies
         // means actually having both.
         let device = device_from(req.get("peer"))?;
-        let wanted: Vec<String> = actions
+        // **The remote name and the local name are two different things, and a
+        // conflict is the case where they differ.**
+        //
+        // This used to collapse `Conflict { path, keep_as }` to `path` and pass
+        // that one string as both, so the peer's version was written straight
+        // over the user's file — while the surface reported that both copies
+        // had been kept, naming a `.sync-conflict-` file that was never
+        // created. The user's edit was gone and nothing said so. The CLI has
+        // always carried the pair (`browse.rs`); this is the same shape.
+        let wanted: Vec<(String, String)> = actions
             .iter()
             .filter_map(|a| match a {
-                peerbeam_sync::Action::Fetch { path } => Some(path.clone()),
-                peerbeam_sync::Action::Conflict { path, .. } => Some(path.clone()),
+                peerbeam_sync::Action::Fetch { path } => Some((path.clone(), path.clone())),
+                peerbeam_sync::Action::Conflict { path, keep_as } => {
+                    Some((path.clone(), keep_as.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -3689,23 +3700,40 @@ impl Manager {
         device: Device,
         folder: String,
         into: std::path::PathBuf,
-        wanted: Vec<String>,
+        // `(remote path, where to write it)`. The two differ for a conflict:
+        // the peer's copy lands beside the user's under its conflict name,
+        // never on top of it.
+        wanted: Vec<(String, String)>,
     ) {
         let Some(session) = self.sync_session(&device).await else {
             return;
         };
         let index = self.sync_index();
-        for rel in wanted {
+        for (rel, write_to) in wanted {
             let remote = format!("{folder}/{rel}");
             // Delta first; the whole file only when it cannot be used. Every
             // reason to give up — no chunk map, a chunk that never arrived,
             // bytes that did not verify — is a reason to send the file the slow
             // way, never a reason to stop the sync.
-            if fetch_by_delta(&session, &index, &folder, &into, &remote, &rel)
+            if fetch_by_delta(&session, &index, &folder, &into, &remote, &write_to)
                 .await
                 .is_none()
             {
-                crate::session_exec::request_file(&session, &remote).await;
+                // The whole-file path writes under the name the *sender*
+                // states, so a conflict cannot use it: it would land on the
+                // user's file again. Skipping loses the peer's copy of a
+                // conflicting file, which is recoverable by syncing again;
+                // overwriting is not.
+                if write_to == rel {
+                    crate::session_exec::request_file(&session, &remote).await;
+                } else {
+                    tracing::warn!(
+                        path = %rel,
+                        keep_as = %write_to,
+                        "conflict copy not fetched: delta failed and a whole-file \
+                         request would overwrite the local file"
+                    );
+                }
             }
         }
     }

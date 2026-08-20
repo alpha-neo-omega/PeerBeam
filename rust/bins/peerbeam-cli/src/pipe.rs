@@ -100,7 +100,7 @@ async fn send(ctx: &Ctx, args: PipeArgs, path_override: Option<&str>) -> CliResu
             target_device(addr.clone(), sa.ip().to_string(), sa.port())
         }
         (None, Some(_)) => {
-            let devices = snapshot(config.clone(), 2).await;
+            let devices = snapshot(config.clone(), 2).await?;
             let candidates: Vec<(String, String)> = devices
                 .iter()
                 .map(|m| (m.device.id.to_string(), m.device.name.clone()))
@@ -316,7 +316,7 @@ async fn resolve_from(
     if query.starts_with("pb-") {
         return Ok(Some(DeviceId::from(query.to_string())));
     }
-    let devices = snapshot(config.clone(), 2).await;
+    let devices = snapshot(config.clone(), 2).await?;
     let candidates: Vec<(String, String)> = devices
         .iter()
         .map(|m| (m.device.id.to_string(), m.device.name.clone()))

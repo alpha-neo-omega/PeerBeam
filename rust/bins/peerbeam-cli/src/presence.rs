@@ -79,7 +79,7 @@ pub async fn ring(
 
     let config = crate::commands::load_config(path_override)?;
     let sc = crate::commands::SecureCtx::build(&config)?;
-    let devices = crate::commands::snapshot(config.clone(), 2).await;
+    let devices = crate::commands::snapshot(config.clone(), 2).await?;
     let candidates: Vec<(String, String)> = devices
         .iter()
         .map(|m| (m.device.id.to_string(), m.device.name.clone()))

@@ -2,6 +2,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../sdk/error_text.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
@@ -69,7 +70,12 @@ class _BrowseScreenState extends State<BrowseScreen> {
         }
       }
     } catch (e) {
-      message = 'Sync failed: $e';
+      // Through `friendlyError`, like every other failure this app shows. The
+      // raw `$e` here was an engine/FFI exception string — the one thing the
+      // SDK's error layer exists to keep off screen, and useless to the person
+      // reading it: "a folder that cannot be reached" is actionable, a Dart
+      // exception's toString is not.
+      message = 'Sync failed — ${friendlyError(e)}';
     }
     if (!mounted) return;
     setState(() => _syncing = false);

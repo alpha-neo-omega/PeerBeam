@@ -62,9 +62,13 @@ Working now:
 
 - `config show|get <key>|set <key> <val>|path` — reads/writes `EngineConfig`
   JSON; dotted keys (`transfer.chunk_size`).
-- `doctor [--json]` — environment checks (config/save dirs writable, UDP
-  bindable, mDNS daemon, Tailscale CLI, crypto) with ✓/!/✗; non-zero exit if
-  any fail.
+- `doctor [--json]` — environment checks (the config file itself, config/save
+  dirs writable, UDP bindable, identity, mDNS daemon, Tailscale CLI, crypto)
+  with ✓/!/✗; non-zero exit if any fail. The `Config` row is the first one: a
+  `config.json` that cannot be parsed fails the run and names the parse error,
+  rather than being quietly replaced by the defaults every check below it would
+  then answer for. A config file that does not exist yet is reported as such and
+  passes — the defaults are the documented behaviour for a fresh install.
 - `space list|create|rename|delete|add|remove|send` — named local sets of trusted
   devices. `space send <SPACE> <PATH…>` is **N ordinary sends**, one per member,
   each through the same permission gate a hand-typed send passes. Nothing about a

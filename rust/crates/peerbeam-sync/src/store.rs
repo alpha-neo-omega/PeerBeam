@@ -38,7 +38,7 @@ impl ChunkStore {
     }
 
     fn namespace(folder: &str) -> String {
-        format!("{NS}-{folder}")
+        format!("{NS}-{}", namespace_slug(folder))
     }
 
     /// Record how a file's content splits into chunks.
@@ -121,6 +121,42 @@ fn read_range(path: &Path, offset: u64, len: u32) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     f.read_exact(&mut buf).ok()?;
     Some(buf)
+}
+
+/// A folder path reduced to something an [`AppStore`] namespace accepts.
+///
+/// # Why this exists
+///
+/// `FsAppStore::namespace_dir` allows only `[A-Za-z0-9._-]`, and the folder name
+/// was being interpolated raw. So folder sync failed outright — before a byte
+/// moved, with an internal "invalid namespace" error — for a share called
+/// `My Photos`, for anything with an accent or an `&`, and for **every nested
+/// path**, which is the only thing the Browse screen's Sync button can produce
+/// below the top level. The most ordinary case was broken.
+///
+/// Percent-encoding rather than a hash: two different folders must not collide,
+/// and a person reading the store directory should still be able to tell which
+/// folder a namespace belongs to. `%` is escaped first so the encoding is
+/// reversible — the same rule `key` already follows for record keys.
+fn namespace_slug(folder: &str) -> String {
+    let mut out = String::with_capacity(folder.len());
+    for b in folder.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+            out.push(c);
+        } else if c == '_' {
+            // Doubled, so a literal underscore can never be read as the start
+            // of an escape. My first attempt used `%XX` — which the store
+            // rejects just as surely as a space, since `%` is not in its
+            // allowed set either. The escape character has to come from inside
+            // the permitted alphabet.
+            out.push_str("__");
+        } else {
+            out.push('_');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

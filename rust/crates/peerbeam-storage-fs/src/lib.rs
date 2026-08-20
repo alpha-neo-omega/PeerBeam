@@ -86,21 +86,26 @@ impl StorageProvider for FsStorage {
         // same candidate — see `unique_path`'s doc comment.
         let final_path = unique_path(dest).await?;
 
-        // Restrict permissions on the completed file before it becomes visible.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600))
-                .await
-                .map_err(|e| DomainError::Storage(format!("set perms {temp}: {e}")))?;
+        match promote(temp, &final_path).await {
+            Ok(()) => Ok(final_path),
+            Err(e) => {
+                // Give the reserved name back. A placeholder left behind is an
+                // empty file sitting at exactly the name a completed transfer
+                // would have — the user sees a 0-byte file for a transfer that
+                // failed — and it also makes the *next* attempt reserve
+                // `name (1)`, so a retry can never land on the name it was
+                // meant to have. Best-effort: `e` is the failure the caller
+                // has to see, so a failed cleanup only warns.
+                if let Err(rm) = tokio::fs::remove_file(&final_path).await {
+                    tracing::warn!(
+                        path = %final_path,
+                        error = %rm,
+                        "failed to release the reserved name after a failed finalize"
+                    );
+                }
+                Err(e)
+            }
         }
-
-        // Replaces the (empty) placeholder we just reserved — this is the
-        // only rename onto `final_path`, so it can't race another finalize.
-        tokio::fs::rename(temp, &final_path)
-            .await
-            .map_err(|e| DomainError::Storage(format!("finalize {temp} -> {final_path}: {e}")))?;
-        Ok(final_path)
     }
 
     async fn list_files(&self, root: &str) -> Result<Vec<(String, u64)>> {
@@ -207,6 +212,29 @@ impl StorageProvider for FsStorage {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+}
+
+/// Move `temp` onto the already-reserved `final_path`, tightening permissions
+/// first so the completed file is never briefly group/world-readable under the
+/// name the user will open.
+///
+/// Split out of [`FsStorage::finalize`] so that every failure between reserving
+/// a name and owning the file funnels through one place — the caller's
+/// placeholder cleanup — instead of each `?` leaking the reservation.
+async fn promote(temp: &str, final_path: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| DomainError::Storage(format!("set perms {temp}: {e}")))?;
+    }
+
+    // Replaces the (empty) placeholder the caller reserved — this is the only
+    // rename onto `final_path`, so it can't race another finalize.
+    tokio::fs::rename(temp, final_path)
+        .await
+        .map_err(|e| DomainError::Storage(format!("finalize {temp} -> {final_path}: {e}")))
 }
 
 /// Try to atomically claim `path` by creating it as a new, empty file.
@@ -438,6 +466,46 @@ mod tests {
             contents.contains(b"payload-two".as_slice()),
             "second payload survived"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finalize that fails after reserving the destination name must leave
+    /// nothing behind. `unique_path` claims the name by creating an empty file;
+    /// when the rename then fails, that placeholder used to survive as a 0-byte
+    /// file at the name the user was expecting the transfer under — and it made
+    /// the next attempt reserve `wanted (1).bin` instead of `wanted.bin`.
+    #[tokio::test]
+    async fn a_failed_finalize_leaves_no_placeholder_behind() {
+        let dir = std::env::temp_dir().join(format!("pb-fs-leak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = FsStorage::new();
+
+        let dest = dir.join("wanted.bin");
+        let dest_str = dest.to_string_lossy().to_string();
+
+        // Rename from a temp that does not exist: the reservation succeeds and
+        // the promotion fails, which is the whole window under test.
+        let missing = dir.join("gone.part").to_string_lossy().to_string();
+        let err = storage.finalize(&missing, &dest_str).await;
+        assert!(
+            matches!(err, Err(DomainError::Storage(_))),
+            "the failure still reaches the caller: {err:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "a failed finalize must not leave a 0-byte file where the transfer was expected"
+        );
+
+        // …and the retry gets the name it was meant to have, not `(1)`.
+        let temp = dir.join("real.part");
+        std::fs::write(&temp, b"payload").unwrap();
+        let final_path = storage
+            .finalize(&temp.to_string_lossy(), &dest_str)
+            .await
+            .unwrap();
+        assert_eq!(final_path, dest_str, "retry lands on the original name");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

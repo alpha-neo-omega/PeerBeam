@@ -265,7 +265,13 @@ class _SpacesScreenState extends State<SpacesScreen> {
       return;
     }
 
-    final staged = await pickFilesToStage();
+    // `keep:` is not optional here, whatever the default says. The Android
+    // picker prunes its own cache on every pick, so a call that does not name
+    // the paths the Send tray is still holding lets it delete that batch out
+    // from under the tray — files the user staged minutes ago, gone the moment
+    // they pick for a Space. Every other call site passes it; this was the one
+    // that did not.
+    final staged = await pickFilesToStage(keep: state.staging.paths);
     if (staged.isEmpty || !mounted) return;
     final paths = staged.map((f) => f.path).toList(growable: false);
 

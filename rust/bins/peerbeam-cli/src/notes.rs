@@ -43,7 +43,7 @@ async fn sync(ctx: &Ctx, peer: String, path_override: Option<&str>) -> CliResult
     let sc = SecureCtx::build(&config)?;
     let store = commands::note_store(&config, &sc.enc, &sc.ident);
 
-    let devices = commands::snapshot(config.clone(), 2).await;
+    let devices = commands::snapshot(config.clone(), 2).await?;
     let candidates: Vec<(String, String)> = devices
         .iter()
         .map(|m| (m.device.id.to_string(), m.device.name.clone()))

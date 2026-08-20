@@ -383,7 +383,7 @@ async fn send(
         let sa = commands::resolve_addr(addr)?;
         commands::target_device(addr.clone(), sa.ip().to_string(), sa.port())
     } else {
-        let devices = commands::snapshot(config.clone(), 2).await;
+        let devices = commands::snapshot(config.clone(), 2).await?;
         let candidates: Vec<(String, String)> = devices
             .iter()
             .map(|m| (m.device.id.to_string(), m.device.name.clone()))
@@ -797,7 +797,7 @@ async fn send_file(
         let sa = commands::resolve_addr(addr)?;
         commands::target_device(addr.clone(), sa.ip().to_string(), sa.port())
     } else {
-        let devices = commands::snapshot(config.clone(), 2).await;
+        let devices = commands::snapshot(config.clone(), 2).await?;
         let candidates: Vec<(String, String)> = devices
             .iter()
             .map(|m| (m.device.id.to_string(), m.device.name.clone()))
@@ -1128,7 +1128,17 @@ async fn deliver_reaction(
     emoji: &str,
     remove: bool,
 ) -> bool {
-    let devices = commands::snapshot(config.clone(), 2).await;
+    // A discovery window that never opened is not a peer that isn't there.
+    // This path cannot propagate — the reaction is already in local history and
+    // the command has succeeded — but "not delivered (peer offline)" would
+    // otherwise be printed about a machine that never got looked for.
+    let devices = match commands::snapshot(config.clone(), 2).await {
+        Ok(d) => d,
+        Err(e) => {
+            commands::report_problem(ctx, &format!("could not look for {peer_id}: {e}"));
+            return false;
+        }
+    };
     let Some(meta) = devices.iter().find(|m| m.device.id == *peer_id) else {
         return false;
     };
@@ -1671,7 +1681,16 @@ async fn send_read_receipt(
     if !config.device.share_read_receipts {
         return false;
     }
-    let devices = commands::snapshot(config.clone(), 2).await;
+    // Same as `deliver_reaction`: best-effort, so it cannot propagate — but a
+    // receipt that was never even attempted because discovery failed is worth
+    // one line on stderr, not silence.
+    let devices = match commands::snapshot(config.clone(), 2).await {
+        Ok(d) => d,
+        Err(e) => {
+            commands::report_problem(ctx, &format!("could not look for {peer_id}: {e}"));
+            return false;
+        }
+    };
     let Some(meta) = devices.iter().find(|m| m.device.id == *peer_id) else {
         return false;
     };
@@ -1840,7 +1859,17 @@ async fn resolve_history_peer(
         return raw_id;
     }
 
-    let devices = commands::snapshot(config.clone(), 2).await;
+    let devices = match commands::snapshot(config.clone(), 2).await {
+        Ok(d) => d,
+        Err(e) => {
+            // Falling back to the literal id is still right — local history is
+            // readable without discovery — but the empty history that follows
+            // would otherwise read as "no conversation with that name", an
+            // answer built entirely out of a failure to look.
+            commands::report_problem(ctx, &format!("could not look for {peer}: {e}"));
+            return raw_id;
+        }
+    };
     let candidates: Vec<(String, String)> = devices
         .iter()
         .map(|m| (m.device.id.to_string(), m.device.name.clone()))

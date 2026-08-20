@@ -767,4 +767,57 @@ void main() {
       expect(find.text('0 of 2 selected'), findsOneWidget);
     });
   });
+
+  /// **A device name is not a short string.** `TransferEvent`'s peer name is
+  /// whatever the other machine calls itself, and the `To/From <peer>` line
+  /// used to be laid out at its full natural width beside the state label — so
+  /// on a phone a long name pushed "Pending" off the card and painted the
+  /// overflow stripe over the progress bar. The name is the part that yields:
+  /// the file above it already says which transfer this is, while the state is
+  /// the one word the card exists to report.
+  ///
+  /// Checked at both ends of the range the app runs at: the card is capped by a
+  /// [ContentPane], so a wide window does not widen this row — it only makes the
+  /// name that overruns it a longer one.
+  for (final size in const [Size(360, 720), Size(1440, 900)]) {
+    testWidgets('a long device name yields to the state label at '
+        '${size.width.toInt()}px', (tester) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final fake = FakePeerBeam();
+      await _pumpTransfers(tester, fake);
+      fake.emit(
+        const TransferEvent(
+          kind: 'transfer_queued',
+          transferId: 'in-1',
+          timestamp: '',
+          payload: {
+            'peer':
+                'Priya’s MacBook Pro (16-inch, work laptop, please do '
+                'not unplug)',
+            'file': 'holiday.mp4',
+            'incoming': true,
+          },
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: 'the card overflowed rather than shortening the name',
+      );
+      expect(
+        find.text('Pending'),
+        findsOneWidget,
+        reason: 'the state is what the card is for — it must survive the name',
+      );
+      final card = tester.getRect(find.byKey(const ValueKey('in-1')));
+      final name = tester.getRect(find.textContaining('Priya'));
+      expect(name.right, lessThanOrEqualTo(card.right));
+    });
+  }
 }

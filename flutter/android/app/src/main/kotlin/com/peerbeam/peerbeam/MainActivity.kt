@@ -370,6 +370,38 @@ class MainActivity : FlutterActivity() {
         return if (held) uri else null
     }
 
+    /// Remember that the file Dart asked us to publish as [requested] actually
+    /// landed under [actual], so [publishedName] can find it again.
+    ///
+    /// Needed because [uniqueName] can only be honest at the cost of the two
+    /// names diverging, and `safOpen` is given the *requested* one: History and
+    /// Chat record the name the engine reported and fall back to opening by it
+    /// once the engine's own copy is gone. Without this, tapping a received
+    /// `taxes.pdf` that was published as `taxes (1).pdf` would open the user's
+    /// unrelated `taxes.pdf` sitting next to it — silently showing them the
+    /// wrong document.
+    ///
+    /// Keyed by the requested name, so re-receiving the same name replaces its
+    /// entry instead of adding one: this grows with the number of *distinct*
+    /// colliding names, not with the number of files received. An equal pair
+    /// clears the entry rather than storing it — once the collision is gone
+    /// (the user deleted their copy) a stale alias would send `safOpen` to the
+    /// older suffixed file forever.
+    private fun rememberPublishedName(requested: String, actual: String) {
+        val key = "published:$requested"
+        val edit = safPrefs.edit()
+        if (requested == actual) edit.remove(key) else edit.putString(key, actual)
+        edit.apply()
+    }
+
+    /// The name the file published as [requested] actually landed under — the
+    /// requested name itself unless a collision forced [uniqueName] to pick
+    /// another. Deliberately does **not** fall back to [requested] when the
+    /// alias names something that is no longer there: that fallback is exactly
+    /// the wrong-document open this alias exists to prevent.
+    private fun publishedName(requested: String): String =
+        safPrefs.getString("published:$requested", null) ?: requested
+
     /// The current destination shown in Settings: a chosen SAF folder if set,
     /// otherwise the zero-config public Downloads/PeerBeam default (API 29+),
     /// otherwise null (old devices fall back to app storage).
@@ -391,23 +423,35 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
-    /// Copy [path] into the chosen tree as [name] (overwriting a same-name file),
-    /// returning the new document URI, or null if no tree / the copy failed.
+    /// Copy [path] into the chosen tree under [name], or the first free
+    /// ` (n)` variant of it when the user already has a file by that name.
+    /// Returns the new document URI, or null if no tree / the copy failed.
     private fun saveToTree(path: String, name: String): String? {
         val uri = persistedTree() ?: return null
         val tree = DocumentFile.fromTreeUri(this, uri) ?: return null
         val src = File(path)
         if (!src.exists()) return null
-        return copyFileIntoDir(tree, name, src)?.uri?.toString()
+        val doc = copyFileIntoDir(tree, name, src) ?: return null
+        // `doc.name`, not the name we asked for: a DocumentsProvider is free to
+        // rename on its own (most append their own " (1)" on a collision that
+        // slipped in between our check and the create), and the alias is only
+        // worth keeping if it names the document that actually exists.
+        rememberPublishedName(name, doc.name ?: name)
+        return doc.uri.toString()
     }
 
-    /// Copy local file [src] into SAF directory [dir] as [name] (overwriting a
-    /// same-name file already there). Returns the new document, or null if the
-    /// source is missing or the copy failed.
+    /// Copy local file [src] into SAF directory [dir] as [name], or as the
+    /// first free ` (n)` variant when [dir] already holds that name. Returns
+    /// the new document, or null if the source is missing or the copy failed.
+    ///
+    /// This used to `findFile(name)?.delete()` for overwrite semantics, on a
+    /// peer-supplied name — so a paired device could destroy any document in
+    /// the user's chosen folder just by sending a file called the same thing.
+    /// See [uniqueName], which the engine's own writes have always had.
     private fun copyFileIntoDir(dir: DocumentFile, name: String, src: File): DocumentFile? {
         if (!src.exists()) return null
-        dir.findFile(name)?.delete() // overwrite semantics
-        val doc = dir.createFile(mimeOf(name), name) ?: return null
+        val free = uniqueName(name) { dir.findFile(it) != null }
+        val doc = dir.createFile(mimeOf(free), free) ?: return null
         return try {
             contentResolver.openOutputStream(doc.uri)?.use { out ->
                 src.inputStream().use { it.copyTo(out) }
@@ -480,7 +524,7 @@ class MainActivity : FlutterActivity() {
     private fun openInTree(name: String): Boolean {
         val uri = persistedTree() ?: return false
         val tree = DocumentFile.fromTreeUri(this, uri) ?: return false
-        val doc = tree.findFile(name) ?: return false
+        val doc = tree.findFile(publishedName(name)) ?: return false
         return try {
             startActivity(
                 Intent(Intent.ACTION_VIEW).apply {
@@ -499,10 +543,13 @@ class MainActivity : FlutterActivity() {
     // ── MediaStore Downloads/PeerBeam (zero-config default, API 29+) ──
 
     /// Copy [path] into public Downloads/PeerBeam via MediaStore (no runtime
-    /// permission), overwriting a same-name entry. Returns the URI, or null when
-    /// unsupported (API < 29) / the copy failed.
-    private fun saveToDownloads(path: String, name: String): String? =
-        saveToDownloadsAt(path, name, "Download/PeerBeam")
+    /// permission). Returns the URI, or null when unsupported (API < 29) / the
+    /// copy failed.
+    private fun saveToDownloads(path: String, name: String): String? {
+        val (uri, saved) = saveToDownloadsAt(path, name, "Download/PeerBeam") ?: return null
+        rememberPublishedName(name, saved)
+        return uri
+    }
 
     /// Publish [files] (all under [root]) into public Downloads via MediaStore,
     /// under `Download/PeerBeam/<root.name>/<subdirs>` per file (API 29+ only —
@@ -513,6 +560,10 @@ class MainActivity : FlutterActivity() {
             val segments = relativeSegments(root, f)
             val subdir = (listOf(root.name) + segments.dropLast(1)).joinToString("/")
             val relativePath = "Download/PeerBeam/$subdir"
+            // No [rememberPublishedName] here: `safOpen` only ever looks in the
+            // destination's top level, so a file published inside a received
+            // folder was never findable by bare name and an alias would only
+            // point at a name that isn't there.
             if (saveToDownloadsAt(f.path, segments.last(), relativePath) == null) ok = false
         }
         return ok
@@ -520,18 +571,28 @@ class MainActivity : FlutterActivity() {
 
     /// Copy [path] into Downloads at an explicit [relativePath] under
     /// `Download/…` (e.g. `Download/PeerBeam/myfolder/sub` for a file inside a
-    /// received folder), overwriting a same-name entry already there. Returns
-    /// the URI, or null when unsupported (API < 29) / the copy failed.
-    private fun saveToDownloadsAt(path: String, name: String, relativePath: String): String? {
+    /// received folder), as [name] or the first free ` (n)` variant of it.
+    /// Returns the URI **and the name it was actually saved under**, or null
+    /// when unsupported (API < 29) / the copy failed.
+    ///
+    /// This used to `deleteFromDownloadsAt(name, relativePath)` first, for
+    /// overwrite semantics, on a peer-supplied name — the same clobber
+    /// [copyFileIntoDir] carried, against whatever the user keeps in
+    /// `Download/PeerBeam`.
+    private fun saveToDownloadsAt(
+        path: String,
+        name: String,
+        relativePath: String,
+    ): Pair<String, String>? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val src = File(path)
         if (!src.exists()) return null
-        deleteFromDownloadsAt(name, relativePath) // overwrite semantics
+        val free = uniqueName(name) { downloadsUriByNameAt(it, relativePath) != null }
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.DISPLAY_NAME, free)
             put(MediaStore.Downloads.RELATIVE_PATH, relativePath)
-            put(MediaStore.Downloads.MIME_TYPE, mimeOf(name))
+            put(MediaStore.Downloads.MIME_TYPE, mimeOf(free))
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
         val uri = contentResolver.insert(collection, values) ?: return null
@@ -548,7 +609,7 @@ class MainActivity : FlutterActivity() {
                 null,
                 null,
             )
-            uri.toString()
+            uri.toString() to free
         } catch (e: Exception) {
             contentResolver.delete(uri, null, null)
             null
@@ -579,14 +640,8 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
-    private fun deleteFromDownloads(name: String) = deleteFromDownloadsAt(name, "Download/PeerBeam")
-
-    private fun deleteFromDownloadsAt(name: String, relativePath: String) {
-        downloadsUriByNameAt(name, relativePath)?.let { contentResolver.delete(it, null, null) }
-    }
-
     private fun openInDownloads(name: String): Boolean {
-        val uri = downloadsUriByName(name) ?: return false
+        val uri = downloadsUriByName(publishedName(name)) ?: return false
         return try {
             startActivity(
                 Intent(Intent.ACTION_VIEW).apply {

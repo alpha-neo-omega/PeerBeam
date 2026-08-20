@@ -578,12 +578,26 @@ class ChatRepository extends ChangeNotifier {
       // Conversations list for exactly as long as it is unreachable — which is
       // when reaching it matters most.
       unawaited(refreshConversations());
+    } on PeerBeamException catch (e) {
+      // The engine **refused** the message: an over-long body, an engine that
+      // never started. That is not the unreachable-peer case — enqueueing is
+      // durable and always attempted, and a queued message is retried by the
+      // drain until it lands — it is a message that was never persisted, so
+      // nothing will ever settle its status and no drain will ever carry it.
+      //
+      // Leaving the optimistic row `pending` was therefore the worst of both:
+      // it read as still on its way, and the very next [refresh] — which
+      // rebuilds the thread from what the engine has, which is nothing —
+      // erased it. The user's last sight of their message was a bubble that
+      // looked sent. Fail it in place with the engine's own reason, exactly as
+      // [sendFile] does for a refused path.
+      _fail(peerId, optimistic.id, e.message);
     } catch (_) {
-      // chatSend itself only fails on a local/validation error (enqueueing
-      // is durable and always attempted) — an unreachable peer is not an
-      // error here, it stays queued in the engine's outbox and is retried by
-      // the drain/flush-on-connect until delivered. Leave the optimistic
-      // message in place; `_onStatus` will update it once delivery happens.
+      // Anything else (a malformed reply, a dead bridge): still a message the
+      // user typed and is owed an answer about. Not rethrown — some callers
+      // fire this and forget it, and an escaping error would be an unhandled
+      // async one — the row itself is the answer.
+      _fail(peerId, optimistic.id, 'Could not send this message');
     }
   }
 

@@ -79,6 +79,27 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
 // an empty set — while a long-running `daemon` (or an in-process transfer) shows
 // its live sessions. No engine state is duplicated here.
 
+/// Say that something went wrong **without** ending the command, on stderr.
+///
+/// For a failure a command survives but must not hide: a chat row that could
+/// not be updated after the file it describes has already landed, a discovery
+/// window that never opened while the work it was helping with is already done.
+/// The CLI installs no `tracing` subscriber, so there is no log for these to
+/// fall into — printing is the only trace available.
+///
+/// Deliberately **not** the `{"event": "error"}` lines `receive`/`pipe` put on
+/// *stdout*: those are part of a documented event stream a script consumes.
+/// This is a diagnostic, and a diagnostic that lands in `chat history --json`'s
+/// output would corrupt the one document that command promises. `--quiet`
+/// silences it like every other human line.
+pub(crate) fn report_problem(ctx: &Ctx, msg: &str) {
+    if ctx.json {
+        ctx.json_note(&json!({"event": "error", "message": msg}));
+    } else {
+        ctx.note(&ctx.err_dim(msg));
+    }
+}
+
 /// Print a diagnostics value as JSON (always machine-readable, pretty in a TTY).
 pub(crate) fn present(ctx: &Ctx, value: &serde_json::Value) -> CliResult {
     if ctx.json {
@@ -314,9 +335,51 @@ async fn check_updates(ctx: &Ctx) -> CliResult {
     }
 }
 
+/// One row of `doctor`'s report: name, `pass`/`warn`/`fail`, and the detail.
+type Check = (String, &'static str, String);
+
+/// The config row `doctor` reports, and the config every check after it runs
+/// against.
+///
+/// `doctor` used to open with `load_config(..).unwrap_or_default()`. A
+/// `config.json` with a stray comma silently *became* the defaults, so the one
+/// command whose entire job is naming a broken setup had nothing at all to say
+/// about the most likely fault — and every check below it then answered for a
+/// config the user does not have: a save directory they never chose, a port
+/// they never set, an identity in a data directory they never named.
+///
+/// Substituting the defaults is still right — a broken config must not cost the
+/// user the other eight answers. What changes is that the substitution is
+/// *reported*, and that `doctor` exits non-zero for it like any other failed
+/// check. The CLI installs no `tracing` subscriber, so a log line here would go
+/// nowhere: the report is the only place this can be said.
+fn config_check(path_override: Option<&str>) -> (EngineConfig, Check) {
+    let path = config_path(path_override);
+    match load_config(path_override) {
+        // A file that is simply not there is not a fault: `load_or_default`
+        // treats NotFound as the defaults by design, and a fresh install has no
+        // `config.json` at all — so this only ever fails on a file that exists
+        // and cannot be used. Saying which of the two it is *is* the diagnosis.
+        Ok(cfg) => {
+            let detail = if path.exists() {
+                path.to_string_lossy().into_owned()
+            } else {
+                format!("{} (none yet — using defaults)", path.display())
+            };
+            (cfg, ("Config".into(), "pass", detail))
+        }
+        Err(e) => (
+            EngineConfig::default(),
+            ("Config".into(), "fail", e.to_string()),
+        ),
+    }
+}
+
 fn doctor(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
-    let cfg = load_config(path_override).unwrap_or_default();
-    let mut checks: Vec<(String, &'static str, String)> = Vec::new();
+    // First row, and the source of `cfg` for every row after it — so what
+    // `doctor` reports and what `doctor` uses can never disagree.
+    let (cfg, config_row) = config_check(path_override);
+    let mut checks: Vec<Check> = vec![config_row];
 
     // Config dir writable.
     let cfg_dir = config_path(path_override)
@@ -397,7 +460,7 @@ fn doctor(ctx: &Ctx, path_override: Option<&str>) -> CliResult {
     }
 }
 
-fn writable_check(name: &str, dir: &str) -> (String, &'static str, String) {
+fn writable_check(name: &str, dir: &str) -> Check {
     let path = std::path::Path::new(dir);
     let probe = path.join(".peerbeam-write-test");
     match std::fs::create_dir_all(path).and_then(|_| std::fs::write(&probe, b"x")) {
@@ -574,20 +637,37 @@ async fn bench_loopback(ctx: &Ctx, size_mib: u64, chunk_kib: u32) -> CliResult {
 
 // ── discovery-backed ────────────────────────────────────────────
 
-pub(crate) async fn snapshot(config: EngineConfig, secs: u64) -> Vec<ManagedDevice> {
-    let Ok(engine) = build_engine(config.clone()) else {
-        return Vec::new();
-    };
-    let Ok(self_device) = me(&config) else {
-        return Vec::new();
-    };
-    if engine.start_discovery(self_device).await.is_err() {
-        return Vec::new();
-    }
+/// Listen for `secs` and return what discovery found.
+///
+/// **A failure here is not an empty network.** This used to fold all three of
+/// its failures — no usable identity (`build_engine`, `me`) and discovery that
+/// would not start (a port already held, no usable interface) — into
+/// `Vec::new()`. Every caller reads that as "nothing out there": `peerbeam
+/// list` printed "no devices found", `chat send` reported the peer was not
+/// reachable, `pipe --from` silently matched nobody. Each of those is a claim
+/// about the user's network made out of a failure on this machine, and it is
+/// the claim they act on — by looking at the router, not at us.
+///
+/// The CLI installs no `tracing` subscriber, so a log line here would go
+/// nowhere at all: propagating is the only way the reason reaches anybody. The
+/// three best-effort callers (a reaction, a read receipt, resolving a name that
+/// may not need discovery at all) print it and carry on instead — see their
+/// own notes.
+pub(crate) async fn snapshot(
+    config: EngineConfig,
+    secs: u64,
+) -> Result<Vec<ManagedDevice>, CliError> {
+    let engine = build_engine(config.clone())?;
+    let self_device = me(&config)?;
+    engine.start_discovery(self_device).await?;
     tokio::time::sleep(Duration::from_secs(secs)).await;
     let devices = engine.devices();
+    // Deliberately not propagated: the answer is already in hand and this
+    // engine is about to be dropped, so failing the command *after* it
+    // succeeded would report a problem the user has no stake in and cannot act
+    // on. The three failures above are the ones that decide the answer.
     let _ = engine.stop_discovery().await;
-    devices
+    Ok(devices)
 }
 
 fn device_rows(devices: &[ManagedDevice]) -> Vec<Vec<String>> {
@@ -641,7 +721,7 @@ async fn discover(ctx: &Ctx, args: DiscoverArgs, path_override: Option<&str>) ->
         return Ok(());
     }
 
-    let devices = snapshot(config, args.timeout).await;
+    let devices = snapshot(config, args.timeout).await?;
     print_devices(ctx, &devices);
     Ok(())
 }
@@ -690,7 +770,7 @@ fn emit_change(ctx: &Ctx, change: &peerbeam_engine::DeviceChange) {
 
 async fn list(ctx: &Ctx, args: ListArgs, path_override: Option<&str>) -> CliResult {
     let config = load_config(path_override)?;
-    let mut devices = snapshot(config, 2).await;
+    let mut devices = snapshot(config, 2).await?;
     if args.online {
         devices.retain(|m| m.online);
     }
@@ -1144,7 +1224,7 @@ pub(crate) async fn send_files(
         let sa = resolve_addr(addr)?;
         target_device(addr.clone(), sa.ip().to_string(), sa.port())
     } else {
-        let devices = snapshot(config.clone(), 2).await;
+        let devices = snapshot(config.clone(), 2).await?;
         let candidates: Vec<(String, String)> = devices
             .iter()
             .map(|m| (m.device.id.to_string(), m.device.name.clone()))
@@ -1757,6 +1837,20 @@ pub(crate) async fn secure_send_file(
 /// with this stream by id alone and never checked against it, so without this
 /// the conversation would keep describing whatever was advertised rather than
 /// what is on disk — see `ChatStore::set_file_row_landing`.
+///
+/// **A store failure is returned, not dropped.** All three writes used to be
+/// `let _ = …`, so a conversation row could be left permanently `PendingApproval`
+/// — an Accept button for a transfer that has already finished — over a file
+/// that landed perfectly, with nothing anywhere recording why. It is returned
+/// rather than propagated because the caller must not fail a receive whose
+/// bytes are safely on disk; `serve_loop` prints it instead.
+///
+/// The first failure stops the rest: `set_file_row_landing` failing and the
+/// settle going ahead anyway would close the row for good while it still
+/// carried the sender's *claim* about the name — which is precisely the lie
+/// that reconciliation exists to prevent. A row left in flight is settled as
+/// `Interrupted` by the next startup reconcile; a row settled with the wrong
+/// name is settled forever.
 fn settle_received_chat_file(
     chat: &peerbeam_chat::ChatStore,
     peer_id: &str,
@@ -1764,19 +1858,19 @@ fn settle_received_chat_file(
     status: peerbeam_chat::Status,
     landed: Option<(&str, u64)>,
     local_path: Option<&str>,
-) {
+) -> Result<(), peerbeam_chat::ChatError> {
     if transfer_id.is_empty() {
-        return;
+        return Ok(());
     }
     let peer = DeviceId::from(peer_id.to_string());
     if let Some((name, size)) = landed {
-        let _ =
-            chat.set_file_row_landing(&peer, transfer_id, peerbeam_chat::Direction::In, name, size);
+        chat.set_file_row_landing(&peer, transfer_id, peerbeam_chat::Direction::In, name, size)?;
     }
     if let Some(path) = local_path {
-        let _ = chat.set_file_row_path(&peer, transfer_id, peerbeam_chat::Direction::In, path);
+        chat.set_file_row_path(&peer, transfer_id, peerbeam_chat::Direction::In, path)?;
     }
-    let _ = chat.settle_file_row(&peer, transfer_id, peerbeam_chat::Direction::In, status);
+    chat.settle_file_row(&peer, transfer_id, peerbeam_chat::Direction::In, status)?;
+    Ok(())
 }
 
 /// Serve inbound QUIC connections as PeerSessions, accept each peer's transfer
@@ -2091,14 +2185,22 @@ async fn serve_loop(
                 // history` run mid-receive shows a file still "waiting" and
                 // labelled with whatever was advertised. A no-op for every
                 // ordinary transfer (no row) and when nothing could be peeked.
-                settle_received_chat_file(
+                if let Err(e) = settle_received_chat_file(
                     &chat,
                     &peer_id,
                     &preview.transfer_id,
                     peerbeam_chat::Status::Transferring,
                     (!preview.name.is_empty()).then_some((preview.name.as_str(), preview.size)),
                     None,
-                );
+                ) {
+                    // Not fatal — the bytes below are what the peer came for —
+                    // but not silent either: the row this could not move stays
+                    // "waiting" in `chat history` while the file arrives.
+                    report_problem(
+                        ctx,
+                        &format!("this transfer's conversation row could not be updated: {e}"),
+                    );
+                }
 
                 // **Where this item lands.** The one call site: the matcher is
                 // consulted once, here, after the transfer has been accepted
@@ -2193,7 +2295,7 @@ async fn serve_loop(
                         // where it landed); an observed cancellation settles
                         // Failed. Both are no-ops unless this transfer's id
                         // genuinely names our own in-flight file row.
-                        match rcv.outcome {
+                        let settled = match rcv.outcome {
                             TransferOutcome::Completed => settle_received_chat_file(
                                 &chat,
                                 &peer_id,
@@ -2210,6 +2312,18 @@ async fn serve_loop(
                                 None,
                                 None,
                             ),
+                        };
+                        // The file is on disk and has already been reported as
+                        // received — the row is the only thing wrong, so this
+                        // says so rather than contradicting the line above it.
+                        if let Err(e) = settled {
+                            report_problem(
+                                ctx,
+                                &format!(
+                                    "{} arrived, but its conversation row could not be updated: {e}",
+                                    rcv.name
+                                ),
+                            );
                         }
                     }
                     Ok(ChannelReceived::Folder(fr)) => {
@@ -2251,14 +2365,22 @@ async fn serve_loop(
                         // Failed too — a no-op unless the id genuinely names
                         // our own in-flight file row (see
                         // `settle_received_chat_file`'s doc).
-                        settle_received_chat_file(
+                        if let Err(e) = settle_received_chat_file(
                             &chat,
                             &peer_id,
                             &preview.transfer_id,
                             peerbeam_chat::Status::Failed,
                             None,
                             None,
-                        );
+                        ) {
+                            // A failed transfer whose row also could not be
+                            // marked failed leaves the conversation showing an
+                            // in-flight file nothing will ever finish.
+                            report_problem(
+                                ctx,
+                                &format!("the failed transfer's conversation row could not be updated: {e}"),
+                            );
+                        }
                     }
                 }
                 session.close().await;
@@ -2676,6 +2798,113 @@ impl Link for MemLink {
 }
 
 // ── unit tests: config dotted-key navigation ────────────────────
+/// `snapshot` — what the discovery-backed commands are told when discovery
+/// could not run at all.
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{snapshot, EngineConfig};
+
+    /// **"No devices found" used to mean this.** A data directory whose
+    /// `identity.json` cannot be parsed fails `build_engine` and `me` — the
+    /// device has no id to announce and nothing to authenticate with — and all
+    /// three of `snapshot`'s failures were folded into an empty `Vec`. `peerbeam
+    /// list` then printed "no devices found": a statement about the user's
+    /// network, produced entirely by a broken file on their own disk, and the
+    /// one they act on by going to look at their router.
+    #[tokio::test]
+    async fn a_snapshot_that_could_not_run_is_an_error_not_an_empty_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // Present but unusable — the case `FsIdentity::load` reports rather
+        // than quietly replacing (a regenerated identity would break every
+        // peer's TOFU pin).
+        std::fs::write(data.join("identity.json"), b"not an identity at all").unwrap();
+
+        let mut config = EngineConfig::default();
+        config.storage.data_directory = data.to_string_lossy().into_owned();
+        // Nothing here reaches the network — this fails before any socket is
+        // bound — but an OS-assigned port keeps it that way if it ever does.
+        config.discovery.port = 0;
+
+        let err = snapshot(config, 0)
+            .await
+            .expect_err("a discovery window that never opened is not an empty network");
+        assert!(
+            err.to_string().contains("identity"),
+            "the reason has to survive as far as the user, got: {err}"
+        );
+    }
+}
+
+/// `doctor`'s config row — the check the command did not have.
+#[cfg(test)]
+mod doctor_tests {
+    use super::{config_check, EngineConfig};
+
+    /// **The silent substitution.** A `config.json` that cannot be parsed used
+    /// to become the defaults with nothing said — in the one command whose
+    /// whole job is saying what is wrong, and about the fault most likely to be
+    /// behind whatever sent the user here. The CLI installs no log sink at all,
+    /// so this report is the only place it can appear.
+    #[test]
+    fn a_config_that_cannot_be_parsed_is_reported_as_a_failed_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, br#"{ "device": { "name": "MyLaptop" "#).unwrap();
+
+        let (cfg, (name, status, detail)) = config_check(Some(&p.to_string_lossy()));
+
+        assert_eq!(name, "Config");
+        assert_eq!(
+            status, "fail",
+            "a config that cannot be parsed must be reported, not folded into the defaults"
+        );
+        assert!(
+            detail.contains("config"),
+            "the row has to carry the reason, got: {detail}"
+        );
+        assert_eq!(
+            cfg.device.name,
+            EngineConfig::default().device.name,
+            "the remaining checks still run — on defaults, which is why saying so matters"
+        );
+    }
+
+    /// A config that does not exist yet is not a fault: `load_or_default`
+    /// treats NotFound as the defaults by design and a fresh install has none,
+    /// so reporting it as a failure would make `doctor` exit non-zero on every
+    /// first run — and teach people to ignore its exit code.
+    #[test]
+    fn a_config_that_was_never_created_still_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+
+        let (_, (_, status, detail)) = config_check(Some(&p.to_string_lossy()));
+
+        assert_eq!(status, "pass");
+        assert!(
+            detail.contains("none yet"),
+            "the report should distinguish 'no config' from 'this config', got: {detail}"
+        );
+    }
+
+    /// And a usable config is *returned*, not merely approved: every check
+    /// after this row reads its save directory, data directory and ports from
+    /// here, so the row and the checks under it describe one config.
+    #[test]
+    fn a_usable_config_is_the_one_the_rest_of_the_report_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, br#"{"device":{"name":"Reception iMac"}}"#).unwrap();
+
+        let (cfg, (_, status, _)) = config_check(Some(&p.to_string_lossy()));
+
+        assert_eq!(status, "pass");
+        assert_eq!(cfg.device.name, "Reception iMac");
+    }
+}
+
 #[cfg(test)]
 mod config_key_tests {
     use super::{navigate, parse_value, render_scalar, set_path};
@@ -3152,6 +3381,101 @@ mod chat_receive_bridge_tests {
         (ChatStore::new(app), dir)
     }
 
+    /// An `AppStore` that reads like the real one and stops accepting writes on
+    /// command — the disk that fills up between a file landing and its row
+    /// being settled, without needing one. Reads keep working on purpose: the
+    /// guard inside `settle_file_row` has to see the real record it is deciding
+    /// about, so what is being tested is the write failing and nothing else.
+    struct FailingWrites {
+        inner: peerbeam_appstore_fs::FsAppStore,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingWrites {
+        fn refuse_writes(&self) {
+            self.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn check(&self) -> peerbeam_domain::error::Result<()> {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(peerbeam_domain::error::DomainError::Storage(
+                    "No space left on device".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl peerbeam_domain::port::AppStore for FailingWrites {
+        fn put(&self, ns: &str, key: &str, value: &[u8]) -> peerbeam_domain::error::Result<()> {
+            self.check()?;
+            self.inner.put(ns, key, value)
+        }
+        fn get(&self, ns: &str, key: &str) -> peerbeam_domain::error::Result<Option<Vec<u8>>> {
+            self.inner.get(ns, key)
+        }
+        fn list(&self, ns: &str) -> peerbeam_domain::error::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.list(ns)
+        }
+        fn namespaces(&self, prefix: &str) -> peerbeam_domain::error::Result<Vec<String>> {
+            self.inner.namespaces(prefix)
+        }
+        fn delete(&self, ns: &str, key: &str) -> peerbeam_domain::error::Result<bool> {
+            self.check()?;
+            self.inner.delete(ns, key)
+        }
+        fn clear(&self, ns: &str) -> peerbeam_domain::error::Result<()> {
+            self.check()?;
+            self.inner.clear(ns)
+        }
+    }
+
+    /// **A store failure used to leave no trace at all.** All three writes were
+    /// `let _ = …`, so a receive whose row could not be updated printed
+    /// "received report.pdf" and left the conversation showing the file as
+    /// still waiting for approval — an Accept button for a transfer that had
+    /// already finished, and nothing anywhere saying why.
+    ///
+    /// Two things are asserted, and the second is the reason this is returned
+    /// rather than propagated: the caller learns about it, and the row is left
+    /// *in flight* rather than settled with the sender's unverified claim —
+    /// which the next startup reconcile can still turn into `Interrupted`.
+    #[test]
+    fn a_store_that_cannot_write_reports_the_failure_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(AeadCrypto::new());
+        let key = derive_subkey(&[11u8; 32], b"peerbeam-appstore-v1");
+        let store = Arc::new(FailingWrites {
+            inner: peerbeam_appstore_fs::FsAppStore::open(dir.path().join("appstore"), key, enc),
+            refuse: std::sync::atomic::AtomicBool::new(false),
+        });
+        let chat = ChatStore::new(store.clone());
+
+        let peer = DeviceId::from("pb-bob");
+        let r = FileRef::new("report.pdf", 4096).unwrap();
+        chat.append(&ChatRecord::file_in(&peer, &r)).unwrap();
+
+        store.refuse_writes();
+        let err = settle_received_chat_file(
+            &chat,
+            "pb-bob",
+            &r.id,
+            Status::Received,
+            Some(("report.pdf", 4096)),
+            Some("/home/me/Downloads/report.pdf"),
+        )
+        .expect_err("a row that could not be written must not report success");
+        assert!(
+            err.to_string().contains("No space left on device"),
+            "the reason has to reach the caller, got: {err}"
+        );
+
+        assert_eq!(
+            chat.get(&peer, &r.id).unwrap().unwrap().status,
+            Status::PendingApproval,
+            "the row is left in flight, so a later reconcile can still settle it"
+        );
+    }
+
     /// A completed receive settles the chat row `Received` and records where
     /// it landed — this is the fix: without it, a file shared via chat and
     /// successfully received here stayed `PendingApproval` forever.
@@ -3169,7 +3493,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("report.pdf", 4096)),
             Some("/home/me/Downloads/report.pdf"),
-        );
+        )
+        .expect("a working store must accept these writes");
 
         let rec = chat.get(&peer, &r.id).unwrap().expect("row");
         assert_eq!(rec.status, Status::Received);
@@ -3200,7 +3525,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("invoice-2026.pdf.exe", 4_000_000_000)),
             Some("/home/me/Downloads/invoice-2026.pdf.exe"),
-        );
+        )
+        .expect("a working store must accept these writes");
 
         let meta = chat
             .get(&peer, &offered.id)
@@ -3240,7 +3566,8 @@ mod chat_receive_bridge_tests {
             Status::Transferring,
             Some(("report.pdf", 4096)),
             None,
-        );
+        )
+        .expect("a working store must accept these writes");
         assert_eq!(
             chat.get(&peer, &r.id).unwrap().unwrap().status,
             Status::Transferring,
@@ -3255,7 +3582,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("report.pdf", 4096)),
             Some("/home/me/Downloads/report.pdf"),
-        );
+        )
+        .expect("a working store must accept these writes");
         let rec = chat.get(&peer, &r.id).unwrap().expect("row");
         assert_eq!(rec.status, Status::Received);
         assert_eq!(
@@ -3274,7 +3602,8 @@ mod chat_receive_bridge_tests {
         let r = FileRef::new("report.pdf", 4096).unwrap();
         chat.append(&ChatRecord::file_in(&peer, &r)).unwrap();
 
-        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Failed, None, None);
+        settle_received_chat_file(&chat, "pb-bob", &r.id, Status::Failed, None, None)
+            .expect("a working store must accept these writes");
 
         let rec = chat.get(&peer, &r.id).unwrap().expect("row");
         assert_eq!(rec.status, Status::Failed);
@@ -3295,7 +3624,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("other.bin", 7)),
             Some("/tmp/x"),
-        );
+        )
+        .expect("a working store must accept these writes");
         assert!(chat.get(&peer, "tx-plain-42").unwrap().is_none());
     }
 
@@ -3315,7 +3645,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("x.bin", 1)),
             Some("/tmp/x"),
-        );
+        )
+        .expect("a working store must accept these writes");
         // The one real row in this conversation must be completely untouched.
         let hist = chat.history(&peer).unwrap();
         assert_eq!(hist.len(), 1);
@@ -3340,7 +3671,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("evil.exe", 1)),
             Some("/tmp/x"),
-        );
+        )
+        .expect("a working store must accept these writes");
 
         let rec = chat
             .get(&peer, &msg.id)
@@ -3374,7 +3706,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("evil.exe", 1)),
             Some("/tmp/x"),
-        );
+        )
+        .expect("a working store must accept these writes");
 
         let rec = chat.get(&peer, &r.id).unwrap().expect("row still present");
         assert_eq!(
@@ -3408,7 +3741,8 @@ mod chat_receive_bridge_tests {
             Status::Received,
             Some(("evil.exe", 1)),
             Some("/tmp/x"),
-        );
+        )
+        .expect("a working store must accept these writes");
 
         assert_eq!(
             chat.get(&peer, &r.id).unwrap().unwrap().status,

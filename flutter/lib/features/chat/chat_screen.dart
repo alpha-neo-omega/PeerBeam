@@ -261,9 +261,11 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /// Offer the quick reactions for [messageId]. Opened by a double-tap: a tap
-  /// already opens a file and a long-press already starts a selection, so this
-  /// is the gesture left that costs neither.
+  /// Offer the quick reactions for [messageId]. Opened by the button on the
+  /// bubble's own metadata row, not by a gesture: a tap already opens a file
+  /// and a long-press already starts a selection, and a double-tap would have
+  /// delayed every one of those by the double-tap timeout (see the comment on
+  /// that button).
   Future<void> _pickReaction(ChatMessage message) async {
     final chosen = await showModalBottomSheet<String>(
       context: context,
@@ -757,50 +759,74 @@ class _ChatScreenState extends State<ChatScreen> {
                                 message:
                                     'Send a message to start the conversation.',
                               ))
-                      // Reversed so the latest message stays pinned to the
-                      // bottom without a manual scroll controller.
-                      : ListView.builder(
-                          reverse: true,
-                          padding: const EdgeInsets.all(AppSpace.md),
-                          itemCount: items.length,
-                          itemBuilder: (context, i) {
-                            final message = items[items.length - 1 - i];
-                            // A row the engine refused to send exists only
-                            // here, so only the user can clear it.
-                            final unsent = state.chat.isUnsent(
-                              widget.peerId,
-                              message.id,
-                            );
-                            return Appear(
-                              index: i,
-                              child: _ChatBubble(
-                                message: message,
-                                // Resolved against the rows on screen only. A
-                                // parent that has disappeared resolves to null
-                                // and renders as an orphan — never fetched from
-                                // elsewhere, or a message the user was told had
-                                // gone could be quoted back at them.
-                                parent: message.inReplyTo == null
-                                    ? null
-                                    : items
-                                          .where(
-                                            (m) => m.id == message.inReplyTo,
+                      // Measured here rather than off the window, because
+                      // the thread is not the window: the [ContentPane] above
+                      // holds it to `Breakpoints.contentMaxWidth`, so on a
+                      // wide monitor a window-relative bubble cap is wider
+                      // than the column the bubble sits in and a long message
+                      // drew a bubble the list then clipped. Reading the
+                      // constraint keeps the cap right for whatever the pane
+                      // does later, including a narrower one.
+                      : LayoutBuilder(
+                          builder: (context, constraints) {
+                            // The list's own padding is inside this box, so a
+                            // bubble sized against the full width would run
+                            // under it.
+                            final column =
+                                constraints.maxWidth - AppSpace.md * 2;
+                            // Reversed so the latest message stays pinned to
+                            // the bottom without a manual scroll controller.
+                            return ListView.builder(
+                              reverse: true,
+                              padding: const EdgeInsets.all(AppSpace.md),
+                              itemCount: items.length,
+                              itemBuilder: (context, i) {
+                                final message = items[items.length - 1 - i];
+                                // A row the engine refused to send exists only
+                                // here, so only the user can clear it.
+                                final unsent = state.chat.isUnsent(
+                                  widget.peerId,
+                                  message.id,
+                                );
+                                return Appear(
+                                  index: i,
+                                  child: _ChatBubble(
+                                    message: message,
+                                    maxWidth: column * 0.75,
+                                    // Resolved against the rows on screen only. A
+                                    // parent that has disappeared resolves to null
+                                    // and renders as an orphan — never fetched from
+                                    // elsewhere, or a message the user was told had
+                                    // gone could be quoted back at them.
+                                    parent: message.inReplyTo == null
+                                        ? null
+                                        : items
+                                              .where(
+                                                (m) =>
+                                                    m.id == message.inReplyTo,
+                                              )
+                                              .firstOrNull,
+                                    error: state.chat.errorFor(message.id),
+                                    selecting: selecting,
+                                    selected: selected.contains(message.id),
+                                    onToggle: () => _toggle(message.id),
+                                    onDismiss: unsent
+                                        ? () => state.chat.dismiss(
+                                            widget.peerId,
+                                            message.id,
                                           )
-                                          .firstOrNull,
-                                error: state.chat.errorFor(message.id),
-                                selecting: selecting,
-                                selected: selected.contains(message.id),
-                                onToggle: () => _toggle(message.id),
-                                onDismiss: unsent
-                                    ? () => state.chat.dismiss(
-                                        widget.peerId,
-                                        message.id,
-                                      )
-                                    : null,
-                                onReact: (emoji, {required remove}) =>
-                                    _react(message.id, emoji, remove: remove),
-                                onPickReaction: () => _pickReaction(message),
-                              ),
+                                        : null,
+                                    onReact: (emoji, {required remove}) =>
+                                        _react(
+                                          message.id,
+                                          emoji,
+                                          remove: remove,
+                                        ),
+                                    onPickReaction: () =>
+                                        _pickReaction(message),
+                                  ),
+                                );
+                              },
                             );
                           },
                         ),
@@ -946,11 +972,19 @@ class _ChatBubble extends StatelessWidget {
   /// being null — an orphan must still show its marker.
   final ChatMessage? parent;
 
+  /// How wide this bubble may grow, measured by the thread from its own column
+  /// rather than from the window. Passed in because a bubble cannot measure it
+  /// here: a [Row] hands its inflexible children an unbounded width, so
+  /// anything asked locally is either infinity or the window — and the window
+  /// is the wrong answer inside a capped [ContentPane].
+  final double maxWidth;
+
   const _ChatBubble({
     required this.message,
     required this.selecting,
     required this.selected,
     required this.onToggle,
+    required this.maxWidth,
     this.error,
     this.parent,
     this.onDismiss,
@@ -987,9 +1021,7 @@ class _ChatBubble extends StatelessWidget {
             const Gap(AppSpace.xs),
           ],
           ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: MediaQuery.sizeOf(context).width * 0.75,
-            ),
+            constraints: BoxConstraints(maxWidth: maxWidth),
             child: Material(
               color: bg,
               borderRadius: BorderRadius.circular(AppRadius.lg),
@@ -1072,15 +1104,30 @@ class _ChatBubble extends StatelessWidget {
                           // button costs a few pixels and no latency.
                           if (onPickReaction != null && !selecting) ...[
                             const Gap(AppSpace.xxs),
+                            // A full [kMinInteractiveDimension] square. The
+                            // glyph stays 14px — this row is metadata, not a
+                            // toolbar — but the *target* was 18px too, which
+                            // is a third of the minimum: a thumb aimed at it
+                            // landed on the bubble instead, and the bubble's
+                            // own onTap opens the file. The row grows to 48
+                            // and every bubble with it, which is the cheaper
+                            // half of the trade — a control that cannot be
+                            // hit is not a smaller control, it is an absent
+                            // one.
                             InkWell(
                               onTap: onPickReaction,
-                              borderRadius: BorderRadius.circular(AppRadius.sm),
-                              child: Padding(
-                                padding: const EdgeInsets.all(2),
-                                child: Icon(
-                                  Icons.add_reaction_outlined,
-                                  size: 14,
-                                  color: fg.withValues(alpha: 0.7),
+                              borderRadius: BorderRadius.circular(
+                                kMinInteractiveDimension / 2,
+                              ),
+                              child: SizedBox(
+                                width: kMinInteractiveDimension,
+                                height: kMinInteractiveDimension,
+                                child: Center(
+                                  child: Icon(
+                                    Icons.add_reaction_outlined,
+                                    size: 14,
+                                    color: fg.withValues(alpha: 0.7),
+                                  ),
                                 ),
                               ),
                             ),

@@ -212,8 +212,18 @@ class SettingsScreen extends StatelessWidget {
                       SwitchListTile.adaptive(
                         secondary: const Icon(Icons.verified_user_rounded),
                         title: const Text('Auto-accept trusted devices'),
+                        // "Pinned" promised more than the engine does. A key is
+                        // pinned the first time a stranger reaches this machine
+                        // — before anyone has decided anything — and
+                        // `admit_transfer` auto-accepts only when the device
+                        // both is approved and still may send files. So a
+                        // pinned-but-unapproved device is prompted for with
+                        // this switch on, exactly as it is with it off, and
+                        // saying otherwise invited someone to leave this on
+                        // believing it covered strangers.
                         subtitle: const Text(
-                          'Skip the prompt for pinned devices',
+                          'Skip the prompt for approved devices that may send '
+                          'files',
                         ),
                         value: state.settings.autoAcceptTrusted,
                         onChanged: _guardedSwitch(

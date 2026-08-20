@@ -83,6 +83,23 @@ class AppShell extends StatelessWidget {
           bottomNavigationBar: NavigationBar(
             selectedIndex: index,
             onDestinationSelected: _go,
+            // Icons only, overriding the theme's `onlyShowSelected`, because
+            // seven destinations do not leave room for a word. Each one gets
+            // width/7 — about 51px on a 360px phone — and `NavigationBar` lays
+            // its label out inside exactly that, with no maxLines to stop it:
+            // "Transfers" wrapped to three lines, and because the bar's height
+            // is fixed at 68 the layout pushed the icon out of the top of the
+            // bar and the label off the bottom of the screen. Nothing threw —
+            // it just drew outside itself, which is why this survived six
+            // destinations and was only noticed at seven.
+            //
+            // The label is not lost: `NavigationDestination.tooltip` is set to
+            // it below, and the bar keeps the label in the semantics tree
+            // whatever this behaviour is (`FadeTransition` with
+            // `alwaysIncludeSemantics`), so a screen reader still names every
+            // destination. The rail keeps its text — from `Breakpoints.compact`
+            // up there is room for it.
+            labelBehavior: NavigationDestinationLabelBehavior.alwaysHide,
             destinations: [
               for (var i = 0; i < _destinations.length; i++)
                 NavigationDestination(

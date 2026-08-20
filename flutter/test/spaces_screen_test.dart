@@ -19,12 +19,15 @@
 //     thing that actually needs doing: re-pair, or take it out.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:peerbeam/features/spaces/spaces_screen.dart';
+import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/app_scope.dart';
+import 'package:peerbeam/state/staging.dart';
 import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
@@ -339,5 +342,80 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(_copy(tester), contains('No longer trusted'));
     expect(find.text('1 device \u00b7 2 no longer trusted'), findsOneWidget);
+  });
+
+  /// **The picker has to be told what is already staged.** On Android the
+  /// native picker streams each pick into its own cache and prunes that cache
+  /// by age on every new pick, so a call that does not name the paths the Send
+  /// tray still holds lets it delete that batch out from under the tray. Every
+  /// other call site passes `keep:`; this one omitted it, which made "stage a
+  /// few files, then send some to a Space" a way to lose the first few.
+  ///
+  /// Asserted on the argument the channel actually receives, like
+  /// `desktop_files_test.dart` does — that a call was made proves nothing here.
+  testWidgets('sending to a Space tells the picker what is already staged', (
+    tester,
+  ) async {
+    MethodCall? pick;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('peerbeam/android'),
+      (c) async {
+        if (c.method == 'pickFiles') pick = c;
+        return <Map<String, Object?>>[];
+      },
+    );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('peerbeam/android'),
+            null,
+          ),
+    );
+
+    final fake = FakePeerBeam()
+      ..spaceList = const [
+        Space(id: 'sp0', name: 'Work', live: ['pb-a']),
+      ];
+    final state = await _open(tester, fake);
+
+    // A Space can only be sent to once discovery has an address for a member.
+    fake.emit(
+      const DeviceAdded(
+        SdkDevice(
+          id: 'pb-a',
+          name: 'Alice Laptop',
+          kind: 'laptop',
+          platform: 'linux',
+          addresses: ['127.0.0.1'],
+          port: 49600,
+          online: true,
+          latencyMs: 5,
+          reachableLan: true,
+          reachableRemote: false,
+        ),
+      ),
+    );
+    // And the tray has to be holding something for there to be anything to
+    // lose.
+    state.staging.add([
+      StagedFile(path: '/cache/picked/1/a.bin', name: 'a.bin', size: 1),
+      StagedFile(path: '/cache/picked/1/b.bin', name: 'b.bin', size: 2),
+    ]);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('space-sp0-send')));
+    await tester.pumpAndSettle();
+
+    expect(pick, isNotNull, reason: 'the picker was never opened');
+    // Matched rather than cast, so omitting `keep:` altogether — which sends no
+    // arguments at all — reads as a failed expectation and not a type error.
+    expect(
+      pick!.arguments,
+      isA<Map<Object?, Object?>>().having((m) => m['keep'], 'keep', [
+        '/cache/picked/1/a.bin',
+        '/cache/picked/1/b.bin',
+      ]),
+      reason: 'the picker was not told what the Send tray still holds',
+    );
   });
 }

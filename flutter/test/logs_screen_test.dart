@@ -22,12 +22,20 @@ import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
-LogLine _line(String level, String message) => LogLine(
-  at: '2026-08-19T10:04:12.123Z',
-  level: level,
-  target: 'pb',
-  message: message,
-);
+LogLine _line(String level, String message, {String at = _utcStamp}) =>
+    LogLine(at: at, level: level, target: 'pb', message: message);
+
+/// What `peerbeam-logs` writes: `Utc::now().to_rfc3339()`.
+const _utcStamp = '2026-08-19T10:04:12.123Z';
+
+/// `at` on this machine's clock, `HH:mm:ss` — computed rather than written out,
+/// so the expectation is right in every timezone a contributor runs the suite
+/// in (including UTC, where it happens to equal the stamp's own digits).
+String _localClock(String at) {
+  final local = DateTime.parse(at).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
+}
 
 Future<void> _open(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
@@ -100,7 +108,51 @@ void main() {
     final fake = FakePeerBeam()..logLines = [_line('WARN', 'peer unreachable')];
     await _open(tester, fake);
 
-    expect(find.text('10:04:12 · WARN · pb'), findsOneWidget);
+    expect(find.text('${_localClock(_utcStamp)} · WARN · pb'), findsOneWidget);
+  });
+
+  /// **The time is this device's, not the engine's.** The engine stamps every
+  /// line in UTC and the screen used to slice the characters after the `T`
+  /// straight out, so a machine in Kolkata showed 10:04 for a line written at
+  /// 15:34 on its own wall clock — five and a half hours of drift, unlabelled,
+  /// on the one screen whose whole job is matching "it broke just now" to a
+  /// line.
+  ///
+  /// Two offsets, because one is not enough to prove anything: whichever zone
+  /// the suite runs in, at most one of these can accidentally agree with the
+  /// stamp's own digits, so the naive substring cannot pass both.
+  testWidgets('a stamp is shown on this device\'s clock, not the engine\'s', (
+    tester,
+  ) async {
+    const ahead = '2026-08-19T10:04:12.123+05:30';
+    const behind = '2026-08-19T10:04:12.123-07:00';
+    final fake = FakePeerBeam()
+      ..logLines = [
+        _line('INFO', 'from a machine ahead of us', at: ahead),
+        _line('INFO', 'from a machine behind us', at: behind),
+      ];
+    await _open(tester, fake);
+
+    expect(find.text('${_localClock(ahead)} · INFO · pb'), findsOneWidget);
+    expect(find.text('${_localClock(behind)} · INFO · pb'), findsOneWidget);
+  });
+
+  /// The other half of that conversion: anything that is not a date *and* a
+  /// time is still shown exactly as it came. A bare date would otherwise parse
+  /// and render as `00:00:00` — a time nothing happened at — and a string that
+  /// is not a stamp at all has no shape to guess.
+  testWidgets('a stamp the screen cannot read is shown untouched', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..logLines = [
+        _line('INFO', 'no stamp', at: 'startup'),
+        _line('INFO', 'date only', at: '2026-08-19'),
+      ];
+    await _open(tester, fake);
+
+    expect(find.text('startup · INFO · pb'), findsOneWidget);
+    expect(find.text('2026-08-19 · INFO · pb'), findsOneWidget);
   });
 
   /// **Export reports where the file went.** A bug report needs the path, and

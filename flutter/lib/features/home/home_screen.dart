@@ -253,6 +253,9 @@ class _HomeScreenState extends State<HomeScreen> {
         context: context,
         builder: (context) => StatefulBuilder(
           builder: (context, setState) => AlertDialog(
+            // See `_editSavedDevice` for why this is scrollable — same three
+            // fields, same keyboard.
+            scrollable: true,
             title: const Text('Add device'),
             content: Column(
               mainAxisSize: MainAxisSize.min,
@@ -335,6 +338,14 @@ class _HomeScreenState extends State<HomeScreen> {
         context: context,
         builder: (context) => StatefulBuilder(
           builder: (context, setState) => AlertDialog(
+            // Scrollable, because three fields plus the validation line is
+            // taller than what a phone keyboard leaves of a 720px screen.
+            // `AlertDialog` shrinks itself to the space above the keyboard and
+            // gives the remainder to `content`, so an unscrolled Column
+            // overflowed — and the error line explaining what to fix was the
+            // first thing to fall off the bottom, which is the one part the
+            // user needed to read.
+            scrollable: true,
             title: const Text('Edit device'),
             content: Column(
               mainAxisSize: MainAxisSize.min,

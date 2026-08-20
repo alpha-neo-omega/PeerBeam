@@ -521,10 +521,26 @@ class _TransferCard extends StatelessWidget {
                           const Gap(AppSpace.xxs),
                           Row(
                             children: [
-                              Text(
-                                '${sending ? 'To' : 'From'} ${transfer.peerName}',
-                                style: text.bodySmall?.copyWith(
-                                  color: scheme.onSurfaceVariant,
+                              // The name yields, the state does not. A device
+                              // name is whatever its owner typed — "Sanjana's
+                              // MacBook Pro (work)" is ordinary — and this Row
+                              // gave it its full natural width, so on a phone
+                              // it pushed the state label off the card and
+                              // painted an overflow stripe where the progress
+                              // should be. The state label is a closed set of
+                              // short words (`TransferState.label`), so it
+                              // keeps its width and stays readable while the
+                              // name ellipsises; losing the tail of a name the
+                              // file above already identifies costs nothing,
+                              // losing "Failed" costs the whole card's point.
+                              Expanded(
+                                child: Text(
+                                  '${sending ? 'To' : 'From'} ${transfer.peerName}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: text.bodySmall?.copyWith(
+                                    color: scheme.onSurfaceVariant,
+                                  ),
                                 ),
                               ),
                               const Gap(AppSpace.xs),

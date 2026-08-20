@@ -16,6 +16,7 @@
 //! Verify(ok)                   R→S
 //! ```
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -503,10 +504,124 @@ async fn cancel_or_pause(
 /// *exactly* the name that would land on disk — a preview that sanitized
 /// differently would be a prompt that lies about what it is approving.
 pub(crate) fn sanitize_file_name(name: &str) -> String {
-    std::path::Path::new(name)
+    let base = std::path::Path::new(name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "received.bin".to_string())
+        .unwrap_or_else(|| "received.bin".to_string());
+    safe_component(&base).into_owned()
+}
+
+/// The one authority on what a single path component may be *on this
+/// platform*. Applied to every peer-supplied name the receiver writes: a
+/// single file's destination above, and — via [`crate::folder`] — each
+/// component of a folder entry's relative path and the folder's own root name.
+///
+/// Unix forbids only `/` and NUL in a name, both of which the callers already
+/// handle, so a name is passed through untouched there: rewriting
+/// `Chapter 1: Intro.md` on a Linux receiver would invent a problem the OS
+/// does not have. Windows is the platform with rules, and
+/// [`windows_safe_component`] is where they live.
+///
+/// `cfg!`, not `#[cfg]`: the Windows rules stay compiled — and unit-tested —
+/// on every platform, so a Linux test run still catches a break in the code
+/// path only Windows users take. The unused branch folds away at compile time.
+pub(crate) fn safe_component(name: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        Cow::Owned(windows_safe_component(name))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Rewrite one path component into the name Windows will actually create.
+///
+/// Three Windows behaviours turn a name that is perfectly ordinary on Unix
+/// into a problem here, and all three are silent:
+///
+/// * **Device names.** `File::create("nul.txt")` opens the NUL *device*: every
+///   write succeeds, every byte is discarded, the transfer verifies and reports
+///   success — and no file exists. The match is on the segment before the first
+///   `.`, so `aux.h`, `com1.log` and `prn` are hit too. A Linux peer sending a
+///   source tree with an `aux.h` in it is the realistic case, not an attack.
+/// * **Illegal characters.** `< > : " | ? *` and the control characters cannot
+///   appear in a name at all, so the create simply fails and the file is lost.
+/// * **Trailing dots and spaces.** Win32 strips them from a component before
+///   resolving it, so `report.` *is* `report`: the name we report to the user
+///   is not the name on disk, and in a folder receive (which writes with
+///   `open_write`, no collision handling) a sibling `report` is silently
+///   truncated by it.
+///
+/// Every case is **renamed**, never refused. The peer that sent `aux.h` is not
+/// an attacker, it is a Linux box with a legal filename; refusing costs the
+/// user the file, `aux_.h` costs them one character. Traversal is the opposite
+/// case — nothing to preserve — and is still rejected upstream
+/// (`folder::sanitize_rel`, and `Path::file_name` for a single file).
+///
+/// Never returns an empty string for a non-empty input: every rule substitutes
+/// or appends, none deletes, so callers keep their existing placeholder logic
+/// for the genuinely nameless case.
+fn windows_safe_component(name: &str) -> String {
+    // Substituting beats deleting for the same reason chat's `display_name`
+    // substitutes: a deleted character leaves no evidence it was ever there,
+    // and a name deleted down to nothing would need a second fallback here.
+    // The two separators are mapped as well, so this function's output is a
+    // single component whatever it is handed.
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    // One `_` for the whole trailing run, rather than dropping it: `report.`
+    // stays distinct from `report` instead of quietly becoming it. This also
+    // disarms `.. ` and `...`, which Win32 trims back to a `..` that climbs
+    // out of the destination — `sanitize_rel` only rejects the exact `..`.
+    let keep = out.trim_end_matches(['.', ' ']).len();
+    if keep < out.len() {
+        out.truncate(keep);
+        out.push('_');
+    }
+
+    // Device check last, on the name as it will finally be written: `nul.txt.`
+    // reaches the NUL device (Windows drops that trailing dot), so a check made
+    // before the dot was dealt with would wave it through.
+    let seg_end = out.find('.').unwrap_or(out.len());
+    if is_windows_device(&out[..seg_end]) {
+        out.insert(seg_end, '_');
+    }
+    out
+}
+
+/// Does `segment` name a Win32 character device?
+///
+/// Matched case-insensitively and with a trailing run of spaces ignored,
+/// because Win32 does both before resolving a name: `NUL`, `nul` and `nul `
+/// are one device, which is why `nul .txt` has to be caught as well.
+fn is_windows_device(segment: &str) -> bool {
+    let upper = segment.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    // The numbered ports: COM0–COM9 and LPT0–LPT9, plus the superscript
+    // spellings (`COM¹`) Microsoft documents as resolving to the same devices.
+    // Exactly one digit — `com10.log` is an ordinary file.
+    let Some(port) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut digits = port.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('0'..='9' | '¹' | '²' | '³'), None)
+    )
 }
 
 async fn recv_meta(link: &mut dyn Link) -> Result<TransferMeta> {
@@ -674,5 +789,87 @@ pub(crate) fn build_progress(
         files_completed,
         files_total,
         eta_secs: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_file_name_keeps_only_the_base_component() {
+        assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name("photo.jpg"), "photo.jpg");
+        assert_eq!(sanitize_file_name(""), "received.bin");
+        assert_eq!(sanitize_file_name("/"), "received.bin");
+        assert_eq!(sanitize_file_name(".."), "received.bin");
+    }
+
+    /// A Windows device name must be renamed, not written: `File::create` on
+    /// `nul.txt` opens the NUL device, every write is discarded, and the
+    /// transfer reports success for a file that does not exist. The stem is
+    /// what matches, so ordinary Unix names (`aux.h`, `com1.log`) are affected.
+    #[test]
+    fn windows_device_names_are_renamed_not_written_to_the_device() {
+        assert_eq!(windows_safe_component("nul.txt"), "nul_.txt");
+        assert_eq!(windows_safe_component("aux.h"), "aux_.h");
+        assert_eq!(windows_safe_component("com1.log"), "com1_.log");
+        assert_eq!(windows_safe_component("LPT9"), "LPT9_");
+        assert_eq!(windows_safe_component("NUL"), "NUL_");
+        assert_eq!(windows_safe_component("nul.tar.gz"), "nul_.tar.gz");
+        // Win32 trims a component's trailing spaces and dots before resolving
+        // it, so both of these still reach the device without the rename.
+        assert_eq!(windows_safe_component("nul .txt"), "nul _.txt");
+        assert_eq!(windows_safe_component("nul.txt."), "nul_.txt_");
+        // Names that merely start like a device are left alone.
+        assert_eq!(windows_safe_component("nullify.txt"), "nullify.txt");
+        assert_eq!(windows_safe_component("com10.log"), "com10.log");
+        assert_eq!(windows_safe_component("comment.md"), "comment.md");
+    }
+
+    #[test]
+    fn windows_illegal_characters_become_underscores() {
+        assert_eq!(
+            windows_safe_component(r#"a<b>c:d"e|f?g*h"#),
+            "a_b_c_d_e_f_g_h"
+        );
+        assert_eq!(windows_safe_component("tab\there"), "tab_here");
+        // Separators too, so the result is always a single component.
+        assert_eq!(windows_safe_component(r"a/b\c"), "a_b_c");
+    }
+
+    /// Windows strips a trailing run of dots and spaces, so without this the
+    /// reported name is not the name on disk and `report.` silently becomes
+    /// `report`.
+    #[test]
+    fn windows_trailing_dots_and_spaces_collapse_to_one_underscore() {
+        assert_eq!(windows_safe_component("report."), "report_");
+        assert_eq!(windows_safe_component("report "), "report_");
+        assert_eq!(windows_safe_component("report. . "), "report_");
+        assert_eq!(windows_safe_component("report.txt"), "report.txt");
+        assert_eq!(windows_safe_component(".hidden"), ".hidden");
+        // `.. ` and `...` are trimmed back to `..` by Win32 — a traversal that
+        // `sanitize_rel`'s exact-`..` check does not see.
+        assert_eq!(windows_safe_component(".. "), "_");
+        assert_eq!(windows_safe_component("..."), "_");
+    }
+
+    /// The platform gate itself: a Unix receiver must not rewrite names its
+    /// filesystem accepts, and a Windows receiver must.
+    #[test]
+    fn only_windows_rewrites_a_legal_unix_name() {
+        if cfg!(windows) {
+            assert_eq!(sanitize_file_name("aux.h"), "aux_.h");
+            assert_eq!(
+                sanitize_file_name("Chapter 1: Intro.md"),
+                "Chapter 1_ Intro.md"
+            );
+        } else {
+            assert_eq!(sanitize_file_name("aux.h"), "aux.h");
+            assert_eq!(
+                sanitize_file_name("Chapter 1: Intro.md"),
+                "Chapter 1: Intro.md"
+            );
+        }
     }
 }

@@ -81,7 +81,7 @@ impl SyncIndex {
     }
 
     fn namespace(folder: &str) -> String {
-        format!("{NS}-{folder}")
+        format!("{NS}-{}", namespace_slug(folder))
     }
 
     /// Everything known about `folder`, keyed by relative path.
@@ -544,5 +544,120 @@ mod tests {
 
         idx.rescan("f", &root).unwrap();
         assert!(idx.load("f").unwrap().contains_key("sub/b.txt"));
+    }
+}
+
+/// A folder path reduced to something an [`AppStore`] namespace accepts.
+///
+/// # Why this exists
+///
+/// `FsAppStore::namespace_dir` allows only `[A-Za-z0-9._-]`, and the folder name
+/// was being interpolated raw. So folder sync failed outright — before a byte
+/// moved, with an internal "invalid namespace" error — for a share called
+/// `My Photos`, for anything with an accent or an `&`, and for **every nested
+/// path**, which is the only thing the Browse screen's Sync button can produce
+/// below the top level. The most ordinary case was broken.
+///
+/// Percent-encoding rather than a hash: two different folders must not collide,
+/// and a person reading the store directory should still be able to tell which
+/// folder a namespace belongs to. `%` is escaped first so the encoding is
+/// reversible — the same rule `key` already follows for record keys.
+fn namespace_slug(folder: &str) -> String {
+    let mut out = String::with_capacity(folder.len());
+    for b in folder.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+            out.push(c);
+        } else if c == '_' {
+            // Doubled, so a literal underscore can never be read as the start
+            // of an escape. My first attempt used `%XX` — which the store
+            // rejects just as surely as a space, since `%` is not in its
+            // allowed set either. The escape character has to come from inside
+            // the permitted alphabet.
+            out.push_str("__");
+        } else {
+            out.push('_');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    /// **The ordinary case was broken.** A share with a space in its name, or
+    /// any nested path — which is the only thing the app's Sync button produces
+    /// below the top level — made the whole sync fail with an internal
+    /// "invalid namespace" error before a byte moved.
+    #[test]
+    fn a_folder_with_a_space_or_a_slash_yields_a_usable_namespace() {
+        for folder in ["My Photos", "Photos/2026", "Ünïcode", "a&b", "with:colon"] {
+            let ns = SyncIndex::namespace(folder);
+            assert!(
+                ns.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                "namespace {ns:?} for {folder:?} is still not storable"
+            );
+            assert!(!ns.is_empty());
+        }
+    }
+
+    /// Two folders must not share a namespace, or one would read the other's
+    /// index and sync the wrong files.
+    #[test]
+    fn different_folders_do_not_collide() {
+        let a = SyncIndex::namespace("Photos/2026");
+        let b = SyncIndex::namespace("Photos-2026");
+        let c = SyncIndex::namespace("Photos 2026");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    /// A plain name is left alone, so existing stores keep their directory.
+    #[test]
+    fn an_already_safe_name_is_unchanged() {
+        assert_eq!(SyncIndex::namespace("Documents"), format!("{NS}-Documents"));
+    }
+}
+
+#[cfg(test)]
+mod nested_folder_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// **The bug, end to end.** A legal namespace string is not the point; the
+    /// point is that a nested folder can be indexed at all. Before the slug,
+    /// this call returned `Err("invalid namespace \"sync-index-Photos/2026\"")`
+    /// and the app reported "Sync failed" for the only kind of path its Browse
+    /// screen can produce below the top level.
+    #[test]
+    fn a_nested_folder_can_be_indexed_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> =
+            Arc::new(peerbeam_crypto::AeadCrypto::new());
+        let key = peerbeam_crypto::derive_subkey(&[7u8; 32], b"peerbeam-appstore-v1");
+        let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+            peerbeam_appstore_fs::FsAppStore::open(dir.path().join("appstore"), key, enc),
+        );
+        let index = SyncIndex::new(app, "pb-me");
+
+        for folder in ["Photos/2026", "My Photos", "a&b"] {
+            let entry = IndexEntry {
+                path: "x.txt".into(),
+                size: 3,
+                modified: 0,
+                content: "abc".into(),
+                version: VersionVector::new(),
+                deleted: false,
+            };
+            index
+                .put(folder, &entry)
+                .unwrap_or_else(|e| panic!("{folder:?} could not be indexed: {e}"));
+            let back = index.load(folder).expect("load");
+            assert!(back.contains_key("x.txt"), "{folder:?} did not read back");
+        }
     }
 }

@@ -83,6 +83,14 @@ dependencies {
     // Storage Access Framework helper: copy received files into the user's
     // chosen folder (a content:// tree the Rust engine can't write directly).
     implementation("androidx.documentfile:documentfile:1.0.1")
+
+    // Plain JVM unit tests (`./gradlew :app:testDebugUnitTest`) for the
+    // platform layer's decision logic — the naming rule that keeps a received
+    // file from overwriting one the user already has, for instance. Deliberately
+    // junit only, with no Robolectric: anything that needs a live Activity or a
+    // ContentResolver belongs on a device, and everything worth asserting here
+    // is reachable as a pure function with its lookups injected.
+    testImplementation("junit:junit:4.13.2")
 }
 
 flutter {

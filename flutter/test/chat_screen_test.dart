@@ -882,4 +882,136 @@ void main() {
       reason: 'a watermark was sent for a thread the peer never wrote in',
     );
   });
+
+  /// **A bubble belongs to the thread's column, not to the window.** The thread
+  /// sits in a [ContentPane] capped at `Breakpoints.contentMaxWidth`; a cap
+  /// measured off `MediaQuery.sizeOf(context).width` is wider than that column
+  /// on any monitor past 1200px, so a long message drew a bubble the list then
+  /// had to clip — text cut off mid-word, or laid over the far edge of the
+  /// pane.
+  ///
+  /// Asserted on the paragraph's own rectangle against the list's — the list
+  /// *is* the column, since [ContentPane]'s own box fills the window and only
+  /// its child is narrowed — rather than on a widget's constraints: what
+  /// matters is where the words end up.
+  testWidgets('a long message stays inside the thread column on a wide window', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    const long =
+        'the engine came back up on its own after the router rebooted and the '
+        'transfer resumed from where it stopped, which is the whole point of '
+        'the resume work and worth writing down at length';
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: long,
+        at: DateTime.now(),
+        status: ChatStatusValue.received,
+      ),
+    ];
+    await _open(tester, fake);
+
+    final column = tester.getRect(find.byType(ListView));
+    final words = tester.getRect(find.text(long));
+    expect(
+      words.left,
+      greaterThanOrEqualTo(column.left),
+      reason: 'the bubble ran off the left of its own column',
+    );
+    expect(
+      words.right,
+      lessThanOrEqualTo(column.right),
+      reason: 'the bubble ran off the right of its own column',
+    );
+    expect(
+      tester.takeException(),
+      isNull,
+      reason: 'the bubble overflowed the row it sits in',
+    );
+  });
+
+  /// The same cap on a phone, where three quarters of the column is the point:
+  /// a bubble that filled the width would leave nothing to tell "mine" from
+  /// "theirs".
+  testWidgets('a long message still leaves a margin on a phone', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 720);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    const long =
+        'a message long enough to wrap several times on a phone screen';
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: long,
+        at: DateTime.now(),
+        status: ChatStatusValue.received,
+      ),
+    ];
+    await _open(tester, fake);
+
+    final column = tester.getRect(find.byType(ListView));
+    final words = tester.getRect(find.text(long));
+    expect(words.right, lessThanOrEqualTo(column.right));
+    expect(
+      words.width,
+      lessThan(column.width * 0.8),
+      reason: 'the bubble should stop well short of the full column',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  /// **The add-reaction control has to be hittable.** Its glyph is 14px and
+  /// used to be the entire target — about a third of the 48dp minimum — so a
+  /// thumb aimed at it landed on the bubble, whose own tap handler opens the
+  /// attached file. Checked by tapping the corner of the target, which is the
+  /// part that did not exist before.
+  testWidgets('the add-reaction control fills a 48dp tap target', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      ChatMessage(
+        id: 'm1',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'ship it',
+        at: DateTime.now(),
+        status: ChatStatusValue.sent,
+      ),
+    ];
+    await _open(tester, fake);
+
+    final target = find
+        .ancestor(
+          of: find.byIcon(Icons.add_reaction_outlined),
+          matching: find.byType(InkWell),
+        )
+        .first;
+    final box = tester.getRect(target);
+    expect(box.width, greaterThanOrEqualTo(kMinInteractiveDimension));
+    expect(box.height, greaterThanOrEqualTo(kMinInteractiveDimension));
+
+    // Two pixels inside the corner: inside the target, far outside the glyph.
+    await tester.tapAt(box.topLeft + const Offset(2, 2));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byTooltip('React with \u{1F44D}'),
+      findsOneWidget,
+      reason: 'the corner of the target did not open the reaction picker',
+    );
+  });
 }

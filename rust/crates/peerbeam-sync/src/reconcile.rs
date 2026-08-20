@@ -232,7 +232,7 @@ fn reconcile_raw(
 mod tests {
     use super::*;
 
-    fn vv(pairs: &[(&str, u64)]) -> VersionVector {
+    pub(crate) fn vv(pairs: &[(&str, u64)]) -> VersionVector {
         let mut v = VersionVector::new();
         for (d, n) in pairs {
             for _ in 0..*n {
@@ -242,7 +242,7 @@ mod tests {
         v
     }
 
-    fn local(entries: &[(&str, VersionVector, bool)]) -> BTreeMap<String, IndexEntry> {
+    pub(crate) fn local(entries: &[(&str, VersionVector, bool)]) -> BTreeMap<String, IndexEntry> {
         entries
             .iter()
             .map(|(p, v, deleted)| {
@@ -261,7 +261,7 @@ mod tests {
             .collect()
     }
 
-    fn remote(path: &str, v: VersionVector, deleted: bool) -> RemoteFile {
+    pub(crate) fn remote(path: &str, v: VersionVector, deleted: bool) -> RemoteFile {
         RemoteFile {
             path: path.to_string(),
             size: 1,
@@ -501,5 +501,46 @@ mod tests {
         assert_eq!(conflict_name("README", "bob"), "README.sync-conflict-bob");
         // A leading dot is a hidden file, not an extension.
         assert_eq!(conflict_name(".bashrc", "bob"), ".bashrc.sync-conflict-bob");
+    }
+}
+
+#[cfg(test)]
+mod conflict_pair_tests {
+    use super::tests::{local, remote, vv};
+    use super::*;
+
+    /// **A conflict names two different paths, and a caller must carry both.**
+    ///
+    /// `Action::Conflict` exists precisely because the peer's copy must land
+    /// beside the user's rather than on top of it: `path` is what to ask the
+    /// peer for, `keep_as` is where to put it. A caller that collapses the two
+    /// to `path` writes the peer's bytes over the local file — which the FFI
+    /// sync path did, while reporting that both copies had been kept.
+    ///
+    /// This test exists so the pair cannot quietly become one field again.
+    #[test]
+    fn a_conflict_carries_a_destination_distinct_from_its_source() {
+        let acts = reconcile(
+            &local(&[("notes.txt", vv(&[("me", 2), ("bob", 1)]), false)]),
+            &[remote("notes.txt", vv(&[("me", 1), ("bob", 2)]), false)],
+            "bob",
+        );
+        let (path, keep_as) = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::Conflict { path, keep_as } => Some((path, keep_as)),
+                _ => None,
+            })
+            .expect("divergent edits must conflict");
+
+        assert_eq!(path, "notes.txt", "the source is the peer's path");
+        assert_ne!(
+            path, keep_as,
+            "the destination must differ, or writing it destroys the local file"
+        );
+        assert!(
+            keep_as.contains("sync-conflict"),
+            "the destination should be recognisable as a conflict copy: {keep_as}"
+        );
     }
 }

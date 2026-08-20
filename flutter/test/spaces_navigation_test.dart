@@ -91,4 +91,111 @@ void main() {
     expect(find.widgetWithText(AppBar, 'Spaces'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  /// **The bar has to stay inside itself, and no exception says when it does
+  /// not.**
+  ///
+  /// Seven destinations give each about 51px on a 360px phone, and
+  /// `NavigationBar` lays a destination's label out inside exactly that with no
+  /// maxLines to stop it wrapping. Its layout then places icon and label as one
+  /// stack centred in a bar whose height the theme fixes at 68 — so a label
+  /// that wrapped to three lines pushed the *icon* out through the top of the
+  /// bar and its own text off the bottom of the screen. Nothing threw: the bar
+  /// simply drew outside itself, which is why six destinations got away with it.
+  ///
+  /// Asserted on the selected destination, since that is the one whose label is
+  /// laid out, and on every destination in turn, because each label is a
+  /// different length.
+  testWidgets('the selected destination stays inside the bar on a phone', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 720);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await _boot(tester);
+
+    // Outlined icon to tap with, filled icon to measure once selected — the
+    // bar swaps one for the other, and the selected one is the interesting one.
+    const destinations = <({IconData unselected, IconData selected})>[
+      (
+        unselected: Icons.devices_other_outlined,
+        selected: Icons.devices_other_rounded,
+      ),
+      (unselected: Icons.forum_outlined, selected: Icons.forum_rounded),
+      (
+        unselected: Icons.swap_horiz_outlined,
+        selected: Icons.swap_horiz_rounded,
+      ),
+      (unselected: Icons.history_outlined, selected: Icons.history_rounded),
+      (unselected: Icons.settings_outlined, selected: Icons.settings_rounded),
+      (
+        unselected: Icons.workspaces_outlined,
+        selected: Icons.workspaces_rounded,
+      ),
+    ];
+    for (final destination in destinations) {
+      final bar = find.byType(NavigationBar);
+      await tester.tap(
+        find.descendant(of: bar, matching: find.byIcon(destination.unselected)),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final barRect = tester.getRect(bar);
+      final icon = tester.getRect(
+        find.descendant(of: bar, matching: find.byIcon(destination.selected)),
+      );
+      expect(
+        icon.top,
+        greaterThanOrEqualTo(barRect.top),
+        reason: '${destination.selected} was pushed out of the top of the bar',
+      );
+      expect(
+        icon.bottom,
+        lessThanOrEqualTo(barRect.bottom),
+        reason:
+            '${destination.selected} was pushed out of the bottom of the bar',
+      );
+    }
+  });
+
+  /// The other half of that fix: the labels are hidden on the compact bar, so
+  /// each destination has to name itself some other way. Both ways it already
+  /// had are kept — the long-press tooltip, and the semantics label a screen
+  /// reader announces — because an unlabelled row of seven icons is a different
+  /// bug, not a fix for this one.
+  testWidgets('every compact destination still names itself', (tester) async {
+    tester.view.physicalSize = const Size(360, 720);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    final semantics = tester.ensureSemantics();
+
+    await _boot(tester);
+
+    for (final label in [
+      'Home',
+      'Devices',
+      'Chats',
+      'Transfers',
+      'History',
+      'Settings',
+      'Spaces',
+    ]) {
+      expect(
+        find.byTooltip(label),
+        findsOneWidget,
+        reason: 'a long press on the $label destination must name it',
+      );
+      expect(
+        find.bySemanticsLabel(RegExp(label)),
+        findsWidgets,
+        reason: 'a screen reader must still announce $label',
+      );
+    }
+    // Disposed here rather than in a tearDown: the framework checks for leaked
+    // handles before tearDowns run, so a deferred dispose fails the test it was
+    // meant to keep clean.
+    semantics.dispose();
+  });
 }

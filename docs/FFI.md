@@ -497,7 +497,11 @@ Notes / honest scope:
 - **Settings** persist to `<data_dir>/ffi_settings.json` and are versioned; they
   apply to the engine on next `pb_init` (no live engine-mutation API), plus the
   live deltas `apply_live_settings` pushes (save directory, auto-accept, device
-  name, auto-save rules).
+  name, auto-save rules). A document this build **cannot parse** is not treated
+  as a missing one: it is renamed to `ffi_settings.json.corrupt-<UTC stamp>`,
+  the reason is logged, and defaults are written in its place. No write — `set`,
+  `reset`, or the first-run seed — ever lands on top of an unreadable document,
+  and a rename that fails refuses the write rather than destroying it.
 - **Auto-save rules** are stored in that same document under `save_rules` and
   overlaid onto `EngineConfig.storage.rules`, which is what the receive path's
   one matcher reads — the same road `transfer_directory` takes. They are

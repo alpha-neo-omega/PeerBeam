@@ -19,7 +19,7 @@ use crate::session_transfer;
 pub async fn pair(ctx: &Ctx, args: PairArgs, path_override: Option<&str>) -> CliResult {
     let config = commands::load_config(path_override)?;
     let sc = SecureCtx::build(&config)?;
-    let devices = commands::snapshot(config.clone(), 2).await;
+    let devices = commands::snapshot(config.clone(), 2).await?;
     let candidates: Vec<(String, String)> = devices
         .iter()
         .map(|m| (m.device.id.to_string(), m.device.name.clone()))

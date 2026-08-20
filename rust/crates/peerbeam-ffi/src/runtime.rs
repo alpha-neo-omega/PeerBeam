@@ -18,7 +18,7 @@ use peerbeam_discovery_udp::{Config as UdpConfig, UdpDiscovery};
 use peerbeam_domain::entity::{Device, DeviceType};
 use peerbeam_domain::event::DeviceChange;
 use peerbeam_domain::id::DeviceId;
-use peerbeam_engine::{Engine, EngineBuilder, RouteManager, SessionDiagnostics};
+use peerbeam_engine::{Engine, EngineBuilder, EngineError, RouteManager, SessionDiagnostics};
 use peerbeam_transfer_quic::QuicTransport;
 use peerbeam_trust_fs::FsTrust;
 
@@ -210,10 +210,46 @@ fn apply_live_device_name(m: &Arc<Manager>, name: &str) {
     if DISCOVERING.load(Ordering::SeqCst) {
         if let Ok(engine) = engine() {
             rt().block_on(async {
-                let _ = engine.stop_discovery().await;
-                let _ = engine.start_discovery(me).await;
+                let stopped = engine.stop_discovery().await;
+                let started = engine.start_discovery(me).await;
+                record_discovery_restart(stopped, started);
             });
         }
+    }
+}
+
+/// Keep [`DISCOVERING`] honest after a rename's discovery restart, and say what
+/// the user is about to see.
+///
+/// The restart used to discard both results. When the `start` half failed,
+/// discovery was genuinely off — the `stop` had already run — while
+/// `DISCOVERING` still claimed it was running and nothing anywhere said
+/// otherwise. From the outside that is indistinguishable from a network with no
+/// devices on it: an empty list, forever, with no reason given and no reason
+/// findable. In this crate a `tracing` line is not a void — [`crate::logs`]
+/// streams it to the surface as a `log_received` event and to the log file — so
+/// this is the one place the failure becomes visible.
+///
+/// Split out from [`apply_live_device_name`] so the part that was wrong (the
+/// decision) is testable without a live engine holding a bound socket.
+fn record_discovery_restart(stopped: Result<(), EngineError>, started: Result<(), EngineError>) {
+    if let Err(e) = stopped {
+        // A stop that failed can leave a provider still advertising, and
+        // `advertise()` no-ops while already advertising (see the caller's
+        // note) — so the restart may not carry the new name at all. Worth a
+        // line either way: peers still showing the old name is otherwise an
+        // unexplainable rename that "didn't work".
+        tracing::warn!(error = %e, "rename: discovery did not stop cleanly; peers may keep showing the old name");
+    }
+    if let Err(e) = started {
+        // Record the truth first: every later reader of this flag — the next
+        // rename included — must not be told discovery is running when the
+        // socket behind it is gone.
+        DISCOVERING.store(false, Ordering::SeqCst);
+        tracing::error!(
+            error = %e,
+            "rename: discovery did not restart, so the device list will stay empty until discovery is started again"
+        );
     }
 }
 
@@ -843,5 +879,62 @@ mod tests {
             peerbeam_chat::Status::Interrupted,
             "a restart must settle a row that no event will ever finish"
         );
+    }
+
+    fn bind_failed() -> EngineError {
+        EngineError::Domain(peerbeam_domain::DomainError::Connection(
+            "address already in use".into(),
+        ))
+    }
+
+    /// A rename restarts discovery (stop, then start with the new name). When
+    /// the start half fails there is no discovery running — and the flag that
+    /// says there is must not keep saying it.
+    ///
+    /// Both results used to be discarded, which left `DISCOVERING` reading
+    /// `true` over a dead socket and nothing logged: an empty device list,
+    /// forever, with nothing anywhere to explain it. The flag is the part a
+    /// test can hold onto; the line naming the consequence goes to the
+    /// surface's own log stream (see `record_discovery_restart`).
+    ///
+    /// `#[serial_test::serial]`: `DISCOVERING` is a process-wide static that
+    /// the init/shutdown tests in this file also write.
+    #[test]
+    #[serial_test::serial]
+    fn a_rename_whose_discovery_restart_fails_stops_claiming_discovery_is_running() {
+        DISCOVERING.store(true, Ordering::SeqCst);
+
+        record_discovery_restart(Ok(()), Err(bind_failed()));
+
+        assert!(
+            !DISCOVERING.load(Ordering::SeqCst),
+            "discovery is not running — the flag a later rename reads must say so"
+        );
+    }
+
+    /// The other half of the contract: a restart that worked must leave the
+    /// flag alone, or the next rename would decline to re-announce and the
+    /// fix above would have cost the feature it was protecting.
+    #[test]
+    #[serial_test::serial]
+    fn a_rename_whose_discovery_restart_succeeds_keeps_discovering_true() {
+        DISCOVERING.store(true, Ordering::SeqCst);
+
+        record_discovery_restart(Ok(()), Ok(()));
+
+        assert!(DISCOVERING.load(Ordering::SeqCst));
+    }
+
+    /// A stop that failed is worth a line but not the flag: discovery is
+    /// running (the start succeeded), and clearing it here would stop the next
+    /// rename from ever re-announcing.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_stop_does_not_clear_the_flag_when_the_start_worked() {
+        DISCOVERING.store(true, Ordering::SeqCst);
+
+        record_discovery_restart(Err(bind_failed()), Ok(()));
+
+        assert!(DISCOVERING.load(Ordering::SeqCst));
     }
 }

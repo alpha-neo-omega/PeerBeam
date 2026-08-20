@@ -398,7 +398,17 @@ complete transfer is it **atomically** promoted:
   never created.
 
 Path names from peers are sanitized to a single base component (no `..`, no
-absolute paths).
+absolute paths), then reduced to what the receiving OS can actually hold. On
+Windows that last step matters more than it sounds: `File::create("nul.txt")`
+opens the NUL *device*, so every write succeeds, the checksum verifies, the
+transfer reports success — and no file exists. The reserved device stems
+(`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`), the characters
+`< > : " | ? *`, and a trailing run of dots or spaces are therefore each
+**renamed** — `nul.txt` becomes `nul_.txt` — never refused: the peer that sent
+`aux.h` is usually a Linux box with a perfectly legal filename, and refusing
+costs the user the file. Traversal is the opposite case, with nothing worth
+preserving, and is still rejected. Unix receivers pass names through untouched
+rather than inventing rules their filesystem does not have.
 
 ## Clipboard sync sends passwords, and nothing detects them
 

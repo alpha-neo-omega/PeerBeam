@@ -246,13 +246,26 @@ class _LogTile extends StatelessWidget {
     if (line.target.isNotEmpty) line.target,
   ].join(' · ');
 
-  /// The time out of an RFC-3339 stamp: `2026-08-19T10:04:12.123Z` reads as
-  /// `10:04:12`. The date is dropped because the buffer only ever covers the
-  /// running session. Anything that is not a stamp is shown exactly as it came
-  /// — guessing at its shape would be worse than a long string.
+  /// The time out of an RFC-3339 stamp, **on this device's clock**:
+  /// `2026-08-19T10:04:12.123Z` reads as `15:34:12` in Kolkata. The date is
+  /// dropped because the buffer only ever covers the running session.
+  ///
+  /// The conversion is the point. `peerbeam-logs` stamps every line with
+  /// `Utc::now().to_rfc3339()`, and this used to slice the characters after the
+  /// `T` straight out — printing UTC in a column headed by nothing, next to a
+  /// wall clock five and a half hours ahead of it. Anyone matching a log line
+  /// against "it broke just now" was reading a different clock than the one
+  /// they were reading the time from.
+  ///
+  /// Anything that is not a date **and** a time is shown exactly as it came:
+  /// guessing at its shape would be worse than a long string, and a date on its
+  /// own would render as `00:00:00` — a time nothing ever happened at.
   static String _clock(String at) {
-    final t = at.indexOf('T');
-    if (t < 0 || at.length < t + 9) return at;
-    return at.substring(t + 1, t + 9);
+    if (!at.contains('T')) return at;
+    final parsed = DateTime.tryParse(at);
+    if (parsed == null) return at;
+    final local = parsed.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(local.hour)}:${two(local.minute)}:${two(local.second)}';
   }
 }

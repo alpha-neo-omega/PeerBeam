@@ -368,4 +368,43 @@ void main() {
 
     expect(find.text('Version unknown · AGPL-3.0'), findsOneWidget);
   });
+
+  /// **The auto-accept switch must not promise more than the engine does.**
+  ///
+  /// Its subtitle read "Skip the prompt for pinned devices", and pinning is not
+  /// the bar: the handshake pins every stranger that reaches this machine, while
+  /// `admit_transfer` on the engine side auto-accepts only a device that is
+  /// *approved* and still holds the `files` permission. A user who read the old
+  /// line and left the switch on believed it covered devices that in fact still
+  /// prompt — the one direction this copy must never be wrong in, since the
+  /// whole point of the setting is knowing when nobody will be asked.
+  testWidgets('the auto-accept switch says approved, not pinned', (
+    tester,
+  ) async {
+    await _open(
+      tester,
+      FakePeerBeam(),
+      scrollTo: 'Auto-accept trusted devices',
+    );
+
+    final subtitle = find.descendant(
+      of: find.widgetWithText(SwitchListTile, 'Auto-accept trusted devices'),
+      matching: find.byType(Text),
+    );
+    final copy = tester
+        .widgetList<Text>(subtitle)
+        .map((t) => t.data ?? '')
+        .join(' ');
+
+    expect(
+      copy,
+      contains('approved'),
+      reason: 'approval is the state the engine actually requires',
+    );
+    expect(
+      copy,
+      isNot(contains('pinned')),
+      reason: 'a pinned-but-unapproved device is prompted for either way',
+    );
+  });
 }

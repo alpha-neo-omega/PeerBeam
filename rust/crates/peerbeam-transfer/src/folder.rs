@@ -28,9 +28,11 @@
 //! TODO(transfer): a proper `.part`-staged folder-resume (mirroring
 //! `stream::receive_file`) is a separate future task.
 //!
-//! A single unreadable source file (send side) or a destination path that
-//! collides with an existing directory (receive side) is skipped with a
-//! warning rather than aborting the whole transfer.
+//! A single unreadable source file (send side), or a destination path that
+//! collides with an existing directory or cannot be made safe to write
+//! (receive side), is skipped with a warning rather than aborting the whole
+//! transfer: the other files in the folder did nothing wrong, and no entry
+//! that is skipped was ever written.
 
 use futures::io::AsyncWrite;
 use futures::AsyncWriteExt;
@@ -46,7 +48,7 @@ use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
 use crate::stream::{
-    build_progress, read_fill, send_with_retry, signal_pause_edge, TransferOutcome,
+    build_progress, read_fill, safe_component, send_with_retry, signal_pause_edge, TransferOutcome,
 };
 
 // ── Wire messages ───────────────────────────────────────────────
@@ -438,13 +440,23 @@ pub async fn receive_folder(
                 }
                 FrameKind::Control => match parse_folder(&frame)? {
                     FolderMessage::FileHeader { path, .. } => {
-                        close_writer(current.take()).await;
-                        // Traversal/absolute paths are a security violation
-                        // from a peer that should not happen with a
-                        // conforming sender — reject outright rather than
-                        // silently continuing.
-                        let dp = dest_path(dest_dir, &root, &path)
-                            .ok_or_else(|| DomainError::Transfer(format!("unsafe path: {path}")))?;
+                        // The previous entry is finished by the arrival of the
+                        // next header when a sender omits `FileEnd`, so its
+                        // flush is as load-bearing here as it is there.
+                        close_writer(current.take()).await?;
+                        // A path with a `..` or a NUL in it is a violation no
+                        // conforming sender commits — but it is skipped like
+                        // any other entry that cannot land, not aborted.
+                        // Nothing is written either way (no destination was
+                        // even computed), so refusing the whole folder buys no
+                        // safety and costs the user every remaining file; the
+                        // warning is the record that it happened.
+                        let Some(dp) = dest_path(dest_dir, &root, &path) else {
+                            tracing::warn!("skipping folder entry with unsafe path {path}");
+                            current = None;
+                            current_skipped = true;
+                            continue;
+                        };
                         // Always write fresh (create/truncate): folder
                         // receives are never resumed (see module docs), so
                         // anything already at `dp` is overwritten rather than
@@ -466,18 +478,30 @@ pub async fn receive_folder(
                         }
                     }
                     FolderMessage::FileEnd { .. } => {
-                        close_writer(current.take()).await;
+                        // Before the count, not after: `files_completed` is
+                        // what the caller reports as arrived, and an entry
+                        // whose flush failed did not arrive.
+                        close_writer(current.take()).await?;
                         if !current_skipped {
                             files_completed += 1;
                         }
                         current_skipped = false;
                     }
                     FolderMessage::Complete => {
-                        close_writer(current.take()).await;
+                        close_writer(current.take()).await?;
                         break TransferOutcome::Completed;
                     }
                     FolderMessage::Cancel => {
-                        close_writer(current.take()).await;
+                        // Logged rather than propagated: this receive is ending
+                        // as `Cancelled` either way, so nothing is about to
+                        // claim the file arrived — and reporting a storage
+                        // error for a transfer the user (or the sender) stopped
+                        // would name the wrong cause. A partial file is the
+                        // expected outcome of a cancel; a *completed* entry
+                        // with a missing tail is what the `?`s above prevent.
+                        if let Err(e) = close_writer(current.take()).await {
+                            tracing::warn!("cancelled folder receive left a file unflushed: {e}");
+                        }
                         break TransferOutcome::Cancelled;
                     }
                     // Cooperative pause: the sender told us it paused/resumed.
@@ -572,11 +596,30 @@ async fn cancel_or_pause(
     Ok(None)
 }
 
-async fn close_writer(writer: Option<Box<dyn AsyncWrite + Unpin + Send>>) {
-    if let Some(mut w) = writer {
-        let _ = w.flush().await;
-        let _ = w.close().await;
-    }
+/// Finish the file just written, surfacing a **deferred** write failure.
+///
+/// A buffered writer accepts every `write_all` and can only discover at flush
+/// time that the bytes had nowhere to go — a disk that filled up, a quota, a
+/// volume that went away mid-folder. Dropping those two results is how a
+/// folder receive reported `Completed` for a file whose tail never landed:
+/// the entry was counted, the caller printed a success, and the sender was
+/// free to delete its copy. `stream::receive_file` has always propagated both
+/// (same `flush: {e}` / `close: {e}` wording), and this is the same failure on
+/// the folder path — not a different policy.
+///
+/// This is deliberately *not* the "skip the entry and warn" treatment given to
+/// a destination that cannot be opened at all: there, nothing was written and
+/// nothing was claimed. Here the bytes were already accepted and counted.
+async fn close_writer(writer: Option<Box<dyn AsyncWrite + Unpin + Send>>) -> Result<()> {
+    let Some(mut w) = writer else {
+        return Ok(());
+    };
+    w.flush()
+        .await
+        .map_err(|e| DomainError::Storage(format!("flush: {e}")))?;
+    w.close()
+        .await
+        .map_err(|e| DomainError::Storage(format!("close: {e}")))
 }
 
 async fn recv_resume(link: &mut dyn Link) -> Result<Vec<u64>> {
@@ -658,7 +701,11 @@ fn sanitize_name(name: &str) -> String {
     if base.is_empty() || base == "." || base == ".." {
         "folder".to_string()
     } else {
-        base
+        // The root is a *directory* this receiver creates, so it needs the
+        // same platform check as the files inside it: a folder named `aux`
+        // cannot be created on Windows at all, which would fail every entry
+        // in the tree rather than one name.
+        safe_component(&base).into_owned()
     }
 }
 
@@ -673,23 +720,33 @@ fn dest_path(dest_dir: &str, root: &str, rel: &str) -> Option<String> {
     ))
 }
 
-/// Sanitize a relative path: reject empty, absolute, `.` and `..` components.
+/// Sanitize a relative path: reject empty, absolute, `.` and `..` components,
+/// and reduce every surviving component to what this platform can actually
+/// write ([`safe_component`]).
 ///
 /// Splits on **both** `/` and `\`: a Windows receiver treats `\` as a path
 /// separator, so a peer sending `..\..\etc` would otherwise slip through a
 /// `/`-only split as one component and traverse out of the destination when the
-/// OS later normalizes it. Any component that is `..`, is empty/`.`, contains a
-/// NUL, or carries a drive/`:` marker is rejected.
+/// OS later normalizes it. A component that is `..`, is empty/`.`, or contains a
+/// NUL is rejected outright — malformed or hostile on every platform.
+///
+/// A component that is merely *unwriteable here* is rewritten instead of
+/// rejected. This used to reject any `:` on every platform, which cost the
+/// whole transfer: `service 14:30:02.log` or `Chapter 1: Intro.md` — ordinary
+/// Unix names — aborted the receive and lost every file behind them. On Windows
+/// [`safe_component`] maps the `:` to `_`, which disarms a drive marker too
+/// (`C:\evil` becomes the contained `C_/evil`), so refusing bought nothing that
+/// rewriting does not.
 fn sanitize_rel(rel: &str) -> Option<String> {
     let mut parts = Vec::new();
     for comp in rel.split(['/', '\\']) {
-        if comp.contains('\0') || comp.contains(':') {
+        if comp.contains('\0') {
             return None;
         }
         match comp {
             "" | "." => continue,
             ".." => return None,
-            c => parts.push(c),
+            c => parts.push(safe_component(c)),
         }
     }
     if parts.is_empty() {
@@ -758,9 +815,36 @@ mod tests {
         assert_eq!(sanitize_rel(r"..\..\Windows\System32"), None);
         assert_eq!(sanitize_rel(r"a\..\..\b"), None);
         assert_eq!(sanitize_rel(r"a\b\c.txt"), Some("a/b/c.txt".to_string()));
-        // Drive letters / colons and NULs are rejected outright.
-        assert_eq!(sanitize_rel(r"C:\evil"), None);
+        // A NUL is rejected outright: no platform can hold one in a name.
         assert_eq!(sanitize_rel("a\0b"), None);
+    }
+
+    /// A colon is a legal Unix filename character, and rejecting it here used
+    /// to abort the whole folder receive — one `service 14:30:02.log` in a
+    /// shared folder lost every file behind it. It must survive as one
+    /// contained component instead.
+    #[test]
+    fn sanitize_rel_keeps_a_colon_instead_of_killing_the_transfer() {
+        let got = sanitize_rel("logs/service 14:30:02.log").expect("kept, not rejected");
+        if cfg!(windows) {
+            assert_eq!(got, "logs/service 14_30_02.log");
+        } else {
+            assert_eq!(got, "logs/service 14:30:02.log");
+        }
+    }
+
+    /// A drive marker no longer costs the transfer either: it is defanged into
+    /// an ordinary component under the destination rather than rejected.
+    #[test]
+    fn sanitize_rel_contains_a_drive_marker_rather_than_rejecting_it() {
+        let got = sanitize_rel(r"C:\evil").expect("contained, not rejected");
+        assert!(!got.starts_with('/'), "still relative: {got}");
+        assert!(!got.contains(".."), "still contained: {got}");
+        if cfg!(windows) {
+            assert_eq!(got, "C_/evil");
+        } else {
+            assert_eq!(got, "C:/evil");
+        }
     }
 
     #[test]
@@ -768,6 +852,17 @@ mod tests {
         assert_eq!(sanitize_name("/a/b/folder"), "folder");
         assert_eq!(sanitize_name(".."), "folder");
         assert_eq!(sanitize_name("plain"), "plain");
+    }
+
+    /// The root becomes a directory on disk, so a Windows device name there is
+    /// as fatal as one on a file — and a Unix root must not be rewritten.
+    #[test]
+    fn sanitize_name_renames_a_windows_device_root() {
+        if cfg!(windows) {
+            assert_eq!(sanitize_name("aux"), "aux_");
+        } else {
+            assert_eq!(sanitize_name("aux"), "aux");
+        }
     }
 
     #[test]

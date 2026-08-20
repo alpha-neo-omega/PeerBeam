@@ -87,7 +87,11 @@ file (the link is ordered).
 Each file keeps its path relative to the folder root; the receiver recreates
 the tree under `dest_dir/<root>/…`. Relative paths are **sanitized** — empty,
 `.`, `..`, and absolute components are rejected — so a malicious manifest
-cannot escape the destination.
+cannot escape the destination. A component that is merely unwriteable on the
+receiving OS (a Windows device name, a `:`, a trailing dot) is *rewritten*
+instead, and an entry whose path cannot be made safe at all is **skipped with
+a warning** rather than aborting the folder — one awkward name must not cost
+the user every file behind it.
 
 ### Resume
 

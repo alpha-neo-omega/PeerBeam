@@ -193,6 +193,37 @@ Future<List<StagedFile>> pickFilesToStage({
 
 /// Open the native directory chooser (used to pick the save location). Returns
 /// the selected absolute path, or null if cancelled.
+///
+/// # Known gap: the path this returns does not survive a relaunch on macOS
+///
+/// `macos/Runner/{DebugProfile,Release}.entitlements` both set
+/// `com.apple.security.app-sandbox`, so choosing a folder outside the app's
+/// container grants this **process** a sandbox extension for it — nothing more.
+/// A path is all `file_selector_macos` ever hands back (`FileSelectorPlugin`
+/// replies with `selection?.path`, never the `NSURL`), so that is all we can
+/// persist, and on the next launch the string is still there while the
+/// permission is not: the engine's writes into it fail with EPERM while
+/// Settings goes on displaying the folder as chosen. Only a folder the user
+/// picks is affected — the default save directory is `dirs`-derived from
+/// `$HOME`, which the sandbox already redirects into the container.
+///
+/// This cannot be repaired from Dart. The durable form of that grant is a
+/// security-scoped bookmark, and every part of it is out of reach here:
+///
+///  * creating one needs the `com.apple.security.files.bookmarks.app-scope`
+///    entitlement, which neither entitlements file declares;
+///  * `URL.bookmarkData(options: .withSecurityScope)` and
+///    `startAccessingSecurityScopedResource()` are Foundation APIs with no Dart
+///    binding, and must run against the `NSURL` **while the panel's grant is
+///    live** — i.e. inside a native picker we would have to own, not after the
+///    fact from a path string;
+///  * the consumer is the Rust engine writing through `tokio::fs` in this
+///    process, so the resolved URL has to be held open across the engine's
+///    whole lifetime — a Swift lifecycle in `macos/Runner` plus opaque bookmark
+///    bytes in the engine's settings, not a change to this function.
+///
+/// Kept as a picked-path-only API rather than pretending otherwise, so the next
+/// person to reach for a fix starts at the entitlement instead of here.
 Future<String?> pickSaveDirectory() => getDirectoryPath();
 
 /// Pick a folder to send (desktop). Returns it as a staged directory entry,

@@ -244,7 +244,7 @@ async fn resume(ctx: &Ctx, id: &str, path_override: Option<&str>) -> CliResult {
     // The peer's addresses come from discovery, never from the checkpoint:
     // where a device can be reached is exactly what changes while a transfer
     // sits interrupted.
-    let devices = snapshot(config.clone(), DISCOVERY_SECS).await;
+    let devices = snapshot(config.clone(), DISCOVERY_SECS).await?;
     let target = devices
         .iter()
         .find(|m| m.device.id == cp.peer)
