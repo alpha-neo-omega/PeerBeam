@@ -506,6 +506,9 @@ pub struct Manager {
     notes: peerbeam_notes::NoteStore,
     /// Named local sets of trusted peers. Purely a label — see `peerbeam-spaces`.
     spaces: peerbeam_spaces::SpaceStore,
+    /// Hardware addresses this device remembers, so a sleeping machine of the
+    /// user's own can be started. Local network only — see `peerbeam-wake`.
+    wake: peerbeam_wake::WakeStore,
     /// Clipboard history — empty and unwritten unless the user turned it on.
     clip_history: peerbeam_clipboard::ClipHistory,
     /// The encrypted store every capability shares, kept so folder sync can
@@ -667,6 +670,7 @@ impl Manager {
             enc,
             // Built before `trust` and `appstore` are moved into the struct.
             spaces: peerbeam_spaces::SpaceStore::new(appstore.clone(), trust.clone()),
+            wake: peerbeam_wake::WakeStore::new(appstore.clone()),
             trust,
             chat,
             notes,
@@ -3863,6 +3867,102 @@ impl Manager {
             .ok_or((Code::InvalidArgument, format!("{key} required")))
     }
 
+    /// `{"device","mac"}` → `{"mac"}`. Records where to send a wake packet.
+    ///
+    /// Grants nothing and tells the device nothing; it is a note this machine
+    /// keeps so it can start one of the user's own machines.
+    pub fn wake_set(&self, req: &Value) -> Op {
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        let raw = Self::str_field(req, "mac")?;
+        let mac: peerbeam_wake::MacAddress = raw
+            .parse()
+            .map_err(|e: peerbeam_wake::MacError| (Code::InvalidArgument, e.to_string()))?;
+        self.wake
+            .remember(&device, mac, chrono::Utc::now())
+            .map_err(|e| (Code::Storage, e.to_string()))?;
+        Ok(json!({ "mac": mac.to_string() }))
+    }
+
+    /// `{"device"}` → `{"forgotten":bool}`.
+    pub fn wake_forget(&self, req: &Value) -> Op {
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        Ok(json!({
+            "forgotten": self
+                .wake
+                .forget(&device)
+                .map_err(|e| (Code::Storage, e.to_string()))?
+        }))
+    }
+
+    /// `{"device"}` → `{"mac", "sent_to":[…]}`.
+    ///
+    /// **Reports what was sent, never that the device woke.** Wake-on-LAN has
+    /// no reply, so a surface that showed "woken" would be inventing a fact.
+    /// The confirmation is the device appearing in discovery.
+    pub fn wake_send(&self, req: &Value) -> Op {
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        let socket = peerbeam_wake::UdpBroadcast::bind()
+            .map_err(|e| (Code::Connection, format!("broadcast socket: {e}")))?;
+        let attempt = peerbeam_wake::wake_device(
+            &self.wake,
+            self.trust.as_ref(),
+            &socket,
+            &device,
+            std::net::Ipv4Addr::BROADCAST,
+        )
+        .map_err(|e| match e {
+            peerbeam_wake::WakeError::Storage(_) => (Code::Storage, e.to_string()),
+            peerbeam_wake::WakeError::Send(_) => (Code::Connection, e.to_string()),
+            _ => (Code::InvalidArgument, e.to_string()),
+        })?;
+        Ok(json!({
+            "mac": attempt.mac.to_string(),
+            "sent_to": attempt.sent_to.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `{"peer_id"}` → `{"seconds"|null}` — this conversation's window.
+    pub fn chat_retention_get(&self, req: &Value) -> Op {
+        let peer = DeviceId::from(Self::str_field(req, "peer_id")?);
+        let r = self
+            .chat
+            .retention(&peer)
+            .map_err(|e| (Code::Storage, e.to_string()))?;
+        Ok(json!({ "seconds": r.ttl_secs }))
+    }
+
+    /// `{"peer_id","seconds"?}` → `{"seconds"|null}`. Omit `seconds` to turn it
+    /// off.
+    ///
+    /// The window is **local**: nothing is sent to the peer, and no surface may
+    /// suggest the peer's copy is affected.
+    pub fn chat_retention_set(&self, req: &Value) -> Op {
+        let peer = DeviceId::from(Self::str_field(req, "peer_id")?);
+        let next = match req.get("seconds").and_then(Value::as_u64) {
+            None => peerbeam_chat::Retention::OFF,
+            Some(secs) => peerbeam_chat::Retention::for_secs(secs)
+                .map_err(|e| (Code::InvalidArgument, e.to_string()))?,
+        };
+        self.chat
+            .set_retention(&peer, next)
+            .map_err(|e| (Code::Storage, e.to_string()))?;
+        Ok(json!({ "seconds": next.ttl_secs }))
+    }
+
+    /// `{"peer_id"?}` → `{"messages","queued"}`. Deletes what has aged out.
+    pub fn chat_prune(&self, req: &Value) -> Op {
+        let now = chrono::Utc::now();
+        let pruned = match req.get("peer_id").and_then(Value::as_str) {
+            Some(p) => self
+                .chat
+                .prune(&DeviceId::from(p.to_string()), now)
+                .map_err(|e| (Code::Storage, e.to_string()))?,
+            None => peerbeam_chat::prune_all_conversations(&self.chat, &self.staging, now)
+                .map_err(|e| (Code::Storage, e.to_string()))?,
+        };
+        Ok(json!({ "messages": pruned.records, "queued": pruned.queued }))
+    }
+
     /// `{}` → `{"spaces":[SpaceView…]}`.
     ///
     /// A Space is a label this device keeps over peers it already trusts. It is
@@ -5113,7 +5213,16 @@ impl Manager {
                 &id,
                 session.peer_device.clone(),
                 Direction::Receiving,
-                &format!("{}/{}", save_dir.trim_end_matches('/'), preview.name),
+                // `local_path`, not a glued `/`: this string is what the app
+                // shows and taps to open, so it must use this machine's
+                // separator. On Windows the glued form produced
+                // `C:\Users\…\recv/file.exe` — which opens, but is not a
+                // path any renderer or split can handle.
+                &peerbeam_domain::local_path(
+                    std::path::Path::new(save_dir.as_str()),
+                    &preview.name,
+                )
+                .to_string_lossy(),
                 &preview.name,
                 preview.size,
                 true,
@@ -5213,8 +5322,11 @@ impl Manager {
                 .clone()
                 .unwrap_or_else(|| active.file.lock().unwrap().clone());
             if !landed.is_empty() {
-                *active.path.lock().unwrap() =
-                    Some(format!("{}/{}", save_dir.trim_end_matches('/'), landed));
+                *active.path.lock().unwrap() = Some(
+                    peerbeam_domain::local_path(std::path::Path::new(save_dir.as_str()), &landed)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
         session.close().await;

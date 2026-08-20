@@ -1598,6 +1598,7 @@ dependencies = [
  "peerbeam-transfer-quic",
  "peerbeam-trust-fs",
  "peerbeam-update",
+ "peerbeam-wake",
  "serde",
  "serde_json",
  "serial_test",

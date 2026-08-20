@@ -757,6 +757,78 @@ pub unsafe extern "C" fn pb_notes_sync(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.notes_sync(&read_json(json)?))()))
 }
 
+/// Record where to send a wake packet: `{device, mac}` → `{mac}`.
+///
+/// A note this machine keeps. It grants nothing and the device is never told.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_wake_set(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.wake_set(&read_json(json)?))()))
+}
+
+/// Forget a device's hardware address: `{device}` → `{forgotten}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_wake_forget(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.wake_forget(&read_json(json)?))()))
+}
+
+/// Send the wake packet: `{device}` → `{mac, sent_to}`.
+///
+/// **Reports what was sent, never that the device woke** — Wake-on-LAN has no
+/// reply, so a surface claiming otherwise would be inventing a fact. Local
+/// network only: a broadcast does not travel over Tailscale or a VPN. Only an
+/// approved device may be woken (I6).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_wake_send(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.wake_send(&read_json(json)?))()))
+}
+
+/// This conversation's disappearing-message window: `{peer_id}` → `{seconds|null}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_retention_get(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.chat_retention_get(&read_json(json)?)
+        })())
+    })
+}
+
+/// Set or clear the window: `{peer_id, seconds?}` → `{seconds|null}`.
+///
+/// **Local.** Nothing is sent to the peer and no surface may suggest the peer's
+/// copy is affected — that is a promise this architecture cannot keep.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_retention_set(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.chat_retention_set(&read_json(json)?)
+        })())
+    })
+}
+
+/// Delete what has aged out: `{peer_id?}` → `{messages, queued}`.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_chat_prune(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.chat_prune(&read_json(json)?))()))
+}
+
 /// Every Space and its members: `{}` → `{spaces: [...]}`.
 ///
 /// A Space is a label this device keeps over peers it already trusts. Nothing
