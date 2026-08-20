@@ -4,7 +4,8 @@ import '../../app/theme.dart';
 import '../../data/trust_repository.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/exceptions.dart';
-import '../../sdk/models.dart' show Space;
+import '../../platform/desktop_files.dart' show pickFilesToStage;
+import '../../sdk/models.dart' show PeerTarget, Space;
 import '../../sdk/peerbeam.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/appear.dart';
@@ -218,6 +219,81 @@ class _SpacesScreenState extends State<SpacesScreen> {
     );
   }
 
+  /// Send files to every member of [space] that discovery can reach **now**.
+  ///
+  /// # Why this reports two numbers
+  ///
+  /// `Space.live` means *this machine still trusts it* — that is a question
+  /// about the trust store. Sending needs something else: an address, which
+  /// only discovery has. A device can be perfectly trusted and simply not on
+  /// the network this minute, and a great many of them will be, because that is
+  /// the ordinary condition of a laptop.
+  ///
+  /// So a fan-out that silently reached four of six would be the worst possible
+  /// outcome: the user would believe six people had the file. Every send is
+  /// attempted, and the result names how many went and how many could not be
+  /// reached — which is also why this does not refuse outright when only some
+  /// are reachable. Sending to the four who are here is usually what was
+  /// wanted; being told it was four is what makes it safe.
+  Future<void> _sendToSpace(Space space) async {
+    final state = AppScope.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+
+    final reachable = <String, PeerTarget>{};
+    final unreachable = <String>[];
+    for (final id in space.live) {
+      final target = state.device.peerTarget(id);
+      if (target == null) {
+        unreachable.add(id);
+      } else {
+        reachable[id] = target;
+      }
+    }
+
+    if (reachable.isEmpty) {
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              'None of the ${space.live.length} device(s) in "${space.name}" '
+              'is reachable right now — they are trusted, but not on the '
+              'network.',
+            ),
+          ),
+        );
+      return;
+    }
+
+    final staged = await pickFilesToStage();
+    if (staged.isEmpty || !mounted) return;
+    final paths = staged.map((f) => f.path).toList(growable: false);
+
+    var sent = 0;
+    final failed = <String>[];
+    for (final entry in reachable.entries) {
+      try {
+        // One send per member, through the same path a hand-typed send uses.
+        // Independent on purpose: one unreachable device must not cancel the
+        // rest, which is the whole reason someone used a Space.
+        await state.transfer.send(entry.value, paths);
+        sent++;
+      } catch (_) {
+        failed.add(entry.key);
+      }
+    }
+    if (!mounted) return;
+
+    final parts = <String>['Sending to $sent device(s)'];
+    if (failed.isNotEmpty) parts.add('${failed.length} refused');
+    if (unreachable.isNotEmpty) {
+      parts.add('${unreachable.length} not on the network');
+    }
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(parts.join(' · '))));
+  }
+
   Future<void> _addDevice(Space space) async {
     final chosen = await showSpaceDevicePicker(
       context,
@@ -413,8 +489,8 @@ class _SpacesScreenState extends State<SpacesScreen> {
           // a permission, and every send is still checked per device.
           'Sending to a Space is one ordinary send per device, checked against '
           'that device’s own permissions — being in a Space grants nothing. '
-          'The fan-out runs in the command line today (“peerbeam space send”), '
-          'over these same Spaces; there is no send button here yet.',
+          'Only devices on the network right now can receive: the rest stay '
+          'trusted and are counted, not silently skipped.',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -495,6 +571,7 @@ class _SpacesScreenState extends State<SpacesScreen> {
               onRename: () => _rename(space),
               onDelete: () => _delete(space),
               onAddDevice: () => _addDevice(space),
+              onSend: space.canSend ? () => _sendToSpace(space) : null,
               onRemoveDevice: (device, {required stale}) =>
                   _removeDevice(space, device, stale: stale),
             ),

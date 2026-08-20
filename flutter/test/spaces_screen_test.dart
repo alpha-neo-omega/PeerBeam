@@ -110,23 +110,56 @@ void main() {
     }
   });
 
-  /// Sending is not wired to the app, so there is no button for it. A control
-  /// that did nothing — or that reached some devices silently — would be worse
-  /// than the gap, and the copy names the gap instead.
-  testWidgets('there is no send affordance, and the copy says so', (
-    tester,
-  ) async {
+  /// A Space with something live offers Send; the copy still says membership
+  /// grants nothing, because that is the claim a device list under a name you
+  /// typed could otherwise be read as making.
+  testWidgets('a Space with live devices offers Send', (tester) async {
     final fake = FakePeerBeam()
       ..spaceList = const [
         Space(id: 'sp0', name: 'Work', live: ['pb-a', 'pb-b']),
       ];
     await _open(tester, fake);
 
-    expect(_copy(tester), contains('no send button here yet'));
-    expect(find.widgetWithText(FilledButton, 'Send'), findsNothing);
-    expect(find.text('Send'), findsNothing);
-    expect(find.byTooltip('Send to this Space'), findsNothing);
+    expect(find.byKey(const Key('space-sp0-send')), findsOneWidget);
+    expect(_copy(tester), contains('being in a Space grants nothing'));
   });
+
+  /// **Absent, not disabled.** The summary line already explains why nothing
+  /// can be sent; a dead button invites a tap that can only disappoint.
+  testWidgets('a Space with nothing live offers no Send', (tester) async {
+    final fake = FakePeerBeam()
+      ..spaceList = const [
+        Space(id: 'sp0', name: 'Work', stale: ['pb-a']),
+      ];
+    await _open(tester, fake);
+
+    expect(find.byKey(const Key('space-sp0-send')), findsNothing);
+  });
+
+  /// Trusted is not the same as reachable. A member discovery cannot see is
+  /// counted rather than silently skipped — believing six people got a file
+  /// when four did is the worst outcome this screen could produce.
+  testWidgets(
+    'sending with nothing reachable says they are not on the network',
+    (tester) async {
+      final fake = FakePeerBeam()
+        ..spaceList = const [
+          Space(id: 'sp0', name: 'Work', live: ['pb-a', 'pb-b']),
+        ];
+      await _open(tester, fake);
+
+      await tester.tap(find.byKey(const Key('space-sp0-send')));
+      await tester.pumpAndSettle();
+
+      expect(_copy(tester), contains('not on the network'));
+      // No picker was opened: there was nobody to send to.
+      expect(
+        fake.calls.where((c) => c.startsWith('sendFile')),
+        isEmpty,
+        reason: 'nothing may be sent when nothing is reachable',
+      );
+    },
+  );
 
   /// **The first frame is not an empty list.** "No Spaces yet" before the read
   /// answers is the confident falsehood every cold start used to flash.

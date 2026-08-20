@@ -39,6 +39,12 @@ class SpaceCard extends StatelessWidget {
   final VoidCallback onDelete;
   final VoidCallback onAddDevice;
 
+  /// Send files to every member discovery can reach right now.
+  ///
+  /// Null when the Space has nothing live to send to, so the control is absent
+  /// rather than present-and-dead.
+  final VoidCallback? onSend;
+
   /// Take one device out. [stale] is passed through because the two removals
   /// are not equally reversible — see the caller.
   final void Function(String deviceId, {required bool stale}) onRemoveDevice;
@@ -50,6 +56,7 @@ class SpaceCard extends StatelessWidget {
     required this.onRename,
     required this.onDelete,
     required this.onAddDevice,
+    this.onSend,
     required this.onRemoveDevice,
   });
 
@@ -100,16 +107,35 @@ class SpaceCard extends StatelessWidget {
             _deviceTile(theme, id, stale: true),
           ],
           const Divider(height: 1),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Padding(
-              padding: const EdgeInsets.all(AppSpace.sm),
-              child: TextButton.icon(
-                key: Key('space-${space.id}-add'),
-                onPressed: onAddDevice,
-                icon: const Icon(Icons.add_rounded),
-                label: const Text('Add a device'),
-              ),
+          Padding(
+            padding: const EdgeInsets.all(AppSpace.sm),
+            // `Wrap`, not a `Row` with a `Spacer`: at 360px the two buttons
+            // overflowed by 134px, and a phone is the width this app is most
+            // often used at. Wrapping puts Send on its own line instead of
+            // clipping it off the screen.
+            child: Wrap(
+              spacing: AppSpace.sm,
+              runSpacing: AppSpace.xxs,
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                TextButton.icon(
+                  key: Key('space-${space.id}-add'),
+                  onPressed: onAddDevice,
+                  icon: const Icon(Icons.add_rounded),
+                  label: const Text('Add a device'),
+                ),
+                // Absent, not disabled, when there is nothing live: the
+                // summary line above already says why, and a dead button
+                // invites a tap that can only disappoint.
+                if (onSend != null)
+                  FilledButton.tonalIcon(
+                    key: Key('space-${space.id}-send'),
+                    onPressed: onSend,
+                    icon: const Icon(Icons.upload_rounded),
+                    label: const Text('Send files'),
+                  ),
+              ],
             ),
           ),
         ],
