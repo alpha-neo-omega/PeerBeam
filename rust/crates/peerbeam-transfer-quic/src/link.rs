@@ -96,6 +96,24 @@ fn conn_err(e: impl std::fmt::Display) -> DomainError {
     DomainError::Connection(format!("quic: {e}"))
 }
 
+/// The same, for a quinn error whose message hides the reason.
+///
+/// `WriteError`/`ReadError` render `ConnectionLost` as the bare text "connection
+/// lost" and keep the `ConnectionError` that says *why* — timed out, reset by
+/// peer, closed by peer, transport error — only in `source()`. A log line saying
+/// a transfer failed because the connection was lost, with no cause, cannot tell
+/// a starved CPU from a peer that hung up from a protocol violation.
+fn conn_err_caused(e: &dyn std::error::Error) -> DomainError {
+    let mut msg = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        msg.push_str(": ");
+        msg.push_str(&c.to_string());
+        cause = c.source();
+    }
+    DomainError::Connection(format!("quic: {msg}"))
+}
+
 /// Outcome of [`fill`].
 enum FillOutcome {
     /// `buf` was filled to `buf.len()`.
@@ -111,7 +129,11 @@ enum FillOutcome {
 /// the next await — so re-calling with the same `buf`/`filled` resumes cleanly.
 async fn fill(recv: &mut RecvStream, buf: &mut [u8], filled: &mut usize) -> Result<FillOutcome> {
     while *filled < buf.len() {
-        match recv.read(&mut buf[*filled..]).await.map_err(conn_err)? {
+        match recv
+            .read(&mut buf[*filled..])
+            .await
+            .map_err(|e| conn_err_caused(&e))?
+        {
             Some(0) | None => return Ok(FillOutcome::Eof),
             Some(n) => *filled += n,
         }
@@ -133,11 +155,14 @@ impl Link for QuicLink {
         let mut header = [0u8; 5];
         header[0] = kind_to_u8(frame.kind);
         header[1..5].copy_from_slice(&len.to_be_bytes());
-        self.send.write_all(&header).await.map_err(conn_err)?;
+        self.send
+            .write_all(&header)
+            .await
+            .map_err(|e| conn_err_caused(&e))?;
         self.send
             .write_all(&frame.payload)
             .await
-            .map_err(conn_err)?;
+            .map_err(|e| conn_err_caused(&e))?;
         Ok(())
     }
 

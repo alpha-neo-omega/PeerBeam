@@ -168,7 +168,15 @@ async fn multiple_simultaneous_transfers() {
                 let storage = FsStorage::new();
                 let (ptx, _p) = mpsc::unbounded_channel();
                 let ctrl = TransferControl::new();
-                receive_file(&mut *link, &storage, &dir, &ctrl, &ptx).await
+                let received = receive_file(&mut *link, &storage, &dir, &ctrl, &ptx).await;
+                // Deliver the checksum verdict before dropping the link: this
+                // link owns its connection, and dropping it closes that
+                // connection at once, discarding whatever has not left the wire.
+                // The sender is blocked reading exactly that verdict, so on a
+                // machine with few cores it saw "closed by peer" instead — this
+                // test failed two runs in three on two cores.
+                let _ = link.graceful_close().await;
+                received
             }));
         }
         let mut ok = 0usize;

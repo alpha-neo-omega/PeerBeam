@@ -123,6 +123,32 @@ downloads do not contain it; it ships in the next release.
   and the app says the same rather than raising anything.
 
 ### Fixed
+- **A reconnect kept its channels only if it won a coin flip.** One transport
+  loss is observed twice — the session's control link fails, *and* every channel
+  actor's stream ends — and both were ready at the same moment in the pump's
+  `select!`, which picks among ready arms at random. When an actor won, the
+  channel had already been removed by the time the session snapshotted what to
+  re-attach, so it resumed with no channels, permanently. Presence and clipboard
+  each hold one channel for the life of a session and rely on re-attach returning
+  the same id, so on the losing side of the flip clipboard sync and presence went
+  quiet after any blip — with no error, because the session really was up. The
+  set to restore is now recorded when a channel opens and cleared only when
+  something explicitly closes it; an actor dying does not count, because an actor
+  dies exactly when its stream vanishes.
+- **A receiver could throw away the verdict it had just written.** A transfer ends
+  with the receiver sending a checksum verdict that the sender is blocked reading.
+  On a link that owns its connection — one per transfer — letting it go closed the
+  connection at once and discarded whatever had not yet left the wire, so the
+  sender reported a failed transfer for a file that had arrived complete and
+  verified. Delivery is now waited for. Only the per-connection path was
+  affected; transfers over a PeerSession channel share a connection that outlives
+  the transfer. Failure rate on a two-core machine was two runs in three, which
+  is what small servers and CPU-limited containers look like.
+- **"connection lost" now says why.** quinn renders a lost connection as those two
+  words and keeps the reason — timed out, reset by peer, closed by peer — only in
+  the error's source, which was discarded. A transfer log that cannot tell a
+  starved CPU from a peer hanging up is not evidence of anything; the cause chain
+  is now included.
 - **A sender's claimed filename could outrank what actually lands.** The peer's
   claim rides the chat channel and the bytes ride the transfer channel, and
   nothing orders the two. When the transfer won that race the reconcile found no

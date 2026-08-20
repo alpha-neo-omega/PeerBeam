@@ -108,7 +108,24 @@ pub async fn receive_file_recover(
     loop {
         attempt += 1;
         let result = match factory.connect().await {
-            Ok(mut link) => receive_file(&mut *link, storage, dest_dir, ctrl, progress).await,
+            Ok(mut link) => {
+                let received = receive_file(&mut *link, storage, dest_dir, ctrl, progress).await;
+                // **The verdict is still in flight.** `receive_file` ends by
+                // writing the checksum verdict the sender is blocked reading, and
+                // on a link that owns its connection — one per transfer, as this
+                // factory hands out — dropping it here closes that connection
+                // immediately, discarding anything not yet on the wire. The sender
+                // then reports a failed transfer for a file that arrived complete
+                // and verified. Delivery is the receiver's obligation, so wait
+                // (bounded) for it before letting the link go.
+                //
+                // Success only: a failed receive is followed by a reconnect, and
+                // there is nothing left worth delivering to delay it.
+                if received.is_ok() {
+                    let _ = link.graceful_close().await;
+                }
+                received
+            }
             Err(e) => Err(e),
         };
 
