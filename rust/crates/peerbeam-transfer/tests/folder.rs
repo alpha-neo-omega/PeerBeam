@@ -421,6 +421,20 @@ async fn two_entries_differing_only_by_case_both_survive() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("Notes.txt"), b"upper").unwrap();
     std::fs::write(root.join("notes.txt"), b"lower").unwrap();
+
+    // **The sender needs a filesystem that can hold both.** On macOS and
+    // Windows those two writes are one file, so the folder being sent has a
+    // single entry and there is no collision to test — the interesting case
+    // there is a *case-sensitive sender* reaching a case-insensitive receiver,
+    // which one machine cannot stage. Skipping says so out loud rather than
+    // passing vacuously on the platforms the bug is actually about.
+    if std::fs::read(root.join("Notes.txt")).unwrap() == b"lower" {
+        eprintln!(
+            "skipped: this filesystem is case-insensitive, so the sender cannot \
+             hold two names differing only in case"
+        );
+        return;
+    }
     let out = dir.path().join("out");
     let out_str = out.to_string_lossy().to_string();
 

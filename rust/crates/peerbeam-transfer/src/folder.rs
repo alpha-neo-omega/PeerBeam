@@ -345,14 +345,23 @@ pub async fn send_folder(
 /// convention for the same situation.
 async fn free_destination(storage: &dyn StorageProvider, dest: &str) -> Result<String> {
     const ATTEMPTS: u32 = 1_000;
-    let (stem, ext) = match dest.rsplit_once('.') {
-        // A leading dot is a dotfile, not an extension: `.gitignore` has no
-        // extension to insert before.
-        Some((stem, ext)) if !stem.is_empty() && !stem.ends_with('/') => (stem, Some(ext)),
-        _ => (dest, None),
+    // Split the **file name**, not the whole path. Deciding on the full string
+    // meant asking whether it ended in `/`, which is not the separator on every
+    // platform — on Windows `C:\\dir\\.gitignore` has no `/` in it, so the
+    // dotfile was read as an extension and came back as ` (1).gitignore`.
+    let name = std::path::Path::new(dest)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dest.to_string());
+    let prefix = &dest[..dest.len() - name.len()];
+    let (stem, ext) = match name.rsplit_once('.') {
+        // A leading dot names the file, it does not separate a suffix:
+        // `.gitignore` has no extension to insert before.
+        Some((stem, ext)) if !stem.is_empty() => (format!("{prefix}{stem}"), Some(ext.to_string())),
+        _ => (dest.to_string(), None),
     };
     for n in 1..=ATTEMPTS {
-        let candidate = match ext {
+        let candidate = match &ext {
             Some(ext) => format!("{stem} ({n}).{ext}"),
             None => format!("{stem} ({n})"),
         };
@@ -897,6 +906,31 @@ mod tests {
             .await
             .expect("a free name");
         assert!(free.ends_with(" (2).txt"), "got {free}");
+    }
+
+    /// **The name is split, not the path.** Deciding where the extension begins
+    /// by looking at the whole string meant asking whether it ended in `/`,
+    /// which is not the separator everywhere: on Windows a dotfile was read as
+    /// an extension and came back as ` (1).gitignore`. Built with `join`, so the
+    /// path carries whatever separator this platform actually uses and the rule
+    /// is checked against that rather than against an assumption about it.
+    ///
+    /// (`Path::file_name` is platform-dependent by design — a backslash is a
+    /// legal character in a Linux filename — so a Windows-shaped string cannot
+    /// stand in for a Windows path here. Only the native shape is meaningful.)
+    #[test]
+    fn a_dotfile_has_no_extension_whatever_the_separator_is() {
+        let path = std::path::Path::new("dir").join("sub").join(".gitignore");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .expect("a file name");
+        assert_eq!(name, ".gitignore");
+        assert_eq!(
+            name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()),
+            None,
+            "a leading dot names the file, it is not an extension"
+        );
     }
 
     #[test]

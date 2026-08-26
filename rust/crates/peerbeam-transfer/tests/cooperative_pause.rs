@@ -254,17 +254,54 @@ async fn sender_pause_resume_cycle_is_bounded_across_multiple_cycles() {
         .is_ok()
     }
 
+    // **Driven until the edge is observed, not for a fixed window.** This used
+    // to give each toggle 15 ms and then assert exactly N frames, which asks the
+    // scheduler to have run the sender inside that window — true on an idle
+    // machine, not on a loaded CI runner, where it failed intermittently with
+    // one frame fewer than expected and read as a flood bug that was not there.
+    //
+    // Waiting for the count to move makes the assertion about the *code* again:
+    // one edge produces one frame, and the check below that it produced no more
+    // than one is the half that catches a flood. The budget is far past what the
+    // work needs and is never reached unless something is genuinely stuck.
+    async fn drive_until<S, R>(
+        target: usize,
+        counter: &AtomicUsize,
+        send: &mut S,
+        recv: &mut R,
+    ) -> bool
+    where
+        S: std::future::Future + Unpin,
+        R: std::future::Future + Unpin,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < target && std::time::Instant::now() < deadline {
+            if drive_for(5, send, recv).await {
+                return true;
+            }
+        }
+        false
+    }
+
     let mut finished_early = false;
-    for _ in 0..3 {
+    for cycle in 1..=3usize {
         if finished_early {
             break;
         }
         ctrl_s.pause();
+        finished_early |= drive_until(cycle, &pauses, &mut send, &mut recv).await;
+        // **Keep driving after the edge lands.** Stopping the moment the count
+        // reaches its target is what makes waiting deterministic — and, on its
+        // own, is also what would hide the bug this test exists for: a flood
+        // sends one frame per chunk, so it needs chunks to flow past the edge
+        // before it shows. This window is that opportunity, and the equality
+        // below is what fails when it is taken.
         finished_early |= drive_for(15, &mut send, &mut recv).await;
         if finished_early {
             break;
         }
         ctrl_s.resume();
+        finished_early |= drive_until(cycle, &resumes, &mut send, &mut recv).await;
         finished_early |= drive_for(15, &mut send, &mut recv).await;
     }
     assert!(
@@ -286,6 +323,10 @@ async fn sender_pause_resume_cycle_is_bounded_across_multiple_cycles() {
         cycles,
         "N resume edges must send exactly N Control::Resume frames, not a flood"
     );
+    // The flood this guards against would be one frame per chunk, and a 64 MiB
+    // file at 4 KiB chunks is sixteen thousand of them — so the equality above
+    // is what catches it, and waiting for each edge is what stops a loaded
+    // machine looking like the same failure.
 
     // Clean up: cancel rather than leaking the still-in-flight transfer.
     ctrl_s.cancel();
