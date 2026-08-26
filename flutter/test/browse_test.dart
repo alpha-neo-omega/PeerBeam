@@ -77,6 +77,30 @@ void main() {
     expect(fake.calls, contains('browse:pb-bob:photos'));
   });
 
+  /// **Tapping a file did nothing whatsoever.** It renders as a `ListTile`
+  /// beside the folder rows, which do open, and there is no per-file fetch —
+  /// files arrive with the folder. A dead tap teaches a user that the app is
+  /// broken; a sentence points at the action that is already on the screen.
+  testWidgets('tapping a file explains how files actually arrive', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..shared[''] = [const BrowseEntry(name: 'photos', isDir: true, size: 0)]
+      ..shared['photos'] = [
+        const BrowseEntry(name: 'holiday.jpg', isDir: false, size: 2048),
+      ];
+    await _open(tester, fake);
+    await tester.tap(find.text('photos'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    await tester.tap(find.text('holiday.jpg'));
+    await tester.pump();
+
+    expect(find.byType(SnackBar), findsOneWidget);
+    expect(find.textContaining('Sync here'), findsOneWidget);
+  });
+
   testWidgets('the path shown is share-relative, never a filesystem location', (
     tester,
   ) async {

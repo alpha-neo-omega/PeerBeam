@@ -34,6 +34,11 @@ class _NotesScreenState extends State<NotesScreen> {
     final state = AppScope.of(context);
     final saved = await showDialog<_Draft>(
       context: context,
+      // **Not dismissible by tapping outside.** This dialog holds text the
+      // user has typed and has not sent anywhere, and the barrier discards it
+      // with no warning and no undo — a mis-aimed tap costs the whole thing.
+      // Cancel and Save are both right there and say what they do.
+      barrierDismissible: false,
       builder: (_) => _NoteEditor(note: existing),
     );
     if (saved == null || !mounted) return;

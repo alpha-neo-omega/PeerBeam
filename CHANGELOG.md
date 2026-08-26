@@ -239,6 +239,16 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **Tapping a file while browsing says how files arrive.** It did nothing at all:
+  the row looks exactly like the folder rows above it, which do open, and there
+  is no per-file fetch — files come across with the folder. A dead tap teaches
+  people the app is broken; it now points at the button already on that screen.
+- **A note or a message you are typing survives a stray tap.** Both editors
+  closed and discarded their text if you tapped outside them, with no warning and
+  no way back. Cancel is still there for people who mean it.
+- **Renaming this device, or changing where files are saved, says when it is
+  refused.** Every switch on that screen already explained a refusal; these two
+  reverted in silence, which reads as the app ignoring you rather than declining.
 - **A revoke that fails now says so.** Withdrawing trust from a device swallowed
   its error and reported nothing, so a revoke that never happened looked exactly
   like one that did: the dialog closed, the device stayed trusted, and you were

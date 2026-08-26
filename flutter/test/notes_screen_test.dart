@@ -65,6 +65,31 @@ void main() {
     expect(fake.notes, isEmpty);
   });
 
+  /// **A stray tap outside used to throw the note away.** The editor holds text
+  /// that exists nowhere else yet, and the default barrier discards it with no
+  /// warning and no undo. Cancel is there for people who mean it.
+  testWidgets('tapping outside the editor does not discard what was typed', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.add_rounded));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).last, 'half a thought');
+    await tester.pump();
+
+    // Tap the very edge of the screen, outside the dialog surface.
+    await tester.tapAt(const Offset(4, 4));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('half a thought'),
+      findsOneWidget,
+      reason: 'the editor closed and took the text with it',
+    );
+  });
+
   testWidgets('writing a note saves it', (tester) async {
     final fake = FakePeerBeam();
     await _open(tester, fake);

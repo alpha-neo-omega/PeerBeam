@@ -44,6 +44,32 @@ void main() {
     );
   });
 
+  /// **The two writes that are not switches said nothing when refused.** Every
+  /// toggle on that screen runs through `_guardedSwitch`, which catches the
+  /// rethrow and names what failed; the device name and the save directory
+  /// awaited it bare, so the value reverted and the screen stayed silent — which
+  /// reads as the app having ignored the change rather than refused it.
+  ///
+  /// Asserted on the store, which is where the rethrow comes from: the screen
+  /// cannot report a failure that never reaches it.
+  test('the device name and save directory rethrow when refused', () async {
+    final fake = FakePeerBeam();
+    final settings = _store();
+    await settings.load(fake);
+    fake.failing.add('settingsSet');
+
+    final name = settings.deviceName;
+    await expectLater(settings.setDeviceName('Renamed'), throwsA(anything));
+    expect(settings.deviceName, name, reason: 'a refused rename was kept');
+
+    final dir = settings.saveDirectory;
+    await expectLater(
+      settings.setSaveDirectory('/tmp/elsewhere'),
+      throwsA(anything),
+    );
+    expect(settings.saveDirectory, dir, reason: 'a refused path was kept');
+  });
+
   test('a write that succeeds is kept and reaches the engine', () async {
     final fake = FakePeerBeam();
     final settings = _store();

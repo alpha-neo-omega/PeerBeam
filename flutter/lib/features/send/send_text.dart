@@ -40,6 +40,11 @@ Future<String?> composeText(BuildContext context, {String prefill = ''}) async {
   try {
     return await showDialog<String>(
       context: context,
+      // **Not dismissible by tapping outside.** This dialog holds text the
+      // user has typed and has not sent anywhere, and the barrier discards it
+      // with no warning and no undo — a mis-aimed tap costs the whole thing.
+      // Cancel and Save are both right there and say what they do.
+      barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         title: const Text('Send text'),
         content: TextField(

@@ -198,9 +198,22 @@ class _BrowseScreenState extends State<BrowseScreen> {
                   ),
                   title: Text(e.name),
                   subtitle: e.isDir ? null : Text(_size(e.size)),
+                  // **A tap on a file used to do nothing at all.** The row
+                  // looks exactly like the folder rows above it, and there is no
+                  // per-file fetch — files arrive by syncing the folder that
+                  // holds them. A dead tap leaves the user pressing harder; a
+                  // sentence tells them where the action actually is, which is
+                  // the button already on this screen.
                   onTap: e.isDir
                       ? () => _load(_path.isEmpty ? e.name : '$_path/${e.name}')
-                      : null,
+                      : () => ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Files come across with the folder. Use '
+                              '"Sync here" to copy this folder to your device.',
+                            ),
+                          ),
+                        ),
                 );
               },
             ),

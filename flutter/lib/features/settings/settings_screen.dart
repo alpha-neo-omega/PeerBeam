@@ -36,6 +36,30 @@ bool get _isAndroid =>
 /// as a refusal. This says which setting failed and why, so the user knows
 /// their choice did not take. Silence here is how "clipboard sync is off"
 /// becomes something a person believes without it being true.
+/// Run a settings write and say so if it is refused.
+///
+/// `_apply` reverts the field and rethrows, which is what makes a refusal
+/// visible *to a switch* — [_guardedSwitch] catches it. The two writes that are
+/// not switches, the device name and the save directory, awaited it bare: the
+/// value snapped back to what it was and nothing said why, which reads as the
+/// app having ignored the change.
+Future<void> _guardedWrite(
+  BuildContext context,
+  String what,
+  Future<void> Function() write,
+) async {
+  final messenger = ScaffoldMessenger.of(context);
+  try {
+    await write();
+  } catch (e) {
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text('Could not change $what: ${friendlyError(e)}')),
+      );
+  }
+}
+
 ValueChanged<bool> _guardedSwitch(
   BuildContext context,
   String what,
@@ -563,8 +587,12 @@ class SettingsScreen extends StatelessWidget {
           ],
         ),
       );
-      if (result != null && result.isNotEmpty) {
-        state.settings.setDeviceName(result);
+      if (result != null && result.isNotEmpty && context.mounted) {
+        await _guardedWrite(
+          context,
+          'the device name',
+          () => state.settings.setDeviceName(result),
+        );
       }
     } finally {
       controller.dispose();
@@ -652,8 +680,12 @@ class SettingsScreen extends StatelessWidget {
   Future<void> _pickSaveDir(BuildContext context) async {
     final settings = AppScope.of(context).settings;
     final dir = await pickSaveDirectory();
-    if (dir != null && dir.isNotEmpty) {
-      settings.setSaveDirectory(dir);
+    if (dir != null && dir.isNotEmpty && context.mounted) {
+      await _guardedWrite(
+        context,
+        'where files are saved',
+        () => settings.setSaveDirectory(dir),
+      );
     }
   }
 }
