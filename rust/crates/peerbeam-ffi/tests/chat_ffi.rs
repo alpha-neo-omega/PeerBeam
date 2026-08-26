@@ -142,7 +142,41 @@ fn wait_event(secs: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+    // **Say what did arrive.** These waits end in `.expect("expected a
+    // chat_received event")`, which names what was wanted and nothing about what
+    // happened — so an intermittent failure on a platform I cannot run locally
+    // reported only that the engine had not done something within four minutes.
+    // The events that *were* captured are the difference between "the message
+    // never arrived" and "it arrived and was filed as something else", and they
+    // were being discarded at exactly the moment they became evidence.
+    eprintln!(
+        "wait_event gave up after {secs}s; {} event(s) captured: {}",
+        events_snapshot().len(),
+        summarise_events()
+    );
     None
+}
+
+/// A one-line digest of the captured events, for a failure message.
+///
+/// Types and ids only: a chat body can be anything a test wrote and is not worth
+/// putting in a CI log, while the shape of the sequence is the whole question —
+/// whether the engine got as far as an event at all, and which.
+fn summarise_events() -> String {
+    let seen = events_snapshot();
+    if seen.is_empty() {
+        return "none".to_string();
+    }
+    seen.iter()
+        .map(|e| {
+            let kind = e["type"].as_str().unwrap_or("?");
+            match e["message"]["direction"].as_str() {
+                Some(dir) => format!("{kind}({dir})"),
+                None => kind.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Poll a `Mutex<Vec<ChatRecord>>` (a manual peer's captured records — it has

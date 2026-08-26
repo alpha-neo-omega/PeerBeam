@@ -61,7 +61,7 @@ type OpResult = Result<Value, (Code, String)>;
 const DRAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The shared multi-thread runtime (created on first use).
-fn rt() -> &'static Runtime {
+pub(crate) fn rt() -> &'static Runtime {
     RT.get_or_init(|| {
         Builder::new_multi_thread()
             .enable_all()
@@ -373,7 +373,9 @@ fn reconcile_chat(chat: &peerbeam_chat::ChatStore) {
 /// at the new, half-working instance.
 pub fn init(config_json: &str) -> OpResult {
     if lock(&ENGINE).is_some() {
-        shutdown();
+        // `teardown`, not `shutdown`: the caller has just registered a callback
+        // and is about to want events from the engine being built below.
+        teardown();
     }
 
     let mut config: EngineConfig = if config_json.trim().is_empty() {
@@ -610,6 +612,19 @@ pub fn status() -> OpResult {
 
 /// Stop work and release the engine.
 pub fn shutdown() {
+    teardown();
+    // **Only here, never on the re-init path.** Clearing the callback is what
+    // makes it safe for Dart to free the function pointer after `pb_shutdown`
+    // returns: `set_callback(None)` takes the exclusive lock, so once it
+    // returns no emitter can still be holding it. A re-init frees nothing and
+    // has just been handed a callback — `init` used to reach this through its
+    // idempotent teardown and clear it, so a host that called `pb_init` twice
+    // stopped receiving events at all, with nothing to say why.
+    crate::events::set_callback(None);
+}
+
+/// Stop everything `shutdown` stops, except the event callback.
+fn teardown() {
     if let Ok(engine) = engine() {
         match tokio::runtime::Handle::try_current() {
             // The calling thread already has a tokio context entered (e.g.
@@ -649,11 +664,6 @@ pub fn shutdown() {
     *lock(&MANAGER) = None;
     *lock(&DIAGNOSTICS) = None;
     *lock(&UDP_DISCOVERY) = None;
-    // Drain any in-flight emit() before returning: set_callback(None) takes
-    // an exclusive lock that blocks until every emitter's shared (read) guard
-    // has released, so once this returns no emitter can still be holding the
-    // callback pointer Dart is about to free.
-    crate::events::set_callback(None);
 }
 
 pub fn discovery_start() -> OpResult {
@@ -709,6 +719,73 @@ pub fn devices() -> OpResult {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    /// **Re-initialising must not make the host go deaf.** `init` tears down an
+    /// existing engine before building the new one, and that teardown used to be
+    /// `shutdown` — which ends by clearing the event callback so Dart can free
+    /// the pointer. On the re-init path nothing is being freed and the caller
+    /// has just registered a callback, so clearing it meant a host that called
+    /// `pb_init` twice stopped receiving events entirely, with a running engine
+    /// and nothing to say why.
+    ///
+    /// Asserted against the callback registry rather than a live engine: what
+    /// regressed is which teardown `init` calls, and this is the observable
+    /// difference between the two.
+    #[test]
+    // The event callback and the engine statics are process-wide, so this joins
+    // the same serialisation group as every other test that touches them.
+    #[serial_test::serial]
+    fn tearing_down_for_a_re_init_keeps_the_event_callback() {
+        extern "C" fn noop(_: *const std::os::raw::c_char) {}
+
+        crate::events::set_callback(Some(noop));
+        teardown();
+        assert!(
+            crate::events::has_callback(),
+            "a re-init teardown cleared the callback the caller just registered"
+        );
+
+        // A real shutdown still clears it — that is what makes freeing the
+        // pointer afterwards safe.
+        shutdown();
+        assert!(
+            !crate::events::has_callback(),
+            "shutdown must clear the callback before a host frees it"
+        );
+    }
+
+    /// The same property through the door a host actually uses. The test above
+    /// drives `teardown` directly, so it says nothing about *which* teardown
+    /// `init` reaches for — and that call is the whole regression: reverting it
+    /// leaves that test passing and this one failing.
+    #[test]
+    #[serial_test::serial]
+    fn initialising_twice_leaves_the_callback_registered() {
+        extern "C" fn noop(_: *const std::os::raw::c_char) {}
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = EngineConfig::default();
+        config.storage.data_directory = dir.path().to_string_lossy().into_owned();
+        config.storage.save_directory = dir.path().to_string_lossy().into_owned();
+        // Ephemeral ports: this must not fight whatever else is on the machine.
+        config.discovery.port = 0;
+        config.transfer.port = 0;
+        let json = serde_json::to_string(&config).expect("config json");
+
+        crate::events::set_callback(Some(noop));
+        init(&json).expect("first init");
+        // The second one takes the re-init path, which is the one that used to
+        // clear the callback out from under the caller.
+        init(&json).expect("second init");
+
+        let still_there = crate::events::has_callback();
+        shutdown();
+        assert!(
+            still_there,
+            "re-initialising left the host with no event callback and a running \
+             engine — events stop, and nothing says why"
+        );
+    }
 
     /// `peerbeam-config` declares its default discovery port as a bare literal
     /// (`49500`) rather than depending on `peerbeam-discovery-udp` just to

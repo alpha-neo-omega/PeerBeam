@@ -1030,8 +1030,38 @@ impl Manager {
 
     /// Stop the receive server (idempotent).
     pub fn stop_daemon(&self) -> Op {
-        if let Some(handle) = self.daemon_task.lock().unwrap().take() {
+        let task = self.daemon_task.lock().unwrap().take();
+        if let Some(handle) = task {
             handle.abort();
+            // **Waited on, not just asked to stop.** `abort` schedules
+            // cancellation; the task keeps running until it next yields, and it
+            // holds the QUIC endpoint while it does. So this used to return with
+            // the port still bound and the daemon still alive — and when the task
+            // finally unwound, `serve`'s own exit path emitted `daemon_stopped`
+            // into whatever was listening by then. In the test suite that meant a
+            // later test's event buffer; for a host that stops and restarts the
+            // engine it means the rebind can race a listener that has not let go.
+            match tokio::runtime::Handle::try_current() {
+                // Already inside a multi-threaded runtime (the case
+                // `runtime::shutdown` documents): `block_on` would panic, so hand
+                // the blocking to this worker.
+                //
+                // A *current-thread* runtime is deliberately left alone: it has
+                // no other worker to hand the blocking to, so waiting here would
+                // deadlock the very executor that has to poll the task to
+                // completion. The abort still stands, making that the one path
+                // that returns before the task has finished — reachable only
+                // from a test driving this inside `#[tokio::test]`, never from a
+                // host, which calls in from a plain thread and takes the branch
+                // below.
+                Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let _ = tokio::task::block_in_place(|| h.block_on(handle));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = crate::runtime::rt().block_on(handle);
+                }
+            }
         }
         self.mark_daemon_stopped();
         Ok(json!({ "running": false }))
@@ -1044,9 +1074,14 @@ impl Manager {
     /// still running, and `start_daemon()`'s guard doesn't permanently
     /// refuse to bring it back up. Idempotent.
     fn mark_daemon_stopped(&self) {
-        self.daemon_running.store(false, Ordering::SeqCst);
         *self.daemon_task.lock().unwrap() = None;
-        daemon_event("daemon_stopped", self.daemon_port);
+        // Announced on the transition only. Both callers can reach this for the
+        // same stop — `stop_daemon` explicitly, and `serve` as it exits — so
+        // emitting unconditionally sent `daemon_stopped` twice for one daemon,
+        // the second one late enough to land after the next engine had started.
+        if self.daemon_running.swap(false, Ordering::SeqCst) {
+            daemon_event("daemon_stopped", self.daemon_port);
+        }
     }
 
     /// Stop then start the receive server.

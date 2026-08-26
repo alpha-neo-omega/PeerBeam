@@ -26,6 +26,16 @@ pub fn set_callback(cb: Option<EventCallback>) {
     *CALLBACK.write().unwrap_or_else(|e| e.into_inner()) = cb;
 }
 
+/// Whether a callback is currently registered.
+///
+/// For asserting the difference between the two teardown paths: a re-init keeps
+/// the caller's callback, a real shutdown clears it so the pointer can be freed.
+#[cfg(test)]
+#[must_use]
+pub fn has_callback() -> bool {
+    CALLBACK.read().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 /// Emit a pre-built event value to Dart, if a callback is registered. Ownership
 /// of the string transfers to the callee (Dart frees it) — required because
 /// `NativeCallable.listener` processes it asynchronously on the Dart isolate.

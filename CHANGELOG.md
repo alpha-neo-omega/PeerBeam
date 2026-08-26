@@ -239,6 +239,19 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **Re-initialising the engine no longer stops every event.** Starting the
+  engine when one is already running tears the old one down first, and that
+  teardown cleared the event callback — which is right when the app is shutting
+  down for good, because it is what makes the pointer safe to release, and wrong
+  on a restart, where nothing is being released and the caller has just handed
+  one over. The app restarts the engine after a settings change, and came back
+  with a working engine that reported nothing: no transfer progress, no incoming
+  file, no device appearing or leaving, and nothing on screen to say why.
+- **Stopping the receive daemon now waits for it to actually stop.** It asked the
+  task to cancel and returned immediately, so the port could still be held when
+  the next start tried to bind it — and the "daemon stopped" notice arrived
+  whenever the task finally unwound, which could be long after something else had
+  started.
 - **Android no longer freezes while a received file is filed away.** Every
   received file was copied into shared storage on the platform thread, so a large
   file or a folder froze the app until Android offered to kill it — and sharing
