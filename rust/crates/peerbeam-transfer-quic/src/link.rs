@@ -92,6 +92,26 @@ fn u8_to_kind(b: u8) -> Result<FrameKind> {
     })
 }
 
+/// How long a graceful close waits for the peer to acknowledge the last frame
+/// before closing anyway.
+///
+/// **Short on purpose, and it has to be.** `stopped()` completes when the peer
+/// acknowledges the data and the FIN — but a peer that simply drops its end
+/// never does, so this is not an unusual cost, it is the *usual* one against
+/// anything that does not read to the end. It was three seconds, which is fine
+/// for a single close and ruinous for a sequence of them: once the wrapper types
+/// began forwarding `graceful_close` (they had been silently degrading it to the
+/// abrupt close), every session close paid it, and 39 Windows tests failed —
+/// dials timing out at five seconds queued behind closes taking three.
+///
+/// A quarter second is still enormous next to what the wait is for. The frame is
+/// already written and the connection is alive; all that is outstanding is an
+/// acknowledgement travelling one round trip — microseconds on loopback, well
+/// under a millisecond on a LAN, tens of milliseconds through a DERP relay on
+/// the far side of the world. A peer that has not answered in 250 ms is not
+/// answering.
+const GRACE: Duration = Duration::from_millis(250);
+
 fn conn_err(e: impl std::fmt::Display) -> DomainError {
     DomainError::Connection(format!("quic: {e}"))
 }
@@ -249,7 +269,7 @@ impl Link for QuicLink {
         // and only then close the connection. A gone/unresponsive peer just hits
         // the timeout, after which we close anyway.
         let _ = self.send.finish();
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.send.stopped()).await;
+        let _ = tokio::time::timeout(GRACE, self.send.stopped()).await;
         self.conn.close(CLOSE_OK.into(), b"bye");
         Ok(())
     }
@@ -308,5 +328,32 @@ impl ProgressSource for QuicProgressSource {
             Err(quinn::ReadExactError::FinishedEarly { .. }) => Ok(None),
             Err(e) => Err(conn_err(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::GRACE;
+    use std::time::Duration;
+
+    /// **The bound is the guard, because no local test can be.** A graceful
+    /// close waits for the peer to acknowledge the last frame, and on loopback
+    /// that acknowledgement is immediate whatever the timeout is — a timing test
+    /// here passes at 250 ms and at three seconds alike, which is a guard that
+    /// guards nothing. What actually broke was the *constant*: at three seconds,
+    /// against peers that never acknowledge, closes queued up behind five-second
+    /// dials and took out 39 Windows tests.
+    ///
+    /// So this asserts the policy directly. If someone raises it, they have to
+    /// come here and read why it is low.
+    #[test]
+    fn the_graceful_close_wait_stays_short() {
+        assert!(
+            GRACE <= Duration::from_millis(500),
+            "GRACE is {GRACE:?}: a close that can take this long against an \
+             unresponsive peer is what broke Windows CI. The wait covers one \
+             round-trip acknowledgement — sub-millisecond on a LAN, tens of \
+             milliseconds through a relay — not a peer that has gone."
+        );
     }
 }
