@@ -131,6 +131,12 @@ class AppShell extends StatelessWidget {
               selectedIndex: index,
               onDestinationSelected: _go,
               extended: extended,
+              // Seven destinations do not fit a short window: a phone in
+              // landscape, or a desktop window tiled to half a screen, pushed the
+              // last ones past the bottom edge, where they were unreachable
+              // rather than merely ugly. Scrolling the group costs nothing when
+              // it does fit.
+              scrollable: true,
               labelType: extended ? null : NavigationRailLabelType.all,
               leading: _RailLeading(extended: extended),
               destinations: [

@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:path_provider/path_provider.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -19,8 +21,14 @@ int _payloadSeq = DateTime.now().microsecondsSinceEpoch;
 /// (`peerbeam-clipboard-<digits>.txt`) and return its path. The receiver and
 /// History render files with this name as a message, not a downloaded file.
 Future<String> writeTextPayload(String text) async {
+  // **`path_provider`, not `Directory.systemTemp`.** On Android the system temp
+  // directory is outside the app sandbox, so the write threw `PathAccessException`
+  // and every staged text or clipboard item failed — and because the send loop
+  // stages before it sends, one text took the whole batch down with it. On
+  // desktop this resolves to the same place `Directory.systemTemp` did.
+  final dir = await getTemporaryDirectory();
   final file = File(
-    '${Directory.systemTemp.path}/peerbeam-clipboard-${_payloadSeq++}.txt',
+    '${dir.path}/peerbeam-clipboard-${_payloadSeq++}.txt',
   );
   await file.writeAsString(text);
   return file.path;

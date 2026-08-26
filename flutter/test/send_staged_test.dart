@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/features/send/send_staged.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -7,10 +10,32 @@ import 'package:peerbeam/state/staging.dart';
 import 'package:peerbeam/state/stores.dart';
 import 'sdk/fake_peerbeam.dart';
 
+/// `writeTextPayload` asks `path_provider` where it may write — Android's
+/// system temp directory is outside the app sandbox — and a unit test has no
+/// plugin behind that channel, so it has to be stood in for.
+void _stubTempDir() {
+  final dir = Directory.systemTemp.createTempSync('pb-staged-temp');
+  addTearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          null,
+        );
+    if (dir.existsSync()) dir.deleteSync(recursive: true);
+  });
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(
+        const MethodChannel('plugins.flutter.io/path_provider'),
+        (call) async =>
+            call.method == 'getTemporaryDirectory' ? dir.path : null,
+      );
+}
+
 void main() {
   testWidgets('sendStaged batches files + materialized text and streams folders', (
     tester,
   ) async {
+    _stubTempDir();
     final fake = FakePeerBeam();
     final state = AppState.live(fake);
     state.staging.add([
@@ -67,6 +92,7 @@ void main() {
   testWidgets(
     'sendStaged removes only the items enqueued before a mid-batch folder failure',
     (tester) async {
+      _stubTempDir();
       final fake = FakePeerBeam()..failFolder = true;
       final state = AppState.live(fake);
       state.staging.add([
