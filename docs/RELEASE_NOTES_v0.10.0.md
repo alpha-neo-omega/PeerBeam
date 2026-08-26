@@ -100,6 +100,42 @@ conditions rather than quietly reinterpreted — see
 Both were reachable only by editing a config file. The logs the engine has always
 kept are now readable where you are.
 
+## Things the app could not do, and now can
+
+A sweep for the shape of two bugs reported from ordinary use — the app quietly
+cannot do something reasonable, and nothing on screen says so — turned up
+nineteen more. The ones you are most likely to have hit:
+
+**You can copy a message.** Chat text was not selectable, because press-and-hold
+is how messages are selected, so a message someone sent you could be read and not
+kept. Select one or several and **Copy text** takes them in order.
+
+**You can copy a device's fingerprint.** It is shown shortened to keep the row
+readable and could not be selected, so the one thing a fingerprint is for —
+comparing it with the other device over some other channel — was the one thing it
+could not do. Tapping it copies the whole value.
+
+**You can reach a device's shared folders without knowing its address.** Browsing
+existed, and the only way in was the menu of a device you had typed an IP address
+for. It is on the Devices menu now, beside Wake.
+
+**A navigation button works while a screen is open over it.** Opening a chat from
+a device and then pressing Home did nothing until you pressed back.
+
+**Searching for a device follows discovery.** It froze at the instant it opened,
+so a device found a second later never appeared — and opening it in the first
+seconds after launch showed "No matches" with nothing typed.
+
+**A device you can wake is not forgotten while it sleeps.** Devices you marked as
+your own, or gave a hardware address, are kept in the list however long they have
+been away; everything else still ages out. And the address is filled in for you
+rather than asked for again — `peerbeam wake list` shows what is recorded.
+
+**Failures say so.** A revoke that did not happen looked exactly like one that
+did. A note the app could not save vanished with your text in it. Renaming this
+device, or changing where files are saved, reverted in silence. A tap on a file
+while browsing did nothing at all.
+
 ## Fixes worth naming
 
 **Anyone who could reach the port could change your clipboard.** Inbound clips
@@ -146,7 +182,7 @@ The full list is in
 
 ## Verified
 
-1706 Rust tests and 544 Flutter tests pass; `cargo fmt`, `cargo clippy -D
+1727 Rust tests, 572 Flutter tests and 18 Kotlin tests pass; `cargo fmt`, `cargo clippy -D
 warnings` and `flutter analyze` are clean.
 
 CI runs the Rust suite and the Flutter suite on every commit, and **builds** the
