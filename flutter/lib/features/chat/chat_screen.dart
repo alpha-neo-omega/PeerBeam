@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/theme.dart';
 import '../../platform/desktop_files.dart';
@@ -618,6 +619,31 @@ class _ChatScreenState extends State<ChatScreen> {
   /// The app bar while messages are selected: leave, the count, and the two
   /// things that can be done to a selection.
   ///
+  /// Put the selected messages' text on the clipboard, in thread order.
+  ///
+  /// Joined with newlines and carrying no names or timestamps: what a person
+  /// asked to copy is what they can see, and a decorated transcript is a
+  /// different thing that they would then have to edit back down. File rows are
+  /// skipped rather than rendered as a placeholder line, for the same reason —
+  /// their name is not text the sender wrote.
+  Future<void> _copySelected(List<ChatMessage> chosen) async {
+    final text = chosen
+        .where((m) => !m.isFile)
+        .map((m) => m.body)
+        .join('\n');
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    _clearSelection();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          chosen.length == 1 ? 'Message copied' : 'Messages copied',
+        ),
+      ),
+    );
+  }
+
   /// [items] arrives in thread order, so [_forwardSelected] gets its messages
   /// in the order they appear rather than in whatever order they were tapped.
   PreferredSizeWidget _selectionBar(
@@ -644,6 +670,19 @@ class _ChatScreenState extends State<ChatScreen> {
             tooltip: 'Reply',
             onPressed: () => _startReply(chosen.first),
           ),
+        // **Text only, and only when there is some.** A file row's body is
+        // empty by construction — its name is the payload — so copying a
+        // selection of files would put an empty string on the clipboard and
+        // look like the copy failed. Offering it disabled says why instead.
+        IconButton(
+          icon: const Icon(Icons.copy_rounded),
+          tooltip: chosen.any((m) => !m.isFile)
+              ? 'Copy text'
+              : 'Nothing to copy — a file row has no text',
+          onPressed: chosen.any((m) => !m.isFile)
+              ? () => _copySelected(chosen)
+              : null,
+        ),
         IconButton(
           icon: const Icon(Icons.forward_rounded),
           tooltip: 'Forward',

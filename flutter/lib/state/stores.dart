@@ -9,6 +9,7 @@ import '../data/discovery_repository.dart';
 import '../data/history_repository.dart';
 import '../data/presence_repository.dart';
 import '../data/saved_devices_repository.dart';
+import '../data/view_prefs_repository.dart';
 import '../data/transfer_repository.dart';
 import '../data/trust_repository.dart';
 import '../sdk/events.dart';
@@ -411,6 +412,9 @@ class AppState {
   final TransferRepository transfer;
   final HistoryRepository history;
   final SavedDevicesRepository saved;
+
+  /// How the device lists are displayed. Local to this app, not the engine.
+  final ViewPrefsRepository view;
   final TrustRepository trust;
   final ChatRepository chat;
   final NotesRepository notes;
@@ -436,6 +440,7 @@ class AppState {
     required this.transfer,
     required this.history,
     required this.saved,
+    required this.view,
     required this.trust,
     required this.chat,
     required this.notes,
@@ -478,6 +483,7 @@ class AppState {
       ),
       history: HistoryRepository(api: api),
       saved: SavedDevicesRepository()..load(),
+      view: ViewPrefsRepository()..load(),
       trust: trust,
       chat: ChatRepository(api: api),
       notes: NotesRepository(api: api),
@@ -515,6 +521,7 @@ class AppState {
     transfer.dispose();
     history.dispose();
     saved.dispose();
+    view.dispose();
     settings.dispose();
     staging.dispose();
     clipboard?.dispose();

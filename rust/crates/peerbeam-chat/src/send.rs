@@ -17,6 +17,43 @@ use crate::store::{ChatStore, OutboxEntry, StagedFile};
 /// reached [`ChannelState::Open`] (factored out of [`send_message`] so
 /// [`flush_to_session`] can reuse the same wire-send step for each queued
 /// entry without re-minting a message or re-opening the channel).
+/// Reuse this session's CHAT channel, opening one only when there is none.
+///
+/// **A channel per message is not safe to close after sending.**
+/// `send_on_channel` resolves once the frame is queued to the channel's actor,
+/// not once it is on the wire — and a `ChannelClose` travels on the session's
+/// *control* stream while the message travels on the channel's own stream.
+/// Nothing orders one against the other, so the peer could see the close first,
+/// tear the channel down and discard a message the sender had already reported
+/// as sent. Intermittent by nature, and worse the slower the machine.
+///
+/// So the channel is kept for the life of the session instead — which is also
+/// what fixes the leak that the per-message close was introduced for, and what
+/// presence and clipboard already do. It is bounded by one channel per session
+/// rather than one per message, and the session closing takes it with it.
+///
+/// A channel this side opened earlier is reused only while it is still open; a
+/// peer that closed it, or a reconnect that took it, simply means opening
+/// another.
+async fn chat_lane(handle: &SessionHandle) -> Result<ChannelId, SendError> {
+    let existing = handle
+        .channels()
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?
+        .into_iter()
+        .find(|c| c.channel_type == ChannelType::CHAT && c.state.is_open())
+        .map(|c| c.id);
+    if let Some(channel) = existing {
+        return Ok(channel);
+    }
+    let channel = handle
+        .open_channel(ChannelType::CHAT)
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))?;
+    wait_for_channel_open(handle, channel).await?;
+    Ok(channel)
+}
+
 async fn send_on_open_channel(
     handle: &SessionHandle,
     channel: ChannelId,
@@ -109,15 +146,11 @@ pub async fn send_reply(
     in_reply_to: Option<&str>,
 ) -> Result<ChatRecord, SendError> {
     let msg = ChatMessage::replying(body, in_reply_to)?; // enforces MAX_BODY
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
     let sent = send_on_open_channel(handle, channel, &msg).await;
-    // Closed either way: a failed send leaks the channel just as surely as a
-    // successful one, and the failure is what a retry follows.
-    handle.close_channel(channel);
+    // **Not closed here.** The lane is the session's, not this message's — see
+    // `chat_lane`. Closing right after a send raced the message it had just
+    // queued.
     sent?;
     let rec = ChatRecord::sent(peer, &msg);
     store.append(&rec)?;
@@ -161,11 +194,7 @@ pub async fn flush_to_session(
     {
         return Ok(Vec::new());
     }
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
 
     let mut flushed = Vec::new();
     for entry in entries {
@@ -207,12 +236,9 @@ pub async fn flush_to_session(
             Kind::File => continue,
         }
     }
-    // One channel for the whole batch, closed once at the end. A flush is the
-    // case where reuse is genuinely right — the entries are machine-paced, so
-    // an open per message would pay the accept round trip for each — but it
-    // still has to be given back, or a peer that reconnects repeatedly leaks
-    // one channel per reconnection.
-    handle.close_channel(channel);
+    // Not closed: this is the session's lane, shared with every other chat
+    // send over it (see `chat_lane`), and closing it here would race whatever
+    // was queued on it — the bug this batch's own channel was closed for.
     Ok(flushed)
 }
 
@@ -440,17 +466,13 @@ pub async fn prepare_file_send(
 /// queued locally, so sending immediately would race the accept over any real
 /// transport.
 pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), SendError> {
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
     let frame = r.to_frame(channel)?;
     let sent = handle
         .send_on_channel(channel, FileRef::message_type(), frame.flags, frame.payload)
         .await
         .map_err(|e| SendError::Session(e.to_string()));
-    handle.close_channel(channel);
+    // The lane belongs to the session, not to this frame — see `chat_lane`.
     sent
 }
 
@@ -473,17 +495,13 @@ pub async fn send_file_ref(handle: &SessionHandle, r: &FileRef) -> Result<(), Se
 /// on `DeviceConfig::share_read_receipts`, which is a privacy choice and has no
 /// business being read down here.
 pub async fn send_receipt(handle: &SessionHandle, r: &Receipt) -> Result<(), SendError> {
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
     let frame = r.to_frame(channel)?;
     let sent = handle
         .send_on_channel(channel, Receipt::message_type(), frame.flags, frame.payload)
         .await
         .map_err(|e| SendError::Session(e.to_string()));
-    handle.close_channel(channel);
+    // The lane belongs to the session, not to this frame — see `chat_lane`.
     sent
 }
 
@@ -493,11 +511,7 @@ pub async fn send_receipt(handle: &SessionHandle, r: &Receipt) -> Result<(), Sen
 /// decides *whether* to send — that decision reads the negotiated capability
 /// and lives with the rest of the send policy, not here.
 pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), SendError> {
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
     let frame = r.to_frame(channel)?;
     let sent = handle
         .send_on_channel(
@@ -508,18 +522,13 @@ pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), S
         )
         .await
         .map_err(|e| SendError::Session(e.to_string()));
-    handle.close_channel(channel);
+    // The lane belongs to the session, not to this frame — see `chat_lane`.
     sent
 }
 
 pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Result<(), SendError> {
-    let channel = handle
-        .open_channel(ChannelType::CHAT)
-        .await
-        .map_err(|e| SendError::Session(e.to_string()))?;
-    wait_for_channel_open(handle, channel).await?;
+    let channel = chat_lane(handle).await?;
     let sent = send_decline_on_open_channel(handle, channel, d).await;
-    handle.close_channel(channel);
     sent
 }
 

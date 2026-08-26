@@ -170,6 +170,17 @@ fn summarise_events() -> String {
     seen.iter()
         .map(|e| {
             let kind = e["type"].as_str().unwrap_or("?");
+            // A failure carries the reason it failed, which is the whole point
+            // of seeing it here: a phantom transfer and a real one that broke
+            // look identical as a bare type name.
+            // The payload is nested under `payload` (see `events::transfer`), and
+            // a failure's reason is the whole point of seeing it here: a phantom
+            // transfer and a real one that broke look identical as a type name.
+            if let Some(msg) = e["payload"]["error"]["message"].as_str() {
+                let file = e["payload"]["file"].as_str().unwrap_or("-");
+                let id = e["transfer_id"].as_str().unwrap_or("-");
+                return format!("{kind}(id={id} file={file}: {msg})");
+            }
             match e["message"]["direction"].as_str() {
                 Some(dir) => format!("{kind}({dir})"),
                 None => kind.to_string(),
@@ -732,8 +743,26 @@ async fn chat_received_into_ffi_and_history_round_trip() {
         })
     })
     .await
-    .unwrap()
-    .expect("expected a chat_received event");
+    .unwrap();
+    let event = match event {
+        Some(event) => event,
+        None => {
+            // **Did it arrive at all?** The event and the stored row come from
+            // the same handler, so asking the store separates "the message never
+            // reached this device" from "it landed and the notification was
+            // lost" — two different bugs that look identical from the event
+            // buffer alone.
+            let convos = call_json(pb_chat_conversations, &json!({}));
+            let hist = call_json(
+                pb_chat_history,
+                &json!({ "peer_id": sent_rec.peer_id.to_string() }),
+            );
+            panic!(
+                "no chat_received event.\n  conversations: {convos}\n  history for                  {}: {hist}",
+                sent_rec.peer_id
+            );
+        }
+    };
     assert_eq!(event["message"]["direction"], "in");
     assert_eq!(event["message"]["status"], "received");
     let sender_peer_id = event["message"]["peer_id"]
@@ -819,8 +848,26 @@ async fn chat_only_dial_does_not_register_phantom_transfer() {
         })
     })
     .await
-    .unwrap()
-    .expect("expected a chat_received event");
+    .unwrap();
+    let event = match event {
+        Some(event) => event,
+        None => {
+            // **Did it arrive at all?** The event and the stored row come from
+            // the same handler, so asking the store separates "the message never
+            // reached this device" from "it landed and the notification was
+            // lost" — two different bugs that look identical from the event
+            // buffer alone.
+            let convos = call_json(pb_chat_conversations, &json!({}));
+            let hist = call_json(
+                pb_chat_history,
+                &json!({ "peer_id": sent_rec.peer_id.to_string() }),
+            );
+            panic!(
+                "no chat_received event.\n  conversations: {convos}\n  history for                  {}: {hist}",
+                sent_rec.peer_id
+            );
+        }
+    };
     assert_eq!(event["message"]["direction"], "in");
     assert_eq!(event["message"]["status"], "received");
 

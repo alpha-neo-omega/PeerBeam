@@ -43,10 +43,34 @@ class AppShell extends StatelessWidget {
     (d) => d.label == 'Transfers',
   );
 
-  void _go(int index) => navigationShell.goBranch(
-    index,
-    initialLocation: index == navigationShell.currentIndex,
-  );
+  void _go(BuildContext context, int index) {
+    // **Clear anything pushed over the shell first.** Chat detail, Notes and
+    // the timeline are pushed routes rather than branches, and `goBranch`
+    // switches the branch *underneath* them — so tapping a destination while
+    // one was open changed a screen nobody could see, and the tap read as
+    // ignored until the user pressed back. Popping first makes the destination
+    // mean what it looks like it means.
+    //
+    // The **branch's** navigator, not the root one. Each branch of a
+    // `StatefulShellRoute` has its own, and a screen pushed from inside a branch
+    // — chat detail is pushed from Home — lands there. `goBranch`'s
+    // `initialLocation` resets a branch's *declarative* location and leaves an
+    // imperatively pushed route sitting on top of it, which is exactly the case
+    // here, so it has to be popped explicitly.
+    //
+    // The root navigator is cleared too, for anything pushed to cover the whole
+    // shell (a dialog, a full-screen route). Both are no-ops when there is
+    // nothing above the branch's first route.
+    final branch =
+        navigationShell.route.branches[navigationShell.currentIndex].navigatorKey;
+    branch.currentState?.popUntil((route) => route.isFirst);
+    final root = Navigator.of(context, rootNavigator: true);
+    if (root.canPop()) root.popUntil((route) => route.isFirst);
+    navigationShell.goBranch(
+      index,
+      initialLocation: index == navigationShell.currentIndex,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -78,11 +102,12 @@ class AppShell extends StatelessWidget {
 
     if (width < Breakpoints.compact) {
       return _withShortcuts(
+        context,
         Scaffold(
           body: body,
           bottomNavigationBar: NavigationBar(
             selectedIndex: index,
-            onDestinationSelected: _go,
+            onDestinationSelected: (i) => _go(context, i),
             // Icons only, overriding the theme's `onlyShowSelected`, because
             // seven destinations do not leave room for a word. Each one gets
             // width/7 — about 51px on a 360px phone — and `NavigationBar` lays
@@ -124,12 +149,13 @@ class AppShell extends StatelessWidget {
 
     final extended = width >= Breakpoints.medium;
     return _withShortcuts(
+      context,
       Scaffold(
         body: Row(
           children: [
             NavigationRail(
               selectedIndex: index,
-              onDestinationSelected: _go,
+              onDestinationSelected: (i) => _go(context, i),
               extended: extended,
               // Seven destinations do not fit a short window: a phone in
               // landscape, or a desktop window tiled to half a screen, pushed the
@@ -178,7 +204,7 @@ class AppShell extends StatelessWidget {
   /// arrives with Spaces for that same reason, and Spaces sits at the end of
   /// `_destinations` precisely so that it is the only digit this change adds
   /// rather than the fourth it moves.
-  Widget _withShortcuts(Widget child) {
+  Widget _withShortcuts(BuildContext context, Widget child) {
     const keys = [
       LogicalKeyboardKey.digit1,
       LogicalKeyboardKey.digit2,
@@ -195,13 +221,13 @@ class AppShell extends StatelessWidget {
         : _destinations.length;
     final bindings = <ShortcutActivator, VoidCallback>{};
     for (var i = 0; i < n; i++) {
-      bindings[SingleActivator(keys[i], control: true)] = () => _go(i);
-      bindings[SingleActivator(keys[i], meta: true)] = () => _go(i);
+      bindings[SingleActivator(keys[i], control: true)] = () => _go(context, i);
+      bindings[SingleActivator(keys[i], meta: true)] = () => _go(context, i);
     }
     return PopScope(
       canPop: navigationShell.currentIndex == 0,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _go(0); // return to the Home branch before allowing exit
+        if (!didPop) _go(context, 0); // return to Home before allowing exit
       },
       child: CallbackShortcuts(
         bindings: bindings,

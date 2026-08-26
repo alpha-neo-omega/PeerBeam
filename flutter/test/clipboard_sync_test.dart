@@ -39,6 +39,7 @@ import 'package:peerbeam/sdk/exceptions.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/staging.dart';
+import 'package:peerbeam/data/view_prefs_repository.dart';
 import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
@@ -104,6 +105,25 @@ Future<void> _settle() async {
   }
 }
 
+
+/// Scroll Settings until [text] is built.
+///
+/// The screen is a lazy scroll view, so a tile below the fold is not in the
+/// tree at all — a `find.text` for it returns nothing whether the tile is absent
+/// or merely further down. Adding a card above the clipboard section is enough
+/// to move it out of range, which is a property of the viewport rather than of
+/// the setting, so the test scrolls to it instead of assuming where it sits.
+Future<void> _scrollTo(WidgetTester tester, String text) async {
+  final target = find.text(text);
+  if (target.evaluate().isNotEmpty) return;
+  await tester.scrollUntilVisible(
+    target,
+    300,
+    scrollable: find.byType(Scrollable).first,
+  );
+  await tester.pumpAndSettle();
+}
+
 Widget _settingsApp(SettingsStore settings) => AppScope(
   state: AppState(
     theme: ThemeController(),
@@ -111,6 +131,7 @@ Widget _settingsApp(SettingsStore settings) => AppScope(
     transfer: TransferRepository(),
     history: HistoryRepository(),
     saved: SavedDevicesRepository(),
+    view: ViewPrefsRepository(),
     trust: TrustRepository(),
     chat: ChatRepository(),
     notes: NotesRepository(),
@@ -524,6 +545,7 @@ void main() {
       );
       await tester.pumpWidget(_settingsApp(settings));
       await tester.pumpAndSettle();
+      await _scrollTo(tester, 'Sync clipboard with trusted devices');
 
       expect(find.text('Sync clipboard with trusted devices'), findsOneWidget);
       // The warning, pinned verbatim. Asserting the whole sentence rather than
@@ -554,6 +576,7 @@ void main() {
 
       await tester.pumpWidget(_settingsApp(settings));
       await tester.pumpAndSettle();
+      await _scrollTo(tester, 'Sync clipboard with trusted devices');
 
       final tile = tester.widget<SwitchListTile>(
         find.ancestor(

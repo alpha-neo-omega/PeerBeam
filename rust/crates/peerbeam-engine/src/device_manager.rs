@@ -78,13 +78,30 @@ impl DeviceManager {
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // **The sweep outlives the stream.** These share one task, and the
+            // stream ending used to `break` out of the loop — taking the ticker
+            // with it. Every device already in the store then stayed exactly as
+            // it was, offline and un-prunable, for as long as the app ran: a
+            // list slowly filling with machines that are no longer there and
+            // will never age out. The stream ends whenever the providers stop
+            // yielding, which needs no user action and says nothing on screen.
+            //
+            // So a finished stream retires that arm and leaves the sweep
+            // running. The task still ends when it is aborted — by `stop`, or
+            // by a `start` replacing it — which is the only place ending it is
+            // actually meant to happen.
+            let mut live = true;
             loop {
                 tokio::select! {
-                    item = stream.next() => {
-                        let Some((provider, event)) = item else { break };
-                        let emitted = store.lock().unwrap().observe(&provider, event);
-                        for change in emitted {
-                            let _ = changes.send(change);
+                    item = stream.next(), if live => {
+                        match item {
+                            Some((provider, event)) => {
+                                let emitted = store.lock().unwrap().observe(&provider, event);
+                                for change in emitted {
+                                    let _ = changes.send(change);
+                                }
+                            }
+                            None => live = false,
                         }
                     }
                     _ = ticker.tick() => {
@@ -229,6 +246,46 @@ mod tests {
             port: 9000,
             last_seen: chrono::Utc::now(),
         }
+    }
+
+    /// **The periodic sweep must outlive the provider stream.** Both run in one
+    /// task, and the stream finishing used to break the loop — taking the ticker
+    /// down with it. Nothing announces that: the app's scan button is its own
+    /// state, so it still reads "Stop" while the engine has quietly stopped
+    /// pruning, and every device already seen stays listed, offline, for as long
+    /// as the app runs.
+    ///
+    /// `Scripted` ends as soon as its script is replayed, which is exactly that
+    /// condition. Asserted on the task rather than on a removal, because the
+    /// sweep's own interval is a minute and its staleness test reads the wall
+    /// clock — what regressed is whether the task is still there to tick at all.
+    #[tokio::test]
+    async fn the_prune_sweep_survives_a_finished_provider_stream() {
+        let provider = Arc::new(Scripted {
+            id: ProviderId::from("udp"),
+            script: vec![DiscoveryEvent::Found(device("a"))],
+        });
+        let manager = DeviceManager::new(vec![provider]);
+        let mut changes = manager.changes();
+        manager.start(device("me")).await.expect("starts");
+
+        // Wait for the one scripted event, after which the stream is finished.
+        let _added = timeout(StdDuration::from_millis(500), changes.recv())
+            .await
+            .expect("the scripted event arrives")
+            .expect("a change");
+        // Give the task a chance to observe the end of the stream.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let task = manager.task.lock().unwrap();
+        let handle = task.as_ref().expect("the merge task is running");
+        assert!(
+            !handle.is_finished(),
+            "the task exited when the provider stream ended, so nothing prunes \
+             offline devices any more"
+        );
     }
 
     /// `prune` (the manual/testable entry point that the periodic sweep in

@@ -1,4 +1,6 @@
 import 'package:flutter/foundation.dart';
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -107,6 +109,25 @@ class SettingsScreen extends StatelessWidget {
                         ),
                       ],
                     ),
+                  ),
+                ),
+              ),
+              const Gap(AppSpace.md),
+
+              const _GroupLabel('Device list'),
+              AnimatedBuilder(
+                animation: state.view,
+                builder: (context, _) => Card(
+                  child: SwitchListTile.adaptive(
+                    secondary: const Icon(Icons.visibility_off_rounded),
+                    title: const Text('Hide offline devices'),
+                    subtitle: const Text(
+                      'Home shows only devices that are reachable now. '
+                      'Devices keeps showing every one, with when it was last '
+                      'seen — that is where you wake a sleeping device.',
+                    ),
+                    value: state.view.hideOffline,
+                    onChanged: (v) => unawaited(state.view.setHideOffline(v)),
                   ),
                 ),
               ),

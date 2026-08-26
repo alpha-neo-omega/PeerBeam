@@ -553,7 +553,11 @@ class _HomeScreenState extends State<HomeScreen> {
               maxWidth: Breakpoints.contentMaxWidth,
             ),
             child: AnimatedBuilder(
-              animation: Listenable.merge([state.device, state.saved]),
+              animation: Listenable.merge([
+                state.device,
+                state.saved,
+                state.view,
+              ]),
               builder: (context, _) {
                 // Every device the engine currently knows about, online or
                 // not: a peer that drops offline stays listed (dimmed, with
@@ -561,7 +565,18 @@ class _HomeScreenState extends State<HomeScreen> {
                 // because its conversation is local history that stays worth
                 // opening. The engine removes a device outright when it
                 // genuinely goes away, and that still drops it from here.
-                final devices = state.device.devices.toList();
+                //
+                // *Hide offline devices* (Settings) trades that for a shorter
+                // list: with it on, only what is reachable now is shown. It is
+                // off by default because the row it hides is not inert — the
+                // chat button opens the conversation you already have with that
+                // peer — and because a device that dropped for a moment returns
+                // on its own. The Devices dashboard is unaffected either way:
+                // last-seen and Wake are the reasons it exists, and Wake applies
+                // precisely to a device that is asleep.
+                final devices = state.device.devices
+                    .where((d) => d.online || !state.view.hideOffline)
+                    .toList();
                 final saved = state.saved.devices;
                 return CustomScrollView(
                   slivers: [

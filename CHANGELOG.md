@@ -239,6 +239,21 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A navigation destination now leaves the screen you pushed.** Opening a chat
+  from a device and then pressing Home did nothing until you pressed back: chat
+  detail sits on top of the section it was opened from, and choosing a
+  destination changed the section *underneath* it. The tap now clears what is on
+  top, so it means what it looks like it means.
+- **Chat messages can be copied.** There was no way to get text out of a
+  conversation — the bubble is not selectable, because press-and-hold is how you
+  select messages. Selecting one (or several) now offers **Copy text**, which
+  copies them in the order they appear, joined by newlines and carrying no names
+  or timestamps: what you asked to copy is what you can see. Rows that are files
+  are skipped, since their name is not text anyone wrote.
+- **Settings → Device list → Hide offline devices.** Off by default. With it on,
+  Home lists only devices you can reach right now. Devices keeps showing every
+  one with when it was last seen — that is where you wake a sleeping machine,
+  which is precisely a device that is offline.
 - **A phone now reports its battery when you share device status.** The engine
   reads a battery from the system on Linux and reports none on Windows and
   macOS by design; on Android it deferred to the app, and the app had nothing

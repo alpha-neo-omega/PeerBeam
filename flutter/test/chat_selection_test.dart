@@ -16,6 +16,7 @@ import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -180,6 +181,52 @@ void main() {
   });
 
   // A right-click is the desktop way in; a long-press with a mouse is not.
+  /// **You could not get a message's text out of the app.** The bubble is a
+  /// plain `Text` — not selectable, because long-press and right-click are how
+  /// selection mode is entered — so there was no way to copy what somebody sent
+  /// you. Copy joins the actions that already work on a selection.
+  testWidgets('copy puts the selected messages on the clipboard, in thread '
+      'order', (tester) async {
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _text('m1', 'first'),
+      _text('m2', 'second'),
+    ];
+    await _open(tester, fake);
+
+    // Selected out of order; copied in the order they appear on screen.
+    await _longPress(tester, 'second');
+    await tester.tap(find.text('first'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Copy text'));
+    await tester.pumpAndSettle();
+
+    expect(copied, ['first\nsecond']);
+    expect(
+      find.text('2 selected'),
+      findsNothing,
+      reason: 'copying finishes the selection, like the other actions do',
+    );
+  });
+
   testWidgets('a secondary tap enters selection too', (tester) async {
     final fake = FakePeerBeam();
     fake.chatHistories['pb-bob'] = [_text('m1', 'first')];

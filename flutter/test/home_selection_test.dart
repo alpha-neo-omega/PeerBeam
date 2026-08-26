@@ -84,6 +84,51 @@ void main() {
     expect(_button(tester, 'Send to Live Laptop').onPressed, isNull);
   });
 
+  /// **The preference is off by default, and turning it on is what changes
+  /// things.** A greyed row is not inert — its chat opens the conversation you
+  /// already have with that peer — so hiding offline devices is a choice rather
+  /// than the behaviour. Both halves are asserted here, because a default that
+  /// quietly flipped would remove a way into chat that nothing announced.
+  testWidgets('hide-offline is opt-in, and hides an offline device when on', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: HomeScreen()),
+      ),
+    );
+    await tester.pump();
+
+    fake.emit(const DeviceAdded(_laptop));
+    fake.emit(const DeviceStatusChanged('x1', false));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // Default: still listed, exactly as before this preference existed.
+    expect(state.view.hideOffline, isFalse);
+    expect(find.text('Live Laptop'), findsOneWidget);
+
+    await state.view.setHideOffline(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(
+      find.text('Live Laptop'),
+      findsNothing,
+      reason: 'an offline device is still listed with the preference on',
+    );
+
+    // And turning it back off brings it back — it was hidden, not forgotten.
+    await state.view.setHideOffline(false);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('Live Laptop'), findsOneWidget);
+  });
+
   // A saved device's id is a locally minted timestamp, NOT the peer's real
   // device id. Opening a thread under it would namespace our own rows under an
   // id the peer never uses, so replies (keyed by the authenticated device id)
