@@ -768,6 +768,16 @@ pub unsafe extern "C" fn pb_wake_set(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.wake_set(&read_json(json)?))()))
 }
 
+/// The hardware address recorded for a device: `{device}` → `{mac}` (null when
+/// none is recorded).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_wake_get(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.wake_get(&read_json(json)?))()))
+}
+
 /// Forget a device's hardware address: `{device}` → `{forgotten}`.
 ///
 /// # Safety

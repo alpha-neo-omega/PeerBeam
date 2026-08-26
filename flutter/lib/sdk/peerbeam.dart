@@ -405,6 +405,13 @@ abstract class PeerBeamApi {
   /// The devices the user marked as their own.
   Future<List<String>> myDevices();
 
+  /// The hardware address recorded for a device, or null when there is none.
+  ///
+  /// A write-only setting is one nobody keeps using: the address could be
+  /// stored and sent with and never read back, so checking one meant typing it
+  /// again — and an address typed from memory is one typed wrong.
+  Future<String?> wakeAddress(String device);
+
   /// Record where to send a wake packet.
   Future<String> setWakeAddress(String device, String mac);
 
@@ -922,6 +929,10 @@ class PeerBeam implements PeerBeamApi {
         .map((e) => (e as Map<String, dynamic>)['device'].toString())
         .toList();
   }
+
+  @override
+  Future<String?> wakeAddress(String device) async =>
+      _data(_req().wakeGet(jsonEncode({'device': device})))['mac'] as String?;
 
   @override
   Future<String> setWakeAddress(String device, String mac) async =>

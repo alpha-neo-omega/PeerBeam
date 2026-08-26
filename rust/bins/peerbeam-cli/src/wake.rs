@@ -27,6 +27,7 @@ pub fn wake(ctx: &Ctx, action: WakeAction, path_override: Option<&str>) -> CliRe
     let store = wake_store(&config)?;
     match action {
         WakeAction::Set { device, mac } => set(ctx, &store, &device, &mac),
+        WakeAction::List => list(ctx, &store),
         WakeAction::Forget { device } => forget(ctx, &store, &device),
         WakeAction::Send { device, broadcast } => send(ctx, &store, &config, &device, &broadcast),
     }
@@ -38,6 +39,32 @@ fn err(e: WakeError) -> CliError {
         WakeError::Send(_) => CliError::Connection(e.to_string()),
         _ => CliError::Usage(e.to_string()),
     }
+}
+
+/// Every recorded address, so one can be checked rather than re-typed.
+fn list(ctx: &Ctx, store: &WakeStore) -> CliResult {
+    let mut records = store.all().map_err(err)?;
+    records.sort_by(|a, b| a.device.0.cmp(&b.device.0));
+    if ctx.json {
+        ctx.json_line(&serde_json::json!({
+            "addresses": records
+                .iter()
+                .map(|r| serde_json::json!({
+                    "device": r.device.0,
+                    "mac": r.mac.to_string(),
+                }))
+                .collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
+    if records.is_empty() {
+        ctx.line("No hardware addresses recorded. `peerbeam wake set <device> <mac>` adds one.");
+        return Ok(());
+    }
+    for r in &records {
+        ctx.line(&format!("{}  {}", r.mac, r.device.0));
+    }
+    Ok(())
 }
 
 fn set(ctx: &Ctx, store: &WakeStore, device: &str, mac: &str) -> CliResult {

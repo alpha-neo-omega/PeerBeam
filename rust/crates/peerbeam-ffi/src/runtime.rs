@@ -587,6 +587,26 @@ pub fn init(config_json: &str) -> OpResult {
     // that static's doc comment for why this matters.
     let drain_handle = rt().spawn(chat_drain_loop(engine.clone(), manager.clone()));
 
+    // **Devices you named are not forgotten.** Pruning after five minutes is
+    // what keeps the list from filling with machines that are long gone, but a
+    // device you can *wake* is asleep — which is to say offline — and it is
+    // woken from that same list. Recording a hardware address is a deliberate
+    // statement that you intend to wake that machine, and marking one as yours
+    // is the same claim in weaker form; dropping either is the app discarding
+    // something it was told. Read live rather than snapshotted, so marking a
+    // device or recording an address takes effect without a restart.
+    {
+        let trust = manager.trust_store();
+        let wake = manager.clone();
+        engine.keep_devices(std::sync::Arc::new(move |id: &DeviceId| {
+            let mine = peerbeam_domain::port::TrustStore::lookup(trust.as_ref(), id)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.mine);
+            mine || wake.has_wake_address(id)
+        }));
+    }
+
     *lock(&ME) = Some(me(&config, &device_id));
     *lock(&ENGINE) = Some(engine);
     *lock(&MANAGER) = Some(manager);

@@ -74,6 +74,26 @@ class _WakeDialogState extends State<WakeDialog> {
   void initState() {
     super.initState();
     _check();
+    _loadRecordedAddress();
+  }
+
+  /// Show the address already recorded for this device, if there is one.
+  ///
+  /// **It was stored, used, and never shown.** Waking sends to a remembered
+  /// address, so the field starting empty every time asked the user to type a
+  /// MAC they had already given — from memory, which is how a MAC gets typed
+  /// wrong. Failing to read one is not worth reporting: the field simply stays
+  /// empty, which is what it did before, and typing one still works.
+  Future<void> _loadRecordedAddress() async {
+    try {
+      final mac = await widget.api.wakeAddress(widget.device.id);
+      if (!mounted || mac == null || mac.isEmpty) return;
+      // Never overwrite something typed while the read was in flight.
+      if (_mac.text.trim().isNotEmpty) return;
+      setState(() => _mac.text = mac);
+    } catch (_) {
+      // Leave the field empty; the dialog works exactly as it did.
+    }
   }
 
   @override

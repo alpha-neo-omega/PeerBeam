@@ -862,6 +862,17 @@ impl Manager {
 
     /// The trust store, for the same wiring — the notes permission is read from
     /// it per batch.
+    /// Whether a hardware address is recorded for `device`, so it can be woken.
+    ///
+    /// Used to exempt it from device pruning: waking a machine needs it listed,
+    /// and a machine worth waking is asleep. A read failure answers `false` —
+    /// the exemption is a convenience, and a store that cannot be read should
+    /// not pin every device in the list for ever.
+    #[must_use]
+    pub fn has_wake_address(&self, device: &DeviceId) -> bool {
+        self.wake.lookup(device).ok().flatten().is_some()
+    }
+
     #[must_use]
     pub fn trust_store(&self) -> Arc<FsTrust> {
         self.trust.clone()
@@ -942,6 +953,15 @@ impl Manager {
                     peerbeam_clipboard::MAX_CLIP
                 ),
             ));
+        }
+        // **Recorded here too, not only on the way in.** Clipboard history was
+        // written from one place — a clip *arriving* from a peer — so the log
+        // held only other people's copies, and what this device sent was absent
+        // from its own history. Recorded before the sync gate, because a clip
+        // this device put out is a clip this device had whether or not it was
+        // allowed to leave.
+        if crate::clipboard::history_enabled() {
+            let _ = self.clip_history.record(text, None);
         }
         if !crate::clipboard::sync_enabled() {
             return Ok(json!({ "queued": 0, "sync": false }));
@@ -3949,6 +3969,24 @@ impl Manager {
             .remember(&device, mac, chrono::Utc::now())
             .map_err(|e| (Code::Storage, e.to_string()))?;
         Ok(json!({ "mac": mac.to_string() }))
+    }
+
+    /// `{"device"}` → `{"mac": string|null}` — the address recorded for a
+    /// device, if any.
+    ///
+    /// **A write-only setting is one nobody keeps using.** The address could be
+    /// stored and sent with, and never read back, so every surface that wanted
+    /// to show it had to ask the user to type it again — and a MAC typed from
+    /// memory is a MAC typed wrong. Null means none is recorded, which is the
+    /// difference between "wake is ready" and "wake needs setting up".
+    pub fn wake_get(&self, req: &Value) -> Op {
+        let device = DeviceId::from(Self::str_field(req, "device")?);
+        let mac = self
+            .wake
+            .lookup(&device)
+            .map_err(|e| (Code::Storage, e.to_string()))?
+            .map(|record| record.mac.to_string());
+        Ok(json!({ "mac": mac }))
     }
 
     /// `{"device"}` → `{"forgotten":bool}`.

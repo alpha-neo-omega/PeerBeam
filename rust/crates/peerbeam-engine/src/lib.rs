@@ -11,6 +11,7 @@
 
 mod builder;
 mod device_manager;
+pub use device_manager::KeepDevice;
 mod diagnostics;
 mod engine;
 mod error;

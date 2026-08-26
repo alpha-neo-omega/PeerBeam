@@ -97,6 +97,14 @@ impl Engine {
         self.devices.snapshot()
     }
 
+    /// Exempt devices from pruning — see [`DeviceManager::keep_devices`].
+    ///
+    /// Set by the composition root, which is the only place that knows about
+    /// trust and wake records; the engine deliberately does not.
+    pub fn keep_devices(&self, keep: crate::device_manager::KeepDevice) {
+        self.devices.keep_devices(keep);
+    }
+
     /// Subscribe to device changes for the UI to render.
     pub fn device_changes(&self) -> broadcast::Receiver<DeviceChange> {
         self.devices.changes()

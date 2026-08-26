@@ -86,6 +86,7 @@ class Bindings {
   final _ArgRetDart _trustSetMine;
   final _ArgRetDart _trustMyDevices;
   final _ArgRetDart _wakeSet;
+  final _ArgRetDart _wakeGet;
   final _ArgRetDart _wakeForget;
   final _ArgRetDart _wakeSend;
   final _ArgRetDart _chatRetentionGet;
@@ -216,6 +217,7 @@ class Bindings {
         'pb_trust_my_devices',
       ),
       _wakeSet = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_set'),
+      _wakeGet = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_get'),
       _wakeForget = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_forget'),
       _wakeSend = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_wake_send'),
       _chatRetentionGet = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
@@ -338,6 +340,7 @@ class Bindings {
   String trustSetMine(String json) => _withArg(json, _trustSetMine);
   String trustMyDevices(String json) => _withArg(json, _trustMyDevices);
   String wakeSet(String json) => _withArg(json, _wakeSet);
+  String wakeGet(String json) => _withArg(json, _wakeGet);
   String wakeForget(String json) => _withArg(json, _wakeForget);
   String wakeSend(String json) => _withArg(json, _wakeSend);
   String chatRetentionGet(String json) => _withArg(json, _chatRetentionGet);

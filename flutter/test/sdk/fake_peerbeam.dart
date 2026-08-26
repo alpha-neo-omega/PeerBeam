@@ -770,6 +770,13 @@ class FakePeerBeam implements PeerBeamApi {
   }
 
   @override
+  Future<String?> wakeAddress(String device) async {
+    _maybeFail('wakeAddress');
+    calls.add('wakeAddress:$device');
+    return wakeAddresses[device];
+  }
+
+  @override
   Future<String> setWakeAddress(String device, String mac) async {
     _maybeFail('setWakeAddress');
     calls.add('setWakeAddress:$device:$mac');

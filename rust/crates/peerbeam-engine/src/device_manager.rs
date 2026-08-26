@@ -39,11 +39,20 @@ const PRUNE_TTL: chrono::Duration = chrono::Duration::minutes(5);
 const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Tracks discovered devices and notifies the UI of changes.
+/// Answers whether a device must survive pruning however long it has been gone.
+///
+/// The store knows liveness and nothing else; whether a device is *yours*, or
+/// has a hardware address recorded so it can be woken, lives in the trust and
+/// wake stores. So the question is injected rather than answered here.
+pub type KeepDevice = Arc<dyn Fn(&DeviceId) -> bool + Send + Sync>;
+
 pub struct DeviceManager {
     providers: Vec<Arc<dyn DiscoveryProvider>>,
     store: Arc<Mutex<DeviceStore>>,
     changes: broadcast::Sender<DeviceChange>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Devices this answers `true` for are never pruned. See [`KeepDevice`].
+    keep: Mutex<Option<KeepDevice>>,
 }
 
 impl DeviceManager {
@@ -60,7 +69,22 @@ impl DeviceManager {
             store: Arc::new(Mutex::new(DeviceStore::new(caps))),
             changes,
             task: Mutex::new(None),
+            keep: Mutex::new(None),
         }
+    }
+
+    /// Protect devices from pruning — those marked as the user's own, and those
+    /// with a wake address recorded.
+    ///
+    /// **Waking a device requires it to still be listed, and a sleeping device
+    /// is an offline one.** Pruning after five minutes is what stops the list
+    /// filling with machines that are long gone, but applied to these it deletes
+    /// the very devices Wake exists for: recording a MAC is a deliberate
+    /// statement that you intend to wake that machine, and marking one as yours
+    /// is the same claim in weaker form. Forgetting either is the app discarding
+    /// something it was told.
+    pub fn keep_devices(&self, keep: KeepDevice) {
+        *self.keep.lock().unwrap() = Some(keep);
     }
 
     /// Advertise `me`, start scanning on every provider, and begin folding
@@ -75,6 +99,7 @@ impl DeviceManager {
         let mut stream = self.tagged_stream();
         let store = self.store.clone();
         let changes = self.changes.clone();
+        let keep = self.keep.lock().unwrap().clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -105,7 +130,7 @@ impl DeviceManager {
                         }
                     }
                     _ = ticker.tick() => {
-                        prune_and_notify(&store, &changes, PRUNE_TTL);
+                        prune_and_notify(&store, &changes, PRUNE_TTL, keep.as_ref());
                     }
                 }
             }
@@ -160,7 +185,8 @@ impl DeviceManager {
     /// stale entries don't accumulate unbounded on a long-running daemon; also
     /// exposed for manual/test invocation.
     pub fn prune(&self, ttl: chrono::Duration) {
-        prune_and_notify(&self.store, &self.changes, ttl);
+        let keep = self.keep.lock().unwrap().clone();
+        prune_and_notify(&self.store, &self.changes, ttl, keep.as_ref());
     }
 
     /// Combine every provider's event stream into one, tagged with the
@@ -185,8 +211,12 @@ fn prune_and_notify(
     store: &Mutex<DeviceStore>,
     changes: &broadcast::Sender<DeviceChange>,
     ttl: chrono::Duration,
+    keep: Option<&KeepDevice>,
 ) {
-    let emitted = store.lock().unwrap().prune(chrono::Utc::now(), ttl);
+    let emitted = store
+        .lock()
+        .unwrap()
+        .prune(chrono::Utc::now(), ttl, |id| keep.is_some_and(|k| k(id)));
     for change in emitted {
         let _ = changes.send(change);
     }

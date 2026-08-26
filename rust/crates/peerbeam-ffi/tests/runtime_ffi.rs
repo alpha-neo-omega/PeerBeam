@@ -256,3 +256,43 @@ fn logs_get_subscribe_export() {
     assert!(out.exists());
     pb_shutdown();
 }
+
+/// **History held only other people's copies.** A clip was recorded on one path
+/// — one *arriving* from a peer — so what this device sent was missing from its
+/// own history: the log answered "what did someone send me", never "what did I
+/// copy". Recorded before the sync gate, because a clip this device put out is
+/// one it had whether or not it was allowed to leave.
+#[test]
+#[serial_test::serial]
+fn a_clip_this_device_sends_is_in_its_own_history() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path());
+    // History is the opt-in this records under; sync deliberately is not, so a
+    // clip is remembered locally even with sharing off.
+    call(
+        peerbeam_ffi::pb_settings_set,
+        &json!({ "clipboard_history": true, "sync_clipboard": false }),
+    );
+
+    let r = call(
+        peerbeam_ffi::pb_clipboard_sync,
+        &json!({ "text": "mine to keep", "peers": [] }),
+    );
+    assert_eq!(r["ok"], true, "sync: {r}");
+
+    let h = call(peerbeam_ffi::pb_clipboard_history, &json!({}));
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert!(
+        entries.iter().any(|e| e["text"] == "mine to keep"),
+        "this device's own clip is missing from its history: {h}"
+    );
+    // `from` names the peer a clip came from; ours came from nowhere.
+    let ours = entries
+        .iter()
+        .find(|e| e["text"] == "mine to keep")
+        .expect("the entry");
+    assert!(
+        ours["from"].is_null(),
+        "a local copy was attributed to a peer"
+    );
+}

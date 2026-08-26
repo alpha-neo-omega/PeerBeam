@@ -193,11 +193,27 @@ impl DeviceStore {
 
     /// Remove offline devices last seen longer ago than `ttl`, returning a
     /// `Removed` change for each.
-    pub fn prune(&mut self, now: DateTime<Utc>, ttl: Duration) -> Vec<DeviceChange> {
+    /// Remove devices that have been offline longer than `ttl`, except those
+    /// `keep` claims.
+    ///
+    /// **`keep` is what stops this deleting the devices Wake is for.** A machine
+    /// you can wake is by definition asleep, which is to say offline, and it is
+    /// woken from the list this prunes — so without an exemption the two
+    /// features cancel each other out about five minutes in. The store cannot
+    /// answer which devices those are (it knows liveness and nothing else), so
+    /// the caller supplies it.
+    pub fn prune(
+        &mut self,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        keep: impl Fn(&DeviceId) -> bool,
+    ) -> Vec<DeviceChange> {
         let stale: Vec<DeviceId> = self
             .devices
             .iter()
-            .filter(|(_, e)| !e.online && now.signed_duration_since(e.last_seen) > ttl)
+            .filter(|(id, e)| {
+                !e.online && now.signed_duration_since(e.last_seen) > ttl && !keep(id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         stale
@@ -669,13 +685,49 @@ mod tests {
 
         // Not yet stale.
         let now = Utc::now();
-        assert!(store.prune(now, Duration::seconds(60)).is_empty());
+        assert!(store
+            .prune(now, Duration::seconds(60), |_| false)
+            .is_empty());
 
         // Far in the future → stale → removed.
         let later = now + Duration::seconds(120);
-        let changes = store.prune(later, Duration::seconds(60));
+        let changes = store.prune(later, Duration::seconds(60), |_| false);
         assert_eq!(changes, vec![DeviceChange::Removed(DeviceId::from("a"))]);
         assert!(store.is_empty());
+    }
+
+    /// **A device you can wake must survive being asleep.** Waking one needs it
+    /// listed, and a machine worth waking is offline — so pruning after a few
+    /// minutes deletes exactly the devices Wake exists for, and the two features
+    /// cancel each other out. `keep` is what stops that: it answers for the
+    /// devices marked as the user's own and those with a hardware address
+    /// recorded, neither of which the store can know by itself.
+    #[test]
+    fn a_kept_device_is_never_pruned_however_long_it_has_been_gone() {
+        let mut store = DeviceStore::new(caps_map());
+        for id in ["keeper", "stranger"] {
+            store.observe(
+                &ProviderId::from("udp"),
+                DiscoveryEvent::Found(device(id, id, "10.0.0.1")),
+            );
+            store.observe(
+                &ProviderId::from("udp"),
+                DiscoveryEvent::Lost(DeviceId::from(id)),
+            );
+        }
+
+        let later = Utc::now() + Duration::days(30);
+        let changes = store.prune(later, Duration::seconds(60), |id| {
+            id == &DeviceId::from("keeper")
+        });
+
+        assert_eq!(
+            changes,
+            vec![DeviceChange::Removed(DeviceId::from("stranger"))],
+            "the exemption must apply to the kept device and to nothing else"
+        );
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(store.snapshot()[0].device.id, DeviceId::from("keeper"));
     }
 
     #[test]

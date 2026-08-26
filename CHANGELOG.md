@@ -239,6 +239,21 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A device you can wake is no longer forgotten while it sleeps.** Offline
+  devices are dropped after a few minutes so the list does not fill with machines
+  that are gone — but a machine you can *wake* is asleep, which is to say
+  offline, and it is woken from that same list. Devices you marked as your own,
+  and devices with a hardware address recorded, are now kept however long they
+  have been away. The two features stopped cancelling each other out about five
+  minutes in.
+- **A recorded wake address can be read back.** It could be set and sent with and
+  never seen again, so waking the same machine twice meant typing its address
+  from memory, which is how an address gets typed wrong. `peerbeam wake list`
+  shows them, and the app fills the field in for you.
+- **Your own clipboard copies are in your clipboard history.** History was
+  written on one path only — a clip *arriving* from a peer — so the log answered
+  "what did someone send me" and never "what did I copy". A clip this device
+  sends is recorded too, whether or not clipboard sharing is on.
 - **Tapping a file while browsing says how files arrive.** It did nothing at all:
   the row looks exactly like the folder rows above it, which do open, and there
   is no per-file fetch — files come across with the folder. A dead tap teaches

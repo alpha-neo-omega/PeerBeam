@@ -183,6 +183,34 @@ void main() {
   });
 
   group('the wake dialog', () {
+    /// **The address was write-only.** It is stored and sent with, and the
+    /// dialog never read it back — so waking the same machine a second time
+    /// asked for a MAC the app already had, typed from memory, which is how a
+    /// MAC gets typed wrong.
+    testWidgets('a recorded address is filled in, not asked for again', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam()
+        ..trusted = [_pin('pb-a', approved: true)]
+        ..wakeAddresses['pb-a'] = 'aa:bb:cc:dd:ee:ff';
+      await _openWake(tester, fake, device: _device('pb-a', 'Alice Desktop'));
+      await _settle(tester);
+
+      expect(
+        find.widgetWithText(TextField, 'aa:bb:cc:dd:ee:ff'),
+        findsOneWidget,
+        reason: 'the stored address was not shown, so it must be retyped',
+      );
+      // And it is ready to send without touching the field.
+      final send = tester.widget<FilledButton>(
+        find.ancestor(
+          of: find.text('Send wake packet'),
+          matching: find.byType(FilledButton),
+        ),
+      );
+      expect(send.onPressed, isNotNull);
+    });
+
     testWidgets('the result never claims the device woke', (tester) async {
       final fake = FakePeerBeam()..trusted = [_pin('pb-a', approved: true)];
       await _openWake(tester, fake, device: _device('pb-a', 'Alice Desktop'));

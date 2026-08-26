@@ -754,6 +754,12 @@ pub enum WakeAction {
         #[arg(value_name = "MAC")]
         mac: String,
     },
+    /// Show the hardware addresses recorded on this device.
+    ///
+    /// A recorded address could be set and used and never read back, so the
+    /// only way to check one was to set it again — and an address typed from
+    /// memory is one typed wrong.
+    List,
     /// Forget a device's hardware address.
     Forget {
         /// The device id.
