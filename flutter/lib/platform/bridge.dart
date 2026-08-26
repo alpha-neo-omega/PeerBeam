@@ -28,6 +28,36 @@ class NotificationContent {
   });
 }
 
+/// A battery reading taken from the platform.
+///
+/// Mirrors `peerbeam_platform::Battery` field for field, because that is what
+/// it becomes: the engine merges a pushed reading into the status it collects
+/// as though it had measured it itself.
+@immutable
+class BatteryReading {
+  /// Charge level, 0-100.
+  final int percent;
+
+  /// Whether it is charging right now, or null when the platform reports a
+  /// state it cannot classify. Kept apart from [percent] on purpose: the level
+  /// says nothing about the direction it is moving.
+  final bool? charging;
+
+  const BatteryReading({required this.percent, this.charging});
+
+  @override
+  bool operator ==(Object other) =>
+      other is BatteryReading &&
+      other.percent == percent &&
+      other.charging == charging;
+
+  @override
+  int get hashCode => Object.hash(percent, charging);
+
+  @override
+  String toString() => 'BatteryReading($percent%, charging: $charging)';
+}
+
 /// Abstraction over the Android platform channels so the Dart controllers are
 /// unit-testable with a fake and are safe no-ops on non-Android platforms.
 abstract class PlatformBridge {
@@ -61,6 +91,17 @@ abstract class PlatformBridge {
   /// Ask for the POST_NOTIFICATIONS runtime permission (Android 13+; a no-op
   /// on older Android, where it's granted implicitly, and off Android).
   Future<void> requestNotificationPermission();
+
+  /// This device's battery, or null when it has none, or when the platform
+  /// declines to say.
+  ///
+  /// Android is the only platform that needs this. `peerbeam_platform::battery`
+  /// reads sysfs on Linux and reports nothing on Windows and macOS by design,
+  /// and on Android it reports nothing because the Rust layer has no route to
+  /// `BatteryManager` — its own comment names the Flutter side as the half that
+  /// fills that gap. Reading a battery here does not share it; see
+  /// `BatteryReporter` for what happens to the value.
+  Future<BatteryReading?> batteryStatus();
 }
 
 /// Real Android implementation over method/event channels. Every call is a
@@ -140,4 +181,29 @@ class AndroidBridge implements PlatformBridge {
   @override
   Future<void> requestNotificationPermission() =>
       _invoke('requestNotificationPermission');
+
+  @override
+  Future<BatteryReading?> batteryStatus() async {
+    if (!_enabled) return null;
+    final Map<Object?, Object?>? map;
+    try {
+      map = await _method.invokeMethod<Map<Object?, Object?>>('batteryStatus');
+    } on MissingPluginException {
+      // A host build without the handler answers this. "No reading" is what
+      // every non-Android platform already answers and what the presence
+      // schema was built to express, so it degrades to an omitted field rather
+      // than taking the app down once a minute.
+      return null;
+    } on PlatformException {
+      return null;
+    }
+    if (map == null) return null;
+    final percent = (map['percent'] as num?)?.toInt();
+    // Out of range is dropped, not clamped — the engine's own override drops it
+    // too (`Status::with_battery_override` ignores anything over
+    // MAX_BATTERY_PERCENT), and a clamped 0 would render as a dead battery that
+    // was never measured.
+    if (percent == null || percent < 0 || percent > 100) return null;
+    return BatteryReading(percent: percent, charging: map['charging'] as bool?);
+  }
 }

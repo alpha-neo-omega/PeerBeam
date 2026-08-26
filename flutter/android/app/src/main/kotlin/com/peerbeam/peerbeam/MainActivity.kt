@@ -10,6 +10,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -24,20 +26,57 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+/// The `peerbeam/android/events` sink, reachable from outside the activity.
+///
+/// A `Service` holds no reference to the `Activity`, and the sink is an activity
+/// field — so `PeerBeamService` had no way to tell Dart anything, which is why
+/// the six-hour foreground-service cap was invisible to the app that had to
+/// react to it.
+///
+/// Posted to the main looper because an `EventSink` must be used from the main
+/// thread, and `Service.onTimeout` makes no such promise. `@Volatile` because the
+/// writer is the activity and the reader can be a service callback on another
+/// thread.
+internal object PlatformEvents {
+    @Volatile
+    var sink: EventChannel.EventSink? = null
+
+    fun emit(event: Map<String, Any?>) {
+        Handler(Looper.getMainLooper()).post { sink?.success(event) }
+    }
+}
 
 class MainActivity : FlutterActivity() {
     private val methodName = "peerbeam/android"
     private val eventName = "peerbeam/android/events"
 
     private var events: EventChannel.EventSink? = null
-    private var pendingInitial: Map<String, Any?>? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    /// The share/view intent that launched us, on its way to Dart via
+    /// `initialIntent`. Main-thread-only state, like everything else this
+    /// class hands to the channels.
+    private val launch = PendingLaunch()
 
     // Storage Access Framework: the user picks a destination folder once; we
     // persist the grant and copy received files into it (the Rust engine writes
     // via std::fs to app storage, which the OS hides — SAF makes files visible).
     private val reqPickTree = 4210
     private var pendingPick: MethodChannel.Result? = null
+
+    // Publishing a received file copies the whole thing into SAF/MediaStore,
+    // which is far too slow for the platform thread: a large file — or a
+    // received folder, which is a copy per file in it — blocked it long enough
+    // for Android to raise an ANR. Publishes run here instead.
+    //
+    // One serial worker rather than a thread per call, because the platform
+    // thread used to serialize them for us: [uniqueName]'s check-then-create
+    // only keeps two same-named files apart when the second one runs after the
+    // first has created its document.
+    private val publisher: ExecutorService = Executors.newSingleThreadExecutor()
 
     // Native multi-file picker (ACTION_OPEN_DOCUMENT): streams each picked
     // file into app cache instead of going through file_selector_android,
@@ -73,23 +112,43 @@ class MainActivity : FlutterActivity() {
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, sink: EventChannel.EventSink?) {
                     events = sink
+                    PlatformEvents.sink = sink
                 }
 
                 override fun onCancel(arguments: Any?) {
                     events = null
+                    PlatformEvents.sink = null
                 }
             },
         )
 
         // The intent that launched us (cold-start share/view), delivered to
-        // Dart on demand via `initialIntent`.
-        pendingInitial = parseIntent(intent)
+        // Dart on demand via `initialIntent`. A shared `content://` payload has
+        // to be copied out of its provider first, and that copy runs on a
+        // worker thread: this method runs before the first Flutter frame, so
+        // copying a large share here held up the launch until Android offered
+        // to kill the app — and taking that offer lost the share entirely.
+        //
+        // Marked as resolving *before* the resolve starts, because a request
+        // that arrives mid-copy has to park rather than be told there is no
+        // share; [resolveIntent] may also deliver inline, which clears the mark
+        // again in the same breath.
+        launch.resolving()
+        resolveIntent(parseIntent(intent)) { launch.deliver(it) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Queued publishes still run to completion; the worker thread just
+        // stops taking new ones and dies once they are done, rather than
+        // outliving the activity that created it.
+        publisher.shutdown()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        parseIntent(intent)?.let { events?.success(it) }
+        resolveIntent(parseIntent(intent)) { event -> event?.let { events?.success(it) } }
     }
 
     private fun onMethod(
@@ -98,10 +157,7 @@ class MainActivity : FlutterActivity() {
         result: MethodChannel.Result,
     ) {
         when (method) {
-            "initialIntent" -> {
-                result.success(pendingInitial)
-                pendingInitial = null
-            }
+            "initialIntent" -> launch.request { result.success(it) }
             "startForegroundService" -> {
                 val svc = Intent(this, PeerBeamService::class.java)
                     .putExtra("title", call.argument<String>("title"))
@@ -192,7 +248,9 @@ class MainActivity : FlutterActivity() {
                     result.error("args", "path and name required", null)
                 } else {
                     // Chosen SAF folder if set, else the public Downloads default.
-                    result.success(saveToTree(path, name) ?: saveToDownloads(path, name))
+                    replyFromPublisher(result) {
+                        saveToTree(path, name) ?: saveToDownloads(path, name)
+                    }
                 }
             }
             "safSaveTree" -> {
@@ -200,7 +258,7 @@ class MainActivity : FlutterActivity() {
                 if (path == null) {
                     result.error("args", "path required", null)
                 } else {
-                    result.success(saveTree(path))
+                    replyFromPublisher(result) { saveTree(path) }
                 }
             }
             "safOpen" -> {
@@ -208,6 +266,35 @@ class MainActivity : FlutterActivity() {
                 result.success(openInTree(name) || openInDownloads(name))
             }
             else -> result.notImplemented()
+        }
+    }
+
+    /// Run [work] on [publisher] and answer [reply] with whatever it returns,
+    /// back on the main thread — the thread the call arrived on, and the only
+    /// one this class's channel state is touched from.
+    ///
+    /// [work] runs where nothing catches for it. MethodChannel wraps a handler
+    /// call in a `catch (RuntimeException)` and turns the throw into a channel
+    /// error; a worker thread has no such wrapper, and an exception escaping
+    /// one takes the process down. So it is caught here and reported as the
+    /// error Dart would have been given anyway.
+    private fun <T> replyFromPublisher(reply: MethodChannel.Result, work: () -> T) {
+        publisher.execute {
+            var value: T? = null
+            var failure: Exception? = null
+            try {
+                value = work()
+            } catch (e: Exception) {
+                failure = e
+            }
+            runOnUiThread {
+                val e = failure
+                if (e == null) {
+                    reply.success(value)
+                } else {
+                    reply.error("publish", e.message ?: "publish failed", null)
+                }
+            }
         }
     }
 
@@ -710,30 +797,74 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun parseIntent(intent: Intent?): Map<String, Any?>? {
+    /// What a share/view intent is asking for, worked out without reading a
+    /// byte. [parseIntent] runs on the main thread, so anything that needs a
+    /// provider's bytes copied is left as URIs for [resolveIntent] to
+    /// materialize on a worker thread.
+    private sealed interface Payload {
+        /// Nothing to copy — the event is already what Dart gets.
+        data class Ready(val event: Map<String, Any?>) : Payload
+
+        /// URIs the Rust engine cannot open as they are (`content://` from
+        /// Photos, Files, WhatsApp, Downloads under scoped storage…).
+        data class Files(val event: String, val uris: List<Uri>) : Payload
+    }
+
+    private fun parseIntent(intent: Intent?): Payload? {
         intent ?: return null
         return when (intent.action) {
             Intent.ACTION_SEND -> {
                 val uri = parcelableExtra(intent, Intent.EXTRA_STREAM)
                 val text = intent.getStringExtra(Intent.EXTRA_TEXT)
                 when {
-                    uri != null -> fileEvent("share", listOf(uri))
-                    text != null -> mapOf("event" to "share", "text" to text)
+                    uri != null -> Payload.Files("share", listOf(uri))
+                    text != null -> Payload.Ready(mapOf("event" to "share", "text" to text))
                     else -> null
                 }
             }
             Intent.ACTION_SEND_MULTIPLE -> {
                 val uris = parcelableArrayList(intent, Intent.EXTRA_STREAM)
-                if (!uris.isNullOrEmpty()) fileEvent("share", uris) else null
+                if (!uris.isNullOrEmpty()) Payload.Files("share", uris) else null
             }
-            Intent.ACTION_VIEW -> intent.data?.let { fileEvent("view", listOf(it)) }
+            Intent.ACTION_VIEW -> intent.data?.let { Payload.Files("view", listOf(it)) }
             else -> null
+        }
+    }
+
+    /// Turn [payload] into the event map Dart consumes and hand it to
+    /// [deliver] on the main thread.
+    ///
+    /// A payload with files goes to a worker thread first: materializing them
+    /// is a whole-file copy per URI (see [resolveToRealPath]). A text share, or
+    /// no share at all, is delivered inline — there is nothing to wait for, and
+    /// it should still reach Dart in the same breath as before.
+    ///
+    /// Its own thread rather than [publisher]'s: a share the user just sent to
+    /// the app should not queue behind however many received files are being
+    /// published. And [deliver] is called whatever the copy did, including
+    /// blowing up — a request parked in [PendingLaunch] is waiting on it, and
+    /// Dart's startup is waiting on that.
+    private fun resolveIntent(payload: Payload?, deliver: (Map<String, Any?>?) -> Unit) {
+        when (payload) {
+            null -> deliver(null)
+            is Payload.Ready -> deliver(payload.event)
+            is Payload.Files ->
+                Thread {
+                    val event = try {
+                        fileEvent(payload.event, payload.uris)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    runOnUiThread { deliver(event) }
+                }.start()
         }
     }
 
     /// Builds the Dart-facing share/view event, resolving every incoming URI to
     /// a real filesystem path first — the Rust engine opens paths via
     /// `tokio::fs`, which can't read a `content://` URI directly.
+    ///
+    /// Copies bytes, so it only ever runs on [resolveIntent]'s worker thread.
     private fun fileEvent(event: String, uris: List<Uri>): Map<String, Any?> {
         val paths = ArrayList<String>()
         val names = ArrayList<String>()
@@ -755,9 +886,9 @@ class MainActivity : FlutterActivity() {
     /// `file://` URIs already are one and are returned as-is (no copy). Every
     /// other scheme (`content://` from Photos/Files/WhatsApp/Downloads under
     /// scoped storage, etc.) is materialized into [sharedDir] first — a
-    /// synchronous copy on the UI thread, same as LocalSend does for share-in;
-    /// large shared files will visibly block until the copy completes. Returns
-    /// null if the URI can't be opened at all, so the caller can skip it.
+    /// whole-file copy, which is why [resolveIntent] only ever calls this from
+    /// a worker thread. Returns null if the URI can't be opened at all, so the
+    /// caller can skip it.
     private fun resolveToRealPath(uri: Uri, sharedDir: File, name: String, index: Int): String? {
         if (uri.scheme == "file") return uri.path
         val safeName = sanitizeFileName(name).ifEmpty { "shared_$index" }
@@ -800,10 +931,10 @@ class MainActivity : FlutterActivity() {
     }
 
     /// Cache subdirectory that share-in copies are materialized into. No
-    /// [keep] list is needed here: unlike a pick, a share-in copy happens
-    /// synchronously on the UI thread in [resolveToRealPath], so by the time
-    /// its path is handed to Dart the copy is already complete — an hour is
-    /// well past any plausible time for that path to still be in use.
+    /// [keep] list is needed here: unlike a pick, a share-in copy is finished
+    /// before its path is handed to Dart — [resolveIntent] delivers the event
+    /// only once [fileEvent] has returned — so an hour is well past any
+    /// plausible time for that path to still be in use.
     private fun prepareSharedDir(): File = prepareBatchDir("shared", 60 * 60 * 1000L)
 
     /// Cache subdirectory that the native file picker streams picked files
@@ -857,4 +988,59 @@ class MainActivity : FlutterActivity() {
         } else {
             intent.getParcelableArrayListExtra(key)
         }
+}
+
+/// The launching share/view intent on its way to Dart, holding whichever of
+/// the two sides turned up first.
+///
+/// Dart asks for the launch intent exactly once, during startup, and reads a
+/// null answer as "nothing was shared". That answer is not always ready when
+/// the question arrives: the files a share names have to be copied out of
+/// their provider first, and that copy runs off the main thread precisely so
+/// it cannot stall the launch. Answering "nothing" in the meantime would throw
+/// the share away — the failure the copy moved off-thread to avoid, arriving
+/// by another route — so a request that lands mid-copy is parked and answered
+/// when [deliver] lands.
+///
+/// Parking does cost the rest of Dart's boot sequence the length of that copy,
+/// since `initialIntent` is awaited in the middle of it — but the app is
+/// drawing and responsive throughout, which is what the copy moved off the
+/// main thread to get.
+///
+/// Not thread-safe by design: every call arrives on the main thread, the copy
+/// worker included, which posts [deliver] back there.
+internal class PendingLaunch {
+    private var event: Map<String, Any?>? = null
+    private var waiter: ((Map<String, Any?>?) -> Unit)? = null
+    private var resolving = false
+
+    /// Marks a resolve as under way. From here until [deliver], a [request] is
+    /// parked instead of answered.
+    fun resolving() {
+        resolving = true
+    }
+
+    /// The resolved event — null when the intent carried nothing to share, or
+    /// when resolving it failed. Answers a parked request, or waits for one.
+    fun deliver(resolved: Map<String, Any?>?) {
+        resolving = false
+        val parked = waiter
+        waiter = null
+        if (parked != null) parked(resolved) else event = resolved
+    }
+
+    /// Dart asking for the launch intent. Answered straight away unless a
+    /// resolve is still running, in which case [reply] is held until [deliver].
+    fun request(reply: (Map<String, Any?>?) -> Unit) {
+        if (resolving) {
+            // Abandon any prior request, as the pickers do: a Result that is
+            // never replied to leaks its Dart-side future forever.
+            waiter?.invoke(null)
+            waiter = reply
+            return
+        }
+        val ready = event
+        event = null // consumed; a launch intent is delivered once
+        reply(ready)
+    }
 }

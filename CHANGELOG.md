@@ -239,6 +239,29 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **Android no longer freezes while a received file is filed away.** Every
+  received file was copied into shared storage on the platform thread, so a large
+  file or a folder froze the app until Android offered to kill it — and sharing
+  something *to* PeerBeam did the same before the first frame was drawn, where
+  dismissing the freeze lost the share outright. Both copies run off the main
+  thread now, following the pattern the same file already used for the file
+  picker.
+- **The app now knows when Android stops it.** A background service is stopped at
+  a six-hour daily cap; the notification told the user and the app went on
+  believing it was running, so nothing restarted it and the device was quietly
+  unreachable until somebody happened to reopen it. The platform tells the app
+  now, before it goes.
+- **Shared folders no longer offers a picker that leads nowhere on Android.** The
+  folder could never actually be served — the app requests no storage permission,
+  and a folder chosen through the system picker is not readable as a path — so
+  the control is replaced by a statement of that, in the same shape the other
+  desktop-only setting already uses.
+- **macOS received files can reach your Downloads folder.** The app is sandboxed
+  and lacked the Downloads entitlement, so it could not write there; and the
+  sandbox redirects `$HOME` to the app's container, so it was not even naming the
+  right folder. Both halves are fixed, and neither works alone. The app also
+  declares why it wants the local network, so macOS 15's permission prompt has a
+  reason to show.
 - **Two files whose names differ only in case no longer become one.** macOS and
   Android hold case-insensitively, so a folder containing `Notes.txt` and
   `notes.txt` had the second silently overwrite the first — and the transfer

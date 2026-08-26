@@ -45,8 +45,18 @@ class FakeBridge implements PlatformBridge {
   /// is still travelling instead of sleeping and hoping.
   Completer<void>? holdStart;
 
+  /// What `batteryStatus` answers. Null is the honest answer everywhere but
+  /// Android, and on a host build whose method channel has no handler.
+  BatteryReading? battery;
+  int batteryReads = 0;
+
+  /// Platform → Dart events, so a test can deliver one after `start()` has
+  /// subscribed (the share/view intents, and the service-stopped notice).
+  final StreamController<Map<String, dynamic>> eventSink =
+      StreamController<Map<String, dynamic>>.broadcast();
+
   @override
-  Stream<Map<String, dynamic>> events() => const Stream.empty();
+  Stream<Map<String, dynamic>> events() => eventSink.stream;
   @override
   Future<Map<String, dynamic>?> initialIntent() async => null;
   @override
@@ -85,6 +95,12 @@ class FakeBridge implements PlatformBridge {
   @override
   Future<void> requestNotificationPermission() async =>
       notificationPermissionRequests++;
+
+  @override
+  Future<BatteryReading?> batteryStatus() async {
+    batteryReads++;
+    return battery;
+  }
 }
 
 void main() {
@@ -545,6 +561,285 @@ void main() {
       // Discovery is unaffected: the lock is not the service's to hold.
       expect(integration.multicast.held, isTrue);
       integration.dispose();
+    });
+  });
+
+  group('parseServiceStopped', () {
+    test('recognises the notice and ignores everything else', () {
+      expect(
+        parseServiceStopped({'event': 'service_stopped', 'reason': 'timeout'}),
+        ServiceStop.timeout,
+      );
+
+      // A stop with a reason this build has no wording for is still a stop:
+      // the service is gone either way, and the flag has to come down.
+      expect(
+        parseServiceStopped({'event': 'service_stopped', 'reason': 'wat'}),
+        ServiceStop.other,
+      );
+      expect(parseServiceStopped({'event': 'service_stopped'}), ServiceStop.other);
+
+      expect(parseServiceStopped({'event': 'share', 'text': 'x'}), isNull);
+      expect(parseServiceStopped(const {}), isNull);
+    });
+  });
+
+  group('ForegroundServiceController platform stop', () {
+    test('a service Android destroyed is not still reported as running', () async {
+      final bridge = FakeBridge();
+      final svc = ForegroundServiceController(bridge);
+
+      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
+      expect(svc.running, isTrue);
+      expect(bridge.startCount, 1);
+
+      // Android 15+ ends a `dataSync` service at six cumulative hours. Nothing
+      // else ever lowers `running`, so before this existed every later sync
+      // short-circuited on "already running" and the device stayed silently
+      // unreachable for the rest of the process's life.
+      svc.platformStopped(ServiceStop.timeout);
+      expect(svc.running, isFalse);
+      expect(svc.stoppedByPlatform, ServiceStop.timeout);
+
+      // The state being asked for has not changed one bit — and it must still
+      // reach the platform, because the delivered-state signature described a
+      // service that no longer exists.
+      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
+      expect(bridge.startCount, 2);
+      expect(svc.running, isTrue);
+      expect(svc.stoppedByPlatform, isNull);
+    });
+
+    test('a stop this app asked for explains nothing', () async {
+      final bridge = FakeBridge();
+      final svc = ForegroundServiceController(bridge);
+
+      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
+      svc.platformStopped(ServiceStop.timeout);
+
+      // Turning off "keep receiving" stops the service on purpose. Leaving the
+      // old explanation standing would tell the user Android took something
+      // away when they put it down themselves.
+      await svc.sync(activeTransfers: 0, receiving: true, incoming: false);
+      await svc.sync(activeTransfers: 0, receiving: false, incoming: false);
+      expect(svc.running, isFalse);
+      expect(svc.stoppedByPlatform, isNull);
+    });
+
+    test('notifies on what a listener can read, not on every tick', () async {
+      final bridge = FakeBridge();
+      final svc = ForegroundServiceController(bridge);
+      var notifications = 0;
+      svc.addListener(() => notifications++);
+
+      await svc.sync(activeTransfers: 1, receiving: false, incoming: false);
+      expect(notifications, 1); // not running → running
+
+      // A second transfer changes the notification body, and nothing a
+      // listener can read: `sync` runs off progress ticks, so a rebuild here
+      // would be one per tick for text no widget renders.
+      await svc.sync(activeTransfers: 2, receiving: false, incoming: false);
+      expect(notifications, 1);
+
+      svc.platformStopped(ServiceStop.timeout);
+      expect(notifications, 2);
+    });
+  });
+
+  group('BatteryReporter', () {
+    /// A reporter over [bridge] that records what reached the engine.
+    ({BatteryReporter reporter, List<({int? percent, bool? charging})> pushes})
+    build(FakeBridge bridge, {Future<void> Function()? onPush}) {
+      final pushes = <({int? percent, bool? charging})>[];
+      return (
+        reporter: BatteryReporter(
+          bridge: bridge,
+          push: ({int? percent, bool? charging}) async {
+            if (onPush != null) await onPush();
+            pushes.add((percent: percent, charging: charging));
+          },
+        ),
+        pushes: pushes,
+      );
+    }
+
+    test('pushes a reading once, and again only when it changes', () async {
+      final bridge = FakeBridge()
+        ..battery = const BatteryReading(percent: 64, charging: false);
+      final h = build(bridge);
+
+      await h.reporter.refresh();
+      expect(h.pushes, [(percent: 64, charging: false)]);
+
+      // A phone sitting still reads the same value every minute; re-crossing
+      // the FFI with it changes nothing about the next heartbeat.
+      await h.reporter.refresh();
+      expect(h.pushes, hasLength(1));
+
+      bridge.battery = const BatteryReading(percent: 63, charging: true);
+      await h.reporter.refresh();
+      expect(h.pushes, hasLength(2));
+      expect(h.pushes.last, (percent: 63, charging: true));
+    });
+
+    test('a platform with no battery is never pushed anything', () async {
+      // Every desktop, and any Android host whose method channel has no
+      // handler. The engine's own collector is the authority there, and a
+      // pushed nothing would be this side asserting a measurement it never
+      // took.
+      final h = build(FakeBridge());
+      await h.reporter.refresh();
+      await h.reporter.refresh();
+      expect(h.pushes, isEmpty);
+    });
+
+    test('losing access clears the engine instead of leaving a stale level', () async {
+      final bridge = FakeBridge()
+        ..battery = const BatteryReading(percent: 12, charging: false);
+      final h = build(bridge);
+      await h.reporter.refresh();
+
+      // The engine holds the last value it was handed, so silence here would
+      // keep sharing 12% long after anything was measuring it.
+      bridge.battery = null;
+      await h.reporter.refresh();
+      expect(h.pushes.last, (percent: null, charging: null));
+
+      // …and having cleared it, there is nothing left to keep clearing.
+      await h.reporter.refresh();
+      expect(h.pushes, hasLength(2));
+    });
+
+    test('a push that throws is retried, not recorded as delivered', () async {
+      final bridge = FakeBridge()
+        ..battery = const BatteryReading(percent: 80, charging: true);
+      var broken = true;
+      final h = build(
+        bridge,
+        onPush: () async {
+          if (broken) throw StateError('not_initialised');
+        },
+      );
+
+      // The engine is still booting. This runs on a timer, so the failure is
+      // kept rather than reported once a minute forever.
+      await h.reporter.refresh();
+      expect(h.pushes, isEmpty);
+      expect(h.reporter.lastFailure, isA<StateError>());
+
+      broken = false;
+      await h.reporter.refresh();
+      expect(h.pushes, [(percent: 80, charging: true)]);
+      expect(h.reporter.lastFailure, isNull);
+    });
+
+    test('start reads immediately; stop ends the polling', () async {
+      final bridge = FakeBridge()
+        ..battery = const BatteryReading(percent: 50, charging: false);
+      final h = build(bridge);
+
+      await h.reporter.start();
+      expect(bridge.batteryReads, 1); // not waiting a minute for the first one
+      expect(h.reporter.active, isTrue);
+
+      await h.reporter.start(); // idempotent
+      expect(h.reporter.active, isTrue);
+
+      h.reporter.stop();
+      expect(h.reporter.active, isFalse);
+    });
+  });
+
+  group('AndroidIntegration platform stop and battery', () {
+    SettingsStore newSettings() => SettingsStore(
+      deviceName: 'd',
+      saveDirectory: '/x',
+      autoAcceptTrusted: false,
+      notifications: true,
+      compression: true,
+    );
+
+    AndroidIntegration build(
+      FakeBridge bridge,
+      SettingsStore settings, {
+      FakePeerBeam? api,
+    }) {
+      final fake = api ?? FakePeerBeam();
+      return AndroidIntegration(
+        bridge: bridge,
+        staging: StagingStore(),
+        transfer: TransferRepository(api: fake),
+        settings: settings,
+        history: HistoryRepository(api: fake),
+        api: api,
+      );
+    }
+
+    test('a service_stopped notice lowers the flag and asks for it back', () async {
+      final bridge = FakeBridge();
+      final integration = build(bridge, newSettings());
+
+      await integration.start();
+      await flush();
+      expect(integration.service.running, isTrue);
+      expect(bridge.startCount, 1);
+
+      bridge.eventSink.add({'event': 'service_stopped', 'reason': 'timeout'});
+      await flush();
+
+      // "Keep receiving" is still on, so the service is still wanted. Asking
+      // again is what actually fixes this when the user is in the app: Android
+      // restores the allowance in the foreground.
+      expect(bridge.startCount, 2);
+      expect(integration.service.running, isTrue);
+      expect(integration.service.stoppedByPlatform, isNull);
+
+      integration.dispose();
+    });
+
+    test('a refused restart leaves both the cause and the refusal readable', () async {
+      final bridge = FakeBridge();
+      final integration = build(bridge, newSettings());
+      await integration.start();
+      await flush();
+
+      // Backgrounded, the allowance is spent and Android says no. The app must
+      // not claim a service either way.
+      bridge.refuseStart = PlatformException(
+        code: 'fgs_denied',
+        message: 'time limit already exhausted',
+      );
+      bridge.eventSink.add({'event': 'service_stopped', 'reason': 'timeout'});
+      await flush();
+
+      expect(integration.service.running, isFalse);
+      expect(integration.service.stoppedByPlatform, ServiceStop.timeout);
+      expect(integration.service.lastRefusal, contains('time limit'));
+
+      integration.dispose();
+    });
+
+    test('the battery reaches the engine, and only with an engine to reach', () async {
+      final fake = FakePeerBeam();
+      final bridge = FakeBridge()
+        ..battery = const BatteryReading(percent: 41, charging: true);
+
+      final wired = build(bridge, newSettings(), api: fake);
+      await wired.start();
+      await flush();
+      expect(fake.batteryPushes, [(percent: 41, charging: true)]);
+      wired.dispose();
+
+      // Without an engine there is nowhere to push, and the platform is not
+      // read at all.
+      final plain = FakeBridge()
+        ..battery = const BatteryReading(percent: 41, charging: true);
+      final unwired = build(plain, newSettings());
+      await unwired.start();
+      await flush();
+      expect(plain.batteryReads, 0);
+      expect(unwired.batteryReporter, isNull);
+      unwired.dispose();
     });
   });
 }

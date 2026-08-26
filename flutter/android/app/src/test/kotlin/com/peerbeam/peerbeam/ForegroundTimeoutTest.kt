@@ -21,8 +21,37 @@ class ForegroundTimeoutTest {
             posted = notice
         }
 
+        override fun announceStopped() {
+            calls += "announce"
+        }
+
         override fun stop() {
             calls += "stop"
+        }
+    }
+
+    /// **The app has to learn the service died, not just the user.** Android
+    /// stops a `dataSync` foreground service at its six-hour cap; the
+    /// notification told the user, and Dart went on believing the service was
+    /// running — so nothing ever restarted it and the device was quietly
+    /// unreachable until somebody reopened the app.
+    ///
+    /// Announced *before* the stop for the reason the notice already is: past
+    /// `stopSelf` the process is on its way out, and an event emitted then can
+    /// lose the race with teardown.
+    @Test
+    fun `tells the app it stopped, before stopping`() {
+        for (activeTransfer in listOf(true, false)) {
+            val ops = RecordingOps()
+            handleForegroundTimeout(activeTransfer, ops)
+            assertTrue(
+                "the app was never told the platform stopped the service",
+                ops.calls.contains("announce"),
+            )
+            assertTrue(
+                "announced after the stop, where it can be lost to teardown",
+                ops.calls.indexOf("announce") < ops.calls.indexOf("stop"),
+            )
         }
     }
 
@@ -44,7 +73,10 @@ class ForegroundTimeoutTest {
     fun `explains itself before it stops`() {
         val ops = RecordingOps()
         handleForegroundTimeout(false, ops)
-        assertEquals(listOf("notice", "stop"), ops.calls)
+        // Both the telling and the announcing happen while this is still a live
+        // service: past `stopSelf` the process is on its way to `onDestroy`, so
+        // anything posted then can be lost to teardown.
+        assertEquals(listOf("notice", "announce", "stop"), ops.calls)
     }
 
     @Test
@@ -84,3 +116,4 @@ class ForegroundTimeoutTest {
         )
     }
 }
+

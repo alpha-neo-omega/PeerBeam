@@ -185,6 +185,11 @@ class FakePeerBeam implements PeerBeamApi {
   /// path actually reached the engine.
   ({int? percent, bool? charging})? pushedBattery;
 
+  /// Every push in order. **This list is what the no-churn test reads**: "an
+  /// unchanged battery is not re-sent every minute" is only observable as a
+  /// count, which [pushedBattery] alone cannot show.
+  final List<({int? percent, bool? charging})> batteryPushes = [];
+
   @override
   Future<PresenceSnapshot> presence() async {
     if (presenceThrows) throw Exception('presence unavailable');
@@ -194,6 +199,7 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<void> presenceBattery({int? percent, bool? charging}) async {
     pushedBattery = (percent: percent, charging: charging);
+    batteryPushes.add((percent: percent, charging: charging));
   }
 
   /// Every clipboard push the watcher made, in order. **This list is what the

@@ -126,6 +126,12 @@ class PeerBeamService : Service() {
                     )
                 }
 
+                override fun announceStopped() {
+                    PlatformEvents.emit(
+                        mapOf("event" to "service_stopped", "reason" to "timeout"),
+                    )
+                }
+
                 override fun stop() {
                     stopIconAnimation()
                     releaseLocks()

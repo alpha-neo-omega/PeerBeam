@@ -12,9 +12,12 @@
 	<!-- Read files the user picks/drops to send, write files they receive. -->
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
-	<!-- Received files default to the OS Downloads folder
-	     (peerbeam_platform::download_dir); without this the sandbox resolves
-	     that to a Downloads inside the app container, not the user's own. -->
+	<!-- Received files default to the OS Downloads folder. This grants access
+	     to the user's real one; it does not by itself make the app *name* it,
+	     because the sandbox also redirects $HOME to the container and that is
+	     what dirs reads. peerbeam_platform::download_dir rewrites a container
+	     path back to the real home for that reason — both halves are needed,
+	     and neither works alone. -->
 	<key>com.apple.security.files.downloads.read-write</key>
 	<true/>
 </dict>

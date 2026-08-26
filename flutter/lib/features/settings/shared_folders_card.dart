@@ -7,6 +7,8 @@ import '../../sdk/error_text.dart';
 import '../../sdk/models.dart' show SharedFolder;
 import '../../state/app_scope.dart';
 
+/// Whether this build runs on Android, as `settings_screen.dart` asks it of
+/// its own Android-only rows.
 bool get _isAndroid =>
     !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
@@ -31,10 +33,10 @@ bool get _isAndroid =>
 /// engine's answer, not this screen's guess, and a refused write must leave the
 /// user looking at what is actually shared.
 ///
-/// On Android the whole card is replaced by a plain statement of why there is
-/// no picker, the way `_SaveRulesCard` does for rules. A picker that led
-/// nowhere is worse than no picker: it spends a user's attention and leaves
-/// them believing a folder is on offer.
+/// On Android the editor is replaced by a plain statement of why there is no
+/// editor, the way `_SaveRulesCard` does for rules. A picker that led nowhere
+/// would be worse than none at all: it spends a user's attention and leaves
+/// them believing a folder is on offer when nothing can be.
 class SharedFoldersCard extends StatefulWidget {
   const SharedFoldersCard({super.key});
 
@@ -165,8 +167,8 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     if (_isAndroid) return _unsupported();
+    final theme = Theme.of(context);
     return Card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -207,6 +209,31 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
       ),
     );
   }
+
+  /// What Android gets instead of the editor: the reason, and no picker.
+  ///
+  /// Gated on the platform rather than on an engine-reported flag, which is
+  /// where this parts company with `_SaveRulesCard` and its `rules_supported`.
+  /// `pb_settings_get` attaches that flag and nothing like it for
+  /// `shared_directories`, so a platform check is the only answer available
+  /// here — the same one the rest of this screen already makes for its other
+  /// Android-only rows.
+  Widget _unsupported() => const Card(
+    child: ListTile(
+      leading: Icon(Icons.folder_off_outlined),
+      title: Text('Not available on this device'),
+      // The honest reason, not a shrug. A share is a filesystem path the
+      // engine canonicalises and then reads with `std::fs`; Android hands an
+      // app a folder as a grant reachable only through its own file APIs, and
+      // this app requests no storage permission that would make a bare path
+      // work instead.
+      subtitle: Text(
+        'Android gives apps access to a folder through its own picker and '
+        'file APIs, never as a path, and PeerBeam offers a shared folder by '
+        'path — so a folder chosen here could never be browsed.',
+      ),
+    ),
+  );
 
   /// The rows, or the empty state. Nothing at all until the first read has
   /// answered — "Nothing shared" is a claim about the engine's list, and

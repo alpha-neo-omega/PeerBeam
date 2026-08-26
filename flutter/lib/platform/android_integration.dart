@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../data/history_repository.dart';
 import '../data/transfer_repository.dart';
+import '../sdk/peerbeam.dart';
 import '../state/models.dart';
 import '../state/staging.dart';
 import '../state/stores.dart';
@@ -26,6 +27,12 @@ class AndroidIntegration {
   final SettingsStore settings;
   final HistoryRepository history;
 
+  /// The engine, when there is one. Only presence needs it from here: Android
+  /// is the one platform whose battery the Rust layer cannot read, so the
+  /// reading has to be pushed down from this side. Optional because everything
+  /// else in this class is pure platform plumbing and works without an engine.
+  final PeerBeamApi? api;
+
   late final ForegroundServiceController service = ForegroundServiceController(
     bridge,
   );
@@ -40,6 +47,13 @@ class AndroidIntegration {
   );
 
   late final BatteryOptimization battery = BatteryOptimization(bridge);
+
+  /// Built in [start] only when there is an engine to push readings into.
+  BatteryReporter? _batteryReporter;
+
+  /// The battery feed, once [start] has built it. Exposed so a test can read
+  /// what it delivered.
+  BatteryReporter? get batteryReporter => _batteryReporter;
 
   /// Latest text handed to us via a share intent (e.g. to send as clipboard).
   final ValueNotifier<String?> sharedText = ValueNotifier<String?>(null);
@@ -62,6 +76,7 @@ class AndroidIntegration {
     required this.transfer,
     required this.settings,
     required this.history,
+    this.api,
   });
 
   Future<void> start() async {
@@ -81,9 +96,32 @@ class AndroidIntegration {
     history.addListener(_onHistoryChanged);
     _onHistoryChanged(); // seed the baseline before reacting to changes
     await _syncService();
+
+    final engine = api;
+    if (engine != null) {
+      final reporter = BatteryReporter(
+        bridge: bridge,
+        push: engine.presenceBattery,
+      );
+      _batteryReporter = reporter;
+      await reporter.start();
+    }
   }
 
   void _onEvent(Map<String, dynamic> event) {
+    // Android destroying the service on its own — the spent six-hour `dataSync`
+    // allowance, in practice. Nothing else lowers the controller's flag, so
+    // without this the app goes on believing it is reachable in the background
+    // for the rest of the process's life. Re-syncing immediately afterwards is
+    // the fix when the app is in the foreground (the allowance is restored
+    // there) and an honestly-recorded refusal when it is not.
+    final stopped = parseServiceStopped(event);
+    if (stopped != null) {
+      service.platformStopped(stopped);
+      _onStoreChanged();
+      return;
+    }
+
     final items = parseSharedEvent(event);
     final files = <StagedFile>[];
     for (final item in items) {
@@ -197,11 +235,13 @@ class AndroidIntegration {
     unawaited(
       _report(multicast.setDiscovering(false), 'releasing the multicast lock'),
     );
+    _batteryReporter?.stop();
     _sub?.cancel();
     _filesShared.close();
     transfer.removeListener(_onStoreChanged);
     settings.removeListener(_onStoreChanged);
     history.removeListener(_onHistoryChanged);
+    service.dispose();
     sharedText.dispose();
   }
 }

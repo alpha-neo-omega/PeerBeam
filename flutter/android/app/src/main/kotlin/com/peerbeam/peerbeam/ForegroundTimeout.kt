@@ -20,6 +20,16 @@ internal interface TimeoutOps {
 
     /// Drop the ongoing notification and the Wi-Fi/CPU locks, then `stopSelf`.
     fun stop()
+
+    /// Tell the app the platform stopped the service, so Dart stops believing
+    /// it is running.
+    ///
+    /// Without this the notification says background receiving stopped and the
+    /// app's own state still says it is on — so nothing ever restarts it, and
+    /// the device is quietly unreachable until someone happens to reopen the
+    /// app and look. A notice the user must read and act on is not the same as
+    /// the app knowing.
+    fun announceStopped()
 }
 
 /// Android's answer to a `dataSync` foreground service that has spent its
@@ -41,6 +51,11 @@ internal fun handleForegroundTimeout(activeTransfer: Boolean, ops: TimeoutOps) {
     // Posted before stopping: past `stopSelf` this service is on its way to
     // `onDestroy` and is no longer a Context worth posting from.
     ops.notice(timeoutNotice(activeTransfer))
+    // Announced before stopping too, and for the same reason — the process may
+    // be on its way out, and an event emitted after `stopSelf` can lose the race
+    // with teardown. Dart hearing this late is the difference between the app
+    // restarting the service and never knowing it was gone.
+    ops.announceStopped()
     ops.stop()
 }
 

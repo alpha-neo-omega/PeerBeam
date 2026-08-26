@@ -44,6 +44,18 @@ Map<String, dynamic> _rule({
   'directory': directory,
 };
 
+/// The rules card's "not available" tile, told apart from the shared-folders
+/// card's.
+///
+/// Both cards say `Not available on this device` on Android, deliberately:
+/// both are true there, and giving the same situation a second wording would
+/// read as two different facts. The subtitle is what separates them, so that
+/// is what this anchors on.
+Finder _rulesUnavailable() => find.ancestor(
+  of: find.textContaining('nowhere for a rule to send them'),
+  matching: find.widgetWithText(ListTile, 'Not available on this device'),
+);
+
 /// Answers "Save to" with a fixed absolute path, so the criteria are what the
 /// dialog tests are about rather than the native folder chooser.
 class _FakeDirectoryPicker extends FileSelectorPlatform {
@@ -251,7 +263,7 @@ void main() {
         ..settings.addAll({'rules_supported': false, 'save_rules': const []});
       await _open(tester, fake);
 
-      expect(find.text('Not available on this device'), findsOneWidget);
+      expect(_rulesUnavailable(), findsOneWidget);
       expect(find.text('Add rule'), findsNothing);
       final copy = tester
           .widgetList<Text>(find.byType(Text))
@@ -274,7 +286,7 @@ void main() {
     final fake = FakePeerBeam()..settings.addAll({'device_name': 'x'});
     await _open(tester, fake);
 
-    expect(find.text('Not available on this device'), findsOneWidget);
+    expect(_rulesUnavailable(), findsOneWidget);
   });
 
   group('the add-rule dialog', () {

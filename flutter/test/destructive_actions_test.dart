@@ -18,6 +18,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -317,37 +318,50 @@ void main() {
   group('stopping a share offers an undo', () {
     testWidgets('un-sharing is immediate and unprompted, and can be taken '
         'back where it was', (tester) async {
-      final fake = FakePeerBeam()
-        ..shares = const [
-          SharedFolder(name: 'Photos', path: '/home/me/Photos', exists: true),
-          SharedFolder(name: 'Media', path: '/srv/media', exists: true),
-        ];
-      await _openSettings(tester, fake, 'SHARED FOLDERS');
+      // Pinned to desktop: flutter_test reports Android by default, and the
+      // shared-folders card draws no list there — Android reaches a folder
+      // only through a grant it cannot turn into a path, so it is given that
+      // reason in place of an editor. The undo under test is a desktop one.
+      // Reset in a `finally`, not an `addTearDown`: `testWidgets` re-checks
+      // foundation's debug variables the instant this callback returns, before
+      // the tear-down queue unwinds.
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      try {
+        final fake = FakePeerBeam()
+          ..shares = const [
+            SharedFolder(name: 'Photos', path: '/home/me/Photos', exists: true),
+            SharedFolder(name: 'Media', path: '/srv/media', exists: true),
+          ];
+        await _openSettings(tester, fake, 'SHARED FOLDERS');
 
-      await tester.tap(
-        find.descendant(
-          of: find.byKey(const Key('shared-folder-/srv/media')),
-          matching: find.byTooltip('Stop sharing'),
-        ),
-      );
-      await _tick(tester);
+        await tester.tap(
+          find.descendant(
+            of: find.byKey(const Key('shared-folder-/srv/media')),
+            matching: find.byTooltip('Stop sharing'),
+          ),
+        );
+        await _tick(tester);
 
-      // Un-sharing is the safe direction: it must never be slowed by a prompt.
-      expect(find.byType(AlertDialog), findsNothing);
-      expect(fake.calls, contains('setSharedFolders:/home/me/Photos'));
-      expect(find.text('/srv/media'), findsNothing);
+        // Un-sharing is the safe direction: it must never be slowed by a
+        // prompt.
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(fake.calls, contains('setSharedFolders:/home/me/Photos'));
+        expect(find.text('/srv/media'), findsNothing);
 
-      await tester.tap(find.text('Undo'));
-      await _tick(tester);
+        await tester.tap(find.text('Undo'));
+        await _tick(tester);
 
-      expect(
-        fake.calls,
-        // Not `calls.last`: every write is followed by a re-read, so the last
-        // call is always the read.
-        contains('setSharedFolders:/home/me/Photos,/srv/media'),
-        reason: 'restored at the index it left, not appended',
-      );
-      expect(find.text('/srv/media'), findsOneWidget);
+        expect(
+          fake.calls,
+          // Not `calls.last`: every write is followed by a re-read, so the
+          // last call is always the read.
+          contains('setSharedFolders:/home/me/Photos,/srv/media'),
+          reason: 'restored at the index it left, not appended',
+        );
+        expect(find.text('/srv/media'), findsOneWidget);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
     });
   });
 }

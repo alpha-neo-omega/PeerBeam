@@ -31,9 +31,11 @@
 	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
-	<!-- macOS 15+ gates local network access behind a prompt. Without this
-	     string there is no prompt to approve, and a denial looks exactly
-	     like a network with no peers on it. -->
+	<!-- macOS 15+ gates local network access behind a prompt. This string is
+	     what the prompt shows as the reason; without it the user is asked to
+	     approve access with nothing said about what for. Either way a denial
+	     looks exactly like a network with no peers on it, which is a separate
+	     gap on the Rust side rather than something this file can fix. -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>PeerBeam looks for devices on this network so you can send files to them directly.</string>
 	<key>NSMainNibFile</key>

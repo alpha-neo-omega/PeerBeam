@@ -69,7 +69,41 @@ pub fn hostname() -> String {
 /// invention. The temp directory remains the last resort for a process with no
 /// home at all.
 pub fn download_dir() -> PathBuf {
-    resolve_download_dir(dirs::download_dir(), dirs::home_dir())
+    unsandboxed(resolve_download_dir(dirs::download_dir(), dirs::home_dir()))
+}
+
+/// Rewrite a path that landed inside a macOS App Sandbox container back to the
+/// user's own home.
+///
+/// **The entitlement is only half of it.** A sandboxed build carries
+/// `com.apple.security.files.downloads.read-write`, which grants *access* to the
+/// real `~/Downloads` — but the sandbox also redirects `$HOME` to
+/// `~/Library/Containers/<bundle>/Data`, and that is where `dirs` reads from. So
+/// the path was still computed inside the container: received files went
+/// somewhere the user could not find, under a name the app told them was
+/// Downloads. Granting access to a folder it never names does nothing.
+///
+/// A string rewrite rather than a `getpwuid` call: the container path has a
+/// fixed shape, the transform is pure and testable, and it needs neither `unsafe`
+/// nor a new dependency. A path that is not a container path is returned
+/// untouched, so this is inert everywhere else — including a macOS build that is
+/// not sandboxed.
+fn unsandboxed(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        const MARKER: &str = "/Library/Containers/";
+        let text = path.to_string_lossy();
+        if let Some((home, rest)) = text.split_once(MARKER) {
+            // `<home>/Library/Containers/<bundle>/Data/<tail>` — drop the bundle
+            // id and the `Data` segment, keep whatever the caller asked for
+            // beneath it.
+            let tail: Vec<&str> = rest.split('/').skip(2).collect();
+            if !home.is_empty() && !tail.is_empty() {
+                return PathBuf::from(home).join(tail.join("/"));
+            }
+        }
+    }
+    path
 }
 
 /// The decision behind [`download_dir`], separated from the environment so it
@@ -233,6 +267,25 @@ mod tests {
             Some(PathBuf::from("/Users/ada")),
         );
         assert_eq!(resolved, PathBuf::from("/Users/ada/Downloads"));
+    }
+
+    /// A sandboxed macOS build computes its Downloads folder inside the
+    /// container, because the sandbox redirects `$HOME` there — so the
+    /// entitlement that grants access to the real one was granting access to a
+    /// folder the app never named. Inert on every other platform and on an
+    /// unsandboxed path.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_container_path_is_rewritten_to_the_real_home() {
+        let inside =
+            PathBuf::from("/Users/ada/Library/Containers/com.peerbeam.peerbeam/Data/Downloads");
+        assert_eq!(unsandboxed(inside), PathBuf::from("/Users/ada/Downloads"));
+    }
+
+    #[test]
+    fn an_ordinary_path_is_left_alone() {
+        let plain = PathBuf::from("/home/ada/Downloads");
+        assert_eq!(unsandboxed(plain.clone()), plain);
     }
 
     /// A process with no home at all still needs somewhere to put a file.
