@@ -239,6 +239,12 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A phone now reports its battery when you share device status.** The engine
+  reads a battery from the system on Linux and reports none on Windows and
+  macOS by design; on Android it deferred to the app, and the app had nothing
+  behind it — so the one reading a phone actually has was the one field silently
+  missing. A device with no battery still reports none, rather than a made-up
+  figure.
 - **Re-initialising the engine no longer stops every event.** Starting the
   engine when one is already running tears the old one down first, and that
   teardown cleared the event callback — which is right when the app is shutting

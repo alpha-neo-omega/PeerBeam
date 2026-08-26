@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -205,6 +206,28 @@ class MainActivity : FlutterActivity() {
             "cancelNotification" -> {
                 Notifications.cancel(this, call.argument<Int>("id") ?: 0)
                 result.success(null)
+            }
+            // The one field a phone is actually asked for, and the one the Rust
+            // layer cannot read: `peerbeam_platform::battery` reads sysfs on
+            // Linux and says nothing on Android, its comment naming this side as
+            // the half that fills the gap. That half did not exist, so "share
+            // device status" quietly omitted the only reading a phone has.
+            "batteryStatus" -> {
+                val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                val percent = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                // A device with no battery answers Integer.MIN_VALUE or a figure
+                // outside 0..100; null is the schema's way of saying "no
+                // reading", which is what every desktop already answers.
+                if (percent in 0..100) {
+                    result.success(
+                        mapOf(
+                            "percent" to percent,
+                            "charging" to bm.isCharging,
+                        ),
+                    )
+                } else {
+                    result.success(null)
+                }
             }
             "isIgnoringBatteryOptimizations" -> {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
