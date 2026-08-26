@@ -22,7 +22,7 @@ mod store;
 mod version;
 
 pub use apply::{apply_local, Outcome};
-pub use delta::{plan as plan_delta, reassemble, ChunkMap, Need};
+pub use delta::{fits_in_memory, plan as plan_delta, reassemble, ChunkMap, Need, MAX_REASSEMBLE};
 pub use handler::{build, build_with, IncomingSink, ManifestSink, SendFile, SyncHandler};
 pub use index::{IndexEntry, SyncIndex, NS as INDEX_NS};
 pub mod manifest_wire {

@@ -270,13 +270,35 @@ impl MessageHandler for SyncHandler {
                 }
                 Ok(())
             }
+            // **Answers, and only from a device this one approved.**
+            //
+            // Both of these are replies to a request *this* side made, so the
+            // capability checks the request arms use are the wrong test: `may(peer,
+            // Browse)` asks whether the peer may browse *us*, which has nothing to
+            // do with whether we asked them for a chunk. They were therefore
+            // ungated entirely — the only two arms in this handler that were —
+            // and both hand their payload straight into an unbounded queue, so any
+            // device that completed a handshake could push bytes into this
+            // process's memory without ever having been asked for them.
+            //
+            // Approval is the honest gate here: a delta fetch only ever goes to a
+            // device the user approved, so an answer from anything else was not one
+            // we asked for. It is not full request/response correlation — that
+            // wants a request id on the wire, which these messages do not carry —
+            // so it narrows who can do it rather than closing it outright.
             MSG_CHUNKMAP => {
+                if !self.trust.is_approved(peer) {
+                    return Ok(());
+                }
                 if let Ok(m) = crate::manifest::ChunkMapResponse::from_frame(&frame) {
                     (self.incoming_chunk_map)(m);
                 }
                 Ok(())
             }
             MSG_CHUNK_DATA => {
+                if !self.trust.is_approved(peer) {
+                    return Ok(());
+                }
                 if let Ok(d) = crate::manifest::ChunkData::from_frame(&frame) {
                     (self.incoming_chunk)(d);
                 }
@@ -435,6 +457,91 @@ mod tests {
         fn is_trusted(&self, _device: &DeviceId) -> bool {
             true
         }
+    }
+
+    /// The same fake with approval withheld: a device that completed a
+    /// handshake and was pinned, which is what every stranger is.
+    fn unapproved_trust() -> Arc<dyn TrustStore> {
+        Arc::new(Trust(TrustRecord {
+            device: DeviceId::from("pb-bob"),
+            fingerprint: "ff".into(),
+            name: "Bob".into(),
+            trusted_at: chrono::Utc::now(),
+            approved: false,
+            permissions: PermissionSet::granted_on_approval(),
+            expires_at: None,
+            mine: false,
+        }))
+    }
+
+    /// A handler that reports what reached the *answer* sinks — the two arms
+    /// that take a reply to a request this side made.
+    fn answer_handler(
+        trust: Arc<dyn TrustStore>,
+    ) -> (
+        Arc<SyncHandler>,
+        Arc<Mutex<Vec<crate::manifest::ChunkData>>>,
+        tempfile::TempDir,
+    ) {
+        let (dir, shares) = tree();
+        let got: Arc<Mutex<Vec<crate::manifest::ChunkData>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let (h, slot) = SyncHandler::with_chunks(
+            shares,
+            trust,
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(move |d| g.lock().unwrap().push(d)),
+        );
+        let _ = slot.set(DeviceId::from("pb-bob"));
+        (h, got, dir)
+    }
+
+    /// **Unsolicited answers from a stranger are dropped.** `MSG_CHUNK_DATA` and
+    /// `MSG_CHUNKMAP` are replies to a request this side made, so the capability
+    /// checks the request arms use are the wrong question — and they were left
+    /// ungated entirely, the only two arms here that were. Both hand their
+    /// payload into an unbounded queue, so any device that finished a handshake
+    /// could push bytes into this process's memory unasked.
+    #[tokio::test]
+    async fn chunk_bytes_from_an_unapproved_device_are_dropped() {
+        let (h, got, _dir) = answer_handler(unapproved_trust());
+        h.handle(
+            crate::manifest::ChunkData {
+                hash: "00".repeat(32),
+                bytes: vec![1, 2, 3],
+            }
+            .to_frame(ChannelId::new(1))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "a device the user never approved queued chunk bytes into this process"
+        );
+    }
+
+    /// And an approved one still gets through, so the gate is a gate and not a
+    /// wall: this is the path a real delta fetch answers on.
+    #[tokio::test]
+    async fn chunk_bytes_from_an_approved_device_still_arrive() {
+        let (h, got, _dir) = answer_handler(trust(true, true));
+        h.handle(
+            crate::manifest::ChunkData {
+                hash: "00".repeat(32),
+                bytes: vec![1, 2, 3],
+            }
+            .to_frame(ChannelId::new(1))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.lock().unwrap().len(), 1);
     }
 
     fn trust(browse: bool, files: bool) -> Arc<dyn TrustStore> {

@@ -5989,6 +5989,23 @@ async fn fetch_by_delta(
         chunks: answer.chunks,
     };
 
+    // **Refused before it is fetched, not after.** `reassemble` enforces this
+    // same ceiling, but it runs once every chunk is already downloaded and
+    // resident — so the guard protected nothing on this path. The declared size
+    // is the peer's figure, and on a 32-bit ABI an over-large one aborts the
+    // process outright (allocation failure is `handle_alloc_error`, not an
+    // `Err`), which is why the whole-file fallback below could never be reached.
+    // Answering `None` here hands this file to that fallback, which streams.
+    if !peerbeam_sync::fits_in_memory(&map) {
+        tracing::warn!(
+            path = remote_path,
+            declared = map.total_bytes(),
+            ceiling = peerbeam_sync::MAX_REASSEMBLE,
+            "delta refused: the peer's chunk map is larger than reassembly allows"
+        );
+        return None;
+    }
+
     let have = index.chunks().have(folder);
     let need = peerbeam_sync::plan_delta(&map, &have);
     let fetched = if need.fetch.is_empty() {

@@ -97,7 +97,23 @@ pub fn plan(want: &ChunkMap, have: &BTreeSet<String>) -> Need {
 /// ceiling used by `index` and `handler`.
 ///
 /// A bound rather than a hint: it is checked against a figure the peer chose.
-const MAX_REASSEMBLE: u64 = 256 * 1024 * 1024;
+pub const MAX_REASSEMBLE: u64 = 256 * 1024 * 1024;
+
+/// Whether a chunk map is small enough to reassemble — asked **before**
+/// fetching, which is the only place the answer is worth anything.
+///
+/// [`reassemble`] enforces the same ceiling, but it runs after every chunk has
+/// been downloaded and buffered, so on the production path the guard was dead
+/// for the accumulation that actually matters: a caller fetched the whole
+/// declared map into memory and only then asked whether it was allowed to. On a
+/// 32-bit ABI — `armeabi-v7a`, which ships — an allocation failure is not an
+/// `Err` but `handle_alloc_error`, so the process aborts before the caller's
+/// whole-file fallback can run. `Need::fetch_bytes` exists for exactly this
+/// question and was computed and never read.
+#[must_use]
+pub fn fits_in_memory(map: &ChunkMap) -> bool {
+    map.total_bytes() <= MAX_REASSEMBLE
+}
 
 pub fn reassemble(
     map: &ChunkMap,
@@ -349,6 +365,35 @@ mod bound_tests {
         // the machine.
         let out = reassemble(&map, |_| panic!("must refuse before supplying"));
         assert!(out.is_none(), "an oversized map was accepted");
+    }
+
+    /// **The same answer, before a byte is fetched.** `reassemble`'s refusal
+    /// arrives after every chunk has been downloaded and buffered, so on the
+    /// production delta path it protected nothing that mattered: the caller had
+    /// already spent the memory by the time it was told the map was too big. On
+    /// `armeabi-v7a` — a shipped ABI — that spend is an abort rather than an
+    /// error, so the caller's whole-file fallback never ran either.
+    #[test]
+    fn an_oversized_map_is_refusable_before_any_chunk_is_fetched() {
+        let chunks: Vec<Chunk> = (0..4)
+            .map(|i| Chunk {
+                hash: format!("{i:064x}"),
+                len: 1024 * 1024 * 1024,
+                offset: i * 1024 * 1024 * 1024,
+            })
+            .collect();
+        let map = ChunkMap {
+            path: "big.bin".into(),
+            chunks,
+        };
+
+        assert!(
+            !fits_in_memory(&map),
+            "a map four times the ceiling must be refusable up front"
+        );
+        // And the two answers agree, so a caller that asks early gets exactly
+        // what `reassemble` would have told it late.
+        assert!(reassemble(&map, |_| panic!("must refuse before supplying")).is_none());
     }
 
     /// A map inside the ceiling still reassembles, so the bound is a bound and

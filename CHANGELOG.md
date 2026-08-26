@@ -239,6 +239,22 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A folder sync could abort the app on a 32-bit phone.** Delta transfer asked
+  whether a file was small enough to rebuild in memory *after* downloading every
+  chunk of it, so the ceiling protected nothing that mattered: the peer's
+  declared size was already spent. On `armeabi-v7a` — a shipped Android ABI —
+  running out of address space is not an error a caller can handle, it aborts the
+  process, so the whole-file fallback that exists for exactly this case never
+  ran. The question is now asked before the first chunk is fetched, in the app
+  and in the CLI, which carried the same order.
+- **Sync answers from a device you never approved are dropped.** The two message
+  types that carry a *reply* — a chunk map, and chunk bytes — were the only ones
+  in the sync handler with no check at all, because the permission the other arms
+  use asks whether a peer may read from *us*, which is the wrong question for an
+  answer. Both hand their payload straight into an unbounded queue, so any device
+  that completed a handshake could push bytes into the app's memory without ever
+  having been asked for them. They now require approval, which is who a delta
+  fetch is sent to in the first place.
 - **A headless Linux box received files into RAM.** The save directory falls back
   to the OS Downloads folder, and on Linux that is read from the XDG user-dirs
   file — which a server, a Docker image or a machine reached over SSH has never

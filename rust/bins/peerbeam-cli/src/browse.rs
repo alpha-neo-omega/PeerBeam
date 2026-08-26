@@ -167,6 +167,15 @@ async fn fetch_by_delta(
         chunks: answer.chunks,
     };
 
+    // **Refused before it is fetched, not after** — the same guard as the FFI's
+    // delta path, and for the same reason: `reassemble` checks this ceiling only
+    // once every chunk is already downloaded and resident, so on this path it
+    // protected nothing. Answering `None` hands the file to the whole-file
+    // fallback, which streams instead of buffering.
+    if !peerbeam_sync::fits_in_memory(&map) {
+        return None;
+    }
+
     let have = index.chunks().have(folder);
     let need = peerbeam_sync::plan_delta(&map, &have);
     let fetched = if need.fetch.is_empty() {
