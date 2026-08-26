@@ -1,7 +1,7 @@
 # PeerBeam — Install & CLI Guide
 
 Everything needed to get PeerBeam running on a machine and drive it from a
-terminal. Written against **v0.8.0**.
+terminal. Written against **v0.10.0**.
 
 - Full CLI reference: [CLI.md](CLI.md)
 - Platform notes: [ANDROID.md](ANDROID.md) · [DESKTOP.md](DESKTOP.md)
@@ -301,7 +301,7 @@ elsewhere.
 ### Background service
 
 ```bash
-peerbeam daemon         # keep discovery + receive running
+peerbeam daemon start   # keep discovery + receive running
 peerbeam history        # completed transfers
 peerbeam config show    # inspect configuration
 peerbeam config set device.name "Workshop PC"

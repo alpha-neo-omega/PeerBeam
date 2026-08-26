@@ -28,6 +28,7 @@ Flutter → FFI Bridge → Rust Public API → Application → TransferEngine
 ```c
 uint32_t pb_abi_version(void);                 // integer, checked at startup
 char*    pb_version_json(void);                // {"abi","semver"}
+char*    pb_check_updates(void);               // {reachable,current,latest?,update_available?,url?}
 char*    pb_init(const char* config_json);     // "" → defaults
 void     pb_shutdown(void);
 void     pb_set_event_callback(void (*cb)(const char*));  // null clears
@@ -40,7 +41,8 @@ char*    pb_devices_json(void);                // {"devices":[…]}
 `pb_abi_version` is bumped on any breaking change to a signature or the
 envelope/DTO shape. Error codes: `not_initialised`, `invalid_argument`,
 `connection`, `integrity`, `cancelled`, `storage`, `transfer`, `encryption`,
-`unimplemented`, `queue_unreadable`, `internal`.
+`unimplemented`, `unsupported`, `queue_unreadable`, `permission_denied`,
+`internal`.
 
 `queue_unreadable` is narrower than the rest: `pb_chat_delete` and
 `pb_chat_delete_messages` return it when the shared outbox holds an entry they
@@ -58,6 +60,18 @@ port actually bound (`peerbeam_config::DiscoveryConfig::port`, default
 `start_discovery` has returned. Purely additive: `discovering` keeps its
 existing key and a caller that ignores `port` is unaffected.
 
+`pb_check_updates` is the only outbound request this app makes to anything but
+a peer, permitted by amendment A1 in
+[ARCHITECTURAL_INVARIANTS](ARCHITECTURAL_INVARIANTS.md) on terms it has to
+keep: it runs when a person asks and never on a timer or at startup, it sends
+no device id, install id or custom header — the only header naming this product
+is the `User-Agent` the API requires, and it carries no version — and the answer
+is a
+version string that nothing acts on — there is no download and no install.
+Being unable to reach the feed answers `{reachable:false, current, reason}`
+rather than failing: offline is an ordinary state for this app, and nothing
+here is allowed to become a precondition for using it.
+
 ### Transfer (M2, additive — ABI still v1)
 
 ```c
@@ -66,11 +80,13 @@ char* pb_transfer_send_folder(const char* json); // {peer, path} → {id}
 char* pb_transfer_pause(const char* json);       // {id}
 char* pb_transfer_resume(const char* json);      // {id}
 char* pb_transfer_cancel(const char* json);      // {id}
-char* pb_transfer_accept(const char* json);      // {id}  approve an incoming transfer
+char* pb_transfer_accept(const char* json);      // {id, confirmed?}  approve an incoming transfer
+char* pb_transfer_accept_trust(const char* json);// {id, confirmed?}  approve it AND trust the sender
 char* pb_transfer_reject(const char* json);      // {id}
 char* pb_transfers_active(void);                 // {transfers:[{id,direction,peer,file,status,stats}]}
 char* pb_transfer_get(const char* json);         // {id} → {transfer} | invalid_argument
 char* pb_history_get(void);                       // {history:[…]}
+char* pb_history_clear(void);                     // → {cleared}, emits history_updated
 ```
 
 ### Interrupted transfers (additive — ABI still v1)
@@ -151,6 +167,16 @@ Two rules, both of them:
 `pb_init` also starts a **receive server** on `transfer.port` so incoming
 transfers can be accepted/rejected. `subscribe_to_transfer_events` is the M1
 `pb_set_event_callback` — one stream carries everything, tagged by `type`.
+
+`pb_transfer_accept` is one-time and does not trust the sender;
+`pb_transfer_accept_trust` also pins it, so its later transfers are
+auto-accepted whenever auto-accept is on. `confirmed` is the optional
+first-contact pairing answer — `true` means the user compared this session's
+pairing code against the other device's screen and they matched. It matters
+only when the sender was pinned by this very handshake *and*
+`require_pairing_confirmation` is on; absent or `false` there refuses the
+accept and leaves the transfer pending, so the user can verify and accept
+again. Everywhere else it is ignored.
 
 **Stats** (in `transfer_progress` and `pb_transfer_get`):
 `{transferred_bytes, total_bytes, current_speed, average_speed, eta_secs}`.
@@ -250,6 +276,9 @@ char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} 
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
 char* pb_chat_mark_read(const char* json);      // {peer, read_through} → {sent}
+char* pb_chat_retention_get(const char* json);  // {peer_id} → {seconds|null}
+char* pb_chat_retention_set(const char* json);  // {peer_id, seconds?} → {seconds|null}
+char* pb_chat_prune(const char* json);          // {peer_id?} → {messages, queued}
 char* pb_notes_list(const char* json);          // {} → {notes:[…]}
 char* pb_notes_create(const char* json);        // {title?, body} → {id}
 char* pb_notes_edit(const char* json);          // {id, title?, body} → {updated}
@@ -362,6 +391,14 @@ already in the requested state (the call is idempotent by design). Reactions are
 **not** queued for later delivery the way text and files are — a gesture that
 arrives long after its conversation moved on is noise.
 
+The retention calls are the disappearing-message window, and it is **local**:
+nothing is sent to the peer, and no surface may suggest the peer's copy is
+affected — that is a promise this architecture cannot keep. Omitting `seconds`
+turns the window off, and `null` coming back means there is none.
+`pb_chat_prune` deletes what has already aged out — one conversation, or every
+one when `peer_id` is absent — and reports how many messages and how many
+queued entries went.
+
 `pb_chat_search` is a **pure local read** of the same conversation namespaces
 `pb_chat_history` reads. Nothing goes on the wire, no peer is dialled, and there
 is no way for a peer to observe that it happened — a thread whose device is long
@@ -399,6 +436,181 @@ from** (not a `peer_id` copied out of the row), the message id, its timestamp,
 that is a substring of the stored text, never re-rendered. A row this build
 cannot decode is skipped exactly as `pb_chat_history` skips it; a genuine store
 failure is reported rather than quietly dropping that thread's matches.
+
+### Trust and permissions (additive — ABI still v1)
+
+```c
+char* pb_trust_list(void);                       // {devices:[{id,name,fingerprint,trusted_at,approved,expires_at,expired,permissions[]}]}
+char* pb_trust_remove(const char* json);         // {id} → {removed}
+char* pb_trust_set_permission(const char* json); // {id, permission, granted} → {changed}
+char* pb_trust_set_mine(const char* json);       // {device, mine} → {changed}
+char* pb_trust_my_devices(const char* json);     // {} → {devices:[…]}
+```
+
+**Pinned is not approved, and a surface that renders the two alike tells the
+user a stranger is trusted.** Every peer that completes the authenticated
+handshake is pinned, so that a later key change is detectable; `approved` is the
+separate fact that the user chose this device, and only an approved one may be
+sent presence, a clip, or an accepted pipe. `approved` is the *effective* answer
+rather than the stored bit: a device whose time-limited approval has run out
+reports `false`, with `expired: true` and `expires_at` saying why. One clock
+read covers the whole list, so a long listing cannot report two devices as of
+two different instants.
+
+`permissions` is an explicit array of names — `files`, `chat`, `clipboard`,
+`presence`, `pipe`, `notes`, `browse` — never a bitmask and never inferred from
+`approved`. It is emitted for un-approved pinned devices too, where it is
+typically empty, so a surface never has to guess what an absent key means.
+`pb_trust_set_permission` takes one of those names; an unknown one is
+`invalid_argument` rather than a silent no-op, so a surface built against a
+newer engine is told instead of humoured. A change takes effect on the **next
+operation**, not the next reconnect: every gate re-reads the trust store per
+message, clip, heartbeat and accept.
+
+`changed: false` and `removed: false` mean the store already read that way (or
+the device is not pinned) and are not errors, so a UI that re-asserts a toggle
+is idempotent. `pb_trust_remove` and `pb_trust_set_permission` emit
+`trust_changed`, which is what makes the Trusted Devices list re-read without
+polling; revoking also drops the device from the presence dashboard immediately
+rather than at the next restart.
+
+`pb_trust_set_mine` is a **local label, not a grant**: it widens no permission
+and the device is never told. `pb_trust_my_devices` lists what it marked,
+deliberately **unfiltered by approval and expiry** — it answers "which of these
+are mine?", not "which may I use?", and hiding a marked-but-unapproved phone is
+how a person concludes it is missing when it is merely waiting for a tap.
+
+### Spaces (additive — ABI still v1)
+
+```c
+char* pb_spaces_list(const char* json);          // {} → {spaces:[{id,name,live[],stale[]}]}
+char* pb_spaces_create(const char* json);        // {name} → {space}
+char* pb_spaces_rename(const char* json);        // {id, name} → {space}
+char* pb_spaces_delete(const char* json);        // {id} → {deleted}
+char* pb_spaces_add_member(const char* json);    // {id, device} → {added}
+char* pb_spaces_remove_member(const char* json); // {id, device} → {removed}
+```
+
+A Space is a **local label** over device ids this machine already trusts.
+Nothing about it is ever sent, no peer learns one exists, and there is no group
+protocol on the wire — which is what keeps group send peer-to-peer rather than
+hub-brokered (I3). Sending to a Space is N ordinary 1:1 sends, each through the
+same per-capability gate a hand-typed send passes (I6), so membership authorizes
+nothing. Records live in the `spaces` namespace of the encrypted `AppStore`, so
+a Space name is not sitting in cleartext on disk (I11).
+
+A view splits its members into `live` — still trusted, the recipients of a
+fan-out, in the order they were added — and `stale`, meaning revoked or past the
+end of a time-limited grant. Stale members stay recorded and nothing is sent to
+them. `pb_spaces_add_member` refuses a device this machine does not trust;
+removing a member and deleting a Space validate nothing, because a revoked
+member is exactly the one a user most needs to be able to take out. Deleting a
+Space changes no trust.
+
+### Folder sync (additive — ABI still v1)
+
+```c
+char* pb_sync_pull(const char* json);    // {peer, path, into} → {fetching,pushing,deleted,renamed,conflicts[],truncated}
+char* pb_sync_watch(const char* json);   // {peer, path, into, interval?} → {watching:true}
+char* pb_sync_unwatch(const char* json); // {path, into} → {watching:false, was_watching}
+char* pb_sync_watches(const char* json); // {} → {watching:[{path,into}]}
+```
+
+**Bidirectional, with conflicts kept rather than resolved.** Per-file version
+vectors distinguish "their copy is newer" from "we both changed it" — the
+question a modification time cannot answer. When both sides changed, the peer's
+copy arrives as `name.sync-conflict-<peer>.ext`, the local file is untouched,
+and `conflicts` names each one so a surface can say which files now exist twice.
+Only the changed parts of a file cross the wire, and a file that merely moved is
+renamed locally rather than fetched again (`renamed`).
+
+`pb_sync_pull` returns once the work has been planned and requested; the bytes
+arrive as ordinary inbound transfers through the usual approval path, because
+that is what they are. `interval` is in seconds and clamped to a floor — a
+one-second poll re-hashes the folder continuously and costs more than the change
+it is trying to notice. A file is acted on only once it has stopped changing, so
+saving a large file mid-poll neither syncs a half-written copy nor raises the
+version vector once per observation and manufactures a conflict out of an
+ordinary save.
+
+### Browsing a peer's shared folders (additive — ABI still v1)
+
+```c
+char* pb_browse_list(const char* json);   // {peer, path?} → {path, entries:[{name,is_dir,size}], truncated, denied}
+char* pb_browse_shares(const char* json); // {} → {shares:[name], entries:[{name,path,exists}]}
+```
+
+`path` is **share-relative** — `photos/2026`, never absolute — and empty asks
+what the device shares at all. `denied: true` with no entries means the device
+is not showing this: it may not have granted this machine `browse`, may share
+nothing, or the path may not exist, and those are **deliberately
+indistinguishable**, because a caller able to tell them apart could map a
+filesystem it may not see, one request at a time. A peer that cannot be reached,
+or whose build does not implement browsing, is a `connection` error instead — a
+different fact, and the only one of the two worth retrying.
+
+`pb_browse_shares` is this device's own list, name **and** path. The name is the
+only thing a peer can address a share by, and it is assigned rather than
+derived: two folders called `Documents` are one share named `Documents` and one
+named `Documents (2)`, so a UI showing "Documents" twice would be offering a
+name only one of them answers to. The path is what lets the person who chose
+them tell them apart, and `exists` says whether the folder is still there.
+**Empty by default** — sharing a folder is a deliberate act, not a consequence
+of trusting someone.
+
+### Wake-on-LAN (additive — ABI still v1)
+
+```c
+char* pb_wake_set(const char* json);    // {device, mac} → {mac}
+char* pb_wake_forget(const char* json); // {device} → {forgotten}
+char* pb_wake_send(const char* json);   // {device} → {mac, sent_to:[…]}
+```
+
+`pb_wake_set` records where to send a packet: a note this machine keeps, which
+grants nothing and which the device is never told. `pb_wake_send` **reports what
+was sent, never that the device woke** — Wake-on-LAN has no reply, so a surface
+claiming otherwise would be inventing a fact, and the confirmation is the device
+turning up in discovery. Only an approved device may be woken (I6). It reaches
+the local broadcast domain and nowhere else: the packet is matched by a
+powered-down network card, which is not something Tailscale or any other VPN can
+carry it to. A malformed MAC is `invalid_argument`, an unwritable store is
+`storage`, and a socket that cannot broadcast is `connection`.
+
+### Timeline (additive — ABI still v1)
+
+```c
+char* pb_timeline(const char* json);    // {limit?} → {events:[…], truncated, limit}
+```
+
+A **read across stores that already exist** — transfers, conversations, and
+clipboard history when it is on — newest first, ties broken by kind so the order
+is total. Nothing is recorded to build it: a timeline with its own log would be
+a second copy of the same facts, free to disagree with them, and a record of
+activity nobody separately agreed to. Entries carry no message bodies and no
+clip text; the timeline says *that* something happened and when, and reading it
+is what the conversation and clipboard screens are for. `limit` defaults to 200
+and a value outside `1..=1000` is refused rather than clamped.
+
+### PeerSession diagnostics (M8, additive — ABI still v1)
+
+```c
+char* pb_sessions_json(void);              // {sessions:[{id,peer,state,version,capabilities}], count}
+char* pb_session_get(const char* json);    // {id} → {session:{…}|null}
+char* pb_channels_json(const char* json);  // {id} → {channels:[…]}; {} or null → {sessions:[…]}
+char* pb_migration_json(void);             // {transport, active_sessions, recovering}
+char* pb_recovery_json(void);              // {recovering, sessions_recovering:[…]}
+char* pb_diagnostics_json(void);           // {sessions, transport, recovery}
+```
+
+Read-only wrappers over the engine's `SessionDiagnostics`, which is the single
+source of truth; no state lives on the FFI side. An id that names no live
+session answers `{session: null}` rather than failing — a diagnostics view
+asking about a session that has since closed is describing ordinary life, not a
+fault.
+
+`pb_migration_json` is a transport summary, and the active transport is always
+PeerSession. Its name is retained for ABI stability rather than because a
+migration is still under way.
 
 ## Events (no polling)
 

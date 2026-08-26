@@ -185,7 +185,14 @@ them is outside A1 and back in conflict with I4.
    defaults 'for convenience'".)
 2. **No identifiers.** No device id, install id, keypair-derived value, cookie,
    or persistent client state. Nothing beyond what a bare HTTPS GET
-   unavoidably discloses. The request carries no PeerBeam-specific header.
+   unavoidably discloses. No custom headers, and no query string: the only
+   header naming this product is the `User-Agent`, which the GitHub API requires
+   and which is the bare word `PeerBeam` — no version, so the request does not
+   disclose which build is asking either. *(Wording sharpened 2026-08-20: this
+   condition first read "carries no PeerBeam-specific header", which a reader
+   could take as forbidding the very `User-Agent` the API will not serve a
+   request without. The intent — that nothing distinguishing this install or
+   this build travels — is unchanged, and so is the shipped request.)*
 3. **The response is inert.** A version string is displayed. No download, no
    install, no behaviour anywhere changes on the strength of what the server
    said. (I4 — "Forbids: … remote feature flags".)

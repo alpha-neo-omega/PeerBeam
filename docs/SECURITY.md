@@ -15,6 +15,29 @@ file writing — all transport-agnostic.
 | Trust store | `peerbeam-trust-fs` (`TrustStore`) | TOFU fingerprint pinning (JSON) |
 | Handshake | `peerbeam-transfer::authenticate` | authenticated ECDH + HMAC key confirmation |
 | Secure framing | `peerbeam-transfer::SecureLink` | sealed frames, monotonic-counter nonce |
+| Per-channel keys | `peerbeam-transfer::session` (`ChannelCrypto`) | HKDF-Expand of the session master |
+| Transport | `peerbeam-transfer-quic` | QUIC (quinn), TLS with no PKI |
+
+## What carries this on the wire
+
+The transport that ships is QUIC (`peerbeam-transfer-quic`, built on quinn), and
+both frontends run over it: the Flutter app through `peerbeam-ffi`'s runtime, and
+every CLI command that reaches another device (`send`, `receive`, `daemon`,
+`chat`, `browse`, `pipe`, `pair`, `presence`) by building a `QuicTransport` of
+its own. One QUIC connection carries one authenticated `PeerSession`, and each of
+that session's channels is one QUIC bidirectional stream — there is no
+PeerBeam-level multiplexing protocol, because the transport already multiplexes.
+
+**QUIC's TLS authenticates nobody, deliberately.** QUIC mandates TLS and this
+project has no PKI to satisfy it with, so each node presents a freshly generated
+self-signed certificate and the client accepts whatever certificate it is shown.
+A bare QUIC connection is therefore an encrypted pipe to an unidentified party,
+and everything else on this page is what makes it a pipe to a known one: the
+handshake in the next section runs over the first stream on the connection, the
+peer's fingerprint is pinned on first contact, and every stream after that is
+sealed under a key of its own. Reading the TLS handshake as identity — "the
+certificate was accepted, so this is the right device" — is the one misreading
+that would make the rest of this document decorative.
 
 ## Mutual authentication
 
@@ -380,6 +403,18 @@ prefix ‖ 8-byte monotonic counter`:
 Session keys are derived from the handshake transcript (fresh nonces), so
 ciphertext captured from one session cannot be replayed into another.
 
+**Every channel has its own keys.** The handshake runs once per session, and its
+directional keys are used as a master secret rather than as frame keys: each
+channel — the control channel included — derives its own send and receive key and
+nonce prefix from that master with HKDF-Expand over the channel id, the protocol
+version, the direction and a reconnect epoch, so no two channels, and neither
+direction of one channel, share a key or a nonce space. A channel's stream is
+wrapped in a `SealedLink`: `SecureLink`'s sealing scheme and frame codec over a
+stream it owns rather than borrows, so the transfer code runs over it unchanged.
+The epoch is what makes resume safe — a resumed session re-derives every key at a
+bumped epoch, so a channel whose counter restarts at zero is never reusing a
+nonce under a key that has already seen it.
+
 Independently, each file transfer still verifies a **whole-file SHA-256** at
 completion (defence in depth + detects on-disk corruption).
 
@@ -546,6 +581,57 @@ clean end, and a mismatch is an error too. Both exit non-zero. That exit code is
 the only signal a script gets, and `peerbeam pipe --listen > f` without checking
 it will happily trust a bad `f`.
 
+## The one request that is not to a peer
+
+Everything else PeerBeam sends goes to a peer, or onto the local network looking
+for one — the Tailscale discovery source asks `tailscaled` on this machine, over
+its Unix socket or the `tailscale` binary, and does not leave it. There is one
+exception, and it is written down here because a privacy claim with an
+unmentioned exception in it is worth nothing.
+
+`peerbeam check-updates`, and the **Check for updates** button in the app's About
+section, make one HTTPS GET to the release feed
+(`api.github.com/repos/alpha-neo-omega/PeerBeam/releases`) and report what came
+back.
+
+**Only when a person asks.** There is no timer, no check at launch, and no check
+as a side effect of anything else: `peerbeam_update::check` has exactly two
+callers, the CLI command and the FFI entry point behind that button, and pressing
+the button is the opt-in each time. Using PeerBeam therefore never tells a server
+that PeerBeam is being used.
+
+**What the request unavoidably discloses.** GitHub sees the connecting IP
+address, and so an approximate location, and the time of the request — which is a
+moment somebody was at this machine running this app. Any HTTPS request discloses
+that much; it is the honest cost of the feature.
+
+**What it does not carry.** No device id, no install id, nothing derived from the
+identity keypair, no cookie or persistent client state, and no custom headers.
+The one header naming this product is the `User-Agent`, which GitHub's API will
+not serve a request without: it is the bare word `PeerBeam`, with no version in
+it, and there is no query string, so the request does not say which build is
+asking either: the feed is asked what the newest release is, and
+the comparison against the running version happens here. The answer is inert
+as well. A `Release` is a version string and a URL; nothing downloads, installs
+or changes behaviour on the strength of what the server said, and there is no
+retry — a caller that wants to ask again asks again.
+
+Failing is not a problem anybody has to solve. An unreachable feed reports
+`reachable: false` and exits 0, because a machine with no route out is a normal
+machine for this app, and nothing here may become a precondition for using it.
+
+**This is an amendment, not an exception somebody took quietly.** Invariant I4
+forbids phone-home without qualification, so a release check conflicts with it as
+written, and the narrow reading — that the clause is aimed at unattended, ongoing
+disclosure rather than at a single request a person makes deliberately — was not
+something to adopt silently. It is recorded as **A1**, the first amendment to
+[the invariants](ARCHITECTURAL_INVARIANTS.md#amendments): dated, approved, and
+stated as six binding conditions that hold together, so a build that drops any
+one of them is outside A1 and back in conflict with I4. The matching non-goal in
+[VISION.md](VISION.md) is narrowed in the same change, because leaving a
+published claim that the shipped build makes false would be worse than the check
+itself.
+
 ## Threat notes / scope
 
 - The handshake authenticates *keys*; binding a key to a human-meaningful
@@ -554,8 +640,10 @@ it will happily trust a bad `f`.
   transfer time, not in discovery.
 - Folder receive does not yet use the `.part`/finalize path (single-file
   does); adopting it there is a follow-up.
-- No real network transport (`TransferProvider`) ships yet; this layer is the
-  prerequisite that must wrap any future QUIC/TCP link.
+- QUIC's own TLS authenticates nobody: certificates are self-signed and accepted
+  unseen, so a connection with no `PeerSession` on it is an encrypted pipe to an
+  unidentified party. See
+  [What carries this on the wire](#what-carries-this-on-the-wire).
 
 ## Testing
 

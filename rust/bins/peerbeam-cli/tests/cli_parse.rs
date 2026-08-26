@@ -137,11 +137,13 @@ fn chat_send_addr_conflicts_with_to() {
                 addr,
                 text,
                 file,
+                reply_to,
             } => {
                 assert!(to.is_none());
                 assert_eq!(addr.as_deref(), Some("1.2.3.4:49600"));
                 assert_eq!(text.as_deref(), Some("hi"));
                 assert!(file.is_none());
+                assert!(reply_to.is_none(), "an ordinary send answers nothing");
             }
             _ => panic!("expected send"),
         },
@@ -189,11 +191,13 @@ fn chat_send_file_parses_with_text_omitted() {
                 addr,
                 text,
                 file,
+                reply_to,
             } => {
                 assert_eq!(to.as_deref(), Some("bob"));
                 assert!(addr.is_none());
                 assert!(text.is_none());
                 assert_eq!(file.as_deref(), Some("/tmp/a.bin"));
+                assert!(reply_to.is_none());
             }
             _ => panic!("expected send"),
         },
@@ -478,4 +482,48 @@ fn rules_add_parses_every_criterion_and_a_position() {
         },
         _ => panic!("expected rules"),
     }
+}
+
+/// `chat send --reply-to` parses, and cannot be combined with `--file`: a file
+/// share is not an answer to a message, and accepting the pair would leave the
+/// marker with nowhere to go.
+#[test]
+fn chat_send_takes_a_reply_target_and_refuses_it_with_a_file() {
+    let cli = Cli::try_parse_from([
+        "peerbeam",
+        "chat",
+        "send",
+        "--to",
+        "bob",
+        "--reply-to",
+        "m-0001",
+        "sure, go ahead",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Chat(a) => match a.action {
+            ChatAction::Send { text, reply_to, .. } => {
+                assert_eq!(text.as_deref(), Some("sure, go ahead"));
+                assert_eq!(reply_to.as_deref(), Some("m-0001"));
+            }
+            _ => panic!("expected send"),
+        },
+        _ => panic!("expected chat"),
+    }
+
+    assert!(
+        Cli::try_parse_from([
+            "peerbeam",
+            "chat",
+            "send",
+            "--to",
+            "bob",
+            "--file",
+            "/tmp/a.bin",
+            "--reply-to",
+            "m-0001",
+        ])
+        .is_err(),
+        "--file and --reply-to must not be accepted together"
+    );
 }

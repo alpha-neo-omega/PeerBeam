@@ -100,11 +100,12 @@ Working now:
   problem, and a script running this must not fail because of it. Permitted by
   amendment A1 in [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments),
   which lists the conditions it is allowed on.
-- `benchmark crypto|hash|loopback|quic [--size N] [--chunk KiB]` — AES-256-GCM
+- `benchmark crypto|hash|loopback [--size N] [--chunk KiB]` — AES-256-GCM
   seal/open and SHA-256 throughput (MiB/s); `loopback` = end-to-end transfer
-  over an in-process link; `quic` = end-to-end over a **real QUIC connection**
-  (loopback) reporting throughput + connect latency. Live progress bar;
-  `--chunk` tunes framing.
+  over an in-process link. Live progress bar; `--chunk` tunes framing. There is
+  no `benchmark quic`: that micro-benchmark measured the legacy direct-transport
+  link and was retired with it, and real QUIC is covered end to end by the
+  two-process tests instead ([Benchmarks](BENCHMARKS.md)).
 - `discover [--timeout N] [--watch]` — scans via all providers; table or live
   NDJSON stream (Ctrl-C to stop).
 - `list [--online]`, `status` — device snapshot / identity + providers.
@@ -169,6 +170,25 @@ Working now:
   mutual authentication. `--to` resolves a peer via discovery (id / name /
   prefix, or interactive pick); `--addr` dials directly, skipping discovery
   (headless/testing). Live progress bar; whole-file SHA-256 verified.
+- `config set transfer.max_send_bytes_per_sec <BYTES>` — an outbound ceiling on
+  what this device sends, in bytes per second; `0`, the default, is unlimited.
+  It reaches `send <FILE>`, `send <DIR>/` and a chat attachment (`chat send
+  --file`), and through them `space send`, `watch` and `transfers resume`, each
+  of which is one of those sends under another name.
+
+  **Sending only.** A receiver cannot slow a sender that ignores it, so a
+  download limit would be a promise this side cannot keep; the honest control is
+  over what this device puts on the wire.
+
+  **`pipe` is not metered.** It is a raw byte stream with no transfer control at
+  all, so the ceiling does not reach it. Everything that goes through the file
+  or folder send loops does.
+
+  The limit is a token bucket, so the figure is an average rather than a
+  cadence: a transfer that has been idle banks up to one second's worth of
+  credit and spends it in a burst instead of stuttering when it resumes. It is
+  applied per transfer, which here is also per command, because the CLI sends
+  one file to one peer at a time — a `space send` fan-out included.
 - `receive [--dir DIR] [--port N] [--once]` — serve QUIC, authenticate each
   peer, stream incoming files to `DIR` (default: config `save_directory`).
   Advertises presence via discovery so `send --to` can find it. `--once` exits
@@ -278,6 +298,32 @@ Working now:
   frames). A headless receiver needs `peerbeam receive` or `peerbeam daemon
   start` running to accept an incoming chat file; `chat watch` alone will only
   show that a file was offered, not receive it.
+- `chat send --reply-to <MSG-ID> [--to <peer>] <text>` — answer an earlier
+  message. `<MSG-ID>` is an id from `chat history --json`, and the reference
+  travels with the message, so the peer's copy answers the same one.
+
+  **Text only.** `--reply-to` and `--file` are refused together, because the
+  reference rides inside the text message and nothing offers replying *with* a
+  file yet. The id is **not** checked against this device's history: an id
+  naming nothing is not an error, it is sent and rendered as a reply whose
+  original is no longer here — which is also what a parent that was deleted, or
+  whose retention window has closed, has to look like. What is refused, before
+  anything is stored or queued, is an empty id or one over 128 characters.
+  Nothing is negotiated for any of it: the reference is an additive field inside
+  the ordinary text message, so a message that is not a reply is byte-for-byte
+  what earlier builds sent, and a peer predating replies ignores the field and
+  shows a reply as an ordinary message.
+
+  `chat history` prints a quote line above a reply — `┌ replying to in:` (or
+  `out:`, naming which side sent the parent) and the first 80 characters of
+  what is stored, a file row quoting its name — or `┌ replying to <id> —
+  original message no longer here` when the parent has gone. Quotes are
+  resolved against the rows being printed, so a message the retention window
+  already hides cannot be quoted back into view, and `chat history` is where a
+  reply is marked: the `chat_received` event a live `chat watch` prints carries
+  the body and no reply reference. Under `--json` every message carries
+  `in_reply_to` — `null` for an ordinary message, and the id it named even when
+  that message is gone.
 - `chat cancel <peer> <id>` — call off a file *we* are sharing: drop it from
   the queue, delete the copy the outbox made of it, and settle the row
   `failed`. `<peer>` is a device id or a discoverable name (same resolution as
@@ -771,6 +817,32 @@ Working now:
   (`{"id","direction","peer","file","path","transferred_bytes","total_bytes","started_at","resumable"}`);
   `discard` emits one `discarded` event with `partial_removed`.
 
+- `session list|show <ID>|stats|watch`, `channels [--session <ID>] [--watch]`,
+  `migration`, `recovery`, `diagnostics` — the PeerSession diagnostics view,
+  printed as JSON (indented on a terminal, one line under `--json`).
+
+  `session list` gives
+  `{"count","sessions":[{"id","peer","state","version","capabilities"}]}`;
+  `session show` one `{"session"}` by its 32-hex id, `null` (and exit `0`) for
+  an id that does not parse or is not open; `session stats` the session count
+  beside the transport summary; `channels` a live per-channel snapshot with
+  frame and byte counters, for one session or all of them; `recovery` the
+  sessions currently reconnecting; and `diagnostics` sessions, transport and
+  recovery in one object. `migration` is the transport summary
+  (`{"transport":"peersession","active_sessions","recovering"}`) under the name
+  the command and its FFI symbol have always had, kept so anything scripted
+  against either keeps working.
+
+  **A one-shot command holds no sessions, and cannot see another process's.**
+  Each invocation builds a fresh diagnostics view over the registry a live
+  `PeerSession` registers into, and there is no IPC to a running receiver — the
+  same gap `daemon stop|status` is gated on. So from a bare shell these print
+  well-formed *empty* snapshots, which is also why `session watch` and
+  `channels --watch` print one snapshot rather than streaming: there is nothing
+  to attach to. They are here because the app reads exactly this view
+  in-process over the FFI (`pb_sessions_json`, `pb_diagnostics_json`, …), and a
+  capability that exists only in the GUI is the split I7 forbids.
+
 Transfers are end-to-end encrypted: QUIC (TLS 1.3) for the pipe, plus an
 application-layer X25519 mutual-auth handshake with TOFU trust pinning and
 per-frame replay protection ([Security](SECURITY.md)).
@@ -869,8 +941,10 @@ emits machine-readable JSON (NDJSON for streaming/long-running commands):
   message, and — `chat watch` only — `{"event":"chat_file_needs_receiver","id","peer","name","size"}`
   when a file is offered to a process that cannot accept its bytes.
 - `chat history --json` is not a stream: one `{"messages":[…]}` object, each
-  message carrying `status` (`staging`/`pending`/`sent`/…) and, for a file,
-  `kind:"file"` plus `{"name","size","local_path"}`.
+  message carrying `status` (`staging`/`pending`/`sent`/…), `in_reply_to` (the
+  id this message answers, `null` when it answers nothing, and still the id
+  when that message has gone) and, for a file, `kind:"file"` plus
+  `{"name","size","local_path"}`.
 - `chat search --json` is not a stream either: one
   `{"hits":[{"peer_id","message_id","timestamp","direction","kind","snippet"}],"truncated":bool,"limit":N}`
   object. Deliberately one object rather than a line per hit — `truncated` has

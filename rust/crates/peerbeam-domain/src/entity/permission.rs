@@ -8,7 +8,7 @@
 //! There was no way to say *"this laptop may sync files but must never read my
 //! clipboard"*.
 //!
-//! [`VISION.md`] permits remote capabilities only as "explicit, **permissioned**,
+//! `VISION.md` permits remote capabilities only as "explicit, **permissioned**,
 //! narrowly-scoped actions", and I6 requires "explicit, revocable,
 //! **per-capability** consent". That is this type: a per-device grant list,
 //! stored next to the approval it refines.
@@ -36,8 +36,6 @@
 //! [`PermissionSet::grants_slot`] lets a test assert that against a slot no
 //! [`Permission`] variant occupies yet, without inventing a fake variant to
 //! prove it with.
-//!
-//! [`VISION.md`]: https://github.com/peerbeam/peerbeam/blob/main/docs/VISION.md
 
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;

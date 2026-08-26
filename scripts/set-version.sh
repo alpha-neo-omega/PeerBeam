@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Single-source the version across Rust + Flutter. Usage: set-version.sh [X.Y.Z]
+# Single-source the version across Rust, Flutter and packaging.
+# Usage: set-version.sh [X.Y.Z]
 # With no arg, syncs everything to the contents of ./VERSION.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,6 +14,16 @@ sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$VER\"/" rust/Car
 build="$(grep -m1 '^version:' flutter/pubspec.yaml | sed -E 's/.*\+([0-9]+).*/\1/')"
 [ "$build" = "$(grep -m1 '^version:' flutter/pubspec.yaml)" ] && build=1
 sed -i -E "s/^version: .*/version: $VER+$build/" flutter/pubspec.yaml
+
+# Arch package version (packaging/arch/PKGBUILD).
+#
+# `pkgver` is not just a label there: the `source=()` line builds both the
+# release tag it downloads (`.../download/v$pkgver/`) and the tarball name out
+# of it. A stale `pkgver` therefore does not fail — it quietly fetches and
+# installs an older release on a newer checkout, and `makepkg -si` reports
+# success. Nothing here used to touch it, so it sat at 0.8.0 through v0.9.0
+# and into v0.10.0 before anyone noticed.
+sed -i -E "s/^pkgver=[0-9]+\.[0-9]+\.[0-9]+/pkgver=$VER/" packaging/arch/PKGBUILD
 
 # Scaffold this version's release notes if they do not exist yet.
 #
@@ -55,3 +66,4 @@ fi
 echo "version set to $VER (flutter build $build)"
 grep -m1 '^version' rust/Cargo.toml
 grep -m1 '^version:' flutter/pubspec.yaml
+grep -m1 '^pkgver=' packaging/arch/PKGBUILD

@@ -103,7 +103,40 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let hostile = "; rm -rf ~ #.txt";
-        let reaper = run(script.to_str().unwrap(), hostile, "pb-bob").expect("spawned");
+        // **Retried, and it says why if it still fails.** `run` answers `None`
+        // for any spawn failure — which is right in production, where a hook
+        // that cannot start must not break a receive — but that makes a bare
+        // `expect("spawned")` a dead end here: the reason lives in a
+        // `tracing::warn!`, and a test binary installs no subscriber, so the one
+        // line explaining the failure goes nowhere. This test failed roughly
+        // once in twenty-five full-workspace runs and said only "spawned".
+        //
+        // Writing a script and immediately exec'ing it is a documented race in
+        // a multithreaded process: another thread's fork can still hold the
+        // write descriptor, and the exec then fails with `ETXTBSY`. It is
+        // transient by construction, so one retry settles it — and if something
+        // else is wrong, the OS error is in the panic instead of a guess.
+        let reaper = match run(script.to_str().unwrap(), hostile, "pb-bob") {
+            Some(reaper) => reaper,
+            None => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                run(script.to_str().unwrap(), hostile, "pb-bob").unwrap_or_else(|| {
+                    let why = std::process::Command::new(script.to_str().unwrap())
+                        .arg(hostile)
+                        .arg("pb-bob")
+                        .spawn()
+                        .err()
+                        .map_or_else(
+                            || {
+                                "a third attempt succeeded, so the failure was transient"
+                                    .to_string()
+                            },
+                            |e| format!("{e} (kind {:?}, errno {:?})", e.kind(), e.raw_os_error()),
+                        );
+                    panic!("the hook could not be spawned twice running: {why}");
+                })
+            }
+        };
         // **Waited on, not polled.** An earlier version slept in a loop for the
         // file to appear; under a full-workspace run a freshly spawned shell can
         // take far longer than it does alone, so the test failed intermittently

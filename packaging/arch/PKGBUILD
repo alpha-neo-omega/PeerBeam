@@ -7,7 +7,7 @@
 # Usage:
 #   cd packaging/arch && makepkg -si
 pkgname=peerbeam
-pkgver=0.8.0
+pkgver=0.10.0
 pkgrel=1
 pkgdesc="Zero-configuration, secure, cross-platform file & clipboard sharing"
 arch=('x86_64')

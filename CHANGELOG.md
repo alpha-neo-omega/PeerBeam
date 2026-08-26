@@ -6,8 +6,9 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
-Everything below landed **after** v0.9.0 was tagged and published. The v0.9.0
-downloads do not contain it; it ships in the next release.
+Nothing yet.
+
+## [0.10.0] - 2026-08-20
 
 ### Added
 - **Trust that runs out.** `peerbeam trust approve <device> --for 30m` (also
@@ -123,6 +124,100 @@ downloads do not contain it; it ships in the next release.
   and the app says the same rather than raising anything.
 
 ### Fixed
+- **A peer's paths could escape the folder you were syncing.** A rename's
+  destination comes off the wire, and `../../x` in it moved *your own* file
+  outside the shared folder; the same shape reached delete, and the delta-fetch
+  write path let peer-chosen bytes land at a peer-chosen absolute path. The
+  reassembly hash proves nothing there, because the peer supplied the map it is
+  checked against. All five sites now keep only real path components.
+- **A declared size was allocated before it was believed.** A chunk map's
+  claimed total went straight to a buffer allocation, so four chunks describing
+  a gigabyte each — a few hundred bytes on the wire — could abort the process
+  before any chunk was supplied or verified. It is refused against the same
+  ceiling the rest of the crate uses, and the buffer now grows from what has
+  actually arrived and hashed.
+- **A stale cache could silently undo a revocation.** Freshness was decided by
+  the time a device was trusted, and nothing that *narrows* a record changes
+  that time — not revoking a permission, not un-marking a device as yours. Two
+  copies therefore always compared equal, the local one always won, and a write
+  from a long-lived cache restored a permission you had just removed. Each
+  mutation now re-reads the record it is about to change.
+- **Windows was silently discarding files.** A folder containing `aux.h` — a
+  legal name on Linux — opened the Windows AUX *device* on the receiver: every
+  write succeeded, was discarded, and the transfer reported success with the file
+  counted. Reserved names, illegal characters and trailing dots or spaces are
+  rewritten rather than refused, because the sender is a Linux box with a legal
+  filename, not an attacker: `aux_.h` costs one character, refusing costs the
+  file.
+- **A colon killed an entire folder transfer.** `:` was rejected on every
+  platform and the receive loop turned that into an abort, so a Linux-to-Linux
+  send of a folder containing `service 14:30:02.log` lost every file behind it —
+  against the module's own documented policy of skipping rather than aborting.
+- **Receiving a file could delete the document it was named after.** Android's
+  publish step deleted any existing file of the peer-supplied name before
+  writing, defeating the no-clobber guarantee the engine enforces elsewhere:
+  receiving `taxes.pdf` destroyed your `taxes.pdf`. It now picks a free name,
+  including the awkward cases — `.gitignore` has no extension, and
+  `archive.tar.gz` becomes `archive.tar (1).gz`.
+- **A full disk reported success.** Flush and close errors were discarded, and a
+  buffered writer accepts every byte and only learns at flush that they had
+  nowhere to go — so a folder receive on a filling disk reported Completed with
+  every entry counted, leaving the sender free to delete its copy.
+- **Anyone who could reach the port could change your clipboard.** Inbound clips
+  were applied with no trust check at all — not `is_approved`, not the Clipboard
+  permission — while the permission the app offers to revoke governed only what
+  this device *sends*. Since first contact pins a stranger as known-but-not-
+  approved, completing a handshake was enough. Both directions are now gated, and
+  a refused clip is dropped and logged rather than failing the channel and taking
+  chat and transfers down with it.
+- **Approving a device did not always record it.** "Accept & Trust" ignored the
+  result of writing the decision, so a failed write left the device unapproved and
+  the next connection asked again, with nothing to say why.
+- **Sync could stop fetching, silently.** Each request opened a channel and none
+  closed one, so a session hit the channel limit and simply stopped after a few
+  hundred — and long conversations hit the same wall in chat. Channels are now
+  reused per lane and returned when done.
+- **A file sync could not delete stayed deleted anyway.** Every `remove_file`
+  error counted as success, so the file was indexed as gone while still on disk:
+  this device stopped offering a file it had, and no later scan put it back. A
+  permanent divergence, which is the one thing sync must never do quietly. A
+  file that was already absent still counts as deleted; anything else is logged
+  and left in the index.
+- **A peer could grow a queue without limit.** Refused channel opens were parked
+  until a stream arrived to pair with, so a peer that opened none added an entry
+  each and was told nothing — while two hot paths scanned that queue. Refusals are
+  now answered immediately and collapse into a count.
+- **Android.** Background receive is on by default and a timed-out foreground
+  service stops itself, as newer Android requires. The multicast lock follows
+  discovery rather than the notification, so turning the notification off no
+  longer kills mDNS. A device that reports its name as `localhost` — as Android
+  does, successfully — no longer shows up under that name. Battery-optimisation
+  and foreground-service starts that could throw are guarded rather than
+  swallowed.
+- **Two folders named `Documents` are both reachable.** Shares are given assigned
+  names, and `/` is addressable.
+- **One `formatBytes`, not two disagreeing by 1024-vs-1000** under the same label.
+  A peer-supplied version string is bounded at both ends, and a size filter that
+  cannot be parsed is refused instead of quietly becoming a catch-all.
+- **Every CLI request over a session leaked its channel.** Nothing in the CLI's
+  session paths closed a channel at all, and a session counts live channels
+  against a limit — so `sync` (one channel per file, plus one per batch of
+  chunks) simply stopped fetching part-way through a folder and said nothing
+  about why, and browse, pairing and notes drew from the same budget. A peer that
+  never accepted an open leaked one too.
+- **The CLI accepted a bandwidth ceiling and then ignored it.** `peerbeam config
+  set transfer.max_send_bytes_per_sec` wrote the value and every CLI send built
+  an unthrottled transfer anyway, with no warning — a setting that is accepted
+  and disregarded is worse than one that does not exist. It now applies to
+  `send`, folder sends and chat attachments.
+- **The CLI could not send a reply, and hid the ones it received.** Replies ship
+  this release, but `chat send` had no way to answer a message and `chat history`
+  printed a reply from the app as an ordinary message — which is the worst of the
+  options, because nothing about the output looks wrong: "sure, go ahead"
+  answering "shall I delete the backups?" and answering "can I borrow a pen?" are
+  the same seven characters. There is now `chat send --reply-to <MSG-ID>`,
+  `in_reply_to` under `--json`, and a quote line above a reply — including for a
+  reply whose original has since gone.
 - **A reconnect kept its channels only if it won a coin flip.** One transport
   loss is observed twice — the session's control link fails, *and* every channel
   actor's stream ends — and both were ready at the same moment in the pump's
@@ -144,6 +239,11 @@ downloads do not contain it; it ships in the next release.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A wrapped link quietly downgraded a graceful close.** The wrappers that add
+  framing and encryption did not forward `graceful_close`, so they inherited the
+  abrupt one — meaning a final frame written just before closing, including the
+  session's own `Shutdown`, could be discarded by the very call that exists to
+  deliver it.
 - **"connection lost" now says why.** quinn renders a lost connection as those two
   words and keeps the reason — timed out, reset by peer, closed by peer — only in
   the error's source, which was discarded. A transfer log that cannot tell a

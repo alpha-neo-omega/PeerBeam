@@ -44,12 +44,12 @@ use peerbeam_domain::entity::{Device, Direction, TransferSession, TransferStatus
 use peerbeam_domain::id::{DeviceId, TransferId};
 use peerbeam_domain::port::{ChannelTransport, EncryptionProvider, TrustStore};
 use peerbeam_domain::session::{
-    Capability, CapabilitySet, ChannelType, MessageFlags, MessageHandler, MessageType,
+    Capability, CapabilitySet, ChannelId, ChannelType, MessageFlags, MessageHandler, MessageType,
     CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
     CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
     PRESENCE_FEAT_STATUS,
 };
-use peerbeam_domain::session::{BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
+use peerbeam_domain::session::{SessionError, BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
 use peerbeam_presence::{PresenceHandler, PresenceSender, HEARTBEAT_INTERVAL};
 use peerbeam_transfer::{
@@ -233,18 +233,52 @@ pub struct Session {
 
 /// How long a pairing step waits. Generous: a person is reading digits off
 /// another screen and typing them, which is not a network round trip.
+/// Closes a channel however its scope ends.
+///
+/// Every request in this file opens a channel of its own, and `ChannelManager`
+/// counts live channels against `DEFAULT_CHANNEL_LIMIT`. A leak here is
+/// therefore not a slow drift but a hard stop part-way through a job: `sync`
+/// opens one channel per file *and* one per 64-chunk batch, so a folder of a
+/// couple of hundred files simply stopped fetching, and said nothing about why.
+/// Nothing in this file closed a channel at all.
+///
+/// `close_channel` is fire-and-forget over the session's command queue, so
+/// `Drop` can do it — which is what makes this safe to rely on, because most
+/// exits on these paths are `?`, `break` or an early `return` rather than the
+/// end of the function.
+struct ChannelGuard<'a> {
+    handle: &'a SessionHandle,
+    channel: ChannelId,
+}
+
+impl Drop for ChannelGuard<'_> {
+    fn drop(&mut self) {
+        self.handle.close_channel(self.channel);
+    }
+}
+
+/// Open a channel for one request and hand back the guard that closes it.
+///
+/// The guard is taken **before** the open is confirmed, so a peer that never
+/// accepts costs nothing either: the wait timing out used to leak the channel
+/// exactly as a completed request that forgot to close did.
+async fn open_guarded(
+    handle: &SessionHandle,
+    channel_type: ChannelType,
+) -> Result<(ChannelId, ChannelGuard<'_>), SessionError> {
+    let channel = handle.open_channel(channel_type).await?;
+    let lane = ChannelGuard { handle, channel };
+    handle
+        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+        .await?;
+    Ok((channel, lane))
+}
+
 const PAIRING_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Send a proof and wait for the verifier's answer: `(verified, attempts_left)`.
 pub async fn send_pairing_proof(session: &Session, proof: &[u8]) -> Option<(bool, u8)> {
-    let channel = session
-        .handle
-        .open_channel(ChannelType::PAIRING)
-        .await
-        .ok()?;
-    session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+    let (channel, _lane) = open_guarded(&session.handle, ChannelType::PAIRING)
         .await
         .ok()?;
     let msg = peerbeam_pairing::PairingMsg::Prove {
@@ -296,17 +330,9 @@ pub async fn await_pairing_proof(session: &Session) -> Option<Vec<u8>> {
 
 /// Tell the peer how its attempt went.
 pub async fn send_pairing_result(session: &Session, verified: bool, attempts_left: u8) {
-    let Ok(channel) = session.handle.open_channel(ChannelType::PAIRING).await else {
+    let Ok((channel, _lane)) = open_guarded(&session.handle, ChannelType::PAIRING).await else {
         return;
     };
-    if session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
-        .await
-        .is_err()
-    {
-        return;
-    }
     let msg = peerbeam_pairing::PairingMsg::Result {
         verified,
         attempts_left,
@@ -331,10 +357,7 @@ pub async fn request_chunk_map(
     path: &str,
 ) -> Option<peerbeam_sync::manifest_wire::ChunkMapResponse> {
     use tokio::time::{timeout, Duration};
-    let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
-    session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+    let (channel, _lane) = open_guarded(&session.handle, ChannelType::SYNC)
         .await
         .ok()?;
     let req = peerbeam_sync::manifest_wire::ChunkMapRequest {
@@ -367,17 +390,9 @@ pub async fn request_chunks(
     const BATCH: usize = 64;
     let mut out = std::collections::HashMap::new();
     for group in hashes.chunks(BATCH) {
-        let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
+        let Ok((channel, _lane)) = open_guarded(&session.handle, ChannelType::SYNC).await else {
             break;
         };
-        if session
-            .handle
-            .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
-            .await
-            .is_err()
-        {
-            break;
-        }
         let req = peerbeam_sync::manifest_wire::ChunkRequest {
             path: path.to_string(),
             hashes: group.to_vec(),
@@ -417,10 +432,7 @@ pub async fn request_chunks(
 pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_sync::Manifest> {
     use tokio::time::{timeout, Duration};
 
-    let channel = session.handle.open_channel(ChannelType::SYNC).await.ok()?;
-    session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+    let (channel, _lane) = open_guarded(&session.handle, ChannelType::SYNC)
         .await
         .ok()?;
     let req = peerbeam_sync::ManifestRequest {
@@ -450,17 +462,9 @@ pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_
 /// Ask a peer to send one file it shares. Fire-and-forget: the bytes arrive as
 /// an ordinary inbound transfer.
 pub async fn request_file(session: &Session, path: &str) -> bool {
-    let Ok(channel) = session.handle.open_channel(ChannelType::SYNC).await else {
+    let Ok((channel, _lane)) = open_guarded(&session.handle, ChannelType::SYNC).await else {
         return false;
     };
-    if session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
-        .await
-        .is_err()
-    {
-        return false;
-    }
     let req = peerbeam_sync::FileRequest {
         path: path.to_string(),
     };
@@ -491,14 +495,7 @@ pub async fn request_listing(
 ) -> Option<peerbeam_browse::ListResponse> {
     use tokio::time::{timeout, Duration};
 
-    let channel = session
-        .handle
-        .open_channel(ChannelType::BROWSE)
-        .await
-        .ok()?;
-    session
-        .handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+    let (channel, _lane) = open_guarded(&session.handle, ChannelType::BROWSE)
         .await
         .ok()?;
     let req = peerbeam_browse::ListRequest::new(path);
@@ -530,12 +527,7 @@ pub async fn send_note_batches(
     handle: &SessionHandle,
     batches: &[peerbeam_notes::NoteBatch],
 ) -> Result<(), CliError> {
-    let channel = handle
-        .open_channel(ChannelType::NOTES)
-        .await
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    handle
-        .await_channel_open(channel, CHANNEL_OPEN_BUDGET)
+    let (channel, _lane) = open_guarded(handle, ChannelType::NOTES)
         .await
         .map_err(|e| CliError::Other(e.to_string()))?;
     for b in batches {

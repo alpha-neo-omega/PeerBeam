@@ -119,11 +119,17 @@ pub async fn receive_file_recover(
                 // and verified. Delivery is the receiver's obligation, so wait
                 // (bounded) for it before letting the link go.
                 //
-                // Success only: a failed receive is followed by a reconnect, and
-                // there is nothing left worth delivering to delay it.
-                if received.is_ok() {
-                    let _ = link.graceful_close().await;
-                }
+                // **Unconditional, and the failure path is the one that proves
+                // why.** A checksum mismatch also writes a verdict — `Verify {
+                // ok: false }` — and *then* returns `Err`, so a success-only
+                // wait discarded exactly the answer the sender was blocked on.
+                // The sender saw a lost connection instead of "checksum
+                // mismatch", and a lost connection is retryable where a
+                // mismatch is not: it would resend a corrupt transfer instead
+                // of reporting it. The wait is bounded and a dead peer resolves
+                // it early, so the cost on a genuinely broken link is not the
+                // full budget.
+                let _ = link.graceful_close().await;
                 received
             }
             Err(e) => Err(e),

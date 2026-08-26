@@ -279,6 +279,18 @@ pub async fn send_folder(
                 break;
             }
             buf.truncate(n);
+
+            // Metered exactly as the single-file loop is, and for the same
+            // reason: after the read and before the wire, charged for the bytes
+            // actually read. Without this the configured ceiling applied to
+            // `send file` and silently did nothing for `send folder/` — which is
+            // the case somebody sets a ceiling *for*, a large thing going out
+            // over a link other people are using. Zero-cost when unlimited.
+            let wait = ctrl.throttle(n as u64);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+
             send_with_retry(link, chunk_frame_owned(Bytes::from(buf)), retries).await?;
             done += n as u64;
             emit(

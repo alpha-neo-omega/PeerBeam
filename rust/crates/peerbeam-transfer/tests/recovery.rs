@@ -61,6 +61,9 @@ struct ClosingLink {
     inner: MemLink,
     graceful: Arc<AtomicU64>,
     abrupt: Arc<AtomicU64>,
+    /// Flip one byte of the first data chunk that arrives, so the receiver's
+    /// whole-file hash cannot match and it takes its integrity-failure path.
+    corrupt: bool,
 }
 
 #[async_trait]
@@ -69,7 +72,19 @@ impl Link for ClosingLink {
         self.inner.send_frame(frame).await
     }
     async fn recv_frame(&mut self) -> Result<Option<Frame>> {
-        self.inner.recv_frame().await
+        let got = self.inner.recv_frame().await?;
+        match got {
+            Some(f) if self.corrupt && f.kind == FrameKind::Chunk && !f.payload.is_empty() => {
+                self.corrupt = false;
+                let mut bytes = f.payload.to_vec();
+                bytes[0] ^= 0xff;
+                Ok(Some(Frame {
+                    kind: f.kind,
+                    payload: bytes.into(),
+                }))
+            }
+            other => Ok(other),
+        }
     }
     async fn close(&mut self) -> Result<()> {
         self.abrupt.fetch_add(1, Ordering::SeqCst);
@@ -274,6 +289,7 @@ async fn a_successful_receive_closes_its_link_gracefully() {
         inner: b,
         graceful: graceful.clone(),
         abrupt: abrupt.clone(),
+        corrupt: false,
     });
     let shared = Arc::new(Mutex::new(Shared {
         send_fails: 0,
@@ -327,4 +343,82 @@ async fn a_successful_receive_closes_its_link_gracefully() {
         0,
         "an abrupt close discards the verdict on transports that buffer"
     );
+}
+
+/// **The failing path is the one that proves the wait must be unconditional.**
+/// A checksum mismatch writes `Verify { ok: false }` and *then* returns `Err`,
+/// so waiting only on success discarded exactly the answer the sender was
+/// blocked on — it saw a lost connection instead, which is retryable where a
+/// mismatch is not, and would resend a corrupt transfer rather than report it.
+#[tokio::test]
+async fn a_failed_receive_still_delivers_its_verdict() {
+    let graceful = Arc::new(AtomicU64::new(0));
+    let abrupt = Arc::new(AtomicU64::new(0));
+    let bytes = pattern(64 * 1024);
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("c.bin");
+    std::fs::write(&src, &bytes).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let (a, b) = MemLink::pair(8);
+    let recv_link: Box<dyn Link> = Box::new(ClosingLink {
+        inner: b,
+        graceful: graceful.clone(),
+        abrupt: abrupt.clone(),
+        corrupt: true,
+    });
+    let shared = Arc::new(Mutex::new(Shared {
+        send_fails: 0,
+        recv_fails: 0,
+        made: true,
+        la: Some(Box::new(a)),
+        lb: Some(recv_link),
+        sent: Arc::new(AtomicU64::new(0)),
+    }));
+    let mut sf = SendFactory(shared.clone());
+    let mut rf = RecvFactory(shared.clone());
+
+    let storage = FsStorage::new();
+    let reliability = FsReliability::new(dir.path().join("checkpoints"));
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    tokio::spawn(async move { while prx.recv().await.is_some() {} });
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let req = SendRequest {
+        transfer_id: "corrupt-1".into(),
+        name: "c.bin".into(),
+        path: src.to_string_lossy().into_owned(),
+        size: bytes.len() as u64,
+        chunk_size: 8 * 1024,
+    };
+
+    let send = send_file_recover(
+        &mut sf,
+        &storage,
+        &reliability,
+        req,
+        checkpoint("corrupt-1"),
+        &cs,
+        &ptx,
+        1,
+        1,
+    );
+    let out_str = out.to_string_lossy().into_owned();
+    let recv = receive_file_recover(&mut rf, &storage, &out_str, &cr, &ptx, 1);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    assert!(rr.is_err(), "a corrupted chunk must fail the receive");
+    assert_eq!(
+        graceful.load(Ordering::SeqCst),
+        1,
+        "the mismatch verdict was thrown away with the link"
+    );
+    // The sender must learn it was a mismatch, not a broken pipe: a mismatch is
+    // final, a broken pipe invites a retry of the same corrupt bytes.
+    match rs {
+        Err(DomainError::Integrity(_)) => {}
+        other => panic!("sender should report an integrity failure, got {other:?}"),
+    }
 }

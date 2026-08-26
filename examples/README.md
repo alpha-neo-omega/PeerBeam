@@ -2,25 +2,24 @@
 
 Runnable and copy-paste examples for embedding and driving PeerBeam.
 
-## Runnable Rust example
+## Runnable end-to-end transfer
 
-**`quic_transfer`** — a complete file transfer over the real QUIC transport in
-a single process: bind → serve/dial → mutual authentication → `SecureLink` →
-`send_file`/`receive_file`, byte-exact. This is the fastest way to understand
-the transfer API.
+There is no single-process `examples/` binary. The `quic_transfer` example was
+retired once both frontends moved onto PeerSession: it demonstrated the direct
+`authenticate` → `SecureLink` → `send_file` composition, which is no longer how
+a transfer is executed, and an example that teaches the wrong path is worse than
+none.
 
-Source: [`rust/bins/peerbeam-cli/examples/quic_transfer.rs`](../rust/bins/peerbeam-cli/examples/quic_transfer.rs)
+What replaces it is a test, because the honest demonstration needs **two**
+processes: `transfer_e2e` runs a real `peerbeam` sender and receiver over QUIC,
+mutually authenticated, and compares the received bytes. It is the fastest way
+to see the transfer path end to end.
+
+Source: [`rust/bins/peerbeam-cli/tests/transfer_e2e.rs`](../rust/bins/peerbeam-cli/tests/transfer_e2e.rs)
 
 ```bash
 cd rust
-cargo run --example quic_transfer -p peerbeam-cli
-# received hello.txt (30 bytes) → /tmp/pb-example-<pid>/out/hello.txt
-```
-
-Verify it compiles as part of the merge gate:
-
-```bash
-cd rust && cargo build --examples
+cargo test -p peerbeam-cli --test transfer_e2e
 ```
 
 ## FFI init (C ABI)

@@ -5,9 +5,14 @@ CLI, anything you build) construct an `Engine` from providers and drive it.
 This document is the embedding guide. For the layering behind it see
 [Architecture](ARCHITECTURE.md).
 
-> Versioning: the workspace is `0.2.x` and pre-1.0 — the API may change between
-> minor versions. Crates are path/workspace members today; they are not yet
-> published to crates.io.
+> Versioning: every crate in the workspace shares one version, and the
+> [`VERSION`](../VERSION) file is where it lives — see
+> [BUILD.md](BUILD.md#version) for how `rust/Cargo.toml` and the pubspec are
+> synced from it. It is deliberately not restated here: this note still claimed
+> `0.2.x` at 0.10.0, which is what a version number copied into prose does. The
+> workspace is pre-1.0, so the API may change between minor versions;
+> [CHANGELOG.md](../CHANGELOG.md) is where each release says what moved. Crates
+> are path/workspace members today; they are not yet published to crates.io.
 
 ## The building blocks
 

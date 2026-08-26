@@ -89,6 +89,15 @@ impl Link for SecureLink<'_> {
     async fn close(&mut self) -> Result<()> {
         self.inner.close().await
     }
+
+    /// Forwarded, not inherited. The trait's default `graceful_close` calls
+    /// `close`, which here is the **abrupt** close — so a wrapper that did not
+    /// forward this silently downgraded every caller that asked for delivery of
+    /// a final frame, including the session's own `Shutdown`. The wrapper adds
+    /// framing, not a close policy.
+    async fn graceful_close(&mut self) -> Result<()> {
+        self.inner.graceful_close().await
+    }
 }
 
 /// Serialize a frame as `[kind tag byte] || payload`. Shared with the session

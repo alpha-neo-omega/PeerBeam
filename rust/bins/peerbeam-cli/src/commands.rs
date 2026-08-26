@@ -1357,7 +1357,7 @@ async fn secure_send_folder(
     }
 
     let (ptx, mut prx) = mpsc::unbounded_channel();
-    let ctrl = TransferControl::new();
+    let ctrl = sc.control();
     let req = FolderSendRequest {
         transfer_id: name.to_string(),
         root_path: path.to_string(),
@@ -1553,9 +1553,34 @@ pub struct SecureCtx {
     pub enc: Arc<AeadCrypto>,
     pub trust: Arc<FsTrust>,
     pub ident: Identity,
+    /// `transfer.max_send_bytes_per_sec`, carried here because every send path
+    /// already takes a `SecureCtx` and none of them took a config.
+    pub send_limit: u64,
+}
+
+/// A `TransferControl` that honours a configured send ceiling.
+///
+/// **Separate from `TransferControl::new()` on purpose.** The ceiling was
+/// readable, writable and documented — `peerbeam config set
+/// transfer.max_send_bytes_per_sec` accepted it — and then every CLI send built
+/// a fresh unlimited control and ignored it, with no warning. A setting that is
+/// accepted and silently disregarded is worse than one that does not exist, and
+/// I7 does not allow a capability that works only in the app.
+///
+/// Zero means unlimited, which is what `TransferControl::new()` already starts
+/// as, so the call is harmless when nothing is configured.
+pub(crate) fn limited_control(bytes_per_sec: u64) -> TransferControl {
+    let ctrl = TransferControl::new();
+    ctrl.set_rate_limit(bytes_per_sec);
+    ctrl
 }
 
 impl SecureCtx {
+    /// A send-side control that honours this device's configured ceiling.
+    pub(crate) fn control(&self) -> TransferControl {
+        limited_control(self.send_limit)
+    }
+
     pub(crate) fn build(config: &EngineConfig) -> Result<Self, CliError> {
         let enc = AeadCrypto::new();
         let identity_path =
@@ -1569,6 +1594,7 @@ impl SecureCtx {
             enc: Arc::new(enc),
             trust: Arc::new(open_trust(config)?),
             ident,
+            send_limit: config.transfer.max_send_bytes_per_sec,
         })
     }
 }
@@ -1758,7 +1784,7 @@ pub(crate) async fn secure_send_file(
 
     let (ptx, mut prx) = mpsc::unbounded_channel();
     let bar = ctx.bar(size, name);
-    let ctrl = TransferControl::new();
+    let ctrl = sc.control();
     let req = SendRequest {
         transfer_id: transfer_id.unwrap_or(name).to_string(),
         name: name.to_string(),
@@ -3819,6 +3845,55 @@ mod scheduled_send_tests {
             msg.contains("HH:MM"),
             "the error did not name a format: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_ceiling_tests {
+    //! `transfer.max_send_bytes_per_sec` reaching the CLI's transfers.
+
+    use super::{limited_control, SecureCtx};
+    use peerbeam_config::EngineConfig;
+
+    /// **The setting was accepted and then ignored.** `peerbeam config set
+    /// transfer.max_send_bytes_per_sec` wrote the value and every CLI send built
+    /// a fresh unlimited control, with no warning — worse than an absent
+    /// setting, and an I7 violation for a headless-first project.
+    #[test]
+    fn a_configured_ceiling_reaches_the_transfer_control() {
+        const MB: u64 = 1_000_000;
+        let ctrl = limited_control(MB);
+        assert_eq!(ctrl.rate_limit(), MB);
+        // The first call is free: the bucket credits up to a second of idle
+        // time, which is what makes the figure an average rather than a cadence.
+        // Spend that burst, then the next second's worth must wait.
+        let _burst = ctrl.throttle(MB);
+        assert!(
+            ctrl.throttle(MB).as_millis() > 0,
+            "a ceiling that never delays anything is not a ceiling"
+        );
+    }
+
+    /// Zero stays unlimited: a limit nobody asked for is a slow transfer nobody
+    /// can explain.
+    #[test]
+    fn no_ceiling_means_no_throttle() {
+        assert_eq!(limited_control(0).rate_limit(), 0);
+        assert_eq!(limited_control(0).throttle(64 * 1024).as_nanos(), 0);
+    }
+
+    /// And it is read from the config rather than defaulted, wherever a send
+    /// path picks up its `SecureCtx`.
+    #[test]
+    fn secure_ctx_carries_the_configured_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = EngineConfig::default();
+        config.storage.data_directory = dir.path().to_string_lossy().into_owned();
+        config.transfer.max_send_bytes_per_sec = 250_000;
+
+        let sc = SecureCtx::build(&config).expect("build");
+        assert_eq!(sc.send_limit, 250_000);
+        assert_eq!(sc.control().rate_limit(), 250_000);
     }
 }
 

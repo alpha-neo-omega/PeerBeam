@@ -856,8 +856,21 @@ impl PeerSession {
         channels: &[(ChannelId, ChannelType)],
     ) -> Result<(), SessionError> {
         for &(id, channel_type) in channels {
-            let msg = self.manager.reopen_channel(id, channel_type).await?;
-            self.control_out.push_back(msg);
+            // **Skip, never abort.** One channel that cannot be re-opened is one
+            // capability that has to re-establish itself; propagating the error
+            // instead failed the whole resume, and `recovery` treats that as
+            // transient and retries it — against an unchanged channel list, so
+            // every attempt failed the same way until recovery gave up. A
+            // session that could have come back with most of its channels was
+            // lost entirely for one of them.
+            match self.manager.reopen_channel(id, channel_type).await {
+                Ok(msg) => self.control_out.push_back(msg),
+                Err(e) => tracing::warn!(
+                    channel = id.get(),
+                    error = %e,
+                    "channel not re-attached after resume"
+                ),
+            }
         }
         Ok(())
     }
@@ -922,6 +935,11 @@ impl PeerSession {
                 }
                 Wake::Control(Ok(Some(frame))) => {
                     self.keepalive.on_activity(Instant::now());
+                    // A frame arrived, so the transport is alive — which is the
+                    // one thing that tells an actor that died with the transport
+                    // apart from one that died on its own. See
+                    // `ChannelManager::confirm_link_alive`.
+                    self.manager.confirm_link_alive();
                     if self.route_control(&frame) == Flow::Closed {
                         return Ok(RunExit::Closed);
                     }

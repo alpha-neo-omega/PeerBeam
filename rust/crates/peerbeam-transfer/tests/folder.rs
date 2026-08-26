@@ -341,3 +341,64 @@ async fn cancel_interrupts_parked_receive() {
     assert_eq!(rr.unwrap().outcome, TransferOutcome::Cancelled);
     send_task.abort();
 }
+
+/// **A ceiling must apply to a folder too.** The throttle lived only in the
+/// single-file loop, so `transfer.max_send_bytes_per_sec` metered `send file`
+/// and did nothing at all for `send folder/` — which is the case somebody sets a
+/// ceiling *for*: a large thing going out over a link other people are using.
+/// A configured ceiling that silently does not apply is worse than none, because
+/// the number is right there in the config saying it does.
+///
+/// Asserted as "the send took time", not as a rate: a rate assertion on a shared
+/// CI box measures the box. The bucket banks one second of credit, so the first
+/// second's worth is free and everything past it must wait.
+#[tokio::test]
+async fn a_send_ceiling_slows_a_folder_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("big");
+    std::fs::create_dir_all(&root).unwrap();
+    // Two files, comfortably past one second of credit at the ceiling below.
+    std::fs::write(root.join("a.bin"), vec![7u8; 300 * 1024]).unwrap();
+    std::fs::write(root.join("b.bin"), vec![9u8; 300 * 1024]).unwrap();
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    // 200 KiB/s against ~600 KiB of payload: about two seconds of waiting once
+    // the first second's credit is spent.
+    cs.set_rate_limit(200 * 1024);
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let started = std::time::Instant::now();
+    let send = send_folder(
+        &mut la,
+        &storage,
+        FolderSendRequest {
+            transfer_id: "throttled-1".into(),
+            root_path: root.to_string_lossy().into_owned(),
+            chunk_size: 64 * 1024,
+        },
+        &cs,
+        &ptx,
+        3,
+    );
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let (rs, rr) = tokio::join!(send, recv);
+    let elapsed = started.elapsed();
+
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "a folder send ignored the ceiling: finished in {elapsed:?}"
+    );
+    // And it still arrived whole — a throttle that dropped bytes would be a
+    // worse bug than the one it fixes.
+    assert_eq!(
+        std::fs::read(out.join("big").join("a.bin")).unwrap().len(),
+        300 * 1024
+    );
+}

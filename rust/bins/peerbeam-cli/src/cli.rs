@@ -306,6 +306,14 @@ pub enum ChatAction {
         /// unreachable peer is queued, not an error.
         #[arg(long, value_name = "PATH", conflicts_with = "text")]
         file: Option<String>,
+        /// Answer an earlier message, by its id from `chat history`.
+        ///
+        /// The peer sees which message this answers. If that message has since
+        /// gone — deleted, or its retention window closed — the reply still
+        /// arrives and is shown as answering something no longer there, never as
+        /// an ordinary message.
+        #[arg(long, value_name = "MSG-ID", conflicts_with = "file")]
+        reply_to: Option<String>,
     },
     /// Call off a file we are sharing: drop it from the queue and delete the
     /// copy the outbox made of it.

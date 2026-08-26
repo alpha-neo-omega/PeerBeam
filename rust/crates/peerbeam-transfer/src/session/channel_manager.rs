@@ -144,6 +144,9 @@ pub struct ChannelManager {
     // Channels the application has been told it has and has not been told it
     // lost: the set to re-attach on resume. See `reattachable_channels`.
     resumable: BTreeMap<ChannelId, ChannelType>,
+    // Channels whose actor died, awaiting proof of which death it was. See
+    // `confirm_link_alive`.
+    pending_forget: Vec<ChannelId>,
 }
 
 impl ChannelManager {
@@ -181,6 +184,7 @@ impl ChannelManager {
             pending_opens: VecDeque::new(),
             pending_streams: VecDeque::new(),
             resumable: BTreeMap::new(),
+            pending_forget: Vec::new(),
         }
     }
 
@@ -609,6 +613,19 @@ impl ChannelManager {
     /// silently fails to come back after a reconnect, which is not visible in
     /// any single-connection test.
     fn announce_open(&mut self, channel: ChannelId, channel_type: ChannelType) {
+        // A second bound, independent of `confirm_link_alive`: the record can
+        // never describe more channels than a session is allowed to hold, so no
+        // sequence of events can make resume ask for more than `permit` grants.
+        // Dropping the *oldest* is the right end to lose — re-attachment exists
+        // for channels still in use, and the ones a peer abandoned are the ones
+        // that stopped being touched.
+        while self.resumable.len() >= self.limit {
+            let Some(oldest) = self.resumable.keys().next().copied() else {
+                break;
+            };
+            self.resumable.remove(&oldest);
+            self.pending_forget.retain(|c| *c != oldest);
+        }
         self.resumable.insert(channel, channel_type);
         self.emit(ChannelEvent::Opened {
             channel,
@@ -625,6 +642,45 @@ impl ChannelManager {
     /// would leave the record behind to be re-attached on some later reconnect.
     fn forget_resumable(&mut self, channel: ChannelId) {
         self.resumable.remove(&channel);
+        self.pending_forget.retain(|c| *c != channel);
+    }
+
+    /// Note that a channel's actor died, without yet deciding what that meant.
+    ///
+    /// An actor dies when its stream ends, and that has two causes which look
+    /// identical from here: the whole transport went, or this one channel ended
+    /// while the session carries on. Only the first should survive into
+    /// [`reattachable_channels`], and which it was becomes knowable a moment
+    /// later — see [`confirm_link_alive`](ChannelManager::confirm_link_alive).
+    fn park_forget(&mut self, channel: ChannelId) {
+        if !self.pending_forget.contains(&channel) {
+            self.pending_forget.push(channel);
+        }
+    }
+
+    /// The control link just carried a frame, so the transport is alive — and
+    /// every actor that died before this frame died for its own reasons, not
+    /// with the transport. Stop offering those for re-attachment.
+    ///
+    /// **This is what bounds `resumable`.** Keeping an actor-closed channel
+    /// unconditionally was unbounded and peer-driven: a peer that opens a
+    /// channel and finishes only its stream — or any message handler returning
+    /// an error, which a malformed frame is enough to cause — left an entry
+    /// behind for ever while `permit` freed the slot, so nothing pushed back.
+    /// Past the channel limit, resume then tried to re-open more channels than
+    /// it is allowed and failed identically on every attempt until recovery gave
+    /// up: a session that would have resumed cleanly became unrecoverable, from
+    /// a few hundred cheap opens.
+    ///
+    /// A transport loss cannot be mistaken for this, because it stops frames
+    /// arriving: `capture_loss` snapshots what is still parked, and parked is
+    /// where a genuinely lost channel sits. The window is one frame wide, and a
+    /// peer's own `ChannelOpen` is a frame — so the queue does not grow even
+    /// while it is being driven.
+    pub fn confirm_link_alive(&mut self) {
+        for channel in std::mem::take(&mut self.pending_forget) {
+            self.resumable.remove(&channel);
+        }
     }
 
     /// Handle a peer `ChannelReject`: drop the pending channel.
@@ -689,12 +745,14 @@ impl ChannelManager {
         match event {
             ActorEvent::Closed { channel } => {
                 if self.channels.remove(&channel).is_some() {
+                    self.park_forget(channel);
                     self.emit(ChannelEvent::Closed { channel });
                 }
                 Vec::new()
             }
             ActorEvent::Errored { channel, detail } => {
                 if self.channels.remove(&channel).is_some() {
+                    self.park_forget(channel);
                     self.emit(ChannelEvent::Error {
                         channel,
                         detail: detail.clone(),
@@ -741,6 +799,7 @@ impl ChannelManager {
         // for good, or `capture_loss` tearing down dead actors *after* it has
         // already snapshotted this set.
         self.resumable.clear();
+        self.pending_forget.clear();
     }
 }
 
@@ -1033,6 +1092,77 @@ mod resume_set_tests {
     /// A close that arrives *after* the local actor already noticed the stream
     /// end — the routine order over a real transport, and the reason
     /// `forget_resumable` is not guarded on the channel still being live.
+    /// **What bounds the set.** An actor-observed close is kept only until the
+    /// control link proves it is still alive; a peer that opens channels and
+    /// abandons their streams therefore cannot accumulate entries. Unbounded,
+    /// this reached 2000 entries from 2000 cheap opens while `permit` never once
+    /// bit, and past the channel limit resume then asked for more channels than
+    /// it is allowed and failed identically every attempt until recovery gave
+    /// up — a session that would have resumed cleanly became unrecoverable.
+    #[tokio::test]
+    async fn abandoned_opens_cannot_grow_the_resume_set() {
+        let (mut m, events) = manager(DEFAULT_CHANNEL_LIMIT);
+        std::mem::forget(events);
+
+        for i in 1..=2_000u64 {
+            let channel = ChannelId::new(i * 2);
+            // A peer's own open is a frame on the control link, which is exactly
+            // the proof `confirm_link_alive` waits for — so driving this attack
+            // is what keeps clearing the queue behind it.
+            m.confirm_link_alive();
+            m.handle_channel_open(channel, OK_TYPE);
+            m.on_stream_accepted(Box::new(DeadLink));
+            m.on_actor_event(ActorEvent::Closed { channel });
+        }
+
+        assert!(
+            m.resumable.len() <= 1,
+            "abandoned opens accumulated: {} entries",
+            m.resumable.len()
+        );
+        assert_eq!(m.channel_count(), 0, "no channel should still be live");
+    }
+
+    /// The record can never describe more channels than a session may hold, so
+    /// no ordering of events can make resume ask `permit` for more than it
+    /// grants. A second bound, independent of the first.
+    #[tokio::test]
+    async fn the_resume_set_never_exceeds_the_channel_limit() {
+        const LIMIT: usize = 8;
+        let (mut m, events) = manager(LIMIT);
+        std::mem::forget(events);
+
+        for i in 1..=200u64 {
+            let channel = ChannelId::new(i * 2);
+            m.handle_channel_open(channel, OK_TYPE);
+            m.on_stream_accepted(Box::new(DeadLink));
+            m.on_actor_event(ActorEvent::Closed { channel });
+        }
+
+        assert!(
+            m.resumable.len() <= LIMIT,
+            "resume set holds {} entries for a limit of {LIMIT}",
+            m.resumable.len()
+        );
+    }
+
+    /// The window is one frame wide, and closing it must not cancel the fix it
+    /// exists inside: a channel whose actor died with the transport is still
+    /// re-attached, because no frame arrives after the transport is gone.
+    #[tokio::test]
+    async fn a_channel_parked_before_the_link_went_quiet_is_still_re_attached() {
+        let (mut m, channel) = with_one_open_channel().await;
+
+        m.on_actor_event(ActorEvent::Closed { channel });
+        // No `confirm_link_alive`: this is the transport-loss case.
+
+        assert_eq!(
+            m.reattachable_channels(),
+            vec![(channel, OK_TYPE)],
+            "a transport loss must still re-attach what it took down"
+        );
+    }
+
     #[tokio::test]
     async fn a_close_arriving_after_the_actor_died_is_still_final() {
         let (mut m, channel) = with_one_open_channel().await;

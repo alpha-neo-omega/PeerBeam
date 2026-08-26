@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.9.0+15
+version: 0.10.0+16
 
 environment:
   sdk: ^3.12.1
@@ -87,7 +87,13 @@ msix_config:
   # (self-signed or CA) — see docs/RELEASE.md → "Signing a Windows build".
   publisher: CN=PeerBeam Contributors
   identity_name: com.peerbeam.peerbeam
-  msix_version: 0.3.0.0
+  # No `msix_version` on purpose: with the key absent the msix tool derives
+  # `major.minor.patch.0` from `version:` above, so the installer version
+  # follows the release for free. An explicit value is a second place to
+  # remember, and remembering it is exactly what stopped happening: it tracked
+  # every release up to 0.3.0, then sat at 0.3.0.0 through nine tagged releases
+  # into v0.10.0 — Windows sees no version change, so an in-place upgrade of
+  # the MSIX is a no-op.
   logo_path: ../packaging/windows/peerbeam.png
   capabilities: "internetClient,privateNetworkClientServer"
   install_certificate: false

@@ -86,7 +86,9 @@ the features.
   login — ever. A self-hostable relay may exist, but only as an optional,
   untrusted, last-resort route (invariant I3/I5).
 - **Not a surveillance surface.** No analytics, telemetry, tracking, or
-  phone-home, in any build (I4).
+  phone-home, in any build (I4) — narrowed once, by
+  [A1](#a1--a-user-initiated-release-check-2026-08-20), for a release check that
+  happens only when a person asks for it.
 - **Not a social platform.** No hub-brokered group chat, feeds, discovery of
   strangers, or public rooms. Communication is between **trusted** peers (I3/I6).
 - **Not a remote-control tool.** PeerBeam is not TeamViewer. Remote capabilities
@@ -111,7 +113,23 @@ redesign before writing code — or propose an amendment.
 
 ## Amendments
 
-*None.*
+### A1 — A user-initiated release check (2026-08-20)
+
+**Non-goal narrowed:** *"Not a surveillance surface."*
+
+**Date:** 2026-08-20.
+
+**Rationale.** A release check contacts a vendor-designated server, and read
+plainly "phone-home" covers it. It is permitted only when a person asks for it —
+`peerbeam check-updates`, or the button in About — never on a timer, at startup,
+or in the background, and it sends no identifier of any kind. The full reasoning
+and the six binding conditions are recorded once, in
+[ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#a1--a-user-initiated-release-check-narrowly-permitted-2026-08-20),
+against invariant I4; this entry exists because the amendment narrows this
+document too, and a non-goal that still read as absolute would be a published
+claim the shipped build makes false.
+
+**Approval:** granted with the feature it accompanies (v0.10.0).
 
 <!--
 Future amendments must include:

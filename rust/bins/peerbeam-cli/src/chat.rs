@@ -75,8 +75,9 @@ pub async fn chat(ctx: &Ctx, action: ChatAction, path_override: Option<&str>) ->
             addr,
             text,
             file,
+            reply_to,
         } => match (text, file) {
-            (Some(text), None) => send(ctx, to, addr, text, path_override).await,
+            (Some(text), None) => send(ctx, to, addr, text, reply_to, path_override).await,
             (None, Some(path)) => send_file(ctx, to, addr, path, path_override).await,
             (Some(_), Some(_)) => Err(CliError::Usage(
                 "provide either message text or --file, not both".into(),
@@ -372,6 +373,7 @@ async fn send(
     to: Option<String>,
     addr: Option<String>,
     text: String,
+    reply_to: Option<String>,
     path_override: Option<&str>,
 ) -> CliResult {
     let config = commands::load_config(path_override)?;
@@ -426,7 +428,8 @@ async fn send(
     // target here, and of the *authenticated* peer again after the dial — the
     // same predicate both times, so the two can never disagree.
     permit_chat(&sc.trust, &target.id)?;
-    let msg = peerbeam_chat::ChatMessage::new(&text).map_err(CliError::from)?;
+    let msg =
+        peerbeam_chat::ChatMessage::replying(&text, reply_to.as_deref()).map_err(CliError::from)?;
     store.enqueue(&target.id, &msg).map_err(CliError::from)?;
     let id = msg.id.clone();
 
@@ -824,7 +827,10 @@ async fn send_file(
     let store = commands::chat_store(&config, &sc.enc, &sc.ident);
     let staging = commands::staging_store(&config);
     let limits = commands::staging_limits(&config);
-    let ctrl = TransferControl::new();
+    // Honours `transfer.max_send_bytes_per_sec`: a chat attachment is a transfer
+    // like any other, and a ceiling that applied to `send` but not to this one
+    // would be a ceiling nobody could reason about.
+    let ctrl = sc.control();
 
     // Validate the path and persist the row BEFORE any copy or network work — a
     // refused path (missing, a directory, a bad name) leaves no row, copies
@@ -1045,7 +1051,8 @@ pub async fn snippet(
         format!("{title}{body}")
     };
 
-    send(ctx, Some(args.to), None, text, path_override).await
+    // Never a reply: this is a note being shared, not an answer to anything.
+    send(ctx, Some(args.to), None, text, None, path_override).await
 }
 
 /// `peerbeam chat react <PEER> <ID> <EMOJI> [--remove]`.
@@ -1639,7 +1646,16 @@ async fn history(
         ctx.line(&ctx.dim("no messages yet"));
         return Ok(());
     }
-    for r in &records {
+    // Resolved against the rows being shown, so a quote can only cite a message
+    // that is actually on screen — and a reply whose parent is not gets the
+    // "no longer here" marker rather than passing as an ordinary message. The
+    // chat crate's own doc calls dropping the marker the worst of the options,
+    // because nothing about the result looks wrong.
+    let contexts = peerbeam_chat::resolve_replies(&records);
+    for (r, reply) in records.iter().zip(contexts.iter()) {
+        if let Some(quote) = reply_prefix(reply) {
+            ctx.line(&ctx.dim(&quote));
+        }
         match (&r.kind, &r.file) {
             (Kind::File, Some(file)) => ctx.line(&render_file_line(r, file)),
             _ => {
@@ -1880,6 +1896,27 @@ async fn resolve_history_peer(
     }
 }
 
+/// The quote line to print above a reply, or `None` for an ordinary message.
+///
+/// Two cases, and the second is the one worth having: a reply whose parent this
+/// device no longer holds says so. The preview is what is *stored*, cut to
+/// [`PREVIEW_CHARS`](peerbeam_chat::PREVIEW_CHARS) by the resolver with nothing
+/// added, so this only wraps it.
+fn reply_prefix(reply: &peerbeam_chat::ReplyContext) -> Option<String> {
+    use peerbeam_chat::ReplyContext;
+    match reply {
+        ReplyContext::NotAReply => None,
+        ReplyContext::Quoting(parent) => Some(format!(
+            "  ┌ replying to {}: {}",
+            dir_str(parent.direction),
+            parent.preview
+        )),
+        ReplyContext::Orphaned { id } => Some(format!(
+            "  ┌ replying to {id} — original message no longer here"
+        )),
+    }
+}
+
 /// Render a conversation's records as `{"messages": [...]}` — the CLI's JSON
 /// contract for `chat history --json`. Factored out so it's unit-testable
 /// against a seeded store without a live PeerSession.
@@ -1897,6 +1934,13 @@ fn render_history_json(records: &[ChatRecord]) -> serde_json::Value {
                 "kind": r.kind,
                 "file": r.file,
                 "reactions": r.reactions,
+                // The message this one answers, or null. A script that renders
+                // a reply as an ordinary message says something the sender did
+                // not: "sure, go ahead" answering "shall I delete the backups?"
+                // and answering "can I borrow a pen?" are the same seven
+                // characters. Present even when the parent is gone — the id is
+                // still what the sender pointed at.
+                "in_reply_to": r.in_reply_to,
                 // Null both when unread and when the peer does not send
                 // receipts — the two are not distinguishable, and a script
                 // must not read the absence of a time as a refusal.
@@ -2113,14 +2157,16 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
 #[cfg(test)]
 mod tests {
     use super::{
-        reachable_targets, render_file_line, render_history_json, render_search_json,
+        reachable_targets, render_file_line, render_history_json, render_search_json, reply_prefix,
         resolve_history_peer, search, search_row_cells, send, send_file, spawn_single_flight,
         DeleteGate,
     };
     use crate::commands::{self, SecureCtx};
     use crate::exit::CliError;
     use crate::output::Ctx;
-    use peerbeam_chat::{ChatMessage, ChatRecord, ChatStore, FileMeta, FileRef, Kind, Status};
+    use peerbeam_chat::{
+        ChatMessage, ChatRecord, ChatStore, Direction, FileMeta, FileRef, Kind, Status,
+    };
     use peerbeam_config::EngineConfig;
     use peerbeam_crypto::{derive_subkey, AeadCrypto};
     use peerbeam_domain::entity::{Device, DeviceType};
@@ -2173,6 +2219,68 @@ mod tests {
         assert_eq!(messages[1]["body"], "there");
         assert_eq!(messages[1]["direction"], "in");
         assert_eq!(messages[1]["status"], "received");
+    }
+
+    /// **A reply must not read as an ordinary message.** The CLI had neither
+    /// half of replies: no way to send one, and `chat history` printed a reply
+    /// received from the app as though it answered nothing — which the chat
+    /// crate's own module doc calls the worst of the options, because nothing
+    /// about the output looks wrong. "Sure, go ahead" answering "shall I delete
+    /// the backups?" and answering "can I borrow a pen?" are the same seven
+    /// characters.
+    #[test]
+    fn render_history_json_carries_the_reply_marker() {
+        let (store, _dir) = seeded_store();
+        let peer = DeviceId::from("pb-bob");
+        let parent = ChatMessage::new("shall I delete the backups?").expect("parent");
+        store
+            .append(&ChatRecord::received(&peer, &parent))
+            .expect("append parent");
+        let answer = ChatMessage::replying("sure, go ahead", Some(&parent.id)).expect("reply");
+        store
+            .append(&ChatRecord::sent(&peer, &answer))
+            .expect("append reply");
+
+        let records = store.history(&peer).expect("history");
+        let value = render_history_json(&records);
+        let messages = value["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["in_reply_to"], serde_json::Value::Null);
+        assert_eq!(
+            messages[1]["in_reply_to"], parent.id,
+            "the reply lost what it was answering"
+        );
+    }
+
+    /// The human line says it too, and says it even when the parent has gone —
+    /// an orphaned reply is the case that only shows up after a retention window
+    /// closes, which is to say not while anyone is looking.
+    #[test]
+    fn the_human_line_marks_a_reply_and_admits_a_missing_parent() {
+        use peerbeam_chat::{ReplyContext, ReplyParent};
+
+        let quoting = ReplyContext::Quoting(ReplyParent {
+            id: "m-1".into(),
+            direction: Direction::In,
+            kind: Kind::Text,
+            preview: "shall I delete the backups?".into(),
+        });
+        let quote = reply_prefix(&quoting).expect("a reply must be marked");
+        assert!(
+            quote.contains("shall I delete the backups?"),
+            "the quote does not show what is being answered: {quote}"
+        );
+
+        let orphaned = reply_prefix(&ReplyContext::Orphaned { id: "m-9".into() })
+            .expect("an orphaned reply must still be marked");
+        assert!(
+            orphaned.contains("m-9") && orphaned.contains("no longer here"),
+            "an orphaned reply must say the original is gone: {orphaned}"
+        );
+
+        assert!(
+            reply_prefix(&ReplyContext::NotAReply).is_none(),
+            "an ordinary message must not gain a quote line"
+        );
     }
 
     #[test]
@@ -2558,6 +2666,7 @@ mod tests {
             None,
             Some("127.0.0.1:1".to_string()),
             "hello offline".to_string(),
+            None,
             Some(cfg_path.to_str().expect("utf8 path")),
         )
         .await;
@@ -3327,6 +3436,7 @@ mod tests {
             None,
             Some("127.0.0.1:1".to_string()),
             "still on its way".to_string(),
+            None,
             Some(cfg_str),
         )
         .await
@@ -3545,6 +3655,7 @@ mod tests {
             addr: None,
             text: Some("hi".to_string()),
             file: Some("/tmp/a.bin".to_string()),
+            reply_to: None,
         };
         let result = super::chat(&ctx, action, None).await;
         assert!(result.is_err(), "text and file are mutually exclusive");
@@ -3558,6 +3669,7 @@ mod tests {
             addr: None,
             text: None,
             file: None,
+            reply_to: None,
         };
         let result = super::chat(&ctx, action, None).await;
         assert!(result.is_err(), "one of text or file is required");
