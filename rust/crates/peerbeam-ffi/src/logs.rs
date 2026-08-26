@@ -77,7 +77,55 @@ pub fn export(req: &Value) -> Op {
         .and_then(Value::as_str)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("peerbeam-logs-{}.jsonl", std::process::id()))
+            // **The host's directory, not the process temp directory.** On
+            // Android `std::env::temp_dir()` is `/data/local/tmp`, which the app
+            // sandbox cannot write — so exporting logs without naming a path
+            // failed on the one platform where a user has no shell to name one
+            // from. The data directory is somewhere the host gave us and every
+            // platform can write; the temp directory remains the fallback for a
+            // caller that exports before `configure` has run.
+            let base = crate::settings::data_dir().unwrap_or_else(std::env::temp_dir);
+            base.join(format!("peerbeam-logs-{}.jsonl", std::process::id()))
         });
     peerbeam_logs::export(&path).map_err(|e| (Code::Internal, format!("exporting logs: {e}")))
+}
+
+#[cfg(test)]
+mod export_path_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// **Android's process temp directory is `/data/local/tmp`**, which the app
+    /// sandbox cannot write — so an export with no path given failed on the one
+    /// platform whose users have no shell to give one from. The default now
+    /// comes from the directory the host configured.
+    #[test]
+    fn the_default_export_path_follows_the_configured_data_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::settings::configure(&dir.path().to_string_lossy());
+
+        let out = export(&json!({})).expect("export");
+        let written = out
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .expect("a path in the answer");
+        assert!(
+            std::path::Path::new(written).starts_with(dir.path()),
+            "exported to {written}, outside the configured data directory"
+        );
+    }
+
+    /// An explicit path still wins: the default is a fallback, not a policy.
+    #[test]
+    fn an_explicit_path_is_honoured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::settings::configure(&dir.path().to_string_lossy());
+        let asked = dir.path().join("chosen.jsonl");
+
+        let out = export(&json!({ "path": asked.to_string_lossy() })).expect("export");
+        assert_eq!(
+            out.get("path").and_then(serde_json::Value::as_str),
+            Some(asked.to_string_lossy().as_ref())
+        );
+    }
 }

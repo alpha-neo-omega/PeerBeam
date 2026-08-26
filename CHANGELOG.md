@@ -239,6 +239,30 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **Two files whose names differ only in case no longer become one.** macOS and
+  Android hold case-insensitively, so a folder containing `Notes.txt` and
+  `notes.txt` had the second silently overwrite the first — and the transfer
+  still counted both as arrived, so it reported success while the user was a file
+  short. The second is given a free name now, `report (1).pdf` style, matching
+  what the app already does when a received file meets one of the same name.
+- **Tailscale could never work in the macOS app.** It looks for the LocalAPI
+  socket, which the Mac build does not create, and then for `tailscale` on
+  `PATH` — which an app launched from Finder does not inherit, so neither
+  Homebrew's prefix nor `/usr/local/bin` is on it. Both misses were invisible at
+  the default log level, and the same install worked from a terminal. It now
+  looks where the binary actually is, the app bundle's own copy included.
+- **`clipboard send` staged your clipboard as a world-readable file.** It wrote
+  to `/tmp` with a name derived from the clock, on the surface that runs on
+  multi-user servers reached over SSH: any other account could read it, or
+  pre-create the name as a symlink. It is created `0600`, and refused rather than
+  followed if the name is already taken.
+- **Exporting logs on Android wrote where the app may not write.** With no path
+  given the default was the process temp directory, which on Android is
+  `/data/local/tmp` — outside the sandbox, on the one platform whose users have
+  no shell to name a path from. It follows the configured data directory now.
+- **The Linux `.deb` announced the wrong architecture on arm64.** The file was
+  built correctly and then reported under a hardcoded `amd64` name, so a script
+  reading that line looked for a file that was not there.
 - **A folder sync could abort the app on a 32-bit phone.** Delta transfer asked
   whether a file was small enough to rebuild in memory *after* downloading every
   chunk of it, so the ceiling protected nothing that mattered: the peer's

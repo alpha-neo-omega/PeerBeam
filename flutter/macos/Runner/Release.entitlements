@@ -12,5 +12,10 @@
 	<!-- Read files the user picks/drops to send, write files they receive. -->
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
+	<!-- Received files default to the OS Downloads folder
+	     (peerbeam_platform::download_dir); without this the sandbox resolves
+	     that to a Downloads inside the app container, not the user's own. -->
+	<key>com.apple.security.files.downloads.read-write</key>
+	<true/>
 </dict>
 </plist>

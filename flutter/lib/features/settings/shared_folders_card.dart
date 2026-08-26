@@ -1,10 +1,14 @@
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/models.dart' show SharedFolder;
 import '../../state/app_scope.dart';
+
+bool get _isAndroid =>
+    !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
 /// The shared-folders editor: what this device offers to peers who may browse.
 ///
@@ -26,6 +30,11 @@ import '../../state/app_scope.dart';
 /// locally, for the reason `_SaveRulesCard` does the same: `exists` is the
 /// engine's answer, not this screen's guess, and a refused write must leave the
 /// user looking at what is actually shared.
+///
+/// On Android the whole card is replaced by a plain statement of why there is
+/// no picker, the way `_SaveRulesCard` does for rules. A picker that led
+/// nowhere is worse than no picker: it spends a user's attention and leaves
+/// them believing a folder is on offer.
 class SharedFoldersCard extends StatefulWidget {
   const SharedFoldersCard({super.key});
 
@@ -43,6 +52,10 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
   @override
   void initState() {
     super.initState();
+    // Nothing to read on Android: `build` never renders a list there, and
+    // asking the engine for one only to throw the answer away is a call made
+    // for nobody.
+    if (_isAndroid) return;
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
   }
 
@@ -153,6 +166,7 @@ class _SharedFoldersCardState extends State<SharedFoldersCard> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (_isAndroid) return _unsupported();
     return Card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

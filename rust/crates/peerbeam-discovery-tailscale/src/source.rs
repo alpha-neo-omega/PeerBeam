@@ -138,6 +138,24 @@ impl StatusSource for LocalApiStatusSource {
     }
 }
 
+/// Where a `tailscale` binary lives on macOS, in the order worth trying.
+///
+/// **A GUI app does not inherit a login shell's `PATH`.** Launched from Finder
+/// it gets `/usr/bin:/bin:/usr/sbin:/sbin`, which contains neither Homebrew
+/// prefix nor `/usr/local/bin` — so `Command::new("tailscale")` fails with
+/// "no such file" no matter how the user installed it. The Mac App Store build
+/// does not create `/var/run/tailscale/tailscaled.sock` either, so the socket
+/// branch above misses as well and the app was left with no working source at
+/// all while the CLI in a terminal worked fine.
+#[cfg(target_os = "macos")]
+const MACOS_BINARIES: &[&str] = &[
+    // The app bundle ships its own CLI; present for both the App Store and
+    // standalone builds, and needs no separate install.
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/usr/local/bin/tailscale",
+];
+
 /// Pick the best available source for this platform: the LocalAPI socket if
 /// present (no subprocess), otherwise the CLI.
 pub fn default_source() -> Box<dyn StatusSource> {
@@ -147,5 +165,34 @@ pub fn default_source() -> Box<dyn StatusSource> {
             return Box::new(LocalApiStatusSource::new());
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(found) = MACOS_BINARIES
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+        {
+            return Box::new(CliStatusSource::with_binary(*found));
+        }
+    }
     Box::new(CliStatusSource::new())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_source_tests {
+    use super::*;
+
+    /// Every candidate is absolute: a relative entry would be resolved against
+    /// the process's working directory, which for an app launched from Finder is
+    /// `/` — and would then depend on `PATH` again, which is the thing this list
+    /// exists to stop depending on.
+    #[test]
+    fn every_macos_candidate_is_an_absolute_path() {
+        for p in MACOS_BINARIES {
+            assert!(
+                std::path::Path::new(p).is_absolute(),
+                "{p} is not absolute, so it would be looked up relative to the \
+                 launching directory"
+            );
+        }
+    }
 }

@@ -402,3 +402,64 @@ async fn a_send_ceiling_slows_a_folder_send() {
         300 * 1024
     );
 }
+
+/// **Two entries differing only in case are one file on macOS and Android.**
+/// Their filesystems are case-insensitive, so a folder holding `Notes.txt` and
+/// `notes.txt` had its second entry silently overwrite the first — and the
+/// transfer still counted two files completed, so it reported that everything
+/// arrived while the user was one file short. Linux is case-sensitive, which is
+/// why this never showed up here.
+///
+/// The test asserts the *content* of both entries survives, which holds on
+/// either kind of filesystem: on Linux the two names are distinct and both land
+/// as sent; on a case-insensitive one the second is given a free name. What must
+/// never happen — one of the two payloads being lost — fails on both.
+#[tokio::test]
+async fn two_entries_differing_only_by_case_both_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("notes");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Notes.txt"), b"upper").unwrap();
+    std::fs::write(root.join("notes.txt"), b"lower").unwrap();
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let send = send_folder(
+        &mut la,
+        &storage,
+        FolderSendRequest {
+            transfer_id: "case-1".into(),
+            root_path: root.to_string_lossy().into_owned(),
+            chunk_size: 64 * 1024,
+        },
+        &cs,
+        &ptx,
+        3,
+    );
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let (rs, rr) = tokio::join!(send, recv);
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+
+    // Both payloads are on disk somewhere under the received folder, whatever
+    // the filesystem decided to call them.
+    let landed: Vec<Vec<u8>> = std::fs::read_dir(out.join("notes"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| std::fs::read(e.path()).unwrap())
+        .collect();
+    assert!(
+        landed.iter().any(|b| b == b"upper"),
+        "the first entry was overwritten: {landed:?}"
+    );
+    assert!(
+        landed.iter().any(|b| b == b"lower"),
+        "the second entry was lost: {landed:?}"
+    );
+}

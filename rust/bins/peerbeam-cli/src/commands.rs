@@ -2772,11 +2772,31 @@ async fn clipboard_send(
     }
 
     // Stage as a wire-convention temp file so receivers offer one-tap Copy.
+    //
+    // **Created 0600, and refused if the name is already taken.** `/tmp` is
+    // shared by every user on the machine, and this is the CLI, which is what
+    // runs on a multi-user server reached over SSH — a plain `write` there left
+    // the clipboard readable by anyone with an account, under a name derived
+    // from the clock that another user could predict and pre-create as a symlink
+    // to a file of their choosing. `create_new` refuses an existing path instead
+    // of following it, and the mode is set as the file is made rather than
+    // after, so there is no window where it exists readable.
     let tmp = std::env::temp_dir().join(format!(
         "peerbeam-clipboard-{}.txt",
         chrono::Utc::now().timestamp_millis()
     ));
-    std::fs::write(&tmp, &text)?;
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+    }
 
     let send_args = SendArgs {
         at: None,

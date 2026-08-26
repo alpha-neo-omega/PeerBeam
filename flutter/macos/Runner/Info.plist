@@ -22,8 +22,20 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<!-- The DNS-SD types we browse, declared for the local-network prompt
+	     below. Must stay in step with peerbeam-discovery-mdns's SERVICE_TYPE
+	     ("_peerbeam._tcp.local."); an entry omits the domain suffix. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_peerbeam._tcp</string>
+	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
+	<!-- macOS 15+ gates local network access behind a prompt. Without this
+	     string there is no prompt to approve, and a denial looks exactly
+	     like a network with no peers on it. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PeerBeam looks for devices on this network so you can send files to them directly.</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>

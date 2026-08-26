@@ -87,7 +87,7 @@ Maintainer: PeerBeam Contributors <noreply@peerbeam>
 Description: Secure, zero-config file & clipboard sharing
 CTRL
   dpkg-deb --build --root-owner-group "$DEB" "$DIST/${APP}-${VER}-${DARCH}.deb"
-  echo "OK  $DIST/${APP}-${VER}-amd64.deb"
+  echo "OK  $DIST/${APP}-${VER}-${DARCH}.deb"
 else
   echo "skip .deb (dpkg-deb absent)"
 fi

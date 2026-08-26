@@ -17,6 +17,7 @@ use crate::events;
 const SCHEMA: u32 = 1;
 
 static SETTINGS_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static TRUST_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 type Op = Result<Value, (Code, String)>;
@@ -26,6 +27,18 @@ pub fn configure(data_dir: &str) {
     let base = PathBuf::from(data_dir);
     *SETTINGS_PATH.lock().unwrap() = Some(base.join("ffi_settings.json"));
     *TRUST_PATH.lock().unwrap() = Some(base.join("trust.json"));
+    *DATA_DIR.lock().unwrap() = Some(base);
+}
+
+/// The configured data directory, once `configure` has run.
+///
+/// Exposed because the process temp directory is not a place this app may write
+/// on every platform it runs on — on Android it is `/data/local/tmp`, outside
+/// the sandbox — so anything defaulting a path needs somewhere the host actually
+/// gave us.
+#[must_use]
+pub fn data_dir() -> Option<PathBuf> {
+    DATA_DIR.lock().unwrap().clone()
 }
 
 fn defaults() -> Value {

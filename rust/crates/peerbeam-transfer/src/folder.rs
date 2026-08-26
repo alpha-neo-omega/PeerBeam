@@ -331,6 +331,40 @@ pub async fn send_folder(
 }
 
 /// Receive a folder recursively over `link`, into `dest_dir/<root>/…`.
+/// A destination not already taken, by appending ` (n)` before the extension.
+///
+/// Asked through [`StorageProvider::size`] rather than `Path::exists`, which is
+/// the whole point on a case-insensitive filesystem: `size("notes.txt")` answers
+/// for `Notes.txt` there, so the collision is seen where `exists` on the literal
+/// string would also have seen it but a case-sensitive comparison of names would
+/// not.
+///
+/// The split is at the **last** dot, so `archive.tar.gz` becomes
+/// `archive.tar (1).gz` — matching what the app already does when it lands a
+/// received file beside one of the same name, rather than inventing a second
+/// convention for the same situation.
+async fn free_destination(storage: &dyn StorageProvider, dest: &str) -> Result<String> {
+    const ATTEMPTS: u32 = 1_000;
+    let (stem, ext) = match dest.rsplit_once('.') {
+        // A leading dot is a dotfile, not an extension: `.gitignore` has no
+        // extension to insert before.
+        Some((stem, ext)) if !stem.is_empty() && !stem.ends_with('/') => (stem, Some(ext)),
+        _ => (dest, None),
+    };
+    for n in 1..=ATTEMPTS {
+        let candidate = match ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        if storage.size(&candidate).await?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(DomainError::Transfer(format!(
+        "no free name for {dest} after {ATTEMPTS} attempts"
+    )))
+}
+
 pub async fn receive_folder(
     link: &mut dyn Link,
     storage: &dyn StorageProvider,
@@ -361,6 +395,15 @@ pub async fn receive_folder(
     let mut done: u64 = 0;
     let mut files_completed: u32 = 0;
 
+    // Destinations already written during this receive, folded to lower case.
+    //
+    // **macOS and Android are case-insensitive.** `Notes.txt` and `notes.txt`
+    // are one file there, so a folder holding both had its second entry silently
+    // overwrite the first — and `files_completed` still counted two, so the
+    // transfer reported that everything arrived while the user was one file
+    // short. Linux, being case-sensitive, is unaffected, which is why nothing
+    // caught it.
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
     // Set whenever the file announced by the most recent `FileHeader` was
     // skipped (unsafe path or a create/open failure, e.g. a destination path
@@ -468,6 +511,33 @@ pub async fn receive_folder(
                             current = None;
                             current_skipped = true;
                             continue;
+                        };
+                        // Two entries of this folder that differ only in case
+                        // are two files on the sender and one destination here,
+                        // so the second is given a free name instead of landing
+                        // on the first. Only entries *this* receive wrote are
+                        // considered: an unrelated file already on disk is still
+                        // overwritten, which is what a folder receive has always
+                        // done and what resume-less delivery means.
+                        let dp = if written.insert(dp.to_lowercase()) {
+                            dp
+                        } else {
+                            match free_destination(storage, &dp).await {
+                                Ok(free) => {
+                                    tracing::warn!(
+                                        "folder entry {path} differs from an earlier entry only \
+                                         by case on this filesystem; writing it to {free}"
+                                    );
+                                    written.insert(free.to_lowercase());
+                                    free
+                                }
+                                Err(e) => {
+                                    tracing::warn!("skipping folder entry {path}: {e}");
+                                    current = None;
+                                    current_skipped = true;
+                                    continue;
+                                }
+                            }
                         };
                         // Always write fresh (create/truncate): folder
                         // receives are never resumed (see module docs), so
@@ -781,6 +851,53 @@ fn join(root: &str, rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Where the counter goes.** A received file that collides gets ` (n)`
+    /// before the extension, so `report.pdf` stays a PDF — the app already does
+    /// this when it lands a file beside one of the same name, and two
+    /// conventions for one situation would be worse than either.
+    #[tokio::test]
+    async fn a_free_name_keeps_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = peerbeam_storage_fs::FsStorage::new();
+        let taken = dir.path().join("report.pdf");
+        std::fs::write(&taken, b"x").unwrap();
+
+        let free = free_destination(&storage, &taken.to_string_lossy())
+            .await
+            .expect("a free name");
+        assert!(free.ends_with(" (1).pdf"), "got {free}");
+    }
+
+    /// A dotfile has no extension to insert before: the leading dot names the
+    /// file, it does not separate a suffix.
+    #[tokio::test]
+    async fn a_dotfile_keeps_its_name_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = peerbeam_storage_fs::FsStorage::new();
+        let taken = dir.path().join(".gitignore");
+        std::fs::write(&taken, b"x").unwrap();
+
+        let free = free_destination(&storage, &taken.to_string_lossy())
+            .await
+            .expect("a free name");
+        assert!(free.ends_with(".gitignore (1)"), "got {free}");
+    }
+
+    /// And it keeps counting rather than giving up on the first collision.
+    #[tokio::test]
+    async fn successive_collisions_keep_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = peerbeam_storage_fs::FsStorage::new();
+        let base = dir.path().join("a.txt");
+        std::fs::write(&base, b"x").unwrap();
+        std::fs::write(dir.path().join("a (1).txt"), b"x").unwrap();
+
+        let free = free_destination(&storage, &base.to_string_lossy())
+            .await
+            .expect("a free name");
+        assert!(free.ends_with(" (2).txt"), "got {free}");
+    }
 
     #[test]
     fn folder_message_roundtrips() {
