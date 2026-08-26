@@ -239,11 +239,12 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
-- **A wrapped link quietly downgraded a graceful close.** The wrappers that add
-  framing and encryption did not forward `graceful_close`, so they inherited the
-  abrupt one — meaning a final frame written just before closing, including the
-  session's own `Shutdown`, could be discarded by the very call that exists to
-  deliver it.
+- **A graceful close no longer waits seconds on a peer that has gone.** The wait
+  is for the peer to acknowledge the last frame, and a peer that simply drops its
+  end never does — so the timeout was the usual cost rather than the rare one. It
+  is a quarter of a second now: one round trip is microseconds on loopback and
+  tens of milliseconds through a relay, and a peer silent past that is not
+  answering.
 - **"connection lost" now says why.** quinn renders a lost connection as those two
   words and keeps the reason — timed out, reset by peer, closed by peer — only in
   the error's source, which was discarded. A transfer log that cannot tell a
