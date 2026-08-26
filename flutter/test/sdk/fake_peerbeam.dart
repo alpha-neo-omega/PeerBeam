@@ -266,8 +266,12 @@ class FakePeerBeam implements PeerBeamApi {
     return changed;
   }
 
+  /// Set to make [trustRemove] throw, so a test can drive the refusal path.
+  Object? trustRemoveError;
+
   @override
   Future<bool> trustRemove(String id) async {
+    if (trustRemoveError != null) throw trustRemoveError!;
     final before = trusted.length;
     trusted.removeWhere((t) => t.id == id);
     return trusted.length != before;
@@ -582,9 +586,13 @@ class FakePeerBeam implements PeerBeamApi {
     return live;
   }
 
+  /// Set to make [notesCreate] throw, so a test can drive the refusal path.
+  Object? notesCreateError;
+
   @override
   Future<String> notesCreate(String body, {String title = ''}) async {
     calls.add('notesCreate:$title');
+    if (notesCreateError != null) throw notesCreateError!;
     final id = 'note-${++_noteSeq}';
     notes.add(
       Note(id: id, title: title, body: body, updatedAt: DateTime.now()),

@@ -3,6 +3,8 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../sdk/error_text.dart';
+
 import '../sdk/events.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
@@ -47,10 +49,20 @@ class TrustRepository extends ChangeNotifier {
   }
 
   /// Revoke a pin; the engine emits `trust_changed`, which refreshes us.
-  Future<void> remove(String id) async {
+  ///
+  /// Returns null when it worked, or a message when it did not. **The caller
+  /// has to say so**: this used to swallow the failure and return nothing, so a
+  /// revoke that never happened looked exactly like one that did — the dialog
+  /// closed, the row stayed, and the user was left believing they had withdrawn
+  /// trust from a device that still holds it. That is the one failure on this
+  /// screen that must never be quiet.
+  Future<String?> remove(String id) async {
     try {
       await _api?.trustRemove(id);
-    } catch (_) {}
+      return null;
+    } catch (e) {
+      return friendlyError(e);
+    }
   }
 
   /// Grant or withhold one permission for a device.

@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import '../sdk/error_text.dart';
+
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 
@@ -41,31 +43,44 @@ class NotesRepository extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Create a note and return its id, or null when there is no engine.
+  /// Create a note. Returns null when it was written, or a message when it was
+  /// not.
+  ///
+  /// **The failure has to reach the caller.** This used to answer a nullable id
+  /// and fold every refusal into null, and the screen did not read even that —
+  /// so a note the engine would not write vanished the moment the dialog closed,
+  /// with the text gone and nothing said. Losing something a person just typed
+  /// is the worst thing this screen can do.
   Future<String?> create(String body, {String title = ''}) async {
     final api = _api;
-    if (api == null) return null;
+    if (api == null) return 'PeerBeam is not running.';
     try {
-      final id = await api.notesCreate(body, title: title);
+      await api.notesCreate(body, title: title);
       await refresh();
-      return id;
-    } catch (_) {
       return null;
+    } catch (e) {
+      return friendlyError(e);
     }
   }
 
-  /// Replace a note's content. Returns whether anything changed — `false` also
-  /// means the note was deleted elsewhere, which the caller should surface
-  /// rather than swallow: the user's edit did not land.
-  Future<bool> edit(String id, String body, {String title = ''}) async {
+  /// Replace a note's content. Returns null when it was saved, or the reason it
+  /// was not.
+  ///
+  /// **Two different failures, told apart.** The engine answering `false` means
+  /// the note is gone — deleted elsewhere — while an exception means the write
+  /// failed for some other reason. This used to return `false` for both, and the
+  /// screen reported every one of them as "That note was deleted": a message
+  /// that is a guess, and one that tells the user to stop looking for text that
+  /// may still be there.
+  Future<String?> edit(String id, String body, {String title = ''}) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) return 'PeerBeam is not running.';
     try {
       final ok = await api.notesEdit(id, body, title: title);
       await refresh();
-      return ok;
-    } catch (_) {
-      return false;
+      return ok ? null : 'That note was deleted, so the edit was not saved.';
+    } catch (e) {
+      return friendlyError(e);
     }
   }
 

@@ -39,24 +39,30 @@ class _NotesScreenState extends State<NotesScreen> {
     if (saved == null || !mounted) return;
 
     if (existing == null) {
-      await state.notes.create(saved.body, title: saved.title);
+      // Checked, not fired and forgotten: a refused create used to take the
+      // text with it, silently.
+      final failure = await state.notes.create(
+        saved.body,
+        title: saved.title,
+      );
+      if (failure != null && mounted) _sayNotSaved(failure);
       return;
     }
-    final ok = await state.notes.edit(
+    // The repository distinguishes "the note is gone" from "the write failed",
+    // and says which. Reporting every refusal as a deletion was a guess, and one
+    // that tells the user to stop looking for text that may still be there.
+    final failure = await state.notes.edit(
       existing.id,
       saved.body,
       title: saved.title,
     );
-    if (!ok && mounted) {
-      // The engine refuses to edit a deleted note rather than resurrecting it,
-      // so the user's edit genuinely did not land. Saying nothing would leave
-      // them believing it had.
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('That note was deleted, so the edit was not saved.'),
-        ),
-      );
-    }
+    if (failure != null && mounted) _sayNotSaved(failure);
+  }
+
+  void _sayNotSaved(String reason) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(reason)));
   }
 
   /// Offer the devices that may sync notes, and exchange with the chosen one.

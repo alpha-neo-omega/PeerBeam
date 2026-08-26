@@ -44,6 +44,27 @@ void main() {
     expect(find.text('no heading here'), findsOneWidget);
   });
 
+  /// **A note the engine refuses used to vanish with the text in it.** The
+  /// screen fired `create` and never read the answer, so a refusal closed the
+  /// dialog, dropped what had just been typed, and said nothing. Losing
+  /// somebody's words is the worst thing this screen can do.
+  testWidgets('a note the engine refuses says so instead of disappearing', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()..notesCreateError = StateError('disk full');
+    await _open(tester, fake);
+
+    await tester.tap(find.byIcon(Icons.add_rounded));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).last, 'remember this');
+    await tester.pump();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SnackBar), findsOneWidget);
+    expect(fake.notes, isEmpty);
+  });
+
   testWidgets('writing a note saves it', (tester) async {
     final fake = FakePeerBeam();
     await _open(tester, fake);

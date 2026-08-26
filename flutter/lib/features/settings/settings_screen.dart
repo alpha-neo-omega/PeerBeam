@@ -595,7 +595,12 @@ class SettingsScreen extends StatelessWidget {
         ],
       ),
     );
-    if (confirmed == true) await state.trust.remove(d.id);
+    if (confirmed != true) return;
+    final failure = await state.trust.remove(d.id);
+    if (failure == null || !context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('${d.name} was not revoked: $failure')),
+    );
   }
 
   /// Where releases are published.

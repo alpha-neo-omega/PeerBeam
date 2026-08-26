@@ -239,6 +239,17 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A revoke that fails now says so.** Withdrawing trust from a device swallowed
+  its error and reported nothing, so a revoke that never happened looked exactly
+  like one that did: the dialog closed, the device stayed trusted, and you were
+  left believing otherwise. Of everything on that screen it is the one failure
+  that must not be quiet.
+- **A note the app cannot save no longer takes your text with it.** Writing a new
+  note fired the write and never read the answer, so a refusal closed the editor,
+  dropped what had just been typed, and said nothing. And every refused *edit*
+  was reported as "That note was deleted" — a guess, and one that tells you to
+  stop looking for text that may still be there. The two failures are now told
+  apart and each says what happened.
 - **You can reach a device's shared folders without knowing its address.**
   Browsing existed — the screen, the engine call, the permission you grant, the
   folder list in Settings — and the only thing that opened it was the menu of a

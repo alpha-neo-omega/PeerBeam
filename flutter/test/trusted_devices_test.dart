@@ -167,6 +167,33 @@ void main() {
     expect(find.text('Full fingerprint copied'), findsOneWidget);
   });
 
+  /// **A revoke that did not happen looked exactly like one that did.** The
+  /// call swallowed its error and returned nothing, so the dialog closed, the
+  /// device stayed trusted, and the user was left believing they had withdrawn
+  /// it. Of everything on this screen, that is the one failure that must not be
+  /// quiet.
+  testWidgets('a revoke that fails says so instead of looking done', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)]
+      ..trustRemoveError = StateError('engine said no');
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    await tester.tap(find.byTooltip('Revoke trust').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Revoke'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('was not revoked'),
+      findsOneWidget,
+      reason: 'the failure was swallowed and the device looks revoked',
+    );
+    // And it is still there, which is the truth of it.
+    expect(find.text('My Laptop'), findsOneWidget);
+  });
+
   testWidgets('an all-approved list says nothing about approval', (
     tester,
   ) async {
