@@ -239,6 +239,15 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **A headless Linux box received files into RAM.** The save directory falls back
+  to the OS Downloads folder, and on Linux that is read from the XDG user-dirs
+  file — which a server, a Docker image or a machine reached over SSH has never
+  had a desktop write. The fallback was the temp directory, so `peerbeam receive`
+  put files in `/tmp/peerbeam`: tmpfs on most distributions, so they lived in RAM
+  and were gone at the next reboot, and `PrivateTmp` hid them from the operator
+  in the meantime. It is `$HOME/Downloads` now — the default the XDG spec already
+  gives when the file is absent — with the temp directory kept only for a process
+  that has no home at all.
 - **A graceful close no longer waits seconds on a peer that has gone.** The wait
   is for the peer to acknowledge the last frame, and a peer that simply drops its
   end never does — so the timeout was the usual cost rather than the rare one. It

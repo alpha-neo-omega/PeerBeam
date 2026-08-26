@@ -54,8 +54,31 @@ pub fn hostname() -> String {
 }
 
 /// Directory for received files (defaults to the OS Downloads folder).
+///
+/// **`$HOME/Downloads` when the OS will not name one**, which on Linux is the
+/// normal case for exactly the machines this project targets: `download_dir`
+/// reads the XDG user-dirs file, and a server, a Docker image or a box reached
+/// over SSH has never run the desktop tool that writes it. The old fallback was
+/// the temp directory, so `peerbeam receive` on a headless host put files in
+/// `/tmp/peerbeam` — which is tmpfs on most distributions, so a received file
+/// lived in RAM and was gone at the next reboot, and systemd's `PrivateTmp`
+/// hides it from the operator meanwhile. Nothing announced any of that.
+///
+/// `$HOME/Downloads` is the XDG-specified default for `XDG_DOWNLOAD_DIR`, so
+/// this is the answer the spec already gives when the file is absent, not an
+/// invention. The temp directory remains the last resort for a process with no
+/// home at all.
 pub fn download_dir() -> PathBuf {
-    dirs::download_dir().unwrap_or_else(temp_fallback)
+    resolve_download_dir(dirs::download_dir(), dirs::home_dir())
+}
+
+/// The decision behind [`download_dir`], separated from the environment so it
+/// can be tested: reading it back through `HOME` would mean mutating process
+/// state that every other test shares.
+fn resolve_download_dir(os_dir: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    os_dir
+        .or_else(|| home.map(|h| h.join("Downloads")))
+        .unwrap_or_else(temp_fallback)
 }
 
 /// Directory for PeerBeam configuration files.
@@ -189,6 +212,34 @@ fn temp_fallback() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A headless Linux box must not receive files into tmpfs.** `dirs`
+    /// answers `None` for the Downloads folder whenever the XDG user-dirs file
+    /// is absent, which is every server, container and SSH session — and the
+    /// temp directory it used to fall back to is RAM on most distributions, so
+    /// received files vanished at reboot without anything having said where they
+    /// went.
+    #[test]
+    fn no_os_downloads_folder_falls_back_to_home_not_temp() {
+        let resolved = resolve_download_dir(None, Some(PathBuf::from("/home/ada")));
+        assert_eq!(resolved, PathBuf::from("/home/ada/Downloads"));
+    }
+
+    /// When the OS does name one — every desktop — that answer wins untouched.
+    #[test]
+    fn an_os_downloads_folder_is_used_as_given() {
+        let resolved = resolve_download_dir(
+            Some(PathBuf::from("/Users/ada/Downloads")),
+            Some(PathBuf::from("/Users/ada")),
+        );
+        assert_eq!(resolved, PathBuf::from("/Users/ada/Downloads"));
+    }
+
+    /// A process with no home at all still needs somewhere to put a file.
+    #[test]
+    fn with_neither_the_temp_directory_is_the_last_resort() {
+        assert_eq!(resolve_download_dir(None, None), temp_fallback());
+    }
 
     #[test]
     fn available_bytes_reports_a_real_figure_for_an_existing_directory() {
