@@ -5,6 +5,7 @@ import '../../sdk/error_text.dart';
 import '../../sdk/models.dart';
 import '../../sdk/peerbeam.dart';
 import '../../state/app_scope.dart';
+import '../browse/browse_screen.dart';
 import '../../state/models.dart';
 import '../../state/stores.dart';
 import '../../widgets/appear.dart';
@@ -224,6 +225,18 @@ class _DevicesScreenState extends State<DevicesScreen> {
                     ? null
                     : () =>
                           showWakeDialog(context, api: api, device: devices[i]),
+                // Resolved against the live store, the same lookup the chat
+                // action on Home makes: a device with no current address has
+                // nothing to browse, and the entry says so rather than opening
+                // a screen that cannot load.
+                onBrowse: switch (state.device.peerTarget(devices[i].id)) {
+                  final PeerTarget target => () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => BrowseScreen(peer: target),
+                    ),
+                  ),
+                  null => null,
+                },
               ),
             ),
           ),

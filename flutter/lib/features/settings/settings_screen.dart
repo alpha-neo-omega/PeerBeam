@@ -122,9 +122,9 @@ class SettingsScreen extends StatelessWidget {
                     secondary: const Icon(Icons.visibility_off_rounded),
                     title: const Text('Hide offline devices'),
                     subtitle: const Text(
-                      'Home shows only devices that are reachable now. '
-                      'Devices keeps showing every one, with when it was last '
-                      'seen — that is where you wake a sleeping device.',
+                      'Home shows only devices that are reachable now. Devices '
+                      'keeps showing every one the app still knows about — that '
+                      'is where you wake a sleeping machine.',
                     ),
                     value: state.view.hideOffline,
                     onChanged: (v) => unawaited(state.view.setHideOffline(v)),
@@ -321,12 +321,45 @@ class SettingsScreen extends StatelessWidget {
                             subtitle: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  _shortFingerprint(pins[i].fingerprint),
-                                  style: const TextStyle(
-                                    fontFeatures: [
-                                      FontFeature.tabularFigures(),
-                                    ],
+                                // **Shortened on screen, whole on the
+                                // clipboard.** A fingerprint exists to be
+                                // compared against the other device over some
+                                // channel that is not this one — read aloud,
+                                // pasted into a message — and 16 of its hex
+                                // characters cannot do that job. The row showed
+                                // only those, with no way to select or copy
+                                // them, so the one thing the value is for was
+                                // the one thing it could not be used for.
+                                Tooltip(
+                                  message: 'Tap to copy the full fingerprint',
+                                  child: InkWell(
+                                    onTap: () => _copyFingerprint(
+                                      context,
+                                      pins[i].fingerprint,
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          _shortFingerprint(
+                                            pins[i].fingerprint,
+                                          ),
+                                          style: const TextStyle(
+                                            fontFeatures: [
+                                              FontFeature.tabularFigures(),
+                                            ],
+                                          ),
+                                        ),
+                                        const Gap(AppSpace.xxs),
+                                        Icon(
+                                          Icons.copy_rounded,
+                                          size: AppIcons.sm,
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                        ),
+                                      ],
+                                    ),
                                   ),
                                 ),
                                 if (!pins[i].approved)
@@ -577,6 +610,17 @@ class SettingsScreen extends StatelessWidget {
   /// version it cannot know is worse than one admitting it does not.
   static String _aboutLine(String? engineVersion) =>
       'Version ${engineVersion ?? 'unknown'} · AGPL-3.0';
+
+  /// Put the **whole** fingerprint on the clipboard, not the shortened form on
+  /// screen: a truncated one compared against another device proves less than
+  /// it appears to, and silently.
+  static Future<void> _copyFingerprint(BuildContext context, String fp) async {
+    await Clipboard.setData(ClipboardData(text: fp));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Full fingerprint copied')),
+    );
+  }
 
   /// First 16 hex chars of the fingerprint, grouped for readability.
   static String _shortFingerprint(String fp) {

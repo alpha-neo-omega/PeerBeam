@@ -7,6 +7,7 @@ import '../notes/notes_screen.dart';
 import '../timeline/timeline_screen.dart';
 
 import '../../app/theme.dart';
+import '../../data/discovery_repository.dart' show DiscoveryRepository;
 import '../../data/saved_devices_repository.dart' show SavedDevice;
 import '../../platform/desktop_files.dart';
 import '../../sdk/error_text.dart';
@@ -41,12 +42,9 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   /// Open a search over discovered devices; on pick, send files to it.
   Future<void> _searchDevices(BuildContext context) async {
-    final devices = AppScope.of(
-      context,
-    ).device.devices.where((d) => d.online).toList();
     final device = await showSearch<Device?>(
       context: context,
-      delegate: _DeviceSearchDelegate(devices),
+      delegate: _DeviceSearchDelegate(AppScope.of(context).device),
     );
     if (device == null || !context.mounted) return;
     await _sendTo(context, device);
@@ -1107,16 +1105,25 @@ class _SavedDeviceCard extends StatelessWidget {
 }
 
 /// Searches the discovered-device list by name. Returns the chosen [Device] via
-/// `close`, or null when dismissed. Operates on a snapshot passed at open time.
+/// `close`, or null when dismissed.
+///
+/// **Reads the store while it is open, rather than a list captured before it
+/// opened.** Discovery is asynchronous and usually still running in the first
+/// seconds after launch, and the search pill sits directly under the app bar —
+/// so opening it early showed "No matches" with nothing typed, and went on
+/// saying that while devices filled in on Home behind it. Dismissing and
+/// reopening was the only way out, and nothing said so. The device picker had
+/// exactly this bug and was fixed the same way; see `showDevicePicker`.
 class _DeviceSearchDelegate extends SearchDelegate<Device?> {
-  final List<Device> devices;
-  _DeviceSearchDelegate(this.devices)
+  final DiscoveryRepository discovery;
+  _DeviceSearchDelegate(this.discovery)
     : super(searchFieldLabel: 'Search devices');
 
   List<Device> get _matches {
+    final live = discovery.devices.where((d) => d.online).toList();
     final q = query.trim().toLowerCase();
-    if (q.isEmpty) return devices;
-    return devices.where((d) => d.name.toLowerCase().contains(q)).toList();
+    if (q.isEmpty) return live;
+    return live.where((d) => d.name.toLowerCase().contains(q)).toList();
   }
 
   @override
@@ -1142,14 +1149,27 @@ class _DeviceSearchDelegate extends SearchDelegate<Device?> {
   @override
   Widget buildSuggestions(BuildContext context) => _list(context);
 
-  Widget _list(BuildContext context) {
+  Widget _list(BuildContext context) => AnimatedBuilder(
+    animation: discovery,
+    builder: (context, _) => _listBody(context),
+  );
+
+  Widget _listBody(BuildContext context) {
     final matches = _matches;
     if (matches.isEmpty) {
-      return const EmptyState(
-        icon: Icons.search_off_rounded,
-        title: 'No matches',
-        message: 'No discovered device matches that name.',
-      );
+      // Two different states, and telling them apart is the difference between
+      // "try another name" and "wait a moment".
+      return query.trim().isEmpty
+          ? const EmptyState(
+              icon: Icons.wifi_tethering_rounded,
+              title: 'Looking for devices',
+              message: 'Devices appear here as they are found.',
+            )
+          : const EmptyState(
+              icon: Icons.search_off_rounded,
+              title: 'No matches',
+              message: 'No discovered device matches that name.',
+            );
     }
     return ListView.builder(
       padding: const EdgeInsets.all(AppSpace.md),

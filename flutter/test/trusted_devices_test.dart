@@ -7,6 +7,7 @@
 // telling the user a stranger is trusted.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/sdk/models.dart';
@@ -130,6 +131,40 @@ void main() {
     expect(_iconIn(tester, 'Unknown Box', Icons.help_outline_rounded), isTrue);
     expect(_iconIn(tester, 'My Laptop', Icons.verified_user_rounded), isTrue);
     expect(_iconIn(tester, 'My Laptop', Icons.help_outline_rounded), isFalse);
+  });
+
+  /// **A fingerprint that cannot leave the screen cannot do its job.** It is
+  /// shown shortened so the row stays readable, and comparing 16 hex characters
+  /// against another device proves less than it looks like it does — so the copy
+  /// has to carry the whole value, not what is rendered.
+  testWidgets('tapping a fingerprint copies the whole thing, not the short '
+      'form', (tester) async {
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)];
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    await tester.tap(find.byTooltip('Tap to copy the full fingerprint').first);
+    await tester.pumpAndSettle();
+
+    expect(copied, ['ab12cd34ef56ab12cd34ef56ab12cd34']);
+    expect(find.text('Full fingerprint copied'), findsOneWidget);
   });
 
   testWidgets('an all-approved list says nothing about approval', (

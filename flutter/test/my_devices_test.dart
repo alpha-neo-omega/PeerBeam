@@ -21,6 +21,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:peerbeam/features/browse/browse_screen.dart';
 import 'package:peerbeam/features/devices/devices_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -86,6 +87,7 @@ String _copy(WidgetTester tester) => tester
     .join(' ');
 
 void main() {
+  _browseEntryTests();
   // `SavedDevicesRepository.load` goes through SharedPreferences, whose
   // platform channel never answers in a widget test unless it is primed —
   // without this the await never returns and the test hangs rather than fails.
@@ -318,4 +320,30 @@ class _GatedMine extends FakePeerBeam {
     await gate.future;
     return super.myDevices();
   }
+}
+
+/// **A shared folder was reachable only by typing an IP address.**
+/// `BrowseScreen`, the engine's `browse` call, the Browse permission and the
+/// shared-folders editor all existed, and the only thing that opened the screen
+/// was the overflow menu of a *saved by-address* entry. So a device discovered
+/// automatically — the ordinary case, and the one the whole product is built
+/// around — had no way in at all.
+void _browseEntryTests() {
+  testWidgets('a discovered device offers a way into its shared folders', (
+    tester,
+  ) async {
+    await _open(tester, FakePeerBeam(), devices: [_device('pb-a', 'Alice')]);
+    await _openMenu(tester, 'Alice');
+
+    expect(
+      find.text('Shared folders…'),
+      findsOneWidget,
+      reason: 'browsing is unreachable without typing the device an address',
+    );
+
+    await tester.tap(find.text('Shared folders…'));
+    await tester.pumpAndSettle();
+    // The screen opened rather than the menu merely closing.
+    expect(find.byType(BrowseScreen), findsOneWidget);
+  });
 }

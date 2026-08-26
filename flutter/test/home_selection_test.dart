@@ -29,6 +29,7 @@ IconButton _button(WidgetTester tester, String tooltip) => tester.widget(
 );
 
 void main() {
+  _liveSearchTests();
   testWidgets('persistent selection bar appears when the stack is non-empty', (
     tester,
   ) async {
@@ -188,5 +189,52 @@ void main() {
     // The thread it opened is the one the peer will actually write into.
     expect(fake.calls, contains('chatHistory:x1'));
     expect(fake.calls, isNot(contains('chatHistory:${saved.id}')));
+  });
+}
+
+/// **The search froze at the moment it opened.** It was handed a list captured
+/// before `showSearch`, so a device found while it was open never appeared —
+/// and opening it during the first seconds after launch, which is exactly when
+/// the pill under the app bar is in reach, showed an empty result with nothing
+/// typed. The device picker had the same bug and was fixed the same way.
+void _liveSearchTests() {
+  testWidgets('a device found while the search is open appears in it', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    await tester.pumpWidget(
+      AppScope(state: state, child: const MaterialApp(home: HomeScreen())),
+    );
+    await tester.pump();
+
+    // Open the search before discovery has answered anything.
+    // The pill sits under the app bar; on the default 800x600 test surface the
+    // sliver list may not have built it yet, so scroll it into view first.
+    final pill = find.text('Search devices');
+    await tester.scrollUntilVisible(
+      pill,
+      120,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(pill);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Looking for devices'),
+      findsOneWidget,
+      reason: 'an empty list before any answer is not "no matches"',
+    );
+
+    fake.emit(const DeviceAdded(_laptop));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(
+      find.text('Live Laptop'),
+      findsOneWidget,
+      reason: 'the search never saw a device discovered after it opened',
+    );
   });
 }

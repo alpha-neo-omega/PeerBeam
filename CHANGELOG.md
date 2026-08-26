@@ -239,6 +239,21 @@ Nothing yet.
   affected; transfers over a PeerSession channel share a connection that outlives
   the transfer. Failure rate on a two-core machine was two runs in three, which
   is what small servers and CPU-limited containers look like.
+- **You can reach a device's shared folders without knowing its address.**
+  Browsing existed — the screen, the engine call, the permission you grant, the
+  folder list in Settings — and the only thing that opened it was the menu of a
+  device you had typed an IP address for. So a device found automatically, which
+  is every device in normal use, had no way in at all. It is now on the Devices
+  dashboard menu, beside Wake.
+- **A device's key fingerprint can be copied.** It is shown shortened to stay
+  readable and was not selectable, so the one thing a fingerprint is for —
+  comparing it with the other device over some other channel — was the one thing
+  it could not do. Tapping it copies the whole value, not the shortened form.
+- **Searching for a device no longer freezes the moment it opens.** It was handed
+  the list as it stood before the search opened, so a device found a second later
+  never appeared, and opening it during the first seconds after launch showed an
+  empty result with nothing typed. It now follows discovery while open, and says
+  "Looking for devices" rather than "No matches" when nothing has answered yet.
 - **A navigation destination now leaves the screen you pushed.** Opening a chat
   from a device and then pressing Home did nothing until you pressed back: chat
   detail sits on top of the section it was opened from, and choosing a

@@ -36,12 +36,17 @@ class DeviceActions extends StatelessWidget {
   /// Open the wake dialog. Null when there is no engine to send through.
   final VoidCallback? onWake;
 
+  /// Look at what this device shares. Null when it has no address to reach —
+  /// which is any device discovery cannot currently see.
+  final VoidCallback? onBrowse;
+
   const DeviceActions({
     super.key,
     required this.device,
     required this.mine,
     this.onSetMine,
     this.onWake,
+    this.onBrowse,
   });
 
   /// The claim under the mark/unmark entry — the one place a user reads what
@@ -73,6 +78,22 @@ class DeviceActions extends StatelessWidget {
                 : Icons.label_outline_rounded,
             title: marked ? 'Remove from My devices' : 'Mark as mine',
             detail: _mineDetail(marked),
+          ),
+        ),
+        // **The only way in for a discovered device.** Browsing used to be
+        // offered solely from a saved by-address entry's menu, so a folder
+        // someone shared with you could be reached only by hand-typing their
+        // IP — the one thing this app is for not needing. The screen, the
+        // engine call and the permission all existed; nothing linked them.
+        PopupMenuItem<VoidCallback>(
+          enabled: onBrowse != null,
+          value: onBrowse ?? () {},
+          child: _Entry(
+            icon: Icons.folder_shared_outlined,
+            title: 'Shared folders…',
+            detail: onBrowse == null
+                ? 'Only while the device is reachable.'
+                : 'What ${device.name} shares with you, if anything.',
           ),
         ),
         PopupMenuItem<VoidCallback>(
