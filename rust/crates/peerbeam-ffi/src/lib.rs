@@ -907,6 +907,145 @@ pub unsafe extern "C" fn pb_spaces_list(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.spaces_list(&read_json(json)?))()))
 }
 
+/// Groups and pending invitations: `{}` → `{groups:[…], invites:[…]}`.
+///
+/// **A Group is not a Space.** A Space is a private label — no peer learns it
+/// exists, and there are no group replies. A Group is the other trade: every
+/// member holds the same roster, so replies reach everyone and **every member
+/// learns every other member**. That disclosure is the whole cost, and a
+/// surface must state it before the user accepts (amendment A2, condition 5).
+///
+/// Invitations come back in the same call because they are the only way into a
+/// group: one that arrived while the app was closed would otherwise stay
+/// invisible until something else happened to fetch it.
+///
+/// Each group carries `reachable` and `unreachable`, so a surface names the
+/// members it cannot message rather than showing a quietly shorter list.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_list(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_list(&read_json(json)?))()))
+}
+
+/// Create a group: `{name}` → `{group}`.
+///
+/// It holds only this device. Members are invited, and join when **they**
+/// accept — nothing here can add somebody else's device (A2, condition 4).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_create(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_create(&read_json(json)?))()))
+}
+
+/// Rename a group: `{id, name}` → `{group}`.
+///
+/// **On this device only.** Names are not synchronised: agreeing on one would
+/// need a device to arbitrate simultaneous renames, and that device would be a
+/// hub — the thing A2 permits groups only by not having.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_rename(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_rename(&read_json(json)?))()))
+}
+
+/// Turn down an invitation: `{group}` → `{declined}`.
+///
+/// **Local and silent.** The inviter is not told. Telling them would publish
+/// "this device saw your invitation and refused", which is a fact about the
+/// user nobody asked to share; ignoring an offer is allowed to look exactly
+/// like never having seen it.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_decline(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_decline(&read_json(json)?))()))
+}
+
+/// Offer a device a place in a group: `{id, peer}` → `{queued}`.
+///
+/// An **offer**, not an enrolment: nothing changes on their device until their
+/// own user accepts (A2, condition 4). The roster travels with it, so the
+/// invitee learns who is already in the group — and everyone in it learns them
+/// if they accept. **A surface must say that before it calls this.**
+///
+/// `queued`, not `sent`: the dial happens in the background so the calling
+/// isolate is not blocked, and the outcome arrives as a `group_control` event.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_invite(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_invite(&read_json(json)?))()))
+}
+
+/// Accept an invitation: `{group, peers}` → `{group}`.
+///
+/// `peers` is how to reach the members — the engine holds ids, the app holds
+/// routes. A member the app cannot see is not told yet and finds out at next
+/// contact; there is nobody to ask for the truth, which is what makes this
+/// hubless.
+///
+/// The roster is adopted **before** anyone is told, so a join whose
+/// announcements half-fail leaves this device in the group it agreed to join
+/// rather than in nothing.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_accept(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_accept(&read_json(json)?))()))
+}
+
+/// Leave a group: `{id, peers}` → `{left}`.
+///
+/// Forgotten here whether or not anyone heard — leaving is a decision about
+/// this device. A member that missed the message may keep sending, and the only
+/// thing that refuses it is withholding `chat` from that device.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_leave(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_leave(&read_json(json)?))()))
+}
+
+/// Message every reachable member: `{id, text}` → `{id, sent, skipped}`.
+///
+/// **N ordinary sends, one id.** Each copy is enqueued in that member's own
+/// outbox and delivered by the same drain a one-to-one message uses, so an
+/// offline member's copy goes out when they return. The shared id is what lets
+/// a transcript show the message once rather than once per member.
+///
+/// `skipped` names the members this device may not message — never silently
+/// dropped (A2, condition 3).
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_send(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_send(&read_json(json)?))()))
+}
+
+/// A group's messages: `{group}` → `{messages}`.
+///
+/// Gathered across the members it was sent to — a group message is N
+/// one-to-one sends, so there is no single namespace holding them. An outgoing
+/// message appears once despite having a row per recipient: they share an id.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_groups_history(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.groups_history(&read_json(json)?))()))
+}
+
 /// Create a Space: `{name}` → `{space}`.
 ///
 /// # Safety

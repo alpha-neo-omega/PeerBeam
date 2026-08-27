@@ -404,6 +404,55 @@ abstract class PeerBeamApi {
   /// thrown error — offline is ordinary here.
   Future<UpdateCheck> checkForUpdates();
 
+  /// The groups this device is in, and the invitations waiting for an answer.
+  ///
+  /// Both in one call because an invitation is the only way into a group: one
+  /// that arrived while the app was closed would otherwise stay invisible.
+  Future<GroupsView> groups();
+
+  /// Create a group holding only this device.
+  ///
+  /// Members are invited and join when **they** accept — nothing here can add
+  /// somebody else's device to a group they never agreed to.
+  Future<Group> createGroup(String name);
+
+  /// Rename a group **on this device only**. Names are never shared.
+  Future<Group> renameGroup(String id, String name);
+
+  /// Turn an invitation down. Local and silent — the inviter is not told.
+  Future<bool> declineGroupInvite(String group);
+
+  /// Offer [peer] a place in [id].
+  ///
+  /// An offer, not an enrolment. The roster travels with it, so they see who is
+  /// already in the group — and everyone in it sees them if they accept.
+  /// **Say so before calling this.**
+  ///
+  /// Returns once queued; the dial happens in the background so the calling
+  /// isolate is never blocked.
+  Future<void> inviteToGroup(String id, PeerTarget peer);
+
+  /// Accept an invitation.
+  ///
+  /// [peers] is how to reach the members — the engine holds ids, the app holds
+  /// routes. A member that cannot be reached now is told at next contact.
+  Future<Group> acceptGroupInvite(String group, List<PeerTarget> peers);
+
+  /// Leave a group: tell whoever can be reached, then forget it here.
+  ///
+  /// Forgotten whether or not anyone heard. A member that missed the message
+  /// may keep sending; withhold `chat` from that device to refuse it.
+  Future<void> leaveGroup(String id, List<PeerTarget> peers);
+
+  /// Send [text] to every member this device may message.
+  ///
+  /// Returns the shared message id and the members that were **skipped**, named
+  /// rather than silently dropped.
+  Future<GroupSendResult> sendToGroup(String id, String text);
+
+  /// A group's messages, gathered across its members.
+  Future<List<ChatMessage>> groupHistory(String group);
+
   /// Every Space this device keeps.
   Future<List<Space>> spaces();
 
@@ -1105,6 +1154,81 @@ class PeerBeam implements PeerBeamApi {
   Future<int> clipboardHistoryClear() async {
     final data = _data(_req().clipHistoryClear('{}'));
     return (data['cleared'] as num?)?.toInt() ?? 0;
+  }
+
+  @override
+  Future<GroupsView> groups() async {
+    final data = _data(_req().groupsList('{}'));
+    return GroupsView(
+      groups: _list(data['groups']).map(Group.fromJson).toList(),
+      invites: _list(data['invites']).map(GroupInvite.fromJson).toList(),
+    );
+  }
+
+  @override
+  Future<Group> createGroup(String name) async {
+    final data = _data(_req().groupsCreate(jsonEncode({'name': name})));
+    return Group.fromJson(data['group'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<Group> renameGroup(String id, String name) async {
+    final data = _data(
+      _req().groupsRename(jsonEncode({'id': id, 'name': name})),
+    );
+    return Group.fromJson(data['group'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<bool> declineGroupInvite(String group) async {
+    final data = _data(_req().groupsDecline(jsonEncode({'group': group})));
+    return data['declined'] == true;
+  }
+
+  @override
+  Future<void> inviteToGroup(String id, PeerTarget peer) async {
+    _data(_req().groupsInvite(jsonEncode({'id': id, 'peer': peer.toJson()})));
+  }
+
+  @override
+  Future<Group> acceptGroupInvite(String group, List<PeerTarget> peers) async {
+    final data = _data(
+      _req().groupsAccept(
+        jsonEncode({
+          'group': group,
+          'peers': peers.map((p) => p.toJson()).toList(),
+        }),
+      ),
+    );
+    return Group.fromJson(data['group'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<void> leaveGroup(String id, List<PeerTarget> peers) async {
+    _data(
+      _req().groupsLeave(
+        jsonEncode({
+          'id': id,
+          'peers': peers.map((p) => p.toJson()).toList(),
+        }),
+      ),
+    );
+  }
+
+  @override
+  Future<GroupSendResult> sendToGroup(String id, String text) async {
+    final data = _data(_req().groupsSend(jsonEncode({'id': id, 'text': text})));
+    return GroupSendResult(
+      id: data['id'] as String? ?? '',
+      sent: (data['sent'] as num?)?.toInt() ?? 0,
+      skipped: [...?(data['skipped'] as List<dynamic>?)?.whereType<String>()],
+    );
+  }
+
+  @override
+  Future<List<ChatMessage>> groupHistory(String group) async {
+    final data = _data(_req().groupsHistory(jsonEncode({'group': group})));
+    return _list(data['messages']).map(ChatMessage.fromJson).toList();
   }
 
   @override

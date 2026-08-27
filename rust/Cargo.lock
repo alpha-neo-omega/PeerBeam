@@ -1587,6 +1587,7 @@ dependencies = [
  "peerbeam-discovery-udp",
  "peerbeam-domain",
  "peerbeam-engine",
+ "peerbeam-groups",
  "peerbeam-identity-fs",
  "peerbeam-logs",
  "peerbeam-notes",

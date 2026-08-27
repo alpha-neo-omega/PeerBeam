@@ -79,6 +79,15 @@ class Bindings {
   final _ArgRetDart _chatReact;
   final _ArgRetDart _chatMarkRead;
   final _ArgRetDart _notesList;
+  final _ArgRetDart _groupsList;
+  final _ArgRetDart _groupsCreate;
+  final _ArgRetDart _groupsRename;
+  final _ArgRetDart _groupsDecline;
+  final _ArgRetDart _groupsInvite;
+  final _ArgRetDart _groupsAccept;
+  final _ArgRetDart _groupsLeave;
+  final _ArgRetDart _groupsSend;
+  final _ArgRetDart _groupsHistory;
   final _ArgRetDart _spacesList;
   final _ArgRetDart _spacesCreate;
   final _ArgRetDart _spacesRename;
@@ -202,6 +211,29 @@ class Bindings {
         'pb_chat_mark_read',
       ),
       _notesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_notes_list'),
+      _groupsList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_groups_list'),
+      _groupsCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_create',
+      ),
+      _groupsRename = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_rename',
+      ),
+      _groupsDecline = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_decline',
+      ),
+      _groupsInvite = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_invite',
+      ),
+      _groupsAccept = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_accept',
+      ),
+      _groupsLeave = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_leave',
+      ),
+      _groupsSend = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_groups_send'),
+      _groupsHistory = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_groups_history',
+      ),
       _spacesList = lib.lookupFunction<_ArgRetC, _ArgRetDart>('pb_spaces_list'),
       _spacesCreate = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_spaces_create',
@@ -342,6 +374,15 @@ class Bindings {
   String chatReact(String json) => _withArg(json, _chatReact);
   String chatMarkRead(String json) => _withArg(json, _chatMarkRead);
   String notesList(String json) => _withArg(json, _notesList);
+  String groupsList(String json) => _withArg(json, _groupsList);
+  String groupsCreate(String json) => _withArg(json, _groupsCreate);
+  String groupsRename(String json) => _withArg(json, _groupsRename);
+  String groupsDecline(String json) => _withArg(json, _groupsDecline);
+  String groupsInvite(String json) => _withArg(json, _groupsInvite);
+  String groupsAccept(String json) => _withArg(json, _groupsAccept);
+  String groupsLeave(String json) => _withArg(json, _groupsLeave);
+  String groupsSend(String json) => _withArg(json, _groupsSend);
+  String groupsHistory(String json) => _withArg(json, _groupsHistory);
   String spacesList(String json) => _withArg(json, _spacesList);
   String spacesCreate(String json) => _withArg(json, _spacesCreate);
   String spacesRename(String json) => _withArg(json, _spacesRename);

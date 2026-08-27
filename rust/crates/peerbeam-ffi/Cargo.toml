@@ -23,6 +23,7 @@ peerbeam-discovery-mdns = { path = "../peerbeam-discovery-mdns" }
 peerbeam-discovery-tailscale = { path = "../peerbeam-discovery-tailscale" }
 peerbeam-transfer = { path = "../peerbeam-transfer" }
 peerbeam-spaces = { path = "../peerbeam-spaces" }
+peerbeam-groups = { path = "../peerbeam-groups" }
 peerbeam-update = { path = "../peerbeam-update" }
 peerbeam-wake = { path = "../peerbeam-wake" }
 peerbeam-transfer-quic = { path = "../peerbeam-transfer-quic" }

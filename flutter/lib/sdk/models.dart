@@ -1334,3 +1334,126 @@ class WakeAttempt {
         .toList(growable: false),
   );
 }
+
+/// A group conversation: a set of devices that **all know about each other**.
+///
+/// # Not a [Space], and the difference is the whole point
+///
+/// A Space is a private label this device keeps. Nothing about it reaches a
+/// peer, so no member learns who else is in one — and the price is that there
+/// are no group replies.
+///
+/// A Group pays the opposite price and buys the conversation: every member
+/// holds the same roster, so a reply reaches everyone, and **every member
+/// learns who every other member is**. That disclosure is the entire cost of
+/// the feature, cannot be withdrawn once made, and must be stated to the user
+/// before they join rather than discovered afterwards.
+class Group {
+  final String id;
+  final String name;
+
+  /// Everyone in the group, this device included.
+  final List<String> members;
+
+  /// Members this device may still message — the ones a send actually reaches.
+  final List<String> reachable;
+
+  /// Members it may not: never approved, revoked, past a time-limited grant, or
+  /// with `chat` withheld. Kept and shown rather than dropped, because a list
+  /// that shrinks by itself leaves someone wondering whether they ever added a
+  /// device.
+  final List<String> unreachable;
+
+  const Group({
+    required this.id,
+    required this.name,
+    this.members = const [],
+    this.reachable = const [],
+    this.unreachable = const [],
+  });
+
+  factory Group.fromJson(Map<String, dynamic> j) => Group(
+    id: j['id'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    members: [...?(j['members'] as List<dynamic>?)?.whereType<String>()],
+    reachable: [...?(j['reachable'] as List<dynamic>?)?.whereType<String>()],
+    unreachable: [
+      ...?(j['unreachable'] as List<dynamic>?)?.whereType<String>(),
+    ],
+  );
+}
+
+/// An invitation received and not yet answered.
+///
+/// **Holding one is not being in a group.** Nothing is joined until this
+/// device's own user accepts, which is why invitations are kept apart from
+/// groups rather than shown among them.
+class GroupInvite {
+  /// The group being offered.
+  final String group;
+
+  /// The inviter's name for it — a suggestion, since names are local to each
+  /// device and are never reconciled.
+  final String name;
+
+  /// The device that offered.
+  final String from;
+
+  /// Who is already in it.
+  ///
+  /// **This is the disclosure.** Accepting means learning these devices and
+  /// being learned by them, so a surface must show this before the user
+  /// answers — not after.
+  final List<String> members;
+
+  /// When it arrived.
+  final DateTime at;
+
+  const GroupInvite({
+    required this.group,
+    required this.name,
+    required this.from,
+    this.members = const [],
+    required this.at,
+  });
+
+  factory GroupInvite.fromJson(Map<String, dynamic> j) => GroupInvite(
+    group: j['group'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    from: j['from'] as String? ?? '',
+    members: [...?(j['members'] as List<dynamic>?)?.whereType<String>()],
+    at: DateTime.tryParse(j['at'] as String? ?? '') ?? DateTime.now(),
+  );
+}
+
+/// What [PeerBeamApi.groups] answers: the groups this device is in, and the
+/// invitations waiting for an answer.
+///
+/// Both together because an invitation is the only way into a group: one that
+/// arrived while the app was closed would otherwise stay invisible until
+/// something else happened to fetch it.
+class GroupsView {
+  final List<Group> groups;
+  final List<GroupInvite> invites;
+
+  const GroupsView({this.groups = const [], this.invites = const []});
+}
+
+/// What a group send did: the shared message id, and who was skipped.
+class GroupSendResult {
+  /// The id every copy shares — what lets a transcript show the message once.
+  final String id;
+
+  /// How many members it was queued for.
+  final int sent;
+
+  /// Members this device may not message, **named** rather than dropped so a
+  /// surface can say who did not get it.
+  final List<String> skipped;
+
+  const GroupSendResult({
+    required this.id,
+    required this.sent,
+    this.skipped = const [],
+  });
+}

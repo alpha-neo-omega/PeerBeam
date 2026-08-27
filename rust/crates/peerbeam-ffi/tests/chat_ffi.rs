@@ -330,6 +330,23 @@ fn session_meta() -> TransferSession {
 /// yet. Retries in short steps for up to `budget` (test-only: panics if the
 /// listener never comes up in time, mirroring `send_message`'s own
 /// fail-after-budget convention).
+/// How long a test waits for the engine's listener to answer.
+///
+/// **Not a network budget — a scheduling one.** These tests dial an engine
+/// inside their own process, so the only thing being waited on is that
+/// process's listener finishing its bind. Five seconds was ample on an idle
+/// machine and not ample under `cargo test --workspace`, where a dozen test
+/// binaries compete for the same cores: `chat_only_dial_does_not_register_
+/// phantom_transfer` and `chat_received_into_ffi_and_history_round_trip` both
+/// failed this way on CI and locally, on all three platforms, while passing
+/// every time the suite ran alone.
+///
+/// A dial that has not connected in a minute is a real failure worth reporting;
+/// one that has not connected in five seconds is usually a busy machine, and
+/// reporting it as a bug wastes the reader's time and teaches them to re-run
+/// rather than read.
+const DIAL_BUDGET: Duration = Duration::from_secs(60);
+
 async fn dial_channels_retrying(
     quic: &QuicTransport,
     route: &Route,
@@ -701,8 +718,7 @@ async fn chat_received_into_ffi_and_history_round_trip() {
         // Bounded retry instead of a fixed sleep: the daemon's listener bind
         // races this dial, and a single unretried attempt right after
         // `pb_init` can flake if the bind hasn't landed yet.
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -806,8 +822,7 @@ async fn chat_only_dial_does_not_register_phantom_transfer() {
         // Bounded retry instead of a fixed sleep: the daemon's listener bind
         // races this dial, and a single unretried attempt right after
         // `pb_init` can flake if the bind hasn't landed yet.
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -1098,8 +1113,7 @@ async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
     let route = direct_route("127.0.0.1", port);
 
     let send_fut = async {
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -1223,8 +1237,7 @@ async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
     let file_ref_id = file_ref.id.clone();
 
     let send_fut = async {
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -1384,8 +1397,7 @@ async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     let shared_id = file_ref.id.clone();
 
     let send_fut = async {
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -1989,8 +2001,7 @@ async fn undecodable_first_frame_falls_back_to_a_minted_id_and_placeholder() {
     let route = direct_route("127.0.0.1", port);
 
     let send_fut = async {
-        let qc =
-            dial_channels_retrying(&quic, &route, &session_meta(), Duration::from_secs(5)).await;
+        let qc = dial_channels_retrying(&quic, &route, &session_meta(), DIAL_BUDGET).await;
         let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
         let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
         let trust: Arc<dyn TrustStore> = Arc::new(trust);

@@ -529,6 +529,10 @@ pub struct Manager {
     notes: peerbeam_notes::NoteStore,
     /// Named local sets of trusted peers. Purely a label — see `peerbeam-spaces`.
     spaces: peerbeam_spaces::SpaceStore,
+    /// Groups: rosters every member holds, and the invitations waiting for an
+    /// answer. Unlike a Space this **is** on the wire, which is the whole trade
+    /// — see `peerbeam-groups` and amendment A2.
+    groups: peerbeam_groups::GroupStore,
     /// Hardware addresses this device remembers, so a sleeping machine of the
     /// user's own can be started. Local network only — see `peerbeam-wake`.
     wake: peerbeam_wake::WakeStore,
@@ -646,6 +650,18 @@ pub(crate) type Op = Result<Value, (Code, String)>;
 /// Validation problems are the caller's to fix and say so; a storage failure is
 /// ours. Collapsing them all to `Internal` would tell a user typing a duplicate
 /// name that the app broke.
+fn group_err(e: peerbeam_groups::GroupError) -> (Code, String) {
+    use peerbeam_groups::GroupError as E;
+    match e {
+        // No `NotFound` in this enum: a named group that is not here is an
+        // argument that does not identify anything, which is what
+        // `InvalidArgument` already means to every surface reading it.
+        E::UnknownGroup { .. } => (Code::InvalidArgument, e.to_string()),
+        E::Unreadable { .. } | E::Unwritable { .. } => (Code::Storage, e.to_string()),
+        _ => (Code::InvalidArgument, e.to_string()),
+    }
+}
+
 fn space_err(e: peerbeam_spaces::SpaceError) -> (Code, String) {
     use peerbeam_spaces::SpaceError as E;
     match e {
@@ -693,6 +709,11 @@ impl Manager {
             enc,
             // Built before `trust` and `appstore` are moved into the struct.
             spaces: peerbeam_spaces::SpaceStore::new(appstore.clone(), trust.clone()),
+            groups: peerbeam_groups::GroupStore::new(
+                appstore.clone(),
+                trust.clone(),
+                identity.device_id.clone(),
+            ),
             wake: peerbeam_wake::WakeStore::new(appstore.clone()),
             trust,
             chat,
@@ -4257,6 +4278,321 @@ impl Manager {
         let id = Self::str_field(req, "id")?;
         let device = DeviceId::from(Self::str_field(req, "device")?);
         Ok(json!({ "removed": self.spaces.remove_member(&id, &device).map_err(space_err)? }))
+    }
+
+    /// `{}` → `{"groups":[…],"invites":[…]}`.
+    ///
+    /// Both in one call because a surface showing groups must show pending
+    /// invitations beside them — an invitation is the only way into a group,
+    /// and one that arrived while the app was closed would otherwise be
+    /// invisible until something else happened to fetch it.
+    ///
+    /// Each group carries `reachable` and `unreachable` so a surface can name
+    /// the members it cannot message rather than quietly showing a shorter
+    /// list (A2, condition 3).
+    pub fn groups_list(&self, _req: &Value) -> Op {
+        let groups = self.groups.list().map_err(group_err)?;
+        let mut out = Vec::with_capacity(groups.len());
+        for g in &groups {
+            let (live, stale) = self.groups.reachable(&g.id).map_err(group_err)?;
+            out.push(json!({
+                "id": g.id,
+                "name": g.name,
+                "members": g.members.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+                "reachable": live.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+                "unreachable": stale.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+            }));
+        }
+        let invites: Vec<Value> = self
+            .groups
+            .invites()
+            .map_err(group_err)?
+            .iter()
+            .map(|i| {
+                json!({
+                    "group": i.group,
+                    "name": i.name,
+                    "from": i.from.0,
+                    "members": i.members.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+                    "at": i.at,
+                })
+            })
+            .collect();
+        Ok(json!({ "groups": out, "invites": invites }))
+    }
+
+    /// `{"name"}` → `{"group":{…}}`.
+    ///
+    /// Holds only this device. Members are added by inviting them and join when
+    /// **they** accept — a create that took a member list would enrol other
+    /// people's devices in something they never agreed to (A2, condition 4).
+    pub fn groups_create(&self, req: &Value) -> Op {
+        let name = Self::str_field(req, "name")?;
+        let g = self.groups.create(&name).map_err(group_err)?;
+        Ok(json!({ "group": { "id": g.id, "name": g.name } }))
+    }
+
+    /// `{"id","name"}` → `{"group":{…}}`. Local only; names are not shared.
+    pub fn groups_rename(&self, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let name = Self::str_field(req, "name")?;
+        let g = self.groups.rename(&id, &name).map_err(group_err)?;
+        Ok(json!({ "group": { "id": g.id, "name": g.name } }))
+    }
+
+    /// `{"group"}` → `{"declined":bool}` — turn an invitation down.
+    ///
+    /// Local and silent: the inviter is **not** told. Telling them would say
+    /// "this device saw your invitation and refused", which is a fact about the
+    /// user that nobody asked to publish; ignoring an offer is allowed to look
+    /// exactly like never having seen it.
+    pub fn groups_decline(&self, req: &Value) -> Op {
+        let group = Self::str_field(req, "group")?;
+        Ok(json!({ "declined": self.groups.forget_invite(&group).map_err(group_err)? }))
+    }
+
+    /// The `peers` array a group verb is given: how to reach each member.
+    ///
+    /// The engine holds a roster of **ids**; routes come from discovery, which
+    /// the app already has. Passing them in keeps one device list rather than
+    /// two that can disagree, and matches how every other peer-addressed call
+    /// here works.
+    ///
+    /// Absent or empty is not an error — it means "nobody reachable right now",
+    /// and the members simply find out at next contact. A group that refused to
+    /// be left because nobody was online would trap the user in it.
+    fn peers_field(req: &Value) -> Result<Vec<Device>, (Code, String)> {
+        let Some(list) = req.get("peers").and_then(|v| v.as_array()) else {
+            return Ok(Vec::new());
+        };
+        // One bad entry is skipped rather than failing the verb: the others are
+        // still worth telling, and an app that sent a malformed peer should not
+        // be able to stop somebody leaving a group.
+        Ok(list
+            .iter()
+            .filter_map(|p| device_from(Some(p)).ok())
+            .collect())
+    }
+
+    /// Dial one member and push a single membership frame.
+    ///
+    /// **Background, never blocking.** Every `pb_*` call is synchronous and the
+    /// app makes them from the isolate that draws, so a verb that dialled
+    /// inline would freeze the interface for as long as the peer took to
+    /// answer — the failure mode `BROWSE_BUDGET` and `RING_BUDGET` exist to
+    /// bound. These spawn and report through an event instead, so the UI stays
+    /// alive and learns what happened when it happens.
+    fn group_control(
+        self: &Arc<Self>,
+        device: Device,
+        group: String,
+        kind: &'static str,
+        message_type: peerbeam_domain::session::MessageType,
+        payload: Vec<u8>,
+    ) {
+        let me = self.clone();
+        crate::runtime::spawn(async move {
+            let meta = me.session(&format!("group-{}", device.id.0), device.id.clone(), 0);
+            let outcome = match crate::session_exec::dial(
+                &me.quic,
+                &me.rm,
+                &device,
+                &meta,
+                me.identity(),
+                me.enc.clone(),
+                me.trust.clone(),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(session) => {
+                    // Asked of the identity that actually answered, not the id
+                    // dialled: a route can resolve to a different device, and
+                    // the permission is about whoever picked up.
+                    let peer = DeviceId::from(session.peer_id.clone());
+                    if peerbeam_chat::may_exchange_chat(me.trust.as_ref(), &peer) {
+                        peerbeam_chat::send_foreign(&session.handle, message_type, payload)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        Err("this device may not exchange messages".to_string())
+                    }
+                }
+                Err((_, why)) => Err(why),
+            };
+            events::event(&json!({
+                "type": "group_control",
+                "kind": kind,
+                "group": group,
+                "device": device.id.0,
+                "ok": outcome.is_ok(),
+                "error": outcome.err(),
+                "timestamp": timestamp(),
+            }));
+        });
+    }
+
+    /// `{"id","peer"}` → `{"queued":true}` — offer a device a place.
+    ///
+    /// An **offer**, not an enrolment: nothing changes on their device until
+    /// their own user accepts (A2, condition 4). The roster travels with it, so
+    /// the invitee learns who is already in the group — and everyone in it
+    /// learns them if they accept. A surface must say so before sending.
+    pub fn groups_invite(self: &Arc<Self>, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let device = device_from(req.get("peer"))?;
+        let group = self.groups.get(&id).map_err(group_err)?;
+        let invite = peerbeam_groups::GroupInvite {
+            group: group.id.clone(),
+            name: group.name.clone(),
+            members: group.members.clone(),
+        };
+        let payload = serde_json::to_vec(&invite).map_err(|e| (Code::Internal, e.to_string()))?;
+        self.group_control(
+            device,
+            group.id,
+            "invite",
+            peerbeam_groups::GroupInvite::message_type(),
+            payload,
+        );
+        Ok(json!({ "queued": true }))
+    }
+
+    /// `{"group"}` → `{"group":{…}}` — accept an invitation.
+    ///
+    /// The roster is adopted **before** anyone is told, so a join whose
+    /// announcements half-fail leaves this device in the group it agreed to
+    /// join rather than in nothing. Members who did not hear find out at next
+    /// contact; there is nobody to ask for the truth, which is the point.
+    pub fn groups_accept(self: &Arc<Self>, req: &Value) -> Op {
+        let group_id = Self::str_field(req, "group")?;
+        let pending = self
+            .groups
+            .invite(&group_id)
+            .map_err(group_err)?
+            .ok_or((Code::InvalidArgument, "no such invitation".into()))?;
+        let joined = self
+            .groups
+            .adopt(&pending.group, &pending.name, &pending.members)
+            .map_err(group_err)?;
+        self.groups
+            .forget_invite(&pending.group)
+            .map_err(group_err)?;
+
+        let announce = peerbeam_groups::GroupJoined {
+            group: joined.id.clone(),
+        };
+        let payload = serde_json::to_vec(&announce).map_err(|e| (Code::Internal, e.to_string()))?;
+        // **The caller supplies how to reach each member.** The engine holds a
+        // roster of ids, not routes: routes come from discovery, which the app
+        // already has in front of it. Matching the ids here rather than
+        // re-resolving them keeps one device list rather than two that can
+        // disagree — and a member the app cannot see is simply not told yet,
+        // which is the same "they find out at next contact" this design accepts
+        // everywhere else.
+        for device in Self::peers_field(req)?
+            .into_iter()
+            .filter(|d| pending.members.contains(&d.id))
+        {
+            self.group_control(
+                device,
+                joined.id.clone(),
+                "joined",
+                peerbeam_groups::GroupJoined::message_type(),
+                payload.clone(),
+            );
+        }
+        events::event(&json!({ "type": "groups_changed", "timestamp": timestamp() }));
+        Ok(json!({ "group": { "id": joined.id, "name": joined.name } }))
+    }
+
+    /// `{"id"}` → `{"left":true}` — tell the members, then forget it here.
+    ///
+    /// Forgotten whether or not anyone heard: leaving is a decision about this
+    /// device. A member that missed the message may keep sending, and the only
+    /// thing that refuses it is withholding `chat` from that device — a
+    /// decision about the device rather than about a label.
+    pub fn groups_leave(self: &Arc<Self>, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let group = self.groups.get(&id).map_err(group_err)?;
+        let msg = peerbeam_groups::GroupLeft {
+            group: group.id.clone(),
+        };
+        let payload = serde_json::to_vec(&msg).map_err(|e| (Code::Internal, e.to_string()))?;
+        let (live, _stale) = self.groups.reachable(&group.id).map_err(group_err)?;
+        for device in Self::peers_field(req)?
+            .into_iter()
+            .filter(|d| live.contains(&d.id))
+        {
+            self.group_control(
+                device,
+                group.id.clone(),
+                "left",
+                peerbeam_groups::GroupLeft::message_type(),
+                payload.clone(),
+            );
+        }
+        self.groups.forget(&group.id).map_err(group_err)?;
+        events::event(&json!({ "type": "groups_changed", "timestamp": timestamp() }));
+        Ok(json!({ "left": true }))
+    }
+
+    /// `{"id","text"}` → `{"id":…,"sent":N,"skipped":[…]}` — message everyone.
+    ///
+    /// **N ordinary sends, one id.** Each copy is enqueued in the member's own
+    /// outbox, so an unreachable member's copy is delivered later by the same
+    /// drain a one-to-one message uses — because that is exactly what it is.
+    /// The message id is minted once and shared, which is what lets a
+    /// transcript show it once instead of once per member.
+    ///
+    /// Members this device may not message are **named** in `skipped`, never
+    /// silently dropped (A2, condition 3).
+    pub fn groups_send(self: &Arc<Self>, req: &Value) -> Op {
+        let id = Self::str_field(req, "id")?;
+        let text = Self::str_field(req, "text")?;
+        let group = self.groups.get(&id).map_err(group_err)?;
+        let (live, stale) = self.groups.reachable(&group.id).map_err(group_err)?;
+        if live.is_empty() {
+            return Err((
+                Code::PermissionDenied,
+                format!("{} has nobody this device may message", group.name),
+            ));
+        }
+        let mut msg = peerbeam_chat::ChatMessage::new(&text)
+            .map_err(|e| (Code::InvalidArgument, e.to_string()))?;
+        msg.group = Some(group.id.clone());
+
+        // **Enqueued and left to the drain.** Every copy goes into the
+        // member's own outbox, and the periodic flush already delivers those
+        // the moment a peer is online — the same machinery a one-to-one message
+        // uses, because that is exactly what each copy is. Dialling here would
+        // duplicate it and would need routes the engine does not hold.
+        for member in &live {
+            self.chat
+                .enqueue(member, &msg)
+                .map_err(|e| (Code::Internal, e.to_string()))?;
+        }
+        Ok(json!({
+            "id": msg.id,
+            "sent": live.len(),
+            "skipped": stale.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `{"group"}` → `{"messages":[…]}` — a group's transcript.
+    ///
+    /// Gathered across the members it was sent to, because that is where the
+    /// copies are: a group message is N one-to-one sends, so there is no group
+    /// namespace to read. An outgoing message appears **once** despite having
+    /// one row per recipient — they share an id.
+    pub fn groups_history(&self, req: &Value) -> Op {
+        let group = Self::str_field(req, "group")?;
+        let rows = self
+            .chat
+            .group_history(&group)
+            .map_err(|e| (Code::Storage, e.to_string()))?;
+        Ok(json!({ "messages": rows.iter().map(crate::events::record_dto).collect::<Vec<_>>() }))
     }
 
     /// `{"device","mine":bool}` → `{"changed":bool}`.

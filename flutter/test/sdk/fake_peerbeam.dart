@@ -340,6 +340,111 @@ class FakePeerBeam implements PeerBeamApi {
     return changed;
   }
 
+  // ── groups ────────────────────────────────────────────────────
+
+  /// Groups this fake reports. Tests set it directly.
+  List<Group> groupsList = [];
+
+  /// Invitations waiting for an answer.
+  List<GroupInvite> groupInvites = [];
+
+  /// Every `sendToGroup` call, in order — so a test can assert what the UI
+  /// actually asked the engine for rather than what it drew afterwards.
+  final List<({String id, String text})> groupSends = [];
+
+  /// Every `inviteToGroup` call.
+  final List<({String id, String peer})> groupInviteCalls = [];
+
+  /// Every `acceptGroupInvite` call, with how many peers it was given.
+  final List<({String group, int peers})> groupAccepts = [];
+
+  /// Members `sendToGroup` reports as skipped.
+  List<String> groupSkipped = [];
+
+  @override
+  Future<GroupsView> groups() async =>
+      GroupsView(groups: groupsList, invites: groupInvites);
+
+  @override
+  Future<Group> createGroup(String name) async {
+    _maybeFail('createGroup');
+    final g = Group(id: 'g-${groupsList.length + 1}', name: name);
+    groupsList = [...groupsList, g];
+    return g;
+  }
+
+  @override
+  Future<Group> renameGroup(String id, String name) async {
+    _maybeFail('renameGroup');
+    groupsList = [
+      for (final g in groupsList)
+        if (g.id != id)
+          g
+        else
+          Group(
+            id: g.id,
+            name: name,
+            members: g.members,
+            reachable: g.reachable,
+            unreachable: g.unreachable,
+          ),
+    ];
+    return groupsList.firstWhere((g) => g.id == id);
+  }
+
+  @override
+  Future<bool> declineGroupInvite(String group) async {
+    _maybeFail('declineGroupInvite');
+    final before = groupInvites.length;
+    groupInvites = groupInvites.where((i) => i.group != group).toList();
+    return groupInvites.length != before;
+  }
+
+  @override
+  Future<void> inviteToGroup(String id, PeerTarget peer) async {
+    _maybeFail('inviteToGroup');
+    groupInviteCalls.add((id: id, peer: peer.id ?? peer.name));
+  }
+
+  @override
+  Future<Group> acceptGroupInvite(String group, List<PeerTarget> peers) async {
+    _maybeFail('acceptGroupInvite');
+    groupAccepts.add((group: group, peers: peers.length));
+    final invite = groupInvites.firstWhere((i) => i.group == group);
+    final g = Group(
+      id: invite.group,
+      name: invite.name,
+      members: [...invite.members, 'pb-me'],
+      reachable: invite.members,
+    );
+    groupsList = [...groupsList, g];
+    groupInvites = groupInvites.where((i) => i.group != group).toList();
+    return g;
+  }
+
+  @override
+  Future<void> leaveGroup(String id, List<PeerTarget> peers) async {
+    _maybeFail('leaveGroup');
+    groupsList = groupsList.where((g) => g.id != id).toList();
+  }
+
+  @override
+  Future<GroupSendResult> sendToGroup(String id, String text) async {
+    _maybeFail('sendToGroup');
+    groupSends.add((id: id, text: text));
+    return GroupSendResult(
+      id: 'm-${groupSends.length}',
+      sent: 1,
+      skipped: groupSkipped,
+    );
+  }
+
+  /// Messages a group transcript returns.
+  List<ChatMessage> groupMessages = [];
+
+  @override
+  Future<List<ChatMessage>> groupHistory(String group) async => groupMessages;
+
   /// Set to make [trustRemove] throw, so a test can drive the refusal path.
   Object? trustRemoveError;
 
