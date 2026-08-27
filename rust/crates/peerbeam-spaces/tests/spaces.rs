@@ -39,6 +39,7 @@ fn pin(trust: &FsTrust, id: &str, expires_at: Option<chrono::DateTime<Utc>>) {
             permissions: PermissionSet::granted_on_approval(),
             expires_at,
             mine: false,
+            auto_accept: false,
         })
         .expect("pin a device");
 }

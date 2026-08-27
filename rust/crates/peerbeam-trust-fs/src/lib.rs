@@ -158,6 +158,15 @@ impl FsTrust {
                         } else {
                             local.mine
                         },
+                        // Fail-closed, like the fields above it that grant
+                        // something. Auto-accept does not widen what a device
+                        // may do, but it does remove the user's chance to say
+                        // no, so a copy where someone turned it back off must
+                        // win: the cost of losing it is one extra prompt, and
+                        // the cost of resurrecting it is a file written to disk
+                        // by a device the user had just decided to be asked
+                        // about.
+                        auto_accept: local.auto_accept && disk_rec.auto_accept,
                     };
                     cache.insert(id, merged);
                 }
@@ -281,6 +290,46 @@ impl FsTrust {
         pin_satisfied: bool,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        self.approve_with(
+            device,
+            pin_satisfied,
+            expires_at,
+            PermissionSet::granted_on_approval(),
+        )
+        .map(|_| ())
+    }
+
+    /// [`approve_gated`](Self::approve_gated), choosing the initial permission
+    /// set, and **reporting whether the device was pinned at all**.
+    ///
+    /// Two things this adds, both because a surface other than the accept-a-
+    /// transfer flow now calls approval directly.
+    ///
+    /// **`grant` replaces the frozen default.** `PermissionSet::none()` is the
+    /// *trust it, share nothing* case: the user vouches for the key — the
+    /// device stops being a stranger, stops re-prompting as first contact — and
+    /// grants it no capability at all. That is closer to invariant I6's
+    /// "explicit, revocable, per-capability consent" than approval's historical
+    /// grant-five-at-once, so it is offered rather than merely tolerated.
+    /// Still written **only on the transition to approved**, so re-approving an
+    /// already-approved device can neither widen nor narrow what the user left
+    /// it — a "trust without sharing" tap must not silently revoke five
+    /// permissions a device has been using.
+    ///
+    /// **Returns `false` when there is no record.** [`approve_gated`] returns
+    /// `Ok(())` for a device that was never pinned, which is right for its
+    /// caller — the accept path has just pinned the peer — and quietly wrong
+    /// for a button: a surface would report success and show the device as
+    /// trusted while the store held nothing. Approval refines a pinned key and
+    /// cannot conjure one; TOFU pins on the handshake, so a device this machine
+    /// has never spoken to has no key to vouch for.
+    pub fn approve_with(
+        &self,
+        device: &DeviceId,
+        pin_satisfied: bool,
+        expires_at: Option<DateTime<Utc>>,
+        grant: PermissionSet,
+    ) -> Result<bool> {
         if !pin_satisfied {
             return Err(DomainError::Encryption(format!(
                 "device {} cannot be approved: PIN pairing is required and has \
@@ -289,26 +338,27 @@ impl FsTrust {
             )));
         }
         let mut cache = self.cache.lock().unwrap();
-        if let Some(record) = cache.get_mut(&device.0) {
-            let mut changed = false;
-            // Keyed on the stored bit, not on whether the grant is *live*: an
-            // expired device is still one the user approved once, so renewing it
-            // must restore the permissions they actually left it rather than
-            // resurrecting the frozen five they had narrowed.
-            if !record.approved {
-                record.approved = true;
-                record.permissions = PermissionSet::granted_on_approval();
-                changed = true;
-            }
-            if record.expires_at != expires_at {
-                record.expires_at = expires_at;
-                changed = true;
-            }
-            if changed {
-                self.persist(&mut cache, &[device.0.as_str()])?;
-            }
+        let Some(record) = cache.get_mut(&device.0) else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        // Keyed on the stored bit, not on whether the grant is *live*: an
+        // expired device is still one the user approved once, so renewing it
+        // must restore the permissions they actually left it rather than
+        // resurrecting the frozen five they had narrowed.
+        if !record.approved {
+            record.approved = true;
+            record.permissions = grant;
+            changed = true;
         }
-        Ok(())
+        if record.expires_at != expires_at {
+            record.expires_at = expires_at;
+            changed = true;
+        }
+        if changed {
+            self.persist(&mut cache, &[device.0.as_str()])?;
+        }
+        Ok(true)
     }
 
     /// Grant or withhold one permission for a pinned device.
@@ -380,6 +430,54 @@ impl FsTrust {
         self.persist(&mut cache, &[device.0.as_str()])?;
         Ok(true)
     }
+
+    /// Stop asking about this one device's files, or start asking again.
+    ///
+    /// Returns whether the store changed; `false` also covers a device that is
+    /// not pinned, which is not an error — there is no record to write it on,
+    /// and inventing one would pin a key nobody presented.
+    ///
+    /// **This is a prompt setting, not a permission.** It cannot admit a file
+    /// the `files` permission would refuse: the gate consults it only after
+    /// `may(Files)` has already said yes. Setting it on a device that may not
+    /// send files is inert.
+    pub fn set_auto_accept(&self, device: &DeviceId, auto_accept: bool) -> Result<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        self.refresh_one(&mut cache, &device.0);
+        let Some(record) = cache.get_mut(&device.0) else {
+            return Ok(false);
+        };
+        if record.auto_accept == auto_accept {
+            return Ok(false);
+        }
+        record.auto_accept = auto_accept;
+        self.persist(&mut cache, &[device.0.as_str()])?;
+        Ok(true)
+    }
+
+    /// Whether this device's files are accepted without asking.
+    ///
+    /// False for a device with no record, an unreadable store, or an expired
+    /// grant — see [`auto_accepts_at`](Self::auto_accepts_at) for why expiry
+    /// matters here.
+    #[must_use]
+    pub fn auto_accepts(&self, device: &DeviceId) -> bool {
+        self.auto_accepts_at(device, Utc::now())
+    }
+
+    /// [`auto_accepts`](Self::auto_accepts) against an explicit clock.
+    ///
+    /// Expiry is honoured: a device whose window has closed may nothing, so it
+    /// cannot be auto-accepting either. Reading the stored bit alone would let
+    /// a lapsed grant keep writing files to disk without asking — the exact
+    /// failure `expires_at` exists to prevent, reintroduced one field over.
+    #[must_use]
+    pub fn auto_accepts_at(&self, device: &DeviceId, now: DateTime<Utc>) -> bool {
+        self.lookup(device)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.auto_accept && r.is_approved_at(now))
+    }
 }
 
 /// A temp path next to `path`, unique per process and per call, so concurrent
@@ -445,6 +543,7 @@ mod tests {
             permissions: PermissionSet::none(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }
     }
 
@@ -640,6 +739,77 @@ mod tests {
         assert!(
             !trust.may(&device, Permission::Files),
             "a refused approval still granted a permission"
+        );
+    }
+
+    #[test]
+    fn approving_a_device_that_was_never_pinned_reports_it_rather_than_lying() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let stranger = DeviceId::from("pb-never-seen");
+
+        // No `record` call: this device has never completed a handshake, so
+        // there is no key to vouch for. Approval refines a pin; it cannot
+        // create one.
+        let found = trust
+            .approve_with(&stranger, true, None, PermissionSet::granted_on_approval())
+            .expect("a missing record is an answer, not an error");
+        assert!(
+            !found,
+            "approving an unpinned device must report false so a button can \
+             say so, rather than reporting success and showing it as trusted"
+        );
+        assert!(trust.lookup(&stranger).unwrap().is_none());
+        assert!(!trust.is_approved(&stranger));
+    }
+
+    #[test]
+    fn trust_without_sharing_approves_and_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let device = DeviceId::from("pb-quiet");
+        trust.record(record("pb-quiet", "fp")).unwrap();
+
+        assert!(trust
+            .approve_with(&device, true, None, PermissionSet::none())
+            .unwrap());
+
+        // Approved — so it is no longer a stranger and stops re-prompting as
+        // first contact...
+        assert!(trust.is_approved(&device));
+        // ...and may do precisely nothing, which is the whole point.
+        for permission in Permission::ALL {
+            assert!(
+                !trust.may(&device, permission),
+                "trust-without-sharing granted {permission:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn re_approving_never_rewrites_permissions_the_user_chose() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let device = DeviceId::from("pb-set");
+        trust.record(record("pb-set", "fp")).unwrap();
+        trust.approve(&device).unwrap();
+        trust
+            .set_permission(&device, Permission::Clipboard, false)
+            .unwrap();
+
+        // A second approval — including one asking for the empty set — must not
+        // touch the permissions. Otherwise "trust without sharing" tapped on an
+        // already-trusted device would silently revoke everything it has been
+        // using, and a plain re-approve would resurrect a permission the user
+        // deliberately turned off.
+        assert!(trust
+            .approve_with(&device, true, None, PermissionSet::none())
+            .unwrap());
+
+        assert!(trust.may(&device, Permission::Files), "files was revoked");
+        assert!(
+            !trust.may(&device, Permission::Clipboard),
+            "a revoked permission came back"
         );
     }
 
@@ -1412,6 +1582,7 @@ mod merge_tests {
             permissions: PermissionSet::granted_on_approval(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         })
         .unwrap();
 
@@ -1450,6 +1621,7 @@ mod merge_tests {
             permissions: PermissionSet::granted_on_approval(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         })
         .unwrap();
 
@@ -1488,6 +1660,7 @@ mod merge_tests {
             permissions: PermissionSet::granted_on_approval(),
             expires_at: Some(far),
             mine: false,
+            auto_accept: false,
         })
         .unwrap();
 

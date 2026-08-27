@@ -325,9 +325,14 @@ fn trust_subcommands_parse() {
     let cli = Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop"]).unwrap();
     match cli.command {
         Command::Trust(a) => match a.action {
-            TrustAction::Approve { device, duration } => {
+            TrustAction::Approve {
+                device,
+                duration,
+                no_share,
+            } => {
                 assert_eq!(device, "laptop");
                 assert_eq!(duration, None, "no `--for` means until revoked");
+                assert!(!no_share, "approving shares by default, as it always has");
             }
             _ => panic!("expected approve"),
         },
@@ -364,7 +369,9 @@ fn trust_approve_takes_an_optional_window() {
         Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop", "--for", "30m"]).unwrap();
     match cli.command {
         Command::Trust(a) => match a.action {
-            TrustAction::Approve { device, duration } => {
+            TrustAction::Approve {
+                device, duration, ..
+            } => {
                 assert_eq!(device, "laptop");
                 assert_eq!(duration.as_deref(), Some("30m"));
             }
@@ -374,6 +381,27 @@ fn trust_approve_takes_an_optional_window() {
     }
     // The flag needs a value: a bare `--for` must not silently mean "forever".
     assert!(Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop", "--for"]).is_err());
+}
+
+/// `--no-share` is the CLI half of "trust without sharing". Without it the GUI
+/// would offer a capability the CLI could not reach, which invariant I7
+/// forbids.
+#[test]
+fn trust_approve_can_grant_nothing() {
+    let cli =
+        Cli::try_parse_from(["peerbeam", "trust", "approve", "laptop", "--no-share"]).unwrap();
+    match cli.command {
+        Command::Trust(a) => match a.action {
+            TrustAction::Approve {
+                device, no_share, ..
+            } => {
+                assert_eq!(device, "laptop");
+                assert!(no_share);
+            }
+            _ => panic!("expected approve"),
+        },
+        _ => panic!("expected trust"),
+    }
 }
 
 /// `--yes` is what makes approval scriptable on a headless box; it is a global

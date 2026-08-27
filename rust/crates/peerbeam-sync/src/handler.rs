@@ -471,6 +471,7 @@ mod tests {
             permissions: PermissionSet::granted_on_approval(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }))
     }
 
@@ -556,6 +557,7 @@ mod tests {
                 .set(Permission::Files, files),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }))
     }
 

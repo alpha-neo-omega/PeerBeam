@@ -156,6 +156,38 @@ pub struct TrustRecord {
     /// [`Permission::Browse`]: crate::entity::Permission::Browse
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mine: bool,
+    /// Accept this device's files **without asking**, for this device alone.
+    ///
+    /// The engine already had a global *auto-accept trusted devices* setting,
+    /// which is all-or-nothing: turning it on to stop a phone you sync with
+    /// hourly from prompting also stops every other approved device prompting.
+    /// This is the same decision made per device, so the answer to "stop asking
+    /// me about *this* one" does not have to be given about all of them.
+    ///
+    /// # It widens nothing on its own
+    ///
+    /// This is a *prompt* setting, not a permission. It decides whether the
+    /// user is asked, never whether the device is allowed: the transfer gate
+    /// consults it only **after** `may(Files)` has already said yes, so a
+    /// device that is unapproved, expired, or narrowed to withhold `files` is
+    /// refused exactly as it would be with this false. Setting it on a device
+    /// that may not send files is therefore inert rather than dangerous —
+    /// `per_device_auto_accept_cannot_admit_what_files_would_refuse` holds that
+    /// shut as a property.
+    ///
+    /// # The upgrade rule
+    ///
+    /// `#[serde(default)]`, so a store written before this field existed loads
+    /// with `false` — every device keeps prompting, which is what those records
+    /// meant and the fail-closed direction besides. Defaulting to `true` would
+    /// silently stop asking about every device on the machine on upgrade, which
+    /// is the one change a user must never discover by finding a file already
+    /// on their disk.
+    ///
+    /// `skip_serializing_if` keeps an untouched record byte-identical to what
+    /// earlier builds wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_accept: bool,
 }
 
 impl TrustRecord {
@@ -279,6 +311,7 @@ mod tests {
             permissions: PermissionSet::granted_on_approval(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         };
         assert_eq!(
             record.effective_permissions_at(at(10, 1)),
@@ -487,6 +520,7 @@ mod tests {
                         permissions,
                         expires_at,
                         mine: false,
+                        auto_accept: false,
                     };
                     // Struct-update syntax, so "differs only in `mine`" is a
                     // fact about the construction rather than a claim in a

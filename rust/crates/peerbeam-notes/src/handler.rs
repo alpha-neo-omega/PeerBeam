@@ -132,6 +132,7 @@ mod tests {
                 .set(Permission::Notes, notes_permitted),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         })))
     }
 

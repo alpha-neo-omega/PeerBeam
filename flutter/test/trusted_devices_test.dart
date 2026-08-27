@@ -414,6 +414,85 @@ void main() {
     expect(find.textContaining('3 of $total allowed'), findsOneWidget);
   });
 
+  testWidgets('a pinned device can be trusted without receiving a file', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-seen', name: 'Unknown Box', approved: false),
+      ];
+    final state = await _open(tester, fake, scrollTo: 'Unknown Box');
+
+    // The row used to say "Accept a transfer from it to approve" and offer
+    // nothing — the engine and the CLI could both approve, the GUI could not.
+    await tester.tap(find.text('Trust'));
+    await tester.pumpAndSettle();
+
+    expect(fake.approveCalls, hasLength(1));
+    expect(fake.approveCalls.single.id, 'pb-seen');
+    expect(fake.approveCalls.single.share, isTrue);
+    expect(
+      state.trust.items.single.approved,
+      isTrue,
+      reason: 'the row must re-read as approved, not merely claim it',
+    );
+  });
+
+  testWidgets('trust-without-sharing approves and grants nothing', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-seen', name: 'Unknown Box', approved: false),
+      ];
+    final state = await _open(tester, fake, scrollTo: 'Unknown Box');
+
+    await tester.tap(find.text('Trust, share nothing'));
+    await tester.pumpAndSettle();
+
+    expect(fake.approveCalls.single.share, isFalse);
+    final device = state.trust.items.single;
+    expect(device.approved, isTrue, reason: 'it is no longer a stranger');
+    for (final permission in PeerBeamPermission.all) {
+      expect(
+        device.may(permission),
+        isFalse,
+        reason: 'trust-without-sharing granted $permission',
+      );
+    }
+  });
+
+  testWidgets('a device that never connected is told, not claimed as trusted', (
+    tester,
+  ) async {
+    // Pinned row on screen, but the engine answers `pinned: false` — the store
+    // lost it, or a concurrent revoke landed first.
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-seen', name: 'Unknown Box', approved: false),
+      ];
+    await _open(tester, fake, scrollTo: 'Unknown Box');
+    fake.trusted = const [];
+
+    await tester.tap(find.text('Trust'));
+    await tester.pumpAndSettle();
+
+    // It must say why rather than showing a device as trusted while the store
+    // holds nothing for it.
+    expect(find.textContaining('never connected'), findsOneWidget);
+  });
+
+  testWidgets('an approved device is offered no approve buttons', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)];
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    expect(find.byKey(const Key('approve-pb-mine')), findsNothing);
+    expect(find.text('Trust, share nothing'), findsNothing);
+  });
+
   testWidgets('a pinned-but-unapproved device is offered no permissions', (
     tester,
   ) async {

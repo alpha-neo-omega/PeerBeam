@@ -344,6 +344,7 @@ mod tests {
                 permissions: PermissionSet::granted_on_approval(),
                 expires_at: None,
                 mine: false,
+                auto_accept: false,
             }))
         }
     }

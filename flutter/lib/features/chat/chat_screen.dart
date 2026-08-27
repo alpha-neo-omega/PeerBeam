@@ -760,6 +760,15 @@ class _ChatScreenState extends State<ChatScreen> {
                   tooltip: 'Disappearing messages',
                   onPressed: _openRetention,
                 ),
+                // The per-device *stop asking about this one's files* switch.
+                //
+                // Here, and not only in Settings, because this is where the
+                // question is felt: a person watching a prompt appear for the
+                // fourth time from the device they are talking to should be
+                // able to answer it where they are. It is the same engine bit
+                // Settings would write, and the same one `peerbeam trust
+                // auto-accept` writes.
+                _AutoAcceptAction(peerId: widget.peerId, peerName: peer.name),
               ],
             ),
       // Desktop-only drag & drop for this one conversation — a transparent
@@ -2108,6 +2117,104 @@ class _ReplyMarker extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// The chat bar's *stop asking about this device's files* control.
+///
+/// # What it is, and what it very deliberately is not
+///
+/// It writes one engine bit — the same one `peerbeam trust auto-accept` writes
+/// — that decides whether an incoming transfer from **this** device raises the
+/// approval prompt. It is not a permission and cannot behave like one: the
+/// engine consults it only after the `files` permission has already admitted
+/// the transfer, so turning it on for a device that may not send files does
+/// nothing at all.
+///
+/// # Why it can be unavailable, and why that is stated
+///
+/// The bit lives on a trust record, so a device this machine has never
+/// completed a handshake with has nowhere to write it. Rather than draw a
+/// switch that silently fails, the entry is disabled and says why — the same
+/// rule the Devices menu follows for Wake and Browse.
+///
+/// An **unapproved** device is a second unavailable case, and a more important
+/// one: it may send nothing, so auto-accepting from it is meaningless, and a
+/// switch reading "on" against a device that is refused anyway would be a
+/// promise the engine does not keep. The engine reports `auto_accept` as
+/// *effective* for exactly this reason, so this never has to re-derive it.
+class _AutoAcceptAction extends StatelessWidget {
+  const _AutoAcceptAction({required this.peerId, required this.peerName});
+
+  final String peerId;
+  final String peerName;
+
+  Future<void> _set(BuildContext context, bool value) async {
+    final trust = AppScope.of(context).trust;
+    final error = await trust.setAutoAccept(peerId, value);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            error ??
+                (value
+                    ? "Files from $peerName will arrive without asking"
+                    : "You'll be asked about files from $peerName"),
+          ),
+        ),
+      );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final trust = AppScope.of(context).trust;
+    return AnimatedBuilder(
+      animation: trust,
+      builder: (context, _) {
+        final device = trust.byId(peerId);
+        final on = device?.autoAccept ?? false;
+        // Why it cannot be set, in the device's own terms. Null means it can.
+        final blocked = device == null
+            ? 'This device has not connected yet.'
+            : !device.approved
+            ? 'Trust this device first — it may send nothing yet.'
+            : !device.may(PeerBeamPermission.files)
+            ? 'This device may not send files.'
+            : null;
+        return PopupMenuButton<bool>(
+          icon: const Icon(Icons.more_vert_rounded),
+          tooltip: 'More',
+          onSelected: (v) => _set(context, v),
+          itemBuilder: (context) => [
+            PopupMenuItem<bool>(
+              enabled: blocked == null,
+              value: !on,
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                  on
+                      ? Icons.notifications_off_outlined
+                      : Icons.download_done_rounded,
+                ),
+                title: Text(
+                  on ? 'Ask about files again' : 'Accept files without asking',
+                ),
+                subtitle: Text(
+                  blocked ??
+                      (on
+                          ? "You'll see the approval prompt for $peerName again."
+                          : "$peerName's files will be saved straight away. "
+                                'Only this device.'),
+                ),
+                isThreeLine: blocked == null,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

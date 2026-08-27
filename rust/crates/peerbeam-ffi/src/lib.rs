@@ -449,6 +449,61 @@ pub unsafe extern "C" fn pb_trust_remove(json: *const c_char) -> *mut c_char {
     guard(|| error::envelope((|| runtime::manager()?.trust_remove(&read_json(json)?))()))
 }
 
+/// Approve a **pinned** device without waiting for a transfer to approve:
+/// `{id, share?}` → `{approved, pinned}`. Emits `trust_changed`.
+///
+/// `share` chooses the initial permission set and defaults to `true`:
+///
+/// * `true` — the frozen set approval has always granted (files, chat,
+///   clipboard, presence, pipe). Permissions added later stay opt-in.
+/// * `false` — **trust without sharing**. The key is vouched for, so the device
+///   stops being a stranger and stops re-prompting as first contact, and it is
+///   granted no capability whatever. Closer to invariant I6's per-capability
+///   consent than granting five at once, which is why it is offered.
+///
+/// Either way the set is written **only on the transition to approved**, so
+/// calling this against an already-approved device changes nothing about what
+/// it may do — `share: false` cannot be used to strip a device's permissions,
+/// and a second approval cannot resurrect one the user revoked.
+///
+/// `pinned` is `false` when this machine holds no key for the device. Approval
+/// refines a TOFU pin and cannot create one: a device that has never completed
+/// a handshake has nothing to vouch for, and this reports that rather than
+/// claiming a success the store does not reflect.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_approve(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.trust_approve(&read_json(json)?))()))
+}
+
+/// Stop asking about one device's files, or start asking again:
+/// `{id, auto_accept}` → `{changed}`. Emits `trust_changed`.
+///
+/// The engine's global *auto-accept trusted devices* setting is all-or-nothing;
+/// this is the same answer per device, so silencing one does not silence all.
+///
+/// **A prompt setting, not a permission.** It is consulted only after the
+/// `files` permission has already admitted the transfer, so it can never accept
+/// something that would otherwise be refused. It is also read as *effective*:
+/// a device whose approval window has closed is not auto-accepting, whatever
+/// its stored bit says.
+///
+/// `changed: false` means the store already read that way, or the device is not
+/// pinned; neither is an error.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_trust_set_auto_accept(json: *const c_char) -> *mut c_char {
+    guard(|| {
+        error::envelope((|| {
+            runtime::manager()?.trust_set_auto_accept(&read_json(json)?)
+        })())
+    })
+}
+
 /// Grant or withhold one per-device permission:
 /// `{id, permission, granted}` → `{changed}`. Emits `trust_changed`.
 ///

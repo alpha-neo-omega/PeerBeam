@@ -17,12 +17,18 @@
 //! free-disk reading, whatever was last copied, raw bytes onto a terminal's
 //! stdout — and each is only defensible as "my own devices".
 //!
-//! A device is **permitted** to do particular things. Approving grants every
-//! permission this build has; `permit` and `revoke-permission` narrow that
-//! afterwards, which is how "this laptop may sync files but must never read my
-//! clipboard" is expressed. Every gate re-reads the store per operation, so a
-//! revoke here stops that device's next message, clip, heartbeat or accept —
-//! not its next connection.
+//! A device is **permitted** to do particular things. Approving grants the
+//! *frozen approval set* — files, chat, clipboard, presence, pipe — and **not**
+//! every permission this build has: `notes` and `browse` were added after that
+//! set was frozen and stay opt-in, precisely so that a release cannot widen
+//! what an unreviewed device may do. `permit` and `revoke-permission` adjust
+//! it afterwards, which is how "this laptop may sync files but must never read
+//! my clipboard" is expressed, and how a device is granted `browse` so it can
+//! list the folders this machine shares. `approve --no-share` grants nothing at
+//! all: the key is vouched for and every capability is left to be granted one
+//! at a time. Every gate re-reads the store per operation, so a revoke here
+//! stops that device's next message, clip, heartbeat or accept — not its next
+//! connection.
 //!
 //! An approval can also be **time-limited**: `approve --for 30m` writes a
 //! deadline, and once it passes the device is back to being merely pinned — it
@@ -75,9 +81,12 @@ const FP_PREVIEW: usize = 16;
 pub fn trust(ctx: &Ctx, action: TrustAction, path_override: Option<&str>) -> CliResult {
     match action {
         TrustAction::List => list(ctx, path_override),
-        TrustAction::Approve { device, duration } => {
-            approve(ctx, &device, duration.as_deref(), path_override)
-        }
+        TrustAction::Approve {
+            device,
+            duration,
+            no_share,
+        } => approve(ctx, &device, duration.as_deref(), !no_share, path_override),
+        TrustAction::AutoAccept { device, no } => set_auto_accept(ctx, &device, !no, path_override),
         TrustAction::Revoke { device } => revoke(ctx, &device, path_override),
         TrustAction::Permit {
             device,
@@ -131,6 +140,62 @@ fn set_mine(ctx: &Ctx, device: &str, mine: bool, path_override: Option<&str>) ->
     } else {
         format!("{device} is no longer marked as yours")
     });
+    Ok(())
+}
+
+/// `peerbeam trust auto-accept <DEVICE> [--no]`.
+///
+/// **Not a permission.** This decides whether the user is *asked* about this
+/// device's files, never whether the device is *allowed* to send them: the
+/// admission gate consults it only after the `files` permission has already
+/// said yes. Setting it on a device that may not send files is inert, and it
+/// is reported as such rather than silently succeeding into nothing.
+fn set_auto_accept(
+    ctx: &Ctx,
+    device: &str,
+    auto_accept: bool,
+    path_override: Option<&str>,
+) -> CliResult {
+    let config = load_config(path_override)?;
+    let store = open_trust(&config)?;
+    let records = store.list();
+    let record = pick(ctx, &records, device)?;
+    let id = record.device.clone();
+
+    let changed = store
+        .set_auto_accept(&id, auto_accept)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    if ctx.json {
+        ctx.json_line(&json!({
+            "event": "trust_auto_accept",
+            "device": id.0,
+            "auto_accept": auto_accept,
+            "changed": changed,
+            "effective": store.auto_accepts(&id),
+        }));
+        return Ok(());
+    }
+
+    let name = if record.name.is_empty() {
+        &id.0
+    } else {
+        &record.name
+    };
+    ctx.line(&if auto_accept {
+        format!("{name}'s files will be accepted without asking")
+    } else {
+        format!("{name}'s files will be asked about")
+    });
+    // Say so rather than leaving the operator believing a setting is in force.
+    // `auto_accepts` is the *effective* answer: it reads approval and expiry
+    // too, so this catches both "never approved" and "the window closed".
+    if auto_accept && !store.auto_accepts(&id) {
+        ctx.line(&ctx.dim(
+            "  ...but it is not approved (or its approval has expired), so it \
+             may send nothing and this has no effect yet",
+        ));
+    }
     Ok(())
 }
 
@@ -429,7 +494,11 @@ pub fn approval_gate(assume_yes: bool, json: bool, answer: Option<bool>) -> Appr
 /// device?" invites yes; naming the clipboard invites a look at the hex, and
 /// naming the deadline — or its absence — is the difference between the two
 /// grants this command can write.
-pub fn approval_question(record: &TrustRecord, expires_at: Option<DateTime<Utc>>) -> String {
+pub fn approval_question(
+    record: &TrustRecord,
+    expires_at: Option<DateTime<Utc>>,
+    share: bool,
+) -> String {
     let window = match expires_at {
         None => "until revoked".to_string(),
         Some(at) => format!(
@@ -437,14 +506,29 @@ pub fn approval_question(record: &TrustRecord, expires_at: Option<DateTime<Utc>>
             at.to_rfc3339_opts(SecondsFormat::Secs, true)
         ),
     };
+    // This used to end "— every permission", which was wrong in two directions
+    // at once. It is not every permission: `notes` and `browse` were added
+    // after `granted_on_approval` was frozen and are not granted here, so a
+    // reader who approved a device and then found it could not list their
+    // shared folders had been told otherwise. And with `--no-share` nothing at
+    // all is granted. A confirmation prompt that overstates what it is about to
+    // do is the one kind of copy a security control must never carry.
+    let grants = if share {
+        "Approving lets this device receive this machine's presence status, clipboard\nand \
+         pipes, and exchange files and messages with it. It does **not** grant `notes`\nor \
+         `browse` — those stay opt-in via `trust grant-permission`. Narrow the rest\nwith \
+         `trust revoke-permission`."
+    } else {
+        "Approving vouches for this device's key and grants it **nothing**: it stops\ncounting \
+         as a stranger, and may do nothing at all until you grant a permission\nwith `trust \
+         grant-permission`."
+    };
     format!(
-        "  fingerprint  {}\n  pinned       {}\n  for          {}\nApproving lets this device \
-         receive this machine's presence status, clipboard and pipes,\nand exchange files and \
-         messages with it — every permission. Narrow it afterwards\nwith `trust \
-         revoke-permission`.\nApprove {} ({})?",
+        "  fingerprint  {}\n  pinned       {}\n  for          {}\n{}\nApprove {} ({})?",
         record.fingerprint,
         record.trusted_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         window,
+        grants,
         record.name,
         record.device.0,
     )
@@ -452,7 +536,13 @@ pub fn approval_question(record: &TrustRecord, expires_at: Option<DateTime<Utc>>
 
 /// `peerbeam trust approve <device> [--for DURATION]` — grant a pinned device
 /// standing, for a while or until it is revoked.
-fn approve(ctx: &Ctx, query: &str, window: Option<&str>, path_override: Option<&str>) -> CliResult {
+fn approve(
+    ctx: &Ctx,
+    query: &str,
+    window: Option<&str>,
+    share: bool,
+    path_override: Option<&str>,
+) -> CliResult {
     // Parsed before the store is opened or a device resolved, so `--for 30mn`
     // fails as a usage error immediately rather than after a prompt has been
     // answered — the same rule `permit` follows for permission names.
@@ -522,7 +612,7 @@ fn approve(ctx: &Ctx, query: &str, window: Option<&str>, path_override: Option<&
         let answer = if ctx.interactive {
             Some(prompt::confirm(
                 ctx,
-                &approval_question(record, expires_at),
+                &approval_question(record, expires_at, share),
                 false,
             ))
         } else {
@@ -533,7 +623,16 @@ fn approve(ctx: &Ctx, query: &str, window: Option<&str>, path_override: Option<&
         }
     }
 
-    store.approve_for(&record.device, expires_at)?;
+    // `approve_with`, so `--no-share` can ask for the empty set. It writes the
+    // permissions only on the transition to approved, which is why passing
+    // `none()` at a device that is already approved cannot strip it — see the
+    // flag's own documentation.
+    let grant = if share {
+        PermissionSet::granted_on_approval()
+    } else {
+        PermissionSet::none()
+    };
+    store.approve_with(&record.device, true, expires_at, grant)?;
     // Report the store, not the request. `FsTrust::approve` is documented as a
     // silent no-op for a device it does not hold — which is exactly what a
     // concurrent `trust revoke` in another process leaves behind — so without
@@ -858,6 +957,7 @@ mod tests {
             permissions,
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }
     }
 
@@ -934,7 +1034,7 @@ mod tests {
     #[test]
     fn the_question_shows_the_full_fingerprint_and_what_approval_grants() {
         let r = record("pb-a", "Laptop", false);
-        let q = approval_question(&r, None);
+        let q = approval_question(&r, None, true);
         assert!(
             q.contains(&r.fingerprint),
             "the fingerprint must be in it: {q}"
@@ -1072,16 +1172,49 @@ mod tests {
         );
     }
 
-    /// The approval prompt must say that approving grants **everything**, since
-    /// that is now a list rather than a single implied bundle.
+    /// The approval prompt must say what it grants — and must not overstate it.
+    ///
+    /// This test previously asserted the prompt said "every permission", which
+    /// was false in this build: `notes` and `browse` were added after
+    /// `granted_on_approval` was frozen and are not granted by approving. A
+    /// user who read that sentence, approved a device and then found it could
+    /// not list their shared folders had been told the opposite of the truth by
+    /// a confirmation prompt — the one place overstating is least excusable.
     #[test]
-    fn the_question_says_approval_grants_every_permission() {
-        let q = approval_question(&record("pb-a", "Laptop", false), None);
+    fn the_question_names_what_approval_grants_without_overstating_it() {
+        let q = approval_question(&record("pb-a", "Laptop", false), None, true);
         assert!(
-            q.contains("every permission"),
-            "the question must say how much it grants: {q}"
+            !q.contains("every permission"),
+            "approval does not grant every permission this build has: {q}"
+        );
+        for named in ["presence", "clipboard", "pipes", "files", "messages"] {
+            assert!(q.contains(named), "the question does not name {named}: {q}");
+        }
+        assert!(
+            q.contains("browse") && q.contains("notes"),
+            "it must say which permissions it does NOT grant: {q}"
         );
         assert!(q.contains("revoke-permission"), "and how to narrow it: {q}");
+    }
+
+    /// The `--no-share` prompt must promise nothing, in as many words.
+    #[test]
+    fn the_no_share_question_says_it_grants_nothing() {
+        let q = approval_question(&record("pb-a", "Laptop", false), None, false);
+        assert!(
+            q.contains("nothing"),
+            "trust-without-sharing must say it grants nothing: {q}"
+        );
+        assert!(
+            q.contains("grant-permission"),
+            "and how to grant something later: {q}"
+        );
+        // It must not read like the sharing variant: someone skimming two
+        // near-identical prompts is exactly who this distinction is for.
+        assert!(
+            !q.contains("exchange files and messages"),
+            "the no-share prompt describes powers it is not granting: {q}"
+        );
     }
 
     // ── time-limited trust ──────────────────────────────────────────────────
@@ -1201,14 +1334,14 @@ mod tests {
     fn the_question_names_the_window_or_says_there_is_none() {
         let r = record("pb-a", "Laptop", false);
 
-        let forever = approval_question(&r, None);
+        let forever = approval_question(&r, None, true);
         assert!(
             forever.contains("until revoked"),
             "an unlimited grant must say so: {forever}"
         );
 
         let deadline = now() + Duration::minutes(30);
-        let limited = approval_question(&r, Some(deadline));
+        let limited = approval_question(&r, Some(deadline), true);
         assert!(
             limited.contains("2026-08-17T12:30:00Z"),
             "a limited grant must name the instant it ends: {limited}"

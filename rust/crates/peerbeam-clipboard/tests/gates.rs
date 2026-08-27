@@ -264,6 +264,7 @@ impl peerbeam_domain::port::TrustStore for PermissiveTrust {
             permissions: peerbeam_domain::entity::PermissionSet::granted_on_approval(),
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }))
     }
     fn is_trusted(&self, _d: &DeviceId) -> bool {

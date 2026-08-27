@@ -134,6 +134,23 @@ abstract class PeerBeamApi {
   /// Pinned (trusted) devices, newest first.
   Future<List<TrustedDevice>> trustList();
 
+  /// Approve a **pinned** device without waiting for a transfer from it.
+  ///
+  /// Returns whether the device was pinned — `false` means this machine holds
+  /// no key for it, so there is nothing to vouch for. Approval refines a TOFU
+  /// pin and cannot create one: a device that has never completed a handshake
+  /// has never presented a key.
+  ///
+  /// [share] chooses the initial permissions. `true` grants the frozen approval
+  /// set (files, chat, clipboard, presence, pipe — never `notes` or `browse`,
+  /// which stay opt-in). `false` is **trust without sharing**: the key is
+  /// vouched for and nothing is granted.
+  ///
+  /// Either way the set is written only on the transition to approved, so
+  /// calling this on an already-approved device cannot widen or narrow what it
+  /// may do.
+  Future<bool> trustApprove(String id, {bool share = true});
+
   /// Revoke a pinned device. Returns whether it was pinned.
   Future<bool> trustRemove(String id);
 
@@ -148,6 +165,15 @@ abstract class PeerBeamApi {
   /// Throws `invalid_argument` for a name this engine does not know — a surface
   /// built against a newer engine is told rather than silently ignored.
   Future<bool> trustSetPermission(String id, String permission, bool granted);
+
+  /// Stop asking about this device's files, or start asking again. Returns
+  /// whether the store changed.
+  ///
+  /// A prompt setting, not a permission: the engine consults it only after the
+  /// `files` permission has already admitted the transfer, so this can never
+  /// accept what would otherwise be refused. Setting it on a device that may
+  /// not send files is inert.
+  Future<bool> trustSetAutoAccept(String id, bool autoAccept);
 
   /// Replace the ordered auto-save rule list. Returns how many were stored.
   ///
@@ -690,6 +716,14 @@ class PeerBeam implements PeerBeamApi {
   }
 
   @override
+  Future<bool> trustApprove(String id, {bool share = true}) async {
+    final data = _data(
+      _req().trustApprove(jsonEncode({'id': id, 'share': share})),
+    );
+    return data['pinned'] == true;
+  }
+
+  @override
   Future<bool> trustRemove(String id) async {
     final data = _data(_req().trustRemove(jsonEncode({'id': id})));
     return data['removed'] == true;
@@ -704,6 +738,16 @@ class PeerBeam implements PeerBeamApi {
     final data = _data(
       _req().trustSetPermission(
         jsonEncode({'id': id, 'permission': permission, 'granted': granted}),
+      ),
+    );
+    return data['changed'] == true;
+  }
+
+  @override
+  Future<bool> trustSetAutoAccept(String id, bool autoAccept) async {
+    final data = _data(
+      _req().trustSetAutoAccept(
+        jsonEncode({'id': id, 'auto_accept': autoAccept}),
       ),
     );
     return data['changed'] == true;

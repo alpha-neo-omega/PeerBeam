@@ -56,7 +56,7 @@ pub fn list_shares() -> Op {
 /// the person choosing the folder needs in order to tell them apart at all.
 #[must_use]
 fn shares_dto(shares: &peerbeam_browse::Shares) -> Value {
-    let entries: Vec<Value> = shares
+    let mut entries: Vec<Value> = shares
         .shares()
         .iter()
         .map(|s| {
@@ -67,6 +67,30 @@ fn shares_dto(shares: &peerbeam_browse::Shares) -> Value {
             })
         })
         .collect();
+    // Folders the user configured that this device cannot serve — an unmounted
+    // drive, a folder since deleted, a path the process may not read.
+    //
+    // They belong here and **only** here. This DTO answers the device's own
+    // user, which is why it carries the path at all; the peer-facing listing is
+    // `peerbeam_browse::list`, which reads `shares()` and never sees these.
+    //
+    // Reporting them is the whole point: `Shares::new` cannot canonicalise them,
+    // so they were dropped, so the Settings card that promises "a folder that
+    // has gone is still listed, and marked broken" silently showed a shorter
+    // list instead — a user whose external drive was unplugged saw a share they
+    // had configured simply absent, which is the one belief that section exists
+    // to prevent.
+    //
+    // `name` is empty because they have none: naming is assigned by
+    // `Shares::new` to things a peer can address, and these are addressable by
+    // nobody. The path is what identifies them to the person who chose it.
+    entries.extend(shares.unresolved().iter().map(|p| {
+        json!({
+            "name": "",
+            "path": p.to_string_lossy(),
+            "exists": false,
+        })
+    }));
     let names: Vec<&str> = shares.shares().iter().map(|s| s.name.as_str()).collect();
     // `shares` kept as names for callers that predate `entries`.
     json!({ "shares": names, "entries": entries })
@@ -102,6 +126,82 @@ pub fn unreachable(path: &str) -> (Code, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A configured folder this device cannot serve is still listed.**
+    ///
+    /// It used to vanish: `Shares::new` cannot canonicalise an unmounted drive
+    /// or a deleted folder, so it dropped the path, so this DTO never mentioned
+    /// it and the Settings card showed a shorter list than the user had
+    /// configured. The card's own promise — "a folder that has gone is still
+    /// listed... it is marked broken instead" — could not be kept about a path
+    /// that had already been thrown away, and the user was left believing they
+    /// had never shared it.
+    #[test]
+    fn a_folder_that_cannot_be_reached_is_listed_as_broken_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("photos");
+        std::fs::create_dir(&real).unwrap();
+        let gone = dir.path().join("external-drive");
+
+        let shares = peerbeam_browse::Shares::new([
+            real.to_string_lossy().to_string(),
+            gone.to_string_lossy().to_string(),
+        ]);
+        let dto = shares_dto(&shares);
+        let entries = dto["entries"].as_array().unwrap();
+
+        assert_eq!(entries.len(), 2, "the broken folder was dropped: {dto}");
+        let broken = entries
+            .iter()
+            .find(|e| e["exists"] == serde_json::Value::Bool(false))
+            .expect("no entry reported as missing");
+        assert!(
+            broken["path"].as_str().unwrap().contains("external-drive"),
+            "the broken row does not identify the folder: {broken}"
+        );
+    }
+
+    /// **...and it is still reachable by nobody.** Listing it locally must not
+    /// make it servable: an unresolvable root cannot be compared against
+    /// safely, which is why `Shares::new` refuses to treat it as a prefix.
+    #[test]
+    fn a_broken_folder_is_visible_to_its_owner_and_addressable_by_no_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("external-drive");
+        let shares = peerbeam_browse::Shares::new([gone.to_string_lossy().to_string()]);
+
+        // Visible to its owner...
+        assert_eq!(shares.unresolved().len(), 1);
+        assert_eq!(shares_dto(&shares)["entries"].as_array().unwrap().len(), 1);
+
+        // ...and absent from everything a peer can reach.
+        assert!(
+            shares.shares().is_empty(),
+            "a peer can see the broken share"
+        );
+        assert!(shares.is_empty(), "the peer-facing set is not empty");
+        assert!(
+            dto_names(&shares_dto(&shares)).is_empty(),
+            "the broken share was given an addressable name"
+        );
+        for probe in ["external-drive", "external-drive/x", ""] {
+            assert!(
+                shares.resolve(probe).is_err(),
+                "a peer resolved `{probe}` to a folder this device cannot serve"
+            );
+        }
+    }
+
+    /// The `shares` array is names only, and a nameless broken row must not
+    /// smuggle an empty string into it.
+    fn dto_names(dto: &Value) -> Vec<String> {
+        dto["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect()
+    }
 
     /// **The UI must show the name a peer can actually use.** Reporting each
     /// root's basename showed two folders called `Documents` as two rows both

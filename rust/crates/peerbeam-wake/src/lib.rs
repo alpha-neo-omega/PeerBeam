@@ -224,6 +224,7 @@ mod tests {
                     _ => None,
                 },
                 mine: false,
+                auto_accept: false,
             }))
         }
     }

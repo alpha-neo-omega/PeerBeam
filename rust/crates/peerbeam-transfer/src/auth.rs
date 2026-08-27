@@ -219,6 +219,11 @@ pub async fn authenticate(
                 trusted_at: Utc::now(),
                 approved: false,
                 permissions: PermissionSet::none(),
+                // Never on a fresh pin: a device nobody has decided about must
+                // ask before it writes a file to this disk. This is the
+                // fail-closed direction and the only defensible one — the
+                // whole point of a pin is that no decision has been made yet.
+                auto_accept: false,
                 // No window: a pin is not a grant, so there is nothing for a
                 // clock to end. A deadline is written by approval, which is the
                 // act a person performs.

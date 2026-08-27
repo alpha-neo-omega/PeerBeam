@@ -558,11 +558,12 @@ Working now:
 - `history [--limit N] [--clear]` — persisted transfer history (sends and
   receives, success or failure), `<data_dir>/history.json`, same schema as the
   app engine's history, bounded to the 500 most recent.
-- `trust list` / `trust approve <device> [--for DURATION]` /
-  `trust revoke <device>` / `trust permit <device> <permission>…` /
+- `trust list` / `trust approve <device> [--for DURATION] [--no-share]` /
+  `trust auto-accept <device> [--no]` / `trust revoke <device>` /
+  `trust permit <device> <permission>…` /
   `trust revoke-permission <device> <permission>…` — the devices this machine
-  trusts, **which of them the user actually chose**, **for how long**, and
-  **what each may do**.
+  trusts, **which of them the user actually chose**, **for how long**,
+  **what each may do**, and **which of them stop asking**.
 
   ```
   STATUS    DEVICE           NAME          FINGERPRINT          PINNED            EXPIRES   PERMISSIONS
@@ -590,6 +591,47 @@ Working now:
   peerbeam trust list --json | jq -r 'select(.approved | not) | .id'
   peerbeam trust approve pb-f4e4d56fce98 --yes    # scripted: no prompt
   ```
+
+  **What `approve` grants is a fixed five, not everything.** It writes `files`,
+  `chat`, `clipboard`, `presence` and `pipe` — the set that existed when
+  permissions were introduced, frozen so that a later release cannot widen what
+  an unreviewed device may do. `notes` and `browse` were added afterwards and
+  stay opt-in, which is why an approved device still cannot list this machine's
+  shared folders until you say so:
+
+  ```bash
+  peerbeam trust grant-permission pb-f4e4d56fce98 browse
+  ```
+
+  **`--no-share` approves and grants nothing.** The key is vouched for — the
+  device stops counting as a stranger and stops re-prompting as first contact —
+  and every capability is left to be granted one at a time, which is what
+  invariant I6 asks for:
+
+  ```bash
+  peerbeam trust approve pb-f4e4d56fce98 --no-share --yes
+  peerbeam trust grant-permission pb-f4e4d56fce98 chat   # …and only chat
+  ```
+
+  It is ignored for a device that is **already** approved: the permission set is
+  written only on the transition, so this can never be used to strip what a
+  working device has been using.
+
+  **`trust auto-accept <device>` stops the approval prompt for one device.**
+  The global `device.auto_accept_trusted` setting is all-or-nothing, so
+  silencing the phone you sync with hourly used to mean silencing every approved
+  device as well:
+
+  ```bash
+  peerbeam trust auto-accept my-phone        # its files arrive without asking
+  peerbeam trust auto-accept my-phone --no   # ask again
+  ```
+
+  It is a **prompt** setting, not a permission. The admission gate consults it
+  only after `files` has already admitted the transfer, so it can never accept
+  what would otherwise be refused, and setting it on a device that is
+  unapproved, expired, or narrowed to withhold `files` does nothing at all —
+  the command says so rather than reporting a setting that is not in force.
 
   `<device>` resolves exactly as `send --to` does — exact id, exact name, then
   unique name prefix — and an ambiguous prefix is an error listing the

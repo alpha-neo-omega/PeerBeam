@@ -65,6 +65,64 @@ class TrustRepository extends ChangeNotifier {
     }
   }
 
+  /// Approve a pinned device directly, without waiting for a transfer from it.
+  ///
+  /// Returns null on success, or a sentence to show the user. Two distinct
+  /// failures, and they must not read alike:
+  ///
+  /// * The engine refused or could not be reached — reported as itself.
+  /// * The device is **not pinned**. The engine answers this without erroring,
+  ///   because it is not an error: approval refines a key remembered from a
+  ///   handshake, and a device this machine has never spoken to has presented
+  ///   none. Saying "approved" there would show a device as trusted while the
+  ///   store held nothing for it.
+  ///
+  /// Not optimistic, unlike [setPermission]. Approval is a standing, not a
+  /// toggle: showing it as granted before the engine agreed would be the one
+  /// guess on this screen worth nothing if wrong. The `trust_changed` event
+  /// drives the refresh.
+  Future<String?> approve(String id, {bool share = true}) async {
+    final api = _api;
+    if (api == null) return 'The engine is not running.';
+    try {
+      final pinned = await api.trustApprove(id, share: share);
+      if (!pinned) {
+        return 'This device has never connected, so there is no key to '
+            'vouch for. It can be approved once it has.';
+      }
+      await refresh();
+      return null;
+    } catch (e) {
+      return friendlyError(e);
+    }
+  }
+
+  /// Stop asking about a device's files, or start asking again.
+  ///
+  /// Returns null on success or a sentence to show. Not optimistic: unlike a
+  /// permission switch, being wrong here means the user believes they will be
+  /// asked about a file and are not — or the reverse. The `trust_changed` event
+  /// drives the refresh.
+  Future<String?> setAutoAccept(String id, bool autoAccept) async {
+    final api = _api;
+    if (api == null) return 'The engine is not running.';
+    try {
+      await api.trustSetAutoAccept(id, autoAccept);
+      await refresh();
+      return null;
+    } catch (e) {
+      return friendlyError(e);
+    }
+  }
+
+  /// The trusted record for [id], or null when this device is not pinned.
+  TrustedDevice? byId(String id) {
+    for (final d in _items) {
+      if (d.id == id) return d;
+    }
+    return null;
+  }
+
   /// Grant or withhold one permission for a device.
   ///
   /// Optimistic: the row is updated locally and listeners notified before the
@@ -106,6 +164,11 @@ class TrustRepository extends ChangeNotifier {
               ...d.permissions.where((p) => granted || p != permission),
               if (granted) permission,
             },
+            // Carried, not defaulted. This guess is about **one permission**;
+            // rebuilding the record without this field would silently show
+            // auto-accept as off until the next refresh, and a user who then
+            // tapped it would be turning on something that was already on.
+            autoAccept: d.autoAccept,
           ),
     ];
     notifyListeners();

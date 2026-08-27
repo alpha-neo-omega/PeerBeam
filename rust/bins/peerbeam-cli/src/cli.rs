@@ -524,9 +524,14 @@ pub enum TrustAction {
     },
     /// List the devices you have marked as your own.
     MyDevices,
-    /// Approve a device and grant it every permission this build has: files,
-    /// chat, clipboard, presence, pipe. Narrow it afterwards with
+    /// Approve a device and grant it the frozen approval set: files, chat,
+    /// clipboard, presence, pipe. Narrow it afterwards with
     /// `trust revoke-permission`. Prints the fingerprint and asks, unless `--yes`.
+    ///
+    /// Not *every* permission this build has: `notes` and `browse` were added
+    /// after the approval set was frozen and stay opt-in, so a device approved
+    /// here still cannot list your shared folders until you grant `browse`
+    /// with `trust grant-permission`.
     Approve {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
@@ -540,6 +545,36 @@ pub enum TrustAction {
         /// person types is `--for`.
         #[arg(long = "for", value_name = "DURATION")]
         duration: Option<String>,
+        /// Approve the device but grant it **nothing** — trust without sharing.
+        ///
+        /// The key is vouched for, so the device stops counting as a stranger
+        /// and stops re-prompting as first contact; it may do nothing at all
+        /// until you grant a permission. Grant them one at a time with
+        /// `trust grant-permission`, which is what invariant I6 asks for.
+        ///
+        /// Ignored for a device that is already approved: the permission set is
+        /// written only when approval is first granted, so this can never be
+        /// used to strip what a working device has been using.
+        #[arg(long)]
+        no_share: bool,
+    },
+    /// Stop asking about this device's files, or start asking again.
+    ///
+    /// The global `device.auto_accept_trusted` setting is all-or-nothing, so
+    /// silencing one device you sync with constantly used to mean silencing
+    /// every approved device. This is the same answer, per device.
+    ///
+    /// **A prompt setting, not a permission.** It is consulted only after the
+    /// `files` permission has already admitted the transfer, so it can never
+    /// accept what would otherwise be refused, and setting it on a device that
+    /// may not send files does nothing at all.
+    AutoAccept {
+        /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Ask about this device's files again.
+        #[arg(long)]
+        no: bool,
     },
     /// Forget a device entirely: its pin, its approval and its permissions. The
     /// next connection from it is a fresh first contact.

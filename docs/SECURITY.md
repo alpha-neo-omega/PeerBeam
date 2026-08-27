@@ -334,6 +334,60 @@ records said any device was theirs, and defaulting to `true` would sweep every
 stranger the TOFU handshake ever pinned into the one list a user taps "send" on
 without reading it.
 
+### Per-device auto-accept decides whether you are *asked*, not what is *allowed*
+
+A record also carries `auto_accept`: the answer to *"stop asking me about this
+one device's files"*. It exists because the global
+`device.auto_accept_trusted` setting is all-or-nothing — silencing the phone you
+sync with hourly used to mean silencing every approved device as well.
+
+**It is a prompt setting, and the distinction is load-bearing.** The admission
+gate (`admit_transfer_for`) consults it only after `may(Files)` has already
+admitted the transfer, so neither it nor the global setting — nor both together
+— can accept a byte the `files` permission would refuse. Setting it on a device
+that is unapproved, expired, or narrowed to withhold `files` is therefore inert
+rather than dangerous, and `peerbeam trust auto-accept` says so instead of
+reporting a setting that is not in force.
+`per_device_auto_accept_cannot_admit_what_files_would_refuse` holds that shut as
+a property rather than as a promise.
+
+It is read as **effective**, like `approved` and `permissions`: a device whose
+approval window has closed is not auto-accepting, whatever the stored bit says.
+Reading the bit alone would let a lapsed grant keep writing files to disk
+without asking — exactly the failure `expires_at` exists to prevent,
+reintroduced one field over.
+
+Concurrent writers merge it **fail-closed**, alongside the fields that grant
+something. It widens nothing, but it does remove the user's chance to say no, so
+a copy where someone turned it back off wins: the cost of losing the setting is
+one extra prompt, and the cost of resurrecting it is a file written to disk by a
+device the user had just decided to be asked about.
+
+A `trust.json` written before this existed has no `auto_accept` and loads with
+`false` — every device keeps prompting, which is both what those records meant
+and the fail-closed direction. Defaulting to `true` would silently stop asking
+about every device on the machine on upgrade, which is the one change a user
+must never discover by finding a file already on their disk.
+
+### Approving grants a frozen five, and `--no-share` grants none
+
+Approving a device writes `PermissionSet::granted_on_approval()` — `files`,
+`chat`, `clipboard`, `presence`, `pipe` — and **not** every permission the build
+has. `notes` and `browse` were added after that set was frozen and stay opt-in,
+so a release cannot widen what an unreviewed device may do. This is why an
+approved device still cannot list this machine's shared folders until `browse`
+is granted deliberately.
+
+`peerbeam trust approve --no-share`, and the GUI's *Trust, share nothing*, vouch
+for the key and grant **nothing at all**: the device stops counting as a
+stranger and stops re-prompting as first contact, and every capability is left
+to be granted one at a time — which is what per-capability consent asks for.
+
+Either way the set is written **only on the transition to approved**. Approving
+an already-approved device can neither widen nor narrow what the user left it:
+a "trust without sharing" tap must not silently revoke five permissions a device
+has been using, and a plain re-approve must not resurrect one the user revoked.
+
 ## Device identity
 
 Each device has a long-term X25519 identity keypair, generated on first run and

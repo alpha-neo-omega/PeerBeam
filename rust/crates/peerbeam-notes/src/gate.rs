@@ -60,6 +60,7 @@ mod tests {
             permissions,
             expires_at: None,
             mine: false,
+            auto_accept: false,
         }
     }
 

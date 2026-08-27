@@ -419,6 +419,14 @@ pub(crate) enum FileAdmission {
 ///    [`TrustStore::may`] implies that approval, so this is strictly narrower
 ///    than what it replaces and no device that auto-accepted before stops
 ///    doing so unless the permission was deliberately removed.
+///
+///    `auto_accept` is now **either** the global setting **or** this device's
+///    own `auto_accept` bit — "stop asking me about this one" — and the two are
+///    deliberately an `or`: the per-device answer exists precisely so the
+///    global one does not have to be turned on for everybody. Both are still
+///    `&& may_files`, so neither can admit a byte the `files` permission would
+///    refuse. That conjunction is the whole safety argument and must not be
+///    loosened: this is a setting about *asking*, never about *allowing*.
 /// 3. **Everything else → [`Prompt`].** In particular a merely *pinned* peer —
 ///    the state the TOFU handshake leaves every stranger in — is prompted
 ///    exactly as it always was. Permissions narrow a standing the user granted;
@@ -442,6 +450,21 @@ pub(crate) fn admit_transfer(
         return FileAdmission::AutoAccept;
     }
     FileAdmission::Prompt
+}
+
+/// [`admit_transfer`], with the per-device *stop asking about this one* bit
+/// folded into the global setting.
+///
+/// Kept as a separate function so [`admit_transfer`]'s existing tests keep
+/// asserting the gate itself, and so the `or` between the two settings is one
+/// line that can be pointed at rather than a condition spread across callers.
+pub(crate) fn admit_transfer_for(
+    global_auto_accept: bool,
+    per_device_auto_accept: bool,
+    trust: &dyn TrustStore,
+    peer: &DeviceId,
+) -> FileAdmission {
+    admit_transfer(global_auto_accept || per_device_auto_accept, trust, peer)
 }
 
 /// The `files` permission on the **outbound** path, as an [`Op`]-shaped refusal.
@@ -2496,10 +2519,45 @@ impl Manager {
                         .into_iter()
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>(),
+                    // The *effective* answer, like `approved` and `permissions`
+                    // above it: a device whose window has closed is not
+                    // auto-accepting, whatever its stored bit says, and a
+                    // surface must not draw a toggle claiming otherwise.
+                    "auto_accept": r.auto_accept && r.is_approved_at(now),
                 })
             })
             .collect();
         Ok(json!({ "devices": devices }))
+    }
+
+    /// Stop asking about one device's files, or start asking again:
+    /// `{id, auto_accept}` → `{changed}`.
+    ///
+    /// The global *auto-accept trusted devices* setting is all-or-nothing, so
+    /// silencing one device the user syncs with constantly meant silencing every
+    /// approved device. This is the same answer given per device.
+    ///
+    /// **A prompt setting, not a permission.** It is consulted only after
+    /// `may(Files)` has already said yes, so it can never admit a transfer the
+    /// permission would refuse — setting it on a device that may not send files
+    /// is inert. `changed: false` also covers a device that is not pinned.
+    pub fn trust_set_auto_accept(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        let auto_accept = req
+            .get("auto_accept")
+            .and_then(|v| v.as_bool())
+            .ok_or((Code::InvalidArgument, "auto_accept required".into()))?;
+        let changed = self
+            .trust
+            .set_auto_accept(&DeviceId::from(id), auto_accept)
+            .map_err(from_domain)?;
+        if changed {
+            events::event(&json!({ "type": "trust_changed", "timestamp": timestamp() }));
+        }
+        Ok(json!({ "changed": changed }))
     }
 
     /// Grant or withhold one permission for one pinned device:
@@ -2516,6 +2574,46 @@ impl Manager {
     ///
     /// Emits `trust_changed`, which is what makes the Trusted Devices list —
     /// and any other open surface — re-read without polling.
+    /// Approve a pinned device directly — `{id, share?}` → `{approved, pinned}`.
+    ///
+    /// The GUI could previously approve a device **only** by answering a
+    /// transfer from it: `pb_transfer_accept_trust` takes a transfer id, and
+    /// nothing else wrote approval. A device seen once and never sent a file
+    /// therefore sat in the trusted list forever reading "Accept a transfer
+    /// from it to approve" — the CLI's `trust approve` had no counterpart here,
+    /// which is invariant I7 in reverse: the engine's capability existed and
+    /// one frontend could not reach it.
+    ///
+    /// `share: false` is the *trust it, share nothing* case. See
+    /// [`FsTrust::approve_with`] for why the permission set is written only on
+    /// the transition to approved.
+    ///
+    /// `pinned: false` reports a device this machine holds no key for, rather
+    /// than reporting a success the store does not reflect.
+    pub fn trust_approve(&self, req: &Value) -> Op {
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or((Code::InvalidArgument, "id required".into()))?;
+        // Defaults to the historical grant, so a caller that omits the field
+        // gets exactly what `trust approve` has always done.
+        let share = req.get("share").and_then(|v| v.as_bool()).unwrap_or(true);
+        let grant = if share {
+            peerbeam_domain::entity::PermissionSet::granted_on_approval()
+        } else {
+            peerbeam_domain::entity::PermissionSet::none()
+        };
+        let device = DeviceId::from(id);
+        let pinned = self
+            .trust
+            .approve_with(&device, true, None, grant)
+            .map_err(from_domain)?;
+        if pinned {
+            events::event(&json!({ "type": "trust_changed", "timestamp": timestamp() }));
+        }
+        Ok(json!({ "approved": pinned, "pinned": pinned }))
+    }
+
     pub fn trust_set_permission(&self, req: &Value) -> Op {
         let id = req
             .get("id")
@@ -3840,8 +3938,24 @@ impl Manager {
             ));
         }
         let me = self.clone();
-        let answer =
-            crate::runtime::block_on(async move { me.ask_browse(device, path.clone()).await });
+        // **Bounded, because this call blocks whoever made it.** Every `pb_*`
+        // function is synchronous, and the Flutter SDK calls this one straight
+        // from the UI isolate, so the whole wait is frozen frames. `dial` tries
+        // each of a device's routes in turn with its own connect timeout, so a
+        // peer that is merely asleep — the ordinary case for "browse a device
+        // that is not there" — could hold the interface for the sum of them.
+        //
+        // The cap does not make this asynchronous and must not be mistaken for
+        // a fix: the real one is to stop calling blocking FFI from the isolate
+        // that draws. It bounds the damage to a wait a person can sit through,
+        // and turns "the app hung" into the honest "could not ask the device",
+        // which is the same answer they would have got at the end anyway.
+        let answer = crate::runtime::block_on(async move {
+            tokio::time::timeout(BROWSE_BUDGET, me.ask_browse(device, path.clone()))
+                .await
+                .ok()
+                .flatten()
+        });
         match answer {
             Some(r) => Ok(crate::browse::response_dto(&r)),
             None => Err(crate::browse::unreachable(
@@ -5134,8 +5248,12 @@ impl Manager {
         // where each leg is named and unit-tested — including the one this
         // increment adds: a device the user approved and then denied `files`
         // is refused outright rather than prompted about.
-        let admission = admit_transfer(
+        // Both read fresh, so a live toggle of either applies without a
+        // restart — the per-device bit comes off the trust store, which every
+        // gate already re-reads per operation.
+        let admission = admit_transfer_for(
             self.auto_accept.load(Ordering::SeqCst),
+            self.trust.auto_accepts(&session.peer_device),
             self.trust.as_ref(),
             &session.peer_device,
         );
@@ -5463,6 +5581,20 @@ impl Manager {
 /// forever: the transfer stays in `active` — counted by the UI/notification —
 /// with no terminal event ever emitted. Long enough that a human answering a
 /// prompt is never rushed; short enough that ghosts don't accumulate.
+/// How long a `browse` may hold its caller before it gives up.
+///
+/// This is a **user-interface** budget, not a network one. `pb_browse_list` is
+/// synchronous and the app calls it from the isolate that draws, so every
+/// second here is a second of frozen frames; the number is therefore chosen for
+/// how long a person will sit still, not for how long a slow link might need.
+///
+/// Ten seconds is comfortably above a working dial over Tailscale or a VPN and
+/// well below the sum of per-route connect timeouts a sleeping peer would
+/// otherwise cost. `browse_budget_is_short_enough_to_sit_through` pins the
+/// upper bound so a later change to the routing cannot quietly restore the
+/// freeze.
+const BROWSE_BUDGET: Duration = Duration::from_secs(10);
+
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long to wait for the peer's first progress report before assuming the
@@ -7446,6 +7578,7 @@ mod tests {
         trust
             .record(peerbeam_domain::entity::TrustRecord {
                 mine: false,
+                auto_accept: false,
                 device: device.clone(),
                 fingerprint: "test-fingerprint".into(),
                 name: "peer".into(),
@@ -8121,6 +8254,7 @@ mod tests {
             }
             Ok(Some(peerbeam_domain::entity::TrustRecord {
                 mine: false,
+                auto_accept: false,
                 device: d.clone(),
                 fingerprint: "ff".into(),
                 name: "Peer".into(),
@@ -8204,6 +8338,77 @@ mod tests {
                 "revoking {other} must not affect transfers"
             );
         }
+    }
+
+    /// The per-device bit stops the prompt for **that** device and no other.
+    /// That is the whole reason it exists: the global setting is all-or-nothing,
+    /// so silencing one chatty phone used to mean silencing every device.
+    #[test]
+    fn per_device_auto_accept_silences_one_device_with_the_global_setting_off() {
+        assert_eq!(
+            admit_transfer_for(false, true, &admit_approved(), &admit_peer()),
+            FileAdmission::AutoAccept,
+            "the per-device answer must work without the global one"
+        );
+        assert_eq!(
+            admit_transfer_for(false, false, &admit_approved(), &admit_peer()),
+            FileAdmission::Prompt,
+            "and a device it was not set on still asks"
+        );
+    }
+
+    /// **The safety property.** Auto-accept decides whether the user is *asked*,
+    /// never whether the device is *allowed*. Neither setting — nor both
+    /// together — may admit a byte the `files` permission would refuse.
+    #[test]
+    fn per_device_auto_accept_cannot_admit_what_files_would_refuse() {
+        let narrowed = AdmitTrust {
+            permissions: peerbeam_domain::entity::PermissionSet::granted_on_approval()
+                .set(Permission::Files, false),
+            ..admit_approved()
+        };
+        for (global, per_device) in [(false, true), (true, true), (true, false)] {
+            assert_eq!(
+                admit_transfer_for(global, per_device, &narrowed, &admit_peer()),
+                FileAdmission::Refused,
+                "global={global} per_device={per_device} admitted a device \
+                 whose `files` permission was revoked"
+            );
+        }
+
+        // And on a device nobody approved, the per-device bit is inert: an
+        // unapproved record may nothing whatever its other bits say, so this
+        // is first contact and is asked about.
+        let pinned = AdmitTrust {
+            approved: false,
+            permissions: peerbeam_domain::entity::PermissionSet::none(),
+            ..admit_approved()
+        };
+        assert_eq!(
+            admit_transfer_for(false, true, &pinned, &admit_peer()),
+            FileAdmission::Prompt,
+            "auto-accept on an unapproved device must not skip the prompt"
+        );
+    }
+
+    /// The browse budget is a UI number: it must stay short enough that a
+    /// person will sit through it, because `pb_browse_list` blocks the isolate
+    /// that draws for its whole duration.
+    ///
+    /// Pinned as a bound rather than an equality so the value can be tuned, but
+    /// not quietly raised back to the sum of per-route connect timeouts that
+    /// froze the app before it existed.
+    #[test]
+    fn browse_budget_is_short_enough_to_sit_through() {
+        assert!(
+            BROWSE_BUDGET <= Duration::from_secs(15),
+            "a synchronous call that blocks the UI for {BROWSE_BUDGET:?} reads \
+             as a hang, not as a wait"
+        );
+        assert!(
+            BROWSE_BUDGET >= Duration::from_secs(5),
+            "too short to complete a working dial over a VPN or Tailscale"
+        );
     }
 
     /// **The backward-compatibility leg.** A merely pinned peer — every

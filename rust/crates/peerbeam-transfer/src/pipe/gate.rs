@@ -153,6 +153,7 @@ mod tests {
                 },
                 expires_at: None,
                 mine: false,
+                auto_accept: false,
             }))
         }
         fn is_trusted(&self, device: &DeviceId) -> bool {

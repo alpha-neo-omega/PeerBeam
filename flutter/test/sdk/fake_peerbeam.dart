@@ -266,6 +266,80 @@ class FakePeerBeam implements PeerBeamApi {
     return changed;
   }
 
+  /// Every `trustApprove` call, in order, with what it asked for.
+  final List<({String id, bool share})> approveCalls = [];
+
+  /// When set, `trustApprove` throws it. For the refused-approval path.
+  Object? trustApproveError;
+
+  @override
+  Future<bool> trustApprove(String id, {bool share = true}) async {
+    approveCalls.add((id: id, share: share));
+    final error = trustApproveError;
+    if (error != null) throw error;
+    // A device that is not in the list was never pinned — the engine's
+    // `pinned: false`, which is an answer rather than an error.
+    if (!trusted.any((t) => t.id == id)) return false;
+    trusted = [
+      for (final t in trusted)
+        if (t.id != id)
+          t
+        else
+          TrustedDevice(
+            id: t.id,
+            name: t.name,
+            fingerprint: t.fingerprint,
+            trustedAt: t.trustedAt,
+            approved: true,
+            // Written only on the transition to approved, exactly as the store
+            // does — so a test that approves an already-approved device sees
+            // its permissions survive.
+            permissions: t.approved
+                ? t.permissions
+                : (share
+                      ? {'files', 'chat', 'clipboard', 'presence', 'pipe'}
+                      : const <String>{}),
+          ),
+    ];
+    return true;
+  }
+
+  /// Every `trustSetAutoAccept` call, in order.
+  final List<({String id, bool autoAccept})> autoAcceptCalls = [];
+
+  /// When set, `trustSetAutoAccept` throws it.
+  Object? trustSetAutoAcceptError;
+
+  @override
+  Future<bool> trustSetAutoAccept(String id, bool autoAccept) async {
+    autoAcceptCalls.add((id: id, autoAccept: autoAccept));
+    final error = trustSetAutoAcceptError;
+    if (error != null) throw error;
+    var changed = false;
+    trusted = [
+      for (final t in trusted)
+        if (t.id != id)
+          t
+        else ...[
+          () {
+            changed = t.autoAccept != autoAccept;
+            return TrustedDevice(
+              id: t.id,
+              name: t.name,
+              fingerprint: t.fingerprint,
+              trustedAt: t.trustedAt,
+              approved: t.approved,
+              permissions: t.permissions,
+              // The engine reports the *effective* answer, so an unapproved
+              // device reads false however its stored bit was set.
+              autoAccept: autoAccept && t.approved,
+            );
+          }(),
+        ],
+    ];
+    return changed;
+  }
+
   /// Set to make [trustRemove] throw, so a test can drive the refusal path.
   Object? trustRemoveError;
 

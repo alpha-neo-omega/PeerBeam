@@ -52,16 +52,30 @@ pub struct Share {
 #[derive(Debug, Clone, Default)]
 pub struct Shares {
     shares: Vec<Share>,
+    unresolved: Vec<PathBuf>,
 }
 
 impl Shares {
     /// Build from configured paths, keeping only those that exist and resolve,
     /// and naming each one addressably.
     ///
-    /// A share that cannot be canonicalised is dropped rather than kept as a
-    /// literal path: an unresolvable root cannot be compared against safely,
-    /// and silently treating it as a prefix would be the bug this module
-    /// exists to prevent.
+    /// A share that cannot be canonicalised is **never served**: an unresolvable
+    /// root cannot be compared against safely, and silently treating it as a
+    /// prefix would be the bug this module exists to prevent. [`resolve`] and
+    /// [`shares`] therefore never see one.
+    ///
+    /// It is **kept, and reported**, though — see [`unresolved`]. Dropping it
+    /// outright was a quieter bug of its own: the folder disappeared from the
+    /// user's own Settings list as well, so a share on an unmounted drive read
+    /// as one the user had never configured. The local surface promises that a
+    /// folder which has gone is still listed and marked broken, and it could
+    /// not keep that promise about a path this constructor had already thrown
+    /// away. What a peer may reach and what its owner can see are different
+    /// questions, and only the first is a security one.
+    ///
+    /// [`resolve`]: Shares::resolve
+    /// [`shares`]: Shares::shares
+    /// [`unresolved`]: Shares::unresolved
     #[must_use]
     pub fn new<I, S>(paths: I) -> Self
     where
@@ -69,8 +83,13 @@ impl Shares {
         S: AsRef<Path>,
     {
         let mut shares: Vec<Share> = Vec::new();
+        let mut unresolved: Vec<PathBuf> = Vec::new();
         for p in paths {
             let Ok(root) = std::fs::canonicalize(p.as_ref()) else {
+                let literal = p.as_ref().to_path_buf();
+                if !unresolved.contains(&literal) {
+                    unresolved.push(literal);
+                }
                 continue;
             };
             // The same folder listed twice is one share, not two. Canonicalising
@@ -84,7 +103,25 @@ impl Shares {
             let name = unique_name(&label(&root), &shares);
             shares.push(Share { name, root });
         }
-        Shares { shares }
+        Shares { shares, unresolved }
+    }
+
+    /// Configured folders this device **cannot** serve, as the user wrote them.
+    ///
+    /// An unmounted drive, a folder since deleted or renamed, a path the process
+    /// may not read. They are never addressable — nothing here reaches
+    /// [`resolve`](Shares::resolve) — and exist solely so the owner's own
+    /// surfaces can say "this one is broken" instead of quietly showing a
+    /// shorter list than the user configured.
+    ///
+    /// **Not for peers.** These are literal local paths, so anything that sends
+    /// them outward would leak the filesystem layout that [`resolve`] exists to
+    /// keep private.
+    ///
+    /// [`resolve`]: Shares::resolve
+    #[must_use]
+    pub fn unresolved(&self) -> &[PathBuf] {
+        &self.unresolved
     }
 
     /// Whether anything is shared at all.

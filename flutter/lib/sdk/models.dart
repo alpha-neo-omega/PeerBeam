@@ -409,6 +409,18 @@ class TrustedDevice {
   /// granted.
   final Set<String> permissions;
 
+  /// Whether this device's files are accepted **without asking**.
+  ///
+  /// A prompt setting, not a permission: the engine consults it only after the
+  /// `files` permission has already admitted the transfer, so it can never let
+  /// through what would otherwise be refused. The engine reports the
+  /// *effective* answer — a device whose approval has expired reads `false`
+  /// here whatever its stored bit says, so a surface never has to re-derive it.
+  ///
+  /// Defaults to `false` for an engine that predates the field: unknown means
+  /// keep asking, which is the only safe reading.
+  final bool autoAccept;
+
   const TrustedDevice({
     required this.id,
     required this.name,
@@ -416,6 +428,7 @@ class TrustedDevice {
     required this.trustedAt,
     this.approved = false,
     this.permissions = const {},
+    this.autoAccept = false,
   });
 
   /// Whether this device is permitted `permission` (a [PeerBeamPermission]
@@ -432,6 +445,7 @@ class TrustedDevice {
     permissions: {
       ...?(j['permissions'] as List<dynamic>?)?.whereType<String>(),
     },
+    autoAccept: j['auto_accept'] as bool? ?? false,
   );
 }
 

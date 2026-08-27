@@ -415,8 +415,7 @@ class SettingsScreen extends StatelessWidget {
                                 ),
                                 if (!pins[i].approved)
                                   Text(
-                                    'Seen once — not approved. Accept a '
-                                    'transfer from it to approve.',
+                                    'Seen once — not approved.',
                                     style: Theme.of(context).textTheme.bodySmall
                                         ?.copyWith(
                                           color: Theme.of(
@@ -424,6 +423,14 @@ class SettingsScreen extends StatelessWidget {
                                           ).colorScheme.onSurfaceVariant,
                                         ),
                                   ),
+                                // The sentence above used to end "Accept a
+                                // transfer from it to approve", which was the
+                                // only route there was: nothing in this app
+                                // called approval directly, so a device seen
+                                // once and never sent a file sat here forever.
+                                // The engine and the CLI could both approve it;
+                                // only the GUI could not.
+                                if (!pins[i].approved) _ApproveRow(device: pins[i]),
                               ],
                             ),
                             isThreeLine: !pins[i].approved,
@@ -732,6 +739,88 @@ class SettingsScreen extends StatelessWidget {
 ///   shows a code, the user compares it, and a mismatch is the signal. Nothing
 ///   here blocks an attacker on its own.
 ///
+/// The two ways to approve a pinned-but-unapproved device, offered inline.
+///
+/// # Why there are two buttons and not one
+///
+/// "Trust" grants the frozen approval set — files, chat, clipboard, presence,
+/// pipe — because that is what approving has always meant and what most people
+/// want from a device they recognise. "Trust, share nothing" approves the key
+/// and grants **nothing**: the device stops counting as a stranger, stops
+/// re-prompting as first contact, and may do nothing at all until a permission
+/// is granted deliberately. That is closer to invariant I6's "explicit,
+/// revocable, per-capability consent" than granting five capabilities on one
+/// tap, so it is offered as a peer rather than buried.
+///
+/// # What neither of them does
+///
+/// Neither grants `browse` or `notes`. Those were added after the approval set
+/// was frozen and stay opt-in — a permission introduced in a later release must
+/// not silently attach itself to devices nobody re-reviewed. It is also why
+/// approving a device does not, on its own, let it list your shared folders:
+/// that needs the "Shared folders" switch, one row down.
+///
+/// # Why it says the fingerprint is unverified
+///
+/// Approving vouches for a key this machine pinned on first contact. If that
+/// first contact was intercepted, the pinned key is the attacker's and
+/// approving it makes the interception permanent. Nothing here can detect
+/// that — only comparing the fingerprint against the other device can — so the
+/// row says so rather than letting a button imply a check that did not happen.
+class _ApproveRow extends StatelessWidget {
+  const _ApproveRow({required this.device});
+
+  final TrustedDevice device;
+
+  Future<void> _approve(BuildContext context, {required bool share}) async {
+    final trust = AppScope.of(context).trust;
+    final error = await trust.approve(device.id, share: share);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            error ??
+                (share
+                    ? '${device.name.isEmpty ? device.id : device.name} is trusted'
+                    : '${device.name.isEmpty ? device.id : device.name} is '
+                          'trusted and may do nothing yet'),
+          ),
+        ),
+      );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      key: Key('approve-${device.id}'),
+      padding: const EdgeInsets.only(top: AppSpace.xxs),
+      child: Wrap(
+        spacing: AppSpace.xs,
+        runSpacing: AppSpace.xxs,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          FilledButton.tonal(
+            onPressed: () => _approve(context, share: true),
+            child: const Text('Trust'),
+          ),
+          TextButton(
+            onPressed: () => _approve(context, share: false),
+            child: const Text('Trust, share nothing'),
+          ),
+          Text(
+            'Compare the fingerprint first — nothing here has checked it.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// The per-device permission switches, under an approved device's row.
 ///
 /// # Why they are here and not in a dialog

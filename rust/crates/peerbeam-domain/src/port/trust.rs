@@ -248,6 +248,7 @@ mod tests {
             permissions,
             expires_at,
             mine: false,
+            auto_accept: false,
         }
     }
 
