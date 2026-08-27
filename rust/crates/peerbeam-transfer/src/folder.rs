@@ -45,6 +45,7 @@
 use futures::io::AsyncWrite;
 use futures::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use peerbeam_domain::entity::{Direction, Progress, TransferStatus};
@@ -57,7 +58,7 @@ use bytes::Bytes;
 use crate::protocol::chunk_frame_owned;
 use crate::stream::{
     build_progress, part_path, read_fill, safe_component, send_with_retry, signal_pause_edge,
-    TransferOutcome,
+    to_hex, TransferOutcome,
 };
 
 // ── Wire messages ───────────────────────────────────────────────
@@ -88,6 +89,16 @@ enum FolderMessage {
     },
     FileEnd {
         index: u32,
+        /// SHA-256 of the entry's bytes, hex — what makes a folder confirmed
+        /// **correct** and not merely arrived.
+        ///
+        /// `Option`, defaulted and skipped when absent, so this is additive in
+        /// both directions: an older receiver ignores an unknown field (nothing
+        /// here sets `deny_unknown_fields`), and an older sender's `FileEnd`
+        /// still parses, leaving the receiver with nothing to check — which is
+        /// exactly what it could do before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checksum: Option<String>,
     },
     Complete,
     /// Receiver → sender: every entry arrived and was published.
@@ -98,6 +109,10 @@ enum FolderMessage {
     /// additive.
     Received {
         files: u64,
+        /// Entries whose bytes did not match the sender's digest, and which
+        /// were therefore **not** published. Non-zero fails the send.
+        #[serde(default)]
+        corrupt: u64,
     },
     Cancel,
     /// Sender → receiver: cooperative pause — see `protocol::Control::Pause`.
@@ -264,6 +279,11 @@ pub async fn send_folder(
         // must never see a `FileHeader` for a file we then fail to stream
         // (no phantom/partial entry left behind).
         let src = join(&req.root_path, rel);
+        // One digest per entry, not one per folder: the receiver verifies each
+        // file before it renames it into place, so a single corrupted entry is
+        // withheld while the rest of the tree still lands. A folder-wide hash
+        // could only condemn everything or nothing.
+        let mut entry_hash = Sha256::new();
         let mut reader = match storage.open_read(&src, already).await {
             Ok(r) => r,
             Err(e) => {
@@ -315,6 +335,7 @@ pub async fn send_folder(
                 tokio::time::sleep(wait).await;
             }
 
+            entry_hash.update(&buf);
             send_with_retry(link, chunk_frame_owned(Bytes::from(buf)), retries).await?;
             done += n as u64;
             emit(
@@ -332,7 +353,10 @@ pub async fn send_folder(
 
         send_with_retry(
             link,
-            folder_frame(&FolderMessage::FileEnd { index: i as u32 }),
+            folder_frame(&FolderMessage::FileEnd {
+                index: i as u32,
+                checksum: Some(to_hex(&entry_hash.finalize())),
+            }),
             retries,
         )
         .await?;
@@ -389,7 +413,7 @@ async fn wait_for_folder_ack(link: &mut dyn Link, files_total: u32) -> Result<()
             match link.recv_frame().await? {
                 Some(frame) if frame.kind == FrameKind::Control => {
                     match parse_folder(&frame)? {
-                        FolderMessage::Received { files } => return Ok(files),
+                        FolderMessage::Received { files, corrupt } => return Ok((files, corrupt)),
                         FolderMessage::Cancel => {
                             return Err(DomainError::Transfer(
                                 "the receiver cancelled the folder".into(),
@@ -413,7 +437,7 @@ async fn wait_for_folder_ack(link: &mut dyn Link, files_total: u32) -> Result<()
     })
     .await;
 
-    let files = match deadline {
+    let (files, corrupt) = match deadline {
         Ok(r) => r?,
         Err(_) => {
             return Err(DomainError::Transfer(
@@ -421,6 +445,16 @@ async fn wait_for_folder_ack(link: &mut dyn Link, files_total: u32) -> Result<()
             ))
         }
     };
+    // **Corruption fails the send.** The receiver withheld those entries rather
+    // than publishing them, so the folder on its disk is incomplete — reporting
+    // `Completed` would be the same lie in a new place. `Integrity`, not
+    // `Transfer`, because that is what the single-file path raises for a
+    // checksum mismatch and the two should not be told apart by their errors.
+    if corrupt > 0 {
+        return Err(DomainError::Integrity(format!(
+            "{corrupt} of {files_total} folder entries failed their checksum and were not written"
+        )));
+    }
     // Reported, not enforced: the receiver legitimately publishes fewer entries
     // than were offered — a name that collides with a directory is skipped by
     // design — and failing the whole send over one skipped file would be worse
@@ -529,6 +563,12 @@ pub async fn receive_folder(
     // same, so a tail that never arrives leaves a `.part` behind rather than a
     // plausible-looking lie.
     let mut current_paths: Option<(String, String)> = None;
+    // Rolling digest of the entry being written, compared against the sender's
+    // on `FileEnd`.
+    let mut entry_hash = Sha256::new();
+    // Entries whose bytes did not match and were therefore withheld. Reported
+    // back so the sender fails rather than believing the folder landed whole.
+    let mut corrupt: u64 = 0;
     // Set whenever the file announced by the most recent `FileHeader` was
     // skipped (unsafe path or a create/open failure, e.g. a destination path
     // that collides with an existing directory) — its `FileEnd` must not be
@@ -603,6 +643,7 @@ pub async fn receive_folder(
                             .write_all(&frame.payload)
                             .await
                             .map_err(|e| DomainError::Storage(format!("write chunk: {e}")))?;
+                        entry_hash.update(&frame.payload);
                         done += frame.payload.len() as u64;
                         emit(
                             progress,
@@ -673,6 +714,7 @@ pub async fn receive_folder(
                         // must not abort the whole folder: skip just this
                         // entry and keep going.
                         let part = part_path(&dp);
+                        entry_hash = Sha256::new();
                         match storage.open_write(&part).await {
                             Ok(w) => {
                                 current = Some(w);
@@ -687,7 +729,34 @@ pub async fn receive_folder(
                             }
                         }
                     }
-                    FolderMessage::FileEnd { .. } => {
+                    FolderMessage::FileEnd { checksum, .. } => {
+                        // **Verified before it is published, never after.**
+                        // Renaming first and checking second would put a
+                        // corrupted file under its real name for as long as the
+                        // check took, which is the exact window staging exists
+                        // to close. A mismatch leaves the `.part` on disk as
+                        // evidence and the destination untouched.
+                        //
+                        // `checksum: None` is an older sender that cannot tell
+                        // us — nothing to verify, and refusing the entry would
+                        // punish the user for the peer's age.
+                        let digest = to_hex(&std::mem::take(&mut entry_hash).finalize());
+                        let mismatch = checksum.as_deref().is_some_and(|want| want != digest);
+                        if mismatch {
+                            corrupt += 1;
+                            let dest = current_paths
+                                .as_ref()
+                                .map(|(_, d)| d.clone())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                "folder entry {dest} failed its checksum and was not published"
+                            );
+                            // Closed but deliberately not finalised.
+                            current_paths = None;
+                            let _ = close_writer(current.take()).await;
+                            current_skipped = false;
+                            continue;
+                        }
                         // Before the count, not after: `files_completed` is
                         // what the caller reports as arrived, and an entry
                         // whose flush failed did not arrive.
@@ -787,6 +856,7 @@ pub async fn receive_folder(
     if ack && outcome == TransferOutcome::Completed {
         let frame = folder_frame(&FolderMessage::Received {
             files: u64::from(files_completed),
+            corrupt,
         });
         if let Err(e) = link.send_frame(frame).await {
             tracing::warn!("folder arrived but the acknowledgement could not be sent: {e}");
@@ -1143,7 +1213,10 @@ mod tests {
                 size: 10,
                 offset: 5,
             },
-            FolderMessage::FileEnd { index: 1 },
+            FolderMessage::FileEnd {
+                index: 1,
+                checksum: None,
+            },
             FolderMessage::Complete,
             FolderMessage::Cancel,
             FolderMessage::Pause,

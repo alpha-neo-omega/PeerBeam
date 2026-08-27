@@ -689,3 +689,125 @@ async fn a_folder_send_to_an_older_peer_is_unchanged() {
         );
     }
 }
+
+/// A link that flips one byte of the **first** chunk it carries, standing in
+/// for a corruption the transport did not catch.
+///
+/// Wrapping the receiving end rather than the sending one is deliberate: the
+/// sender's digest must be computed over what it *read from disk*, so a test
+/// that corrupted before hashing would prove nothing.
+struct CorruptingLink {
+    inner: MemLink,
+    done: bool,
+}
+
+#[async_trait]
+impl Link for CorruptingLink {
+    async fn send_frame(&mut self, frame: Frame) -> Result<()> {
+        self.inner.send_frame(frame).await
+    }
+    async fn recv_frame(&mut self) -> Result<Option<Frame>> {
+        let frame = self.inner.recv_frame().await?;
+        match frame {
+            Some(mut f) if !self.done && f.kind == FrameKind::Chunk && !f.payload.is_empty() => {
+                self.done = true;
+                let mut bytes = f.payload.to_vec();
+                bytes[0] ^= 0xff;
+                f.payload = bytes.into();
+                Ok(Some(f))
+            }
+            other => Ok(other),
+        }
+    }
+    async fn close(&mut self) -> Result<()> {
+        self.inner.close().await
+    }
+}
+
+/// **A folder entry whose bytes changed in flight is never published, and the
+/// send fails.**
+///
+/// Staging alone could not catch this: the entry arrives complete, so it would
+/// have been flushed and renamed into place looking perfectly whole. Only a
+/// digest computed by the sender over what it read, and checked by the receiver
+/// before the rename, can tell the difference — which is why "arrived" and
+/// "correct" are two different guarantees.
+#[tokio::test]
+async fn a_corrupted_folder_entry_is_withheld_and_fails_the_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("myfolder");
+    std::fs::create_dir_all(&root).unwrap();
+    let payload = pattern(5, 40 * 1024);
+    std::fs::write(root.join("only.bin"), &payload).unwrap();
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, lb) = MemLink::pair(4);
+    let mut lb = CorruptingLink {
+        inner: lb,
+        done: false,
+    };
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let send = send_folder(
+        &mut la,
+        &storage,
+        req(&root.to_string_lossy()),
+        &cs,
+        &ptx,
+        3,
+        true,
+    );
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, true);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    // The receive completes — every frame arrived — but the entry is withheld.
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    assert!(
+        !out.join("myfolder").join("only.bin").exists(),
+        "a corrupted entry was published under its real name"
+    );
+
+    // And the sender is told, rather than reporting a folder it did not deliver.
+    let err = rs.expect_err("a corrupted folder must not be reported as sent");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("checksum"),
+        "the failure does not name the cause: {msg}"
+    );
+}
+
+/// **An older sender sends no digest, and its folders still land.** There is
+/// nothing to verify, and refusing the entry would punish the user for the
+/// peer's age — the same rule every other negotiated feature here follows.
+#[tokio::test]
+async fn a_folder_from_a_sender_with_no_checksums_still_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // `false`/`false` is the negotiated state against a peer that predates all
+    // of this; the sender still emits `FileEnd`, just without a digest.
+    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    for (rel, bytes) in &files {
+        assert_eq!(
+            &std::fs::read(out.join("myfolder").join(rel)).unwrap(),
+            bytes
+        );
+    }
+}

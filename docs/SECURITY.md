@@ -513,10 +513,23 @@ can take. Two differences from the single-file rules remain, and are deliberate:
   predates it sends nothing, is waited on for nothing, and behaves exactly as
   before — additive, not a wire break.
 
-  What is still missing is a folder **checksum**. The single-file path sends
-  `Complete { checksum }` and the receiver verifies it, so corruption in transit
-  is caught; a folder is confirmed as *arrived*, not as *correct*. Adding a
-  per-entry digest is a further protocol change and is not done.
+  **And each entry is checksummed.** `FileEnd` carries a SHA-256 of the bytes
+  the sender read from disk, and the receiver compares its own digest **before**
+  the rename. A mismatch withholds that entry — the `.part` stays as evidence,
+  the destination is untouched — and is counted back to the sender, which fails
+  the send with an `Integrity` error rather than reporting a folder it did not
+  deliver. Verifying before publishing is the point: checking after the rename
+  would put a corrupted file under its real name for as long as the check took,
+  which is the window staging exists to close.
+
+  Per **entry**, not per folder, so one bad file is withheld while the rest of
+  the tree lands. A folder-wide digest could only condemn everything or nothing.
+
+  The digest field is optional and skipped when absent, so this is additive in
+  both directions: an older receiver ignores an unknown field, and an older
+  sender's `FileEnd` still parses, leaving nothing to check — which is what that
+  receiver could do before. A folder from a peer that sends no digests still
+  lands; refusing it would punish the user for the peer's age.
 
 Path names from peers are sanitized to a single base component (no `..`, no
 absolute paths), then reduced to what the receiving OS can actually hold. On

@@ -212,12 +212,15 @@ Working now:
   connection lost mid-file left a short file sitting under the name the user
   expected — silently, and indistinguishable from a whole one.
 
-  **And the sender waits to be told the folder landed.** `send folder/` now
+  **And the sender waits to be told the folder landed, intact.** `send folder/`
   ends on the receiver's confirmation rather than on its own last write, so a
-  send that reports success has been told the files are on the peer's disk. If
-  the confirmation never arrives the send **fails** — silence is not success.
-  Against a peer built before this (the capability is negotiated), nothing is
-  sent, nothing is waited for, and both ends behave exactly as they did.
+  send that reports success has been told the files are on the peer's disk. Each
+  entry carries a SHA-256 the receiver checks **before** renaming it into place:
+  a file whose bytes changed in flight is withheld, not published, and the send
+  fails with an integrity error (exit `5`). If the confirmation never arrives at
+  all the send fails too — silence is not success. Against a peer built before
+  this (the capability is negotiated, the digest optional), nothing is sent,
+  nothing is waited for, and both ends behave exactly as they did.
 - `daemon start [--foreground]` — run the receive loop until interrupted.
   (`daemon stop|status` need the IPC layer — not built yet, exit code 8.)
 - `clipboard send [--to NAME | --addr IP:PORT] [TEXT]` — send text using the
