@@ -166,13 +166,27 @@ fn set_auto_accept(
         .set_auto_accept(&id, auto_accept)
         .map_err(|e| CliError::Other(e.to_string()))?;
 
+    // Whether the setting actually does anything for this device.
+    //
+    // **Both halves, and `may` is the one that matters.** This first asked only
+    // `auto_accepts`, which reads `auto_accept && is_approved_at` — so an
+    // approved device whose `files` permission had been revoked passed the
+    // check and was told the setting was in force, when the admission gate
+    // refuses that device outright. The exact case the flag's own documentation
+    // names as inert was the one case the warning missed.
+    //
+    // `may` implies approval and honours expiry, so it subsumes what
+    // `auto_accepts` was testing; the stored bit is checked separately because
+    // `may` says nothing about it.
+    let in_force = store.auto_accepts(&id) && store.may(&id, Permission::Files);
+
     if ctx.json {
         ctx.json_line(&json!({
             "event": "trust_auto_accept",
             "device": id.0,
             "auto_accept": auto_accept,
             "changed": changed,
-            "effective": store.auto_accepts(&id),
+            "effective": in_force,
         }));
         return Ok(());
     }
@@ -188,13 +202,15 @@ fn set_auto_accept(
         format!("{name}'s files will be asked about")
     });
     // Say so rather than leaving the operator believing a setting is in force.
-    // `auto_accepts` is the *effective* answer: it reads approval and expiry
-    // too, so this catches both "never approved" and "the window closed".
-    if auto_accept && !store.auto_accepts(&id) {
-        ctx.line(&ctx.dim(
-            "  ...but it is not approved (or its approval has expired), so it \
-             may send nothing and this has no effect yet",
-        ));
+    // Named separately because the two causes need different fixes: one is
+    // `trust approve`, the other is `trust permit <device> files`.
+    if auto_accept && !in_force {
+        let why = if store.may(&id, Permission::Files) {
+            "it is not approved (or its approval has expired)"
+        } else {
+            "it may not send files"
+        };
+        ctx.line(&ctx.dim(&format!("  ...but {why}, so this has no effect yet")));
     }
     Ok(())
 }
@@ -516,12 +532,12 @@ pub fn approval_question(
     let grants = if share {
         "Approving lets this device receive this machine's presence status, clipboard\nand \
          pipes, and exchange files and messages with it. It does **not** grant `notes`\nor \
-         `browse` — those stay opt-in via `trust grant-permission`. Narrow the rest\nwith \
+         `browse` — those stay opt-in via `trust permit`. Narrow the rest\nwith \
          `trust revoke-permission`."
     } else {
         "Approving vouches for this device's key and grants it **nothing**: it stops\ncounting \
          as a stranger, and may do nothing at all until you grant a permission\nwith `trust \
-         grant-permission`."
+         permit`."
     };
     format!(
         "  fingerprint  {}\n  pinned       {}\n  for          {}\n{}\nApprove {} ({})?",
@@ -1206,7 +1222,7 @@ mod tests {
             "trust-without-sharing must say it grants nothing: {q}"
         );
         assert!(
-            q.contains("grant-permission"),
+            q.contains("trust permit"),
             "and how to grant something later: {q}"
         );
         // It must not read like the sharing variant: someone skimming two

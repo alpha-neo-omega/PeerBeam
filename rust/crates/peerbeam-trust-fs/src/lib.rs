@@ -742,6 +742,38 @@ mod tests {
         );
     }
 
+    /// **`auto_accepts` is not "auto-accept is in force".** It answers only
+    /// "the bit is set and the approval is live" — it says nothing about the
+    /// `files` permission, and a surface that treats it as the whole answer
+    /// will tell a user a setting applies to a device the admission gate
+    /// refuses outright.
+    ///
+    /// `peerbeam trust auto-accept` did exactly that: it warned when a device
+    /// was unapproved and stayed silent when `files` had been revoked, which is
+    /// the very case its own documentation calls inert. Anything asking
+    /// "will this actually do something?" must ask both.
+    #[test]
+    fn auto_accepts_is_true_even_when_files_is_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = FsTrust::open(dir.path().join("trust.json")).unwrap();
+        let device = DeviceId::from("pb-narrowed");
+        trust.record(record("pb-narrowed", "fp")).unwrap();
+        trust.approve(&device).unwrap();
+        trust.set_auto_accept(&device, true).unwrap();
+        trust
+            .set_permission(&device, Permission::Files, false)
+            .unwrap();
+
+        assert!(
+            trust.auto_accepts(&device),
+            "the bit is set and the approval is live, so this is true..."
+        );
+        assert!(
+            !trust.may(&device, Permission::Files),
+            "...while the device may send nothing, which is what decides it"
+        );
+    }
+
     #[test]
     fn approving_a_device_that_was_never_pinned_reports_it_rather_than_lying() {
         let dir = tempfile::tempdir().unwrap();

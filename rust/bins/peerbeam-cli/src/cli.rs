@@ -531,7 +531,7 @@ pub enum TrustAction {
     /// Not *every* permission this build has: `notes` and `browse` were added
     /// after the approval set was frozen and stay opt-in, so a device approved
     /// here still cannot list your shared folders until you grant `browse`
-    /// with `trust grant-permission`.
+    /// with `trust permit`.
     Approve {
         /// Device id, name, or unambiguous name prefix (as shown by `trust list`).
         #[arg(value_name = "DEVICE")]
@@ -550,7 +550,7 @@ pub enum TrustAction {
         /// The key is vouched for, so the device stops counting as a stranger
         /// and stops re-prompting as first contact; it may do nothing at all
         /// until you grant a permission. Grant them one at a time with
-        /// `trust grant-permission`, which is what invariant I6 asks for.
+        /// `trust permit`, which is what invariant I6 asks for.
         ///
         /// Ignored for a device that is already approved: the permission set is
         /// written only when approval is first granted, so this can never be

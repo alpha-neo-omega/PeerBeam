@@ -600,7 +600,7 @@ Working now:
   shared folders until you say so:
 
   ```bash
-  peerbeam trust grant-permission pb-f4e4d56fce98 browse
+  peerbeam trust permit pb-f4e4d56fce98 browse
   ```
 
   **`--no-share` approves and grants nothing.** The key is vouched for — the
@@ -610,7 +610,7 @@ Working now:
 
   ```bash
   peerbeam trust approve pb-f4e4d56fce98 --no-share --yes
-  peerbeam trust grant-permission pb-f4e4d56fce98 chat   # …and only chat
+  peerbeam trust permit pb-f4e4d56fce98 chat   # …and only chat
   ```
 
   It is ignored for a device that is **already** approved: the permission set is
