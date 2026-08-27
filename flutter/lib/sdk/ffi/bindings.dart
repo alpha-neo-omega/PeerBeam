@@ -313,7 +313,7 @@ class Bindings {
   /// Load the native library. `overridePath` forces a specific file (tests).
   static Bindings load({String? overridePath}) {
     try {
-      final lib = _openLibrary(overridePath);
+      final lib = openPeerbeamLibrary(overridePath);
       return Bindings._(lib);
     } on NativeLoadError {
       rethrow;
@@ -356,8 +356,7 @@ class Bindings {
   String trustApprove(String json) => _withArg(json, _trustApprove);
   String trustRemove(String json) => _withArg(json, _trustRemove);
   String trustSetPermission(String json) => _withArg(json, _trustSetPermission);
-  String trustSetAutoAccept(String json) =>
-      _withArg(json, _trustSetAutoAccept);
+  String trustSetAutoAccept(String json) => _withArg(json, _trustSetAutoAccept);
   String rulesSet(String json) => _withArg(json, _rulesSet);
   String historyClear() => _consume(_historyClear());
   String settingsGet() => _consume(_settingsGet());
@@ -443,7 +442,12 @@ class Bindings {
 }
 
 /// Open the platform's shared library. iOS links statically (process symbols).
-DynamicLibrary _openLibrary(String? overridePath) {
+///
+/// Public because `off_isolate.dart` opens the same image from a background
+/// isolate, and it must resolve the identical file: a second copy of this
+/// logic that drifted would have one isolate talking to a different build of
+/// the engine than the other.
+DynamicLibrary openPeerbeamLibrary(String? overridePath) {
   if (overridePath != null) return DynamicLibrary.open(overridePath);
   if (Platform.isIOS) return DynamicLibrary.process();
   if (Platform.isMacOS) {

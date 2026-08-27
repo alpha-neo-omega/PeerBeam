@@ -633,9 +633,52 @@ the user.
 ## Threading
 
 One global multi-thread tokio runtime owns the engine and all async work, so
-background transfers continue across UI navigation. FFI functions are thin and
-non-blocking (discovery start/stop are fast); long work runs on the runtime and
-surfaces via events. Dart never blocks.
+background transfers continue across UI navigation. Most FFI functions are thin
+and non-blocking: they hand work to the runtime and the answer arrives as an
+event.
+
+### Seven that do block, and where they run
+
+This section used to end "Dart never blocks." That was not true. Seven entry
+points dial a peer and wait for the answer inside the call, and a synchronous
+FFI call runs on whichever Dart isolate made it — so making them from the UI
+isolate froze the app for the whole round trip. The engine bounds three of them
+and that only bounds the freeze:
+
+| Entry point | Waits for | Bound |
+| --- | --- | --- |
+| `pb_browse_list` | a peer's folder listing | `BROWSE_BUDGET` 10s |
+| `pb_presence_ring` | a peer to make a noise | `RING_BUDGET` 8s |
+| `pb_sync_pull` | a folder sync to be planned | `SYNC_BUDGET` 300s |
+| `pb_notes_sync` | a note batch to be sent | the dial's own 30s |
+| `pb_chat_mark_read` | a read receipt to be sent | the dial's own 30s |
+| `pb_chat_react` | a reaction to be sent | the dial's own 30s |
+| `pb_check_updates` | one HTTPS request | the request |
+
+`pb_chat_mark_read` was the worst of them in practice: unbounded, and fired
+every time a conversation was opened.
+
+The Dart SDK now runs exactly these seven on a background isolate
+(`lib/sdk/ffi/off_isolate.dart`), one per call so a 300s sync cannot queue
+behind a 10s browse. Everything else still runs inline, because for a local
+store read the isolate hop costs more than the work.
+
+This is safe because Dart isolates are threads of one process: the second
+isolate's `DynamicLibrary.open` reaches the same image and the same Rust
+statics, so it drives the *same* engine. `runtime::block_on` takes no global
+lock, so the call genuinely runs beside the UI isolate rather than queueing.
+Events are unaffected — `pb_set_event_callback` is registered once by the UI
+isolate with a `NativeCallable.listener`, and the engine keeps calling that
+pointer regardless of which isolate asked for the work.
+
+Errors need no marshalling: the FFI reports failure *inside* its JSON envelope
+rather than by throwing, so the raw string crosses the port and is decoded into
+the same typed exception on the calling isolate.
+
+Measured, not asserted: `test/sdk/ffi_test.dart` dials TEST-NET-1
+(`192.0.2.1`, reserved and unroutable) while a 20ms `Timer.periodic` counts
+ticks. Against the synchronous call the count is **zero** for the full eight
+seconds; off-isolate the timer keeps firing.
 
 ## Platform support
 

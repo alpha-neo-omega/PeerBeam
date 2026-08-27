@@ -2,6 +2,7 @@
 // does — init, discovery, error mapping (typed exceptions over real FFI), event
 // stream delivery, and a stress/leak loop. Skipped if the library isn't built.
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -71,6 +72,47 @@ void main() {
       expect((ev as TransferEvent).transferId, isNotEmpty);
       // Clean up the (parked) transfer.
       await api.cancel(ids.first);
+    });
+
+    /// **The one that proves the point.** Everything else in
+    /// `off_isolate_test.dart` substitutes the isolate hop; only the real
+    /// library can show that the calling isolate keeps running while a native
+    /// call sits on a network round trip.
+    ///
+    /// `192.0.2.1` is TEST-NET-1 (RFC 5737) — reserved, unroutable, and
+    /// guaranteed never to answer — so the dial burns its whole `RING_BUDGET`
+    /// instead of connecting. A `Timer.periodic` cannot fire while its isolate
+    /// is inside blocking C code, so a tick count that advanced is direct
+    /// evidence the event loop stayed alive.
+    ///
+    /// Against the old synchronous body this counts zero ticks.
+    test('a peer dial leaves the calling isolate free to run', () async {
+      await api.initialize();
+      var ticks = 0;
+      final timer = Timer.periodic(
+        const Duration(milliseconds: 20),
+        (_) => ticks++,
+      );
+      final started = DateTime.now();
+      await api.presenceRing(
+        const PeerTarget(name: 'nobody', addresses: ['192.0.2.1'], port: 49600),
+        seconds: 1,
+      );
+      final elapsed = DateTime.now().difference(started);
+      timer.cancel();
+
+      // Guards the guard: if the dial were to fail instantly the tick count
+      // would prove nothing, so assert there was real blocking work to survive.
+      expect(
+        elapsed.inMilliseconds,
+        greaterThan(500),
+        reason: 'the unroutable dial should have taken real time',
+      );
+      expect(
+        ticks,
+        greaterThan(5),
+        reason: 'the isolate was blocked for the whole native call',
+      );
     });
 
     test('stress: many calls stay bounded and stable', () async {

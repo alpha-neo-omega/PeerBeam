@@ -11,6 +11,7 @@ import 'package:ffi/ffi.dart';
 import 'events.dart';
 import 'exceptions.dart';
 import 'ffi/bindings.dart';
+import 'ffi/off_isolate.dart';
 import 'models.dart';
 
 /// Expected native ABI. The SDK refuses to run against a mismatched engine.
@@ -575,12 +576,49 @@ class PeerBeam implements PeerBeamApi {
   /// Try to load the native library. Never throws — if the library is absent,
   /// [available] is false and calls throw [PeerBeamUnavailable] so the app
   /// degrades gracefully. `overrideLibPath` targets a specific file (tests).
-  PeerBeam({String? overrideLibPath}) {
+  // `prefer_initializing_formals` suggests `this._invokeOff`, which Dart does
+  // not allow: a named parameter may not begin with an underscore, and the
+  // field is private on purpose.
+  PeerBeam({String? overrideLibPath, OffIsolateInvoke? invokeOff})
+    : _libPath = overrideLibPath,
+      // ignore: prefer_initializing_formals
+      _invokeOff = invokeOff {
     try {
       _b = Bindings.load(overridePath: overrideLibPath);
     } on NativeLoadError {
       _b = null;
     }
+  }
+
+  /// Forwarded to the background isolate so it opens the same library file.
+  final String? _libPath;
+
+  /// Substituted by tests; `null` means the real isolate hop.
+  final OffIsolateInvoke? _invokeOff;
+
+  /// Run one blocking native call off the UI isolate.
+  ///
+  /// Used only by the calls that dial a peer. Everything else reads a local
+  /// store and returns in microseconds, where an isolate hop would cost more
+  /// than the work it moved.
+  ///
+  /// Availability is checked here, on the UI isolate, so an absent engine
+  /// throws [PeerBeamUnavailable] exactly as it did before rather than failing
+  /// later as a library-load error inside a spawned isolate — a place the
+  /// caller has no way to catch it from.
+  ///
+  /// Only for the real path. A substituted [OffIsolateInvoke] *is* the engine
+  /// for that call, so demanding a loaded library as well would make the seam
+  /// untestable anywhere the library is absent, which is everywhere CI runs.
+  Future<Map<String, dynamic>> _off(String symbol, [String? arg]) async {
+    final invoke = _invokeOff;
+    if (invoke == null) _req();
+    final raw = invoke != null
+        ? await invoke(symbol, arg)
+        : await invokeOffIsolate(symbol, arg, _libPath);
+    // Decoded on this isolate, so a refusal arrives as the same
+    // `PeerBeamException` subclass every caller already catches.
+    return _data(raw);
   }
 
   @override
@@ -869,15 +907,14 @@ class PeerBeam implements PeerBeamApi {
     String emoji, {
     bool remove = false,
   }) async {
-    final data = _data(
-      _req().chatReact(
-        jsonEncode({
-          'peer': peerId,
-          'id': messageId,
-          'emoji': emoji,
-          'remove': remove,
-        }),
-      ),
+    final data = await _off(
+      'pb_chat_react',
+      jsonEncode({
+        'peer': peerId,
+        'id': messageId,
+        'emoji': emoji,
+        'remove': remove,
+      }),
     );
     return (
       applied: data['applied'] == true,
@@ -887,10 +924,9 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<bool> chatMarkRead(String peerId, String readThrough) async {
-    final data = _data(
-      _req().chatMarkRead(
-        jsonEncode({'peer': peerId, 'read_through': readThrough}),
-      ),
+    final data = await _off(
+      'pb_chat_mark_read',
+      jsonEncode({'peer': peerId, 'read_through': readThrough}),
     );
     return data['sent'] == true;
   }
@@ -925,24 +961,27 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<bool> notesSync(PeerTarget peer) async {
-    final data = _data(_req().notesSync(jsonEncode({'peer': peer.toJson()})));
+    final data = await _off(
+      'pb_notes_sync',
+      jsonEncode({'peer': peer.toJson()}),
+    );
     return data['sent'] == true;
   }
 
   @override
   Future<bool> presenceRing(PeerTarget peer, {int seconds = 15}) async {
-    final data = _data(
-      _req().presenceRing(
-        jsonEncode({'peer': peer.toJson(), 'seconds': seconds}),
-      ),
+    final data = await _off(
+      'pb_presence_ring',
+      jsonEncode({'peer': peer.toJson(), 'seconds': seconds}),
     );
     return data['sent'] == true;
   }
 
   @override
   Future<BrowseListing> browse(PeerTarget peer, {String path = ''}) async {
-    final data = _data(
-      _req().browseList(jsonEncode({'peer': peer.toJson(), 'path': path})),
+    final data = await _off(
+      'pb_browse_list',
+      jsonEncode({'peer': peer.toJson(), 'path': path}),
     );
     return BrowseListing.fromJson(data);
   }
@@ -963,7 +1002,7 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<UpdateCheck> checkForUpdates() async =>
-      UpdateCheck.fromJson(_data(_req().checkUpdates()));
+      UpdateCheck.fromJson(await _off('pb_check_updates'));
 
   @override
   Future<List<Space>> spaces() async {
@@ -1097,10 +1136,9 @@ class PeerBeam implements PeerBeamApi {
     String path,
     String into,
   ) async {
-    final data = _data(
-      _req().syncPull(
-        jsonEncode({'peer': peer.toJson(), 'path': path, 'into': into}),
-      ),
+    final data = await _off(
+      'pb_sync_pull',
+      jsonEncode({'peer': peer.toJson(), 'path': path, 'into': into}),
     );
     return SyncResult.fromJson(data);
   }
@@ -1207,10 +1245,7 @@ class PeerBeam implements PeerBeamApi {
   Future<void> leaveGroup(String id, List<PeerTarget> peers) async {
     _data(
       _req().groupsLeave(
-        jsonEncode({
-          'id': id,
-          'peers': peers.map((p) => p.toJson()).toList(),
-        }),
+        jsonEncode({'id': id, 'peers': peers.map((p) => p.toJson()).toList()}),
       ),
     );
   }
