@@ -113,8 +113,8 @@ async fn transfers_folder_preserving_structure() {
     let cr = TransferControl::new();
     let (ptx, _prx) = mpsc::unbounded_channel();
 
-    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     let (rs, rr) = tokio::join!(send, recv);
 
     assert_eq!(rs.unwrap(), TransferOutcome::Completed);
@@ -175,8 +175,9 @@ async fn receive_overwrites_preexisting_destination_files() {
         &cs,
         &ptx,
         3,
+        false,
     );
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     let (rs, rr) = tokio::join!(send, recv);
 
     assert_eq!(rs.unwrap(), TransferOutcome::Completed);
@@ -211,8 +212,8 @@ async fn cancel_then_rerun_completes() {
         let cr = TransferControl::new();
         let (ptx, _prx) = mpsc::unbounded_channel();
         cs.pause();
-        let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3);
-        let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+        let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+        let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
         let canceller = async {
             tokio::time::sleep(Duration::from_millis(60)).await;
             cs.cancel();
@@ -228,8 +229,8 @@ async fn cancel_then_rerun_completes() {
         let cs = TransferControl::new();
         let cr = TransferControl::new();
         let (ptx, _prx) = mpsc::unbounded_channel();
-        let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3);
-        let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+        let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+        let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
         let (rs, rr) = tokio::join!(send, recv);
         assert_eq!(rs.unwrap(), TransferOutcome::Completed);
         assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
@@ -266,8 +267,8 @@ async fn receiver_pause_actually_stops_progress() {
     // wait_while_paused rather than proceeding into the frame select.
     cr.pause();
 
-    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     tokio::pin!(send);
     tokio::pin!(recv);
 
@@ -324,10 +325,10 @@ async fn cancel_interrupts_parked_receive() {
     cs.pause();
     let send_req = req(&root_path);
     let send_task = tokio::spawn(async move {
-        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3).await;
+        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3, false).await;
     });
 
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     let canceller = async {
         tokio::time::sleep(Duration::from_millis(60)).await;
         cr.cancel();
@@ -385,8 +386,9 @@ async fn a_send_ceiling_slows_a_folder_send() {
         &cs,
         &ptx,
         3,
+        false,
     );
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     let (rs, rr) = tokio::join!(send, recv);
     let elapsed = started.elapsed();
 
@@ -456,8 +458,9 @@ async fn two_entries_differing_only_by_case_both_survive() {
         &cs,
         &ptx,
         3,
+        false,
     );
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     let (rs, rr) = tokio::join!(send, recv);
     assert_eq!(rs.unwrap(), TransferOutcome::Completed);
     assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
@@ -520,10 +523,10 @@ async fn an_interrupted_folder_receive_leaves_no_file_at_the_real_name() {
 
     let send_req = req(&root.to_string_lossy());
     let send_task = tokio::spawn(async move {
-        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3).await;
+        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3, false).await;
     });
 
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
     // **Cancel on data, not on a clock.** A `MemLink` moves six megabytes in
     // well under any sleep worth writing, so a timed cancel always arrived
     // after `Completed` and never entered the window this test exists to
@@ -566,5 +569,123 @@ async fn an_interrupted_folder_receive_leaves_no_file_at_the_real_name() {
             big.len()
         );
         assert_eq!(on_disk, big, "published file differs from the source");
+    }
+}
+
+/// **With the feature negotiated, a folder send waits to be told it landed.**
+///
+/// This closes the other half of the truncation bug. Staging stopped a partial
+/// file appearing under a real name; this stops the *sender* claiming success
+/// for bytes the receiver never got. `send_frame` returns once the transport
+/// accepts the bytes, and the session then closes the shared QUIC connection —
+/// which quinn documents as licence for the peer to discard stream data it has
+/// not yet handed to the application.
+#[tokio::test]
+async fn a_folder_send_waits_for_the_receiver_to_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    let send = send_folder(
+        &mut la,
+        &storage,
+        req(&root_path),
+        &cs,
+        &ptx,
+        3,
+        true, // the peer advertised TRANSFER_FEAT_FOLDER_ACK
+    );
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, true);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    for (rel, bytes) in &files {
+        assert_eq!(
+            &std::fs::read(out.join("myfolder").join(rel)).unwrap(),
+            bytes
+        );
+    }
+}
+
+/// **A receiver that never confirms fails the send.** Silence must not be read
+/// as success — that is exactly the bug the acknowledgement exists to close, and
+/// treating a missing answer as `Completed` would reintroduce it wholesale.
+///
+/// Driven by letting the receiver finish and go away rather than by waiting out
+/// `ACK_TIMEOUT`: the sender is told the peer supports the feature, the peer
+/// sends no answer and drops the link, and the sender must fail. Same verdict,
+/// same code path into `wait_for_folder_ack`, without spending thirty seconds
+/// of every test run proving a constant.
+#[tokio::test]
+async fn a_folder_send_fails_when_the_confirmation_never_comes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, _files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let storage_r = storage.clone();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+    let ptx_r = ptx.clone();
+
+    // `lb` is moved in, so it is dropped the moment the receive returns — the
+    // shape of a peer that got every byte and then went away without
+    // answering, which is precisely what an older build does.
+    let recv_task = tokio::spawn(async move {
+        receive_folder(&mut lb, &storage_r, &out_str, &cr, &ptx_r, false).await
+    });
+
+    let rs = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, true).await;
+    let rr = recv_task.await.expect("receive task panicked");
+
+    // The receive itself succeeded — the files are on disk — but the sender
+    // must not claim a delivery it was never told about.
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    let err = rs.expect_err("silence must not be reported as a delivered folder");
+    assert!(
+        format!("{err}").contains("confirm"),
+        "the failure does not say what went wrong: {err}"
+    );
+}
+
+/// **A peer that predates the feature is unaffected.** Nothing is sent, nothing
+/// is waited for, and the send completes exactly as it did before — which is
+/// what makes this additive rather than a wire break.
+#[tokio::test]
+async fn a_folder_send_to_an_older_peer_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root_path, files) = build_tree(dir.path());
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // Both false: the negotiated set ANDed the bit away.
+    let send = send_folder(&mut la, &storage, req(&root_path), &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx, false);
+    let (rs, rr) = tokio::join!(send, recv);
+
+    assert_eq!(rs.unwrap(), TransferOutcome::Completed);
+    assert_eq!(rr.unwrap().outcome, TransferOutcome::Completed);
+    for (rel, bytes) in &files {
+        assert_eq!(
+            &std::fs::read(out.join("myfolder").join(rel)).unwrap(),
+            bytes
+        );
     }
 }

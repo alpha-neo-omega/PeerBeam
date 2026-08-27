@@ -144,10 +144,11 @@ async fn receive_on_channel_dispatches_a_folder() {
         &ctrl_s,
         &ptx_s,
         0,
+        true,
     );
     let recv = async {
         let inc = p.b_incoming.recv().await.expect("incoming");
-        receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r).await
+        receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r, true).await
     };
     let (sr, rr) = tokio::join!(send, recv);
     assert_eq!(sr.expect("send folder"), TransferOutcome::Completed);
@@ -197,7 +198,7 @@ async fn receive_on_channel_dispatches_a_file() {
     );
     let recv = async {
         let inc = p.b_incoming.recv().await.expect("incoming");
-        receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r).await
+        receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r, true).await
     };
     let (sr, rr) = tokio::join!(send, recv);
     assert_eq!(sr.expect("send"), TransferOutcome::Completed);
@@ -294,7 +295,8 @@ async fn peek_reports_file_meta_and_the_receive_is_unaffected() {
     let recv = async {
         let inc = p.b_incoming.recv().await.expect("incoming");
         let (inc, preview) = peek_incoming_meta(inc).await;
-        let received = receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r).await;
+        let received =
+            receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r, true).await;
         (preview, received)
     };
     let (sr, (preview, rr)) = tokio::join!(send, recv);
@@ -352,11 +354,13 @@ async fn peek_reports_folder_manifest_and_the_receive_is_unaffected() {
         &ctrl_s,
         &ptx_s,
         0,
+        true,
     );
     let recv = async {
         let inc = p.b_incoming.recv().await.expect("incoming");
         let (inc, preview) = peek_incoming_meta(inc).await;
-        let received = receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r).await;
+        let received =
+            receive_on_channel(inc, &p.b, &storage_r, &dst_dir, &ctrl_r, &ptx_r, true).await;
         (preview, received)
     };
     let (sr, (preview, rr)) = tokio::join!(send, recv);

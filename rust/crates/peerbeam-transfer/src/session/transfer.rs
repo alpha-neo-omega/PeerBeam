@@ -194,12 +194,22 @@ pub async fn send_folder_on_session(
     ctrl: &TransferControl,
     progress: &UnboundedSender<Progress>,
     retries: u32,
+    expect_ack: bool,
 ) -> Result<TransferOutcome> {
     let (channel, mut link) = session
         .open_stream_channel(ChannelType::TRANSFER)
         .await
         .map_err(sess_to_dom)?;
-    let outcome = send_folder(link.as_mut(), storage, req, ctrl, progress, retries).await;
+    let outcome = send_folder(
+        link.as_mut(),
+        storage,
+        req,
+        ctrl,
+        progress,
+        retries,
+        expect_ack,
+    )
+    .await;
     session.close_channel(channel);
     outcome
 }
@@ -213,11 +223,12 @@ pub async fn receive_folder_on_channel(
     dest_dir: &str,
     ctrl: &TransferControl,
     progress: &UnboundedSender<Progress>,
+    ack: bool,
 ) -> Result<FolderReceived> {
     let IncomingStreamChannel {
         channel, mut link, ..
     } = incoming;
-    let received = receive_folder(link.as_mut(), storage, dest_dir, ctrl, progress).await;
+    let received = receive_folder(link.as_mut(), storage, dest_dir, ctrl, progress, ack).await;
     session.close_channel(channel);
     received
 }
@@ -376,6 +387,7 @@ pub async fn receive_on_channel(
     dest_dir: &str,
     ctrl: &TransferControl,
     progress: &UnboundedSender<Progress>,
+    ack: bool,
 ) -> Result<ChannelReceived> {
     let IncomingStreamChannel {
         channel, mut link, ..
@@ -388,7 +400,7 @@ pub async fn receive_on_channel(
         let is_folder = first.kind == FrameKind::Control;
         let mut peek = PeekLink::new(first, link.as_mut());
         if is_folder {
-            receive_folder(&mut peek, storage, dest_dir, ctrl, progress)
+            receive_folder(&mut peek, storage, dest_dir, ctrl, progress, ack)
                 .await
                 .map(ChannelReceived::Folder)
         } else {

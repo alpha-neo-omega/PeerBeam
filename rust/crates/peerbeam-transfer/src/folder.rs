@@ -90,6 +90,15 @@ enum FolderMessage {
         index: u32,
     },
     Complete,
+    /// Receiver → sender: every entry arrived and was published.
+    ///
+    /// **Sent only when `TRANSFER_FEAT_FOLDER_ACK` was negotiated.** The enum is
+    /// externally tagged, so a sender that predates this variant fails to parse
+    /// it rather than ignoring it — the capability check is what keeps this
+    /// additive.
+    Received {
+        files: u64,
+    },
     Cancel,
     /// Sender → receiver: cooperative pause — see `protocol::Control::Pause`.
     Pause,
@@ -166,6 +175,11 @@ pub struct FolderReceived {
 
 /// Send a folder recursively over `link`, preserving structure. Skips (with a
 /// warning) any source file that fails to open rather than aborting.
+/// `expect_ack` is the negotiated `TRANSFER_FEAT_FOLDER_ACK` bit. With it, this
+/// waits for the receiver's `Received` before reporting `Completed`, so success
+/// means the bytes landed rather than that they reached a send buffer. Without
+/// it — a peer that predates the bit — nothing is expected and the behaviour is
+/// exactly what it was.
 pub async fn send_folder(
     link: &mut dyn Link,
     storage: &dyn StorageProvider,
@@ -173,6 +187,7 @@ pub async fn send_folder(
     ctrl: &TransferControl,
     progress: &UnboundedSender<Progress>,
     retries: u32,
+    expect_ack: bool,
 ) -> Result<TransferOutcome> {
     // TODO(transfer): empty subdirectories are not preserved — `list_files`
     // only returns files, so a source folder that contains only empty dirs
@@ -325,6 +340,17 @@ pub async fn send_folder(
     }
 
     send_with_retry(link, folder_frame(&FolderMessage::Complete), retries).await?;
+    // **The bytes are not delivered because the last frame was written.**
+    // `send_frame` returns once the transport accepts the bytes into its send
+    // buffer, and the session closes the shared QUIC connection shortly after
+    // this returns — which quinn documents as licence for the peer to discard
+    // stream data it has received but not yet handed to the application. So a
+    // folder used to be reported sent while its tail was thrown away, and the
+    // single-file path has always known better: it ends on the receiver's
+    // verdict, not on its own write.
+    if expect_ack {
+        wait_for_folder_ack(link, files_total).await?;
+    }
     emit(
         progress,
         &req.transfer_id,
@@ -337,6 +363,74 @@ pub async fn send_folder(
         TransferStatus::Completed,
     );
     Ok(TransferOutcome::Completed)
+}
+
+/// How long the sender waits for the receiver's `Received` before giving up.
+///
+/// The receiver sends it the moment it has flushed and renamed the last entry,
+/// so this covers one round trip plus that final `fsync` — not the transfer.
+/// Generous enough for a slow link and a slow disk; short enough that a peer
+/// which died mid-write does not hold a send open indefinitely.
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Block until the receiver confirms the folder landed, or fail the send.
+///
+/// **A timeout here is a failure, not a shrug.** The whole point of the
+/// acknowledgement is that "sent" should mean "arrived"; treating silence as
+/// success would restore precisely the bug it exists to close. The caller only
+/// reaches this when the peer advertised `TRANSFER_FEAT_FOLDER_ACK`, so silence
+/// means the peer stopped answering, not that it does not understand.
+///
+/// A `Cancel` is reported as cancelled rather than as an error: the receiver
+/// turning the folder down is an outcome, not a fault.
+async fn wait_for_folder_ack(link: &mut dyn Link, files_total: u32) -> Result<()> {
+    let deadline = tokio::time::timeout(ACK_TIMEOUT, async {
+        loop {
+            match link.recv_frame().await? {
+                Some(frame) if frame.kind == FrameKind::Control => {
+                    match parse_folder(&frame)? {
+                        FolderMessage::Received { files } => return Ok(files),
+                        FolderMessage::Cancel => {
+                            return Err(DomainError::Transfer(
+                                "the receiver cancelled the folder".into(),
+                            ))
+                        }
+                        // Anything else is a peer that is still talking; keep
+                        // reading rather than guessing what it meant.
+                        _ => continue,
+                    }
+                }
+                // Data frames cannot appear here — the sender is done writing —
+                // but ignoring them is safer than failing on one.
+                Some(_) => continue,
+                None => {
+                    return Err(DomainError::Transfer(
+                        "the link closed before the receiver confirmed the folder".into(),
+                    ))
+                }
+            }
+        }
+    })
+    .await;
+
+    let files = match deadline {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(DomainError::Transfer(
+                "the receiver never confirmed the folder arrived".into(),
+            ))
+        }
+    };
+    // Reported, not enforced: the receiver legitimately publishes fewer entries
+    // than were offered — a name that collides with a directory is skipped by
+    // design — and failing the whole send over one skipped file would be worse
+    // than the warning. What matters is that it answered at all.
+    if files != u64::from(files_total) {
+        tracing::warn!(
+            "folder acknowledged with {files} of {files_total} entries; some were skipped"
+        );
+    }
+    Ok(())
 }
 
 /// Receive a folder recursively over `link`, into `dest_dir/<root>/…`.
@@ -389,6 +483,7 @@ pub async fn receive_folder(
     dest_dir: &str,
     ctrl: &TransferControl,
     progress: &UnboundedSender<Progress>,
+    ack: bool,
 ) -> Result<FolderReceived> {
     let (transfer_id, root, files) = recv_manifest(link).await?;
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -607,6 +702,10 @@ pub async fn receive_folder(
                         finish_entry(current.take(), current_paths.take(), storage).await?;
                         break TransferOutcome::Completed;
                     }
+                    // Receiver → sender only. A peer sending us one is confused
+                    // rather than hostile; ignoring it costs nothing and is
+                    // kinder than aborting a folder that is otherwise arriving.
+                    FolderMessage::Received { .. } => continue,
                     FolderMessage::Cancel => {
                         // Logged rather than propagated: this receive is ending
                         // as `Cancelled` either way, so nothing is about to
@@ -674,6 +773,25 @@ pub async fn receive_folder(
             }
         }
     };
+
+    // **Answer before reporting.** The sender is blocked on this when the
+    // feature was negotiated, and it is what turns its "sent" from "the bytes
+    // reached a send buffer" into "the bytes are on the peer's disk". Sent
+    // after `finish_entry` has flushed and renamed the last entry, so the claim
+    // is true when it is made.
+    //
+    // A failure to send it is not made fatal to the *receive*: the files are
+    // written and renamed, the user has them, and turning that into a failed
+    // receive would be a worse lie than the one this closes. The sender learns
+    // the truth anyway — it times out and fails its own side.
+    if ack && outcome == TransferOutcome::Completed {
+        let frame = folder_frame(&FolderMessage::Received {
+            files: u64::from(files_completed),
+        });
+        if let Err(e) = link.send_frame(frame).await {
+            tracing::warn!("folder arrived but the acknowledgement could not be sent: {e}");
+        }
+    }
 
     if outcome == TransferOutcome::Completed {
         emit(

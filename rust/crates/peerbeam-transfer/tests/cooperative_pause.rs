@@ -452,8 +452,16 @@ async fn folder_sender_pause_stops_receiver_and_resume_completes() {
 
     ctrl_s.pause();
 
-    let send = send_folder(&mut la, &storage, folder_req(&root_path), &ctrl_s, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &ctrl_r, &ptx);
+    let send = send_folder(
+        &mut la,
+        &storage,
+        folder_req(&root_path),
+        &ctrl_s,
+        &ptx,
+        3,
+        false,
+    );
+    let recv = receive_folder(&mut lb, &storage, &out_str, &ctrl_r, &ptx, false);
     tokio::pin!(send);
     tokio::pin!(recv);
 

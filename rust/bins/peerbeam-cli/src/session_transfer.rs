@@ -47,7 +47,7 @@ use peerbeam_domain::session::{
     Capability, CapabilitySet, ChannelId, ChannelType, MessageFlags, MessageHandler, MessageType,
     CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF, CHAT_FEAT_REACTION, CHAT_FEAT_RECEIPT,
     CLIPBOARD_FEAT_CLIP, NOTES_FEAT_SYNC, PIPE_FEAT_STREAM, PRESENCE_FEAT_RING,
-    PRESENCE_FEAT_STATUS,
+    PRESENCE_FEAT_STATUS, TRANSFER_FEAT_FOLDER_ACK,
 };
 use peerbeam_domain::session::{SessionError, BROWSE_FEAT_LIST, SYNC_FEAT_MANIFEST};
 use peerbeam_engine::RouteManager;
@@ -140,7 +140,10 @@ fn session_cfg(handlers: Vec<Arc<dyn MessageHandler>>) -> SessionConfig {
 /// while `session_cfg` quietly stopped advertising.
 fn advertised_caps() -> CapabilitySet {
     CapabilitySet::new()
-        .with(Capability::new(TRANSFER))
+        .with(Capability::with_features(
+            TRANSFER,
+            TRANSFER_FEAT_FOLDER_ACK,
+        ))
         .with(Capability::with_features(
             CHAT,
             CHAT_FEAT_FILEREF | CHAT_FEAT_FILEDECLINE | CHAT_FEAT_REACTION | CHAT_FEAT_RECEIPT,
@@ -170,6 +173,13 @@ fn advertised_caps() -> CapabilitySet {
 /// decision is unit-testable without a live session (mirrors the FFI's
 /// `session_exec::caps_support_file_ref`; kept as an independent copy rather
 /// than shared, since the two frontends have no common crate to host one in).
+/// Whether the negotiated set carries the folder-acknowledgement feature.
+/// False for a peer that predates it, and then nothing changes on either side.
+pub fn caps_support_folder_ack(caps: &CapabilitySet) -> bool {
+    caps.features(TRANSFER)
+        .is_some_and(|f| f & TRANSFER_FEAT_FOLDER_ACK != 0)
+}
+
 fn caps_support_file_ref(caps: &CapabilitySet) -> bool {
     caps.features(CHAT)
         .is_some_and(|f| f & CHAT_FEAT_FILEREF != 0)
@@ -904,6 +914,35 @@ mod tests {
     /// `session_cfg` could stop advertising while these tests stayed green.
     fn our_caps() -> CapabilitySet {
         session_cfg(Vec::new()).capabilities
+    }
+
+    /// **The folder-acknowledgement bit must be advertised by this frontend.**
+    ///
+    /// The FFI has the identical test, for the reason the chat one gives: a
+    /// bit advertised by only one of our two surfaces makes a peer's behaviour
+    /// depend on which of them it reached. Here that would mean folder sends
+    /// silently reverting to reporting success for unconfirmed bytes.
+    #[test]
+    fn the_folder_ack_bit_is_advertised() {
+        let caps = our_caps();
+        let f = caps.features(TRANSFER).expect("TRANSFER advertised");
+        assert!(
+            f & TRANSFER_FEAT_FOLDER_ACK != 0,
+            "folder sends will not be confirmed"
+        );
+        assert!(caps_support_folder_ack(&caps), "and the predicate agrees");
+    }
+
+    /// A peer that predates the bit negotiates it away, and then nothing is
+    /// expected and nothing is sent — which is what keeps this additive.
+    #[test]
+    fn an_older_peer_negotiates_the_folder_ack_away() {
+        let legacy = CapabilitySet::new().with(Capability::new(TRANSFER));
+        let negotiated = our_caps().intersect(&legacy);
+        assert!(
+            !caps_support_folder_ack(&negotiated),
+            "we would wait for a confirmation an older peer never sends"
+        );
     }
 
     /// Both chat feature bits must be advertised by **this** frontend. The FFI

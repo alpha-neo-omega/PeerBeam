@@ -439,6 +439,7 @@ async fn send_from_ffi_events_and_stats() {
             &recv_dir_s,
             &ctrl,
             &ptx,
+            true,
         )
         .await
         .unwrap()

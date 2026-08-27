@@ -1715,6 +1715,7 @@ impl Manager {
         );
         *active.status.lock().unwrap() = "transferring".into();
 
+        let expect_ack = crate::session_exec::caps_support_folder_ack(&session.capabilities);
         let handle = session.handle.clone();
         let req = FolderSendRequest {
             transfer_id: id.clone(),
@@ -1729,7 +1730,8 @@ impl Manager {
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let r = send_folder_on_session(&handle, &storage, req, &ctrl, &ptx, 3).await;
+                let r = send_folder_on_session(&handle, &storage, req, &ctrl, &ptx, 3, expect_ack)
+                    .await;
                 drop(ptx);
                 r
             },
@@ -5487,6 +5489,7 @@ impl Manager {
         let folder_root = Arc::new(std::sync::Mutex::new(None::<String>));
         let dest_dir = save_dir.clone();
         let folder_root_cell = folder_root.clone();
+        let ack = crate::session_exec::caps_support_folder_ack(&session.capabilities);
         let handle = session.handle.clone();
         let outcome = drive(
             id.clone(),
@@ -5494,15 +5497,16 @@ impl Manager {
             active.file.clone(),
             active.ctrl.clone(),
             |ptx| async move {
-                let r = receive_on_channel(incoming_ch, &handle, &storage, &dest_dir, &ctrl, &ptx)
-                    .await
-                    .map(|received| match received {
-                        ChannelReceived::File(f) => f.outcome,
-                        ChannelReceived::Folder(fr) => {
-                            *folder_root_cell.lock().unwrap() = Some(fr.root);
-                            fr.outcome
-                        }
-                    });
+                let r =
+                    receive_on_channel(incoming_ch, &handle, &storage, &dest_dir, &ctrl, &ptx, ack)
+                        .await
+                        .map(|received| match received {
+                            ChannelReceived::File(f) => f.outcome,
+                            ChannelReceived::Folder(fr) => {
+                                *folder_root_cell.lock().unwrap() = Some(fr.root);
+                                fr.outcome
+                            }
+                        });
                 drop(ptx);
                 r
             },

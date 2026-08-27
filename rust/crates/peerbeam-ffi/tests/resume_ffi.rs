@@ -279,8 +279,16 @@ async fn serve_legs(
             } else {
                 tokio::spawn(async move { while prx.recv().await.is_some() {} });
             }
-            let _: Result<ChannelReceived, _> =
-                receive_on_channel(channel, &session, &FsStorage::new(), &dest, &ctrl, &ptx).await;
+            let _: Result<ChannelReceived, _> = receive_on_channel(
+                channel,
+                &session,
+                &FsStorage::new(),
+                &dest,
+                &ctrl,
+                &ptx,
+                false,
+            )
+            .await;
             session.close();
             pump.abort();
         }

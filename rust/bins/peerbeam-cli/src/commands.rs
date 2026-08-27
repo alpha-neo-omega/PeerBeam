@@ -1365,8 +1365,11 @@ async fn secure_send_folder(
     };
 
     let handle = &session.handle;
+    // Only wait for a confirmation the peer said it would send — see
+    // `TRANSFER_FEAT_FOLDER_ACK`.
+    let expect_ack = crate::session_transfer::caps_support_folder_ack(session.capabilities());
     let send = async move {
-        let r = send_folder_on_session(handle, storage, req, &ctrl, &ptx, 3).await;
+        let r = send_folder_on_session(handle, storage, req, &ctrl, &ptx, 3, expect_ack).await;
         drop(ptx);
         r
     };
@@ -2276,10 +2279,13 @@ async fn serve_loop(
 
                 let storage_ref = &storage;
                 let handle = &session.handle;
+                let ack = crate::session_transfer::caps_support_folder_ack(session.capabilities());
                 let (ptx, mut prx) = mpsc::unbounded_channel();
                 let ctrl = TransferControl::new();
                 let recv = async move {
-                    let r = receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx).await;
+                    let r =
+                        receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx, ack)
+                            .await;
                     drop(ptx);
                     r
                 };
@@ -3384,6 +3390,7 @@ mod chat_wiring_dial_regression {
                     recv_dir.to_str().expect("utf8 recv dir"),
                     &ctrl,
                     &ptx,
+                    true,
                 )
                 .await;
                 drop(ptx);

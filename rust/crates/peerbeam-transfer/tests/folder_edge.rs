@@ -60,8 +60,8 @@ async fn transfers_edge_case_filenames_and_trees() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
     assert_eq!(so.unwrap(), TransferOutcome::Completed);
     assert_eq!(ro.unwrap().outcome, TransferOutcome::Completed);
@@ -134,8 +134,8 @@ async fn zero_byte_files_are_created() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
     assert_eq!(so.unwrap(), TransferOutcome::Completed);
     let fr = ro.unwrap();
@@ -205,8 +205,8 @@ async fn send_folder_skips_unreadable_file_delivers_rest() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
 
     // Restore perms so the tempdir can be cleaned up.
@@ -265,8 +265,8 @@ async fn receive_folder_skips_path_type_collision_delivers_rest() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
 
     assert_eq!(
@@ -387,8 +387,8 @@ async fn a_folder_receive_that_cannot_flush_fails_instead_of_reporting_success()
     let out_str = out.to_string_lossy().to_string();
     let sender_storage = FsStorage::new();
     let receiver_storage = FullDiskStorage(FsStorage::new());
-    let send = send_folder(&mut la, &sender_storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &receiver_storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &sender_storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &receiver_storage, &out_str, &cr, &ptx2, false);
     let (_so, ro) = tokio::join!(send, recv);
 
     let err = ro.expect_err("a folder whose files could not be flushed must not report success");
@@ -433,8 +433,8 @@ async fn a_colon_in_a_name_does_not_kill_the_rest_of_the_folder() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
 
     assert_eq!(so.unwrap(), TransferOutcome::Completed);
@@ -518,8 +518,8 @@ async fn an_unsafe_path_skips_only_that_entry() {
         chunk_size: 64 * 1024,
     };
     let out_str = out.to_string_lossy().to_string();
-    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3);
-    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2);
+    let send = send_folder(&mut la, &storage, req, &cs, &ptx, 3, false);
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx2, false);
     let (so, ro) = tokio::join!(send, recv);
 
     assert_eq!(so.unwrap(), TransferOutcome::Completed);

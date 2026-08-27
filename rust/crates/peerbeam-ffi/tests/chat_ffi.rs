@@ -1705,6 +1705,7 @@ async fn chat_send_file_shares_a_file_in_the_thread_end_to_end() {
             &peer_dest_str,
             &ctrl,
             &ptx,
+            true,
         )
         .await
         .expect("peer receives the attached file")
@@ -2199,6 +2200,7 @@ async fn a_queued_file_survives_a_restart_and_delivers_when_the_peer_appears() {
             &peer_dest_str,
             &ctrl,
             &ptx,
+            true,
         )
         .await
         .expect("peer receives the queued file")
@@ -3090,6 +3092,7 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
             &peer_dest_str,
             &ctrl,
             &ptx,
+            true,
         )
         .await
         .expect("peer receives the queued file")

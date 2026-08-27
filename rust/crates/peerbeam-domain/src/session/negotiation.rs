@@ -140,6 +140,28 @@ pub const CHAT_FEAT_REACTION: u32 = 1 << 2;
 /// against a peer that predates it.
 pub const CHAT_FEAT_RECEIPT: u32 = 1 << 3;
 
+/// Feature bit on the TRANSFER capability: this peer answers a completed
+/// **folder** transfer with a `Received` acknowledgement.
+///
+/// Comprehension, not consent — like every bit here. What it buys is the one
+/// guarantee a folder send never had: the single-file path ends with
+/// `Complete { checksum }` and blocks on the receiver's verdict, so a sender
+/// that returns `Completed` knows the bytes landed. The folder path had no
+/// acknowledgement at all, so it reported success once the last frame reached
+/// the stream's send buffer — and the session then closed the shared QUIC
+/// connection, which quinn documents as licence for the peer to discard stream
+/// data it has not yet handed to the application. A folder could therefore be
+/// reported sent while its tail was thrown away.
+///
+/// Both sides read the **negotiated** (intersected) set, so a peer that
+/// predates this bit ANDs it away and both ends behave exactly as they did
+/// before: no acknowledgement is sent, none is expected, and nothing on the
+/// wire changes. That is what keeps this additive rather than a break — a
+/// receiver must never send a frame an older sender would fail to parse, and
+/// `FolderMessage` is externally tagged, so an unknown variant is an error
+/// rather than something to skip.
+pub const TRANSFER_FEAT_FOLDER_ACK: u32 = 1 << 0;
+
 /// Feature bit on the NOTES capability: this peer understands the `NoteBatch`
 /// message (notes MessageType 1) — sending it notes will mean something.
 ///

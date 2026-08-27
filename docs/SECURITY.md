@@ -500,12 +500,23 @@ can take. Two differences from the single-file rules remain, and are deliberate:
   to replace — so this path uses `finalize_replacing`. Single-file receives keep
   the no-overwrite rule, where silently replacing a file the user already had
   would be the wrong answer.
-- **No integrity check yet.** The single-file path sends `Complete { checksum }`
-  and blocks on the receiver's verdict; the folder path has no completion
-  acknowledgement at all, so a sender can still report a folder "sent" whose
-  tail the receiver never got. Staging bounds the damage — the missing bytes
-  leave a `.part` rather than a plausible file — but it does not detect the
-  loss. A folder-level acknowledgement is a protocol change and is not done.
+- **Acknowledged, but not checksummed.** The folder path now ends on the
+  receiver's `Received`, so a sender that reports `Completed` has been told the
+  entries were flushed and renamed — it no longer reports success for bytes that
+  only reached a send buffer, which mattered because the session closes the
+  shared QUIC connection immediately afterwards and quinn documents that as
+  licence for the peer to discard undelivered stream data. Silence is a
+  **failure**, not a shrug: treating a missing answer as success would restore
+  the bug wholesale.
+
+  It is gated on the negotiated `TRANSFER_FEAT_FOLDER_ACK` bit, so a peer that
+  predates it sends nothing, is waited on for nothing, and behaves exactly as
+  before — additive, not a wire break.
+
+  What is still missing is a folder **checksum**. The single-file path sends
+  `Complete { checksum }` and the receiver verifies it, so corruption in transit
+  is caught; a folder is confirmed as *arrived*, not as *correct*. Adding a
+  per-entry digest is a further protocol change and is not done.
 
 Path names from peers are sanitized to a single base component (no `..`, no
 absolute paths), then reduced to what the receiving OS can actually hold. On
