@@ -485,6 +485,21 @@ complete transfer is it **atomically** promoted:
   visible.
 - **Failure/cancel** — the `.part` remains (resumable); the final file is
   never created.
+- **One writer at a time** — a staging file is claimed for the life of the
+  receive that owns it. Two transfers arriving simultaneously for the same name
+  (two phones sending `IMG_0001.jpg`) used to open the *same* `.part`: the
+  second read the first's bytes as a resume offset, told its sender to skip
+  them, and appended into the same file, so both streams interleaved, both
+  checksums failed and **both transfers were lost**. The second now lands beside
+  the first as `IMG_0001 (1).jpg`, which is the name `finalize` would have given
+  it anyway. A `.part` left by an *earlier* transfer is held by nobody and is
+  still resumed exactly as before.
+
+  The claim is **in-process**, which is where the collision happens: incoming
+  connections are served concurrently inside one engine. Two separate PeerBeam
+  processes sharing one save directory are not covered — that wants a lock file,
+  and a guard claiming to solve it without one would be worse than a guard that
+  says it does not.
 
 **Folder transfers stage too, since 2026-08-27 — and did not before.** Each
 entry in a folder is written to its own `.part` and renamed on completion, the

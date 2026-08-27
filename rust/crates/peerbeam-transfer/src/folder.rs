@@ -57,8 +57,8 @@ use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
 use crate::stream::{
-    build_progress, part_path, read_fill, safe_component, send_with_retry, signal_pause_edge,
-    to_hex, TransferOutcome,
+    build_progress, free_destination, part_path, read_fill, safe_component, send_with_retry,
+    signal_pause_edge, to_hex, TransferOutcome,
 };
 
 // ── Wire messages ───────────────────────────────────────────────
@@ -468,49 +468,10 @@ async fn wait_for_folder_ack(link: &mut dyn Link, files_total: u32) -> Result<()
 }
 
 /// Receive a folder recursively over `link`, into `dest_dir/<root>/…`.
-/// A destination not already taken, by appending ` (n)` before the extension.
 ///
-/// Asked through [`StorageProvider::size`] rather than `Path::exists`, which is
-/// the whole point on a case-insensitive filesystem: `size("notes.txt")` answers
-/// for `Notes.txt` there, so the collision is seen where `exists` on the literal
-/// string would also have seen it but a case-sensitive comparison of names would
-/// not.
-///
-/// The split is at the **last** dot, so `archive.tar.gz` becomes
-/// `archive.tar (1).gz` — matching what the app already does when it lands a
-/// received file beside one of the same name, rather than inventing a second
-/// convention for the same situation.
-async fn free_destination(storage: &dyn StorageProvider, dest: &str) -> Result<String> {
-    const ATTEMPTS: u32 = 1_000;
-    // Split the **file name**, not the whole path. Deciding on the full string
-    // meant asking whether it ended in `/`, which is not the separator on every
-    // platform — on Windows `C:\\dir\\.gitignore` has no `/` in it, so the
-    // dotfile was read as an extension and came back as ` (1).gitignore`.
-    let name = std::path::Path::new(dest)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dest.to_string());
-    let prefix = &dest[..dest.len() - name.len()];
-    let (stem, ext) = match name.rsplit_once('.') {
-        // A leading dot names the file, it does not separate a suffix:
-        // `.gitignore` has no extension to insert before.
-        Some((stem, ext)) if !stem.is_empty() => (format!("{prefix}{stem}"), Some(ext.to_string())),
-        _ => (dest.to_string(), None),
-    };
-    for n in 1..=ATTEMPTS {
-        let candidate = match &ext {
-            Some(ext) => format!("{stem} ({n}).{ext}"),
-            None => format!("{stem} ({n})"),
-        };
-        if storage.size(&candidate).await?.is_none() {
-            return Ok(candidate);
-        }
-    }
-    Err(DomainError::Transfer(format!(
-        "no free name for {dest} after {ATTEMPTS} attempts"
-    )))
-}
-
+/// `ack` is the negotiated `TRANSFER_FEAT_FOLDER_ACK` bit: with it, a completed
+/// folder is confirmed back to the sender once the last entry is flushed and
+/// renamed, so the sender's "sent" means the bytes are on this disk.
 pub async fn receive_folder(
     link: &mut dyn Link,
     storage: &dyn StorageProvider,

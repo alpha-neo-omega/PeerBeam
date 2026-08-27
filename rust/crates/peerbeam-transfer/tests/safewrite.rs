@@ -142,3 +142,77 @@ async fn failed_transfer_leaves_no_final_file_and_no_poisoned_part() {
         "poisoned .part must be removed, not retained"
     );
 }
+
+/// **Two transfers arriving at once for the same name must both survive.**
+///
+/// The staging path is derived from the destination name, so two simultaneous
+/// receives of `f.bin` used to open the *same* `.part`. The second read the
+/// first's bytes as a resume offset, told its sender to skip them, and appended
+/// into the same file — both streams interleaved, both checksums failed, and
+/// **both transfers were destroyed**. Two phones sending `IMG_0001.jpg` is the
+/// ordinary shape of this, not a contrived one, and incoming connections are
+/// spawned concurrently inside one engine.
+///
+/// What must hold afterwards: two files on disk, each byte-exact. Which one
+/// gets the plain name and which gets ` (1)` is a race and is not asserted —
+/// only that neither was corrupted by the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_simultaneous_receives_of_one_name_do_not_destroy_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let out_s = out.to_string_lossy().to_string();
+
+    // Deliberately different contents, so an interleave cannot go unnoticed.
+    let a_bytes: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let b_bytes: Vec<u8> = (0..96 * 1024).map(|i| ((i + 7) % 241) as u8).collect();
+    let a_src = dir.path().join("a-source");
+    let b_src = dir.path().join("b-source");
+    std::fs::write(&a_src, &a_bytes).unwrap();
+    std::fs::write(&b_src, &b_bytes).unwrap();
+
+    let storage = FsStorage::new();
+    let (mut a_send, mut a_recv) = MemLink::pair(2);
+    let (mut b_send, mut b_recv) = MemLink::pair(2);
+    let ctrl = TransferControl::new();
+    let (ptx, _prx) = mpsc::unbounded_channel();
+
+    // Both name the same destination file.
+    let (sa, ra, sb, rb) = tokio::join!(
+        send_file(
+            &mut a_send,
+            &storage,
+            req(&a_src, a_bytes.len()),
+            &ctrl,
+            &ptx,
+            0
+        ),
+        receive_file(&mut a_recv, &storage, &out_s, &ctrl, &ptx),
+        send_file(
+            &mut b_send,
+            &storage,
+            req(&b_src, b_bytes.len()),
+            &ctrl,
+            &ptx,
+            0
+        ),
+        receive_file(&mut b_recv, &storage, &out_s, &ctrl, &ptx),
+    );
+    sa.expect("send a");
+    sb.expect("send b");
+    let a = ra.expect("receive a must not be destroyed by the other transfer");
+    let b = rb.expect("receive b must not be destroyed by the other transfer");
+
+    // Two distinct files, each exactly what its sender read.
+    assert_ne!(a.name, b.name, "both landed on the same file");
+    let on_a = std::fs::read(out.join(&a.name)).expect("file a");
+    let on_b = std::fs::read(out.join(&b.name)).expect("file b");
+    let mut got = [on_a, on_b];
+    got.sort();
+    let mut want = [a_bytes, b_bytes];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "a concurrent receive corrupted the other's bytes"
+    );
+}

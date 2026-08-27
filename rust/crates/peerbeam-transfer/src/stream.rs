@@ -22,6 +22,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::io::AsyncRead;
 use futures::{AsyncReadExt, AsyncWriteExt};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -47,6 +50,118 @@ pub const PART_SUFFIX: &str = ".part";
 #[must_use]
 pub fn part_path(dest: &str) -> String {
     format!("{dest}{PART_SUFFIX}")
+}
+
+/// A destination not already taken, by appending ` (n)` before the extension.
+///
+/// Asked through [`StorageProvider::size`] rather than `Path::exists`, which is
+/// the whole point on a case-insensitive filesystem: `size("notes.txt")` answers
+/// for `Notes.txt` there, so the collision is seen where `exists` on the literal
+/// string would also have seen it but a case-sensitive comparison of names would
+/// not.
+///
+/// The split is at the **last** dot, so `archive.tar.gz` becomes
+/// `archive.tar (1).gz` — matching what the app already does when it lands a
+/// received file beside one of the same name, rather than inventing a second
+/// convention for the same situation.
+pub(crate) async fn free_destination(storage: &dyn StorageProvider, dest: &str) -> Result<String> {
+    const ATTEMPTS: u32 = 1_000;
+    // Split the **file name**, not the whole path. Deciding on the full string
+    // meant asking whether it ended in `/`, which is not the separator on every
+    // platform — on Windows `C:\\dir\\.gitignore` has no `/` in it, so the
+    // dotfile was read as an extension and came back as ` (1).gitignore`.
+    let name = std::path::Path::new(dest)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dest.to_string());
+    let prefix = &dest[..dest.len() - name.len()];
+    let (stem, ext) = match name.rsplit_once('.') {
+        // A leading dot names the file, it does not separate a suffix:
+        // `.gitignore` has no extension to insert before.
+        Some((stem, ext)) if !stem.is_empty() => (format!("{prefix}{stem}"), Some(ext.to_string())),
+        _ => (dest.to_string(), None),
+    };
+    for n in 1..=ATTEMPTS {
+        let candidate = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        if storage.size(&candidate).await?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(DomainError::Transfer(format!(
+        "no free name for {dest} after {ATTEMPTS} attempts"
+    )))
+}
+
+/// Staging files a live receive in this process is currently writing.
+///
+/// **The concurrency guard for `.part`.** A staging path is derived from the
+/// destination name alone, so two transfers arriving at the same time for the
+/// same name — two phones sending `IMG_0001.jpg`, which is the ordinary case
+/// rather than a contrived one — used to open the *same* file. The second read
+/// the first's bytes as a resume offset, told its sender to skip them, and
+/// appended into the same file; both streams interleaved, both checksums
+/// failed, and both transfers were lost.
+///
+/// In-process, because that is where the collision actually happens: incoming
+/// connections are spawned concurrently inside one engine. Two separate
+/// PeerBeam processes sharing a save directory are not covered, and a lock file
+/// would be the answer there — but that is a different, rarer problem, and a
+/// guard that pretends to solve it would be worse than one that says it does
+/// not.
+static STAGING_IN_USE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// A staging path this receive owns until it finishes.
+///
+/// Released on drop, so every exit path — success, error, cancel, panic —
+/// frees the name without anything having to remember to.
+pub(crate) struct StagingClaim(String);
+
+impl StagingClaim {
+    /// Take `path` if no live receive holds it.
+    fn take(path: &str) -> Option<Self> {
+        let mut held = STAGING_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        held.insert(path.to_string())
+            .then(|| Self(path.to_string()))
+    }
+}
+
+impl Drop for StagingClaim {
+    fn drop(&mut self) {
+        STAGING_IN_USE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Choose a destination whose staging file no other live receive is writing,
+/// and claim it.
+///
+/// The first choice is always the name the sender asked for, so the ordinary
+/// case is unchanged and a `.part` left by an *earlier* transfer is still
+/// resumed exactly as before — nothing here is holding it. Only a name being
+/// written *right now* is stepped around, and the step is the same one
+/// `finalize` would have taken anyway: `file (1).pdf` beside `file.pdf`.
+pub(crate) async fn claim_destination(
+    storage: &dyn StorageProvider,
+    dest: String,
+) -> Result<(String, String, StagingClaim)> {
+    let part = part_path(&dest);
+    if let Some(claim) = StagingClaim::take(&part) {
+        return Ok((dest, part, claim));
+    }
+    // Someone is mid-flight on this name. Take the next free one rather than
+    // interleaving into their file.
+    let free = free_destination(storage, &dest).await?;
+    let free_part = part_path(&free);
+    let claim = StagingClaim::take(&free_part).ok_or_else(|| {
+        DomainError::Transfer(format!("could not claim a staging file for {dest}"))
+    })?;
+    tracing::warn!("another transfer is already writing {dest}; this one lands at {free}");
+    Ok((free, free_part, claim))
 }
 
 /// Base backoff between retry attempts (grows linearly with attempts).
@@ -236,11 +351,11 @@ pub async fn receive_file(
     // Data is written to a `.part` file; the final name only appears once the
     // whole file is received and verified (safe, atomic, no partial clobber).
     //
-    // TODO(transfer): the `.part` name is derived from the destination name
-    // alone (no size/hash binding), so two different transfers that resolve
-    // to the same destination could in principle share a `.part`. Out of
-    // scope for this fix.
-    let part = part_path(&dest);
+    // The claim is what stops two simultaneous receives for the same name
+    // sharing that file and destroying each other — see `claim_destination`.
+    // `_claim` is held for the rest of this function on purpose: dropping it
+    // early would free the name while we are still writing to it.
+    let (dest, part, _claim) = claim_destination(storage, dest).await?;
 
     // Resume from whatever the in-progress `.part` already holds.
     let existing = storage.size(&part).await?.unwrap_or(0).min(meta.size);
