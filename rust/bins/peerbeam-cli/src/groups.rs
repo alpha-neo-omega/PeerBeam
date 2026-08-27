@@ -150,10 +150,7 @@ fn list(ctx: &Ctx, store: &GroupStore) -> CliResult {
                 i.from.0,
                 i.members.len()
             )));
-            ctx.line(&ctx.dim(&format!(
-                "    `peerbeam group accept {}` to join",
-                i.group
-            )));
+            ctx.line(&ctx.dim(&format!("    `peerbeam group accept {}` to join", i.group)));
         }
         ctx.line("");
     }
@@ -300,14 +297,7 @@ where
         std::sync::Arc::new(peerbeam_transfer_quic::QuicTransport::new().map_err(CliError::from)?);
     let routes = peerbeam_engine::RouteManager::new(quic.clone());
     let session = crate::session_transfer::dial(
-        &quic,
-        &routes,
-        found,
-        "group",
-        &sc.ident,
-        &sc.enc,
-        &sc.trust,
-        None,
+        &quic, &routes, found, "group", &sc.ident, &sc.enc, &sc.trust, None,
     )
     .await?;
 

@@ -22,51 +22,53 @@ use peerbeam_domain::id::DeviceId;
 #[must_use]
 pub fn sink() -> Option<peerbeam_chat::ForeignSink> {
     let mgr = crate::runtime::manager().ok()?;
-    Some(Arc::new(move |peer: DeviceId, message_type: u16, payload: Vec<u8>| {
-        let store = mgr.group_store();
-        match peerbeam_groups::apply(&store, &peer, message_type, &payload) {
-            // An invitation is **held**, never adopted: it becomes a pending
-            // offer for the user to answer, and only their acceptance writes a
-            // roster (A2, condition 4).
-            Ok(peerbeam_groups::GroupEvent::Invited {
-                group,
-                name,
-                from,
-                members,
-            }) => {
-                let invite = peerbeam_groups::PendingInvite {
-                    group: group.clone(),
+    Some(Arc::new(
+        move |peer: DeviceId, message_type: u16, payload: Vec<u8>| {
+            let store = mgr.group_store();
+            match peerbeam_groups::apply(&store, &peer, message_type, &payload) {
+                // An invitation is **held**, never adopted: it becomes a pending
+                // offer for the user to answer, and only their acceptance writes a
+                // roster (A2, condition 4).
+                Ok(peerbeam_groups::GroupEvent::Invited {
+                    group,
                     name,
                     from,
                     members,
-                    at: crate::transfer::timestamp(),
-                };
-                if let Err(e) = store.record_invite(&invite) {
-                    // Logged, not fatal: a peer must not be able to break this
-                    // device's session by sending something unstorable.
-                    tracing::warn!("could not record a group invitation: {e}");
-                    return;
+                }) => {
+                    let invite = peerbeam_groups::PendingInvite {
+                        group: group.clone(),
+                        name,
+                        from,
+                        members,
+                        at: crate::transfer::timestamp(),
+                    };
+                    if let Err(e) = store.record_invite(&invite) {
+                        // Logged, not fatal: a peer must not be able to break this
+                        // device's session by sending something unstorable.
+                        tracing::warn!("could not record a group invitation: {e}");
+                        return;
+                    }
+                    crate::events::event(&serde_json::json!({
+                        "type": "groups_changed",
+                        "reason": "invited",
+                        "group": group,
+                        "timestamp": crate::transfer::timestamp(),
+                    }));
                 }
-                crate::events::event(&serde_json::json!({
-                    "type": "groups_changed",
-                    "reason": "invited",
-                    "group": group,
-                    "timestamp": crate::transfer::timestamp(),
-                }));
+                Ok(peerbeam_groups::GroupEvent::Joined { group, .. })
+                | Ok(peerbeam_groups::GroupEvent::Left { group, .. }) => {
+                    crate::events::event(&serde_json::json!({
+                        "type": "groups_changed",
+                        "reason": "roster",
+                        "group": group,
+                        "timestamp": crate::transfer::timestamp(),
+                    }));
+                }
+                // A frame this build does not implement, or one naming a group this
+                // device does not hold. Neither is an error — see `apply`.
+                Ok(peerbeam_groups::GroupEvent::Ignored) => {}
+                Err(e) => tracing::warn!("could not apply a group message: {e}"),
             }
-            Ok(peerbeam_groups::GroupEvent::Joined { group, .. })
-            | Ok(peerbeam_groups::GroupEvent::Left { group, .. }) => {
-                crate::events::event(&serde_json::json!({
-                    "type": "groups_changed",
-                    "reason": "roster",
-                    "group": group,
-                    "timestamp": crate::transfer::timestamp(),
-                }));
-            }
-            // A frame this build does not implement, or one naming a group this
-            // device does not hold. Neither is an error — see `apply`.
-            Ok(peerbeam_groups::GroupEvent::Ignored) => {}
-            Err(e) => tracing::warn!("could not apply a group message: {e}"),
-        }
-    }))
+        },
+    ))
 }
