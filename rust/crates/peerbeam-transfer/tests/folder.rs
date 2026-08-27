@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use peerbeam_domain::entity::Direction;
 use peerbeam_domain::error::{DomainError, Result};
 use peerbeam_domain::port::{Frame, FrameKind, Link};
 use peerbeam_storage_fs::FsStorage;
@@ -476,4 +477,94 @@ async fn two_entries_differing_only_by_case_both_survive() {
         landed.iter().any(|b| b == b"lower"),
         "the second entry was lost: {landed:?}"
     );
+}
+
+/// **An interrupted folder receive must not leave a truncated file under the
+/// name a complete one would have.**
+///
+/// This is the defect that made `sends_a_folder_between_two_processes_over_quic`
+/// fail intermittently on CI, and it was a real data-integrity bug rather than a
+/// flaky test: the folder path wrote straight to the destination with
+/// `open_write`, so a connection lost mid-file left a plausible-looking, short
+/// file at exactly the path the user expected. `docs/SECURITY.md`'s "Safe file
+/// writing" promised staging-and-rename and the single-file path did it; this
+/// path never had.
+///
+/// The receive is cut off partway, which is the same shape as a link that dies:
+/// bytes have been accepted for an entry whose `FileEnd` never arrives. What
+/// must be true afterwards is not that the bytes are somewhere — they may well
+/// be, in a `.part` — but that **nothing is sitting at the real name pretending
+/// to be whole**.
+///
+/// One big file, not `build_tree`'s three small ones: the whole tree crossed a
+/// `MemLink` in under 20ms, so the cancel arrived after `Completed` and the
+/// interesting state was never reached. Six megabytes at a 64 KiB chunk is ~96
+/// chunks through a 4-frame channel, which cannot finish inside the window.
+#[tokio::test]
+async fn an_interrupted_folder_receive_leaves_no_file_at_the_real_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("myfolder");
+    std::fs::create_dir_all(&root).unwrap();
+    let big = pattern(7, 6 * 1024 * 1024);
+    std::fs::write(root.join("big.bin"), &big).unwrap();
+    let out = dir.path().join("out");
+    let out_str = out.to_string_lossy().to_string();
+
+    let storage = FsStorage::new();
+    let storage_send = storage.clone();
+    let (mut la, mut lb) = MemLink::pair(4);
+    let cs = TransferControl::new();
+    let cr = TransferControl::new();
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let ptx_send = ptx.clone();
+
+    let send_req = req(&root.to_string_lossy());
+    let send_task = tokio::spawn(async move {
+        let _ = send_folder(&mut la, &storage_send, send_req, &cs, &ptx_send, 3).await;
+    });
+
+    let recv = receive_folder(&mut lb, &storage, &out_str, &cr, &ptx);
+    // **Cancel on data, not on a clock.** A `MemLink` moves six megabytes in
+    // well under any sleep worth writing, so a timed cancel always arrived
+    // after `Completed` and never entered the window this test exists to
+    // cover. Waiting for a receive-side progress report that has bytes but is
+    // not yet the whole file puts the cancel exactly where it belongs, on
+    // every machine.
+    let canceller = async {
+        while let Some(p) = prx.recv().await {
+            if p.direction == Direction::Receiving && p.transferred_bytes > 0 {
+                break;
+            }
+        }
+        cr.cancel();
+    };
+    let (rr, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(recv, canceller)
+    })
+    .await
+    .expect("the receive must end, not hang");
+    assert_eq!(
+        rr.unwrap().outcome,
+        TransferOutcome::Cancelled,
+        "the payload finished before the cancel landed, so the partial-write \
+         window was never entered — make the file bigger"
+    );
+    send_task.abort();
+
+    // The whole point: if anything exists under the real name, it is whole.
+    // A partial file there is indistinguishable from a complete one to anything
+    // that opens it, including the user.
+    let landed = out.join("myfolder").join("big.bin");
+    if let Ok(on_disk) = std::fs::read(&landed) {
+        assert_eq!(
+            on_disk.len(),
+            big.len(),
+            "{} exists under its final name with {} of {} bytes — a truncated \
+             folder entry must stay staged, never be published",
+            landed.display(),
+            on_disk.len(),
+            big.len()
+        );
+        assert_eq!(on_disk, big, "published file differs from the source");
+    }
 }

@@ -1917,6 +1917,10 @@ async fn serve_loop(
 ) -> CliResult {
     use futures::StreamExt;
 
+    // The first failure this loop saw, if any. See the return at the end for
+    // why only `--once` turns it into a non-zero exit.
+    let mut failed: Option<String> = None;
+
     let sc = SecureCtx::build(config)?;
     let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
     let storage = FsStorage::new();
@@ -2378,6 +2382,14 @@ async fn serve_loop(
                         }
                     }
                     Err(e) => {
+                        // Remembered so the process can exit non-zero. Printing
+                        // "transfer failed" and then returning success made a
+                        // failed receive indistinguishable from a good one to
+                        // anything that reads exit codes — a script, a systemd
+                        // unit, or the folder end-to-end test, whose
+                        // "receiver exited successfully" assertion could not
+                        // fail and so never caught a truncated delivery.
+                        failed = Some(e.to_string());
                         history::record(
                             &hist,
                             history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
@@ -2420,7 +2432,14 @@ async fn serve_loop(
     if let Some(engine) = &engine {
         let _ = engine.stop_discovery().await;
     }
-    Ok(())
+    // `--once` exists to perform one transfer, so its outcome *is* this
+    // process's outcome. A long-running `receive` is a different contract — it
+    // keeps serving, and one peer's failure is not the server's — so it still
+    // returns success and reports each failure as it happens.
+    match failed {
+        Some(reason) if once => Err(CliError::Connection(reason)),
+        _ => Ok(()),
+    }
 }
 
 /// Resolve `host:port` (or `ip:port`) to a socket address. Parsing is attempted

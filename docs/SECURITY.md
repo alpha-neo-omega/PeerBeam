@@ -486,6 +486,27 @@ complete transfer is it **atomically** promoted:
 - **Failure/cancel** — the `.part` remains (resumable); the final file is
   never created.
 
+**Folder transfers stage too, since 2026-08-27 — and did not before.** Each
+entry in a folder is written to its own `.part` and renamed on completion, the
+way a single file always has been. Until then `folder::receive_folder` called
+`open_write` on the destination directly, so a folder receive that lost its
+connection mid-file left a **truncated file under the name the user expected**,
+indistinguishable from a complete one. Everything above was true of single-file
+receives and false of folder receives, which is the worst shape a security claim
+can take. Two differences from the single-file rules remain, and are deliberate:
+
+- **Folder entries replace.** A folder is delivered as a tree and re-receiving
+  one must reproduce it, not accumulate `f (1).bin` beside the file it is meant
+  to replace — so this path uses `finalize_replacing`. Single-file receives keep
+  the no-overwrite rule, where silently replacing a file the user already had
+  would be the wrong answer.
+- **No integrity check yet.** The single-file path sends `Complete { checksum }`
+  and blocks on the receiver's verdict; the folder path has no completion
+  acknowledgement at all, so a sender can still report a folder "sent" whose
+  tail the receiver never got. Staging bounds the damage — the missing bytes
+  leave a `.part` rather than a plausible file — but it does not detect the
+  loss. A folder-level acknowledgement is a protocol change and is not done.
+
 Path names from peers are sanitized to a single base component (no `..`, no
 absolute paths), then reduced to what the receiving OS can actually hold. On
 Windows that last step matters more than it sounds: `File::create("nul.txt")`

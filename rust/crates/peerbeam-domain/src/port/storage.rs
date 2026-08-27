@@ -38,4 +38,22 @@ pub trait StorageProvider: Send + Sync {
     /// (e.g. `file (1).ext`) so existing files are never overwritten.
     /// Restrictive permissions are applied. Returns the actual final path.
     async fn finalize(&self, temp: &str, dest: &str) -> Result<String>;
+
+    /// [`finalize`](Self::finalize), but **replacing** anything already at
+    /// `dest` instead of choosing a free name.
+    ///
+    /// For callers whose contract is *overwrite*, which a folder receive's is:
+    /// a folder is delivered as a tree, and re-receiving one must reproduce it
+    /// rather than accumulate `f (1).bin`, `f (2).bin` beside the files it is
+    /// supposed to be replacing. Single-file receives keep using [`finalize`] —
+    /// there, silently overwriting a file the user already had would be the
+    /// wrong answer, and the two contracts are genuinely different rather than
+    /// one being a special case of the other.
+    ///
+    /// The default delegates to [`finalize`], so an implementation that has no
+    /// notion of replacement keeps its existing non-clobbering behaviour rather
+    /// than being forced into one it cannot honour.
+    async fn finalize_replacing(&self, temp: &str, dest: &str) -> Result<String> {
+        self.finalize(temp, dest).await
+    }
 }

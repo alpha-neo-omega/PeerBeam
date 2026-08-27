@@ -197,6 +197,20 @@ Working now:
   safety number); if `device.require_pairing_confirmation` is enabled, the user
   is prompted to confirm the code matches the sender's (a decline un-pins the
   peer and aborts the transfer).
+
+  **`--once` now exits non-zero when the transfer failed** (exit `4`). It used
+  to print `transfer failed: …` and exit `0`, which made a failed receive
+  indistinguishable from a good one to anything reading exit codes — a script,
+  a systemd unit, or a test. A long-running `receive` is unchanged: it keeps
+  serving, reports each failure as it happens, and still exits `0`, because one
+  peer's failure is not the server's.
+
+  **A folder entry that does not finish is not published.** Each file in a
+  folder transfer is written to a `.part` beside its destination and renamed
+  only once it is complete, the same way a single-file receive has always
+  worked. Before this, a folder receive wrote straight to the destination, so a
+  connection lost mid-file left a short file sitting under the name the user
+  expected — silently, and indistinguishable from a whole one.
 - `daemon start [--foreground]` — run the receive loop until interrupted.
   (`daemon stop|status` need the IPC layer — not built yet, exit code 8.)
 - `clipboard send [--to NAME | --addr IP:PORT] [TEXT]` — send text using the

@@ -108,6 +108,30 @@ impl StorageProvider for FsStorage {
         }
     }
 
+    async fn finalize_replacing(&self, temp: &str, dest: &str) -> Result<String> {
+        // No `unique_path` reservation: the caller's contract is *replace*, so
+        // the destination is the destination and there is no candidate to pick.
+        //
+        // `rename` over an existing file is atomic on Unix and the reader of
+        // `dest` sees either the old file or the new one, never a mixture. On
+        // Windows it fails when the target exists, so that case falls back to
+        // remove-then-rename — a narrow window in which `dest` is absent, which
+        // is worse than atomic but far better than the truncated file this
+        // staging exists to prevent.
+        match promote(temp, dest).await {
+            Ok(()) => Ok(dest.to_string()),
+            Err(first) => {
+                if tokio::fs::metadata(dest).await.is_err() {
+                    return Err(first);
+                }
+                tokio::fs::remove_file(dest).await.map_err(|e| {
+                    DomainError::Storage(format!("replace {dest}: {e} (after {first})"))
+                })?;
+                promote(temp, dest).await.map(|()| dest.to_string())
+            }
+        }
+    }
+
     async fn list_files(&self, root: &str) -> Result<Vec<(String, u64)>> {
         let root_path = PathBuf::from(root);
         // Canonicalized once so a symlink's resolved target can be checked

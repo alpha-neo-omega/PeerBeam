@@ -16,17 +16,25 @@
 //! root; the receiver recreates the tree under `dest_dir/<root>/…`. Relative
 //! paths are sanitized (no `..`, no absolute) to prevent traversal.
 //!
-//! **No resume (yet)** — folder transfers are not wired to any resume UI/FFI,
-//! so every folder receive is treated as fresh: each file is written with
-//! `open_write` (create/truncate), overwriting anything already at the
-//! destination path rather than blind-appending onto it (blind-appending onto
-//! a same-sized pre-existing file used to silently corrupt it). The wire
-//! messages still carry a `have`/`offset` so a future resume feature can slot
-//! in without a protocol change, but today the receiver always reports `0`
-//! and the sender always streams from the start.
+//! **Staged, like a single file** — each entry is written to `part_path(dest)`
+//! and renamed onto its real name only once it has been flushed and closed.
+//! This is not decoration: it used to `open_write` the destination directly, so
+//! a folder receive that lost its connection mid-file left a **truncated file
+//! under the name the user expects**, indistinguishable from a complete one,
+//! and `docs/SECURITY.md`'s "Safe file writing" was false for this path. A tail
+//! that never arrives now leaves a `.part` behind instead of a plausible lie.
 //!
-//! TODO(transfer): a proper `.part`-staged folder-resume (mirroring
-//! `stream::receive_file`) is a separate future task.
+//! **No resume (yet)** — folder transfers are not wired to any resume UI/FFI,
+//! so every folder receive is treated as fresh: each entry is written with
+//! `open_write` (create/truncate) into its staging path, overwriting anything
+//! already there rather than blind-appending onto it (blind-appending onto a
+//! same-sized pre-existing file used to silently corrupt it). The wire messages
+//! still carry a `have`/`offset` so a future resume feature can slot in without
+//! a protocol change, but today the receiver always reports `0` and the sender
+//! always streams from the start.
+//!
+//! TODO(transfer): folder *resume* — reusing the staged `.part` across attempts
+//! rather than restarting it — is still a separate future task.
 //!
 //! A single unreadable source file (send side), or a destination path that
 //! collides with an existing directory or cannot be made safe to write
@@ -48,7 +56,8 @@ use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
 use crate::stream::{
-    build_progress, read_fill, safe_component, send_with_retry, signal_pause_edge, TransferOutcome,
+    build_progress, part_path, read_fill, safe_component, send_with_retry, signal_pause_edge,
+    TransferOutcome,
 };
 
 // ── Wire messages ───────────────────────────────────────────────
@@ -414,6 +423,17 @@ pub async fn receive_folder(
     // caught it.
     let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
+    // The entry being written, as (staging path, final path).
+    //
+    // **A folder entry is staged like a single file, and for the same reason.**
+    // This path used to `open_write` the FINAL destination, so an interrupted
+    // folder receive left a truncated file sitting under the name the user
+    // expects — indistinguishable from a complete one, and `docs/SECURITY.md`'s
+    // "Safe file writing" was simply false here. `stream::receive_file` has
+    // always staged into `part_path` and renamed on success; this now does the
+    // same, so a tail that never arrives leaves a `.part` behind rather than a
+    // plausible-looking lie.
+    let mut current_paths: Option<(String, String)> = None;
     // Set whenever the file announced by the most recent `FileHeader` was
     // skipped (unsafe path or a create/open failure, e.g. a destination path
     // that collides with an existing directory) — its `FileEnd` must not be
@@ -506,8 +526,9 @@ pub async fn receive_folder(
                     FolderMessage::FileHeader { path, .. } => {
                         // The previous entry is finished by the arrival of the
                         // next header when a sender omits `FileEnd`, so its
-                        // flush is as load-bearing here as it is there.
-                        close_writer(current.take()).await?;
+                        // flush — and its rename — are as load-bearing here as
+                        // they are there.
+                        finish_entry(current.take(), current_paths.take(), storage).await?;
                         // A path with a `..` or a NUL in it is a violation no
                         // conforming sender commits — but it is skipped like
                         // any other entry that cannot land, not aborted.
@@ -556,14 +577,17 @@ pub async fn receive_folder(
                         // directory, or a filesystem-level type mismatch —
                         // must not abort the whole folder: skip just this
                         // entry and keep going.
-                        match storage.open_write(&dp).await {
+                        let part = part_path(&dp);
+                        match storage.open_write(&part).await {
                             Ok(w) => {
                                 current = Some(w);
+                                current_paths = Some((part, dp));
                                 current_skipped = false;
                             }
                             Err(e) => {
                                 tracing::warn!("skipping folder entry {path}: {e}");
                                 current = None;
+                                current_paths = None;
                                 current_skipped = true;
                             }
                         }
@@ -572,14 +596,15 @@ pub async fn receive_folder(
                         // Before the count, not after: `files_completed` is
                         // what the caller reports as arrived, and an entry
                         // whose flush failed did not arrive.
-                        close_writer(current.take()).await?;
-                        if !current_skipped {
+                        let landed =
+                            finish_entry(current.take(), current_paths.take(), storage).await?;
+                        if !current_skipped && landed {
                             files_completed += 1;
                         }
                         current_skipped = false;
                     }
                     FolderMessage::Complete => {
-                        close_writer(current.take()).await?;
+                        finish_entry(current.take(), current_paths.take(), storage).await?;
                         break TransferOutcome::Completed;
                     }
                     FolderMessage::Cancel => {
@@ -590,6 +615,12 @@ pub async fn receive_folder(
                         // would name the wrong cause. A partial file is the
                         // expected outcome of a cancel; a *completed* entry
                         // with a missing tail is what the `?`s above prevent.
+                        // Closed, but **not finalised**: a cancelled entry is
+                        // incomplete by definition, so it stays a `.part` and
+                        // never appears under the name a complete file would.
+                        // Nothing to clear — `current_paths` dies with this
+                        // `break`, and the entry is published only by
+                        // `finish_entry`, which this arm deliberately skips.
                         if let Err(e) = close_writer(current.take()).await {
                             tracing::warn!("cancelled folder receive left a file unflushed: {e}");
                         }
@@ -701,6 +732,49 @@ async fn cancel_or_pause(
 /// This is deliberately *not* the "skip the entry and warn" treatment given to
 /// a destination that cannot be opened at all: there, nothing was written and
 /// nothing was claimed. Here the bytes were already accepted and counted.
+/// Flush and close the entry's writer, then publish it under its real name.
+///
+/// **Close first, rename second, and only on success.** The rename is what
+/// makes a folder entry appear complete, so it must not happen until the bytes
+/// are actually on disk — a flush error leaves the `.part` behind and reports
+/// itself rather than publishing a file whose tail never landed.
+///
+/// `paths` is `None` for an entry that was skipped (an unsafe path, a
+/// destination that would not open), which is why the writer and the paths are
+/// taken together: there is nothing to publish and nothing to fail about.
+///
+/// `finalize_replacing`, not `finalize`: a folder receive overwrites, and has
+/// always said so. `finalize` picks a free name when the destination exists,
+/// which would turn re-receiving a folder into a directory accumulating
+/// `f (1).bin` beside the file it was meant to replace.
+async fn finish_entry(
+    writer: Option<Box<dyn AsyncWrite + Unpin + Send>>,
+    paths: Option<(String, String)>,
+    storage: &dyn StorageProvider,
+) -> Result<bool> {
+    close_writer(writer).await?;
+    let Some((part, dest)) = paths else {
+        return Ok(false);
+    };
+    match storage.finalize_replacing(&part, &dest).await {
+        Ok(_) => Ok(true),
+        // **One entry that cannot land must not take the folder with it.** A
+        // destination that collides with an existing directory used to fail at
+        // `open_write` and was skipped with a warning; staging moved that
+        // failure to the rename, and propagating it here turned a skipped file
+        // into an aborted transfer. Same verdict as before, later in the
+        // sequence: warn, do not count it as arrived, keep going.
+        //
+        // The staged `.part` is deliberately left on disk — it is the evidence
+        // that bytes arrived for a file that could not be published, and the
+        // single-file path leaves one for the same reason.
+        Err(e) => {
+            tracing::warn!("folder entry could not be written to {dest}: {e}");
+            Ok(false)
+        }
+    }
+}
+
 async fn close_writer(writer: Option<Box<dyn AsyncWrite + Unpin + Send>>) -> Result<()> {
     let Some(mut w) = writer else {
         return Ok(());
