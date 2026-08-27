@@ -151,7 +151,11 @@ class _NotesScreenState extends State<NotesScreen> {
       ),
     );
     if (confirmed != true) return;
-    await state.notes.delete(note.id);
+    final error = await state.notes.delete(note.id);
+    if (error == null || !mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(error)));
   }
 
   @override

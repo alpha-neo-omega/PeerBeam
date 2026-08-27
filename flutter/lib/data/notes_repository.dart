@@ -102,15 +102,26 @@ class NotesRepository extends ChangeNotifier {
     }
   }
 
-  Future<bool> delete(String id) async {
+  /// Delete a note. Returns null when it is gone, or a sentence to show.
+  ///
+  /// **The caller has to say so**, for the same reason [edit] does. This used
+  /// to return a bare `bool` and swallow the exception, and the screen threw
+  /// the answer away — so a delete the engine refused looked exactly like one
+  /// that worked: the dialog closed, the note stayed, and the user was left
+  /// believing they had deleted something they had not.
+  ///
+  /// A note that is already gone is **not** a failure. Deleting something twice
+  /// reaches the state the user asked for, and reporting an error there would
+  /// be pedantry about a job already done.
+  Future<String?> delete(String id) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) return 'PeerBeam is not running.';
     try {
-      final ok = await api.notesDelete(id);
+      await api.notesDelete(id);
       await refresh();
-      return ok;
-    } catch (_) {
-      return false;
+      return null;
+    } catch (e) {
+      return friendlyError(e);
     }
   }
 }

@@ -367,6 +367,17 @@ pub struct PeerSession {
     transcript: Vec<u8>,
 }
 
+/// How long a peer has to complete the authenticated handshake.
+///
+/// Not a network-speed budget: by the time this runs the QUIC connection is
+/// established and the handshake is four small frames, so anything beyond a few
+/// seconds is a peer that has stopped participating rather than a slow link.
+/// Thirty seconds matches the other per-operation budgets in this workspace and
+/// is far more than a working peer needs.
+///
+/// It exists because nothing else would ever fire. See the call site.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl PeerSession {
     /// Open a session over an authenticated, secured `transport`.
     ///
@@ -400,7 +411,23 @@ impl PeerSession {
         let local = identity.device_id.clone();
         // The authenticated handshake runs exactly once per session, over the raw
         // control stream. Its master secret keys every channel (control included).
-        let auth_session = authenticate(control.as_mut(), &identity, &*enc, &*trust).await?;
+        //
+        // **Bounded, because nothing else bounds it.** `authenticate` reads
+        // frames in a loop with no deadline of its own, and QUIC's idle timer
+        // cannot rescue it: this transport sends a keep-alive every 5s against
+        // a 30s idle timeout, so a peer whose QUIC stack still answers — a
+        // half-crashed device, a stale NAT mapping, anything listening on the
+        // port that is not PeerBeam — holds the handshake open forever. Every
+        // synchronous FFI call that dials therefore inherited "may never
+        // return", which on the Flutter side is the isolate that draws.
+        let auth_session = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            authenticate(control.as_mut(), &identity, &*enc, &*trust),
+        )
+        .await
+        .map_err(|_| {
+            SessionError::Link("the peer did not complete the handshake in time".into())
+        })??;
         let peer = auth_session.peer_id.clone();
         let newly_trusted = auth_session.newly_trusted;
         let peer_name = auth_session.peer_name.clone();

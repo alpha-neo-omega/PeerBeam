@@ -3562,7 +3562,16 @@ impl Manager {
             .unwrap_or(15)
             .min(u64::from(peerbeam_presence::MAX_RING_SECONDS)) as u16;
         let me = self.clone();
-        let sent = crate::runtime::block_on(async move { me.deliver_ring(device, seconds).await });
+        // Bounded for the reason `browse` is: this is a synchronous FFI call
+        // and the app makes it from the isolate that draws. Ring is the sharpest
+        // case of all — a person taps it *because* they cannot find the device,
+        // which is exactly when the dial goes slowly, so the unbounded version
+        // froze the interface precisely when it was being used.
+        let sent = crate::runtime::block_on(async move {
+            tokio::time::timeout(RING_BUDGET, me.deliver_ring(device, seconds))
+                .await
+                .unwrap_or(false)
+        });
         Ok(json!({ "sent": sent }))
     }
 
@@ -3641,6 +3650,20 @@ impl Manager {
             ));
         }
 
+        // **One deadline for the whole operation.** Each network wait inside had
+        // a timeout of its own and none bounded the total, so a folder with many
+        // files against a peer that stalls part-way could hold this call — and
+        // therefore the isolate that draws — for far longer than any single
+        // timeout suggests.
+        //
+        // It does **not** bound the rescan below: that is synchronous CPU and
+        // disk work, and a timeout cannot interrupt it. A first sync of a very
+        // large folder still hashes every byte before this returns. Bounding the
+        // waits is what can be done here; the fix for the rest is to stop
+        // calling blocking FFI from the drawing isolate.
+        let deadline = tokio::time::Instant::now() + SYNC_BUDGET;
+        let left = move || deadline.saturating_duration_since(tokio::time::Instant::now());
+
         // Rescan before anything else: an edit made outside PeerBeam is exactly
         // as real as one received, and a sync that ignored it would overwrite
         // the user's work with a peer's older copy.
@@ -3655,7 +3678,10 @@ impl Manager {
         let me = self.clone();
         let manifest_path = path.clone();
         let manifest = crate::runtime::block_on(async move {
-            me.fetch_manifest(device.clone(), manifest_path).await
+            tokio::time::timeout(left(), me.fetch_manifest(device.clone(), manifest_path))
+                .await
+                .ok()
+                .flatten()
         });
         let Some(manifest) = manifest else {
             return Err((
@@ -3717,8 +3743,14 @@ impl Manager {
         let request_path = path.clone();
         let into_for_fetch = into.clone();
         crate::runtime::block_on(async move {
-            me.request_files(device, request_path, into_for_fetch, wanted)
-                .await;
+            // Whatever arrived before the deadline is kept: files land as they
+            // are received, so giving up here leaves a partially-synced folder
+            // rather than undoing anything. The next sync picks up the rest.
+            let _ = tokio::time::timeout(
+                left(),
+                me.request_files(device, request_path, into_for_fetch, wanted),
+            )
+            .await;
         });
 
         Ok(json!({
@@ -5598,6 +5630,29 @@ impl Manager {
 /// upper bound so a later change to the routing cannot quietly restore the
 /// freeze.
 const BROWSE_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long `ring` may hold its caller before giving up.
+///
+/// A UI budget, like [`BROWSE_BUDGET`], and shorter: ringing is a "make a noise
+/// now" gesture, so a person who has waited eight seconds has already learned
+/// what the answer is going to be. `sent: false` is an ordinary answer here —
+/// the command has never promised the device made a sound, only that a request
+/// was sent — so giving up early costs a truthful report of nothing.
+const RING_BUDGET: Duration = Duration::from_secs(8);
+
+/// How long the whole of `sync` may hold its caller.
+///
+/// Bigger than the others because a sync legitimately moves files, and cutting
+/// a working transfer off at ten seconds would break the feature to protect the
+/// interface. It exists because the operation had **no** ceiling at all: two
+/// dials, a manifest wait, then a wait per file and per chunk batch, each with
+/// its own timeout and none bounding the total — a large folder against a peer
+/// that stalls mid-way could hold the isolate for an hour, which Android kills
+/// as an ANR long before the user gets an error.
+///
+/// The real fix is to stop calling blocking FFI from the drawing isolate; this
+/// bounds the damage until that exists.
+const SYNC_BUDGET: Duration = Duration::from_secs(300);
 
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
 

@@ -814,3 +814,55 @@ async fn cancelled_transfer_does_not_terminate_session() {
     )
     .await;
 }
+
+/// **A peer that never finishes the handshake must not hold the dial open
+/// forever.**
+///
+/// `authenticate` reads frames in a loop with no deadline of its own, and QUIC
+/// cannot rescue it: the transport sends a keep-alive every 5s against a 30s
+/// idle timeout, so a connection whose far end still ACKs but never speaks
+/// PeerBeam never goes idle. Every synchronous FFI call that dials therefore
+/// inherited "may never return" — and on the Flutter side the caller is the
+/// isolate that draws, so the app hangs with no error and no recovery short of
+/// force-quit.
+///
+/// Run in **virtual time** (`start_paused`), so this asserts the bound exists
+/// without spending the bound proving it: tokio auto-advances the clock while
+/// the runtime is idle, which is exactly the state a stalled handshake is in.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_never_authenticates_does_not_hang_the_dial() {
+    let (ta, _tb) = MemTransport::pair();
+    let (ev_tx, _events) = unbounded_channel();
+    let (ch_tx, _channels) = unbounded_channel();
+    let (in_tx, _incoming) = unbounded_channel();
+    let (id, enc, trust) = security("device-a");
+
+    // `_tb` is held but never driven: the far side accepts nothing and sends
+    // nothing, which is a half-crashed peer, a stale NAT mapping, or anything
+    // listening on the port that is not PeerBeam.
+    let opened = PeerSession::open(
+        ta,
+        SessionRole::Initiator,
+        SessionConfig::new(CapabilitySet::new().with(Capability::new(ChannelType::TRANSFER))),
+        ev_tx,
+        ch_tx,
+        in_tx,
+        None,
+        id,
+        enc,
+        trust,
+    )
+    .await;
+
+    // A real wall-clock guard around the virtual one: if the bound were gone,
+    // this test would hang rather than fail, and a hanging test is a worse
+    // signal than a failing one.
+    let Err(err) = opened else {
+        panic!("a stalled handshake must not open a session");
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("handshake"),
+        "the failure does not say the handshake stalled: {msg}"
+    );
+}

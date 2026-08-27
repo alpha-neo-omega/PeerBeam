@@ -2515,7 +2515,10 @@ fn history_cmd(ctx: &Ctx, args: HistoryArgs, path_override: Option<&str>) -> Cli
     let path = history::path_for(&config.storage.data_directory);
 
     if args.clear {
-        history::clear(&path);
+        // Reported, not assumed. Somebody clearing history before handing over
+        // a machine must be told if the file is still there.
+        history::clear(&path)
+            .map_err(|e| CliError::Other(format!("could not clear {}: {e}", path.display())))?;
         if ctx.json {
             ctx.json_line(&json!({"event": "history_cleared"}));
         } else {

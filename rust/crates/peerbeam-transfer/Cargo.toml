@@ -27,5 +27,7 @@ peerbeam-reliability-fs = { path = "../peerbeam-reliability-fs" }
 peerbeam-crypto = { path = "../peerbeam-crypto" }
 peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
 peerbeam-identity-fs = { path = "../peerbeam-identity-fs" }
-tokio = { workspace = true }
+# test-util enables the virtual clock, so the handshake-timeout test asserts
+# the bound exists without spending AUTH_TIMEOUT proving it.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

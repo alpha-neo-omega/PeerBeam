@@ -50,21 +50,33 @@ pub fn record(path: &Path, entry: Entry) {
         let drop = entries.len() - MAX_HISTORY;
         entries.drain(..drop);
     }
-    save(path, &entries);
+    record_save(path, &entries);
 }
 
-/// Remove all entries.
-pub fn clear(path: &Path) {
-    save(path, &[]);
+/// Remove all entries, reporting whether the file was actually rewritten.
+///
+/// **The result is not decoration.** `history --clear` is what somebody runs
+/// before handing a machine to someone else; reporting success over a write
+/// that failed — a read-only volume, a full disk, a permissions change — leaves
+/// them believing a record is gone when it is still on disk. That is the one
+/// failure on this command that must never be quiet.
+pub fn clear(path: &Path) -> std::io::Result<()> {
+    save(path, &[])
 }
 
-fn save(path: &Path, entries: &[Entry]) {
+/// Recording is best-effort and stays that way: a transfer must not fail
+/// because its history line could not be written.
+fn record_save(path: &Path, entries: &[Entry]) {
+    let _ = save(path, entries);
+}
+
+fn save(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    if let Ok(bytes) = serde_json::to_vec(entries) {
-        let _ = std::fs::write(path, bytes);
-    }
+    let bytes = serde_json::to_vec(entries)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, bytes)
 }
 
 /// A ready-to-record entry stamped with "now".
@@ -115,8 +127,31 @@ mod tests {
         assert_eq!(got[1].direction, "receiving");
         assert!(!got[1].success);
 
-        clear(&p);
+        clear(&p).expect("clearing a writable history file must succeed");
         assert!(load(&p).is_empty());
+    }
+
+    /// **A clear that did not happen must not report success.**
+    ///
+    /// `history --clear` is what somebody runs before handing a machine to
+    /// someone else. This used to return unit and swallow the write error, so a
+    /// read-only volume, a full disk or a permissions change produced "history
+    /// cleared" and exit 0 over a file that was still there — and a script had
+    /// no way to notice.
+    ///
+    /// A directory standing where the file should be is the cheapest way to
+    /// make the write fail on every platform.
+    #[test]
+    fn a_clear_that_cannot_write_reports_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("history.json");
+        std::fs::create_dir(&blocked).expect("a directory where the file goes");
+
+        let err = clear(&blocked).expect_err("writing over a directory must fail");
+        assert!(
+            !format!("{err}").is_empty(),
+            "the failure must carry something the caller can show"
+        );
     }
 
     #[test]
