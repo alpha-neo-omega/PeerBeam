@@ -51,38 +51,26 @@ jobs:
       - name: Test
         run: flutter test
 
-  # **Android had no CI at all.** It built only on a release tag, so every
-  # Android defect this project has found was found by reading the code — the
-  # SAF main-thread copy, the sandbox temp path, the missing battery hook, the
-  # service cap. Worse, the eighteen Kotlin unit tests that exist ran nowhere:
-  # they were written, committed, and then never executed again.
+  # **Android still has no CI, and that is a real gap.** It builds only on a
+  # release tag, so every Android defect this project has found was found by
+  # reading the code — the SAF main-thread copy, the sandbox temp path, the
+  # missing battery hook, the service cap. Eighteen Kotlin unit tests exist and
+  # run nowhere.
   #
-  # This runs them, and only them. Compiling the Rust engine for Android was in
-  # the first draft of this job and was removed after trying it: `ring` has a C
-  # build script, so even `cargo check --target aarch64-linux-android` needs the
-  # NDK toolchain, and a job that fails for environmental reasons teaches people
-  # to ignore the whole file. Engine-for-Android is therefore still proven only
-  # on the release path, which is a real remaining gap and is named as one here
-  # rather than papered over.
+  # Two attempts at a cheap job failed, and both reasons are recorded so the
+  # next attempt starts past them rather than repeating them:
   #
-  # `testDebugUnitTest` is JVM-only: no emulator, no device, no NDK. The Flutter
-  # setup and `pub get` are required before Gradle — the Android project's build
-  # reads what `pub get` generates — and mirror what the release job already
-  # does successfully.
-  android:
-    name: Android (kotlin unit tests)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "17" }
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
-      - run: flutter pub get
-        working-directory: flutter
-      - name: Kotlin unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest
-        working-directory: flutter/android
+  # 1. Compiling the engine (`cargo check --target aarch64-linux-android`) needs
+  #    the NDK, because `ring` has a C build script that runs even for `check`.
+  # 2. Running the tests with `./gradlew` fails with exit 127: Flutter's Android
+  #    template `.gitignore`s `/gradlew`, so a fresh checkout has the wrapper
+  #    *properties* but not the script. `scripts/package-android.sh` never hits
+  #    this because it goes through `flutter build apk`, which provisions its
+  #    own Gradle.
+  #
+  # So the workable shapes are `flutter build apk --debug` (slow, but proven on
+  # the release path) or provisioning Gradle explicitly. Neither was worth
+  # landing untested after the first one broke every push.
 
   # Cross-platform proof: the Rust engine and the desktop app must build (and
   # the engine's tests pass) on every desktop OS. Intel macOS is covered from
