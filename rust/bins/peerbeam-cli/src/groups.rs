@@ -309,12 +309,24 @@ where
             ctx.dim(&peer.0),
             ctx.dim("skipped — this device may not exchange messages")
         ));
-        session.handle.close();
+        session.close().await;
         return Ok(());
     }
 
     let out = f(&session).await;
-    session.handle.close();
+    // `close().await`, never the bare `handle.close()`. The handle form only
+    // *posts* a close command and returns, so this command's process could —
+    // and on a loaded machine did — exit before the frame it just "sent"
+    // reached the wire. `send_on_channel` returning `Ok` means the session
+    // actor accepted the payload, not that the peer has it.
+    //
+    // That is not a hypothesis. `tests/group_e2e.rs` fails against the handle
+    // form and passes against this one; the invitation simply never arrived,
+    // and `group invite` reported success either way. Every other CLI command
+    // that sends and leaves already awaits this — `chat.rs` does it at nine
+    // sites — and groups did not, because `Session::close` consumes `self`
+    // while `f` borrows it, and the bare handle was the shape that compiled.
+    session.close().await;
     out
 }
 

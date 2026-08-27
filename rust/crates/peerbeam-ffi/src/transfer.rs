@@ -3621,22 +3621,26 @@ impl Manager {
         else {
             return false;
         };
-        if !crate::session_exec::caps_support_ring(&session.capabilities) {
-            return false;
-        }
-        // Built with this device's real trust and sharing settings even though
-        // `ring` consults neither: the sender owns the channel bookkeeping both
-        // paths share, and handing it a fake gate would leave a `beat` added
-        // here later silently ungated.
-        let mut sender = peerbeam_presence::PresenceSender::new(
-            session.handle.clone(),
-            session.peer_device.clone(),
-            session.capabilities.clone(),
-            self.trust.clone(),
-            Arc::new(crate::presence::sharing_enabled),
-            Arc::new(peerbeam_presence::Status::default),
-        );
-        sender.ring(seconds).await.is_ok()
+        let rang = if crate::session_exec::caps_support_ring(&session.capabilities) {
+            // Built with this device's real trust and sharing settings even
+            // though `ring` consults neither: the sender owns the channel
+            // bookkeeping both paths share, and handing it a fake gate would
+            // leave a `beat` added here later silently ungated.
+            let mut sender = peerbeam_presence::PresenceSender::new(
+                session.handle.clone(),
+                session.peer_device.clone(),
+                session.capabilities.clone(),
+                self.trust.clone(),
+                Arc::new(crate::presence::sharing_enabled),
+                Arc::new(peerbeam_presence::Status::default),
+            );
+            sender.ring(seconds).await.is_ok()
+        } else {
+            false
+        };
+        // Drained before reporting — see `group_control` for the whole story.
+        session.close().await;
+        rang
     }
 
     /// Sync a folder with a peer, in both directions:
@@ -3904,7 +3908,16 @@ impl Manager {
         path: String,
     ) -> Option<peerbeam_sync::Manifest> {
         let session = self.sync_session(&device).await?;
-        crate::session_exec::request_manifest(&session, &path).await
+        let manifest = crate::session_exec::request_manifest(&session, &path).await;
+        // Closed here, and deliberately NOT in `request_files` below. A
+        // manifest is a completed request/response, so nothing is still in
+        // flight. `request_files` is the opposite: it asks and does not wait,
+        // the peer answers with bytes over the Transfer channel, and closing
+        // would cancel exactly the transfer it just asked for. Dropping the
+        // session leaves the pump running (`Wake::Command(None)` is ignored),
+        // which is what makes that work.
+        session.close().await;
+        manifest
     }
 
     /// Ask the peer for each wanted file. Best effort: the bytes arrive as
@@ -4046,10 +4059,17 @@ impl Manager {
         )
         .await
         .ok()?;
-        if !crate::session_exec::caps_support_browse(&session.capabilities) {
-            return None;
-        }
-        crate::session_exec::request_listing(&session, &path).await
+        let listing = if crate::session_exec::caps_support_browse(&session.capabilities) {
+            crate::session_exec::request_listing(&session, &path).await
+        } else {
+            None
+        };
+        // A request/response exchange, so unlike the send-and-leave paths the
+        // answer already proves delivery. Closed anyway: it is `run` returning
+        // that takes the session out of the diagnostics registry, so dropping
+        // it left a browse the user finished showing as live.
+        session.close().await;
+        listing
     }
 
     /// Sync notes with a peer: `{peer}` → `{sent}`.
@@ -4102,18 +4122,21 @@ impl Manager {
         else {
             return false;
         };
-        if !crate::session_exec::caps_support_notes(&session.capabilities) {
-            return false;
-        }
         // Re-asked of the **authenticated** identity, which is the device the
         // permission is actually about: the pre-dial id is whatever the caller
         // named, and for an address-dialled peer it is a placeholder.
-        if !peerbeam_notes::may_sync_notes(self.trust.as_ref(), &session.peer_device) {
-            return false;
-        }
-        crate::session_exec::send_note_batches(&session.handle, &batches)
-            .await
-            .is_ok()
+        let sent = if crate::session_exec::caps_support_notes(&session.capabilities)
+            && peerbeam_notes::may_sync_notes(self.trust.as_ref(), &session.peer_device)
+        {
+            crate::session_exec::send_note_batches(&session.handle, &batches)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        // Drained before reporting — see `group_control`.
+        session.close().await;
+        sent
     }
 
     /// Every live note, newest edit first: `{}` → `{notes: [...]}`.
@@ -4417,13 +4440,29 @@ impl Manager {
                     // dialled: a route can resolve to a different device, and
                     // the permission is about whoever picked up.
                     let peer = DeviceId::from(session.peer_id.clone());
-                    if peerbeam_chat::may_exchange_chat(me.trust.as_ref(), &peer) {
+                    let sent = if peerbeam_chat::may_exchange_chat(me.trust.as_ref(), &peer) {
                         peerbeam_chat::send_foreign(&session.handle, message_type, payload)
                             .await
                             .map_err(|e| e.to_string())
                     } else {
                         Err("this device may not exchange messages".to_string())
-                    }
+                    };
+                    // Drained before the event is emitted, and both halves of
+                    // that matter.
+                    //
+                    // `send_foreign` returning `Ok` means the session actor
+                    // accepted the payload, not that the peer holds it — so
+                    // reporting `"ok": true` on the strength of it announced a
+                    // delivery that had not happened. Dropping the session here
+                    // instead of closing it also stranded the pump: `close`
+                    // awaits `run`, and it is `run` returning that takes the
+                    // session out of the diagnostics registry.
+                    //
+                    // The CLI had the same defect in `groups.rs::with_device`,
+                    // where `tests/group_e2e.rs` caught it: the invitation
+                    // never arrived and the command reported success.
+                    session.close().await;
+                    sent
                 }
                 Err((_, why)) => Err(why),
             };
@@ -4747,12 +4786,16 @@ impl Manager {
         else {
             return false;
         };
-        if !crate::session_exec::caps_support_receipt(&session.capabilities) {
-            return false;
-        }
-        peerbeam_chat::send_receipt(&session.handle, &r)
-            .await
-            .is_ok()
+        let sent = if crate::session_exec::caps_support_receipt(&session.capabilities) {
+            peerbeam_chat::send_receipt(&session.handle, &r)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        // Drained before reporting — see `group_control`.
+        session.close().await;
+        sent
     }
 
     /// React to one message: `{peer, id, emoji, remove?}` →
@@ -4838,12 +4881,18 @@ impl Manager {
         else {
             return false;
         };
-        if !crate::session_exec::caps_support_reaction(&session.capabilities) {
-            return false;
-        }
-        peerbeam_chat::send_reaction(&session.handle, &r)
-            .await
-            .is_ok()
+        let sent = if crate::session_exec::caps_support_reaction(&session.capabilities) {
+            peerbeam_chat::send_reaction(&session.handle, &r)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        // Drained before reporting — see `group_control`. This one had the
+        // defect its own doc comment warns about: `delivered` was reported from
+        // a call that had not yet reached the peer.
+        session.close().await;
+        sent
     }
 
     pub fn chat_search(&self, req: &Value) -> Op {
