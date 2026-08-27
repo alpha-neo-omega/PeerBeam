@@ -35,6 +35,8 @@ use peerbeam_transfer_quic::{direct_route, QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 use tokio::net::UdpSocket;
 
+mod common;
+
 /// The session config a manual chat-only peer advertises: just CHAT (plus the
 /// always-implicit CONTROL) — matches `peerbeam-chat/tests/roundtrip.rs`.
 /// Negotiation is an intersection (`CapabilitySet::intersect`), never an
@@ -706,7 +708,7 @@ async fn chat_send_from_ffi_reaches_peer_and_persists_sent_record() {
 #[serial_test::serial]
 async fn chat_received_into_ffi_and_history_round_trip() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49901;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     let (enc, trust, identity) = peer_identity(dir.path(), "sender");
@@ -810,7 +812,7 @@ async fn chat_received_into_ffi_and_history_round_trip() {
 #[serial_test::serial]
 async fn chat_only_dial_does_not_register_phantom_transfer() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49903;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     let (enc, trust, identity) = peer_identity(dir.path(), "sender");
@@ -1101,7 +1103,7 @@ async fn chat_drain_delivers_queued_message_once_peer_comes_online() {
 #[serial_test::serial]
 async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49904;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     let payload = b"late stream payload, well past the old 3s grace".to_vec();
@@ -1218,7 +1220,7 @@ async fn late_opening_sender_stream_is_not_dropped_by_stream_grace() {
 #[serial_test::serial]
 async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49905;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     // A 4096-byte "report.pdf" so the size assertion is a real wire value.
@@ -1377,7 +1379,7 @@ async fn file_ref_and_its_transfer_share_one_id_end_to_end() {
 #[serial_test::serial]
 async fn a_file_refs_claim_never_outranks_what_the_transfer_actually_lands() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49912;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     // What really travels: a small, differently-named file.
@@ -1993,7 +1995,7 @@ async fn chat_send_file_refuses_a_peer_that_cannot_receive_attachments() {
 #[serial_test::serial]
 async fn undecodable_first_frame_falls_back_to_a_minted_id_and_placeholder() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49906;
+    let port = common::free_port();
     init_ffi(port, dir.path());
 
     let (enc, trust, identity) = peer_identity(dir.path(), "garbage-sender");

@@ -27,6 +27,8 @@ use peerbeam_transfer::{
 use peerbeam_transfer_quic::{direct_route, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 
+mod common;
+
 /// The transfer session config used by the test peers (matches the FFI engine).
 fn peer_cfg() -> SessionConfig {
     SessionConfig::new(CapabilitySet::new().with(Capability::new(ChannelType::TRANSFER)))
@@ -138,7 +140,7 @@ fn control_before_init_errors() {
 #[serial_test::serial]
 async fn receive_into_ffi_with_accept() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49823;
+    let port = common::free_port();
     init_ffi(port, dir.path());
     tokio::time::sleep(Duration::from_millis(300)).await; // let the server bind
 
@@ -266,7 +268,7 @@ async fn receive_into_ffi_with_accept() {
 #[serial_test::serial]
 async fn receive_into_ffi_is_gated_until_the_pairing_code_is_confirmed() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49826;
+    let port = common::free_port();
     init_ffi(port, dir.path());
     // Turn the check on the way Settings does. `pb_settings_set` persists it
     // and pushes it into the live engine, so it must apply to the very next

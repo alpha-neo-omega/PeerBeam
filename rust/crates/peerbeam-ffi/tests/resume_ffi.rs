@@ -37,6 +37,8 @@ use peerbeam_transfer::{
 use peerbeam_transfer_quic::{direct_route, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
 
+mod common;
+
 // ── harness (mirrors tests/transfer_ffi.rs) ─────────────────────
 
 fn peer_cfg() -> SessionConfig {
@@ -528,7 +530,7 @@ async fn a_resumed_send_continues_from_the_receivers_offset() {
 #[serial_test::serial]
 async fn a_resumed_receive_continues_in_its_own_directory_after_the_save_dir_moves() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49880;
+    let port = common::free_port();
     init_ffi(port, dir.path());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1049,7 +1051,7 @@ fn startup_reclaims_checkpoints_that_aged_out_and_keeps_the_rest() {
 #[serial_test::serial]
 async fn a_rejected_transfer_is_never_resumable_but_an_accepted_one_resumes_unprompted() {
     let dir = tempfile::tempdir().unwrap();
-    let port = 49877;
+    let port = common::free_port();
     init_ffi(port, dir.path());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
