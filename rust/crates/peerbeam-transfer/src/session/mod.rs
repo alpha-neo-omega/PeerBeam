@@ -369,14 +369,25 @@ pub struct PeerSession {
 
 /// How long a peer has to complete the authenticated handshake.
 ///
-/// Not a network-speed budget: by the time this runs the QUIC connection is
-/// established and the handshake is four small frames, so anything beyond a few
-/// seconds is a peer that has stopped participating rather than a slow link.
-/// Thirty seconds matches the other per-operation budgets in this workspace and
-/// is far more than a working peer needs.
+/// **A backstop against "never", not a responsiveness budget** — and the two
+/// want very different numbers. What the user actually waits on is bounded
+/// separately and much more tightly by the per-operation budgets in
+/// `peerbeam_ffi::transfer` (`BROWSE_BUDGET`, `RING_BUDGET`, `SYNC_BUDGET`), so
+/// nothing here needs to be short to keep an interface alive. All this has to
+/// do is stop a stalled handshake pinning a connection forever.
 ///
-/// It exists because nothing else would ever fire. See the call site.
-const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// It is therefore deliberately generous. The first value was thirty seconds,
+/// chosen to match those other budgets, and that was a mistake of exactly the
+/// kind this comment now exists to prevent: on a CI runner under heavy
+/// contention a legitimate handshake — four small frames, but four frames whose
+/// tasks have to be *scheduled* — exceeded it, and a test that tolerates a slow
+/// dial for four minutes started failing at thirty seconds. A bound that fires
+/// on a working peer is worse than the hang it replaced, because it turns a
+/// rare stall into a routine failure.
+///
+/// Two minutes is far beyond any real handshake on any machine that is making
+/// progress at all, and still finite, which is the entire requirement.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl PeerSession {
     /// Open a session over an authenticated, secured `transport`.
