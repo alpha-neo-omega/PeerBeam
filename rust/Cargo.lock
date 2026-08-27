@@ -1610,6 +1610,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerbeam-groups"
+version = "0.10.0"
+dependencies = [
+ "chrono",
+ "peerbeam-appstore-fs",
+ "peerbeam-chat",
+ "peerbeam-crypto",
+ "peerbeam-domain",
+ "peerbeam-trust-fs",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "peerbeam-identity-fs"
 version = "0.10.0"
 dependencies = [
