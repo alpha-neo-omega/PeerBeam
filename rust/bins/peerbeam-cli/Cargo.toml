@@ -28,6 +28,7 @@ peerbeam-trust-fs = { path = "../../crates/peerbeam-trust-fs" }
 peerbeam-identity-fs = { path = "../../crates/peerbeam-identity-fs" }
 peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
 peerbeam-spaces = { path = "../../crates/peerbeam-spaces" }
+peerbeam-groups = { path = "../../crates/peerbeam-groups" }
 peerbeam-update = { path = "../../crates/peerbeam-update" }
 peerbeam-wake = { path = "../../crates/peerbeam-wake" }
 peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }

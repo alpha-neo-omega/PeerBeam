@@ -76,6 +76,20 @@ pub enum Command {
     /// those are point-to-point. There is no acknowledgement in the protocol,
     /// so this reports what it sent, never that the machine woke.
     Wake(WakeArgs),
+    /// Group conversations: a named set of devices that all know each other.
+    ///
+    /// **Not a Space.** A Space is a private label this device keeps, so no
+    /// member learns who else is in one — and there are no group replies. A
+    /// Group is the opposite trade: every member holds the same roster, so a
+    /// reply reaches everyone, and **every member learns who every other member
+    /// is**. That disclosure is the whole cost and cannot be taken back.
+    ///
+    /// There is no server and no host. Every member holds the roster, nobody is
+    /// asked for it, and a message is N ordinary sends — each through the same
+    /// per-device permission check a hand-addressed message passes. Permitted by
+    /// amendment A2 in `docs/ARCHITECTURAL_INVARIANTS.md`, on conditions it
+    /// lists.
+    Group(GroupArgs),
     /// Named sets of trusted devices you can send to at once.
     ///
     /// A Space lives on this device only. It is never sent anywhere, no peer
@@ -814,6 +828,96 @@ pub enum WakeAction {
         /// broadcast, which reaches the local segment.
         #[arg(long, value_name = "ADDR", default_value = "255.255.255.255")]
         broadcast: String,
+    },
+}
+
+#[derive(Args)]
+pub struct GroupArgs {
+    #[command(subcommand)]
+    pub action: GroupAction,
+}
+
+#[derive(Subcommand)]
+pub enum GroupAction {
+    /// List every group, with its members and which are still reachable.
+    List,
+    /// Create a group holding only this device.
+    ///
+    /// Members are added by inviting them and are added only when **they**
+    /// accept: a create that took a member list would enrol other people's
+    /// devices in something they never agreed to.
+    Create {
+        /// What to call it. Names are unique on this device, ignoring case.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Rename a group **on this device only**.
+    ///
+    /// Names are not synchronised: agreeing on one would need a device to
+    /// arbitrate simultaneous renames, and that device would be a hub. Two
+    /// members may see different names for one conversation.
+    Rename {
+        /// The group, by name or id.
+        #[arg(value_name = "GROUP")]
+        group: String,
+        /// The new name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Offer a trusted device a place in a group.
+    ///
+    /// An **offer**, not an enrolment. Nothing happens on their device until
+    /// their own user accepts, and the roster grows when they say so.
+    ///
+    /// The invitation carries the roster, so the invitee learns who is already
+    /// in the group — and everyone already in it learns about them when they
+    /// accept.
+    Invite {
+        /// The group, by name or id.
+        #[arg(value_name = "GROUP")]
+        group: String,
+        /// Device id, name, or unambiguous name prefix.
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
+    /// Accept an invitation, by the group id it named.
+    ///
+    /// Joining tells every member listed in the invitation that you are in, so
+    /// **they all learn your device**, and you learn theirs.
+    Accept {
+        /// The group id from the invitation.
+        #[arg(value_name = "GROUP-ID")]
+        group: String,
+    },
+    /// Leave a group: tell its members, then forget it here.
+    ///
+    /// The message is advisory — a member that ignores it keeps sending, and
+    /// nothing can compel otherwise. What leaving guarantees is local and
+    /// complete: this device drops the group and stops sending to it. To refuse
+    /// a device's messages entirely, use `trust revoke-permission <device> chat`.
+    Leave {
+        /// The group, by name or id.
+        #[arg(value_name = "GROUP")]
+        group: String,
+    },
+    /// Send a message to every reachable member.
+    ///
+    /// **N ordinary sends**, one per member, each through the same permission
+    /// gate a hand-addressed message passes. A member you no longer trust is
+    /// named and skipped, never silently dropped.
+    Send {
+        /// The group, by name or id.
+        #[arg(value_name = "GROUP")]
+        group: String,
+        /// The message.
+        #[arg(value_name = "TEXT")]
+        text: String,
+    },
+    /// Show a group's messages, gathered across its members.
+    History {
+        /// The group, by name or id.
+        #[arg(value_name = "GROUP")]
+        group: String,
     },
 }
 

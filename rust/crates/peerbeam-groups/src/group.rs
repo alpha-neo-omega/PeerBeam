@@ -108,6 +108,29 @@ pub struct Group {
     pub members: Vec<DeviceId>,
 }
 
+/// An invitation this device has received and not yet answered.
+///
+/// **Not a group.** Holding one means somebody offered; it grants nothing, and
+/// nothing is joined until this device's own user accepts (A2, condition 4).
+/// It is stored apart from groups for exactly that reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingInvite {
+    /// The group being offered.
+    pub group: String,
+    /// The inviter's name for it — a suggestion, since names are local.
+    pub name: String,
+    /// Who offered, as the authenticated session reported them.
+    pub from: DeviceId,
+    /// Who is already in it.
+    ///
+    /// **This is the disclosure.** Accepting means learning these devices and
+    /// being learned by them, which is why a surface must state it before the
+    /// user answers rather than after (A2, condition 5).
+    pub members: Vec<DeviceId>,
+    /// When it arrived, RFC 3339.
+    pub at: String,
+}
+
 impl Group {
     /// Everyone but this device — the recipients of one message.
     ///

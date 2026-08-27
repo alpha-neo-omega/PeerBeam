@@ -8,6 +8,7 @@ pub(crate) mod clipboard;
 pub mod commands;
 pub mod engine;
 pub mod exit;
+pub mod groups;
 pub mod history;
 pub mod logs;
 pub mod notes;

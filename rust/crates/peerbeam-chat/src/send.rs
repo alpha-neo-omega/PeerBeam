@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use peerbeam_domain::id::DeviceId;
-use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType};
+use peerbeam_domain::session::{ChannelId, ChannelState, ChannelType, MessageFlags, MessageType};
 use peerbeam_transfer::{SessionHandle, TransferControl};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -528,6 +528,38 @@ pub async fn send_reaction(handle: &SessionHandle, r: &Reaction) -> Result<(), S
         .map_err(|e| SendError::Session(e.to_string()));
     // The lane belongs to the session, not to this frame — see `chat_lane`.
     sent
+}
+
+/// Send a frame this crate does not define, down the Chat channel.
+///
+/// The outbound half of [`ForeignSink`](crate::ForeignSink), and the same
+/// bargain: a session maps one handler to one channel and chat owns CHAT, so
+/// anything else riding it has to go through here. Chat supplies the lane and
+/// stays ignorant of what the bytes mean — groups are the first caller, and
+/// this crate knows nothing about them.
+///
+/// Sent **optional**, so a peer that does not implement the type ignores it
+/// rather than failing the channel and taking the conversation down with it.
+/// Whether it is worth sending at all is the caller's decision, read from the
+/// negotiated capability — the same split every other send here follows.
+///
+/// # Errors
+/// [`SendError`] when the lane cannot be opened or the frame cannot be sent.
+pub async fn send_foreign(
+    handle: &SessionHandle,
+    message_type: MessageType,
+    payload: Vec<u8>,
+) -> Result<(), SendError> {
+    let channel = chat_lane(handle).await?;
+    handle
+        .send_on_channel(
+            channel,
+            message_type,
+            MessageFlags::OPTIONAL,
+            bytes::Bytes::from(payload),
+        )
+        .await
+        .map_err(|e| SendError::Session(e.to_string()))
 }
 
 pub async fn send_file_decline(handle: &SessionHandle, d: &FileDecline) -> Result<(), SendError> {

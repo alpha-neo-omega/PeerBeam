@@ -25,8 +25,8 @@ pub use retention::{
 pub use search::{SearchHit, SearchResults, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 pub use send::{
     begin_file_send, flush_to_session, next_file_for, prepare_file_send, send_file_decline,
-    send_file_ref, send_message, send_reaction, send_receipt, send_reply, stage_file_send,
-    PendingFile, SendError,
+    send_file_ref, send_foreign, send_message, send_reaction, send_receipt, send_reply,
+    stage_file_send, PendingFile, SendError,
 };
 pub use staging::{StagingError, StagingLimits, StagingStore};
 pub use store::{namespace, ChatStore, Landing, OutboxEntry, StagedFile, OUTBOX_NS};

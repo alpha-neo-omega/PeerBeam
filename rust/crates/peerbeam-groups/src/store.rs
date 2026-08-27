@@ -9,10 +9,22 @@ use rand::RngCore;
 use peerbeam_domain::id::DeviceId;
 use peerbeam_domain::port::{AppStore, TrustStore};
 
-use crate::group::{normalise, validate_member, validate_name, Group, GroupError, MAX_MEMBERS};
+use crate::group::{
+    normalise, validate_member, validate_name, Group, GroupError, PendingInvite, MAX_MEMBERS,
+};
 
 /// The single namespace every group lives in.
 pub const NS: &str = "groups";
+
+/// Invitations received and not yet answered.
+///
+/// **Separate from [`NS`], because an invitation is not a membership.** A
+/// pending invitation must not appear anywhere a group does — it is an offer
+/// somebody made, and the whole point of A2's fourth condition is that nothing
+/// is joined until this device's own user says so. Keeping them in one
+/// namespace would mean every listing had to remember to filter, and one that
+/// forgot would show a group this device is not in.
+pub const INVITES_NS: &str = "group-invites";
 
 /// A shared, wire-visible group id: 32 random hex characters.
 ///
@@ -216,6 +228,70 @@ impl GroupStore {
         group.name = name;
         self.write(&group)?;
         Ok(group)
+    }
+
+    /// Remember an invitation until the user answers it.
+    ///
+    /// Keyed by group id, so a second copy of the same offer replaces the first
+    /// rather than stacking: two invitations to one group are one decision.
+    ///
+    /// # Errors
+    /// A bad member id, or a store error.
+    pub fn record_invite(&self, invite: &PendingInvite) -> Result<(), GroupError> {
+        for m in &invite.members {
+            validate_member(m)?;
+        }
+        let bytes = serde_json::to_vec(invite).map_err(|e| GroupError::Unwritable {
+            reason: e.to_string(),
+        })?;
+        self.store
+            .put(INVITES_NS, &invite.group, &bytes)
+            .map_err(|e| GroupError::Unwritable {
+                reason: e.to_string(),
+            })
+    }
+
+    /// Invitations waiting for an answer.
+    ///
+    /// An invitation to a group this device has **already joined** is dropped
+    /// from the answer: it is an offer that has been taken, and showing it
+    /// would invite the user to accept something twice.
+    ///
+    /// # Errors
+    /// A store error.
+    pub fn invites(&self) -> Result<Vec<PendingInvite>, GroupError> {
+        let raw = self
+            .store
+            .list(INVITES_NS)
+            .map_err(|e| GroupError::Unreadable {
+                reason: e.to_string(),
+            })?;
+        let held = self.list()?;
+        Ok(raw
+            .iter()
+            .filter_map(|(_, b)| serde_json::from_slice::<PendingInvite>(b).ok())
+            .filter(|i| !held.iter().any(|g| g.id == i.group))
+            .collect())
+    }
+
+    /// One pending invitation by group id.
+    ///
+    /// # Errors
+    /// A store error.
+    pub fn invite(&self, group: &str) -> Result<Option<PendingInvite>, GroupError> {
+        Ok(self.invites()?.into_iter().find(|i| i.group == group))
+    }
+
+    /// Forget an invitation — answered, or declined.
+    ///
+    /// # Errors
+    /// A store error.
+    pub fn forget_invite(&self, group: &str) -> Result<bool, GroupError> {
+        self.store
+            .delete(INVITES_NS, group)
+            .map_err(|e| GroupError::Unwritable {
+                reason: e.to_string(),
+            })
     }
 
     /// Split `id`'s recipients into those this device may still message and
@@ -533,6 +609,68 @@ pub(crate) mod tests {
         let (live, stale) = store.reachable(&g.id).unwrap();
         assert!(live.is_empty(), "a store error must not read as permission");
         assert_eq!(stale, vec![alice()]);
+    }
+
+    fn an_invite(group: &str) -> PendingInvite {
+        PendingInvite {
+            group: group.to_string(),
+            name: "Trip".into(),
+            from: alice(),
+            members: vec![alice(), bob()],
+            at: "2026-08-27T10:00:00Z".into(),
+        }
+    }
+
+    /// An invitation is held apart from groups: holding one is not being in
+    /// one, and a listing that mixed them would show a group this device has
+    /// not joined.
+    #[test]
+    fn a_pending_invitation_is_not_a_group() {
+        let (store, _t, _d) = new_store();
+        store.record_invite(&an_invite("g-1")).unwrap();
+        assert_eq!(store.invites().unwrap().len(), 1);
+        assert!(
+            store.list().unwrap().is_empty(),
+            "an invitation appeared as a group"
+        );
+    }
+
+    /// Once the offer is taken, it stops being an offer — otherwise the user is
+    /// invited to accept something they are already in.
+    #[test]
+    fn an_invitation_to_a_group_already_joined_is_not_offered() {
+        let (store, _t, _d) = new_store();
+        store.record_invite(&an_invite("g-1")).unwrap();
+        store.adopt("g-1", "Trip", &[alice(), bob()]).unwrap();
+        assert!(store.invites().unwrap().is_empty());
+    }
+
+    /// Two copies of one offer are one decision, not two rows.
+    #[test]
+    fn a_repeated_invitation_replaces_rather_than_stacks() {
+        let (store, _t, _d) = new_store();
+        store.record_invite(&an_invite("g-1")).unwrap();
+        store.record_invite(&an_invite("g-1")).unwrap();
+        assert_eq!(store.invites().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_an_invitation_twice_is_not_an_error() {
+        let (store, _t, _d) = new_store();
+        store.record_invite(&an_invite("g-1")).unwrap();
+        assert!(store.forget_invite("g-1").unwrap());
+        assert!(!store.forget_invite("g-1").unwrap());
+        assert!(store.invites().unwrap().is_empty());
+    }
+
+    /// A roster arriving from a peer is validated like any other: an id that
+    /// could forge a delimiter must not be written even into an offer.
+    #[test]
+    fn a_hostile_id_in_an_invitation_is_refused() {
+        let (store, _t, _d) = new_store();
+        let mut bad = an_invite("g-1");
+        bad.members = vec![DeviceId::from("pb-a\nb")];
+        assert!(store.record_invite(&bad).is_err());
     }
 
     #[test]

@@ -36,9 +36,10 @@ mod store;
 
 pub use control::{apply, GroupEvent};
 pub use group::{
-    normalise, validate_member, validate_name, Group, GroupError, MAX_MEMBERS, MAX_NAME,
+    normalise, validate_member, validate_name, Group, GroupError, PendingInvite, MAX_MEMBERS,
+    MAX_NAME,
 };
 pub use message::{
     GroupInvite, GroupJoined, GroupLeft, MSG_GROUP_INVITE, MSG_GROUP_JOINED, MSG_GROUP_LEFT,
 };
-pub use store::{GroupStore, NS};
+pub use store::{GroupStore, INVITES_NS, NS};

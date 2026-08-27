@@ -50,6 +50,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Rules(a) => crate::rules::rules(ctx, a.action, cfg_override.as_deref()),
         Command::Notes(a) => crate::notes::notes(ctx, a.action, cfg_override.as_deref()).await,
         Command::Space(a) => crate::spaces::space(ctx, a.action, cfg_override.as_deref()).await,
+        Command::Group(a) => crate::groups::group(ctx, a.action, cfg_override.as_deref()).await,
         Command::Wake(a) => crate::wake::wake(ctx, a.action, cfg_override.as_deref()),
         Command::Ring(a) => crate::presence::ring(ctx, a, cfg_override.as_deref()).await,
         Command::Timeline(a) => timeline_cmd(ctx, a, cfg_override.as_deref()),
@@ -1694,6 +1695,27 @@ pub(crate) fn space_store(config: &EngineConfig) -> Result<peerbeam_spaces::Spac
     );
     let trust: Arc<dyn peerbeam_domain::port::TrustStore> = sc.trust.clone();
     Ok(peerbeam_spaces::SpaceStore::new(app, trust))
+}
+
+/// Build the CLI's Group store.
+///
+/// Same `AppStore` and key as every other record, plus the trust store and this
+/// device's own id — a group read answers "may I still message this member?"
+/// before anything else, and a roster includes the holder, so both are needed
+/// to answer either question.
+pub(crate) fn group_store(config: &EngineConfig) -> Result<peerbeam_groups::GroupStore, CliError> {
+    let sc = SecureCtx::build(config)?;
+    let root = std::path::Path::new(&config.storage.data_directory).join("appstore");
+    let key = peerbeam_crypto::derive_subkey(&sc.ident.keypair.secret.0, b"peerbeam-appstore-v1");
+    let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+        peerbeam_appstore_fs::FsAppStore::open(root, key, sc.enc.clone()),
+    );
+    let trust: Arc<dyn peerbeam_domain::port::TrustStore> = sc.trust.clone();
+    Ok(peerbeam_groups::GroupStore::new(
+        app,
+        trust,
+        sc.ident.device_id.clone(),
+    ))
 }
 
 pub(crate) fn note_store(
