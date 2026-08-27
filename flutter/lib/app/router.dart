@@ -6,6 +6,7 @@ import '../features/devices/devices_screen.dart';
 import '../features/history/history_screen.dart';
 import '../features/home/home_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../features/groups/groups_screen.dart';
 import '../features/spaces/spaces_screen.dart';
 import '../features/transfers/transfers_screen.dart';
 import 'shell.dart';
@@ -87,6 +88,19 @@ GoRouter buildRouter() {
               GoRoute(
                 path: '/spaces',
                 pageBuilder: (c, s) => _fade(const SpacesScreen()),
+              ),
+            ],
+          ),
+          // Groups last, beside Spaces, for the same reason Spaces is last:
+          // this list *is* the Ctrl/⌘+1..N order, and anything inserted higher
+          // renumbers every shortcut below it. It sits next to Spaces because
+          // the two are easy to confuse and being adjacent invites the
+          // comparison rather than hiding it.
+          StatefulShellBranch(
+            routes: [
+              GoRoute(
+                path: '/groups',
+                pageBuilder: (c, s) => _fade(const GroupsScreen()),
               ),
             ],
           ),

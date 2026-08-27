@@ -362,8 +362,10 @@ class FakePeerBeam implements PeerBeamApi {
   List<String> groupSkipped = [];
 
   @override
-  Future<GroupsView> groups() async =>
-      GroupsView(groups: groupsList, invites: groupInvites);
+  Future<GroupsView> groups() async {
+    _maybeFail('groups');
+    return GroupsView(groups: groupsList, invites: groupInvites);
+  }
 
   @override
   Future<Group> createGroup(String name) async {

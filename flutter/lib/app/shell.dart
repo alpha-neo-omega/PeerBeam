@@ -34,6 +34,7 @@ class AppShell extends StatelessWidget {
     // between, so it takes the free digit at the end instead of shifting four
     // that people have learned.
     _Dest(Icons.workspaces_outlined, Icons.workspaces_rounded, 'Spaces'),
+    _Dest(Icons.groups_outlined, Icons.groups_rounded, 'Groups'),
   ];
 
   /// The destination whose icon carries the active-transfer badge. Derived from

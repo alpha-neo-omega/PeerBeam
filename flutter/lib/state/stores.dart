@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../data/chat_repository.dart';
+import '../data/groups_repository.dart';
 import '../data/notes_repository.dart';
 import '../data/clipboard_sync.dart';
 import '../data/discovery_repository.dart';
@@ -419,6 +420,9 @@ class AppState {
   final ChatRepository chat;
   final NotesRepository notes;
 
+  /// Group conversations, and the invitations waiting for an answer.
+  final GroupsRepository groups;
+
   /// Set while another device is looking for this one.
   final RingAlert ring;
   final PresenceRepository presence;
@@ -444,6 +448,7 @@ class AppState {
     required this.trust,
     required this.chat,
     required this.notes,
+    required this.groups,
     required this.ring,
     required this.presence,
     required this.settings,
@@ -487,6 +492,7 @@ class AppState {
       trust: trust,
       chat: ChatRepository(api: api),
       notes: NotesRepository(api: api),
+      groups: GroupsRepository(api: api),
       ring: ring,
       presence: PresenceRepository(api: api),
       settings: settings,
