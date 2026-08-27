@@ -90,7 +90,9 @@ the features.
   [A1](#a1--a-user-initiated-release-check-2026-08-20), for a release check that
   happens only when a person asks for it.
 - **Not a social platform.** No hub-brokered group chat, feeds, discovery of
-  strangers, or public rooms. Communication is between **trusted** peers (I3/I6).
+  strangers, or public rooms. Communication is between **trusted** peers (I3/I6)
+  — narrowed once, by [A2](#a2--peer-held-group-conversations-2026-08-27), for a
+  group whose roster every member holds and which no device brokers.
 - **Not a remote-control tool.** PeerBeam is not TeamViewer. Remote capabilities
   are limited to explicit, permissioned, narrowly-scoped actions — never arbitrary
   control of another machine (I6).
@@ -130,6 +132,31 @@ document too, and a non-goal that still read as absolute would be a published
 claim the shipped build makes false.
 
 **Approval:** granted with the feature it accompanies (v0.10.0).
+
+### A2 — Peer-held group conversations (2026-08-27)
+
+**Non-goal narrowed:** *"Not a social platform."*
+
+**Date:** 2026-08-27.
+
+**Rationale.** The non-goal's first clause forbids "hub-brokered group chat".
+A2 permits a **Group** in which every member holds the complete roster and every
+message is N direct sends — so there is no broker, no host, no creator
+privilege, and no device others must ask. What the clause was written to refuse
+— a coordinating server, and the account-shaped social surface that follows one
+— is refused exactly as before. Feeds, public rooms and discovery of strangers
+remain out.
+
+The trade is stated rather than hidden: in a Group, every member learns who
+every other member is. **Spaces do not have that property and are unchanged** —
+they stay local, rosterless and invisible to peers, and remain the default. The
+full reasoning and the eight binding conditions are recorded once, in
+[ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#a2--peer-held-group-conversations-without-a-hub-2026-08-27),
+against invariant I3; this entry exists because the amendment narrows this
+document too, and a non-goal that still read as absolute would be a published
+claim the shipped build makes false.
+
+**Approval:** granted by the repository owner, 2026-08-27.
 
 <!--
 Future amendments must include:

@@ -22,7 +22,11 @@ This is the important half, and it is why the feature looks the way it does.
 **Not a group.** A Space has no shared roster, no group key, no group id, and no
 membership messages. Nothing about it is ever put on the wire — this crate
 defines no message type and registers no channel. Two devices in the same Space
-have no idea that they are.
+have no idea that they are. (Since
+[A2](ARCHITECTURAL_INVARIANTS.md#a2--peer-held-group-conversations-without-a-hub-2026-08-27)
+a separate **Group** construct does exist, with a roster every member holds.
+It is a different thing with a different trade — see the amendment note below —
+and none of this paragraph is weakened by it.)
 
 **Not synced.** A Space exists on the device that defined it and nowhere else.
 Your laptop's "Work Laptops" and your phone's "Work Laptops" are two unrelated
@@ -35,7 +39,8 @@ requires a central hub or server for its common case* — applied literally: a
 Space cannot require a hub, because a Space never leaves the machine.
 [VISION.md](VISION.md)'s permanent non-goal says the same thing from the other
 side: *"No hub-brokered group chat, feeds, discovery of strangers, or public
-rooms."*
+rooms."* A2 leaves this untouched for Spaces, and satisfies it for Groups by
+having no broker rather than by having no roster.
 
 **Not a permission.** Being in a Space grants a device nothing at all. Each of
 the N sends a fan-out performs passes through exactly the gate it would have
@@ -56,17 +61,34 @@ typed to them alone. They cannot enumerate the other members, cannot tell a
 fan-out from a direct send, and cannot learn that the Space exists.
 
 **This is a privacy feature, not a limitation, and it is the reason no group
-identity travels.** The moment a Space had an identity on the wire, some device
-would have to hold the roster and answer questions about it — and a device that
-brokers membership on everyone else's behalf is a hub, whatever it is called.
-Group metadata is also the part of a messaging system that leaks most: who knows
-whom, which is precisely what a peer-to-peer tool with no accounts should never
-be in a position to reveal.
+identity travels.** Group metadata is the part of a messaging system that leaks
+most: who knows whom, which is precisely what a peer-to-peer tool with no
+accounts should never be in a position to reveal by default.
 
-The cost is real and worth naming: there are no group replies. A member's answer
-comes back to you alone, because that is the only party who knows the message
-went to more than one device. If you want everyone to see everyone, tell them
-who else you sent to — that disclosure is yours to make, not PeerBeam's.
+The cost is real and worth naming: **a Space has no group replies.** A member's
+answer comes back to you alone, because that is the only party who knows the
+message went to more than one device. If you want everyone to see everyone, tell
+them who else you sent to — that disclosure is yours to make, not PeerBeam's.
+
+> **Amended 2026-08-27 by [A2](ARCHITECTURAL_INVARIANTS.md#a2--peer-held-group-conversations-without-a-hub-2026-08-27).**
+> This section previously argued that no roster may exist on the wire at all,
+> on the grounds that "some device would have to hold the roster and answer
+> questions about it — and a device that brokers membership on everyone else's
+> behalf is a hub, whatever it is called." A2 rejects that step: a roster every
+> member holds **in full**, and that no member is asked for, has no broker. No
+> device others must query, none whose absence stops the conversation, none that
+> learns what the rest do not.
+>
+> So **Groups** exist alongside Spaces, and they do have group replies. What
+> they cost is exactly the property this section defends: in a Group, every
+> member learns every other member, and A2 requires the UI to say so at the
+> point of joining.
+>
+> **Everything above about Spaces still holds, unchanged.** A Space remains
+> local, rosterless, unsynced and invisible to peers; it is not a Group, is
+> never converted into one, and its fan-out send is not renamed "group chat".
+> Choose a Space when nobody should learn who else received it, and a Group when
+> everyone is meant to.
 
 ---
 

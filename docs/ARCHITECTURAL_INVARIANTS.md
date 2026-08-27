@@ -211,6 +211,89 @@ them is outside A1 and back in conflict with I4.
 **Scope.** A1 covers a release check and nothing else. It is not a precedent for
 any other outbound request; a second one needs its own amendment.
 
+### A2 — Peer-held group conversations, without a hub (2026-08-27)
+
+**Invariant amended:** none outright. I3 — *Peer-to-peer first* — is **read**,
+not narrowed: its Forbids line targets "chat rooms via a hub", and what follows
+is defined to have no hub. Also narrows the permanent non-goal in
+[VISION.md](VISION.md) — *"Not a social platform."*, whose first clause reads
+"No hub-brokered group chat". And it supersedes the design statement in
+[SPACES.md](SPACES.md) that a Space "is not a group" and has "no shared roster,
+no group key, no group id".
+
+**The conflict.** Three documents refuse this today, at three different
+strengths:
+
+1. **VISION.md non-goal** — "No hub-brokered group chat". Read against a mesh
+   design this is *satisfiable*: nothing is brokered. Read as shorthand for "no
+   group chat", it is not.
+2. **I3's Forbids** — "chat rooms via a hub". Same reading, same answer.
+3. **SPACES.md** closes even the mesh variant explicitly: "someone would have to
+   hold the roster and answer questions about it — and a device that brokers
+   membership on everyone else's behalf is a hub, whatever it is called."
+
+(3) is the real obstacle, and it is the one this amendment overturns. It is a
+derived document, so it does not require an amendment of its own — but it
+records a deliberate refusal, and overturning it silently is exactly what
+CLAUDE.md forbids.
+
+**Rationale for amending rather than refusing.** SPACES.md already names the
+cost it accepted: *"there are no group replies."* A user who sends a file to
+five people and receives five separate, mutually invisible replies is doing
+group work with a tool that refuses to admit groups exist. The privacy property
+being defended — that no member learns who else is a member — is real and worth
+keeping *by default*, but it is a property of **Spaces**, and it does not follow
+that a second, explicitly-joined construct may not exist beside them.
+
+The hub objection is answerable on its own terms. A roster that every member
+holds in full, and that every member re-sends to every other member directly, has
+no broker: there is no device that others must ask, none whose absence stops the
+conversation, and none that learns anything the others do not. That is a
+replicated set, not a server. What it costs is not centralisation but
+**metadata**: every member learns every other member. That is the honest price,
+and it must be stated to the user rather than buried.
+
+**What A2 permits.** A **Group**: a named, explicitly-joined set of trusted
+devices, distinct from a Space, in which every member holds the full roster and
+every message is sent directly to each member.
+
+**Binding conditions.** All hold together; a build that drops any one is outside
+A2 and back in conflict with I3 and the VISION non-goal.
+
+1. **No hub, no host, no creator privilege.** Every member holds the complete
+   roster. No member is required for the group to function, and a member going
+   offline degrades nothing but that member's own delivery. Any design in which
+   one device answers membership questions for others is outside A2.
+2. **No relay.** Group messages take the same routes as 1:1 messages and are
+   never relayed through a third member. N members means N direct sends.
+   (I3 — a relay stays "optional, the lowest-priority route, and untrusted".)
+3. **Per-member permission still gates every send.** Membership grants nothing.
+   A message to a group passes the same `may_exchange_chat` check per recipient
+   that a hand-addressed message would, and a member who has revoked chat simply
+   does not receive it — and is named, not silently dropped. (I6.)
+4. **Joining is explicit, on both sides.** No device is added to a group without
+   an action by its own user. An invitation is an offer, never an enrolment;
+   there is no mechanism by which a third party's device joins anything on its
+   owner's behalf.
+5. **The metadata cost is stated in the UI, at the point of joining.** The user
+   is told, in plain words, that every member will learn who every other member
+   is. A group that leaked the membership silently would be the surveillance
+   property this project exists to refuse, merely relocated.
+6. **Spaces are unchanged and stay the default.** A Space remains local, roster
+   -less and invisible to peers. A Group is a second construct with a different
+   trade, chosen deliberately; neither is silently converted into the other, and
+   the fan-out send that Spaces already perform is not renamed "group chat".
+7. **Reachable from the CLI, not GUI-only.** (I7.)
+8. **End-to-end encrypted per member.** Each direct send keeps the existing 1:1
+   guarantees; no group key is introduced that would weaken them or create a
+   shared secret whose compromise exposes the whole conversation. (I5.)
+
+**Approval:** granted by the repository owner, 2026-08-27.
+
+**Scope.** A2 covers peer-held group conversations and nothing else. It is not a
+precedent for feeds, public rooms, discovery of strangers, or any
+server-mediated feature; each of those remains refused by the same non-goal.
+
 <!--
 Future amendments must include:
 - Date
