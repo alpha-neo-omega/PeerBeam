@@ -1,0 +1,25 @@
+[package]
+name = "peerbeam-groups"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+peerbeam-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# For the id-collision test: asserting against chat's real constants rather
+# than a copy of them, so the test cannot keep passing after chat adds a sixth.
+peerbeam-chat = { path = "../peerbeam-chat" }
+peerbeam-crypto = { path = "../peerbeam-crypto" }
+peerbeam-appstore-fs = { path = "../peerbeam-appstore-fs" }
+peerbeam-trust-fs = { path = "../peerbeam-trust-fs" }
+chrono = { workspace = true }
+tempfile = { workspace = true }

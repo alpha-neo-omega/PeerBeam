@@ -162,6 +162,22 @@ pub const CHAT_FEAT_RECEIPT: u32 = 1 << 3;
 /// rather than something to skip.
 pub const TRANSFER_FEAT_FOLDER_ACK: u32 = 1 << 0;
 
+/// Feature bit on the CHAT capability: this peer understands group messages —
+/// `GroupInvite`, `GroupJoined`, `GroupLeft`, and a chat message carrying a
+/// `group` id.
+///
+/// **A receive capability, read like [`CHAT_FEAT_FILEREF`]**: it asserts
+/// comprehension, not willingness. Whether a device is actually in a group is
+/// a decision its own user made by accepting an invitation, and whether a
+/// message reaches it is `Permission::Chat` in the trust store — checked per
+/// member on every send, because membership grants nothing (amendment A2,
+/// condition 3).
+///
+/// What the bit is *for* is not sending an invitation into a void: a peer that
+/// predates groups would ignore the frame as an unknown optional type, and the
+/// inviter would sit waiting for a `GroupJoined` that can never come.
+pub const CHAT_FEAT_GROUP: u32 = 1 << 4;
+
 /// Feature bit on the NOTES capability: this peer understands the `NoteBatch`
 /// message (notes MessageType 1) — sending it notes will mean something.
 ///

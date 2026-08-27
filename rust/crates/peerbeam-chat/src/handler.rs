@@ -17,12 +17,31 @@ use crate::store::ChatStore;
 /// Called with each newly received (deduped) record so a surface can display it.
 pub type ReceivedSink = Arc<dyn Fn(ChatRecord) + Send + Sync>;
 
+/// A frame on the Chat channel that this crate does not implement, handed on
+/// rather than dropped: `(peer, message_type, payload)`.
+///
+/// **Why chat has an escape hatch instead of a second handler.** A session maps
+/// one handler to one channel, and Chat's is this one — so anything else that
+/// wants to ride the Chat channel has to arrive through here. Groups do, and
+/// this crate deliberately knows nothing about them: it forwards the bytes and
+/// the type, and whoever wired the sink decides what they mean. That keeps the
+/// group roster, its rules and its vocabulary in `peerbeam_groups`, where a
+/// change to them cannot reach into chat.
+///
+/// Only **optional** unknown types are forwarded. A required one this build
+/// does not implement is still an error, because a peer that marked a frame
+/// required is saying the conversation is wrong without it.
+pub type ForeignSink = Arc<dyn Fn(DeviceId, u16, Vec<u8>) + Send + Sync>;
+
 /// Serves inbound Chat-channel frames for one session. The session peer is bound
 /// once, after the handshake, via the returned [`OnceLock`].
 pub struct ChatHandler {
     store: ChatStore,
     peer: Arc<OnceLock<DeviceId>>,
     sink: ReceivedSink,
+    /// Where an unknown optional frame goes instead of nowhere. `None` keeps
+    /// the previous behaviour exactly: ignored.
+    foreign: Option<ForeignSink>,
 }
 
 impl ChatHandler {
@@ -38,6 +57,28 @@ impl ChatHandler {
             store,
             peer: peer.clone(),
             sink,
+            foreign: None,
+        });
+        (handler, peer)
+    }
+
+    /// [`new`](Self::new), with somewhere for unknown optional frames to go.
+    ///
+    /// Separate constructor rather than a parameter on `new`, so every existing
+    /// caller keeps compiling and keeps its current behaviour: a build that does
+    /// not wire groups forwards nothing and ignores exactly what it ignored
+    /// before.
+    pub fn with_foreign(
+        store: ChatStore,
+        sink: ReceivedSink,
+        foreign: ForeignSink,
+    ) -> (Arc<ChatHandler>, Arc<OnceLock<DeviceId>>) {
+        let peer = Arc::new(OnceLock::new());
+        let handler = Arc::new(ChatHandler {
+            store,
+            peer: peer.clone(),
+            sink,
+            foreign: Some(foreign),
         });
         (handler, peer)
     }
@@ -160,10 +201,18 @@ impl MessageHandler for ChatHandler {
             // the channel; required means fail this channel only. (Increment 0.)
             other => {
                 if frame.flags.is_optional() {
-                    // Ignored on purpose: a newer peer sent an additive message
-                    // this build does not implement. (No log — this crate has no
-                    // tracing dependency and one is not worth adding for a
-                    // skipped frame.)
+                    // Handed on if anybody is listening — see [`ForeignSink`].
+                    // Groups ride this channel and arrive here; this crate does
+                    // not know that, and must not learn it.
+                    //
+                    // The peer is bound after the handshake, so a frame that
+                    // somehow arrives before it has nobody to attribute to and
+                    // is dropped rather than guessed at.
+                    if let (Some(foreign), Some(peer)) = (&self.foreign, self.peer.get()) {
+                        foreign(peer.clone(), other, frame.payload.to_vec());
+                    }
+                    // Still `Ok` either way: an additive message this build does
+                    // not implement is not a broken conversation.
                     return Ok(());
                 }
                 Err(SessionError::FrameDecode(format!(

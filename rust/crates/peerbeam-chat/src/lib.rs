@@ -12,7 +12,7 @@ pub mod staging;
 mod store;
 
 pub use gate::may_exchange_chat;
-pub use handler::{ChatHandler, ReceivedSink};
+pub use handler::{ChatHandler, ForeignSink, ReceivedSink};
 pub use message::{
     mint_id, ChatError, ChatMessage, FileDecline, FileRef, Reaction, Receipt, MAX_BODY, MAX_ID,
     MAX_NAME, MAX_REACTION, MSG_FILE_DECLINE, MSG_FILE_REF, MSG_REACTION, MSG_RECEIPT, MSG_TEXT,
