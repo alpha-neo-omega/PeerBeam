@@ -531,6 +531,7 @@ async fn reflush_is_idempotent_on_the_receiver() {
         timestamp: m.timestamp.clone(),
         body: m.body.clone(),
         in_reply_to: None,
+        group: None,
     };
     store_a.enqueue(&b_id, &dup).unwrap();
     let reflushed = peerbeam_chat::flush_to_session(&a_handle, &store_a, &b_id)

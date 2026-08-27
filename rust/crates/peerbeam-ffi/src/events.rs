@@ -227,6 +227,7 @@ mod tests {
         // does not send reactions", and would have to guess.
         let rec = peerbeam_chat::ChatRecord {
             in_reply_to: None,
+            group: None,
             stored_at: None,
             id: "m1".to_string(),
             peer_id: "pb-bob".to_string(),
@@ -284,6 +285,7 @@ mod tests {
 
         let rec = ChatRecord {
             in_reply_to: None,
+            group: None,
             stored_at: None,
             id: "m1".to_string(),
             peer_id: "pb-bob".to_string(),

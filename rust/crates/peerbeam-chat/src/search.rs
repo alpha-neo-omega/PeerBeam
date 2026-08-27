@@ -364,6 +364,7 @@ mod tests {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: None,
+            group: None,
             stored_at: None,
         }
     }
@@ -385,6 +386,7 @@ mod tests {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: None,
+            group: None,
             stored_at: None,
         }
     }

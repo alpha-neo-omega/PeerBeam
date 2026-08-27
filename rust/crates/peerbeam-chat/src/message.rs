@@ -118,6 +118,16 @@ pub struct ChatMessage {
     /// it later is additive rather than a migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    /// The group this message belongs to, if any.
+    ///
+    /// Additive in exactly the way [`in_reply_to`](Self::in_reply_to) is: an
+    /// unknown field is ignored by `serde_json` on both sides, so a peer that
+    /// predates groups reads the message as an ordinary one-to-one text rather
+    /// than failing on it. That is the fallback, not the plan — `CHAT_FEAT_GROUP`
+    /// is negotiated so a group is not formed with a peer that would show its
+    /// messages in the wrong conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ChatMessage {
@@ -145,6 +155,7 @@ impl ChatMessage {
             timestamp: Utc::now().to_rfc3339(),
             body: body.to_string(),
             in_reply_to: in_reply_to.map(str::to_string),
+            group: None,
         })
     }
 

@@ -192,6 +192,29 @@ pub struct ChatRecord {
     /// of history nobody has replied in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    /// The group this message belongs to, or `None` for an ordinary one-to-one
+    /// message.
+    ///
+    /// **A group message is stored where it was actually sent**: in the
+    /// namespace of the member it went to or came from, tagged with the group
+    /// it belongs to. It is not filed under a synthetic conversation of its
+    /// own, because there is no such conversation on the wire — a group message
+    /// is N one-to-one messages, and the store says so. A group transcript is
+    /// assembled by gathering these tags across members
+    /// ([`ChatStore::group_history`](crate::ChatStore::group_history)); the
+    /// one-to-one transcript is what is left when they are taken out.
+    ///
+    /// That is also why [`history`](crate::ChatStore::history) filters them:
+    /// without it, opening a chat with one member would show fragments of every
+    /// group conversation shared with them, interleaved with the private one
+    /// and indistinguishable from it.
+    ///
+    /// `default` so every row written before groups existed decodes as
+    /// one-to-one, and `skip_serializing_if` so an ordinary message is written
+    /// exactly as it was before — adding a feature must not rewrite the shape
+    /// of history that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// When **this device** first put this row into its own history.
     ///
     /// This is the age a [disappearing-message window](crate::Retention) is
@@ -253,6 +276,9 @@ impl ChatRecord {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: msg.in_reply_to.clone(),
+            // Carried from the message, not defaulted: this is what files the
+            // row into a group transcript instead of the private conversation.
+            group: msg.group.clone(),
             stored_at: Some(Utc::now()),
         }
     }
@@ -272,6 +298,9 @@ impl ChatRecord {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: msg.in_reply_to.clone(),
+            // Carried from the message, not defaulted: this is what files the
+            // row into a group transcript instead of the private conversation.
+            group: msg.group.clone(),
             stored_at: Some(Utc::now()),
         }
     }
@@ -292,6 +321,9 @@ impl ChatRecord {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: msg.in_reply_to.clone(),
+            // Carried from the message, not defaulted: this is what files the
+            // row into a group transcript instead of the private conversation.
+            group: msg.group.clone(),
             stored_at: Some(Utc::now()),
         }
     }
@@ -314,6 +346,7 @@ impl ChatRecord {
             // anyway.
             reactions: Vec::new(),
             in_reply_to: None,
+            group: None,
             stored_at: Some(Utc::now()),
         }
     }
@@ -338,6 +371,7 @@ impl ChatRecord {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: None,
+            group: None,
             stored_at: Some(Utc::now()),
         }
     }

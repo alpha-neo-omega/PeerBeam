@@ -209,6 +209,10 @@ pub async fn flush_to_session(
                     // local history and be silently dropped on the wire for
                     // exactly the messages that were queued.
                     in_reply_to: entry.in_reply_to.clone(),
+                    // Same reason as the reply link directly above: a queued
+                    // group message that flushed without its tag would arrive
+                    // as an ordinary one-to-one message.
+                    group: entry.group.clone(),
                 };
                 if send_on_open_channel(handle, channel, &msg).await.is_err() {
                     break; // peer went away mid-flush; remaining entries stay queued
@@ -1012,6 +1016,7 @@ mod tests {
             file: None,
             offers_refused: 0,
             in_reply_to: None,
+            group: None,
         };
         raw.put(
             crate::store::OUTBOX_NS,

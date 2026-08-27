@@ -80,6 +80,13 @@ pub struct OutboxEntry {
     /// dropped for exactly the messages that were sent to an offline peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    /// The group this message belongs to, carried for exactly the reason the
+    /// reply link above is: `flush_to_session` rebuilds the wire message from
+    /// this entry, so a group tag missing here is one the peer never sees — and
+    /// a message queued for an offline member would arrive as an ordinary
+    /// one-to-one message and land in the wrong conversation on their device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl OutboxEntry {
@@ -353,6 +360,14 @@ impl ChatStore {
                     // line per filtered message would write the disappearing
                     // conversation into the log file instead.
                 }
+                // A message belonging to a group is not part of the private
+                // conversation with this peer, even though it is stored here —
+                // it was sent here because a group message *is* N one-to-one
+                // sends. Without this filter, opening a chat with one member
+                // would show fragments of every group shared with them,
+                // interleaved with the private thread and indistinguishable
+                // from it. `group_history` is where they belong.
+                Ok(rec) if rec.group.is_some() => {}
                 // Through `with_landing` like `get`: the conversation view is
                 // where a person reads the filename they are about to approve,
                 // so it must not be the one path that shows the peer's claim.
@@ -386,6 +401,70 @@ impl ChatStore {
     /// unavoidable (it is equally true after a user's own delete), but it must
     /// not also be true for the whole stretch between the window closing and
     /// the prune running.
+    /// Every message belonging to `group`, oldest first.
+    ///
+    /// # Gathered across members, because that is where they are
+    ///
+    /// A group message is **N one-to-one sends** (amendment A2, condition 2),
+    /// so each copy is stored in the namespace of the member it went to or came
+    /// from, tagged with the group. There is no group namespace, because there
+    /// is no group conversation on the wire to have one — inventing a synthetic
+    /// peer to file them under would make the store claim a thing the protocol
+    /// does not do.
+    ///
+    /// So this walks the conversation namespaces and keeps the tagged rows.
+    /// That is more work than one namespace read, and it is the honest shape:
+    /// the cost is proportional to how many people you talk to, which is the
+    /// same thing `conversations` already pays.
+    ///
+    /// # Sending appears once, receiving appears once per sender
+    ///
+    /// An **outgoing** group message is one row per recipient — the same text
+    /// sent N times — so it is de-duplicated by message id here, keeping the
+    /// first. An **incoming** one arrives once from its author and needs no
+    /// such treatment. Without the de-duplication a person would see their own
+    /// message repeated once per member of the group.
+    ///
+    /// Each member's retention window applies to their own copy, exactly as it
+    /// does for the private conversation: a window is a promise about what this
+    /// device keeps of a given peer, and a group does not suspend it.
+    ///
+    /// # Errors
+    /// [`ChatError::Serialization`] when the store cannot be read.
+    pub fn group_history(&self, group: &str) -> Result<Vec<ChatRecord>, ChatError> {
+        let mut out: Vec<ChatRecord> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let now = Utc::now();
+        for peer in self.conversations()? {
+            let retention = self.retention(&peer)?;
+            let raw = self
+                .store
+                .list(&namespace(&peer))
+                .map_err(|e| ChatError::Serialization(e.to_string()))?;
+            for (_, value) in raw {
+                // A row this build cannot read is skipped, not fatal — the same
+                // forward-compatibility rule `history` follows.
+                let Ok(rec) = ChatRecord::decode(&value) else {
+                    continue;
+                };
+                if rec.group.as_deref() != Some(group) {
+                    continue;
+                }
+                if rec.has_disappeared(retention, now) {
+                    continue;
+                }
+                if seen.insert(rec.id.clone()) {
+                    out.push(self.with_landing(rec));
+                }
+            }
+        }
+        // Ids are time-ordered, so this is chronological across members without
+        // trusting any peer's clock — the same property the per-conversation
+        // listing gets for free from the store's key order.
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
     pub fn contains(&self, peer: &DeviceId, id: &str) -> Result<bool, ChatError> {
         let ns = namespace(peer);
         self.store
@@ -501,6 +580,7 @@ impl ChatStore {
             file: None,
             offers_refused: 0,
             in_reply_to: msg.in_reply_to.clone(),
+            group: msg.group.clone(),
         };
         self.store
             .put(OUTBOX_NS, &msg.id, &entry.encode())
@@ -568,6 +648,7 @@ impl ChatStore {
             // A `FileRef` carries no reply reference on the wire yet; see
             // `ChatMessage::in_reply_to`.
             in_reply_to: None,
+            group: None,
         };
         self.store
             .put(OUTBOX_NS, &r.id, &entry.encode())
@@ -613,6 +694,7 @@ impl ChatStore {
             // A decline answers nothing: it is a status change on a row that
             // already exists, not a message in the thread.
             in_reply_to: None,
+            group: None,
         };
         self.store
             .put(OUTBOX_NS, &d.id, &entry.encode())
@@ -888,6 +970,7 @@ impl ChatStore {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: entry.in_reply_to.clone(),
+            group: entry.group.clone(),
             // The row this rebuilds went missing, so "when this device first
             // stored it" is genuinely unknown and now is the only honest
             // answer: this is the moment the only surviving copy of the message
@@ -1648,6 +1731,102 @@ mod tests {
         (ChatStore::new(app.clone()), app, dir)
     }
 
+    /// **A group message must not appear in the private conversation.**
+    ///
+    /// A group message is N one-to-one sends, so its copies really do live in
+    /// each member's namespace. Without the filter, opening a chat with one
+    /// member would show fragments of every group shared with them, mixed into
+    /// the private thread and indistinguishable from it.
+    #[test]
+    fn a_group_message_is_absent_from_the_one_to_one_history() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+
+        let private = ChatMessage::new("just between us").unwrap();
+        cs.append(&ChatRecord::sent(&bob, &private)).unwrap();
+
+        let mut in_group = ChatMessage::new("hello everyone").unwrap();
+        in_group.group = Some("g-1".into());
+        cs.append(&ChatRecord::sent(&bob, &in_group)).unwrap();
+
+        let one_to_one = cs.history(&bob).unwrap();
+        assert_eq!(
+            one_to_one.len(),
+            1,
+            "a group message leaked into the private thread"
+        );
+        assert_eq!(one_to_one[0].body, "just between us");
+    }
+
+    /// The group transcript is gathered across the members it was sent to, and
+    /// the sender's own copy appears **once** rather than once per recipient.
+    #[test]
+    fn a_group_transcript_gathers_members_and_does_not_repeat_the_sender() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let carol = DeviceId::from("pb-carol");
+
+        // One outgoing message, sent to two members: two stored rows, one id.
+        let mut mine = ChatMessage::new("shall we meet at six").unwrap();
+        mine.group = Some("g-1".into());
+        cs.append(&ChatRecord::sent(&bob, &mine)).unwrap();
+        cs.append(&ChatRecord::sent(&carol, &mine)).unwrap();
+
+        // A reply from Carol arrives once, from her.
+        let mut hers = ChatMessage::new("six works").unwrap();
+        hers.group = Some("g-1".into());
+        cs.append(&ChatRecord::received(&carol, &hers)).unwrap();
+
+        let thread = cs.group_history("g-1").unwrap();
+        let bodies: Vec<&str> = thread.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["shall we meet at six", "six works"],
+            "the sender's own message must appear once, and in order"
+        );
+    }
+
+    /// A group transcript holds only its own group.
+    #[test]
+    fn a_group_transcript_excludes_other_groups_and_private_messages() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+
+        let private = ChatMessage::new("private").unwrap();
+        cs.append(&ChatRecord::sent(&bob, &private)).unwrap();
+        let mut other = ChatMessage::new("other group").unwrap();
+        other.group = Some("g-2".into());
+        cs.append(&ChatRecord::sent(&bob, &other)).unwrap();
+        let mut mine = ChatMessage::new("this group").unwrap();
+        mine.group = Some("g-1".into());
+        cs.append(&ChatRecord::sent(&bob, &mine)).unwrap();
+
+        let thread = cs.group_history("g-1").unwrap();
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].body, "this group");
+    }
+
+    /// A queued group message must still be a group message when it flushes.
+    /// The outbox rebuilds the wire message from its own entry, so a tag
+    /// missing there is one the peer never sees — and the message would land in
+    /// the private conversation on their device.
+    #[test]
+    fn a_queued_group_message_keeps_its_group_through_the_outbox() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+        let mut msg = ChatMessage::new("queued for later").unwrap();
+        msg.group = Some("g-1".into());
+        cs.enqueue(&bob, &msg).unwrap();
+
+        let pending = cs.outbox_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].group.as_deref(),
+            Some("g-1"),
+            "the outbox dropped the group tag"
+        );
+    }
+
     #[test]
     fn a_receipt_marks_our_outgoing_messages_up_to_the_watermark() {
         let (cs, _store, _dir) = new_store();
@@ -2189,6 +2368,7 @@ mod tests {
             file: None,
             offers_refused: 0,
             in_reply_to: None,
+            group: None,
         };
         cs.record_sent(&entry).unwrap();
 
@@ -2748,6 +2928,7 @@ mod tests {
             read_at: None,
             reactions: Vec::new(),
             in_reply_to: None,
+            group: None,
             stored_at: None,
         };
         let later = ChatRecord {
@@ -3070,6 +3251,7 @@ mod tests {
             }),
             offers_refused: 0,
             in_reply_to: None,
+            group: None,
         };
         assert!(
             cs.get(&peer, &entry.message_id).unwrap().is_none(),
@@ -3106,6 +3288,7 @@ mod tests {
             file: None,
             offers_refused: 0,
             in_reply_to: None,
+            group: None,
         };
         cs.record_sent(&entry).unwrap();
         assert!(cs.history(&peer).unwrap().is_empty());
@@ -3126,6 +3309,7 @@ mod tests {
             }),
             offers_refused: 2,
             in_reply_to: None,
+            group: None,
         };
         let back = OutboxEntry::decode(&e.encode()).unwrap();
         assert_eq!(back, e);
