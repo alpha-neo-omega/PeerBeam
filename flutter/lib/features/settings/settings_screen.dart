@@ -291,6 +291,33 @@ class SettingsScreen extends StatelessWidget {
                           state.settings.setNotifications,
                         ),
                       ),
+                      const Divider(height: 1),
+                      // Its own builder: this one is a *view* preference, so it
+                      // listens to `state.view` while everything above it
+                      // listens to `state.settings`. Same card because it
+                      // belongs to the same question — what happens when a file
+                      // arrives — and splitting it out would file one answer
+                      // under a heading of its own for no reader's benefit.
+                      AnimatedBuilder(
+                        animation: state.view,
+                        builder: (context, _) => SwitchListTile.adaptive(
+                          secondary: const Icon(Icons.notification_important_outlined),
+                          title: const Text('Ask when a file arrives'),
+                          // The subtitle has to kill the obvious misreading.
+                          // "Ask when a file arrives", turned off, reads like
+                          // "don't ask" — which sounds exactly like
+                          // auto-accept, one switch above it, and is not. The
+                          // transfer still waits for an answer either way.
+                          subtitle: const Text(
+                            'Show the approval prompt over whatever is open. '
+                            'Turning this off never accepts anything on its '
+                            'own — transfers still wait for you on Transfers.',
+                          ),
+                          value: state.view.askOnReceive,
+                          onChanged: (v) =>
+                              unawaited(state.view.setAskOnReceive(v)),
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -712,9 +739,27 @@ class SettingsScreen extends StatelessWidget {
 /// The distinction this section already draws — approved versus merely pinned —
 /// is *whether* the user chose a device. Permissions are *what* that choice
 /// left it, which is the same question one level finer, so they belong in the
-/// same place rather than behind a tap that has to be discovered. Approving
-/// grants all of them, so the common device shows five switches all on and
-/// costs the reader nothing; a narrowed one shows exactly which is off.
+/// same place rather than behind a tap that has to be discovered.
+///
+/// # Why they nevertheless collapse
+///
+/// Seven switches, each with a sentence under it, is roughly a screenful **per
+/// approved device**. That was fine at one device and unreadable at five: the
+/// list this section is part of stopped being a list of devices and became a
+/// wall of switches, and finding the device you wanted meant scrolling past
+/// every permission of every device before it.
+///
+/// The compromise is that collapsing must not hide the *answer*, only the
+/// controls. So the header always states the count — "All 7 allowed", or
+/// "3 of 7 allowed" — and a narrowed device is called out whether or not it is
+/// open. The security-relevant fact (this device is not on the defaults) is
+/// therefore still visible at a glance in a collapsed list, which is the
+/// property the old always-open layout actually provided and the one worth
+/// keeping.
+///
+/// Expansion state is per row and deliberately **not persisted**: it is a
+/// reading position, not a preference, and a device that silently reopened
+/// itself on every visit to Settings would defeat the point.
 ///
 /// # Why each switch carries a sentence
 ///
@@ -726,19 +771,30 @@ class SettingsScreen extends StatelessWidget {
 /// Revoking takes effect on that device's **next** operation, not its next
 /// connection — the engine's gates re-read the trust store per message, clip,
 /// heartbeat and accept — so the subtitle can promise "next", and does.
-class _DevicePermissions extends StatelessWidget {
+class _DevicePermissions extends StatefulWidget {
   const _DevicePermissions({required this.device});
 
   final TrustedDevice device;
 
   @override
+  State<_DevicePermissions> createState() => _DevicePermissionsState();
+}
+
+class _DevicePermissionsState extends State<_DevicePermissions> {
+  bool _open = false;
+
+  @override
   Widget build(BuildContext context) {
+    final device = widget.device;
     final trust = AppScope.of(context).trust;
     final theme = Theme.of(context);
+    final total = PeerBeamPermission.all.length;
+    final granted = PeerBeamPermission.all.where(device.may).length;
+    final narrowed = granted < total;
     return Padding(
       // Keyed by device id so a test — and anything else reaching for one
       // device's switches — can scope to this block. Every approved device
-      // renders the same five labels, so an unkeyed finder matches the wrong
+      // renders the same labels, so an unkeyed finder matches the wrong
       // row the moment there are two devices, which is the normal case.
       key: Key('device-permissions-${device.id}'),
       padding: const EdgeInsets.only(
@@ -749,22 +805,49 @@ class _DevicePermissions extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'What ${device.name.isEmpty ? device.id : device.name} may do',
-            style: theme.textTheme.labelLarge?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+          InkWell(
+            onTap: () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: AppSpace.xxs),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'What ${device.name.isEmpty ? device.id : device.name} '
+                      'may do · ${narrowed ? '$granted of $total' : 'all $total'} '
+                      'allowed',
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: narrowed
+                            ? theme.colorScheme.primary
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    _open
+                        ? Icons.expand_less_rounded
+                        : Icons.expand_more_rounded,
+                    size: AppIcons.sm,
+                    color: theme.colorScheme.onSurfaceVariant,
+                    semanticLabel: _open
+                        ? 'Hide permissions'
+                        : 'Show permissions',
+                  ),
+                ],
+              ),
             ),
           ),
-          for (final permission in PeerBeamPermission.all)
-            SwitchListTile.adaptive(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              title: Text(PeerBeamPermission.label(permission)),
-              subtitle: Text(PeerBeamPermission.description(permission)),
-              value: device.may(permission),
-              onChanged: (v) =>
-                  trust.setPermission(device.id, permission, granted: v),
-            ),
+          if (_open)
+            for (final permission in PeerBeamPermission.all)
+              SwitchListTile.adaptive(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(PeerBeamPermission.label(permission)),
+                subtitle: Text(PeerBeamPermission.description(permission)),
+                value: device.may(permission),
+                onChanged: (v) =>
+                    trust.setPermission(device.id, permission, granted: v),
+              ),
         ],
       ),
     );

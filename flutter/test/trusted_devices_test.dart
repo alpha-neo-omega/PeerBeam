@@ -46,6 +46,32 @@ Finder _switchFor(String deviceId, String label) => find.descendant(
   matching: find.widgetWithText(SwitchListTile, label),
 );
 
+/// Open [deviceId]'s permission block.
+///
+/// The switches collapse by default: seven of them per device, each with a
+/// sentence under it, is about a screenful per approved device, and the trusted
+/// list stopped being a list of devices at more than one or two. Every test
+/// that asserts on a switch opens the block first, which is also the user's
+/// path to it.
+Future<void> _expandPermissions(WidgetTester tester, String deviceId) async {
+  final header = find.descendant(
+    of: find.byKey(Key('device-permissions-$deviceId')),
+    matching: find.byType(InkWell),
+  );
+  expect(
+    header,
+    findsOneWidget,
+    reason: 'collapsed, so the header is the only InkWell in the block',
+  );
+  // The block may be scrolled out of view: a test that narrows one device
+  // scrolls to a *different* one, and the header is then in the tree but off
+  // screen, where a tap lands on nothing.
+  await tester.ensureVisible(header);
+  await tester.pumpAndSettle();
+  await tester.tap(header);
+  await tester.pumpAndSettle();
+}
+
 /// Open Settings with the fake's trust list loaded, and scroll the Trusted
 /// devices section into view.
 ///
@@ -224,6 +250,7 @@ void main() {
     final fake = FakePeerBeam()
       ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)];
     await _open(tester, fake, scrollTo: 'My Laptop');
+    await _expandPermissions(tester, 'pb-mine');
 
     for (final permission in PeerBeamPermission.all) {
       final label = PeerBeamPermission.label(permission);
@@ -258,6 +285,7 @@ void main() {
         ),
       ];
     await _open(tester, fake, scrollTo: 'My Laptop');
+    await _expandPermissions(tester, 'pb-mine');
 
     expect(
       tester.widget<SwitchListTile>(_switchFor('pb-mine', 'Clipboard')).value,
@@ -288,6 +316,10 @@ void main() {
         _device(id: 'pb-other', name: 'Desktop', approved: true),
       ];
     await _open(tester, fake, scrollTo: 'Desktop');
+    // Both: the assertion at the end is that flipping one device's switch left
+    // the other's alone, and a collapsed block has no switch to check.
+    await _expandPermissions(tester, 'pb-mine');
+    await _expandPermissions(tester, 'pb-other');
 
     await _flip(tester, _switchFor('pb-mine', 'Clipboard'));
 
@@ -318,6 +350,7 @@ void main() {
       ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)]
       ..trustSetPermissionError = Exception('unknown permission');
     await _open(tester, fake, scrollTo: 'My Laptop');
+    await _expandPermissions(tester, 'pb-mine');
 
     await _flip(tester, _switchFor('pb-mine', 'Pipes'));
 
@@ -328,6 +361,57 @@ void main() {
       reason:
           'a switch must never be left showing something that did not happen',
     );
+  });
+
+  testWidgets('permissions start collapsed, so a device row stays one row', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..trusted = [_device(id: 'pb-mine', name: 'My Laptop', approved: true)];
+    await _open(tester, fake, scrollTo: 'My Laptop');
+
+    // Collapsed is the point: seven switches per device is what made the list
+    // unreadable. Not one of them is built until the header is tapped.
+    for (final permission in PeerBeamPermission.all) {
+      expect(
+        _switchFor('pb-mine', PeerBeamPermission.label(permission)),
+        findsNothing,
+        reason: '${PeerBeamPermission.label(permission)} must start hidden',
+      );
+    }
+
+    await _expandPermissions(tester, 'pb-mine');
+
+    for (final permission in PeerBeamPermission.all) {
+      expect(
+        _switchFor('pb-mine', PeerBeamPermission.label(permission)),
+        findsOneWidget,
+        reason: '${PeerBeamPermission.label(permission)} must appear on expand',
+      );
+    }
+  });
+
+  testWidgets('a collapsed row still says how many permissions are allowed', (
+    tester,
+  ) async {
+    final total = PeerBeamPermission.all.length;
+    final fake = FakePeerBeam()
+      ..trusted = [
+        _device(id: 'pb-mine', name: 'My Laptop', approved: true),
+        _device(
+          id: 'pb-other',
+          name: 'Desktop',
+          approved: true,
+          // Narrowed: browse and notes withheld.
+          permissions: {'files', 'chat', 'clipboard'},
+        ),
+      ];
+    await _open(tester, fake, scrollTo: 'Desktop');
+
+    // The security-relevant fact — this device is not on the defaults — has to
+    // survive collapsing, or hiding the switches would hide the answer too.
+    expect(find.textContaining('all $total allowed'), findsOneWidget);
+    expect(find.textContaining('3 of $total allowed'), findsOneWidget);
   });
 
   testWidgets('a pinned-but-unapproved device is offered no permissions', (

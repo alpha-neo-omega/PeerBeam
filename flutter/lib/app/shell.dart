@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 
 import '../features/send/drop_zone.dart';
+import '../features/transfers/incoming_prompt.dart';
 import '../state/app_scope.dart';
 import '../sdk/error_text.dart';
 import '../state/stores.dart';
@@ -91,6 +92,17 @@ class AppShell extends StatelessWidget {
       ],
     );
 
+    // The incoming-transfer prompt hosts itself here — inside the shell, and so
+    // under the **root** navigator — because the decision it raises outranks
+    // every screen. Approval used to be offered only on Transfers and in a
+    // chat, which meant a file arriving while the user was anywhere else waited
+    // with nothing on screen to ask about it.
+    //
+    // It renders nothing of its own: it wraps the body, listens, and pushes a
+    // dialog when one is warranted. Wrapping the *body* rather than the
+    // Scaffold keeps the two layout branches below identical.
+    final watched = IncomingTransferPrompt(child: body);
+
     // Transfer badge count reacts only to the transfer store.
     Widget badgedIcon(Widget icon) => AnimatedBuilder(
       animation: state.transfer,
@@ -104,7 +116,7 @@ class AppShell extends StatelessWidget {
       return _withShortcuts(
         context,
         Scaffold(
-          body: body,
+          body: watched,
           bottomNavigationBar: NavigationBar(
             selectedIndex: index,
             onDestinationSelected: (i) => _go(context, i),
@@ -183,7 +195,7 @@ class AppShell extends StatelessWidget {
               ],
             ),
             const VerticalDivider(width: 1, thickness: 1),
-            Expanded(child: body),
+            Expanded(child: watched),
           ],
         ),
       ),
