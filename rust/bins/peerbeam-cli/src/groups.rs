@@ -207,51 +207,389 @@ fn history(ctx: &Ctx, config: &peerbeam_config::EngineConfig, id: &str) -> CliRe
     Ok(())
 }
 
-/// Everything below needs the network, and each is a thin orchestration over
-/// paths that already exist: the group layer decides *who*, and the chat layer
-/// does the sending exactly as it would for a message typed by hand.
+/// Dial one member and hand the session to `f`.
+///
+/// **One dial per member, and that is the design rather than a shortcut.** A
+/// group message is N ordinary one-to-one sends over the same routes any other
+/// message takes (A2, condition 2); there is no group connection to open,
+/// because there is no group on the wire.
+///
+/// The trust check is made against the **authenticated** peer, not the id we
+/// dialled: those differ when a route resolves to a device other than the one
+/// expected, and the permission is about who actually answered.
+async fn with_member<F>(
+    ctx: &Ctx,
+    config: &peerbeam_config::EngineConfig,
+    member: &peerbeam_domain::id::DeviceId,
+    f: F,
+) -> Result<(), CliError>
+where
+    F: for<'a> FnOnce(
+        &'a crate::session_transfer::Session,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), CliError>> + 'a>,
+    >,
+{
+    let sc = crate::commands::SecureCtx::build(config)?;
+    let devices = crate::commands::snapshot(config.clone(), 2).await?;
+    let found = devices
+        .iter()
+        .find(|d| d.device.id.to_string() == member.0)
+        .ok_or_else(|| CliError::NotFound(format!("{} is not reachable", member.0)))?;
+
+    let quic =
+        std::sync::Arc::new(peerbeam_transfer_quic::QuicTransport::new().map_err(CliError::from)?);
+    let routes = peerbeam_engine::RouteManager::new(quic.clone());
+    let session = crate::session_transfer::dial(
+        &quic,
+        &routes,
+        &found.device,
+        "group",
+        &sc.ident,
+        &sc.enc,
+        &sc.trust,
+        None,
+    )
+    .await?;
+
+    // Asked of the identity that actually answered — see the doc above.
+    let peer = peerbeam_domain::id::DeviceId::from(session.peer_id.clone());
+    if !peerbeam_chat::may_exchange_chat(sc.trust.as_ref(), &peer) {
+        ctx.line(&format!(
+            "  {}  {}",
+            ctx.dim(&peer.0),
+            ctx.dim("skipped — this device may not exchange messages")
+        ));
+        session.handle.close();
+        return Ok(());
+    }
+
+    let out = f(&session).await;
+    session.handle.close();
+    out
+}
+
+/// Offer a device a place in a group.
 async fn invite(
-    _ctx: &Ctx,
-    _store: &GroupStore,
-    _id: &str,
-    _device: &str,
-    _path_override: Option<&str>,
+    ctx: &Ctx,
+    store: &GroupStore,
+    id: &str,
+    device: &str,
+    path_override: Option<&str>,
 ) -> CliResult {
-    Err(CliError::Unavailable(
-        "group invitations need the session wiring that is not built yet".into(),
-    ))
+    let config = load_config(path_override)?;
+    let group = store.get(id).map_err(err)?;
+
+    // Resolved through discovery like any other peer reference, so a name or a
+    // prefix works here exactly as it does for `send --to`.
+    let devices = crate::commands::snapshot(config.clone(), 2).await?;
+    let candidates: Vec<(String, String)> = devices
+        .iter()
+        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+        .collect();
+    let index = crate::commands::resolve_peer(ctx, &candidates, &Some(device.to_string()))?;
+    let target = peerbeam_domain::id::DeviceId::from(devices[index].device.id.to_string());
+
+    let invite = peerbeam_groups::GroupInvite {
+        group: group.id.clone(),
+        name: group.name.clone(),
+        members: group.members.clone(),
+    };
+    let payload = serde_json::to_vec(&invite)
+        .map_err(|e| CliError::Other(format!("could not encode the invitation: {e}")))?;
+
+    with_member(ctx, &config, &target, |session| {
+        let payload = payload.clone();
+        Box::pin(async move {
+            peerbeam_chat::send_foreign(
+                &session.handle,
+                peerbeam_groups::GroupInvite::message_type(),
+                payload,
+            )
+            .await
+            .map_err(|e| CliError::Connection(e.to_string()))
+        })
+    })
+    .await?;
+
+    ctx.line(&format!("invited {} to {}", target.0, group.name));
+    // Said at the moment it becomes true, not buried in a help page: this is
+    // the disclosure the whole feature costs (A2, condition 5).
+    ctx.line(&ctx.dim(
+        "  they can see who is already in the group; everyone in it will see them if they accept",
+    ));
+    ctx.line(&ctx.dim("  nothing happens on their device until they accept"));
+    Ok(())
 }
 
+/// Accept an invitation: adopt the roster, then tell every member.
 async fn accept(
-    _ctx: &Ctx,
-    _store: &GroupStore,
-    _id: &str,
-    _path_override: Option<&str>,
+    ctx: &Ctx,
+    store: &GroupStore,
+    group: &str,
+    path_override: Option<&str>,
 ) -> CliResult {
-    Err(CliError::Unavailable(
-        "accepting an invitation needs the session wiring that is not built yet".into(),
-    ))
+    let config = load_config(path_override)?;
+    let pending = store
+        .invite(group)
+        .map_err(err)?
+        .ok_or_else(|| CliError::NotFound(format!("no pending invitation to {group}")))?;
+
+    // Adopted first, so a join that half-fails leaves this device in the group
+    // it agreed to join rather than in nothing. The members who did not hear
+    // find out when they next receive anything from here.
+    let joined = store
+        .adopt(&pending.group, &pending.name, &pending.members)
+        .map_err(err)?;
+    store.forget_invite(&pending.group).map_err(err)?;
+
+    let announce = peerbeam_groups::GroupJoined {
+        group: joined.id.clone(),
+    };
+    let payload = serde_json::to_vec(&announce)
+        .map_err(|e| CliError::Other(format!("could not encode the announcement: {e}")))?;
+
+    let mut told = 0usize;
+    for member in &pending.members {
+        let payload = payload.clone();
+        // One member being unreachable must not stop the rest being told —
+        // the same rule `space send` follows, and for the same reason.
+        match with_member(ctx, &config, member, move |session| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                peerbeam_chat::send_foreign(
+                    &session.handle,
+                    peerbeam_groups::GroupJoined::message_type(),
+                    payload,
+                )
+                .await
+                .map_err(|e| CliError::Connection(e.to_string()))
+            })
+        })
+        .await
+        {
+            Ok(()) => told += 1,
+            Err(e) => ctx.line(&format!(
+                "  {}  {}",
+                ctx.dim(&member.0),
+                ctx.dim(&e.to_string())
+            )),
+        }
+    }
+
+    ctx.line(&format!("joined {}", joined.name));
+    ctx.line(&ctx.dim(&format!(
+        "  told {told} of {} member(s); the rest find out when they next hear from you",
+        pending.members.len()
+    )));
+    Ok(())
 }
 
-async fn leave(
-    _ctx: &Ctx,
-    _store: &GroupStore,
-    _id: &str,
-    _path_override: Option<&str>,
-) -> CliResult {
-    Err(CliError::Unavailable(
-        "leaving needs the session wiring that is not built yet".into(),
-    ))
+/// Leave a group: tell the members, then forget it here.
+async fn leave(ctx: &Ctx, store: &GroupStore, id: &str, path_override: Option<&str>) -> CliResult {
+    let config = load_config(path_override)?;
+    let group = store.get(id).map_err(err)?;
+    let me_out = peerbeam_groups::GroupLeft {
+        group: group.id.clone(),
+    };
+    let payload = serde_json::to_vec(&me_out)
+        .map_err(|e| CliError::Other(format!("could not encode the message: {e}")))?;
+
+    let (live, stale) = store.reachable(&group.id).map_err(err)?;
+    for m in &stale {
+        ctx.line(&format!(
+            "  {}  {}",
+            ctx.dim(&m.0),
+            ctx.dim("not told — this device may not message it")
+        ));
+    }
+    for member in &live {
+        let payload = payload.clone();
+        if let Err(e) = with_member(ctx, &config, member, move |session| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                peerbeam_chat::send_foreign(
+                    &session.handle,
+                    peerbeam_groups::GroupLeft::message_type(),
+                    payload,
+                )
+                .await
+                .map_err(|e| CliError::Connection(e.to_string()))
+            })
+        })
+        .await
+        {
+            ctx.line(&format!(
+                "  {}  {}",
+                ctx.dim(&member.0),
+                ctx.dim(&e.to_string())
+            ));
+        }
+    }
+
+    // Forgotten regardless of who heard. Leaving is a decision about this
+    // device, and a member that never got the message keeps sending — which is
+    // what `trust revoke-permission <device> chat` is for, and is said here
+    // rather than left to be discovered.
+    store.forget(&group.id).map_err(err)?;
+    ctx.line(&format!("left {}", group.name));
+    ctx.line(
+        &ctx.dim(
+            "  a member that did not hear may keep sending; withhold `chat` from it to refuse",
+        ),
+    );
+    Ok(())
 }
 
+/// Send one message to every reachable member.
 async fn send(
-    _ctx: &Ctx,
-    _store: &GroupStore,
-    _id: &str,
-    _text: &str,
-    _path_override: Option<&str>,
+    ctx: &Ctx,
+    store: &GroupStore,
+    id: &str,
+    text: &str,
+    path_override: Option<&str>,
 ) -> CliResult {
-    Err(CliError::Unavailable(
-        "sending to a group needs the session wiring that is not built yet".into(),
-    ))
+    let config = load_config(path_override)?;
+    let group = store.get(id).map_err(err)?;
+    let (live, stale) = store.reachable(&group.id).map_err(err)?;
+
+    for m in &stale {
+        // Named, never silently dropped (A2, condition 3).
+        ctx.line(&format!(
+            "  {}  {}",
+            ctx.dim(&m.0),
+            ctx.dim("skipped — not approved, or chat withheld")
+        ));
+    }
+    if live.is_empty() {
+        return Err(CliError::Usage(format!(
+            "{} has nobody this device may message",
+            group.name
+        )));
+    }
+
+    let sc = crate::commands::SecureCtx::build(&config)?;
+    let chat = crate::commands::chat_store(&config, &sc.enc, &sc.ident);
+
+    // **One message, one id, N sends.** The id is minted once so every copy is
+    // the same message — that is what lets `group_history` show it once instead
+    // of once per member.
+    let mut msg =
+        peerbeam_chat::ChatMessage::new(text).map_err(|e| CliError::Usage(e.to_string()))?;
+    msg.group = Some(group.id.clone());
+
+    let mut sent = 0usize;
+    for member in &live {
+        // Queued first, so an unreachable member's copy is delivered later by a
+        // running host rather than lost — the same path a one-to-one message
+        // takes, because that is exactly what this is.
+        chat.enqueue(member, &msg)
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        let flushed = with_member(ctx, &config, member, |session| {
+            let chat = chat.clone();
+            Box::pin(async move {
+                peerbeam_chat::flush_to_session(
+                    &session.handle,
+                    &chat,
+                    &session.peer_id.clone().into(),
+                )
+                .await
+                .map_err(|e| CliError::Connection(e.to_string()))
+                .map(|_| ())
+            })
+        })
+        .await;
+        match flushed {
+            Ok(()) => sent += 1,
+            Err(e) => ctx.line(&format!(
+                "  {}  {}",
+                ctx.dim(&member.0),
+                ctx.dim(&e.to_string())
+            )),
+        }
+    }
+
+    ctx.line(&format!("sent to {sent} of {} member(s)", live.len()));
+    if sent < live.len() {
+        ctx.line(&ctx.dim("  the rest are queued and go out when they are reachable"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerbeam_domain::id::DeviceId;
+    use std::sync::Arc;
+
+    /// A group store over a real encrypted `AppStore`, with nothing trusted —
+    /// `resolve` never asks the trust question, so the answer does not matter
+    /// here and a fixture that pretended otherwise would be noise.
+    fn store() -> (GroupStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> =
+            Arc::new(peerbeam_crypto::AeadCrypto::new());
+        let key = peerbeam_crypto::derive_subkey(&[3u8; 32], b"peerbeam-appstore-v1");
+        let app: Arc<dyn peerbeam_domain::port::AppStore> = Arc::new(
+            peerbeam_appstore_fs::FsAppStore::open(dir.path().join("appstore"), key, enc),
+        );
+        let trust: Arc<dyn peerbeam_domain::port::TrustStore> =
+            Arc::new(peerbeam_trust_fs::FsTrust::open(dir.path().join("trust.json")).unwrap());
+        (GroupStore::new(app, trust, DeviceId::from("pb-me")), dir)
+    }
+
+    /// The ladder: exact id, then exact name, then unique prefix — the same one
+    /// `send --to` and `trust approve` climb.
+    #[test]
+    fn a_group_resolves_by_id_then_name_then_prefix() {
+        let (store, _dir) = store();
+        let trip = store.create("Work Trip").unwrap();
+        store.create("Holiday").unwrap();
+
+        assert_eq!(resolve(&store, &trip.id).unwrap(), trip.id);
+        assert_eq!(resolve(&store, "Work Trip").unwrap(), trip.id);
+        // Case and spacing are forgiving, exactly as they are for the name rule.
+        assert_eq!(resolve(&store, "  work   trip ").unwrap(), trip.id);
+        assert_eq!(resolve(&store, "Work").unwrap(), trip.id);
+    }
+
+    /// **An ambiguous name is named, never guessed.** Acting on the wrong group
+    /// is not a private mistake — the message goes to other people.
+    #[test]
+    fn an_ambiguous_prefix_lists_the_candidates_instead_of_choosing() {
+        let (store, _dir) = store();
+        store.create("Work Trip").unwrap();
+        store.create("Work Party").unwrap();
+
+        let err = resolve(&store, "Work").expect_err("two matches must not be guessed between");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Work Trip"),
+            "the candidates are not named: {msg}"
+        );
+        assert!(
+            msg.contains("Work Party"),
+            "the candidates are not named: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_matches_nothing_is_not_found() {
+        let (store, _dir) = store();
+        store.create("Work Trip").unwrap();
+        assert!(matches!(
+            resolve(&store, "Holiday"),
+            Err(CliError::NotFound(_))
+        ));
+    }
+
+    /// An exact name wins over a prefix that also matches it, so a group called
+    /// "Work" is reachable even when "Work Trip" exists.
+    #[test]
+    fn an_exact_name_beats_a_longer_one_it_prefixes() {
+        let (store, _dir) = store();
+        let work = store.create("Work").unwrap();
+        store.create("Work Trip").unwrap();
+        assert_eq!(resolve(&store, "Work").unwrap(), work.id);
+    }
 }
