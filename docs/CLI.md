@@ -75,6 +75,54 @@ Working now:
   Space reaches any peer, so **no member learns who else is in it**. A member this
   device no longer trusts is named and skipped, never silently dropped. Every
   command takes a Space by name or id. See [SPACES.md](SPACES.md).
+- `group list|create|rename|invite|accept|leave|send|history` — conversations a
+  set of devices share. **Not a Space**, and the difference is the whole point:
+  a Space is a private label nobody else learns, while in a Group **every member
+  learns every other member**. That disclosure cannot be withdrawn once made.
+
+  There is no server and no host. Every member holds the roster, nobody is asked
+  for it, and a message is N ordinary one-to-one sends — each through the same
+  per-device `chat` permission a hand-addressed message passes. Permitted by
+  amendment A2 in [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md);
+  the full picture is in [GROUPS.md](GROUPS.md).
+
+  ```bash
+  peerbeam group create "Work Trip"
+  peerbeam group invite "Work Trip" alices-laptop
+  peerbeam group invite "Work Trip" --addr 100.64.0.7:51000   # reachable, not discovered
+
+  peerbeam group list              # groups, and invitations waiting for an answer
+  peerbeam group accept <GROUP-ID> # join, and tell the members
+  peerbeam group send "Work Trip" "six works for me"
+  peerbeam group history "Work Trip"
+  peerbeam group leave "Work Trip"
+  ```
+
+  `<GROUP>` resolves by exact id, then exact name, then unique name prefix — the
+  same ladder `send --to` and `trust approve` climb. An ambiguous name is
+  refused with the candidates named rather than guessed between: acting on the
+  wrong group is not a private mistake, because the message reaches other
+  people.
+
+  **Creating a group adds nobody.** Members are invited and join when *they*
+  accept; there is deliberately no way to put somebody else's device into a
+  group they never agreed to. An invitation is an offer — it shows up in the
+  invitee's `group list` and changes nothing until they run `group accept`.
+  Ignoring one is local and silent: the inviter is not told.
+
+  **Members you can no longer message are named, not hidden** — when you list,
+  when you send, and when you leave. `group send` reports how many copies were
+  queued; an unreachable member's copy is delivered by the same drain a
+  one-to-one message uses, because that is exactly what each copy is.
+
+  **Leaving is advisory.** Your device forgets the group and stops sending, and
+  the members are told — but one that misses the message can keep sending to
+  you. To refuse it, withhold the permission from that device:
+  `peerbeam trust revoke-permission <device> chat`.
+
+  **Names are local.** `group rename` renames on this device only: agreeing on
+  one name would need a device to arbitrate simultaneous renames, and that
+  device would be a hub.
 - `trust mine <DEVICE> [--no]` and `trust my-devices` — mark which machines are
   yours, and list them. A label kept on this device: it grants nothing, widens no
   permission, and the device is never told.

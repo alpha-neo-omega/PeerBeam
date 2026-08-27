@@ -88,7 +88,8 @@ them who else you sent to — that disclosure is yours to make, not PeerBeam's.
 > local, rosterless, unsynced and invisible to peers; it is not a Group, is
 > never converted into one, and its fan-out send is not renamed "group chat".
 > Choose a Space when nobody should learn who else received it, and a Group when
-> everyone is meant to.
+> everyone is meant to. Groups are documented in [GROUPS.md](GROUPS.md), which
+> opens with a table for exactly that choice.
 
 ---
 

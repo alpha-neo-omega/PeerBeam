@@ -671,7 +671,13 @@ async fn establish(
     let mut handlers: Vec<Arc<dyn MessageHandler>> = Vec::new();
     let mut peer_slot: Option<Arc<OnceLock<DeviceId>>> = None;
     if let Some((store, sink)) = chat {
-        let (h, slot) = ChatHandler::new(store, sink);
+        // Group frames ride this channel, so they arrive through this handler
+        // or not at all — see `crate::groups_sync` for why the store is a
+        // process-global rather than another argument here.
+        let (h, slot) = match crate::groups_sync::sink() {
+            Some(foreign) => ChatHandler::with_foreign(store, sink, foreign),
+            None => ChatHandler::new(store, sink),
+        };
         peer_slot = Some(slot);
         handlers.push(h as Arc<dyn MessageHandler>);
     }

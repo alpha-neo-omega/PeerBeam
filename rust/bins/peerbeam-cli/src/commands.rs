@@ -31,6 +31,16 @@ use crate::output::Ctx;
 use crate::{history, prompt, resolve};
 
 pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> CliResult {
+    // Make this process able to *receive* group membership frames before any
+    // session can be built. Best-effort: a config that cannot be read is a
+    // problem the command itself will report far better than a wiring step
+    // could, and a process with no group store simply ignores group frames —
+    // exactly as every build before groups did.
+    if let Ok(config) = load_config(cfg_override.as_deref()) {
+        if let Ok(store) = group_store(&config) {
+            crate::groups_sync::install(store);
+        }
+    }
     match cmd {
         Command::Config(a) => config(ctx, a, cfg_override.as_deref()),
         Command::Doctor => doctor(ctx, cfg_override.as_deref()),

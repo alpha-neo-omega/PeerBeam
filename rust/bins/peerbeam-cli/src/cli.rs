@@ -876,9 +876,17 @@ pub enum GroupAction {
         /// The group, by name or id.
         #[arg(value_name = "GROUP")]
         group: String,
-        /// Device id, name, or unambiguous name prefix.
+        /// Device id, name, or unambiguous name prefix, as `list` shows it.
         #[arg(value_name = "DEVICE")]
-        device: String,
+        device: Option<String>,
+        /// Reach the device directly at `HOST:PORT` instead of finding it.
+        ///
+        /// For a peer this machine can reach but has not discovered — across a
+        /// VPN or a routed subnet, where discovery broadcasts do not travel but
+        /// the address is known. The same escape hatch `send` and `chat send`
+        /// offer, and it exists for the same reason.
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "device")]
+        addr: Option<String>,
     },
     /// Accept an invitation, by the group id it named.
     ///

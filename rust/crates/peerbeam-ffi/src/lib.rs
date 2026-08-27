@@ -16,6 +16,7 @@ mod clipboard;
 mod dto;
 mod error;
 mod events;
+mod groups_sync;
 mod hook;
 mod logs;
 mod notes_sync;

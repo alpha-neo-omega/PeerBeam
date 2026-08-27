@@ -9,6 +9,7 @@ pub mod commands;
 pub mod engine;
 pub mod exit;
 pub mod groups;
+pub mod groups_sync;
 pub mod history;
 pub mod logs;
 pub mod notes;

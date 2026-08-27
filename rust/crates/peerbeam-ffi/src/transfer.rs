@@ -918,6 +918,12 @@ impl Manager {
     }
 
     #[must_use]
+    /// The group store, for the session wiring that applies inbound membership
+    /// frames — see `crate::groups_sync`.
+    pub fn group_store(&self) -> peerbeam_groups::GroupStore {
+        self.groups.clone()
+    }
+
     pub fn trust_store(&self) -> Arc<FsTrust> {
         self.trust.clone()
     }
@@ -6413,7 +6419,7 @@ fn emit_peer(id: &str, stats: &Arc<Mutex<Stats>>, peer_bytes: u64) {
 
 // ── helpers ─────────────────────────────────────────────────────
 
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 

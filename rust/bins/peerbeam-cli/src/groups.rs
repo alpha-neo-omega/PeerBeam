@@ -36,9 +36,13 @@ pub async fn group(ctx: &Ctx, action: GroupAction, path_override: Option<&str>) 
             let id = resolve(&store, &group)?;
             rename(ctx, &store, &id, &name)
         }
-        GroupAction::Invite { group, device } => {
+        GroupAction::Invite {
+            group,
+            device,
+            addr,
+        } => {
             let id = resolve(&store, &group)?;
-            invite(ctx, &store, &id, &device, path_override).await
+            invite(ctx, &store, &id, device, addr, path_override).await
         }
         GroupAction::Accept { group } => accept(ctx, &store, &group, path_override).await,
         GroupAction::Leave { group } => {
@@ -105,7 +109,23 @@ fn err(e: GroupError) -> CliError {
 
 fn list(ctx: &Ctx, store: &GroupStore) -> CliResult {
     let groups = store.list().map_err(err)?;
+    // **Invitations are listed too.** They are the only way into a group, so a
+    // listing that showed memberships alone would leave an offer that arrived
+    // while nothing was running permanently invisible — there is no other
+    // command that would surface it. Kept in their own section, and their own
+    // JSON event, because holding an offer is not being in a group.
+    let invites = store.invites().map_err(err)?;
     if ctx.json {
+        for i in &invites {
+            ctx.json_line(&serde_json::json!({
+                "event": "group_invite",
+                "group": i.group,
+                "name": i.name,
+                "from": i.from.0,
+                "members": i.members.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+                "at": i.at,
+            }));
+        }
         for g in &groups {
             let (live, stale) = store.reachable(&g.id).map_err(err)?;
             ctx.json_line(&serde_json::json!({
@@ -119,8 +139,28 @@ fn list(ctx: &Ctx, store: &GroupStore) -> CliResult {
         }
         return Ok(());
     }
+    if !invites.is_empty() {
+        ctx.line(&ctx.bold("Invitations"));
+        for i in &invites {
+            ctx.line(&format!("  {}  {}", i.name, ctx.dim(&i.group)));
+            // The disclosure, stated where the offer is read — the same
+            // sentence the app's join dialog carries, for the same reason.
+            ctx.line(&ctx.dim(&format!(
+                "    from {} · {} device(s) inside; joining shows them yours",
+                i.from.0,
+                i.members.len()
+            )));
+            ctx.line(&ctx.dim(&format!(
+                "    `peerbeam group accept {}` to join",
+                i.group
+            )));
+        }
+        ctx.line("");
+    }
     if groups.is_empty() {
-        ctx.line(&ctx.dim("no groups yet — `peerbeam group create <name>` starts one"));
+        if invites.is_empty() {
+            ctx.line(&ctx.dim("no groups yet — `peerbeam group create <name>` starts one"));
+        }
         return Ok(());
     }
     for g in &groups {
@@ -230,20 +270,39 @@ where
         Box<dyn std::future::Future<Output = Result<(), CliError>> + 'a>,
     >,
 {
-    let sc = crate::commands::SecureCtx::build(config)?;
     let devices = crate::commands::snapshot(config.clone(), 2).await?;
     let found = devices
         .iter()
         .find(|d| d.device.id.to_string() == member.0)
         .ok_or_else(|| CliError::NotFound(format!("{} is not reachable", member.0)))?;
+    with_device(ctx, config, &found.device, f).await
+}
 
+/// [`with_member`], for a caller that already holds the device.
+///
+/// `--addr` names a peer discovery has never seen, so there is nothing to look
+/// up — and looking anyway would refuse exactly the case that flag exists for.
+async fn with_device<F>(
+    ctx: &Ctx,
+    config: &peerbeam_config::EngineConfig,
+    found: &peerbeam_domain::entity::Device,
+    f: F,
+) -> Result<(), CliError>
+where
+    F: for<'a> FnOnce(
+        &'a crate::session_transfer::Session,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), CliError>> + 'a>,
+    >,
+{
+    let sc = crate::commands::SecureCtx::build(config)?;
     let quic =
         std::sync::Arc::new(peerbeam_transfer_quic::QuicTransport::new().map_err(CliError::from)?);
     let routes = peerbeam_engine::RouteManager::new(quic.clone());
     let session = crate::session_transfer::dial(
         &quic,
         &routes,
-        &found.device,
+        found,
         "group",
         &sc.ident,
         &sc.enc,
@@ -274,21 +333,28 @@ async fn invite(
     ctx: &Ctx,
     store: &GroupStore,
     id: &str,
-    device: &str,
+    device: Option<String>,
+    addr: Option<String>,
     path_override: Option<&str>,
 ) -> CliResult {
     let config = load_config(path_override)?;
     let group = store.get(id).map_err(err)?;
 
-    // Resolved through discovery like any other peer reference, so a name or a
-    // prefix works here exactly as it does for `send --to`.
-    let devices = crate::commands::snapshot(config.clone(), 2).await?;
-    let candidates: Vec<(String, String)> = devices
-        .iter()
-        .map(|m| (m.device.id.to_string(), m.device.name.clone()))
-        .collect();
-    let index = crate::commands::resolve_peer(ctx, &candidates, &Some(device.to_string()))?;
-    let target = peerbeam_domain::id::DeviceId::from(devices[index].device.id.to_string());
+    // `--addr` or discovery, resolved exactly as `send` and `chat send` do so
+    // one rule is learned once.
+    let peer = if let Some(addr) = &addr {
+        let sa = crate::commands::resolve_addr(addr)?;
+        crate::commands::target_device(addr.clone(), sa.ip().to_string(), sa.port())
+    } else {
+        let devices = crate::commands::snapshot(config.clone(), 2).await?;
+        let candidates: Vec<(String, String)> = devices
+            .iter()
+            .map(|m| (m.device.id.to_string(), m.device.name.clone()))
+            .collect();
+        let index = crate::commands::resolve_peer(ctx, &candidates, &device)?;
+        devices[index].device.clone()
+    };
+    let target = peer.id.clone();
 
     let invite = peerbeam_groups::GroupInvite {
         group: group.id.clone(),
@@ -298,7 +364,7 @@ async fn invite(
     let payload = serde_json::to_vec(&invite)
         .map_err(|e| CliError::Other(format!("could not encode the invitation: {e}")))?;
 
-    with_member(ctx, &config, &target, |session| {
+    with_device(ctx, &config, &peer, |session| {
         let payload = payload.clone();
         Box::pin(async move {
             peerbeam_chat::send_foreign(

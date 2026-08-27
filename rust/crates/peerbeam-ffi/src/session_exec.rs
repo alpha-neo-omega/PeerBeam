@@ -844,7 +844,17 @@ async fn establish(
     let mut handlers: Vec<Arc<dyn MessageHandler>> = Vec::new();
     let mut peer_slot: Option<Arc<OnceLock<DeviceId>>> = None;
     if let Some(w) = chat {
-        let (h, slot) = ChatHandler::new(w.store, w.sink);
+        // Group membership frames ride the Chat channel, so they arrive through
+        // the chat handler or not at all — a session maps one handler per
+        // channel. The sink is read from the running engine rather than passed
+        // in, for the reason the notes wiring below gives: an argument is one
+        // more thing a call site can forget, and a dropped group frame is
+        // silent. That is not hypothetical — the first cut of groups forwarded
+        // nothing, so every invitation that arrived was discarded.
+        let (h, slot) = match crate::groups_sync::sink() {
+            Some(foreign) => ChatHandler::with_foreign(w.store, w.sink, foreign),
+            None => ChatHandler::new(w.store, w.sink),
+        };
         peer_slot = Some(slot);
         handlers.push(h as Arc<dyn MessageHandler>);
     }
