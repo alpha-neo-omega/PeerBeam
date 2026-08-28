@@ -51,26 +51,60 @@ jobs:
       - name: Test
         run: flutter test
 
-  # **Android still has no CI, and that is a real gap.** It builds only on a
-  # release tag, so every Android defect this project has found was found by
-  # reading the code — the SAF main-thread copy, the sandbox temp path, the
-  # missing battery hook, the service cap. Eighteen Kotlin unit tests exist and
-  # run nowhere.
+  # Android's Kotlin unit tests, which for a long time ran nowhere: every
+  # Android defect this project found was found by reading the code.
   #
-  # Two attempts at a cheap job failed, and both reasons are recorded so the
-  # next attempt starts past them rather than repeating them:
+  # This job is deliberately NOT a full Android build. Compiling the engine for
+  # Android needs the NDK (`ring` runs a C build script even for `cargo check`)
+  # and takes many minutes; the release workflow already does that on a tag.
+  # What was missing was any check at all on the Kotlin, and these tests are
+  # cheap.
   #
-  # 1. Compiling the engine (`cargo check --target aarch64-linux-android`) needs
-  #    the NDK, because `ring` has a C build script that runs even for `check`.
-  # 2. Running the tests with `./gradlew` fails with exit 127: Flutter's Android
-  #    template `.gitignore`s `/gradlew`, so a fresh checkout has the wrapper
-  #    *properties* but not the script. `scripts/package-android.sh` never hits
-  #    this because it goes through `flutter build apk`, which provisions its
-  #    own Gradle.
+  # Two earlier attempts failed, and both reasons are handled explicitly below
+  # rather than left to be rediscovered:
   #
-  # So the workable shapes are `flutter build apk --debug` (slow, but proven on
-  # the release path) or provisioning Gradle explicitly. Neither was worth
-  # landing untested after the first one broke every push.
+  # 1. `./gradlew` is exit 127 on a fresh checkout — Flutter's Android template
+  #    `.gitignore`s `/gradlew`, so the wrapper *properties* are committed and
+  #    the script is not. It is generated here from those properties.
+  # 2. `flutter pub get` alone does not write `android/local.properties`, which
+  #    Flutter's `settings.gradle.kts` reads for `flutter.sdk`. `--config-only`
+  #    writes it without building anything.
+  #
+  # Scoped to `:app:` on purpose: a bare `testDebugUnitTest` also builds the
+  # unit tests of every plugin, and `mobile_scanner`'s do not compile. That is
+  # a third-party module's problem and not something this repository should
+  # fail on.
+  android:
+    name: Android (kotlin tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Resolve plugins
+        run: cd flutter && flutter pub get
+      - name: Write local.properties (no build)
+        run: cd flutter && flutter build apk --config-only
+      - name: Generate the Gradle wrapper
+        # The template gitignores it; the properties are committed, so this
+        # produces exactly the version the project pins.
+        run: cd flutter/android && gradle wrapper
+      - name: Kotlin unit tests
+        run: cd flutter/android && ./gradlew :app:testDebugUnitTest --console=plain
+      - name: Publish results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-results
+          path: flutter/build/app/test-results/**/*.xml
+          if-no-files-found: warn
 
   # Cross-platform proof: the Rust engine and the desktop app must build (and
   # the engine's tests pass) on every desktop OS. Intel macOS is covered from
