@@ -653,6 +653,13 @@ class ChatMessage {
   /// orphan rather than being quoted from somewhere else.
   final String? inReplyTo;
 
+  /// The group this message belongs to, or null for a one-to-one message.
+  ///
+  /// Group rows are deliberately excluded from per-peer history, so without
+  /// this a group message that arrived live was invisible everywhere until the
+  /// group's transcript was read again.
+  final String? group;
+
   const ChatMessage({
     required this.id,
     required this.peerId,
@@ -667,6 +674,7 @@ class ChatMessage {
     this.reactions = const [],
     this.readAt,
     this.inReplyTo,
+    this.group,
   });
 
   bool get isMine => direction == 'out';
@@ -707,6 +715,7 @@ class ChatMessage {
           const [],
       readAt: DateTime.tryParse(j['read_at'] as String? ?? ''),
       inReplyTo: j['in_reply_to'] as String?,
+          group: j['group'] as String?,
     );
   }
 

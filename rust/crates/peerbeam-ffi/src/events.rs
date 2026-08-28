@@ -107,6 +107,15 @@ pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
         // which is also why a parent that has gone renders as an orphan rather
         // than being quoted from somewhere else.
         "in_reply_to": rec.in_reply_to,
+        // The group this message belongs to, or null for an ordinary
+        // one-to-one message.
+        //
+        // Without it a surface could not tell the two apart, and group rows are
+        // deliberately excluded from per-peer history — so a group message that
+        // arrived live appeared nowhere at all until the group's transcript was
+        // re-read. Additive: a consumer that ignores the field sees exactly
+        // what it saw before.
+        "group": rec.group,
     })
 }
 

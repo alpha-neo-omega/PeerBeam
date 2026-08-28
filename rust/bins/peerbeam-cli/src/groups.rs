@@ -259,7 +259,7 @@ async fn with_member<F>(
     config: &peerbeam_config::EngineConfig,
     member: &peerbeam_domain::id::DeviceId,
     f: F,
-) -> Result<(), CliError>
+) -> Result<bool, CliError>
 where
     F: for<'a> FnOnce(
         &'a crate::session_transfer::Session,
@@ -279,12 +279,16 @@ where
 ///
 /// `--addr` names a peer discovery has never seen, so there is nothing to look
 /// up — and looking anyway would refuse exactly the case that flag exists for.
+/// Returns whether the message actually went. `Ok(false)` means the device was
+/// **skipped** by its `chat` permission — not an error, and not a delivery
+/// either. Returning `Ok(())` for both made every caller count a skipped member
+/// as told, one line below the "skipped" notice it had just printed.
 async fn with_device<F>(
     ctx: &Ctx,
     config: &peerbeam_config::EngineConfig,
     found: &peerbeam_domain::entity::Device,
     f: F,
-) -> Result<(), CliError>
+) -> Result<bool, CliError>
 where
     F: for<'a> FnOnce(
         &'a crate::session_transfer::Session,
@@ -310,7 +314,7 @@ where
             ctx.dim("skipped — this device may not exchange messages")
         ));
         session.close().await;
-        return Ok(());
+        return Ok(false);
     }
 
     let out = f(&session).await;
@@ -327,7 +331,7 @@ where
     // sites — and groups did not, because `Session::close` consumes `self`
     // while `f` borrows it, and the bare handle was the shape that compiled.
     session.close().await;
-    out
+    out.map(|()| true)
 }
 
 /// Offer a device a place in a group.
@@ -366,7 +370,7 @@ async fn invite(
     let payload = serde_json::to_vec(&invite)
         .map_err(|e| CliError::Other(format!("could not encode the invitation: {e}")))?;
 
-    with_device(ctx, &config, &peer, |session| {
+    let went = with_device(ctx, &config, &peer, |session| {
         let payload = payload.clone();
         Box::pin(async move {
             peerbeam_chat::send_foreign(
@@ -379,6 +383,13 @@ async fn invite(
         })
     })
     .await?;
+
+    // `with_device` answers `false` when the device may not be messaged, and it
+    // has already said so. Claiming "invited" on top of that would contradict
+    // the line above it.
+    if !went {
+        return Ok(());
+    }
 
     ctx.line(&format!("invited {} to {}", target.0, group.name));
     // Said at the moment it becomes true, not buried in a help page: this is
@@ -418,6 +429,7 @@ async fn accept(
         .map_err(|e| CliError::Other(format!("could not encode the announcement: {e}")))?;
 
     let mut told = 0usize;
+    let mut skipped = 0usize;
     for member in &pending.members {
         let payload = payload.clone();
         // One member being unreachable must not stop the rest being told —
@@ -436,7 +448,11 @@ async fn accept(
         })
         .await
         {
-            Ok(()) => told += 1,
+            // Only a delivery counts. `Ok(false)` is a member skipped by its
+            // `chat` permission, which `with_device` has already named — and
+            // which used to be counted here as told.
+            Ok(true) => told += 1,
+            Ok(false) => skipped += 1,
             Err(e) => ctx.line(&format!(
                 "  {}  {}",
                 ctx.dim(&member.0),
@@ -450,6 +466,11 @@ async fn accept(
         "  told {told} of {} member(s); the rest find out when they next hear from you",
         pending.members.len()
     )));
+    if skipped > 0 {
+        ctx.line(&ctx.dim(&format!(
+            "  {skipped} may not be messaged from here and were not told"
+        )));
+    }
     Ok(())
 }
 
@@ -547,6 +568,7 @@ async fn send(
     msg.group = Some(group.id.clone());
 
     let mut sent = 0usize;
+    let mut skipped = 0usize;
     for member in &live {
         // Queued first, so an unreachable member's copy is delivered later by a
         // running host rather than lost — the same path a one-to-one message
@@ -568,7 +590,8 @@ async fn send(
         })
         .await;
         match flushed {
-            Ok(()) => sent += 1,
+            Ok(true) => sent += 1,
+            Ok(false) => skipped += 1,
             Err(e) => ctx.line(&format!(
                 "  {}  {}",
                 ctx.dim(&member.0),
@@ -578,7 +601,12 @@ async fn send(
     }
 
     ctx.line(&format!("sent to {sent} of {} member(s)", live.len()));
-    if sent < live.len() {
+    if skipped > 0 {
+        ctx.line(&ctx.dim(&format!(
+            "  {skipped} may not be messaged from here and were skipped"
+        )));
+    }
+    if sent + skipped < live.len() {
         ctx.line(&ctx.dim("  the rest are queued and go out when they are reachable"));
     }
     Ok(())

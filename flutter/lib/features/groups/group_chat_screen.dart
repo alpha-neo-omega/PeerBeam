@@ -17,9 +17,12 @@
 // — the message did reach the rest, so reporting a failure would be wrong, and
 // reporting nothing would be worse.
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../app/theme.dart';
+import '../../sdk/events.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
@@ -44,6 +47,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   bool _sending = false;
 
   bool _started = false;
+  StreamSubscription<BridgeEvent>? _events;
 
   // `didChangeDependencies`, not `initState`: `AppScope.of` establishes an
   // inherited-widget dependency, which Flutter forbids before `initState`
@@ -54,10 +58,22 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (_started) return;
     _started = true;
     _load();
+
+    // **Live, not only on open.** A group row is excluded from per-peer
+    // history by design, so before the event carried its group there was
+    // nowhere an arriving group message could show up at all. Listening here
+    // is what makes a reply appear while the thread is on screen.
+    final api = AppScope.of(context).api;
+    _events = api?.events.listen((e) {
+      if (e is ChatReceived && e.message.group == widget.group.id) {
+        _load();
+      }
+    });
   }
 
   @override
   void dispose() {
+    _events?.cancel();
     _composer.dispose();
     _scroll.dispose();
     super.dispose();

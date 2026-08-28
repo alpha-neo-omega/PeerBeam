@@ -11,6 +11,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/features/groups/groups_screen.dart';
 import 'package:peerbeam/features/groups/join_dialog.dart';
+import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
@@ -282,5 +283,59 @@ void main() {
       // device the engine would refuse.
       expect(find.textContaining('has to see a trusted device'), findsOneWidget);
     });
+  });
+
+  /// **A group row is excluded from per-peer history by design**, so before the
+  /// engine's event carried its group there was nowhere an arriving group
+  /// message could appear. This is the test that the thread is live.
+  testWidgets('a message that arrives while the thread is open shows up', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()
+      ..groupsList = [
+        const Group(
+          id: 'g-1',
+          name: 'Work Trip',
+          members: ['pb-me', 'pb-bob'],
+          reachable: ['pb-bob'],
+          unreachable: [],
+        ),
+      ];
+    await _open(tester, fake);
+    await tester.tap(find.byKey(const Key('open-g-1')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.text('six works for me'), findsNothing);
+
+    // The engine delivers a group message the way it really does.
+    fake.groupMessages = [
+      ChatMessage(
+        id: 'm-1',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: 'six works for me',
+        at: DateTime.utc(2026, 8, 28),
+        status: 'received',
+        group: 'g-1',
+      ),
+    ];
+    fake.emit(
+      ChatReceived(
+        ChatMessage(
+          id: 'm-1',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: 'six works for me',
+          at: DateTime.utc(2026, 8, 28),
+          status: 'received',
+          group: 'g-1',
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.text('six works for me'), findsOneWidget);
   });
 }
