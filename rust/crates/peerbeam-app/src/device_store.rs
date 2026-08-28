@@ -40,6 +40,12 @@ struct Entry {
 }
 
 /// Tracks all known devices and turns provider events into [`DeviceChange`]s.
+/// The most devices this store will hold at once.
+///
+/// Generous for any real network — a large office sees tens — and small enough
+/// that an unauthenticated flood cannot exhaust memory. See `upsert`.
+const MAX_DEVICES: usize = 512;
+
 pub struct DeviceStore {
     /// Capabilities of each registered provider, for deriving reachability.
     provider_caps: HashMap<ProviderId, DiscoveryCaps>,
@@ -69,8 +75,32 @@ impl DeviceStore {
     fn upsert(&mut self, provider: &ProviderId, device: Device) -> Vec<DeviceChange> {
         let id = device.id.clone();
         let last_seen = device.last_seen;
+        // Read before the mutable borrow below.
+        let full = self.devices.len() >= MAX_DEVICES;
 
         match self.devices.get_mut(&id) {
+            None if full => {
+                // **A new id from a full table is dropped, not admitted.**
+                //
+                // A UDP announce is unauthenticated: anything on the LAN can
+                // send one, with any `id` it likes and no handshake, and every
+                // fresh id used to become a resident entry here. The UDP
+                // provider expires its own view after a few seconds, but this
+                // store keeps a device for `PRUNE_TTL` after it goes offline —
+                // so a few thousand packets a second became millions of live
+                // entries, each holding a peer-chosen name.
+                //
+                // Dropping is the right failure: the devices already here are
+                // the ones the user can actually see and act on, and a flood
+                // must not push them out. Real devices arriving during a flood
+                // are lost until it stops, which is the lesser harm and is at
+                // least self-correcting.
+                // No `tracing` in this crate, and adding a dependency for one
+                // line is not worth it: the cap is visible in the code and the
+                // consequence — a device that does not appear — is what the
+                // user sees.
+                Vec::new()
+            }
             None => {
                 let mut providers = HashSet::new();
                 providers.insert(provider.clone());
@@ -352,6 +382,29 @@ fn merge(existing: &Device, incoming: &Device, take_identity: bool) -> Device {
 
 #[cfg(test)]
 mod tests {
+
+    /// **An unauthenticated flood must not push out the real devices.**
+    ///
+    /// A UDP announce needs no handshake, so anything on the LAN can mint ids;
+    /// each one used to become a resident entry held for `PRUNE_TTL` past going
+    /// offline.
+    #[test]
+    fn a_flood_of_new_ids_cannot_grow_the_list_without_bound() {
+        let mut store = DeviceStore::new(HashMap::new());
+        let provider = ProviderId::from("udp");
+
+        for i in 0..(MAX_DEVICES * 3) {
+            store.observe(
+                &provider,
+                DiscoveryEvent::Found(device(&format!("pb-flood-{i:06}"), "flood", "10.0.0.9")),
+            );
+        }
+        assert!(
+            store.devices.len() <= MAX_DEVICES,
+            "the table is capped, not unbounded: {} entries",
+            store.devices.len()
+        );
+    }
     use super::*;
     use peerbeam_domain::entity::{DeviceType, Platform};
 

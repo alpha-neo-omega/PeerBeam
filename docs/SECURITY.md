@@ -880,12 +880,27 @@ A permission is checked where the code can enforce it, and the two file-shaped
 ones are not symmetric. Worth stating plainly, because a switch whose scope is
 guessed at is a switch people trust wrongly:
 
-- **Files** — enforced in **both** directions. Inbound, `admit_transfer` refuses
-  an approved device whose `files` was turned off. Outbound, `permit_send_files`
-  refuses the same device before a path is validated. Neither refuses a
-  *merely pinned* peer: sending to a device you have just discovered has never
-  required approval, and gating it on `may` (which implies approval) would break
-  the app's primary flow.
+- **Files** — enforced in **both** directions **by the app**. Inbound,
+  `admit_transfer` refuses an approved device whose `files` was turned off.
+  Outbound, `permit_send_files` refuses the same device before a path is
+  validated. Neither refuses a *merely pinned* peer: sending to a device you
+  have just discovered has never required approval, and gating it on `may`
+  (which implies approval) would break the app's primary flow.
+
+  **The CLI does not enforce it, in either direction.** `peerbeam receive` and
+  `peerbeam daemon` reach `receive_on_channel` with no admission gate, and the
+  send path calls no outbound check — both functions live in `peerbeam-ffi` and
+  `bins/` calls neither. So revoking `files` from a device changes nothing about
+  what the CLI accepts from it or sends to it.
+
+  This section previously said "enforced in **both** directions" without
+  qualification, which was true of the app and false of the CLI —
+  [CLI.md](CLI.md) has always documented that CLI receive accepts files from any
+  authenticated peer. The gap is real and is recorded rather than papered over:
+  a headless receiver has nobody to answer a prompt, so the fix is not simply
+  calling the app's gate, and shipping a half-applied version of it would turn
+  "accepts everything" into "accepts nothing" for exactly the deployments that
+  cannot notice.
 - **Messages** — enforced on **sending only**. Revoking it means this device
   will not message that one; it does not stop that device messaging here. Chat
   has never required approval to receive, and the inbound path would need the

@@ -160,6 +160,7 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<void> historyClear() async {
+    _maybeFail('historyClear');
     historyEntries = [];
   }
 

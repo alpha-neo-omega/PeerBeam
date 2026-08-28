@@ -164,6 +164,10 @@ pub(crate) async fn claim_destination(
     Ok((free, free_part, claim))
 }
 
+/// How long the receiver waits for the sender to hang up after the final
+/// `Verify`, so that frame is delivered rather than discarded by our own close.
+const VERIFY_DRAIN: Duration = Duration::from_secs(5);
+
 /// Base backoff between retry attempts (grows linearly with attempts).
 const RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -473,13 +477,17 @@ pub async fn receive_file(
                 }
                 FrameKind::Control => match parse_control(&frame)? {
                     Control::Complete { checksum } => {
+                        // **Answered after the file lands, not here.** The
+                        // `Verify` frame used to go out at this point, before
+                        // the writer had been flushed or closed and before the
+                        // `.part` had been renamed into place — so the sender
+                        // was told the file was safely received while a full
+                        // disk, a read-only destination or a failed rename
+                        // could still lose it, and the sender had already
+                        // dropped its copy of that news. The pipe path states
+                        // this rule in its own words, and the folder path
+                        // repeats it; this one did not follow it.
                         integrity_ok = to_hex(&hasher.clone().finalize()) == checksum;
-                        let _ = send_with_retry(
-                            link,
-                            control_frame(&Control::Verify { ok: integrity_ok }),
-                            0,
-                        )
-                        .await;
                         break TransferOutcome::Completed;
                     }
                     Control::Cancel => break TransferOutcome::Cancelled,
@@ -530,19 +538,25 @@ pub async fn receive_file(
         }
     };
 
-    writer
-        .flush()
-        .await
-        .map_err(|e| DomainError::Storage(format!("flush: {e}")))?;
-    writer
-        .close()
-        .await
-        .map_err(|e| DomainError::Storage(format!("close: {e}")))?;
+    // Everything that has to succeed before this device can honestly say the
+    // file is here — flushed, closed, verified, and renamed into place. Its
+    // result is what `Verify` reports, so a failure reaches the sender as
+    // `ok: false` rather than being contradicted by a frame already on the
+    // wire. The rename is inside it too: a `.part` that cannot be published is
+    // not a received file, whatever its bytes hash to.
+    let landed: Result<Option<String>> = async {
+        writer
+            .flush()
+            .await
+            .map_err(|e| DomainError::Storage(format!("flush: {e}")))?;
+        writer
+            .close()
+            .await
+            .map_err(|e| DomainError::Storage(format!("close: {e}")))?;
 
-    // On a verified completion, atomically promote `.part` to its final,
-    // non-colliding name. On integrity failure or cancel, the `.part` stays
-    // on disk (resumable) and the final file is never created/clobbered.
-    let final_name = if outcome == TransferOutcome::Completed {
+        if outcome != TransferOutcome::Completed {
+            return Ok(None);
+        }
         if !integrity_ok {
             // A poisoned `.part` must not survive a failed integrity check:
             // resume logic re-hashes whatever prefix is on disk, so leaving
@@ -559,22 +573,55 @@ pub async fn receive_file(
                 "checksum mismatch for {base}"
             )));
         }
-        let final_path = storage.finalize(&part, &dest).await?;
-        let name = std::path::Path::new(&final_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| base.clone());
-        let _ = progress.send(make_progress(
-            &meta.transfer_id,
-            Direction::Receiving,
-            TransferStatus::Completed,
-            meta.size.max(received),
-            received,
-            &name,
-        ));
-        name
-    } else {
-        base
+        // Atomically promote `.part` to its final, non-colliding name.
+        storage.finalize(&part, &dest).await.map(Some)
+    }
+    .await;
+
+    // The one frame that tells the sender whether it may forget its copy.
+    if outcome == TransferOutcome::Completed {
+        let _ = send_with_retry(
+            link,
+            control_frame(&Control::Verify { ok: landed.is_ok() }),
+            0,
+        )
+        .await;
+        // **Writing the frame is not delivering it.** Every caller drops the
+        // link (or closes the channel) the moment this returns, and quinn's
+        // `Connection::close` discards stream data that has not gone out — so
+        // the last frame written is the one most likely to be lost.
+        //
+        // That was invisible while `Verify` was sent from the `Control::Complete`
+        // arm: the flush, close and rename that followed happened to give the
+        // write time to reach the wire. Moving the frame to where it can tell
+        // the truth removed that accidental delay, and the loopback transfer
+        // tests failed at once — the sender reporting a closed connection
+        // instead of a verdict.
+        //
+        // A sender that has read `Verify` stops reading and lets its side go,
+        // so waiting for the link to end is both the acknowledgement and the
+        // delay. Bounded, because a sender that never hangs up must not park
+        // this task — by then the frame has had far longer than it needs.
+        let _ = tokio::time::timeout(VERIFY_DRAIN, link.recv_frame()).await;
+    }
+
+    let final_name = match landed? {
+        Some(final_path) => {
+            let name = std::path::Path::new(&final_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| base.clone());
+            let _ = progress.send(make_progress(
+                &meta.transfer_id,
+                Direction::Receiving,
+                TransferStatus::Completed,
+                meta.size.max(received),
+                received,
+                &name,
+            ));
+            name
+        }
+        None => base,
     };
 
     Ok(Received {

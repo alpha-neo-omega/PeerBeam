@@ -37,7 +37,13 @@ class HistoryScreen extends StatelessWidget {
         ],
       ),
     );
-    if (confirmed == true) state.history.clear();
+    if (confirmed != true) return;
+    final failure = await state.history.clear();
+    if (!context.mounted || failure == null) return;
+    // Said plainly: the list looks empty, and on disk it is not.
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(failure)));
   }
 
   @override

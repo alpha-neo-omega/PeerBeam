@@ -57,7 +57,7 @@ use bytes::Bytes;
 
 use crate::protocol::chunk_frame_owned;
 use crate::stream::{
-    build_progress, free_destination, part_path, read_fill, safe_component, send_with_retry,
+    build_progress, free_destination, read_fill, safe_component, send_with_retry,
     signal_pause_edge, to_hex, TransferOutcome,
 };
 
@@ -523,7 +523,15 @@ pub async fn receive_folder(
     // always staged into `part_path` and renamed on success; this now does the
     // same, so a tail that never arrives leaves a `.part` behind rather than a
     // plausible-looking lie.
-    let mut current_paths: Option<(String, String)> = None;
+    //
+    // The third field is the staging **claim**. `receive_file` has held one
+    // since two concurrent receives of the same name were found interleaving
+    // into one `.part`; folder entries were never given the same guarantee, so
+    // two folder receives carrying `DCIM/IMG_0001.jpg` — or a folder and a
+    // single file — still shared a staging path and published a mixture of both
+    // senders' bytes. Holding the claim here closes that, and dropping it with
+    // `current_paths` frees the name on every exit.
+    let mut current_paths: Option<(String, String, crate::stream::StagingClaim)> = None;
     // Rolling digest of the entry being written, compared against the sender's
     // on `FileEnd`.
     let mut entry_hash = Sha256::new();
@@ -697,12 +705,29 @@ pub async fn receive_folder(
                         // directory, or a filesystem-level type mismatch —
                         // must not abort the whole folder: skip just this
                         // entry and keep going.
-                        let part = part_path(&dp);
                         entry_hash = Sha256::new();
+                        // Claimed, not merely named: another live receive may
+                        // already be writing this `.part`, and two writers on
+                        // one staging file publish a mixture. A name that is
+                        // taken yields the next free one, exactly as the
+                        // single-file path does.
+                        let claimed = match crate::stream::claim_destination(storage, dp).await {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::warn!("skipping folder entry {path}: {e}");
+                                None
+                            }
+                        };
+                        let Some((dp, part, claim)) = claimed else {
+                            current = None;
+                            current_paths = None;
+                            current_skipped = true;
+                            continue;
+                        };
                         match storage.open_write(&part).await {
                             Ok(w) => {
                                 current = Some(w);
-                                current_paths = Some((part, dp));
+                                current_paths = Some((part, dp, claim));
                                 current_skipped = false;
                             }
                             Err(e) => {
@@ -730,7 +755,7 @@ pub async fn receive_folder(
                             corrupt += 1;
                             let dest = current_paths
                                 .as_ref()
-                                .map(|(_, d)| d.clone())
+                                .map(|(_, d, _)| d.clone())
                                 .unwrap_or_default();
                             tracing::warn!(
                                 "folder entry {dest} failed its checksum and was not published"
@@ -921,11 +946,13 @@ async fn cancel_or_pause(
 /// `f (1).bin` beside the file it was meant to replace.
 async fn finish_entry(
     writer: Option<Box<dyn AsyncWrite + Unpin + Send>>,
-    paths: Option<(String, String)>,
+    // The claim rides along and is dropped at the end of this call, which is
+    // what frees the staging name for the next receive.
+    paths: Option<(String, String, crate::stream::StagingClaim)>,
     storage: &dyn StorageProvider,
 ) -> Result<bool> {
     close_writer(writer).await?;
-    let Some((part, dest)) = paths else {
+    let Some((part, dest, _claim)) = paths else {
         return Ok(false);
     };
     match storage.finalize_replacing(&part, &dest).await {

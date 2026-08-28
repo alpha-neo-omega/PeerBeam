@@ -2157,33 +2157,49 @@ impl Manager {
                 let drop = history.len() - MAX_HISTORY;
                 history.drain(..drop);
             }
-            self.persist_history(&history);
+            let _ = self.persist_history(&history);
         }
         events::event(&json!({ "type": "history_updated", "timestamp": timestamp() }));
     }
 
-    /// Best-effort write of the history document (atomic-enough for a cache:
-    /// history is convenience data, not integrity-critical).
-    fn persist_history(&self, history: &[Value]) {
+    /// Write the history document, reporting whether it landed.
+    ///
+    /// Recording a transfer stays best-effort — losing one row of convenience
+    /// data is not worth failing a completed transfer over. **Clearing is
+    /// different**: it is a promise that something is gone, and a promise this
+    /// process cannot keep must not be reported as kept. The CLI draws exactly
+    /// this line in `history.rs`.
+    fn persist_history(&self, history: &[Value]) -> std::io::Result<()> {
         let Some(path) = self.history_path.as_deref() else {
-            return;
+            return Ok(());
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        if let Ok(bytes) = serde_json::to_vec(history) {
-            let _ = std::fs::write(path, bytes);
-        }
+        let bytes = serde_json::to_vec(history)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, bytes)
     }
 
     /// Clear all history (persisted too) and notify.
+    ///
+    /// **Fails loudly.** The in-memory list is emptied either way — the user
+    /// asked, and the screen must reflect it — but a persist that failed means
+    /// the rows come back on the next start, so saying `cleared: true` would be
+    /// a privacy claim this build could not keep.
     pub fn history_clear(&self) -> Op {
-        {
+        let persisted = {
             let mut history = self.history.lock().unwrap();
             history.clear();
-            self.persist_history(&history);
-        }
+            self.persist_history(&history)
+        };
         events::event(&json!({ "type": "history_updated", "timestamp": timestamp() }));
+        persisted.map_err(|e| {
+            (
+                Code::Storage,
+                format!("history was cleared here but not on disk: {e}"),
+            )
+        })?;
         Ok(json!({ "cleared": true }))
     }
 

@@ -3,6 +3,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../sdk/error_text.dart';
 import '../sdk/events.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
@@ -61,13 +62,29 @@ class HistoryRepository extends ChangeNotifier {
     }
   }
 
-  /// Clear history in the engine (persisted); the local view empties
-  /// immediately and the engine's history_updated confirms.
-  void clear() {
-    unawaited(_api?.historyClear().catchError((_) {}));
-    if (_items.isEmpty) return;
-    _items = [];
-    notifyListeners();
+  /// Clear history in the engine and locally.
+  ///
+  /// Returns `null` when it is really gone, or a sentence to show when it is
+  /// not. **Awaited, and the failure surfaced.** This used to be a
+  /// fire-and-forget with `.catchError((_) {})` followed by an unconditional
+  /// local empty, so a persist that failed left the screen looking cleared
+  /// while the rows came back on the next start — a privacy claim the app
+  /// could not keep, and could not even know it had broken.
+  ///
+  /// The local list is emptied either way: the user asked, and the engine has
+  /// dropped its copy too. What the caller must not do is call it done.
+  Future<String?> clear() async {
+    String? failure;
+    try {
+      await _api?.historyClear();
+    } catch (e) {
+      failure = friendlyError(e);
+    }
+    if (_items.isNotEmpty) {
+      _items = [];
+      notifyListeners();
+    }
+    return failure;
   }
 
   @override

@@ -59,6 +59,33 @@ pub struct GroupStore {
     me: DeviceId,
 }
 
+/// Serialises every read-modify-write of a group record.
+///
+/// **Process-wide, not a field.** `add_member` reads the group, appends and
+/// writes it back with nothing between the read and the write, so two
+/// `GroupJoined` frames arriving together both read the same roster and the
+/// second write discards the first member. The window is real rather than
+/// theoretical: `FsAppStore::put` fsyncs a temp and the parent directory, so
+/// the write is milliseconds long, and inbound frames are handled concurrently.
+///
+/// It matters more than an ordinary lost update because there is nothing to
+/// repair it from. The inviter's copy is the only complete roster — `invite`
+/// sends the roster as of invitation time, and `adopt` writes only inviter and
+/// self — so a member dropped here is a member no peer can put back.
+///
+/// A global rather than a field on the store because the store is rebuilt per
+/// frame (`groups_sync::sink` clones one out of a `OnceLock`, and the CLI
+/// constructs a fresh one per command), so a per-instance lock would guard
+/// nothing. Group writes are rare; the contention does not matter.
+static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`WRITE`], recovering rather than propagating a poisoned lock: the
+/// guarded state is a file, and a panic elsewhere must not make every later
+/// group operation fail forever.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl GroupStore {
     #[must_use]
     pub fn new(store: Arc<dyn AppStore>, trust: Arc<dyn TrustStore>, me: DeviceId) -> Self {
@@ -136,6 +163,7 @@ impl GroupStore {
     /// [`MAX_MEMBERS`], or a store error.
     pub fn adopt(&self, id: &str, name: &str, members: &[DeviceId]) -> Result<Group, GroupError> {
         let name = validate_name(name)?;
+        let _guard = write_lock();
         for m in members {
             validate_member(m)?;
         }
@@ -165,6 +193,9 @@ impl GroupStore {
     /// member id, or a store error.
     pub fn add_member(&self, id: &str, device: &DeviceId) -> Result<Group, GroupError> {
         validate_member(device)?;
+        // Held across the read and the write — see `WRITE`. Two members
+        // joining at once used to lose one of them, unrecoverably.
+        let _guard = write_lock();
         let mut group = self.get(id)?;
         if group.holds(device) {
             return Ok(group);
@@ -184,6 +215,7 @@ impl GroupStore {
     /// # Errors
     /// [`GroupError::UnknownGroup`] or a store error.
     pub fn remove_member(&self, id: &str, device: &DeviceId) -> Result<Group, GroupError> {
+        let _guard = write_lock();
         let mut group = self.get(id)?;
         group.members.retain(|m| m != device);
         self.write(&group)?;
@@ -217,6 +249,7 @@ impl GroupStore {
     /// or a store error.
     pub fn rename(&self, id: &str, name: &str) -> Result<Group, GroupError> {
         let name = validate_name(name)?;
+        let _guard = write_lock();
         let mut group = self.get(id)?;
         if self
             .list()?
@@ -465,6 +498,40 @@ pub(crate) mod tests {
             store.create("  work   trip "),
             Err(GroupError::DuplicateName { .. })
         ));
+    }
+
+    /// **Two members joining at once must both be in the roster.**
+    ///
+    /// `add_member` reads, appends and writes back, and the store's write
+    /// fsyncs — so without a lock across that pair the second write discards
+    /// the first member. It is unrecoverable: the inviter's copy is the only
+    /// complete roster, so nothing can put the lost member back.
+    #[test]
+    fn concurrent_joins_do_not_lose_a_member() {
+        let (store, _trust, dir) = new_store();
+        let group = store.create("Trip").unwrap();
+        let store = Arc::new(store);
+
+        const N: usize = 24;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = store.clone();
+            let id = group.id.clone();
+            handles.push(std::thread::spawn(move || {
+                s.add_member(&id, &DeviceId::from(format!("pb-{i:04}")))
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+
+        let after = store.get(&group.id).unwrap();
+        assert_eq!(
+            after.members.len(),
+            N + 1,
+            "every member that joined must be in the roster (plus this device)"
+        );
+        drop(dir);
     }
 
     /// Adopting an invitation adds **this device** to the roster: the inviter's
