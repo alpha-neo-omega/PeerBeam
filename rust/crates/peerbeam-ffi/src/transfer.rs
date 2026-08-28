@@ -34,9 +34,9 @@ use peerbeam_domain::session::CapabilitySet;
 use peerbeam_engine::RouteManager;
 use peerbeam_storage_fs::FsStorage;
 use peerbeam_transfer::{
-    peek_incoming_meta, receive_on_channel, send_file_on_session_recover, send_folder_on_session,
-    ChannelReceived, FolderSendRequest, Identity, SendRequest, TransferControl, TransferOutcome,
-    BACK_PAUSE, BACK_RESUME,
+    admit_transfer_for, peek_incoming_meta, receive_on_channel, send_file_on_session_recover,
+    send_folder_on_session, ChannelReceived, FileAdmission, FolderSendRequest, Identity,
+    SendRequest, TransferControl, TransferOutcome, BACK_PAUSE, BACK_RESUME,
 };
 use peerbeam_transfer_quic::{QuicChannels, QuicTransport};
 use peerbeam_trust_fs::FsTrust;
@@ -379,92 +379,6 @@ fn should_send_decline(
     outcome == AcceptOutcome::Rejected
         && crate::session_exec::caps_support_file_decline(caps)
         && chat.contains(peer, id).unwrap_or(false)
-}
-
-/// What the trust store says about an inbound transfer from `peer`, decided
-/// **before** anyone is asked anything.
-///
-/// Three outcomes rather than a bool, because the store genuinely has three
-/// things to say and collapsing any two of them loses a real behaviour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileAdmission {
-    /// The user approved this device and then took its `files` permission
-    /// away. Refuse without prompting: they have already answered.
-    Refused,
-    /// Ask the user, exactly as this build always has.
-    Prompt,
-    /// Accept without asking.
-    AutoAccept,
-}
-
-/// The trust half of the inbound-transfer decision.
-///
-/// Extracted from `handle_incoming` as a pure function of data already in hand
-/// — no session, no network — so every leg is unit-testable and a refactor
-/// cannot delete one silently. It mirrors [`should_send_decline`] and the four
-/// `may_*` gates: the predicate is the tested unit, the call site is the thin
-/// part.
-///
-/// The legs, in order:
-///
-/// 1. **Approved, but `files` revoked → [`Refused`].** The user said "this
-///    device may not send me files". Prompting anyway would ask them to
-///    re-decide something they already decided, on the schedule of whoever is
-///    sending — which is how a permission becomes a nuisance rather than a
-///    setting. This also beats a resume: an interrupted transfer that was
-///    accepted before the permission was taken away does not get to finish
-///    (revoking applies to the *next* operation, and this is one).
-/// 2. **`auto_accept` and the device may [`Permission::Files`] →
-///    [`AutoAccept`].** Formerly `auto && record.approved`;
-///    [`TrustStore::may`] implies that approval, so this is strictly narrower
-///    than what it replaces and no device that auto-accepted before stops
-///    doing so unless the permission was deliberately removed.
-///
-///    `auto_accept` is now **either** the global setting **or** this device's
-///    own `auto_accept` bit — "stop asking me about this one" — and the two are
-///    deliberately an `or`: the per-device answer exists precisely so the
-///    global one does not have to be turned on for everybody. Both are still
-///    `&& may_files`, so neither can admit a byte the `files` permission would
-///    refuse. That conjunction is the whole safety argument and must not be
-///    loosened: this is a setting about *asking*, never about *allowing*.
-/// 3. **Everything else → [`Prompt`].** In particular a merely *pinned* peer —
-///    the state the TOFU handshake leaves every stranger in — is prompted
-///    exactly as it always was. Permissions narrow a standing the user granted;
-///    they never create one, and they must not turn first contact into a silent
-///    refusal.
-///
-/// [`Refused`]: FileAdmission::Refused
-/// [`AutoAccept`]: FileAdmission::AutoAccept
-/// [`Prompt`]: FileAdmission::Prompt
-/// [`TrustStore::may`]: peerbeam_domain::port::TrustStore::may
-pub(crate) fn admit_transfer(
-    auto_accept: bool,
-    trust: &dyn TrustStore,
-    peer: &DeviceId,
-) -> FileAdmission {
-    let may_files = trust.may(peer, Permission::Files);
-    if trust.is_approved(peer) && !may_files {
-        return FileAdmission::Refused;
-    }
-    if auto_accept && may_files {
-        return FileAdmission::AutoAccept;
-    }
-    FileAdmission::Prompt
-}
-
-/// [`admit_transfer`], with the per-device *stop asking about this one* bit
-/// folded into the global setting.
-///
-/// Kept as a separate function so [`admit_transfer`]'s existing tests keep
-/// asserting the gate itself, and so the `or` between the two settings is one
-/// line that can be pointed at rather than a condition spread across callers.
-pub(crate) fn admit_transfer_for(
-    global_auto_accept: bool,
-    per_device_auto_accept: bool,
-    trust: &dyn TrustStore,
-    peer: &DeviceId,
-) -> FileAdmission {
-    admit_transfer(global_auto_accept || per_device_auto_accept, trust, peer)
 }
 
 /// The `files` permission on the **outbound** path, as an [`Op`]-shaped refusal.
@@ -6819,10 +6733,14 @@ fn observe_folder(root: &std::path::Path) -> Vec<(String, peerbeam_sync::Observe
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The predicate moved to `peerbeam_transfer::admission` so both surfaces
+    // could ask it; its tests stayed here, where the rest of the admission
+    // behaviour is asserted.
     use peerbeam_domain::port::EncryptionProvider;
     use peerbeam_domain::session::{
         Capability, ChannelType, CHAT_FEAT_FILEDECLINE, CHAT_FEAT_FILEREF,
     };
+    use peerbeam_transfer::admit_transfer;
 
     /// A `Manager` with no daemon/history wired up, just enough to exercise
     /// identity/name plumbing in isolation (no network I/O beyond binding an

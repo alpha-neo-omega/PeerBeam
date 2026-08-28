@@ -15,6 +15,7 @@
 //! `StorageProvider`, so this crate is fully testable with in-memory links
 //! and temp files.
 
+mod admission;
 mod auth;
 mod checkpoint;
 mod clipboard;
@@ -30,6 +31,7 @@ mod secure;
 mod session;
 mod stream;
 
+pub use admission::{admit_transfer, admit_transfer_for, may_send_files, FileAdmission};
 pub use auth::{authenticate, Identity, Session};
 pub use checkpoint::{
     check_resume, is_expired, is_expired_after, partial_file, ResumeClaim, ResumeRefusal,

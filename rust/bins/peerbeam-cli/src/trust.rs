@@ -196,20 +196,15 @@ fn set_auto_accept(
     } else {
         &record.name
     };
-    // **Says which surface this governs.** The `files` permission and
-    // auto-accept are enforced by the app; `peerbeam receive` and
-    // `peerbeam daemon` have no admission gate at all and take files from any
-    // authenticated peer. Printing "will be asked about" without saying where
-    // told an operator a switch was protecting a headless box when it was not.
+    // Auto-accept is an app-side setting: it decides whether the app *asks*.
+    // The CLI has nobody to ask, so it accepts — but it now refuses a device
+    // whose `files` permission was revoked, on both surfaces
+    // (`peerbeam_transfer::admission`).
     ctx.line(&if auto_accept {
-        format!("{name}'s files will be accepted without asking, in the app")
+        format!("{name}'s files will be accepted without asking")
     } else {
-        format!("{name}'s files will be asked about in the app")
+        format!("{name}'s files will be asked about in the app, and accepted by the CLI")
     });
-    ctx.line(&ctx.dim(
-        "  `peerbeam receive` and `peerbeam daemon` accept files from any \
-         authenticated peer regardless of this",
-    ));
     // Say so rather than leaving the operator believing a setting is in force.
     // Named separately because the two causes need different fixes: one is
     // `trust approve`, the other is `trust permit <device> files`.

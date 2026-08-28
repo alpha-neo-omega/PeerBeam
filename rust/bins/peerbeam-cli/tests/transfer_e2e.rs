@@ -407,3 +407,149 @@ fn wait_with_timeout(
         }
     }
 }
+
+/// **The `files` permission, enforced by the CLI.**
+///
+/// It was not, for the whole of this project's life: `peerbeam receive` and
+/// `peerbeam daemon` reached the receive path with no admission gate, so
+/// revoking a device's `files` permission changed nothing on a headless box —
+/// while `docs/SECURITY.md` said the permission was "enforced in both
+/// directions" and `peerbeam trust` printed sentences about a gate that never
+/// ran.
+///
+/// The gate refuses only what the user already decided about: a device they
+/// approved and then narrowed. A merely-pinned stranger is untouched, which is
+/// what keeps a headless receiver from turning into one that accepts nothing.
+#[test]
+fn a_device_whose_files_permission_was_revoked_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let recv_dir = dir.path().join("recv");
+    let src = dir.path().join("secret.bin");
+
+    let mut cfg = EngineConfig::default();
+    cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
+    cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
+    cfg.save(&cfg_path).unwrap();
+
+    let sender_cfg_path = dir.path().join("sender-config.json");
+    let mut sender_cfg = cfg.clone();
+    sender_cfg.storage.data_directory = dir
+        .path()
+        .join("data-sender")
+        .to_string_lossy()
+        .into_owned();
+    sender_cfg.save(&sender_cfg_path).unwrap();
+
+    std::fs::write(&src, b"not for you").unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    // The sender's own device id, which is what the receiver will pin.
+    let status = Command::new(BIN)
+        .args([
+            "--config",
+            sender_cfg_path.to_str().unwrap(),
+            "--no-color",
+            "--json",
+            "status",
+        ])
+        .output()
+        .expect("status");
+    let sender_id = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+        .ok()
+        .and_then(|v| v["device_id"].as_str().map(str::to_string))
+        .expect("sender device id");
+
+    // Round one: an ordinary transfer, so the receiver pins the sender.
+    let port = spawn_receiver_and_send(&cfg_path, &recv_dir, &sender_cfg_path, &src);
+    assert!(
+        recv_dir.join("secret.bin").exists(),
+        "the first transfer is unaffected — the peer is only pinned, not narrowed"
+    );
+    std::fs::remove_file(recv_dir.join("secret.bin")).unwrap();
+    let _ = port;
+
+    // The user approves the device, then takes its Files permission away.
+    for args in [
+        vec!["trust", "approve", sender_id.as_str()],
+        vec!["trust", "revoke-permission", sender_id.as_str(), "files"],
+    ] {
+        let mut full = vec!["--config", cfg_path.to_str().unwrap(), "--no-color", "-y"];
+        full.extend_from_slice(&args);
+        let o = Command::new(BIN).args(&full).output().expect("trust");
+        assert!(
+            o.status.success(),
+            "{args:?} failed: {}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    // Round two: the same send must now be refused, and nothing may land.
+    let _ = spawn_receiver_and_send(&cfg_path, &recv_dir, &sender_cfg_path, &src);
+    assert!(
+        !recv_dir.join("secret.bin").exists(),
+        "a device whose Files permission was revoked must not be able to send"
+    );
+}
+
+/// Start a `receive --once`, send one file to it, and return the port used.
+///
+/// The send's exit status is deliberately not asserted: this helper is used for
+/// both the accepted and the refused round, and a refusal is a *successful*
+/// enforcement, not a test failure.
+fn spawn_receiver_and_send(
+    cfg_path: &std::path::Path,
+    recv_dir: &std::path::Path,
+    sender_cfg_path: &std::path::Path,
+    src: &std::path::Path,
+) -> u16 {
+    let mut receiver = Command::new(BIN)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--no-color",
+            "receive",
+            "--once",
+            "--port",
+            "0",
+            "--dir",
+            recv_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn receiver");
+
+    let stdout = receiver.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(port) = parse_listen_port(&line) {
+                let _ = tx.send(port);
+            }
+        }
+    });
+    let port = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("receiver should announce a listening port");
+
+    let _ = Command::new(BIN)
+        .args([
+            "--config",
+            sender_cfg_path.to_str().unwrap(),
+            "--no-color",
+            "-y",
+            "send",
+            src.to_str().unwrap(),
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("run sender");
+
+    let _ = wait_with_timeout(&mut receiver, Duration::from_secs(20));
+    let _ = receiver.kill();
+    let _ = receiver.wait();
+    port
+}

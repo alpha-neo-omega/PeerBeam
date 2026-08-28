@@ -887,20 +887,23 @@ guessed at is a switch people trust wrongly:
   have just discovered has never required approval, and gating it on `may`
   (which implies approval) would break the app's primary flow.
 
-  **The CLI does not enforce it, in either direction.** `peerbeam receive` and
-  `peerbeam daemon` reach `receive_on_channel` with no admission gate, and the
-  send path calls no outbound check — both functions live in `peerbeam-ffi` and
-  `bins/` calls neither. So revoking `files` from a device changes nothing about
-  what the CLI accepts from it or sends to it.
+  **The CLI enforces it too, and did not until recently.** The decision was
+  `pub(crate)` in `peerbeam-ffi` and so unreachable from `bins/`, so
+  `peerbeam receive` and `peerbeam daemon` took files from any authenticated
+  peer while this section claimed otherwise. It now lives in
+  `peerbeam_transfer::admission` and both surfaces ask the same predicate.
 
-  This section previously said "enforced in **both** directions" without
-  qualification, which was true of the app and false of the CLI —
-  [CLI.md](CLI.md) has always documented that CLI receive accepts files from any
-  authenticated peer. The gap is real and is recorded rather than papered over:
-  a headless receiver has nobody to answer a prompt, so the fix is not simply
-  calling the app's gate, and shipping a half-applied version of it would turn
-  "accepts everything" into "accepts nothing" for exactly the deployments that
-  cannot notice.
+  **Only the refusal crosses over, deliberately.** `Refused` — approved, then
+  narrowed — closes the connection. `Prompt` continues exactly as the CLI
+  always has, because a headless receiver has nobody to ask; making it refuse
+  instead would turn "accepts everything" into "accepts nothing" for precisely
+  the deployments that cannot notice. So a merely-pinned stranger is unaffected
+  on both surfaces, and [CLI.md](CLI.md)'s statement that CLI receive accepts
+  files from any authenticated peer remains true for every device the user has
+  not explicitly decided about.
+
+  Outbound is the mirror: `peerbeam send` refuses a device whose `files` was
+  turned off, and does not refuse one that was never approved.
 - **Messages** — enforced on **sending only**. Revoking it means this device
   will not message that one; it does not stop that device messaging here. Chat
   has never required approval to receive, and the inbound path would need the

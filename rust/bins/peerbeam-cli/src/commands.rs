@@ -1360,6 +1360,19 @@ async fn secure_send_folder(
         Some((chat.clone(), sink.clone())),
     )
     .await?;
+    // **The `files` permission, outbound.** Asked of the identity that actually
+    // answered rather than the id dialled: a route can resolve to a different
+    // device, and the permission is about whoever picked up. A device the user
+    // approved and then narrowed is refused; a merely-pinned peer is not, which
+    // keeps "spot a device, send it a file" working.
+    let peer = peerbeam_domain::id::DeviceId::from(session.peer_id.clone());
+    if !peerbeam_transfer::may_send_files(sc.trust.as_ref(), &peer) {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} may not be sent files — its Files permission was turned off",
+            peer.0
+        )));
+    }
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
     // Captured now (rather than read off `session` down by the JSON output)
@@ -1810,6 +1823,19 @@ pub(crate) async fn secure_send_file(
         Some((chat.clone(), sink.clone())),
     )
     .await?;
+    // **The `files` permission, outbound.** Asked of the identity that actually
+    // answered rather than the id dialled: a route can resolve to a different
+    // device, and the permission is about whoever picked up. A device the user
+    // approved and then narrowed is refused; a merely-pinned peer is not, which
+    // keeps "spot a device, send it a file" working.
+    let peer = peerbeam_domain::id::DeviceId::from(session.peer_id.clone());
+    if !peerbeam_transfer::may_send_files(sc.trust.as_ref(), &peer) {
+        session.close().await;
+        return Err(CliError::Other(format!(
+            "{} may not be sent files — its Files permission was turned off",
+            peer.0
+        )));
+    }
     let newly_trusted = session.newly_trusted;
     let peer_id = session.peer_id.clone();
     // Captured now (rather than read off `session` down by the JSON output)
@@ -2074,6 +2100,47 @@ async fn serve_loop(
                         "  pairing code: {}",
                         ctx.bold(&session.pairing_code)
                     ));
+                }
+
+                // **The `files` permission, enforced here at last.**
+                //
+                // `admit_transfer` is the same predicate the app asks; it was
+                // `pub(crate)` in `peerbeam-ffi` and so unreachable from here,
+                // which is why `peerbeam receive` and `peerbeam daemon` took
+                // files from any authenticated peer while `docs/SECURITY.md`
+                // said the permission was enforced in both directions.
+                //
+                // Only the refusal is acted on, and that is the whole point of
+                // the shape. `Refused` means the user approved this device and
+                // then took its `files` permission away — an answer they have
+                // already given. `Prompt` and `AutoAccept` both continue
+                // exactly as this loop always has, because a headless receiver
+                // has nobody to ask and turning "accepts everything" into
+                // "accepts nothing" would break every deployment that cannot
+                // notice. So a merely-pinned stranger is unaffected: this
+                // narrows a standing the user granted, it never creates one.
+                if peerbeam_transfer::admit_transfer(
+                    config.device.auto_accept_trusted,
+                    sc.trust.as_ref(),
+                    &peerbeam_domain::id::DeviceId::from(peer_id.clone()),
+                ) == peerbeam_transfer::FileAdmission::Refused
+                {
+                    if ctx.json {
+                        ctx.json_line(&json!({
+                            "event": "error",
+                            "message": "peer may not send files",
+                            "peer": peer_id,
+                        }));
+                    } else {
+                        ctx.line(&ctx.red(&format!(
+                            "{peer_id} may not send files — its `files` permission was revoked"
+                        )));
+                    }
+                    session.close().await;
+                    if once {
+                        break;
+                    }
+                    continue;
                 }
 
                 // Optional first-contact pairing check: when the toggle is on and this
