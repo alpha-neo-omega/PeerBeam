@@ -527,6 +527,15 @@ pub async fn receive_folder(
     // Rolling digest of the entry being written, compared against the sender's
     // on `FileEnd`.
     let mut entry_hash = Sha256::new();
+    // How many bytes the current entry declared, and how many have landed.
+    //
+    // The manifest's size is a bound, not a hint: without it a sender could
+    // declare a small folder and stream without end into the receiver's disk,
+    // and — if it finished with an honest checksum — have the oversized file
+    // published under the declared name. `stream::receive_file` carries the
+    // same guard for the single-file path.
+    let mut entry_limit: u64 = 0;
+    let mut entry_written: u64 = 0;
     // Entries whose bytes did not match and were therefore withheld. Reported
     // back so the sender fails rather than believing the folder landed whole.
     let mut corrupt: u64 = 0;
@@ -600,11 +609,19 @@ pub async fn receive_folder(
             Some(frame) => match frame.kind {
                 FrameKind::Chunk => {
                     if let Some(writer) = current.as_mut() {
+                        // See `entry_limit`: the declared size bounds what may
+                        // be written under that name.
+                        if entry_written + frame.payload.len() as u64 > entry_limit {
+                            return Err(DomainError::Transfer(
+                                "sender exceeded the size its manifest declared".into(),
+                            ));
+                        }
                         writer
                             .write_all(&frame.payload)
                             .await
                             .map_err(|e| DomainError::Storage(format!("write chunk: {e}")))?;
                         entry_hash.update(&frame.payload);
+                        entry_written += frame.payload.len() as u64;
                         done += frame.payload.len() as u64;
                         emit(
                             progress,
@@ -620,7 +637,13 @@ pub async fn receive_folder(
                     }
                 }
                 FrameKind::Control => match parse_folder(&frame)? {
-                    FolderMessage::FileHeader { path, .. } => {
+                    FolderMessage::FileHeader {
+                        path, size, offset, ..
+                    } => {
+                        // A resumed entry has `offset` bytes already on disk, so
+                        // only the remainder may still arrive.
+                        entry_limit = size.saturating_sub(offset);
+                        entry_written = 0;
                         // The previous entry is finished by the arrival of the
                         // next header when a sender omits `FileEnd`, so its
                         // flush — and its rename — are as load-bearing here as

@@ -317,7 +317,105 @@ fn save(value: &Value) -> Result<(), (Code, String)> {
     // copy of something this build cannot read.
     preserve_unreadable(&p)?;
     let json = serde_json::to_vec_pretty(value).expect("settings serializable");
-    std::fs::write(&p, json).map_err(|e| (Code::Storage, format!("write settings: {e}")))
+    write_atomically(&p, &json)
+}
+
+/// How many times a rename is retried before giving up, and how long between.
+///
+/// Windows refuses a rename while *any* handle to the destination is open — a
+/// concurrent reader is enough — so the same retry the app store uses applies
+/// here. Twenty attempts at ten milliseconds fails a genuinely broken write in
+/// a fifth of a second.
+const COMMIT_ATTEMPTS: u32 = 20;
+const COMMIT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Write the settings document durably: temp, fsync, atomic rename.
+///
+/// **`std::fs::write` truncates first.** A crash, a power loss or a full disk
+/// between the truncate and the write left a zero-length or half-written
+/// `ffi_settings.json` — which `load` cannot parse, so it quarantines the file
+/// and writes defaults. Every preference the user set is silently gone, and one
+/// of them is `require_pairing_confirmation`, which defaults **off**: a torn
+/// write turns a security gate the user switched on back off, with no error and
+/// nothing on screen.
+///
+/// Renaming a fully written temp over the old document means the old one
+/// survives every failure, which is what makes the reset impossible rather than
+/// merely unlikely. Same shape as `peerbeam-appstore-fs::write_private`.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), (Code, String)> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    write_tmp(&tmp, bytes)?;
+
+    let mut last = None;
+    for attempt in 0..COMMIT_ATTEMPTS {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => {
+                // The rename itself is durable only once the directory entry
+                // is. Best-effort: a filesystem that refuses to fsync a
+                // directory is not a reason to report the write as failed.
+                if let Some(dir) = path.parent() {
+                    if let Ok(d) = std::fs::File::open(dir) {
+                        let _ = d.sync_all();
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < COMMIT_ATTEMPTS {
+                    std::thread::sleep(COMMIT_BACKOFF);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err((
+        Code::Storage,
+        format!(
+            "write settings after {COMMIT_ATTEMPTS} attempts: {}",
+            last.expect("a failure is recorded before the loop ends")
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn write_tmp(tmp: &std::path::Path, bytes: &[u8]) -> Result<(), (Code, String)> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)
+        .map_err(|e| (Code::Storage, format!("create settings tmp: {e}")))?;
+    let r = (|| {
+        f.write_all(bytes)
+            .map_err(|e| (Code::Storage, format!("write settings tmp: {e}")))?;
+        f.sync_all()
+            .map_err(|e| (Code::Storage, format!("fsync settings tmp: {e}")))
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    r
+}
+
+#[cfg(not(unix))]
+fn write_tmp(tmp: &std::path::Path, bytes: &[u8]) -> Result<(), (Code, String)> {
+    use std::io::Write;
+    let r = (|| {
+        let mut f = std::fs::File::create(tmp)
+            .map_err(|e| (Code::Storage, format!("create settings tmp: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| (Code::Storage, format!("write settings tmp: {e}")))?;
+        f.sync_all()
+            .map_err(|e| (Code::Storage, format!("fsync settings tmp: {e}")))
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    r
 }
 
 /// Trusted devices from the TOFU store (best-effort; empty if none/unreadable).

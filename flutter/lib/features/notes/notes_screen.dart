@@ -108,17 +108,30 @@ class _NotesScreenState extends State<NotesScreen> {
     );
     if (chosen == null || !mounted) return;
 
-    // The device list is the trust store's, which holds no addresses — the
-    // engine resolves the peer itself, so an empty target here is honest
-    // rather than a guess at where the device is.
-    final sent = await state.notes.sync(
-      PeerTarget(
-        id: chosen.id,
-        name: chosen.name,
-        addresses: const [],
-        port: 0,
-      ),
-    );
+    // **The engine does not resolve an addressless target, and never did.**
+    // This used to build one with `addresses: const []` and `port: 0`, on the
+    // reasoning that the trust store holds no addresses so an empty target was
+    // "honest". `device_from` refuses an empty address list outright, and then
+    // a zero port — so notes sync from this screen could not succeed at all,
+    // and reported "Could not reach <name>" whatever the device was doing.
+    //
+    // Discovery is what holds addresses, so ask it, exactly as Spaces and Chats
+    // do. A device the trust store knows but discovery has not seen is a real
+    // state, and worth saying plainly rather than reporting as unreachable.
+    final target = state.device.peerTarget(chosen.id);
+    if (target == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'PeerBeam has not seen ${chosen.name} on the network yet, so it '
+            'has nowhere to send to. Open the app on that device.',
+          ),
+        ),
+      );
+      return;
+    }
+    final sent = await state.notes.sync(target);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(

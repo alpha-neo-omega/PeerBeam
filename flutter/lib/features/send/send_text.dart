@@ -12,6 +12,34 @@ import 'staged_sheet.dart';
 /// The wire-name convention for a text/clipboard payload.
 final RegExp messageFileName = RegExp(r'^peerbeam-clipboard-\d+\.txt$');
 
+/// The largest payload that is read into memory to be shown as a message.
+///
+/// **The name is the peer's, so the size cannot be inferred from it.** Whether
+/// a received file is treated as a message is decided purely by
+/// [messageFileName] matching, and the receiver only strips directory
+/// components from the name a sender chose — so a peer can send two gigabytes
+/// called `peerbeam-clipboard-1.txt`. Reading that with `readAsString` is a
+/// long freeze on desktop and a killed process on Android.
+///
+/// A real text payload is a few kilobytes; anything past this is not a message
+/// whatever it is called, and is handled as an ordinary file.
+const int maxMessageBytes = 256 * 1024;
+
+/// Read a message payload, or `null` if it is missing, unreadable, or too large
+/// to be one.
+///
+/// Shared so the two places that render a message cannot drift on the cap
+/// again: this one had it and History did not.
+Future<String?> readMessagePayload(String path) async {
+  try {
+    final f = File(path);
+    if (await f.length() > maxMessageBytes) return null;
+    return await f.readAsString();
+  } catch (_) {
+    return null;
+  }
+}
+
 /// Monotonic, digits-only sequence for temp payload names — seeded from the
 /// clock so temp files from different runs never collide, and guaranteed unique
 /// within a run (two texts in one stack would otherwise share a millisecond).

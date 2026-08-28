@@ -230,13 +230,11 @@ mod hex_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        if s.len() % 2 != 0 {
-            return Err(serde::de::Error::custom("odd-length hex"));
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom))
-            .collect()
+        // `peerbeam_domain::hex`, not a slice loop: `&s[i..i + 2]` indexes by
+        // bytes and panics when a character is wider than one. A peer reaches
+        // that with the ASCII JSON escape `"\u20aca"`, and the panic lands
+        // inside a channel actor — before this peer is approved.
+        peerbeam_domain::hex::decode(&s).ok_or_else(|| serde::de::Error::custom("invalid hex"))
     }
 }
 

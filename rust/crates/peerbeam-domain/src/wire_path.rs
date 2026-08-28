@@ -48,16 +48,42 @@ pub fn wire_path(rel: &Path) -> String {
 /// as the tap-to-open target. A consumer that splits on `\` sees one segment
 /// where there are two.
 ///
-/// `.` and `..` segments are dropped, so a relative path can never climb out of
-/// `root` however it was built.
+/// # Containment
+///
+/// Every segment must be exactly one ordinary file name. Anything else is
+/// dropped, so a path built by a peer lands inside `root` or nowhere.
+///
+/// **Checking for the literal strings `.` and `..` was not enough, and on
+/// Windows it was a remote write.** `rel` arrives `/`-separated from a peer, so
+/// `..\..\x` is a *single* segment: it is neither `.` nor `..`, and
+/// `PathBuf::push` then expands it using the host's separator, climbing two
+/// levels out of the sync root. Worse, `push` **replaces** the whole path when
+/// given something rooted — `C:\evil` and `\evil` discard `root` entirely and
+/// write wherever the peer named, with this process's privileges.
+///
+/// Splitting on `\` as well would fix that and break something else: a
+/// backslash is a legal character in a Unix filename, so a file genuinely
+/// called `a\b.txt` would become the two-segment path `a/b.txt`, inventing a
+/// directory — the same trap [`wire_path`] documents. Asking `Path` what a
+/// segment actually *is* answers both: on Windows `..\..\x` yields several
+/// components and is refused, while on Unix `a\b.txt` is one ordinary name and
+/// is kept.
 #[must_use]
 pub fn local_path(root: &Path, rel: &str) -> std::path::PathBuf {
+    use std::path::Component;
     let mut out = root.to_path_buf();
     for seg in rel.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
             continue;
         }
-        out.push(seg);
+        // Exactly one `Normal` component, or nothing. This is what rejects a
+        // drive prefix (`C:`), a root (`\evil`), a UNC share (`\\host\s`)
+        // and any embedded `..` on the platform where they mean something.
+        let mut parts = Path::new(seg).components();
+        match (parts.next(), parts.next()) {
+            (Some(Component::Normal(name)), None) => out.push(name),
+            _ => continue,
+        }
     }
     out
 }
@@ -128,6 +154,63 @@ mod tests {
         let got = local_path(Path::new("root"), "../../etc/passwd");
         let want: PathBuf = ["root", "etc", "passwd"].iter().collect();
         assert_eq!(got, want);
+    }
+
+    /// **The Windows remote-write.** `rel` comes from a peer and is
+    /// `/`-separated, so each of these is a *single* segment: neither `.` nor
+    /// `..`, and so pushed verbatim by the old code. On Windows `push` then
+    /// reads the backslashes as separators — and for a rooted segment discards
+    /// `root` altogether — so a peer could name any location on the disk.
+    ///
+    /// Asserted structurally rather than per-platform so Linux CI catches a
+    /// regression too: whatever the host, the result must stay under `root` and
+    /// must never contain a `..` component.
+    #[test]
+    fn a_peer_supplied_path_can_never_leave_the_root() {
+        use std::path::Component;
+        let root = Path::new("root");
+        for hostile in [
+            r"..\..\etc\passwd",
+            r"C:\evil.txt",
+            r"\evil.txt",
+            r"\\host\share\evil.txt",
+            r"..\..\..\..\..\..\Windows\System32\drivers\etc\hosts",
+            "a/..\\..\\b",
+        ] {
+            let got = local_path(root, hostile);
+            assert!(
+                got.starts_with(root),
+                "{hostile:?} escaped the root entirely: {got:?}"
+            );
+            assert!(
+                !got.components().any(|c| c == Component::ParentDir),
+                "{hostile:?} kept a `..` that the filesystem would follow: {got:?}"
+            );
+        }
+    }
+
+    /// A drive-rooted segment is dropped, not pushed — `PathBuf::push` replaces
+    /// the whole path when given one, which is how `root` was lost.
+    ///
+    /// Windows only, and that is the point: on Unix `C:\evil` is not rooted at
+    /// all, just an oddly named file, and keeping it under `root` is correct.
+    /// The containment property that must hold *everywhere* is asserted by
+    /// `a_peer_supplied_path_can_never_leave_the_root`.
+    #[cfg(windows)]
+    #[test]
+    fn a_rooted_segment_contributes_nothing() {
+        assert_eq!(local_path(Path::new("root"), r"C:\evil"), Path::new("root"));
+    }
+
+    /// The Unix half of the same decision: a backslash is a legal character in
+    /// a filename there, so `a\b.txt` is one ordinary name and must survive.
+    /// Splitting on `\` instead of asking `Path` would have invented a
+    /// directory here.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_filename_containing_a_backslash_is_kept_whole() {
+        let got = local_path(Path::new("root"), "a\\b.txt");
+        assert_eq!(got, Path::new("root").join("a\\b.txt"));
     }
 
     #[test]

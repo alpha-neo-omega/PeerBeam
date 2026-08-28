@@ -44,12 +44,20 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   StreamSubscription<void>? _shareSub;
   StreamSubscription<String>? _clipNoticeSub;
   bool _sheetOpen = false;
+  // `api` is what makes the battery reporter exist: `start()` builds it only
+  // when there is an engine to push readings into, and this call site never
+  // passed one — so Android never reported its battery to a peer, and the Rust
+  // side cannot cover for it (`peerbeam-platform`'s reader is Linux-only).
+  //
+  // Safe as a `late final` initialiser: it is first touched in `initState`
+  // after `_api` is assigned.
   late final AndroidIntegration _android = AndroidIntegration(
     bridge: AndroidBridge(),
     staging: _state.staging,
     transfer: _state.transfer,
     settings: _state.settings,
     history: _state.history,
+    api: _api,
   );
 
   @override
@@ -229,16 +237,10 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   /// Read a received text payload and show it as a message dialog (LocalSend
   /// style) — content + Copy — instead of it looking like a downloaded file.
   Future<void> _offerClipboardCopy(({String path, String peer}) c) async {
-    const maxBytes = 256 * 1024; // text payloads are small
-    String text;
-    try {
-      final f = File(c.path);
-      if (await f.length() > maxBytes) return;
-      text = await f.readAsString();
-    } catch (_) {
-      return; // unreadable/removed — the file still sits in History
-    }
-    if (text.trim().isEmpty) return;
+    // `readMessagePayload` holds the cap, shared with History so the two
+    // cannot drift — History had no cap at all.
+    final text = await readMessagePayload(c.path);
+    if (text == null || text.trim().isEmpty) return;
     _showMessage('Message from ${c.peer}', text);
   }
 

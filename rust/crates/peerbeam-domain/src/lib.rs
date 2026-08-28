@@ -14,6 +14,7 @@
 pub mod entity;
 pub mod error;
 pub mod event;
+pub mod hex;
 pub mod id;
 pub mod port;
 pub mod session;

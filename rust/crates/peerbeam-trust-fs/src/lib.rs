@@ -201,13 +201,52 @@ impl FsTrust {
         // sharing this store can't rename the same temp out from under each
         // other (which would ENOENT one of them).
         let tmp = unique_tmp(&self.path);
-        std::fs::write(&tmp, json)
-            .map_err(|e| DomainError::Storage(format!("write trust store: {e}")))?;
+        write_tmp(&tmp, &json)?;
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             DomainError::Storage(format!("commit trust store: {e}"))
         })
     }
+}
+
+/// Write the temp the store is committed from, `0600` at creation on Unix.
+///
+/// **Mode at creation, not afterwards.** `std::fs::write` creates at the
+/// process umask — commonly `0644` — so the file is world-readable for the
+/// window before the rename, and `unique_tmp` makes a fresh inode every call so
+/// the loose mode survives the rename onto the real path. Every other sensitive
+/// store here (`peerbeam-identity-fs`, `peerbeam-appstore-fs`) already creates
+/// at `0600`; this one did not.
+///
+/// The contents are metadata rather than key material — device ids,
+/// fingerprints, names, permissions and expiry — so this is exposure of who
+/// this machine trusts, not a key compromise. It is still nobody else's
+/// business on a shared machine.
+#[cfg(unix)]
+fn write_tmp(tmp: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+        .map_err(|e| DomainError::Storage(format!("create trust tmp: {e}")))?;
+    let r = (|| {
+        f.write_all(bytes)
+            .map_err(|e| DomainError::Storage(format!("write trust store: {e}")))?;
+        f.sync_all()
+            .map_err(|e| DomainError::Storage(format!("fsync trust store: {e}")))
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    r
+}
+
+#[cfg(not(unix))]
+fn write_tmp(tmp: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(tmp, bytes).map_err(|e| DomainError::Storage(format!("write trust store: {e}")))
 }
 
 impl FsTrust {
@@ -545,6 +584,24 @@ mod tests {
             mine: false,
             auto_accept: false,
         }
+    }
+
+    /// The same assertion the identity and app stores already carry. The trust
+    /// store holds no key material, but who this machine trusts is nobody
+    /// else's business on a shared box — and it was written at the umask,
+    /// commonly `0644`, because `fs::write` creates at the umask and
+    /// `unique_tmp` makes a fresh inode whose loose mode survives the rename.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_written_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        let store = FsTrust::open(&path).unwrap();
+        store.record(record("dev-1", "fp-abc")).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the trust store must not be world-readable");
     }
 
     #[test]

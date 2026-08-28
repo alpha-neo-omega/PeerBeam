@@ -67,4 +67,37 @@ void main() {
     final b = await writeTextPayload('two');
     expect(a == b, isFalse);
   });
+
+  group('a message payload is bounded before it is read', () {
+    /// **The name is the peer's.** Whether a received file is shown as a
+    /// message is decided purely by `messageFileName` matching, and the
+    /// receiver only strips directory components from the name the sender
+    /// chose — so a peer can send an arbitrarily large file called
+    /// `peerbeam-clipboard-1.txt`. History used to `readAsString` it whole.
+    test('an oversized payload reads as null rather than being loaded', () async {
+      final dir = await Directory.systemTemp.createTemp('pb-msg');
+      addTearDown(() => dir.delete(recursive: true));
+      final f = File('${dir.path}/peerbeam-clipboard-1.txt');
+      await f.writeAsBytes(List.filled(maxMessageBytes + 1, 0x41));
+
+      expect(
+        messageFileName.hasMatch(f.uri.pathSegments.last),
+        isTrue,
+        reason: 'it still looks like a message — that is the whole problem',
+      );
+      expect(await readMessagePayload(f.path), isNull);
+    });
+
+    test('an ordinary payload still reads', () async {
+      final dir = await Directory.systemTemp.createTemp('pb-msg');
+      addTearDown(() => dir.delete(recursive: true));
+      final f = File('${dir.path}/peerbeam-clipboard-2.txt');
+      await f.writeAsString('hello');
+      expect(await readMessagePayload(f.path), 'hello');
+    });
+
+    test('a missing payload is null, not a throw', () async {
+      expect(await readMessagePayload('/nowhere/peerbeam-clipboard-3.txt'), isNull);
+    });
+  });
 }

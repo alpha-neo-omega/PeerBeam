@@ -192,4 +192,95 @@ void main() {
       expect(find.textContaining('Space'), findsOneWidget);
     });
   });
+
+  group('the conversation is reachable', () {
+    /// **The feature was unreachable.** Engine, FFI, CLI and repository all
+    /// carried `send` and `history`; this screen wired neither, so a group
+    /// could be created and joined and never spoken in.
+    testWidgets('a group can be opened and spoken in', (tester) async {
+      final fake = FakePeerBeam()
+        ..groupsList = [
+          const Group(
+            id: 'g-1',
+            name: 'Work Trip',
+            members: ['pb-me', 'pb-bob'],
+            reachable: ['pb-bob'],
+            unreachable: [],
+          ),
+        ];
+      await _open(tester, fake);
+
+      await tester.tap(find.byKey(const Key('open-g-1')));
+      // Pumped rather than settled: the loading spinner animates forever, so
+      // `pumpAndSettle` never returns while it is on screen.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(find.byKey(const Key('group-composer')), findsOneWidget);
+
+      await tester.enterText(
+        find.byKey(const Key('group-composer')),
+        'six works for me',
+      );
+      await tester.tap(find.byKey(const Key('group-send')));
+      await tester.pumpAndSettle();
+
+      expect(
+        fake.groupSends,
+        contains((id: 'g-1', text: 'six works for me')),
+        reason: 'the composer must actually reach the engine',
+      );
+    });
+
+    /// A member the `chat` permission excludes is named, never silently
+    /// dropped: the message did reach the rest.
+    testWidgets('a member who was skipped is named', (tester) async {
+      final fake = FakePeerBeam()
+        ..groupsList = [
+          const Group(
+            id: 'g-1',
+            name: 'Work Trip',
+            members: ['pb-me', 'pb-bob'],
+            reachable: ['pb-bob'],
+            unreachable: [],
+          ),
+        ]
+        ..groupSkipped = ['pb-bob'];
+      await _open(tester, fake);
+
+      await tester.tap(find.byKey(const Key('open-g-1')));
+      // Pumped rather than settled: the loading spinner animates forever, so
+      // `pumpAndSettle` never returns while it is on screen.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.enterText(find.byKey(const Key('group-composer')), 'hello');
+      await tester.tap(find.byKey(const Key('group-send')));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('pb-bob'), findsWidgets);
+    });
+
+    /// Inviting is the other half that was missing, and it must state the
+    /// disclosure before it happens — A2, condition 5.
+    testWidgets('inviting says what it costs before it is sent', (tester) async {
+      final fake = FakePeerBeam()
+        ..groupsList = [
+          const Group(
+            id: 'g-1',
+            name: 'Work Trip',
+            members: ['pb-me'],
+            reachable: [],
+            unreachable: [],
+          ),
+        ];
+      await _open(tester, fake);
+
+      await tester.tap(find.byKey(const Key('invite-to-g-1')));
+      await tester.pumpAndSettle();
+
+      // With nobody reachable the screen says so rather than offering a
+      // device the engine would refuse.
+      expect(find.textContaining('has to see a trusted device'), findsOneWidget);
+    });
+  });
 }

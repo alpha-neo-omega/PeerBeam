@@ -66,6 +66,15 @@ impl MessageHandler for BrowseHandler {
         // never treated as a request — otherwise this device would answer its
         // own answers straight back at the peer.
         if frame.message_type.get() == crate::message::MSG_LIST_RESPONSE {
+            // Only a device the user approved is ever asked for a listing, so
+            // an answer from anything else was not one we asked for. Without
+            // this, any handshaken peer could push listings into a sink that is
+            // only drained while a browse is open — unbounded, and retained for
+            // the life of the session. `peerbeam-sync`'s answer arms narrow the
+            // same way, for the same reason.
+            if !self.trust.is_approved(peer) {
+                return Ok(());
+            }
             if let Ok(r) = ListResponse::from_frame(&frame) {
                 (self.incoming)(r);
             }

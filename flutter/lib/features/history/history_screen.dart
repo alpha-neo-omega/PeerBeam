@@ -1,4 +1,3 @@
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -105,12 +104,11 @@ class _HistoryRow extends StatelessWidget {
   /// Files/folders: open with the OS handler. Messages: show the text + Copy.
   Future<void> _tap(BuildContext context) async {
     if (_isMessage) {
-      String content;
-      try {
-        content = await File(item.path).readAsString();
-      } catch (_) {
-        content = '';
-      }
+      // Bounded: the "is a message" decision is made from the peer-supplied
+      // file name alone, so an unbounded `readAsString` here was a peer-sized
+      // allocation. A payload too large to be a message falls through to the
+      // ordinary file behaviour below.
+      final content = await readMessagePayload(item.path) ?? '';
       if (!context.mounted) return;
       if (content.trim().isEmpty) {
         ScaffoldMessenger.of(context)

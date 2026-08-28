@@ -436,6 +436,26 @@ pub async fn receive_file(
         match frame {
             Some(frame) => match frame.kind {
                 FrameKind::Chunk => {
+                    // **The size the user approved is a bound, not a hint.**
+                    // Without this, a sender could declare "photo.jpg, 2 MB",
+                    // stream ten gigabytes, and finish with an honest checksum
+                    // of what it actually sent — so integrity passed, the file
+                    // was finalised, and ten gigabytes landed under the name
+                    // and size the user consented to. Never sending `Complete`
+                    // was the milder version: the `.part` grew until the disk
+                    // filled.
+                    //
+                    // `meta.size` was read only to clamp the resume offset and
+                    // to feed `meta.size.max(received)` into the progress bar —
+                    // which hid the overrun by growing the denominator.
+                    //
+                    // The same guard, for the same reason, is already next door
+                    // in `clipboard.rs`; this path is the one that skipped it.
+                    if received + frame.payload.len() as u64 > meta.size {
+                        return Err(DomainError::Transfer(
+                            "sender exceeded the size it declared".into(),
+                        ));
+                    }
                     writer
                         .write_all(&frame.payload)
                         .await

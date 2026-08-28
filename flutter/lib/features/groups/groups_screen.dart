@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
+import 'group_chat_screen.dart';
 import '../../widgets/common.dart';
 import 'join_dialog.dart';
 
@@ -133,6 +134,87 @@ class _GroupsScreenState extends State<GroupsScreen> {
     _say(error ?? 'Declined — ${_nameFor(invite.from)} is not told');
   }
 
+  /// Open the group's conversation.
+  ///
+  /// The engine, the FFI, the CLI and this app's repository all carried
+  /// `send` and `history` from the start, and nothing on this screen reached
+  /// them — a group could be created and joined and never spoken in.
+  void _open(Group group) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => GroupChatScreen(group: group, nameFor: _nameFor),
+      ),
+    );
+  }
+
+  /// Offer a device a place in the group.
+  ///
+  /// Only devices discovery can currently reach are offered: the engine dials
+  /// the peer itself and refuses a target with no address, so listing a device
+  /// it cannot reach would turn "invite" into a failure to diagnose.
+  ///
+  /// The disclosure is stated before the invitation goes, not after — accepting
+  /// tells every member who the invitee is, and tells the invitee who everyone
+  /// is, and neither can be undone.
+  Future<void> _invite(Group group) async {
+    final state = AppScope.of(context);
+    final already = group.members.toSet();
+    final candidates = state.trust.items
+        .where((d) => !already.contains(d.id))
+        .where((d) => state.device.peerTarget(d.id) != null)
+        .toList();
+
+    if (candidates.isEmpty) {
+      _say(
+        'No device to invite: PeerBeam has to see a trusted device on the '
+        'network before it can offer it a place.',
+      );
+      return;
+    }
+
+    final chosen = await showDialog<TrustedDevice>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text('Invite to ${group.name}'),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpace.md,
+              0,
+              AppSpace.md,
+              AppSpace.sm,
+            ),
+            child: Text(
+              'They will see who is already in the group, and everyone in it '
+              'will see them if they accept. That cannot be undone.',
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ),
+          for (final d in candidates)
+            SimpleDialogOption(
+              key: Key('invite-candidate-${d.id}'),
+              onPressed: () => Navigator.of(dialogContext).pop(d),
+              child: Text(d.name),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null || !mounted) return;
+
+    final target = state.device.peerTarget(chosen.id);
+    if (target == null) {
+      _say('${chosen.name} went off the network before the invitation went.');
+      return;
+    }
+    final error = await state.groups.invite(group.id, target);
+    if (!mounted) return;
+    _say(
+      error ??
+          'Invited ${chosen.name} — nothing changes on their device until '
+          'they accept',
+    );
+  }
+
   Future<void> _leave(Group group) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -254,6 +336,8 @@ class _GroupsScreenState extends State<GroupsScreen> {
                     _GroupCard(
                       group: group,
                       nameFor: _nameFor,
+                      onOpen: () => _open(group),
+                      onInvite: () => _invite(group),
                       onRename: () => _rename(group),
                       onLeave: () => _leave(group),
                     ),
@@ -271,12 +355,16 @@ class _GroupCard extends StatelessWidget {
   const _GroupCard({
     required this.group,
     required this.nameFor,
+    required this.onOpen,
+    required this.onInvite,
     required this.onRename,
     required this.onLeave,
   });
 
   final Group group;
   final String Function(String id) nameFor;
+  final VoidCallback onOpen;
+  final VoidCallback onInvite;
   final VoidCallback onRename;
   final VoidCallback onLeave;
 
@@ -294,6 +382,18 @@ class _GroupCard extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(group.name, style: theme.textTheme.titleMedium),
+                ),
+                IconButton(
+                  key: Key('open-${group.id}'),
+                  tooltip: 'Open the conversation',
+                  icon: const Icon(Icons.forum_outlined),
+                  onPressed: onOpen,
+                ),
+                IconButton(
+                  key: Key('invite-to-${group.id}'),
+                  tooltip: 'Invite a device',
+                  icon: const Icon(Icons.person_add_alt_1_outlined),
+                  onPressed: onInvite,
                 ),
                 IconButton(
                   tooltip: 'Rename',

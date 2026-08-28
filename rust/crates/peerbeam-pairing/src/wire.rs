@@ -61,19 +61,31 @@ mod hex_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        if s.len() % 2 != 0 {
-            return Err(serde::de::Error::custom("odd-length hex"));
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(serde::de::Error::custom))
-            .collect()
+        // `peerbeam_domain::hex`, not a slice loop: `&s[i..i + 2]` indexes by
+        // bytes and panics when a character is wider than one. A peer reaches
+        // that with the ASCII JSON escape `"\u20aca"`, and the panic lands
+        // inside a channel actor — before this peer is approved.
+        peerbeam_domain::hex::decode(&s).ok_or_else(|| serde::de::Error::custom("invalid hex"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A peer could kill the pairing channel with one frame, before being
+    /// approved.** The payload below is pure ASCII on the wire — `\u20ac` is a
+    /// JSON escape — so nothing upstream can filter it; serde unescapes it to a
+    /// three-byte `€`, and the old decoder sliced two bytes into it and
+    /// panicked inside the channel actor.
+    #[test]
+    fn a_multibyte_proof_is_refused_rather_than_panicking() {
+        // Written as the escape it is on the wire, so this test carries the
+        // same ASCII bytes a hostile peer would send.
+        let frame = br#"{"Prove":{"proof":"\u20aca"}}"#;
+        let got: Result<PairingMsg, _> = serde_json::from_slice(frame);
+        assert!(got.is_err(), "refused, and above all not a panic");
+    }
 
     #[test]
     fn messages_round_trip() {

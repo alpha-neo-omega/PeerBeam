@@ -164,7 +164,19 @@ impl MessageHandler for SyncHandler {
         };
         match frame.message_type.get() {
             MSG_MANIFEST => {
-                // An answer to something we asked.
+                // An answer to something we asked — and we only ask a device
+                // the user approved, so an answer from anything else was not
+                // one we asked for. Without this, any peer that completes a
+                // handshake could push manifests into a sink nobody is
+                // draining: `sync_incoming` is an unbounded channel whose
+                // receiver only exists while a sync is running, so the frames
+                // accumulate for the life of the session.
+                //
+                // The same narrowing as `MSG_CHUNKMAP` and `MSG_CHUNK_DATA`
+                // below, which had it; this arm was missed.
+                if !self.trust.is_approved(peer) {
+                    return Ok(());
+                }
                 if let Ok(m) = Manifest::from_frame(&frame) {
                     (self.incoming)(m);
                 }
@@ -286,6 +298,9 @@ impl MessageHandler for SyncHandler {
             // we asked for. It is not full request/response correlation — that
             // wants a request id on the wire, which these messages do not carry —
             // so it narrows who can do it rather than closing it outright.
+            //
+            // `MSG_MANIFEST` above carries the same guard, and did not until it
+            // was noticed that an unapproved peer could fill its sink.
             MSG_CHUNKMAP => {
                 if !self.trust.is_approved(peer) {
                     return Ok(());
@@ -500,6 +515,51 @@ mod tests {
         );
         let _ = slot.set(DeviceId::from("pb-bob"));
         (h, got, dir)
+    }
+
+    /// **The third answer arm, which was missed.** `MSG_MANIFEST` is a reply to
+    /// a manifest request, and the sink it feeds (`sync_incoming`) is an
+    /// unbounded channel whose receiver only exists while a sync is running —
+    /// so an unapproved peer could push manifests that are retained for the
+    /// life of the session and never drained. The comment on the two arms below
+    /// claimed they were "the only two arms here that were" ungated; this one
+    /// was too.
+    #[tokio::test]
+    async fn a_manifest_from_an_unapproved_device_is_dropped() {
+        let (dir, shares) = tree();
+        let got: Arc<Mutex<Vec<Manifest>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let (h, slot) = SyncHandler::with_chunks(
+            shares,
+            unapproved_trust(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(move |m| g.lock().unwrap().push(m)),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let _ = slot.set(DeviceId::from("pb-bob"));
+
+        h.handle(
+            Manifest {
+                path: "share".into(),
+                files: Vec::new(),
+                denied: false,
+                truncated: false,
+            }
+            .to_frame(ChannelId::new(1))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "a manifest nobody asked this device for must not reach the sink"
+        );
+        drop(dir);
     }
 
     /// **Unsolicited answers from a stranger are dropped.** `MSG_CHUNK_DATA` and
