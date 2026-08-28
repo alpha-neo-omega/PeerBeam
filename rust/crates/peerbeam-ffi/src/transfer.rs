@@ -5545,13 +5545,44 @@ impl Manager {
         // any stream is coming raised a phantom "incoming file" approval for
         // every chat message — and, with auto-accept on, wrote a failed-transfer
         // history row for it. Wait for the stream first, bounded.
-        let incoming_ch = match tokio::time::timeout(STREAM_GRACE, session.next_incoming()).await {
-            Ok(Some(c)) => c,
-            // No stream channel: a chat-only dial. Close quietly — no `active`
-            // entry, no transfer_queued, no approval prompt, no history row.
-            Ok(None) | Err(_) => {
-                session.close().await;
-                return;
+        // **Re-armed while the peer is doing something.**
+        //
+        // A folder sync carries no transfer stream: it runs on the SYNC
+        // channels, which `next_incoming` never yields. So a peer fetching a
+        // shared folder from this device was hung up on after `STREAM_GRACE`,
+        // mid-fetch, while its own client budgeted `SYNC_BUDGET` — five times
+        // longer — for the same operation. That constant mismatch is the proof
+        // it was never intended.
+        //
+        // The deadline still exists, and still closes a session that is truly
+        // idle. What it now asks is whether any channel moved a frame during
+        // the window; a peer that is talking is not a chat-only dial.
+        // `SESSION_MAX_IDLE_ROUNDS` caps the total wait so a peer trickling one
+        // frame a minute cannot hold a session open forever.
+        let incoming_ch = {
+            let mut rounds = 0u32;
+            let mut seen = session_frames(&session).await;
+            loop {
+                match tokio::time::timeout(STREAM_GRACE, session.next_incoming()).await {
+                    Ok(Some(c)) => break c,
+                    // No stream channel: a chat-only dial. Close quietly — no
+                    // `active` entry, no transfer_queued, no approval prompt,
+                    // no history row.
+                    Ok(None) => {
+                        session.close().await;
+                        return;
+                    }
+                    Err(_) => {
+                        let now = session_frames(&session).await;
+                        rounds += 1;
+                        if now > seen && rounds < SESSION_MAX_IDLE_ROUNDS {
+                            seen = now;
+                            continue;
+                        }
+                        session.close().await;
+                        return;
+                    }
+                }
             }
         };
 
@@ -6108,6 +6139,31 @@ const PEER_PROGRESS_GRACE: Duration = Duration::from_secs(3);
 /// backlog: cutting it off early would mark in-flight messages Sent and lose
 /// them (see `flush_to_session`).
 const STREAM_GRACE: Duration = Duration::from_secs(60);
+
+/// How many `STREAM_GRACE` windows a session may be extended by ongoing traffic
+/// before it is closed anyway.
+///
+/// A backstop, not a budget: without it a peer that moves one frame per window
+/// keeps a session alive indefinitely. Ten windows is longer than `SYNC_BUDGET`,
+/// so a legitimate folder sync finishes well inside it.
+const SESSION_MAX_IDLE_ROUNDS: u32 = 10;
+
+/// Total frames moved on every channel of a session, as an activity signal.
+///
+/// Zero on a session whose channels cannot be read — a session that cannot
+/// answer is not one to keep waiting on.
+async fn session_frames(session: &crate::session_exec::Session) -> u64 {
+    session
+        .handle
+        .channels()
+        .await
+        .map(|cs| {
+            cs.iter()
+                .map(|c| c.stats.frames_sent + c.stats.frames_recv)
+                .sum()
+        })
+        .unwrap_or(0)
+}
 
 /// How many times a send re-opens a transfer channel on the same session
 /// before giving up.

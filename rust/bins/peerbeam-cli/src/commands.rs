@@ -30,6 +30,10 @@ use crate::exit::{CliError, CliResult};
 use crate::output::Ctx;
 use crate::{history, prompt, resolve};
 
+/// How long a receive loop waits for a peer to open its channel before giving
+/// up on that connection and going back to accepting others. See the call site.
+pub(crate) const ACCEPT_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> CliResult {
     // Make this process able to *receive* group membership frames before any
     // session can be built. Best-effort: a config that cannot be read is a
@@ -2166,8 +2170,34 @@ async fn serve_loop(
                 )
                 .await;
 
-                // Await the peer's transfer channel.
-                let incoming_ch = match session.next_incoming().await {
+                // Await the peer's transfer channel, **bounded**.
+                //
+                // This await used to have no deadline, inline in the accept
+                // arm: one peer that completed a handshake and then opened no
+                // channel parked the whole loop. No further connection was
+                // accepted and the outbox drain never fired again — a receiver
+                // that looked alive and did nothing, for as long as that peer
+                // held on.
+                //
+                // A bound is not the whole fix. The right shape is to spawn the
+                // per-connection body so a slow peer cannot occupy the accept
+                // arm at all (`peerbeam-ffi`'s serve loop does that), which
+                // changes this loop from strictly serialised to concurrent —
+                // too large a change to make alongside everything else, and it
+                // needs the staging-claim work that just landed as a
+                // prerequisite. Recorded as a known issue rather than half-done.
+                //
+                // Generous on purpose: a channel that has not opened in two
+                // minutes is a peer that is not coming, and a tighter bound
+                // fires on a working peer under load — which is exactly how an
+                // earlier 30s guess broke CI.
+                let incoming_ch = match tokio::time::timeout(
+                    ACCEPT_CHANNEL_TIMEOUT,
+                    session.next_incoming(),
+                )
+                .await
+                .unwrap_or(None)
+                {
                     Some(c) => c,
                     None => {
                         if ctx.json {

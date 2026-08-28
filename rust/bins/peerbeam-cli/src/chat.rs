@@ -2120,7 +2120,19 @@ async fn watch(ctx: &Ctx, port: Option<u16>, path_override: Option<&str>) -> Cli
                 // would say nothing to this side's operator and nothing about
                 // *why* — and an unexplained discard is exactly the kind of
                 // thing a later change "tidies up" into an accept.
-                while let Some(incoming_ch) = session.next_incoming().await {
+                // Bounded for the same reason as the receive loop's own
+                // accept: an unbounded wait here lets one peer that opens no
+                // channel park `chat watch` entirely, so nothing else connects
+                // and the outbox never drains. See
+                // `commands::ACCEPT_CHANNEL_TIMEOUT` for why the real fix is
+                // spawning the per-connection body rather than a deadline.
+                while let Some(incoming_ch) = tokio::time::timeout(
+                    crate::commands::ACCEPT_CHANNEL_TIMEOUT,
+                    session.next_incoming(),
+                )
+                .await
+                .unwrap_or(None)
+                {
                     if incoming_ch.channel_type != ChannelType::PIPE {
                         continue; // a transfer stream: discarded unread, as before
                     }
