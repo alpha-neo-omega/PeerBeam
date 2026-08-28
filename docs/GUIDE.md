@@ -1,7 +1,7 @@
 # PeerBeam — Install & CLI Guide
 
 Everything needed to get PeerBeam running on a machine and drive it from a
-terminal. Written against **v0.10.0**.
+terminal. Written against **v0.11.0**.
 
 - Full CLI reference: [CLI.md](CLI.md)
 - Platform notes: [ANDROID.md](ANDROID.md) · [DESKTOP.md](DESKTOP.md)
@@ -248,6 +248,29 @@ peerbeam chat cancel laptop <MSG-ID>
 
 Messages and files queue for an offline peer and are delivered when it returns.
 `chat search` reads only this device's stored history — nothing goes on the wire.
+
+### Groups
+
+A conversation a set of devices share — everyone can reply to everyone.
+
+```bash
+peerbeam group create "Work Trip"
+peerbeam group invite "Work Trip" alices-laptop
+peerbeam group list                       # groups, and invitations waiting
+peerbeam group accept <GROUP-ID>          # join, and tell the members
+peerbeam group send "Work Trip" "six works for me"
+peerbeam group history "Work Trip"
+peerbeam group leave "Work Trip"
+```
+
+**Everyone in a group learns who everyone else is**, and that cannot be undone.
+That is the whole trade: a Space sends to several devices without any of them
+learning about the others, and has no group replies. Use a Space when nobody
+should know who else received it, a Group when everyone is meant to.
+
+There is no server and no host — a group message is N ordinary one-to-one sends,
+and nothing here can be asked "who is in this group?" because every member
+already holds the roster. Full detail in [GROUPS.md](GROUPS.md).
 
 ### Trust and permissions
 

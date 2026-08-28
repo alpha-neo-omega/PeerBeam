@@ -8,6 +8,64 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 Nothing yet.
 
+## [0.11.0] - 2026-08-28
+
+### Added
+- **Groups.** A conversation a set of devices share: everyone holds the same
+  roster, so a reply reaches everyone — and everyone in it learns who everyone
+  else is. No server, no host, no group key; a message is N ordinary one-to-one
+  sends. `peerbeam group create|invite|accept|send|history|leave`, and a Groups
+  screen in the app with the conversation and the invite action. Permitted by
+  amendment A2 on eight binding conditions. See `docs/GROUPS.md`.
+- **A receive prompt in the app**, with a switch in Settings to turn it off, and
+  per-conversation auto-accept.
+- **Android Kotlin unit tests run in CI.** Eighteen of them existed and ran
+  nowhere.
+
+### Fixed
+- **Files over 256 MiB never synced.** Both delta paths refused an over-large
+  chunk map and handed the file to a whole-file fallback whose only handler
+  emitted an event nothing consumes — so the file never arrived, nothing failed,
+  and the sync still counted it as fetched. Chunks are now fetched a window at a
+  time and written as they arrive.
+- **A failed sync destroyed the local copy.** It wrote straight to the
+  destination; it now stages and renames. Files that did not arrive are named
+  rather than counted among the fetched.
+- **A peer could write outside the sync root on Windows.** `..\..\x` is a
+  single `/`-separated segment, which Windows expanded with its own separator;
+  a rooted segment such as `C:\evil` discarded the destination entirely.
+- **The approved size was not a bound.** A sender could declare a small file,
+  stream an arbitrarily large one, and finish with an honest checksum — so it
+  was verified and published under the approved name.
+- **A peer could kill a channel before approval** with hex containing a
+  character wider than one byte, reachable through a plain JSON escape.
+- **Settings could silently reset.** The document was written with a truncating
+  call, so a torn write left a file that could not be parsed and defaults were
+  written in its place — including `require_pairing_confirmation`, which
+  defaults off. Now temp + fsync + rename.
+- **The `files` permission is enforced by the CLI**, in both directions. It
+  never was. Only the refusal was added: a device that was never approved is
+  unaffected, so a headless receiver keeps working.
+- **A receiver claimed a file had arrived before it was written.** `Verify` went
+  out before the flush, close and rename it described.
+- **Concurrent folder receives shared one staging file** and published a mixture
+  of two senders' bytes.
+- **Concurrent group joins lost a member**, with no peer able to repair it.
+- **A CLI receiver could be parked by one silent peer.** Each connection is now
+  served on its own task: 2 seconds against 118.
+- **The app froze on every call that dialled a peer** — seven of them, including
+  marking a conversation read. They now run off the UI isolate.
+- Clearing history reported success over a failed write; notes sync from the app
+  could never succeed; Android never reported its battery; tapping a "message"
+  in History read a peer-named file of any size into memory.
+- The trust store is written `0600`. Two message types could be pushed into
+  undrained queues by any handshaken peer, and an unauthenticated LAN announce
+  could grow the device list without limit.
+- `set-version.sh` increments the Android build number. It preserved it, and it
+  was bumped by hand every release — a miss would have shipped an APK that
+  Android refuses to install over the previous one, failing on the phone rather
+  than in CI.
+
 ## [0.10.0] - 2026-08-20
 
 ### Added

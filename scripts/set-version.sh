@@ -10,9 +10,25 @@ echo "$VER" > VERSION
 # Rust workspace version (rust/Cargo.toml [workspace.package]).
 sed -i -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$VER\"/" rust/Cargo.toml
 
-# Flutter version (keep the +build suffix, default +1).
-build="$(grep -m1 '^version:' flutter/pubspec.yaml | sed -E 's/.*\+([0-9]+).*/\1/')"
-[ "$build" = "$(grep -m1 '^version:' flutter/pubspec.yaml)" ] && build=1
+# Flutter version, and the Android build number **incremented** with it.
+#
+# The `+N` suffix is Android's `versionCode`, and Android refuses to install a
+# package whose code is not greater than the installed one. It does not fail
+# loudly at build time — it fails at *install* time, on a user's phone, as
+# "app not installed". So a release that reuses the previous number is one
+# nobody can upgrade to, and nothing in CI would have said so.
+#
+# This used to only preserve the existing number, and it was bumped by hand
+# every release (14 → 15 → 16 for v0.8.2 → v0.9.0 → v0.10.0). That worked
+# until somebody forgot. Bumping only when the marketing version actually
+# changes keeps a re-run of `set-version.sh` on the same version idempotent.
+current="$(grep -m1 '^version:' flutter/pubspec.yaml)"
+build="$(printf '%s' "$current" | sed -E 's/.*\+([0-9]+).*/\1/')"
+[ "$build" = "$current" ] && build=0
+prev_ver="$(printf '%s' "$current" | sed -E 's/^version: ([0-9.]+).*/\1/')"
+if [ "$prev_ver" != "$VER" ]; then
+  build=$((build + 1))
+fi
 sed -i -E "s/^version: .*/version: $VER+$build/" flutter/pubspec.yaml
 
 # Arch package version (packaging/arch/PKGBUILD).
