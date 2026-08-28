@@ -180,4 +180,43 @@ void main() {
     );
     expect(find.textContaining('quic handshake timed out'), findsNothing);
   });
+
+  testWidgets('a file the peer could not send is named, not counted as synced', (
+    tester,
+  ) async {
+    final realPicker = FileSelectorPlatform.instance;
+    FileSelectorPlatform.instance = _FakeDirectoryPicker();
+    addTearDown(() => FileSelectorPlatform.instance = realPicker);
+
+    // What the engine reports when a fetch did not produce a file: the pass
+    // set out to fetch two, and one of them never arrived. Before this was
+    // reported, the user was told only "2 in" — a file that silently never
+    // synced looked exactly like one that did.
+    final fake = FakePeerBeam()
+      ..shared[''] = [const BrowseEntry(name: 'photos', isDir: true, size: 0)]
+      ..shared['photos'] = const []
+      ..syncResult = const SyncResult(
+        fetching: 2,
+        pushing: 0,
+        deleted: 0,
+        renamed: 0,
+        conflicts: [],
+        truncated: false,
+        failed: ['holiday.mov'],
+      );
+    await _open(tester, fake);
+
+    await tester.tap(find.text('photos'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    await tester.tap(find.byIcon(Icons.sync));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('holiday.mov'),
+      findsOneWidget,
+      reason: 'the file that did not arrive is named',
+    );
+  });
 }

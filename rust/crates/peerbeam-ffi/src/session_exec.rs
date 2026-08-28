@@ -633,34 +633,6 @@ pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_
     .flatten()
 }
 
-/// Ask a peer to send one file it shares.
-///
-/// Fire-and-forget: the bytes arrive as an ordinary inbound transfer, through
-/// the same accept/approve path as any other file, because they *are* an
-/// ordinary transfer. Nothing here waits for them.
-pub async fn request_file(session: &Session, path: &str) -> bool {
-    let req = peerbeam_sync::FileRequest {
-        path: path.to_string(),
-    };
-    match session
-        .channels
-        .send(Lane::SyncAsk, |c| {
-            req.to_frame(c).map_err(|e| e.to_string())
-        })
-        .await
-    {
-        Ok(()) => true,
-        Err((_, e)) => {
-            // The `bool` is the caller's contract, and its one caller drops it:
-            // nothing waits for these bytes, so a request that never left would
-            // otherwise be indistinguishable from a file the peer chose not to
-            // send. Logged here, where the reason is still known.
-            tracing::warn!(%path, error = %e, "file request not sent");
-            false
-        }
-    }
-}
-
 /// Whether `caps` — an **already-negotiated** (intersected) set — carries
 /// folder sync.
 pub fn caps_support_sync(caps: &CapabilitySet) -> bool {
@@ -1109,6 +1081,23 @@ async fn establish(
         let peer_for_files = peer_device.clone();
         crate::runtime::spawn(async move {
             while let Some(path) = rx.recv().await {
+                // **This does not send the file, and nothing else does.**
+                // `sync_file_requested` is emitted and no code in this
+                // repository consumes it — not the Flutter event model, not the
+                // SDK, not the docs. A peer that asks for a whole file gets
+                // nothing back and no error, so it is logged here where the
+                // request is known.
+                //
+                // Nothing asks any more: both delta paths stream, so a large
+                // file no longer falls back to a whole-file request. The
+                // message and its handler stay because an older peer may still
+                // send one, and answering with silence is at least consistent
+                // with what it has always done.
+                tracing::warn!(
+                    path = %path.to_string_lossy(),
+                    "a peer asked for a whole file over the sync channel; \
+                     this build does not serve that request"
+                );
                 crate::events::emit(&serde_json::json!({
                     "type": "sync_file_requested",
                     "timestamp": chrono::Utc::now().to_rfc3339(),

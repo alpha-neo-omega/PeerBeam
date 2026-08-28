@@ -469,30 +469,6 @@ pub async fn request_manifest(session: &Session, path: &str) -> Option<peerbeam_
     .flatten()
 }
 
-/// Ask a peer to send one file it shares. Fire-and-forget: the bytes arrive as
-/// an ordinary inbound transfer.
-pub async fn request_file(session: &Session, path: &str) -> bool {
-    let Ok((channel, _lane)) = open_guarded(&session.handle, ChannelType::SYNC).await else {
-        return false;
-    };
-    let req = peerbeam_sync::FileRequest {
-        path: path.to_string(),
-    };
-    let Ok(frame) = req.to_frame(channel) else {
-        return false;
-    };
-    session
-        .handle
-        .send_on_channel(
-            channel,
-            peerbeam_sync::FileRequest::message_type(),
-            frame.flags,
-            frame.payload,
-        )
-        .await
-        .is_ok()
-}
-
 /// Ask a peer for one listing and wait for its answer, bounded.
 ///
 /// The CLI has no session run-loop of its own to route the response through, so

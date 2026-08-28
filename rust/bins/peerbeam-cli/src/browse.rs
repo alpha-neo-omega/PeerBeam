@@ -167,51 +167,37 @@ async fn fetch_by_delta(
         chunks: answer.chunks,
     };
 
-    // **Refused before it is fetched, not after** — the same guard as the FFI's
-    // delta path, and for the same reason: `reassemble` checks this ceiling only
-    // once every chunk is already downloaded and resident, so on this path it
-    // protected nothing. Answering `None` hands the file to the whole-file
-    // fallback, which streams instead of buffering.
-    if !peerbeam_sync::fits_in_memory(&map) {
-        return None;
-    }
-
     let have = index.chunks().have(folder);
-    let need = peerbeam_sync::plan_delta(&map, &have);
-    let fetched = if need.fetch.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        session_transfer::request_chunks(session, remote_path, &need.fetch).await
-    };
-
     let local = index.load(folder).ok()?;
-    let rebuilt = peerbeam_sync::reassemble(&map, |h| {
-        // What just arrived, else what is already on disk somewhere in this
-        // folder. `reassemble` verifies every chunk either way, so a stale
-        // local file cannot corrupt the result.
-        fetched
-            .get(h)
-            .cloned()
-            .or_else(|| index.chunks().read(folder, into, &local, h))
-    })?;
 
     // **`local_path`, not `join`.** `write_to` is a path from the peer's
     // manifest: `reconcile` emits a `Fetch` for any remote path absent from the
     // local index, and nothing between `Manifest::from_frame` and here checks
     // its shape — the manifest decoder bounds length and count, not content. So
-    // `into.join("../../../../.bashrc")` resolves outside the sync root and this
-    // `fs::write` would put peer-chosen bytes there, with the app's privileges.
+    // `into.join("../../../../.bashrc")` resolves outside the sync root and the
+    // write would put peer-chosen bytes there, with this process's privileges.
     // The reassembly hash proves nothing about that: the peer supplied the map
     // it is checked against.
     //
     // `local_path` keeps only real components, so a hostile path lands inside
     // the root or nowhere.
     let dest = peerbeam_domain::local_path(into, write_to);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    std::fs::write(&dest, &rebuilt).ok()?;
-    Some(need.reuse_bytes)
+
+    // Shared with the FFI rather than a second copy of it — this function and
+    // its opposite number had the same two defects because they were the same
+    // code written twice. `fetch_streamed` drops the size ceiling (it streams
+    // instead of buffering) and stages the write, so a failure no longer
+    // truncates the user's file.
+    peerbeam_sync::fetch_streamed(
+        &map,
+        &dest,
+        &have,
+        |h| index.chunks().read(folder, into, &local, h),
+        |hashes| async move {
+            session_transfer::request_chunks(session, remote_path, &hashes).await
+        },
+    )
+    .await
 }
 
 /// Every file under `root`, as the settling rule wants to see it.
@@ -344,6 +330,7 @@ async fn sync_once(
         .map_err(|e| CliError::Other(e.to_string()))?;
 
     let mut delta_saved: u64 = 0;
+    let mut failed: Vec<String> = Vec::new();
     for a in &actions {
         // A conflict is fetched too — keeping both copies means having both —
         // but under its conflict name, so the local file is never touched.
@@ -357,10 +344,13 @@ async fn sync_once(
 
         match fetch_by_delta(&session, &index, &args.path, &into, &remote_path, &write_to).await {
             Some(saved) => delta_saved += saved,
-            // No chunk map, a missing chunk, or an unwritable file: ask for the
-            // whole thing. Slower, and always correct.
+            // Named, not silently retried. This used to ask for the whole file
+            // — "slower, and always correct" — but that request reaches a
+            // handler whose only action is emitting an event nothing consumes,
+            // so the file never arrived and the run still reported it under
+            // `fetching`.
             None => {
-                session_transfer::request_file(&session, &remote_path).await;
+                failed.push(rel.clone());
             }
         }
     }
@@ -368,6 +358,10 @@ async fn sync_once(
 
     if ctx.json {
         ctx.json_line(&serde_json::json!({
+            // `fetching` is what the pass set out to fetch; `failed` names what
+            // did not arrive. Reporting only the first said a file had been
+            // fetched when nothing had been written.
+            "failed": failed,
             "fetching": outcome.fetching,
             "renamed": outcome.renamed,
             "pushing": outcome.pushing,
@@ -392,6 +386,14 @@ async fn sync_once(
             ctx.bold("conflicts")
         ));
         for name in &outcome.conflicts {
+            ctx.line(&format!("  {name}"));
+        }
+    }
+    if !failed.is_empty() {
+        // Named individually for the same reason conflicts are: "2 failed"
+        // does not tell anyone which file they are still missing.
+        ctx.line(&format!("{} — not fetched:", ctx.bold("failed")));
+        for name in &failed {
             ctx.line(&format!("  {name}"));
         }
     }

@@ -62,6 +62,13 @@ class _BrowseScreenState extends State<BrowseScreen> {
           if (r.deleted > 0) '${r.deleted} deleted',
         ];
         message = parts.isEmpty ? 'Syncing' : 'Syncing: ${parts.join(', ')}';
+        if (r.failed.isNotEmpty) {
+          // Named, and said plainly. A file the peer could not give us is the
+          // one thing about a sync the user has to know, and it used to be the
+          // one thing they were not told.
+          message +=
+              " — couldn't fetch ${r.failed.length == 1 ? r.failed.single : r.failed.join(', ')}";
+        }
         if (r.conflicts.isNotEmpty) {
           // Named, not counted: a conflict is a decision, and "2 conflicts"
           // tells nobody which files to look at.

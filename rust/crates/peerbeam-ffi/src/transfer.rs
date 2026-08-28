@@ -3773,18 +3773,28 @@ impl Manager {
         let me = self.clone();
         let request_path = path.clone();
         let into_for_fetch = into.clone();
-        crate::runtime::block_on(async move {
+        let wanted_count = wanted.len();
+        let failed: Vec<String> = crate::runtime::block_on(async move {
             // Whatever arrived before the deadline is kept: files land as they
             // are received, so giving up here leaves a partially-synced folder
             // rather than undoing anything. The next sync picks up the rest.
-            let _ = tokio::time::timeout(
+            // On timeout the budget ran out mid-fetch, and which files made it
+            // is not known from here — an empty failure list, so the pass reads
+            // as unfinished rather than as everything having arrived.
+            tokio::time::timeout(
                 left(),
                 me.request_files(device, request_path, into_for_fetch, wanted),
             )
-            .await;
+            .await
+            .unwrap_or_default()
         });
 
         Ok(json!({
+            // `fetching` is what this pass set out to fetch, and `failed` names
+            // what did not arrive. Reporting only the first told the user a
+            // file had been fetched when nothing had been written.
+            "failed": failed,
+            "fetched": wanted_count.saturating_sub(failed.len()),
             "fetching": outcome.fetching,
             "renamed": outcome.renamed,
             "pushing": outcome.pushing,
@@ -3920,8 +3930,16 @@ impl Manager {
         manifest
     }
 
-    /// Ask the peer for each wanted file. Best effort: the bytes arrive as
-    /// ordinary transfers, so nothing here waits for them.
+    /// Fetch each wanted file, and report the ones that did not arrive.
+    ///
+    /// **Returns the failures rather than swallowing them.** This used to end
+    /// by asking for the whole file, on the reasoning that a failed delta is "a
+    /// reason to send the file the slow way, never a reason to stop the sync".
+    /// That request went to a handler whose only action is emitting a
+    /// `sync_file_requested` event that nothing in this repository consumes, so
+    /// the file never came and nobody was told — while `sync_pull` still
+    /// counted it in `fetching`. Naming the failures is what that count was
+    /// missing.
     async fn request_files(
         self: &Arc<Self>,
         device: Device,
@@ -3931,38 +3949,33 @@ impl Manager {
         // the peer's copy lands beside the user's under its conflict name,
         // never on top of it.
         wanted: Vec<(String, String)>,
-    ) {
+    ) -> Vec<String> {
         let Some(session) = self.sync_session(&device).await else {
-            return;
+            // Every wanted file failed, and for one reason: the peer could not
+            // be reached. Reported as such rather than as nothing to do.
+            return wanted.into_iter().map(|(rel, _)| rel).collect();
         };
         let index = self.sync_index();
+        let mut failed = Vec::new();
         for (rel, write_to) in wanted {
             let remote = format!("{folder}/{rel}");
-            // Delta first; the whole file only when it cannot be used. Every
-            // reason to give up — no chunk map, a chunk that never arrived,
-            // bytes that did not verify — is a reason to send the file the slow
-            // way, never a reason to stop the sync.
+            // A failure here is per-file and never stops the sync: the rest of
+            // the folder is still worth fetching.
             if fetch_by_delta(&session, &index, &folder, &into, &remote, &write_to)
                 .await
                 .is_none()
             {
-                // The whole-file path writes under the name the *sender*
-                // states, so a conflict cannot use it: it would land on the
-                // user's file again. Skipping loses the peer's copy of a
-                // conflicting file, which is recoverable by syncing again;
-                // overwriting is not.
-                if write_to == rel {
-                    crate::session_exec::request_file(&session, &remote).await;
-                } else {
-                    tracing::warn!(
-                        path = %rel,
-                        keep_as = %write_to,
-                        "conflict copy not fetched: delta failed and a whole-file \
-                         request would overwrite the local file"
-                    );
-                }
+                tracing::warn!(path = %rel, "file not synced");
+                failed.push(rel);
             }
         }
+        // Closed now that nothing outlives this call. The session used to be
+        // dropped so the whole-file request above could still be answered — and
+        // because the pump ignores a dropped handle, that leaked one session
+        // and one QUIC connection per sync pass, forever. `sync_watch` runs a
+        // pass every 30 seconds.
+        session.close().await;
+        failed
     }
 
     /// A session for folder sync, or `None` if the peer cannot take one.
@@ -6644,56 +6657,38 @@ async fn fetch_by_delta(
         chunks: answer.chunks,
     };
 
-    // **Refused before it is fetched, not after.** `reassemble` enforces this
-    // same ceiling, but it runs once every chunk is already downloaded and
-    // resident — so the guard protected nothing on this path. The declared size
-    // is the peer's figure, and on a 32-bit ABI an over-large one aborts the
-    // process outright (allocation failure is `handle_alloc_error`, not an
-    // `Err`), which is why the whole-file fallback below could never be reached.
-    // Answering `None` here hands this file to that fallback, which streams.
-    if !peerbeam_sync::fits_in_memory(&map) {
-        tracing::warn!(
-            path = remote_path,
-            declared = map.total_bytes(),
-            ceiling = peerbeam_sync::MAX_REASSEMBLE,
-            "delta refused: the peer's chunk map is larger than reassembly allows"
-        );
-        return None;
-    }
-
     let have = index.chunks().have(folder);
-    let need = peerbeam_sync::plan_delta(&map, &have);
-    let fetched = if need.fetch.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        crate::session_exec::request_chunks(session, remote_path, &need.fetch).await
-    };
-
     let local = index.load(folder).ok()?;
-    let rebuilt = peerbeam_sync::reassemble(&map, |h| {
-        fetched
-            .get(h)
-            .cloned()
-            .or_else(|| index.chunks().read(folder, into, &local, h))
-    })?;
 
     // **`local_path`, not `join`.** `write_to` is a path from the peer's
     // manifest: `reconcile` emits a `Fetch` for any remote path absent from the
     // local index, and nothing between `Manifest::from_frame` and here checks
     // its shape — the manifest decoder bounds length and count, not content. So
-    // `into.join("../../../../.bashrc")` resolves outside the sync root and this
-    // `fs::write` would put peer-chosen bytes there, with the app's privileges.
-    // The reassembly hash proves nothing about that: the peer supplied the map
-    // it is checked against.
+    // `into.join("../../../../.bashrc")` resolves outside the sync root and the
+    // write would put peer-chosen bytes there, with the app's privileges. The
+    // reassembly hash proves nothing about that: the peer supplied the map it
+    // is checked against.
     //
     // `local_path` keeps only real components, so a hostile path lands inside
     // the root or nowhere.
     let dest = peerbeam_domain::local_path(into, write_to);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    std::fs::write(&dest, &rebuilt).ok()?;
-    Some(need.reuse_bytes)
+
+    // The size ceiling that used to stand here is gone with the buffering it
+    // guarded: `fetch_streamed` fetches a window at a time and writes as it
+    // goes, so a large file is no longer refused and handed to a whole-file
+    // fallback that did nothing. It also stages and renames, so a failure
+    // leaves the user's copy alone. Shared with the CLI, which had its own
+    // copy of this with both defects.
+    peerbeam_sync::fetch_streamed(
+        &map,
+        &dest,
+        &have,
+        |h| index.chunks().read(folder, into, &local, h),
+        |hashes| async move {
+            crate::session_exec::request_chunks(session, remote_path, &hashes).await
+        },
+    )
+    .await
 }
 
 /// A stable key for one watched (share path → local directory) pair.

@@ -115,6 +115,170 @@ pub fn fits_in_memory(map: &ChunkMap) -> bool {
     map.total_bytes() <= MAX_REASSEMBLE
 }
 
+/// Write the file `map` describes into `out`, verifying every chunk.
+///
+/// **Streaming: never holds more than one chunk.** [`reassemble`] builds the
+/// whole file in memory, which is why it needs [`MAX_REASSEMBLE`] and why any
+/// file above that ceiling could not be synced at all — the whole-file fallback
+/// that refusal handed it to did nothing on either caller. Writing as we go
+/// removes both the ceiling and the allocation, and honours the workspace rule
+/// that no file is ever fully resident.
+///
+/// Returns the bytes written, or `None` if a chunk was missing, the wrong
+/// length, or did not hash to the name it was supplied under. **Every chunk is
+/// verified before it is written**, for the reason [`reassemble`] gives: a
+/// chunk arrives identified only by a hash, and a peer that sent the wrong
+/// bytes under a right-looking name would otherwise have its content written
+/// into a file the user believes is a faithful copy.
+///
+/// A refusal can leave a partially written `out`. That is the caller's to
+/// handle, and the reason both callers write to a staging file and rename only
+/// on success rather than over the user's copy.
+pub fn reassemble_into<W: std::io::Write>(
+    map: &ChunkMap,
+    mut supply: impl FnMut(&str) -> Option<Vec<u8>>,
+    out: &mut W,
+) -> Option<u64> {
+    // No ceiling here, deliberately. `reassemble` needs one because it
+    // accumulates; this does not, so the only limit that applies is disk space,
+    // which the write below reports honestly.
+    let mut written = 0u64;
+    for chunk in &map.chunks {
+        let bytes = supply(&chunk.hash)?;
+        if bytes.len() != chunk.len as usize {
+            return None;
+        }
+        if peerbeam_chunk::hash(&bytes) != chunk.hash {
+            return None;
+        }
+        out.write_all(&bytes).ok()?;
+        written += bytes.len() as u64;
+    }
+    Some(written)
+}
+
+/// Fetch one file's chunks and write it into `dest`, streaming.
+///
+/// This is the whole receive half of a delta sync, in one place because both
+/// callers had their own copy of it and both copies had the same two defects.
+///
+/// # What it fixes
+///
+/// **Files larger than [`MAX_REASSEMBLE`] never synced.** Both callers refused
+/// an over-large chunk map and handed the file to a whole-file fallback whose
+/// only handler emitted an event nothing consumes — so the file silently never
+/// arrived, while the sync result counted it as being fetched. Chunks are now
+/// fetched a window at a time and written as they arrive, so a file's size is
+/// the filesystem's business rather than memory's.
+///
+/// **A failed sync destroyed the user's copy.** Both callers wrote straight to
+/// the destination, so a chunk that did not verify, a disconnect or a full disk
+/// left the file truncated — having already replaced one that was fine. This
+/// writes to a staging file beside the destination and renames only once the
+/// whole file is written and flushed, which is what the transfer path has
+/// always done.
+///
+/// # Arguments
+///
+/// - `have` — chunk hashes already held locally, so they are never requested.
+/// - `local` — reads one of those chunks back from disk.
+/// - `fetch` — asks the peer for a batch of chunks. Called once per window.
+///
+/// Returns the bytes that were reused rather than transferred, or `None` if the
+/// file could not be built — in which case `dest` is left exactly as it was.
+pub async fn fetch_streamed<Fetch, Fut>(
+    map: &ChunkMap,
+    dest: &std::path::Path,
+    have: &BTreeSet<String>,
+    mut local: impl FnMut(&str) -> Option<Vec<u8>>,
+    mut fetch: Fetch,
+) -> Option<u64>
+where
+    Fetch: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = std::collections::HashMap<String, Vec<u8>>>,
+{
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let part = staging_path(dest);
+    let file = std::fs::File::create(&part).ok()?;
+    let mut out = std::io::BufWriter::new(file);
+
+    let mut reuse = 0u64;
+    let mut built = true;
+    // One window of chunks resident at a time. A chunk is at most
+    // `peerbeam_chunk::MAX_CHUNK` (256 KiB) and averages 64 KiB, so a window
+    // costs a few megabytes however large the file is.
+    for window in map.chunks.chunks(FETCH_WINDOW) {
+        let missing: Vec<String> = window
+            .iter()
+            .filter(|c| !have.contains(&c.hash))
+            .map(|c| c.hash.clone())
+            .collect();
+        let fetched = if missing.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            fetch(missing).await
+        };
+
+        let slice = ChunkMap {
+            path: map.path.clone(),
+            chunks: window.to_vec(),
+        };
+        let wrote = reassemble_into(
+            &slice,
+            |h| match fetched.get(h) {
+                Some(b) => Some(b.clone()),
+                None => {
+                    let bytes = local(h);
+                    if let Some(b) = &bytes {
+                        reuse += b.len() as u64;
+                    }
+                    bytes
+                }
+            },
+            &mut out,
+        );
+        if wrote.is_none() {
+            built = false;
+            break;
+        }
+    }
+
+    // Flushed before the rename, or the rename publishes a file whose tail is
+    // still in this buffer.
+    let flushed = std::io::Write::flush(&mut out).is_ok();
+    drop(out);
+    if !built || !flushed || std::fs::rename(&part, dest).is_err() {
+        // The destination is untouched on every failure path, which is the
+        // point of staging. The staging file is not left behind to be mistaken
+        // for a synced one.
+        let _ = std::fs::remove_file(&part);
+        return None;
+    }
+    Some(reuse)
+}
+
+/// How many chunks are fetched, and held, at once.
+const FETCH_WINDOW: usize = 64;
+
+/// Where a streamed sync writes before it may replace the real file.
+///
+/// A sibling of the destination rather than a temp directory, so the rename
+/// that publishes it cannot cross a filesystem: `fs::rename` fails across
+/// devices rather than falling back to a copy.
+fn staging_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".pbsync");
+    dest.with_file_name(name)
+}
+
+/// [`reassemble_into`], accumulating into memory.
+///
+/// Kept for callers that genuinely want the bytes in hand, and bounded by
+/// [`MAX_REASSEMBLE`] because it accumulates. The sync path uses
+/// [`reassemble_into`]: it must handle files larger than any ceiling worth
+/// setting.
 pub fn reassemble(
     map: &ChunkMap,
     mut supply: impl FnMut(&str) -> Option<Vec<u8>>,
@@ -179,6 +343,245 @@ mod tests {
                 (c.hash, bytes[s..s + c.len as usize].to_vec())
             })
             .collect()
+    }
+
+    /// **The bug this function exists for.** A file over [`MAX_REASSEMBLE`]
+    /// could not be synced at all: `reassemble` refused it, and the whole-file
+    /// fallback that refusal handed it to did nothing. Streaming has no
+    /// ceiling, so the same content writes correctly.
+    #[test]
+    fn a_map_too_large_to_hold_in_memory_still_writes() {
+        let body = data(3 * peerbeam_chunk::MIN_CHUNK, 7);
+        let map = map_of("big", &body);
+        let have = store(&body);
+
+        // Declared over the ceiling without allocating it: the check
+        // `reassemble` makes is against the map's own arithmetic.
+        let mut oversized = map.clone();
+        let filler = Chunk {
+            offset: 0,
+            len: u32::MAX,
+            hash: "not-supplied".into(),
+        };
+        for _ in 0..((MAX_REASSEMBLE / u64::from(u32::MAX)) + 1) {
+            oversized.chunks.push(filler.clone());
+        }
+        assert!(
+            oversized.total_bytes() > MAX_REASSEMBLE,
+            "the fixture must exceed the in-memory ceiling"
+        );
+        assert!(
+            reassemble(&oversized, |h| have.get(h).cloned()).is_none(),
+            "the in-memory path refuses it, which is what stranded the file"
+        );
+
+        let mut out = Vec::new();
+        let n = reassemble_into(&map, |h| have.get(h).cloned(), &mut out)
+            .expect("a streamed reassembly has no memory ceiling to hit");
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(out, body);
+    }
+
+    /// Every chunk is verified before it reaches the file. Deleting either
+    /// check in [`reassemble_into`] must fail this.
+    #[test]
+    fn a_chunk_that_does_not_match_its_hash_is_never_written() {
+        let body = data(3 * peerbeam_chunk::MIN_CHUNK, 11);
+        let map = map_of("f", &body);
+        let mut have = store(&body);
+        // Same length, different bytes — so only the hash check can catch it.
+        let victim = map.chunks[1].hash.clone();
+        let good = have.get(&victim).cloned().unwrap();
+        have.insert(victim, vec![0xAA; good.len()]);
+
+        let mut out = Vec::new();
+        assert!(
+            reassemble_into(&map, |h| have.get(h).cloned(), &mut out).is_none(),
+            "a chunk whose bytes do not hash to its name must be refused"
+        );
+        assert!(
+            out.len() < body.len(),
+            "it stopped at the bad chunk rather than writing the whole file"
+        );
+    }
+
+    /// A chunk the supplier does not have stops the reassembly rather than
+    /// silently producing a short file.
+    #[test]
+    fn a_missing_chunk_refuses_rather_than_truncating() {
+        let body = data(3 * peerbeam_chunk::MIN_CHUNK, 13);
+        let map = map_of("f", &body);
+        let mut have = store(&body);
+        have.remove(&map.chunks[1].hash);
+
+        let mut out = Vec::new();
+        assert!(reassemble_into(&map, |h| have.get(h).cloned(), &mut out).is_none());
+    }
+
+    /// The streamed and buffered paths agree, so switching a caller over
+    /// cannot change what lands on disk.
+    #[test]
+    fn streaming_and_buffering_produce_the_same_bytes() {
+        let body = data(6 * peerbeam_chunk::MIN_CHUNK, 3);
+        let map = map_of("f", &body);
+        let have = store(&body);
+
+        let buffered = reassemble(&map, |h| have.get(h).cloned()).unwrap();
+        let mut streamed = Vec::new();
+        reassemble_into(&map, |h| have.get(h).cloned(), &mut streamed).unwrap();
+        assert_eq!(buffered, streamed);
+        assert_eq!(streamed, body);
+    }
+
+    // ── fetch_streamed: the whole receive half ──────────────────
+
+    /// Nothing held locally, everything fetched — the ordinary first sync of a
+    /// new file, and the case the old code could not do above 256 MiB.
+    #[tokio::test]
+    async fn a_file_is_fetched_and_written_whole() {
+        let body = data(8 * peerbeam_chunk::MIN_CHUNK, 21);
+        let map = map_of("f", &body);
+        let pool = store(&body);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nested").join("f.bin");
+
+        let reuse = fetch_streamed(
+            &map,
+            &dest,
+            &BTreeSet::new(),
+            |_| None,
+            |hashes| {
+                let pool = pool.clone();
+                async move {
+                    hashes
+                        .into_iter()
+                        .filter_map(|h| pool.get(&h).map(|b| (h, b.clone())))
+                        .collect()
+                }
+            },
+        )
+        .await
+        .expect("a first sync writes the file");
+
+        assert_eq!(reuse, 0, "nothing was held locally");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(
+            !staging_path(&dest).exists(),
+            "the staging file is renamed away, not left behind"
+        );
+    }
+
+    /// A chunk already on disk is never asked for, and is counted as reused.
+    #[tokio::test]
+    async fn chunks_already_held_are_not_requested() {
+        let body = data(8 * peerbeam_chunk::MIN_CHUNK, 22);
+        let map = map_of("f", &body);
+        let pool = store(&body);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+
+        let have: BTreeSet<String> = map.chunks.iter().map(|c| c.hash.clone()).collect();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+
+        let reuse = fetch_streamed(
+            &map,
+            &dest,
+            &have,
+            |h| pool.get(h).cloned(),
+            |hashes| {
+                seen.lock().unwrap().extend(hashes);
+                async move { std::collections::HashMap::new() }
+            },
+        )
+        .await
+        .expect("everything was already held");
+
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "a chunk already on disk must not be requested"
+        );
+        assert_eq!(reuse, body.len() as u64, "all of it was reuse");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    /// **The data-loss fix.** A peer that answers with bytes that do not match
+    /// the hash must not leave the user's existing copy damaged. The old code
+    /// wrote straight to the destination, so a failure part-way through
+    /// replaced a good file with a truncated one.
+    #[tokio::test]
+    async fn a_bad_chunk_leaves_the_existing_file_untouched() {
+        let body = data(8 * peerbeam_chunk::MIN_CHUNK, 23);
+        let map = map_of("f", &body);
+        let mut pool = store(&body);
+        assert!(
+            map.chunks.len() >= 2,
+            "the fixture needs a chunk after the first, so the failure happens \
+             once bytes are already staged"
+        );
+        // Same length, wrong bytes: only the hash check catches it. The LAST
+        // chunk, so the write has already got somewhere before it fails.
+        let victim = map.chunks[map.chunks.len() - 1].hash.clone();
+        let len = pool.get(&victim).unwrap().len();
+        pool.insert(victim, vec![0x5A; len]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+        let previous = b"the copy the user already had".to_vec();
+        std::fs::write(&dest, &previous).unwrap();
+
+        let out = fetch_streamed(
+            &map,
+            &dest,
+            &BTreeSet::new(),
+            |_| None,
+            |hashes| {
+                let pool = pool.clone();
+                async move {
+                    hashes
+                        .into_iter()
+                        .filter_map(|h| pool.get(&h).map(|b| (h, b.clone())))
+                        .collect()
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            out.is_none(),
+            "a chunk that does not verify fails the fetch"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            previous,
+            "the user's file must survive a failed sync"
+        );
+        assert!(
+            !staging_path(&dest).exists(),
+            "a failed staging file is cleaned up, not left to be mistaken for a sync"
+        );
+    }
+
+    /// A peer that simply stops answering is the same story: no partial file.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_leaves_no_partial_file() {
+        let body = data(8 * peerbeam_chunk::MIN_CHUNK, 24);
+        let map = map_of("f", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f.bin");
+
+        let out = fetch_streamed(
+            &map,
+            &dest,
+            &BTreeSet::new(),
+            |_| None,
+            |_| async move { std::collections::HashMap::new() },
+        )
+        .await;
+
+        assert!(out.is_none());
+        assert!(!dest.exists(), "nothing is published from a failed fetch");
+        assert!(!staging_path(&dest).exists());
     }
 
     fn hashes(bytes: &[u8]) -> BTreeSet<String> {

@@ -988,6 +988,7 @@ class SyncResult {
     required this.renamed,
     required this.conflicts,
     required this.truncated,
+    this.failed = const [],
   });
 
   /// Files being fetched from the peer.
@@ -1010,6 +1011,14 @@ class SyncResult {
   /// Whether the folder held more files than one manifest carries.
   final bool truncated;
 
+  /// Files that were meant to arrive and did not.
+  ///
+  /// Named rather than counted, and separate from [fetching] deliberately:
+  /// `fetching` is what the pass set out to do. Reporting only that told the
+  /// user a file had been fetched when nothing had been written — which is
+  /// exactly how a file over 256 MiB used to vanish without a word.
+  final List<String> failed;
+
   factory SyncResult.fromJson(Map<String, dynamic> json) => SyncResult(
     fetching: (json['fetching'] as num?)?.toInt() ?? 0,
     pushing: (json['pushing'] as num?)?.toInt() ?? 0,
@@ -1019,6 +1028,9 @@ class SyncResult {
         .map((e) => e.toString())
         .toList(),
     truncated: json['truncated'] as bool? ?? false,
+    failed: ((json['failed'] as List?) ?? const [])
+        .map((e) => e.toString())
+        .toList(),
   );
 
   /// Whether anything at all needs to happen.
@@ -1027,7 +1039,8 @@ class SyncResult {
       pushing == 0 &&
       deleted == 0 &&
       renamed == 0 &&
-      conflicts.isEmpty;
+      conflicts.isEmpty &&
+      failed.isEmpty;
 }
 
 /// A folder being kept in sync continuously.
