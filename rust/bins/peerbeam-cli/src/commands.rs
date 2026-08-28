@@ -1988,7 +1988,6 @@ async fn serve_loop(
 
     let sc = SecureCtx::build(config)?;
     let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
-    let storage = FsStorage::new();
     let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
     let (local, mut incoming) = quic.serve_channels_on(addr).await.map_err(CliError::from)?;
     if ctx.json {
@@ -2070,7 +2069,7 @@ async fn serve_loop(
                 // `crate::chat`'s module doc on why dial/accept symmetry
                 // matters — an unhandled push is silently dropped, not
                 // errored).
-                let mut session = match crate::session_transfer::accept(
+                let session = match crate::session_transfer::accept(
                     qc,
                     &accept_routes,
                     &sc.ident,
@@ -2217,349 +2216,52 @@ async fn serve_loop(
                     }
                 }
 
-                // Flush-on-connect: push anything already queued for this peer
-                // now that the pairing gate has let this connection through —
-                // cheaper/faster than waiting for the next drain tick, and
-                // independent of whatever this connection is otherwise for (a
-                // transfer, or nothing at all). Deliberately placed AFTER the
-                // pairing gate (not before, unlike the FFI's `handle_incoming`,
-                // which has no such gate to order against): `PairingGate::Revoke`
-                // means the operator suspects this newly-pinned peer of being a
-                // MITM and the connection is being torn down above — chat
-                // content must not be pushed to a peer we're actively revoking
-                // trust in. `Revoke`'s branch always `continue`s/`break`s before
-                // reaching here, so this line only ever runs on
-                // Proceed/Confirmed.
-                let _ = peerbeam_chat::flush_to_session(
-                    &session.handle,
-                    &chat,
-                    &DeviceId::from(peer_id.clone()),
-                )
-                .await;
-
-                // Await the peer's transfer channel, **bounded**.
+                // **Spawned, not awaited — unless `--once`.**
                 //
-                // This await used to have no deadline, inline in the accept
-                // arm: one peer that completed a handshake and then opened no
-                // channel parked the whole loop. No further connection was
-                // accepted and the outbox drain never fired again — a receiver
-                // that looked alive and did nothing, for as long as that peer
-                // held on.
+                // Everything above this point is what must stay serial: the
+                // handshake, the permission gate, and the pairing prompt, which
+                // reads stdin. What follows is one connection's own work, and
+                // running it inline is what made a second peer wait out the
+                // first one's entire transfer.
                 //
-                // A bound is not the whole fix. The right shape is to spawn the
-                // per-connection body so a slow peer cannot occupy the accept
-                // arm at all (`peerbeam-ffi`'s serve loop does that), which
-                // changes this loop from strictly serialised to concurrent —
-                // too large a change to make alongside everything else, and it
-                // needs the staging-claim work that just landed as a
-                // prerequisite. Recorded as a known issue rather than half-done.
-                //
-                // Generous on purpose: a channel that has not opened in two
-                // minutes is a peer that is not coming, and a tighter bound
-                // fires on a working peer under load — which is exactly how an
-                // earlier 30s guess broke CI.
-                let incoming_ch = match tokio::time::timeout(
-                    ACCEPT_CHANNEL_TIMEOUT,
-                    session.next_incoming(),
-                )
-                .await
-                .unwrap_or(None)
-                {
-                    Some(c) => c,
-                    None => {
-                        if ctx.json {
-                            ctx.json_line(&json!({"event": "error", "message": "closed before data"}));
-                        } else {
-                            ctx.line(&ctx.red("transfer failed: closed before data"));
-                        }
-                        session.close().await;
-                        if once {
+                // `--once` still runs it inline, because its whole purpose is
+                // to report *this* transfer's outcome as an exit code, and a
+                // spawned task's result cannot be that. So the serial path is
+                // preserved exactly where it is observable.
+                if once {
+                    match serve_connection(
+                        *ctx,
+                        config.clone(),
+                        dir.to_string(),
+                        rules.to_vec(),
+                        sc.clone(),
+                        chat.clone(),
+                        session,
+                        peer_id,
+                        newly_trusted,
+                    )
+                    .await
+                    {
+                        Served::Done(f) => {
+                            failed = f;
                             break;
                         }
-                        continue;
-                    }
-                };
-
-                // **The listen gate.** This is a `receive`/`daemon`, not a
-                // `peerbeam pipe --listen`, so an inbound pipe is refused here
-                // — the one place a long-lived background process could
-                // otherwise become a remote write to whatever terminal it was
-                // started from. The capability is still advertised and the
-                // channel type still registered as a stream (see
-                // `session_transfer::session_cfg`): that is what routes the
-                // pipe here to be refused with a reason, instead of leaving it
-                // to hang as an unhandled message channel.
-                //
-                // `accept_pipe` is the single funnel that decides — this side
-                // passes `listening: false` and an `out` that discards, so
-                // even a broken gate could not write the peer's bytes
-                // anywhere. Refusing does not end the loop: a stranger must not
-                // be able to stop a receiver by dialling it.
-                if incoming_ch.channel_type == peerbeam_domain::session::ChannelType::PIPE {
-                    let consent = peerbeam_transfer::PipeConsent {
-                        listening: false,
-                        trust: sc.trust.as_ref(),
-                        only_from: None,
-                        negotiated: session.capabilities(),
-                    };
-                    let peer = DeviceId::from(peer_id.clone());
-                    let mut nowhere = futures::io::sink();
-                    let refused = accept_pipe(
-                        incoming_ch,
-                        &session.handle,
-                        &peer,
-                        &consent,
-                        &mut nowhere,
-                    )
-                    .await;
-                    let msg = match refused {
-                        Ok(_) => "a pipe was accepted by a process that must never accept one"
-                            .to_string(),
-                        Err(e) => e.to_string(),
-                    };
-                    if ctx.json {
-                        ctx.json_line(&json!({"event": "error", "message": msg}));
-                    } else {
-                        ctx.line(&ctx.dim(&msg));
-                    }
-                    session.close().await;
-                    continue;
-                }
-
-                // Peek the sender's transfer id before consuming any bytes, so
-                // the chat bridge below can correlate this receive with a
-                // FileRef-offered row even if the transfer itself later
-                // fails — `peek_incoming_meta` replays the frame it reads, so
-                // `receive_on_channel` sees exactly what it would have
-                // without this call. `transfer_id` is empty when nothing
-                // could be peeked (closed/malformed/slow first frame), which
-                // the bridge below reads as "no correlation possible" and
-                // skips entirely. Mirrors the FFI's own `handle_incoming`
-                // peek (`peek_incoming_meta`).
-                let (incoming_ch, preview) = peek_incoming_meta(incoming_ch).await;
-
-                // A chat file row starts life `PendingApproval`, describing the
-                // peer's `FileRef` claim. Bytes are now moving, and the peek has
-                // just told us what the *stream* says is arriving — so correct
-                // the row's name/size against it and move it off
-                // `PendingApproval`, mirroring the FFI's `chat_set_landing` +
-                // `chat_settle(Transferring)` pair. Without this a `chat
-                // history` run mid-receive shows a file still "waiting" and
-                // labelled with whatever was advertised. A no-op for every
-                // ordinary transfer (no row) and when nothing could be peeked.
-                if let Err(e) = settle_received_chat_file(
-                    &chat,
-                    &peer_id,
-                    &preview.transfer_id,
-                    peerbeam_chat::Status::Transferring,
-                    (!preview.name.is_empty()).then_some((preview.name.as_str(), preview.size)),
-                    None,
-                ) {
-                    // Not fatal — the bytes below are what the peer came for —
-                    // but not silent either: the row this could not move stays
-                    // "waiting" in `chat history` while the file arrives.
-                    report_problem(
-                        ctx,
-                        &format!("this transfer's conversation row could not be updated: {e}"),
-                    );
-                }
-
-                // **Where this item lands.** The one call site: the matcher is
-                // consulted once, here, after the transfer has been accepted
-                // and immediately before its bytes are written. It cannot
-                // affect *whether* anything is accepted — everything that
-                // decides that has already run above (I6).
-                //
-                // The three inputs are the authenticated sender id, the
-                // *sanitized* name (`preview.name` is what `peek_incoming_meta`
-                // put through `sanitize_file_name`, never the raw wire name)
-                // and the size. A peek that learned nothing leaves the name
-                // empty and the size zero, which simply matches fewer rules —
-                // a catch-all still applies, and `dir` is still the answer when
-                // nothing matches.
-                let dest = peerbeam_config::rules::destination(
-                    rules,
-                    dir,
-                    &peer_id,
-                    &preview.name,
-                    preview.size,
-                );
-                // A destination that failed must be *said*, not swallowed. The
-                // file is safe — it is going to `dir` — but a user who wrote a
-                // rule believes the sort happened.
-                if let Some(fb) = &dest.fallback {
-                    let msg = format!(
-                        "rule destination {} is unusable ({}); saving to {} instead",
-                        fb.rule_directory, fb.reason, dest.directory
-                    );
-                    if ctx.json {
-                        ctx.json_line(&json!({
-                            "event": "rule_fallback",
-                            "rule_directory": fb.rule_directory,
-                            "directory": dest.directory,
-                            "reason": fb.reason,
-                            "peer": peer_id,
-                        }));
-                    } else {
-                        ctx.line(&ctx.yellow(&msg));
+                        // A refused pipe is not the transfer `--once` waits
+                        // for, so keep listening.
+                        Served::Skipped => continue,
                     }
                 }
-                let dir = dest.directory.as_str();
-
-                let storage_ref = &storage;
-                let handle = &session.handle;
-                let ack = crate::session_transfer::caps_support_folder_ack(session.capabilities());
-                let (ptx, mut prx) = mpsc::unbounded_channel();
-                let ctrl = TransferControl::new();
-                let recv = async move {
-                    let r =
-                        receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx, ack)
-                            .await;
-                    drop(ptx);
-                    r
-                };
-                // Human progress bar (created lazily once the total size is known).
-                let pump = async move {
-                    let mut bar: Option<crate::output::Bar> = None;
-                    while let Some(p) = prx.recv().await {
-                        if !ctx.json {
-                            let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
-                            b.update(p.transferred_bytes);
-                        }
-                    }
-                    if let Some(b) = bar {
-                        b.finish();
-                    }
-                };
-                let (r, _) = tokio::join!(recv, pump);
-                let hist = history::path_for(&config.storage.data_directory);
-                match r {
-                    Ok(ChannelReceived::File(rcv)) => {
-                        let saved = std::path::Path::new(dir)
-                            .join(&rcv.name)
-                            .to_string_lossy()
-                            .into_owned();
-                        history::record(
-                            &hist,
-                            history::entry("receiving", &peer_id, &rcv.name, &saved, rcv.bytes, true),
-                        );
-                        if ctx.json {
-                            ctx.json_line(&json!({
-                                "event": "received",
-                                "file": rcv.name,
-                                "bytes": rcv.bytes,
-                                "peer": peer_id,
-                                "newly_trusted": newly_trusted,
-                                "pairing_code": session.pairing_code.clone(),
-                                "transport": "peersession",
-                            }));
-                        } else {
-                            ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
-                        }
-                        // Chat bridge: a completed receive settles Received (+
-                        // where it landed); an observed cancellation settles
-                        // Failed. Both are no-ops unless this transfer's id
-                        // genuinely names our own in-flight file row.
-                        let settled = match rcv.outcome {
-                            TransferOutcome::Completed => settle_received_chat_file(
-                                &chat,
-                                &peer_id,
-                                &preview.transfer_id,
-                                peerbeam_chat::Status::Received,
-                                Some((rcv.name.as_str(), rcv.bytes)),
-                                Some(&saved),
-                            ),
-                            TransferOutcome::Cancelled => settle_received_chat_file(
-                                &chat,
-                                &peer_id,
-                                &preview.transfer_id,
-                                peerbeam_chat::Status::Failed,
-                                None,
-                                None,
-                            ),
-                        };
-                        // The file is on disk and has already been reported as
-                        // received — the row is the only thing wrong, so this
-                        // says so rather than contradicting the line above it.
-                        if let Err(e) = settled {
-                            report_problem(
-                                ctx,
-                                &format!(
-                                    "{} arrived, but its conversation row could not be updated: {e}",
-                                    rcv.name
-                                ),
-                            );
-                        }
-                    }
-                    Ok(ChannelReceived::Folder(fr)) => {
-                        let saved = std::path::Path::new(dir)
-                            .join(&fr.root)
-                            .to_string_lossy()
-                            .into_owned();
-                        history::record(
-                            &hist,
-                            history::entry("receiving", &peer_id, &fr.root, &saved, 0, true),
-                        );
-                        if ctx.json {
-                            ctx.json_line(&json!({
-                                "event": "received_folder",
-                                "folder": fr.root,
-                                "files": fr.files,
-                                "peer": peer_id,
-                                "newly_trusted": newly_trusted,
-                                "pairing_code": session.pairing_code.clone(),
-                                "transport": "peersession",
-                            }));
-                        } else {
-                            ctx.line(
-                                &ctx.green(&format!("received folder {} ({} files)", fr.root, fr.files)),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Remembered so the process can exit non-zero. Printing
-                        // "transfer failed" and then returning success made a
-                        // failed receive indistinguishable from a good one to
-                        // anything that reads exit codes — a script, a systemd
-                        // unit, or the folder end-to-end test, whose
-                        // "receiver exited successfully" assertion could not
-                        // fail and so never caught a truncated delivery.
-                        failed = Some(e.to_string());
-                        history::record(
-                            &hist,
-                            history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
-                        );
-                        if ctx.json {
-                            ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
-                        } else {
-                            ctx.line(&ctx.red(&format!("transfer failed: {e}")));
-                        }
-                        // Chat bridge: a transfer failure settles the row
-                        // Failed too — a no-op unless the id genuinely names
-                        // our own in-flight file row (see
-                        // `settle_received_chat_file`'s doc).
-                        if let Err(e) = settle_received_chat_file(
-                            &chat,
-                            &peer_id,
-                            &preview.transfer_id,
-                            peerbeam_chat::Status::Failed,
-                            None,
-                            None,
-                        ) {
-                            // A failed transfer whose row also could not be
-                            // marked failed leaves the conversation showing an
-                            // in-flight file nothing will ever finish.
-                            report_problem(
-                                ctx,
-                                &format!("the failed transfer's conversation row could not be updated: {e}"),
-                            );
-                        }
-                    }
-                }
-                session.close().await;
-                if once {
-                    break;
-                }
+                tokio::spawn(serve_connection(
+                    *ctx,
+                    config.clone(),
+                    dir.to_string(),
+                    rules.to_vec(),
+                    sc.clone(),
+                    chat.clone(),
+                    session,
+                    peer_id,
+                    newly_trusted,
+                ));
             }
         }
     }
@@ -4171,4 +3873,366 @@ mod duration_tests {
             assert_eq!(humantime(seconds), printed, "{spec}");
         }
     }
+}
+
+/// What one accepted connection turned out to be.
+enum Served {
+    /// The connection is finished. `Some` names the transfer failure that
+    /// `--once` turns into a non-zero exit.
+    Done(Option<String>),
+    /// Nothing this loop was waiting for — a refused pipe. `--once` keeps
+    /// waiting rather than exiting on it, which is what it always did.
+    Skipped,
+}
+
+/// Serve one accepted connection to its end.
+///
+/// **Extracted so it can be spawned.** Inline in the accept arm, this body made
+/// `serve_loop` strictly serial: one peer's transfer — or one peer that simply
+/// held a session open — delayed every other connection for its whole duration.
+/// A deadline bounded the worst case but did not remove it; running the body on
+/// its own task does.
+///
+/// Everything it needs is owned or cheaply cloned, and the one thing that
+/// cannot be concurrent stays behind: the pairing prompt reads stdin, and two
+/// connections asking a terminal at once is incoherent, so the caller runs the
+/// handshake and the gate before it decides whether to spawn this.
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection(
+    ctx: Ctx,
+    config: EngineConfig,
+    dir: String,
+    rules: Vec<peerbeam_config::SaveRule>,
+    sc: SecureCtx,
+    chat: peerbeam_chat::ChatStore,
+    mut session: crate::session_transfer::Session,
+    peer_id: String,
+    newly_trusted: bool,
+) -> Served {
+    // `FsStorage` is a unit-ish handle, so a fresh one per connection is the
+    // same thing the loop shared — and sharing a `&` across a spawn would need
+    // a lifetime this task does not have.
+    let storage = FsStorage::new();
+    let ctx = &ctx;
+    let config = &config;
+    let dir = dir.as_str();
+    let rules: &[peerbeam_config::SaveRule] = &rules;
+    let sc = &sc;
+    let mut failure: Option<String> = None;
+    // Flush-on-connect: push anything already queued for this peer
+    // now that the pairing gate has let this connection through —
+    // cheaper/faster than waiting for the next drain tick, and
+    // independent of whatever this connection is otherwise for (a
+    // transfer, or nothing at all). Deliberately placed AFTER the
+    // pairing gate (not before, unlike the FFI's `handle_incoming`,
+    // which has no such gate to order against): `PairingGate::Revoke`
+    // means the operator suspects this newly-pinned peer of being a
+    // MITM and the connection is being torn down above — chat
+    // content must not be pushed to a peer we're actively revoking
+    // trust in. `Revoke`'s branch always `continue`s/`break`s before
+    // reaching here, so this line only ever runs on
+    // Proceed/Confirmed.
+    let _ =
+        peerbeam_chat::flush_to_session(&session.handle, &chat, &DeviceId::from(peer_id.clone()))
+            .await;
+
+    // Await the peer's transfer channel, **bounded**.
+    //
+    // This await used to have no deadline, inline in the accept
+    // arm: one peer that completed a handshake and then opened no
+    // channel parked the whole loop. No further connection was
+    // accepted and the outbox drain never fired again — a receiver
+    // that looked alive and did nothing, for as long as that peer
+    // held on.
+    //
+    // A bound is not the whole fix. The right shape is to spawn the
+    // per-connection body so a slow peer cannot occupy the accept
+    // arm at all (`peerbeam-ffi`'s serve loop does that), which
+    // changes this loop from strictly serialised to concurrent —
+    // too large a change to make alongside everything else, and it
+    // needs the staging-claim work that just landed as a
+    // prerequisite. Recorded as a known issue rather than half-done.
+    //
+    // Generous on purpose: a channel that has not opened in two
+    // minutes is a peer that is not coming, and a tighter bound
+    // fires on a working peer under load — which is exactly how an
+    // earlier 30s guess broke CI.
+    let incoming_ch = match tokio::time::timeout(ACCEPT_CHANNEL_TIMEOUT, session.next_incoming())
+        .await
+        .unwrap_or(None)
+    {
+        Some(c) => c,
+        None => {
+            if ctx.json {
+                ctx.json_line(&json!({"event": "error", "message": "closed before data"}));
+            } else {
+                ctx.line(&ctx.red("transfer failed: closed before data"));
+            }
+            session.close().await;
+            return Served::Done(None);
+        }
+    };
+
+    // **The listen gate.** This is a `receive`/`daemon`, not a
+    // `peerbeam pipe --listen`, so an inbound pipe is refused here
+    // — the one place a long-lived background process could
+    // otherwise become a remote write to whatever terminal it was
+    // started from. The capability is still advertised and the
+    // channel type still registered as a stream (see
+    // `session_transfer::session_cfg`): that is what routes the
+    // pipe here to be refused with a reason, instead of leaving it
+    // to hang as an unhandled message channel.
+    //
+    // `accept_pipe` is the single funnel that decides — this side
+    // passes `listening: false` and an `out` that discards, so
+    // even a broken gate could not write the peer's bytes
+    // anywhere. Refusing does not end the loop: a stranger must not
+    // be able to stop a receiver by dialling it.
+    if incoming_ch.channel_type == peerbeam_domain::session::ChannelType::PIPE {
+        let consent = peerbeam_transfer::PipeConsent {
+            listening: false,
+            trust: sc.trust.as_ref(),
+            only_from: None,
+            negotiated: session.capabilities(),
+        };
+        let peer = DeviceId::from(peer_id.clone());
+        let mut nowhere = futures::io::sink();
+        let refused =
+            accept_pipe(incoming_ch, &session.handle, &peer, &consent, &mut nowhere).await;
+        let msg = match refused {
+            Ok(_) => "a pipe was accepted by a process that must never accept one".to_string(),
+            Err(e) => e.to_string(),
+        };
+        if ctx.json {
+            ctx.json_line(&json!({"event": "error", "message": msg}));
+        } else {
+            ctx.line(&ctx.dim(&msg));
+        }
+        session.close().await;
+        return Served::Skipped;
+    }
+
+    // Peek the sender's transfer id before consuming any bytes, so
+    // the chat bridge below can correlate this receive with a
+    // FileRef-offered row even if the transfer itself later
+    // fails — `peek_incoming_meta` replays the frame it reads, so
+    // `receive_on_channel` sees exactly what it would have
+    // without this call. `transfer_id` is empty when nothing
+    // could be peeked (closed/malformed/slow first frame), which
+    // the bridge below reads as "no correlation possible" and
+    // skips entirely. Mirrors the FFI's own `handle_incoming`
+    // peek (`peek_incoming_meta`).
+    let (incoming_ch, preview) = peek_incoming_meta(incoming_ch).await;
+
+    // A chat file row starts life `PendingApproval`, describing the
+    // peer's `FileRef` claim. Bytes are now moving, and the peek has
+    // just told us what the *stream* says is arriving — so correct
+    // the row's name/size against it and move it off
+    // `PendingApproval`, mirroring the FFI's `chat_set_landing` +
+    // `chat_settle(Transferring)` pair. Without this a `chat
+    // history` run mid-receive shows a file still "waiting" and
+    // labelled with whatever was advertised. A no-op for every
+    // ordinary transfer (no row) and when nothing could be peeked.
+    if let Err(e) = settle_received_chat_file(
+        &chat,
+        &peer_id,
+        &preview.transfer_id,
+        peerbeam_chat::Status::Transferring,
+        (!preview.name.is_empty()).then_some((preview.name.as_str(), preview.size)),
+        None,
+    ) {
+        // Not fatal — the bytes below are what the peer came for —
+        // but not silent either: the row this could not move stays
+        // "waiting" in `chat history` while the file arrives.
+        report_problem(
+            ctx,
+            &format!("this transfer's conversation row could not be updated: {e}"),
+        );
+    }
+
+    // **Where this item lands.** The one call site: the matcher is
+    // consulted once, here, after the transfer has been accepted
+    // and immediately before its bytes are written. It cannot
+    // affect *whether* anything is accepted — everything that
+    // decides that has already run above (I6).
+    //
+    // The three inputs are the authenticated sender id, the
+    // *sanitized* name (`preview.name` is what `peek_incoming_meta`
+    // put through `sanitize_file_name`, never the raw wire name)
+    // and the size. A peek that learned nothing leaves the name
+    // empty and the size zero, which simply matches fewer rules —
+    // a catch-all still applies, and `dir` is still the answer when
+    // nothing matches.
+    let dest =
+        peerbeam_config::rules::destination(rules, dir, &peer_id, &preview.name, preview.size);
+    // A destination that failed must be *said*, not swallowed. The
+    // file is safe — it is going to `dir` — but a user who wrote a
+    // rule believes the sort happened.
+    if let Some(fb) = &dest.fallback {
+        let msg = format!(
+            "rule destination {} is unusable ({}); saving to {} instead",
+            fb.rule_directory, fb.reason, dest.directory
+        );
+        if ctx.json {
+            ctx.json_line(&json!({
+                "event": "rule_fallback",
+                "rule_directory": fb.rule_directory,
+                "directory": dest.directory,
+                "reason": fb.reason,
+                "peer": peer_id,
+            }));
+        } else {
+            ctx.line(&ctx.yellow(&msg));
+        }
+    }
+    let dir = dest.directory.as_str();
+
+    let storage_ref = &storage;
+    let handle = &session.handle;
+    let ack = crate::session_transfer::caps_support_folder_ack(session.capabilities());
+    let (ptx, mut prx) = mpsc::unbounded_channel();
+    let ctrl = TransferControl::new();
+    let recv = async move {
+        let r = receive_on_channel(incoming_ch, handle, storage_ref, dir, &ctrl, &ptx, ack).await;
+        drop(ptx);
+        r
+    };
+    // Human progress bar (created lazily once the total size is known).
+    let pump = async move {
+        let mut bar: Option<crate::output::Bar> = None;
+        while let Some(p) = prx.recv().await {
+            if !ctx.json {
+                let b = bar.get_or_insert_with(|| ctx.bar(p.total_bytes, "recv"));
+                b.update(p.transferred_bytes);
+            }
+        }
+        if let Some(b) = bar {
+            b.finish();
+        }
+    };
+    let (r, _) = tokio::join!(recv, pump);
+    let hist = history::path_for(&config.storage.data_directory);
+    match r {
+        Ok(ChannelReceived::File(rcv)) => {
+            let saved = std::path::Path::new(dir)
+                .join(&rcv.name)
+                .to_string_lossy()
+                .into_owned();
+            history::record(
+                &hist,
+                history::entry("receiving", &peer_id, &rcv.name, &saved, rcv.bytes, true),
+            );
+            if ctx.json {
+                ctx.json_line(&json!({
+                    "event": "received",
+                    "file": rcv.name,
+                    "bytes": rcv.bytes,
+                    "peer": peer_id,
+                    "newly_trusted": newly_trusted,
+                    "pairing_code": session.pairing_code.clone(),
+                    "transport": "peersession",
+                }));
+            } else {
+                ctx.line(&ctx.green(&format!("received {} ({} bytes)", rcv.name, rcv.bytes)));
+            }
+            // Chat bridge: a completed receive settles Received (+
+            // where it landed); an observed cancellation settles
+            // Failed. Both are no-ops unless this transfer's id
+            // genuinely names our own in-flight file row.
+            let settled = match rcv.outcome {
+                TransferOutcome::Completed => settle_received_chat_file(
+                    &chat,
+                    &peer_id,
+                    &preview.transfer_id,
+                    peerbeam_chat::Status::Received,
+                    Some((rcv.name.as_str(), rcv.bytes)),
+                    Some(&saved),
+                ),
+                TransferOutcome::Cancelled => settle_received_chat_file(
+                    &chat,
+                    &peer_id,
+                    &preview.transfer_id,
+                    peerbeam_chat::Status::Failed,
+                    None,
+                    None,
+                ),
+            };
+            // The file is on disk and has already been reported as
+            // received — the row is the only thing wrong, so this
+            // says so rather than contradicting the line above it.
+            if let Err(e) = settled {
+                report_problem(
+                    ctx,
+                    &format!(
+                        "{} arrived, but its conversation row could not be updated: {e}",
+                        rcv.name
+                    ),
+                );
+            }
+        }
+        Ok(ChannelReceived::Folder(fr)) => {
+            let saved = std::path::Path::new(dir)
+                .join(&fr.root)
+                .to_string_lossy()
+                .into_owned();
+            history::record(
+                &hist,
+                history::entry("receiving", &peer_id, &fr.root, &saved, 0, true),
+            );
+            if ctx.json {
+                ctx.json_line(&json!({
+                    "event": "received_folder",
+                    "folder": fr.root,
+                    "files": fr.files,
+                    "peer": peer_id,
+                    "newly_trusted": newly_trusted,
+                    "pairing_code": session.pairing_code.clone(),
+                    "transport": "peersession",
+                }));
+            } else {
+                ctx.line(&ctx.green(&format!("received folder {} ({} files)", fr.root, fr.files)));
+            }
+        }
+        Err(e) => {
+            // Remembered so the process can exit non-zero. Printing
+            // "transfer failed" and then returning success made a
+            // failed receive indistinguishable from a good one to
+            // anything that reads exit codes — a script, a systemd
+            // unit, or the folder end-to-end test, whose
+            // "receiver exited successfully" assertion could not
+            // fail and so never caught a truncated delivery.
+            failure = Some(e.to_string());
+            history::record(
+                &hist,
+                history::entry("receiving", &peer_id, "(incomplete)", "", 0, false),
+            );
+            if ctx.json {
+                ctx.json_line(&json!({"event": "error", "message": e.to_string()}));
+            } else {
+                ctx.line(&ctx.red(&format!("transfer failed: {e}")));
+            }
+            // Chat bridge: a transfer failure settles the row
+            // Failed too — a no-op unless the id genuinely names
+            // our own in-flight file row (see
+            // `settle_received_chat_file`'s doc).
+            if let Err(e) = settle_received_chat_file(
+                &chat,
+                &peer_id,
+                &preview.transfer_id,
+                peerbeam_chat::Status::Failed,
+                None,
+                None,
+            ) {
+                // A failed transfer whose row also could not be
+                // marked failed leaves the conversation showing an
+                // in-flight file nothing will ever finish.
+                report_problem(
+                    ctx,
+                    &format!("the failed transfer's conversation row could not be updated: {e}"),
+                );
+            }
+        }
+    }
+    session.close().await;
+    Served::Done(failure)
 }

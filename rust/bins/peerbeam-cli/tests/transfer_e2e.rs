@@ -553,3 +553,191 @@ fn spawn_receiver_and_send(
     let _ = receiver.wait();
     port
 }
+
+/// **A peer that completes the handshake and then does nothing must not stop
+/// everyone else.**
+///
+/// The accept loop used to run each connection to completion inline, so this
+/// exact peer — connected, authenticated, silent — held the loop for as long as
+/// it liked. The deadline added earlier bounds that at two minutes; running the
+/// connection on its own task removes it.
+///
+/// A bare datagram will not do: it is rejected before the loop reaches the body
+/// under test, so the test would pass against the serial version and prove
+/// nothing. This dials a real session and holds it.
+#[test]
+fn a_silent_authenticated_peer_does_not_block_a_real_transfer() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.json");
+    let recv_dir = dir.path().join("recv");
+    let src = dir.path().join("payload.bin");
+
+    let mut cfg = EngineConfig::default();
+    cfg.storage.data_directory = dir.path().join("data").to_string_lossy().into_owned();
+    cfg.storage.save_directory = recv_dir.to_string_lossy().into_owned();
+    cfg.save(&cfg_path).unwrap();
+
+    let sender_cfg_path = dir.path().join("sender-config.json");
+    let mut sender_cfg = cfg.clone();
+    sender_cfg.storage.data_directory = dir
+        .path()
+        .join("data-sender")
+        .to_string_lossy()
+        .into_owned();
+    sender_cfg.save(&sender_cfg_path).unwrap();
+
+    std::fs::write(&src, vec![9u8; 64 * 1024]).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+
+    // Daemon-shaped: no `--once`, so it keeps serving.
+    let mut receiver = Command::new(BIN)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--no-color",
+            "receive",
+            "--port",
+            "0",
+            "--dir",
+            recv_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn receiver");
+
+    let stdout = receiver.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(port) = parse_listen_port(&line) {
+                let _ = tx.send(port);
+            }
+        }
+    });
+    let port = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("receiver should announce a listening port");
+
+    // The squatter: a real handshake, then silence, held for the whole test.
+    let holding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let held = holding.clone();
+    let squatter = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async move {
+            let quic = peerbeam_transfer_quic::QuicTransport::new().expect("quic");
+            let route = peerbeam_domain::entity::Route {
+                kind: peerbeam_domain::entity::RouteKind::Lan,
+                address: "127.0.0.1".into(),
+                port,
+            };
+            let meta = peerbeam_domain::entity::TransferSession {
+                id: peerbeam_domain::id::TransferId::from("squat"),
+                peer: peerbeam_domain::id::DeviceId::from("pb-squatter"),
+                direction: peerbeam_domain::entity::Direction::Sending,
+                status: peerbeam_domain::entity::TransferStatus::Transferring,
+                files: Vec::new(),
+                total_bytes: 0,
+                transferred_bytes: 0,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                is_resume: false,
+                accepted: true,
+            };
+            let Ok(qc) = quic.dial_channels(&route, &meta).await else {
+                return;
+            };
+            use peerbeam_domain::port::EncryptionProvider as _;
+            let enc = peerbeam_crypto::AeadCrypto::new();
+            let keypair = enc.generate_keypair();
+            let identity = peerbeam_transfer::Identity {
+                device_id: peerbeam_domain::id::DeviceId::from("pb-squatter"),
+                name: "squatter".into(),
+                keypair,
+            };
+            let enc: Arc<dyn peerbeam_domain::port::EncryptionProvider> = Arc::new(enc);
+            let trust: Arc<dyn peerbeam_domain::port::TrustStore> = Arc::new(
+                peerbeam_trust_fs::FsTrust::open(
+                    std::env::temp_dir().join(format!("pb-squat-{}.json", std::process::id())),
+                )
+                .expect("trust"),
+            );
+            let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+            let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+            let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+            let transport: Arc<dyn peerbeam_domain::port::ChannelTransport> = Arc::new(qc);
+            let cfg = peerbeam_transfer::SessionConfig::new(
+                peerbeam_domain::session::CapabilitySet::new().with(
+                    peerbeam_domain::session::Capability::new(
+                        peerbeam_domain::session::ChannelType::CONTROL,
+                    ),
+                ),
+            );
+            let Ok(mut ps) = peerbeam_transfer::PeerSession::open(
+                transport,
+                peerbeam_transfer::SessionRole::Initiator,
+                cfg,
+                ev,
+                ch,
+                inc,
+                None,
+                identity,
+                enc,
+                trust,
+            )
+            .await
+            else {
+                return;
+            };
+            // Authenticated, and now deliberately silent: no channel is ever
+            // opened. Held until the assertion below has run.
+            tokio::spawn(async move {
+                let _ = ps.run().await;
+            });
+            while held.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    });
+
+    // Give the squatter time to finish its handshake and take the loop.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let started = std::time::Instant::now();
+    let send = Command::new(BIN)
+        .args([
+            "--config",
+            sender_cfg_path.to_str().unwrap(),
+            "--no-color",
+            "-y",
+            "send",
+            src.to_str().unwrap(),
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("run sender");
+    let elapsed = started.elapsed();
+
+    holding.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = squatter.join();
+    let _ = receiver.kill();
+    let _ = receiver.wait();
+
+    assert!(
+        send.status.success(),
+        "send failed: {}{}",
+        String::from_utf8_lossy(&send.stdout),
+        String::from_utf8_lossy(&send.stderr),
+    );
+    assert!(
+        recv_dir.join("payload.bin").exists(),
+        "the transfer must complete while a silent peer holds a session open"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "it must not wait the silent peer out: took {elapsed:?}"
+    );
+}

@@ -6,6 +6,7 @@ use std::io::{IsTerminal, Write};
 
 use crate::exit::CliError;
 
+#[derive(Clone, Copy)]
 pub struct Ctx {
     pub json: bool,
     pub color: bool,

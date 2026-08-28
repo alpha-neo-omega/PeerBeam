@@ -67,3 +67,12 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# For the accept-loop concurrency test: it needs a peer that completes a real
+# handshake and then opens no channel, which is the case that used to park the
+# loop. Nothing short of a real session reproduces it — a bare datagram is
+# rejected before the loop ever gets to the body under test.
+peerbeam-transfer-quic = { path = "../../crates/peerbeam-transfer-quic" }
+peerbeam-transfer = { path = "../../crates/peerbeam-transfer" }
+peerbeam-crypto = { path = "../../crates/peerbeam-crypto" }
+peerbeam-trust-fs = { path = "../../crates/peerbeam-trust-fs" }
+futures = { workspace = true }
