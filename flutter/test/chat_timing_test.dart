@@ -7,11 +7,15 @@
 // first and orders by the second; conflating them is what every test here
 // guards against.
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:peerbeam/data/chat_repository.dart';
 import 'package:peerbeam/sdk/events.dart';
+import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/models.dart';
+import 'package:peerbeam/state/app_scope.dart';
+import 'package:peerbeam/state/stores.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
@@ -301,6 +305,43 @@ void main() {
       expect(repo.messagesFor('pb-bob').length, 1);
     });
 
+    // THE REPORTED SYMPTOM: "new chat above old chat", inside one thread.
+    //
+    // A peer whose clock runs 3 hours behind mints its message ids and
+    // timestamps 3 hours in the past. The engine returns a thread in store-key
+    // (message id) order, so that peer's REPLY — genuinely the newest message
+    // — comes back ahead of the message it is answering, and the transcript
+    // showed it above. `storedAt` is when each row reached this device, which
+    // is the same clock for both, so ordering by it restores what happened.
+    test('a peer whose clock runs behind does not appear above the message '
+        'it is answering', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      // The order the engine hands over: by message id, i.e. by each author's
+      // own clock. The peer's id is 3h in the past, so it sorts first.
+      fake.chatHistories['pb-bob'] = [
+        _msg(
+          'their-reply',
+          at: DateTime.parse('2026-01-01T11:00:00Z'), // their skewed clock
+          storedAt: DateTime.parse('2026-01-01T14:00:00Z'), // actually arrived
+        ),
+        _msg(
+          'my-question',
+          direction: 'out',
+          at: DateTime.parse('2026-01-01T13:00:00Z'),
+          storedAt: DateTime.parse('2026-01-01T13:00:00Z'),
+        ),
+      ];
+
+      await repo.refresh('pb-bob');
+
+      expect(
+        repo.messagesFor('pb-bob').map((m) => m.id).toList(),
+        ['my-question', 'their-reply'],
+        reason: 'the reply still sits above the question it answers',
+      );
+    });
+
     // A row this device cannot date at all is kept, and gets a DEFINITE
     // position rather than a comparison that contradicts itself. Falling back
     // to comparing ids is not a valid ordering: with `b` undatable, ids can
@@ -357,4 +398,61 @@ void main() {
       expect(expected, ['b', 'e', 'c', 'd', 'a']);
     });
   });
+
+  group('what the screen actually renders', () {
+    // The transcript is a `reverse: true` ListView that ALSO indexes
+    // `items[length - 1 - i]` (chat_screen.dart:827-832). Two reversals that
+    // cancel out are easy to "fix" into one, so this pins the outcome by
+    // measured y-coordinate rather than by reading the widget tree: oldest at
+    // the top, newest at the bottom, like every messenger.
+    testWidgets('the newest message is at the BOTTOM', (tester) async {
+      final fake = FakePeerBeam();
+      fake.chatHistories['pb-bob'] = [
+        _screenMsg('OLDEST', '10:00'),
+        _screenMsg('MIDDLE', '11:00'),
+        _screenMsg('NEWEST', '12:00'),
+      ];
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(peerId: 'pb-bob', peer: _probePeer),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      final oldest = tester.getTopLeft(find.text('OLDEST')).dy;
+      final middle = tester.getTopLeft(find.text('MIDDLE')).dy;
+      final newest = tester.getTopLeft(find.text('NEWEST')).dy;
+
+      expect(
+        oldest < middle && middle < newest,
+        isTrue,
+        reason:
+            'y: OLDEST=$oldest MIDDLE=$middle NEWEST=$newest — the transcript '
+            'is not oldest-at-top',
+      );
+    });
+  });
 }
+
+const _probePeer = PeerTarget(
+  id: 'pb-bob',
+  name: 'Bob',
+  addresses: ['127.0.0.1'],
+  port: 49600,
+);
+
+ChatMessage _screenMsg(String body, String hhmm) => ChatMessage(
+  id: 'id-$hhmm',
+  peerId: 'pb-bob',
+  direction: 'in',
+  body: body,
+  at: DateTime.parse('2026-01-01T$hhmm:00Z'),
+  storedAt: DateTime.parse('2026-01-01T$hhmm:00Z'),
+  status: ChatStatusValue.received,
+);

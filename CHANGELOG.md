@@ -7,6 +7,21 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Fixed
+- **"Trust" on a receive prompt did not stop the asking.** The primary button —
+  labelled "Trust", tooltipped "Accept and always trust this device" — recorded
+  the approval and nothing else. Approval only makes a device *eligible*:
+  whether it is actually asked about is `global_auto_accept ||
+  per_device_auto_accept`, and the global setting defaults off. So the user's
+  explicit consent was written to disk and then not acted on, and the very next
+  file prompted again. Accept-and-trust now also sets that device's own
+  auto-accept bit — the narrow grant, this device rather than everybody,
+  revocable from the switch on the Trusted Devices screen and still ANDed with
+  the `files` permission in the gate, so it changes what the user is *asked* and
+  never what a peer is *allowed*. The button now reads **Always accept** and
+  says what it will do before the tap rather than in a tooltip after it.
+
+  This was also why a file shared **in a chat** asked every time: those bytes go
+  through the same admission gate, so they failed for the same reason.
 - **A chat row's clock could be the sender's, and its position could be too.**
   A record carries two times: `timestamp`, minted by whoever sent it, and
   `stored_at`, written by this device on arrival. `stored_at` existed and was

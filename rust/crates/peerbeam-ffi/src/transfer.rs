@@ -2223,10 +2223,26 @@ impl Manager {
         }
     }
 
-    /// Accept an incoming transfer AND trust the sending device: future
-    /// transfers from it are auto-accepted whenever auto-accept is enabled.
-    /// The only path that ever approves a device — a plain [`accept`](Self::accept)
-    /// never does.
+    /// Accept an incoming transfer AND trust the sending device: files from it
+    /// are accepted without asking from now on.
+    ///
+    /// The only path that ever approves a device — a plain
+    /// [`accept`](Self::accept) never does — and the only one that turns on a
+    /// device's own auto-accept bit.
+    ///
+    /// It sets **both**, and that is the point. Approval alone only makes a
+    /// device *eligible*: `admit_transfer_for` then asks
+    /// `global_auto_accept || per_device_auto_accept`, and the global setting
+    /// defaults off. Approving without the per-device bit is what made this
+    /// call appear not to work — the user pressed a button reading "Trust",
+    /// the approval was written, and the next file prompted anyway.
+    ///
+    /// Deliberately the *narrow* grant: this device, not every trusted device.
+    /// Revoked from the Trusted Devices screen's own switch
+    /// (`pb_trust_set_auto_accept`), and still ANDed with
+    /// [`Permission::Files`](peerbeam_domain::entity::Permission::Files) in the
+    /// gate, so it changes what the user is **asked** and never what a peer is
+    /// **allowed**.
     ///
     /// `confirmed` carries the same meaning as on [`accept`](Self::accept), and
     /// is gated identically. If anything this path needs it more: it is the one
@@ -5418,6 +5434,41 @@ impl Manager {
                         peer = %peer_id.0,
                         "accepted the transfer but could not record the approval — \
                          this device will be asked about again"
+                    );
+                }
+                // ...and stop asking about THIS device, which is the other
+                // half of what the button says.
+                //
+                // Approving alone did not do that. Approval makes a device
+                // *eligible* for auto-accept; whether it is actually asked
+                // about is then `global_auto_accept || per_device_auto_accept`
+                // (`admit_transfer_for`), and the global setting defaults off
+                // (`DeviceConfig::auto_accept_trusted`). So the app offered a
+                // primary button reading "Trust", tooltipped "Accept and
+                // always trust this device", and then asked again on the very
+                // next file — the user's explicit consent was recorded and
+                // then not acted on. That is the defect a user reports as
+                // "auto-accept is not working".
+                //
+                // Setting the per-device bit is what that consent means, and
+                // it is the narrow form of it: this device, not everybody.
+                // I6 requires consent for auto-accept to be **explicit,
+                // revocable and per-capability** — a button naming this device
+                // and this file is explicit, the Trusted Devices screen's own
+                // auto-accept switch (`pb_trust_set_auto_accept`) is where it
+                // is revoked, and `admit_transfer` still ANDs the whole
+                // decision with `may(Files)`, so this widens what the user is
+                // *asked* and never what a peer is *allowed*.
+                //
+                // Best-effort for the same reason as the approval above: the
+                // file the user just accepted is not held hostage to a disk
+                // write, and a failure says so rather than passing silently.
+                if let Err(e) = self.trust.set_auto_accept(peer_id, true) {
+                    tracing::warn!(
+                        error = %e,
+                        peer = %peer_id.0,
+                        "accepted and approved this device but could not record \
+                         auto-accept — it will be asked about again"
                     );
                 }
                 AcceptOutcome::Accepted
@@ -8806,6 +8857,96 @@ mod tests {
 
     fn admit_peer() -> DeviceId {
         DeviceId::from("pb-bob")
+    }
+
+    /// **The button does what it says.** "Trust" on the receive prompt is
+    /// tooltipped "Accept and always trust this device", and it used to write
+    /// only the approval — which makes a device *eligible* for auto-accept
+    /// while `admit_transfer_for` still asks
+    /// `global_auto_accept || per_device_auto_accept`, and the global setting
+    /// defaults off. So the user's explicit consent was recorded and then not
+    /// acted on, and the very next file prompted again: the defect reported as
+    /// "auto-accept is not working, it asks every time".
+    ///
+    /// Asserted end to end — the real `FsTrust`, the real decision channel —
+    /// because the bug was precisely that two writes that both had to happen
+    /// did not, and a test of either one alone passed throughout.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accept_and_trust_stops_the_device_being_asked_about_again() {
+        let (mgr, _chat, _dir) = test_manager_full("truster", 0);
+        let peer = DeviceId::from("pb-bob");
+        // Pinned by the handshake, as every peer reaching the gate has been.
+        mgr.trust
+            .record(peerbeam_domain::entity::TrustRecord {
+                mine: false,
+                auto_accept: false,
+                device: peer.clone(),
+                fingerprint: "ff".into(),
+                name: "Bob".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: false,
+                permissions: peerbeam_domain::entity::PermissionSet::none(),
+                expires_at: None,
+            })
+            .expect("pin the peer");
+
+        // Nothing is granted yet: a merely pinned device is prompted.
+        assert_eq!(
+            admit_transfer_for(
+                mgr.auto_accept.load(Ordering::SeqCst),
+                mgr.trust.auto_accepts(&peer),
+                mgr.trust.as_ref(),
+                &peer,
+            ),
+            FileAdmission::Prompt,
+            "a pinned but unapproved device must still be asked about"
+        );
+
+        // The user taps "Trust" on a live prompt.
+        let m = Arc::new(mgr);
+        let waiter = {
+            let m = m.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move { m.wait_for_accept("tx-1", &peer).await })
+        };
+        // Let `wait_for_accept` register its pending entry first.
+        for _ in 0..50 {
+            if m.pending.lock().unwrap().contains_key("tx-1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        m.accept_trust("tx-1", true).expect("accept and trust");
+        assert!(
+            waiter.await.expect("the waiter task").accepted(),
+            "the transfer itself must still go through"
+        );
+
+        // Both writes landed...
+        assert!(m.trust.is_approved(&peer), "the approval was not recorded");
+        assert!(
+            m.trust.auto_accepts(&peer),
+            "the per-device auto-accept bit was not set — this is the bug"
+        );
+
+        // ...and the next file from this device is not asked about, with the
+        // GLOBAL setting still off, which is the whole point of the narrow
+        // grant.
+        assert!(
+            !m.auto_accept.load(Ordering::SeqCst),
+            "this test is only meaningful while the global setting is off"
+        );
+        assert_eq!(
+            admit_transfer_for(
+                m.auto_accept.load(Ordering::SeqCst),
+                m.trust.auto_accepts(&peer),
+                m.trust.as_ref(),
+                &peer,
+            ),
+            FileAdmission::AutoAccept,
+            "the device the user chose to trust is still being asked about"
+        );
     }
 
     /// Leg 2, and the compatibility statement for this whole change: an

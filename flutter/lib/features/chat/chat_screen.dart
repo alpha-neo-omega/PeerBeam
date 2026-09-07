@@ -1529,7 +1529,12 @@ class _FileBody extends StatelessWidget {
                           child: const Text('Accept'),
                         ),
                         Tooltip(
-                          message: 'Accept and always trust this device',
+                          // Named for its consequence — see the same pair in
+                          // `incoming_prompt.dart`.
+                          message:
+                              'Accept this file, and accept files from this '
+                              'device without asking. Change it later under '
+                              'Trusted devices.',
                           child: FilledButton(
                             onPressed: () => acceptWithPairingCheck(
                               context,
@@ -1542,7 +1547,7 @@ class _FileBody extends StatelessWidget {
                                     confirmed: confirmed,
                                   ),
                             ),
-                            child: const Text('Trust'),
+                            child: const Text('Always accept'),
                           ),
                         ),
                       ],

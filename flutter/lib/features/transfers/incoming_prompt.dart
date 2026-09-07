@@ -213,9 +213,25 @@ class _IncomingDialog extends StatelessWidget {
       actions: [
         TextButton(onPressed: onDecline, child: const Text('Decline')),
         TextButton(onPressed: onAccept, child: const Text('Accept')),
+        // Named for its consequence, not for the internal state it writes.
+        // "Trust" read as a fact about the device rather than a standing
+        // permission, so someone who wanted this file and knew the laptop
+        // pressed it and was surprised to be asked again — the more so because
+        // the engine, until this was fixed, recorded the approval and then
+        // still asked. The engine now stops asking; this says so before the
+        // tap rather than in a tooltip after it.
+        //
+        // The plain "Accept" beside it keeps its label: it is the one-time
+        // answer, it reads that way already, and it is the same word the bulk
+        // approval action uses.
         Tooltip(
-          message: 'Accept and always trust this device',
-          child: FilledButton(onPressed: onTrust, child: const Text('Trust')),
+          message:
+              'Accept this file, and accept files from this device without '
+              'asking. Change it later under Trusted devices.',
+          child: FilledButton(
+            onPressed: onTrust,
+            child: const Text('Always accept'),
+          ),
         ),
       ],
     );
