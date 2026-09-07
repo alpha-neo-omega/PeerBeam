@@ -634,8 +634,8 @@ class ChatMessage {
   /// list, fed the same string, correctly said it knew nothing. Compare
   /// [ChatConversation.lastAt] and [ChatSearchHit.at], which already keep null.
   ///
-  /// Use [displayAt] to show a time and [orderedAt] to sort by one; neither is
-  /// this field alone.
+  /// Use [shownAt] for the time a surface shows and sorts by; this field is
+  /// the sender's claim, and is not that.
   final DateTime? at;
 
   /// When **this device** stored the row, or null for a row written before the
@@ -715,22 +715,42 @@ class ChatMessage {
 
   bool get isMine => direction == 'out';
 
-  /// The time to **show** for this row, or null when nothing is known.
+  /// The row's time: **[storedAt] when there is one**, else [at]. Null when
+  /// nothing is known, which renders as no time at all — never as "now".
   ///
-  /// The sender's stamp first, because "when was this sent" is the question a
-  /// transcript's clock answers. [storedAt] is the fallback rather than the
-  /// first choice: for an outgoing row the two are the same instant, and for
-  /// an inbound one with an unusable stamp, when it got here is the honest
-  /// remaining answer. Null renders as no time at all — never as "now".
-  DateTime? get displayAt => at ?? storedAt;
+  /// One getter, used for both what is shown and what the transcript is sorted
+  /// by, because the two must not be allowed to disagree. This briefly was two
+  /// — display from the sender's `at`, order from the local `storedAt` — and
+  /// the pair is unstable: any row whose arrival is materially later than its
+  /// send time then sits in one place while claiming another. A message a peer
+  /// queued while offline is exactly that row. It arrives stamped 08:00 (the
+  /// outbox flush carries the original `timestamp`) but is stored on arrival at
+  /// 14:30 (`ChatRecord::received` stamps `Utc::now()` unconditionally), so it
+  /// correctly sorted last and then printed "08:00" underneath a bubble reading
+  /// "14:30".
+  ///
+  /// # Why the local clock wins
+  ///
+  /// It is the only clock every row in a transcript shares. The sender's stamp
+  /// cannot be used for ordering: a peer whose clock runs fast would place its
+  /// messages above ones sent after them, and one running slow would bury its
+  /// reply beneath the message it is answering — the defect this whole area was
+  /// fixed for.
+  ///
+  /// And it cannot be used for *display* either, given that. From the
+  /// receiver's side "sent long ago, delivered late" and "sent just now by a
+  /// device whose clock is behind" are the same two numbers; there is no way to
+  /// tell them apart, so there is no rule that shows the send time only in the
+  /// honest case. What this device can always state as fact is when the message
+  /// reached it, so that is what it says.
+  ///
+  /// [at] is still carried, and is the right field for anything that wants the
+  /// sender's claim as a claim.
+  DateTime? get shownAt => storedAt ?? at;
 
-  /// The time to **order** this row by, or null when nothing is known.
-  ///
-  /// [storedAt] first, and for the opposite reason: this device's clock is the
-  /// only one every row in a transcript shares. Ordering by the sender's stamp
-  /// puts a peer whose clock runs fast above messages sent after its own, and
-  /// buries a peer whose clock runs slow beneath the message it is answering.
-  DateTime? get orderedAt => storedAt ?? at;
+  /// The time to **order** this row by. An alias of [shownAt] — see there for
+  /// why ordering and display are deliberately the same number.
+  DateTime? get orderedAt => shownAt;
 
   /// Whether this message answers another.
   bool get isReply => inReplyTo != null;

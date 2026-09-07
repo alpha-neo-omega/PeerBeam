@@ -22,6 +22,27 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
   This was also why a file shared **in a chat** asked every time: those bytes go
   through the same admission gate, so they failed for the same reason.
+- **The approval prompt was raised for every incoming file, including ones the
+  engine had already auto-accepted.** The engine announced a transfer
+  (`transfer_queued`) *before* running the admission gate, and the event said
+  nothing about whether anyone was being asked — so the app raised its modal off
+  the resulting `pending` row for every arrival, and had nothing to withdraw it
+  with. An auto-accepted file landed while the user was still looking at
+  "Decline / Accept", which is the whole of what auto-accept looks like from the
+  outside: it read as auto-accept doing nothing at all. The decision is now
+  settled before the announcement, which carries `needs_decision`, and a prompt
+  already on screen withdraws itself when the answer arrives from anywhere else
+  (another screen, the CLI, or the accept timeout).
+- **A group transcript was ordered by each member's own clock, and opened on the
+  oldest message.** `group_history` sorted on the message id under a comment
+  claiming that was chronological "without trusting any peer's clock" — but an
+  id embeds the *minting* device's millis and an inbound row's id comes straight
+  off the wire, so every member's clock decided where its messages sat: a member
+  running behind had its reply drawn above the question. It now orders by
+  `stored_at`, which fixes the GUI and `peerbeam group history` together. The
+  screen itself also rendered unreversed and never used its scroll controller,
+  so it presented the oldest end of a conversation where the one-to-one thread
+  presents the newest.
 - **A chat row's clock could be the sender's, and its position could be too.**
   A record carries two times: `timestamp`, minted by whoever sent it, and
   `stored_at`, written by this device on arrival. `stored_at` existed and was
@@ -47,11 +68,18 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   thread was reopened. Such a row now shows no time at all, which is what the
   Conversations list already did with the same string. Same fix for a reaction's
   timestamp.
-- **A message the peer queued while offline landed at the bottom of the
-  transcript.** A live arrival was appended regardless of its time, so a drained
-  outbox stacked hours-old messages under ones sent minutes ago and then jumped
-  them back into place on the next refresh. A share the engine refused was
-  likewise pinned below every later message for the rest of the session.
+- **A late-delivered message was drawn in one place and labelled with another.**
+  A row was ordered by when it arrived and labelled with when its sender says it
+  was sent, and those differ for any message a peer queued while offline: the
+  outbox flush carries the original timestamp while arrival is stamped locally,
+  so a burst composed at 08:00 landed at the newest end reading "08:00" beneath
+  a bubble reading "14:30". The two are now one number — the local one — so a
+  bubble's time and its position can no longer disagree. From the receiving side
+  "sent long ago, delivered late" and "sent just now by a device whose clock is
+  behind" are the same two numbers, so there is no rule that shows the sender's
+  time only in the honest case; what this device can state as fact is when the
+  message reached it. A share the engine refused is likewise no longer pinned
+  below every later message for the rest of the session.
 - **Messages did not disappear while you were watching them.** A
   disappearing-message window that closed with the thread open left the expired
   messages readable on screen — under a strip saying they disappear after an hour

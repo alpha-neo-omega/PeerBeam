@@ -111,6 +111,33 @@ class _IncomingTransferPromptState extends State<IncomingTransferPrompt> {
 
   Future<void> _prompt(Transfer transfer) async {
     final state = _app!;
+    // Withdraw the dialog if the question stops being one while it is open.
+    //
+    // Belt to the engine's braces: `needs_decision` keeps the prompt from
+    // being raised for a transfer nobody is being asked about, and this closes
+    // one already on screen when the answer arrives from somewhere else — the
+    // Transfers screen, the chat row's own inline Accept, the CLI, or the
+    // engine's accept timeout. Without it the dialog outlived its transfer and
+    // the next tap answered a decision that no longer existed.
+    void closeIfSettled() {
+      if (!mounted) return;
+      final live = state.transfer.awaitingApproval.any(
+        (t) => t.id == transfer.id,
+      );
+      if (live) return;
+      final nav = Navigator.of(context, rootNavigator: true);
+      if (nav.canPop()) nav.pop();
+    }
+
+    state.transfer.addListener(closeIfSettled);
+    try {
+      await _show(transfer, state);
+    } finally {
+      state.transfer.removeListener(closeIfSettled);
+    }
+  }
+
+  Future<void> _show(Transfer transfer, AppState state) async {
     await showDialog<void>(
       context: context,
       // Dismissable on purpose: see the class doc. Dismissal answers nothing.

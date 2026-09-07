@@ -1154,7 +1154,7 @@ class _ChatBubble extends StatelessWidget {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            _time(message.displayAt),
+                            _time(message.shownAt),
                             style: text.labelSmall?.copyWith(
                               color: fg.withValues(alpha: 0.7),
                             ),
@@ -1253,7 +1253,7 @@ class _ChatBubble extends StatelessWidget {
   // the optimistic message is replaced by the parsed (UTC) record.
   //
   // Null renders as no time at all. That is the whole point of
-  // [ChatMessage.displayAt] being nullable: an inbound row carries the
+  // [ChatMessage.shownAt] being nullable: an inbound row carries the
   // sender's own unvalidated timestamp string, and when there is no usable
   // instant behind it the honest thing to show is nothing. Printing the
   // current clock instead — which is what a `?? DateTime.now()` at the parse

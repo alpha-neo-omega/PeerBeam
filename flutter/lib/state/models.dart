@@ -165,6 +165,19 @@ class Transfer {
   /// be inventing the one check the code exists to make the user perform.
   final String pairingCode;
 
+  /// Whether the engine is waiting on this user to accept or decline.
+  ///
+  /// An incoming transfer is `pending` for two quite different reasons — the
+  /// engine is asking, or it has already admitted the file and simply has not
+  /// started moving bytes yet — and only the first is a question. Without this
+  /// the app raised its approval modal for every inbound file and had nothing
+  /// to withdraw it with, so an auto-accepted file landed while the user was
+  /// still being asked about it. That is the whole of what auto-accept looks
+  /// like from the outside, so it read as auto-accept not working.
+  ///
+  /// True for an outgoing transfer's row only because nothing reads it there.
+  final bool needsDecision;
+
   const Transfer({
     required this.id,
     required this.peerName,
@@ -178,6 +191,7 @@ class Transfer {
     this.resumable = false,
     this.newlyTrusted = false,
     this.pairingCode = '',
+    this.needsDecision = true,
   });
 
   double get progress =>
@@ -207,6 +221,7 @@ class Transfer {
     // first-contact prompt lose the very thing it exists to show.
     newlyTrusted: newlyTrusted,
     pairingCode: pairingCode,
+    needsDecision: needsDecision,
   );
 }
 

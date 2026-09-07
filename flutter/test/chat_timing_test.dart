@@ -1,11 +1,16 @@
 // What a chat row's clock is allowed to say, and what decides where the row
 // sits in the transcript.
 //
-// Two times exist per row and they answer different questions. `at` is the
-// sender's own stamp — on an inbound row, a peer's unvalidated claim about its
-// own clock. `storedAt` is when THIS device wrote the row. A surface shows the
-// first and orders by the second; conflating them is what every test here
-// guards against.
+// Two times exist per row. `at` is the sender's own stamp — on an inbound row,
+// a peer's unvalidated claim about its own clock. `storedAt` is when THIS
+// device wrote the row.
+//
+// A surface uses `storedAt` for BOTH what it shows and what it sorts by
+// (`shownAt`), and that single number is what these tests guard. Splitting the
+// two — label from the sender, order from here — is what an earlier version of
+// this file asserted, and it puts a row in one place while it claims another:
+// a message a peer queued while offline then reads "08:00" underneath a bubble
+// reading "14:30".
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -58,7 +63,7 @@ void main() {
 
       expect(msg.at, isNull);
       expect(msg.storedAt, isNull);
-      expect(msg.displayAt, isNull, reason: 'nothing to show is not "now"');
+      expect(msg.shownAt, isNull, reason: 'nothing to show is not "now"');
       expect(msg.orderedAt, isNull);
     });
 
@@ -91,28 +96,39 @@ void main() {
       });
 
       expect(msg.at, isNull);
-      expect(msg.displayAt, DateTime.parse('2026-01-01T10:00:00Z'));
+      expect(msg.shownAt, DateTime.parse('2026-01-01T10:00:00Z'));
       expect(msg.orderedAt, DateTime.parse('2026-01-01T10:00:00Z'));
     });
   });
 
-  group('which clock answers which question', () {
+  group('the time shown is the time ordered by', () {
     final sent = DateTime.parse('2099-01-01T00:00:00Z');
     final arrived = DateTime.parse('2026-01-01T10:00:00Z');
 
-    test('display shows the send time, ordering uses the arrival time', () {
+    // The invariant, and the reason `shownAt` is one getter rather than two.
+    // A row that is sorted by one number and labelled with another sits in one
+    // place while claiming another, and no rule can make that read correctly:
+    // from the receiver's side "sent long ago, delivered late" and "sent now by
+    // a device whose clock is behind" are the same two numbers.
+    test('a peer claiming another year is both shown and ordered locally', () {
       final msg = _msg('m1', at: sent, storedAt: arrived);
 
-      // What the sender said — a transcript's clock answers "when was this
-      // sent".
-      expect(msg.displayAt, sent);
-      // What this device knows — ordering must not be a peer's to choose.
+      expect(msg.shownAt, arrived);
       expect(msg.orderedAt, arrived);
+      expect(msg.shownAt, msg.orderedAt);
+      // The claim is still carried, for anything that wants it AS a claim.
+      expect(msg.at, sent);
     });
 
-    test('an outgoing row has one instant, so both agree', () {
+    test('an ordinary row has one instant anyway', () {
       final msg = _msg('m1', direction: 'out', at: arrived, storedAt: arrived);
-      expect(msg.displayAt, msg.orderedAt);
+      expect(msg.shownAt, msg.orderedAt);
+    });
+
+    test('with no local stamp it falls back to the sender\'s', () {
+      final msg = _msg('m1', at: sent);
+      expect(msg.shownAt, sent);
+      expect(msg.orderedAt, sent);
     });
   });
 
@@ -165,44 +181,62 @@ void main() {
   });
 
   group('transcript order', () {
-    // The defect: `_onReceived` appended. An arrival is usually the newest
-    // thing in the thread — but a peer that was offline queues its messages
-    // and flushes them on reconnect, so a burst stamped hours ago landed
-    // BELOW messages the user had sent minutes earlier, and then jumped back
-    // up on the next refresh.
-    test('a drained outbox lands in time order, not at the bottom', () async {
+    // A message a peer queued while offline arrives stamped with its ORIGINAL
+    // send time (the outbox flush carries `entry.timestamp` —
+    // peerbeam-chat/src/send.rs) but is stored on arrival
+    // (`ChatRecord::received` stamps `Utc::now()` unconditionally —
+    // peerbeam-chat/src/record.rs). So `at` is old and `storedAt` is now, and
+    // this test uses those values rather than the impossible pair an earlier
+    // version of it asserted (an old `storedAt`, which no engine path can
+    // produce — the test passed and proved nothing).
+    //
+    // It lands last, which is right: it is the most recent thing to reach this
+    // device. What matters is that its LABEL agrees with that position rather
+    // than reading 08:00 underneath a bubble reading 14:30 — which is what
+    // `shownAt` guarantees by being the same number the sort uses.
+    test('a drained outbox lands last and is labelled with its arrival, not '
+        'its send time', () async {
       final fake = FakePeerBeam();
       final repo = ChatRepository(api: fake);
+      final mine = DateTime.parse('2026-01-01T14:29:00Z');
+      final drainedAt = DateTime.parse('2026-01-01T14:30:00Z');
       fake.chatHistories['pb-bob'] = [
-        _msg(
-          'recent',
-          direction: 'out',
-          at: DateTime.parse('2026-01-01T14:30:00Z'),
-          storedAt: DateTime.parse('2026-01-01T14:30:00Z'),
-        ),
+        _msg('recent', direction: 'out', at: mine, storedAt: mine),
       ];
       await repo.refresh('pb-bob');
 
-      // Three messages the peer queued while offline, arriving now but
-      // stamped — and stored — earlier.
+      // Composed at 08:00-08:05 while this peer was offline; all three reach
+      // us at 14:30.
       for (final t in ['08:00', '08:02', '08:05']) {
         fake.emit(
           ChatReceived(
             _msg(
               't$t',
               at: DateTime.parse('2026-01-01T$t:00Z'),
-              storedAt: DateTime.parse('2026-01-01T$t:00Z'),
+              storedAt: drainedAt,
             ),
           ),
         );
       }
       await flush();
 
+      final rows = repo.messagesFor('pb-bob');
       expect(
-        repo.messagesFor('pb-bob').map((m) => m.id).toList(),
-        ['t08:00', 't08:02', 't08:05', 'recent'],
-        reason: 'an arrival was appended rather than placed in time order',
+        rows.map((m) => m.id).toList(),
+        ['recent', 't08:00', 't08:02', 't08:05'],
+        reason: 'the drained burst did not land at the newest end',
       );
+      // And no bubble claims a time that contradicts where it sits: the times
+      // read top-to-bottom are non-decreasing.
+      final shown = rows.map((m) => m.shownAt!).toList();
+      for (var i = 1; i < shown.length; i++) {
+        expect(
+          shown[i].isBefore(shown[i - 1]),
+          isFalse,
+          reason:
+              'row $i is labelled ${shown[i]} but sits below ${shown[i - 1]}',
+        );
+      }
     });
 
     test('a live arrival that IS newest still goes last', () async {

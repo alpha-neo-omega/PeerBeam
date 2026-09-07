@@ -5750,19 +5750,6 @@ impl Manager {
         // A no-op for the vast majority (an ordinary transfer has no row), and
         // a no-op when the peek learned nothing (empty name).
         self.chat_set_landing(&active, &preview.name, preview.size);
-        events::transfer(
-            &id,
-            "transfer_queued",
-            json!({
-                "peer": peer,
-                "peer_id": session.peer_device.0,
-                "incoming": true,
-                "file": display,
-                "size": preview.size,
-                "newly_trusted": session.newly_trusted,
-                "pairing_code": session.pairing_code.clone(),
-            }),
-        );
         // Record first contact before any decision can be taken, so the accept
         // gate and the refusal un-pin both see it. `newly_trusted` is the only
         // moment this is knowable: the handshake has already pinned the peer,
@@ -5804,6 +5791,36 @@ impl Manager {
         // interruption must not turn an unanswered prompt into a yes (I6).
         let resuming =
             self.resumes_accepted_receive(&id, &session.peer_device, &preview.name, preview.size);
+        // Announce the transfer only now that it is known whether anyone will
+        // be asked about it, and say which.
+        //
+        // This used to be emitted *before* the gate ran, and `needs_decision`
+        // did not exist. A surface has no other way to tell "queued, waiting
+        // for you" from "queued, already admitted", so the app raised its modal
+        // for every inbound file and then had nothing to withdraw it with: the
+        // auto-accepted file landed while the user was still looking at
+        // "Decline / Accept". Auto-accept appeared not to work at all, because
+        // the only part of it a user can see is whether they get asked.
+        //
+        // `false` covers all three ways nobody is asked — auto-accepted,
+        // refused outright by a revoked `files` permission, or resuming a
+        // transfer this user already accepted. Ordering the emit after
+        // `resumes_accepted_receive` is what lets the resume leg be honest too.
+        let needs_decision = matches!(admission, FileAdmission::Prompt) && !resuming;
+        events::transfer(
+            &id,
+            "transfer_queued",
+            json!({
+                "peer": peer,
+                "peer_id": session.peer_device.0,
+                "incoming": true,
+                "file": display,
+                "size": preview.size,
+                "newly_trusted": session.newly_trusted,
+                "pairing_code": session.pairing_code.clone(),
+                "needs_decision": needs_decision,
+            }),
+        );
         let outcome = match admission {
             // A revoked `files` permission beats a resume: the user's decision
             // is newer than the checkpoint.
