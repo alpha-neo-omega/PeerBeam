@@ -1085,18 +1085,47 @@ pub(crate) async fn send_paths(
 /// Shared with `trust list`, which prints how long a time-limited approval has
 /// left: the CLI must say a duration the same way everywhere, or `--for 2h` and
 /// the row it produces would not obviously be about the same thing.
+///
+/// **Exact, never rounded down.** This renders two things a user is entitled to
+/// hold this device to — how long a disappearing-message window keeps a message
+/// readable (`chat retention`), and how long a time-limited approval has left
+/// (`trust list`) — so a remainder that does not fit the coarsest unit is
+/// appended rather than dropped. `90s` reads `1m30s`, not `1m`: the earlier form
+/// understated a window the user had just set by a third of it, and a caller who
+/// waited the duration it printed found the messages still readable. A value
+/// that lands exactly on a unit still reads as it always did (`2h` → `2h00m`),
+/// which is what keeps it the inverse of [`parse_duration`].
 pub(crate) fn humantime(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        // Days once there are any. A week-long trust window rendered as
-        // `168h00m` is a number nobody reads as a week.
-        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        let (m, s) = (secs / 60, secs % 60);
+        return if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s:02}s")
+        };
+    }
+    if secs < 86_400 {
+        let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        let hm = format!("{h}h{m:02}m");
+        return if s == 0 { hm } else { format!("{hm}{s:02}s") };
+    }
+    // Days once there are any. A week-long trust window rendered as
+    // `168h00m` is a number nobody reads as a week.
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    let dh = format!("{d}d{h:02}h");
+    match (m, s) {
+        (0, 0) => dh,
+        (_, 0) => format!("{dh}{m:02}m"),
+        _ => format!("{dh}{m:02}m{s:02}s"),
     }
 }
 
@@ -3872,6 +3901,70 @@ mod duration_tests {
             let seconds = std::time::Duration::from_secs(parsed.num_seconds() as u64);
             assert_eq!(humantime(seconds), printed, "{spec}");
         }
+    }
+
+    /// **A window is never printed shorter than it is.** `humantime` renders how
+    /// long a disappearing-message window keeps a message readable and how long
+    /// a trust approval has left, and it used to drop whatever did not fit the
+    /// coarsest unit: `--after 90s` printed `1m`, so the CLI told the user their
+    /// messages were gone a full third of the window before they were. Every
+    /// remainder now survives, and a caller can wait exactly what was printed.
+    #[test]
+    fn a_duration_is_never_printed_shorter_than_it_is() {
+        for (secs, printed) in [
+            (90u64, "1m30s"),
+            (61, "1m01s"),
+            (119, "1m59s"),
+            (3_690, "1h01m30s"),
+            (3_601, "1h00m01s"),
+            (86_401, "1d00h00m01s"),
+            (86_460, "1d00h01m"),
+            // Exactly on a unit still reads as it always did — that is what
+            // keeps this the inverse of `parse_duration`.
+            (60, "1m"),
+            (3_600, "1h00m"),
+            (86_400, "1d00h"),
+        ] {
+            assert_eq!(
+                humantime(std::time::Duration::from_secs(secs)),
+                printed,
+                "{secs}s"
+            );
+        }
+
+        // The property the examples above are instances of: what is printed
+        // parses back to no less than what went in, for every second up to a
+        // day and change. A renderer that rounds down fails this immediately.
+        for secs in (0u64..90_000).step_by(37) {
+            let printed = humantime(std::time::Duration::from_secs(secs));
+            let back = re_read(&printed);
+            assert_eq!(
+                back, secs,
+                "{secs}s printed as {printed}, which reads back as {back}s"
+            );
+        }
+    }
+
+    /// Sum the `<n><unit>` runs in a `humantime` string back into seconds.
+    fn re_read(s: &str) -> u64 {
+        let mut total = 0u64;
+        let mut n = 0u64;
+        for c in s.chars() {
+            if let Some(d) = c.to_digit(10) {
+                n = n * 10 + u64::from(d);
+                continue;
+            }
+            total += n * match c {
+                's' => 1,
+                'm' => 60,
+                'h' => 3_600,
+                'd' => 86_400,
+                other => panic!("unknown unit {other} in {s}"),
+            };
+            n = 0;
+        }
+        assert_eq!(n, 0, "trailing digits with no unit in {s}");
+        total
     }
 }
 

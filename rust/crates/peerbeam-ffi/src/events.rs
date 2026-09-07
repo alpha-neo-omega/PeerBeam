@@ -87,6 +87,15 @@ pub fn record_dto(rec: &peerbeam_chat::ChatRecord) -> Value {
         "peer_id": rec.peer_id,
         "direction": rec.direction,
         "timestamp": rec.timestamp,
+        // When THIS device stored the row, as distinct from `timestamp`, which
+        // on an inbound row is the sender's own unvalidated claim about its own
+        // clock. A surface displays `timestamp` (when the message was sent) but
+        // must order and date by this (when it got here) — otherwise a peer
+        // with a skewed clock decides where its messages sit in the user's
+        // transcript, and a peer that sends a string this device cannot parse
+        // leaves the surface nothing honest to show at all. `null` only for a
+        // row written before the field existed; see `ChatRecord::stored_at`.
+        "stored_at": rec.stored_at.map(|at| at.to_rfc3339()),
         "body": rec.body,
         "status": rec.status,
         "kind": rec.kind,

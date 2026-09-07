@@ -71,6 +71,11 @@ class _ChatScreenState extends State<ChatScreen> {
   /// incoming messages and staging progress rebuild this screen constantly.
   Set<String> _selected = {};
 
+  /// Ticks a disappearing-message window closed while the thread is on screen.
+  /// Null whenever this conversation has no window set — a thread that keeps
+  /// its messages forever must not wake a timer.
+  Timer? _retentionTick;
+
   @override
   void initState() {
     super.initState();
@@ -92,13 +97,41 @@ class _ChatScreenState extends State<ChatScreen> {
       // unconditionally is not a disclosure — the engine owns that decision,
       // and duplicating it here would be a second place to get it wrong.
       await chat.markRead(widget.peerId);
+      if (!mounted) return;
+      _armRetentionTick();
     });
   }
 
   @override
   void dispose() {
+    _retentionTick?.cancel();
     _controller.dispose();
     super.dispose();
+  }
+
+  /// (Re)start the sweep that clears messages whose window closes while the
+  /// user is looking at the thread. Called once the thread is open and again
+  /// whenever the window changes.
+  ///
+  /// The period is a quarter of the window, so a message is never on screen
+  /// much past its time, and capped at a minute so the hour/day/week windows
+  /// this screen offers cost one cheap local read a minute rather than a busy
+  /// loop. The floor matters because the CLI can set a window this screen
+  /// cannot (`chat retention --after 90s`), and a fixed minute would have been
+  /// most of it.
+  void _armRetentionTick() {
+    _retentionTick?.cancel();
+    _retentionTick = null;
+    if (!mounted) return;
+    final seconds = AppScope.of(
+      context,
+    ).chat.retentionFor(widget.peerId).seconds;
+    if (seconds == null) return;
+    final period = Duration(seconds: (seconds ~/ 4).clamp(5, 60));
+    _retentionTick = Timer.periodic(period, (_) {
+      if (!mounted) return;
+      unawaited(AppScope.of(context).chat.sweepRetention(widget.peerId));
+    });
   }
 
   /// The peer as discovery can see it **right now**, falling back to the target
@@ -431,6 +464,9 @@ class _ChatScreenState extends State<ChatScreen> {
         chosen.seconds,
       );
       if (!mounted) return;
+      // The window just changed, so the sweep's period has to: a thread that
+      // had none now needs one, and one turned off must stop waking a timer.
+      _armRetentionTick();
       _snack(messenger, _retentionOutcome(chosen.seconds, pruned));
     } catch (e) {
       // Never swallowed: the sheet closed on the tap, so silence here would
@@ -627,10 +663,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// skipped rather than rendered as a placeholder line, for the same reason —
   /// their name is not text the sender wrote.
   Future<void> _copySelected(List<ChatMessage> chosen) async {
-    final text = chosen
-        .where((m) => !m.isFile)
-        .map((m) => m.body)
-        .join('\n');
+    final text = chosen.where((m) => !m.isFile).map((m) => m.body).join('\n');
     if (text.isEmpty) return;
     await Clipboard.setData(ClipboardData(text: text));
     if (!mounted) return;
@@ -1121,7 +1154,7 @@ class _ChatBubble extends StatelessWidget {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            _time(message.at),
+                            _time(message.displayAt),
                             style: text.labelSmall?.copyWith(
                               color: fg.withValues(alpha: 0.7),
                             ),
@@ -1218,7 +1251,16 @@ class _ChatBubble extends StatelessWidget {
   // is created with a local `DateTime.now()`. Normalize both through
   // `toLocal()` so a non-UTC user doesn't see the displayed time shift when
   // the optimistic message is replaced by the parsed (UTC) record.
-  String _time(DateTime t) {
+  //
+  // Null renders as no time at all. That is the whole point of
+  // [ChatMessage.displayAt] being nullable: an inbound row carries the
+  // sender's own unvalidated timestamp string, and when there is no usable
+  // instant behind it the honest thing to show is nothing. Printing the
+  // current clock instead — which is what a `?? DateTime.now()` at the parse
+  // boundary used to produce — put a real-looking send time on the row, one
+  // that advanced every time the thread was re-read.
+  String _time(DateTime? t) {
+    if (t == null) return '';
     final local = t.toLocal();
     return '${local.hour.toString().padLeft(2, '0')}:'
         '${local.minute.toString().padLeft(2, '0')}';

@@ -2380,7 +2380,17 @@ impl Manager {
                     for rec in history {
                         events.push(json!({
                             "kind": "chat",
-                            "at": rec.timestamp,
+                            // When THIS device stored the row, not the
+                            // sender's claim about its own clock: every other
+                            // kind of row in this list is stamped locally, and
+                            // one row on a peer's clock does not just label
+                            // itself wrongly, it sorts itself wrongly against
+                            // all of them. Falls back to the row's own
+                            // timestamp only for a legacy row with no
+                            // `stored_at`, which is the best this device has.
+                            "at": rec
+                                .age_basis()
+                                .map_or_else(|| rec.timestamp.clone(), |at| at.to_rfc3339()),
                             "peer": peer.0,
                             "detail": match rec.kind {
                                 peerbeam_chat::Kind::File => rec
@@ -2411,14 +2421,27 @@ impl Manager {
             }
         }
 
-        // Newest first, with the id as a stable tiebreak so two events in the
-        // same second do not swap places between calls.
+        // Newest first, with the kind as a stable tiebreak so two events in
+        // the same instant do not swap places between calls.
+        //
+        // Compared as parsed instants, never as text. These strings come from
+        // three different producers, and a text comparison is only the same as
+        // a chronological one while all of them agree on UTC offset and
+        // fractional-second width. `2026-01-01T00:00:00.900Z` sorts *before*
+        // `2026-01-01T00:00:00Z` as text, because `.` precedes `Z`, and any
+        // offset other than `+00:00` sorts by its wall-clock text rather than
+        // its instant. A row that will not parse sorts oldest, so it lands at
+        // the end instead of claiming the top of the user's activity list.
+        fn instant(v: &Value) -> chrono::DateTime<chrono::Utc> {
+            v.get("at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map_or(chrono::DateTime::<chrono::Utc>::MIN_UTC, |t| {
+                    t.with_timezone(&chrono::Utc)
+                })
+        }
         events.sort_by(|a, b| {
-            let (x, y) = (
-                a.get("at").and_then(Value::as_str).unwrap_or_default(),
-                b.get("at").and_then(Value::as_str).unwrap_or_default(),
-            );
-            y.cmp(x).then_with(|| {
+            instant(b).cmp(&instant(a)).then_with(|| {
                 let (ka, kb) = (
                     a.get("kind").and_then(Value::as_str).unwrap_or_default(),
                     b.get("kind").and_then(Value::as_str).unwrap_or_default(),
@@ -4890,11 +4913,36 @@ impl Manager {
     /// you for `n` decisions. A thread with unread *text* therefore reads 0,
     /// which is the honest answer to a question this product cannot yet ask.
     ///
-    /// `last_timestamp` is the newest row's timestamp, or `null` for a thread
-    /// whose rows this build cannot read. Sorted newest-first (ties broken by
-    /// peer id, so the order is stable), which is what a conversation list
-    /// wants — but note that an inbound row's timestamp came off the peer's own
-    /// clock, so this is best-effort recency and not a trusted ordering.
+    /// Two times are reported for the newest row, and they answer different
+    /// questions. `last_timestamp` is the row's own timestamp — for an inbound
+    /// row, the **sender's** claim about its own clock — and is what a surface
+    /// may *display* as when the message was sent. `last_at` is
+    /// [`ChatRecord::age_basis`]: the instant **this** device stored the row,
+    /// which is what a surface must use for *recency* ("last message 5m ago")
+    /// and what this list is sorted by. Either is `null` for a thread whose
+    /// rows this build cannot read, and `last_at` is additionally `null` for a
+    /// legacy row whose unvalidated timestamp will not parse.
+    ///
+    /// Sorted newest-first by `last_at`, ties broken by peer id so the order is
+    /// stable, and a thread with no datable row sorts last rather than first.
+    ///
+    /// # Why not the timestamp
+    ///
+    /// This used to take the newest row as `history.last()` — the greatest
+    /// store key, so the row whose *author's* clock read latest — and then sort
+    /// the threads by comparing those timestamp strings as text. Both handed a
+    /// peer control of the user's conversation list. A peer whose clock ran
+    /// hours ahead pinned its thread to the top and labelled it "just now"
+    /// indefinitely; a peer whose clock ran behind buried a thread a message
+    /// had just arrived in, under quieter ones. Comparing as text also broke on
+    /// its own: an offset of `+05:30` reads as five and a half hours later than
+    /// the same instant in `+00:00`, and `…00.900Z` sorts *before* `…00Z`
+    /// because `.` precedes `Z`.
+    ///
+    /// `stored_at` exists for exactly this reason and is already what a
+    /// disappearing-message window is measured against — see
+    /// [`ChatRecord::stored_at`]. Using it here makes the ordering this list
+    /// always wanted actually true, rather than best-effort.
     ///
     /// Cost: one namespace scan plus one full history read per conversation.
     /// [`AppStore`](peerbeam_domain::port::AppStore) has no "last key" call, so
@@ -4906,7 +4954,16 @@ impl Manager {
             .chat
             .conversations()
             .map_err(|e| (Code::Internal, e.to_string()))?;
-        let mut rows: Vec<(String, Option<String>, usize)> = Vec::with_capacity(peers.len());
+        struct Row {
+            peer_id: String,
+            /// The newest row's own timestamp — the sender's string on an
+            /// inbound row. For display only.
+            last_timestamp: Option<String>,
+            /// When this device stored that row. Orders the list.
+            last_at: Option<chrono::DateTime<chrono::Utc>>,
+            unread_hint: usize,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(peers.len());
         for peer in peers {
             // A thread whose records cannot be read still exists and must still
             // be listed — dropping it would hide the very conversation this
@@ -4916,25 +4973,52 @@ impl Manager {
                 tracing::warn!(error = %e, peer_id = %peer.0, "conversation summary unreadable");
                 Vec::new()
             });
-            let last = history.last().map(|rec| rec.timestamp.clone());
+            // The newest row by when THIS device stored it, not by store key
+            // (the author's clock) and not by comparing timestamp strings. The
+            // id is the tiebreak so a thread whose rows share a stored_at
+            // resolves the same way on every call. A row this device cannot
+            // date loses to any it can, and only wins when nothing else is
+            // datable — so a junk timestamp cannot claim the thread's summary.
+            let newest = history
+                .iter()
+                .max_by(|a, b| {
+                    a.age_basis()
+                        .cmp(&b.age_basis())
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+                .map(|rec| (rec.timestamp.clone(), rec.age_basis()));
             let awaiting = history
                 .iter()
                 .filter(|rec| {
                     rec.direction == ChatDirection::In && rec.status == ChatStatus::PendingApproval
                 })
                 .count();
-            rows.push((peer.0, last, awaiting));
+            let (last_timestamp, last_at) = match newest {
+                Some((ts, at)) => (Some(ts), at),
+                None => (None, None),
+            };
+            rows.push(Row {
+                peer_id: peer.0,
+                last_timestamp,
+                last_at,
+                unread_hint: awaiting,
+            });
         }
-        // Newest first. `None` sorts below every `Some`, so an unreadable
-        // thread lands at the bottom rather than the top.
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Newest first. `None` sorts below every `Some`, so a thread this build
+        // cannot date lands at the bottom rather than the top.
+        rows.sort_by(|a, b| {
+            b.last_at
+                .cmp(&a.last_at)
+                .then_with(|| a.peer_id.cmp(&b.peer_id))
+        });
         let peers: Vec<Value> = rows
             .into_iter()
-            .map(|(peer_id, last_timestamp, unread_hint)| {
+            .map(|row| {
                 json!({
-                    "peer_id": peer_id,
-                    "last_timestamp": last_timestamp,
-                    "unread_hint": unread_hint,
+                    "peer_id": row.peer_id,
+                    "last_timestamp": row.last_timestamp,
+                    "last_at": row.last_at.map(|at| at.to_rfc3339()),
+                    "unread_hint": row.unread_hint,
                 })
             })
             .collect();
@@ -10023,6 +10107,125 @@ mod tests {
         let mut sorted = times.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(times, sorted, "the timeline was not newest-first");
+    }
+
+    /// **A peer does not get to choose where its message sits in the user's
+    /// activity list.** Every other kind of row in the timeline is stamped by
+    /// this device; a chat row used to be stamped with `rec.timestamp`, which
+    /// on an inbound row is the sender's own unvalidated claim about its own
+    /// clock. A peer claiming next year pinned itself to the top of the list
+    /// and — a negative age reading as `just now` in the surface's `_when` —
+    /// labelled itself the most recent thing that had happened.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peers_clock_does_not_decide_where_its_message_sits_in_the_timeline() {
+        let (mgr, chat, _dir) = test_manager_full("timeliner3", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // Arrived first, but claims to be from next year.
+        let mut liar = peerbeam_chat::ChatMessage::new("from the future").expect("message");
+        liar.timestamp = "2099-01-01T00:00:00Z".to_string();
+        let mut early = peerbeam_chat::ChatRecord::received(&peer, &liar);
+        early.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&early).expect("append the future-stamped row");
+
+        // Arrived second, stamped honestly.
+        let honest = peerbeam_chat::ChatMessage::new("from now").expect("message");
+        let mut late = peerbeam_chat::ChatRecord::received(&peer, &honest);
+        late.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&late).expect("append the honest row");
+
+        let out = mgr.timeline(&json!({})).expect("timeline");
+        let events = out["events"].as_array().expect("array");
+        let times: Vec<&str> = events.iter().filter_map(|e| e["at"].as_str()).collect();
+
+        // Both rows are dated by when they arrived here, so nothing in the
+        // list claims to be from 2099.
+        assert!(
+            !times.iter().any(|t| t.starts_with("2099")),
+            "a peer's claimed clock reached the timeline: {times:?}"
+        );
+        // And the honest row, which arrived an hour later, leads.
+        assert_eq!(
+            times.first().map(|t| &t[..13]),
+            Some("2026-01-01T11"),
+            "the timeline ordered by the peer's claim rather than by arrival: {times:?}"
+        );
+    }
+
+    /// **The conversations list is ordered by this device's clock, and says so
+    /// honestly.** It used to take the newest row as `history.last()` — the
+    /// greatest store key, so whichever row's *author* had the latest clock —
+    /// and then order the threads by comparing those timestamp strings as text.
+    /// A peer running fast held the top of the list and read "just now"
+    /// indefinitely; a peer running slow buried a thread a message had just
+    /// arrived in.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peers_clock_does_not_decide_the_conversations_order_or_its_recency() {
+        let (mgr, chat, _dir) = test_manager_full("lister", 0);
+        let fast = DeviceId::from("pb-fast");
+        let quiet = DeviceId::from("pb-quiet");
+
+        // The fast peer's row arrived FIRST and claims next year.
+        let mut liar = peerbeam_chat::ChatMessage::new("tomorrow").expect("message");
+        liar.timestamp = "2099-01-01T00:00:00Z".to_string();
+        let mut early = peerbeam_chat::ChatRecord::received(&fast, &liar);
+        early.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&early).expect("append");
+
+        // The quiet peer's row arrived an hour later, stamped honestly.
+        let honest = peerbeam_chat::ChatMessage::new("today").expect("message");
+        let mut late = peerbeam_chat::ChatRecord::received(&quiet, &honest);
+        late.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&late).expect("append");
+
+        let out = mgr
+            .chat_conversations(&json!({}))
+            .expect("chat_conversations");
+        let peers = out["peers"].as_array().expect("array");
+        let ids: Vec<&str> = peers.iter().filter_map(|p| p["peer_id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pb-quiet", "pb-fast"],
+            "the list was ordered by the peers' own clocks"
+        );
+
+        // `last_at` is what a surface reads recency from, and it is this
+        // device's clock — so nothing in it claims to be from 2099.
+        let fast_row = peers
+            .iter()
+            .find(|p| p["peer_id"] == "pb-fast")
+            .expect("the fast peer is still listed");
+        assert_eq!(
+            fast_row["last_at"].as_str().map(|t| &t[..13]),
+            Some("2026-01-01T10"),
+            "last_at carried the peer's claim"
+        );
+        // `last_timestamp` still reports what the sender actually said, so a
+        // surface can show the claimed send time. The two are different
+        // questions and both are answered.
+        assert_eq!(
+            fast_row["last_timestamp"].as_str(),
+            Some("2099-01-01T00:00:00Z"),
+            "the sender's own stamp is no longer reported at all"
+        );
     }
 
     #[tokio::test]

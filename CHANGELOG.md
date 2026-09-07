@@ -6,7 +6,51 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+- **A chat row's clock could be the sender's, and its position could be too.**
+  A record carries two times: `timestamp`, minted by whoever sent it, and
+  `stored_at`, written by this device on arrival. `stored_at` existed and was
+  wired only to disappearing messages; every other surface still trusted the
+  sender's. So a peer's clock decided where its messages sat and how recent they
+  looked — one running fast held the top of the Conversations list reading "just
+  now" indefinitely, one running slow buried a thread a message had just arrived
+  in. Ordering and recency now come from `stored_at` everywhere (chat search, the
+  Conversations list, the Activity timeline, the transcript); `timestamp` is
+  still what a bubble *displays*, because "when was this sent" is the question a
+  transcript's clock answers. `stored_at` is additive on the FFI — ABI still v1.
+  See *Which clock a chat row is dated by* in `docs/FFI.md`.
+- **Timestamps were compared as text rather than as instants.** Chat search, the
+  Conversations list and the timeline all sorted RFC 3339 *strings*, which only
+  matches chronological order while every row shares one UTC offset and one
+  fractional-second width. A peer stamping `+05:30` sorted five and a half hours
+  ahead of the same instant in `+00:00`, and `…00.900Z` sorted *before* `…00Z`
+  because `.` precedes `Z`.
+- **An unparseable timestamp displayed as the current time.** The app read a
+  chat time as `tryParse(…) ?? DateTime.now()`, so a peer-supplied string this
+  build could not parse did not render as unknown — it rendered as the clock you
+  were looking at, and being re-derived on every read it advanced each time the
+  thread was reopened. Such a row now shows no time at all, which is what the
+  Conversations list already did with the same string. Same fix for a reaction's
+  timestamp.
+- **A message the peer queued while offline landed at the bottom of the
+  transcript.** A live arrival was appended regardless of its time, so a drained
+  outbox stacked hours-old messages under ones sent minutes ago and then jumped
+  them back into place on the next refresh. A share the engine refused was
+  likewise pinned below every later message for the rest of the session.
+- **Messages did not disappear while you were watching them.** A
+  disappearing-message window that closed with the thread open left the expired
+  messages readable on screen — under a strip saying they disappear after an hour
+  — until the screen was left and re-entered. The engine had already stopped
+  returning them.
+- **`copyWith` silently dropped a message's `group`**, though it documents that
+  an omitted argument never clears a field. Any status settling on a group row —
+  the ordinary path for an outgoing one — turned it back into a one-to-one
+  message.
+- **`peerbeam chat retention` understated the window it had just set.** The
+  duration renderer dropped whatever did not fit its coarsest unit, so
+  `--after 90s` printed `1m`: messages stayed readable for 30 seconds after the
+  CLI said they were gone. Shared with `trust list`, which understated a
+  time-limited approval the same way.
 
 ## [0.11.0] - 2026-08-28
 
