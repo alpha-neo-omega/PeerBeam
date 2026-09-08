@@ -7,6 +7,13 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Releases now attach `SHA256SUMS`.** Generated over exactly the files being
+  uploaded, named by basename so `sha256sum -c SHA256SUMS` works in whatever
+  directory you downloaded into, and attached in the same call that creates the
+  release — a separate upload step could fail after the release existed and
+  leave artifacts unchecksummed with nothing to notice. It proves a download is
+  intact, not that it came from this project: the list sits beside the files it
+  describes. `docs/GUIDE.md` says how to check one, and says that plainly.
 - **A tray / menu-bar icon on desktop.** Windows puts it in the notification
   area, macOS in the menu bar (it has no taskbar), Linux via Ayatana's
   app-indicator. The menu shows what is happening — transfers in progress with

@@ -319,6 +319,37 @@ jobs:
           mapfile -t -O "${#files[@]}" files < <(find artifacts/macos \
             -maxdepth 1 -type f -name '*.dmg' 2>/dev/null)
           printf 'upload: %s\n' "${files[@]}"
+          # SHA256SUMS over exactly the files being uploaded.
+          #
+          # Named by BASENAME, not by the path here, so that
+          # `sha256sum -c SHA256SUMS` works in whatever directory a person
+          # downloaded into — a checksum file listing `artifacts/linux/foo.deb`
+          # verifies nothing on anybody else's machine. `gh` also names assets
+          # by basename, so the two agree by construction.
+          #
+          # Attached in the same `gh release create` call below rather than
+          # uploaded afterwards: a separate step can fail after the release
+          # already exists, which would publish artifacts with no checksums and
+          # no error anybody sees until they look.
+          #
+          # This is integrity, not authenticity. It lets someone confirm a
+          # download is not truncated or corrupted, and lets two people confirm
+          # they have the same bytes. It does NOT prove the bytes came from this
+          # project — the file sits beside the artifacts it describes, so
+          # whoever could replace one could replace both. That needs a signature
+          # over a key published elsewhere, which is a separate piece of work.
+          sums=/tmp/SHA256SUMS
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no artifacts found to publish"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            printf '%s  %s\n' \
+              "$(sha256sum < "$f" | cut -d' ' -f1)" \
+              "$(basename "$f")"
+          done | sort -k2 > "$sums"
+          cat "$sums"
+          files+=("$sums")
           # Hand-written notes when the tag carries them, generated notes when
           # it does not. This used to be an unconditional --notes-file, which
           # meant a tag without one failed the job *after* every platform had

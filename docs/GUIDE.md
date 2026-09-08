@@ -39,6 +39,32 @@ from the full list of files yourself, everything is attached to
 The GUI and the CLI are two frontends over the same engine. Installing both on
 one machine is normal and they share the same identity, trust store and history.
 
+### Checking a download arrived intact
+
+Every release attaches **`SHA256SUMS`**. Download it into the same directory as
+the file you fetched and check them together:
+
+```bash
+# Linux / macOS
+sha256sum -c SHA256SUMS            # or: shasum -a 256 -c SHA256SUMS
+
+# Windows PowerShell — compare one file against the list
+(Get-FileHash .\peerbeam-0.11.0-windows-x64-portable.zip -Algorithm SHA256).Hash
+Select-String -Path .\SHA256SUMS -Pattern 'windows-x64-portable'
+```
+
+`sha256sum -c` prints `OK` per file it can find and exits non-zero if any hash
+disagrees. It ignores lines for files you did not download, so checking one file
+out of twenty-three is fine.
+
+> **What this proves, and what it does not.** A matching hash means the bytes are
+> the bytes the release was built from — not truncated by a dropped connection,
+> not corrupted in transit or on disk. It does **not** prove they came from this
+> project: `SHA256SUMS` sits beside the files it describes, so anyone able to
+> replace an artifact could replace the list too. Proving origin needs a
+> signature verified against a key published somewhere else, which PeerBeam does
+> not yet have — see [Signing status](RELEASE.md#signing-status).
+
 ---
 
 ## 2. Install the app
