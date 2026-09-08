@@ -47,7 +47,7 @@ each without platform-specific assumptions in shared code:
 | Save-directory dialog | ✓ | ✓ | ✓ | `file_selector` `getDirectoryPath()` |
 | Networked transfer (QUIC) | ✓ | ✓ | ✓ | Rust engine (`peerbeam` CLI/engine) |
 | OS notifications | ✗ | ✗ | ✗ | Not implemented on desktop (in-app UI only) |
-| System tray | ✗ | ✗ | ✗ | Not implemented |
+| System tray / menu bar | ✓ | ✓ | ✓ | `tray_manager` + `window_manager` |
 | Background service | — | — | — | Android-only concept; N/A on desktop |
 
 ✓ = implemented (Linux build-verified; Windows/macOS pending a host build).
@@ -64,7 +64,21 @@ each without platform-specific assumptions in shared code:
   wired to Settings → "Save to" (desktop only); updates the save directory.
 - **Notifications** — no desktop OS-notification backend yet. Transfer status is
   shown in-app. (Android uses native notifications via the platform bridge.)
-- **Tray integration** — not implemented.
+- **Tray integration** — a status icon with live transfers and online devices,
+  plus Open / Send files… / Quit. Windows draws it in the notification area,
+  macOS in the menu bar, Linux via Ayatana's app-indicator. The menu's *content*
+  is a pure function (`lib/platform/tray_model.dart`) with unit tests
+  (`test/tray_model_test.dart`); the plugin call site cannot be driven headless
+  and needs a manual pass per desktop.
+
+  Closing the window can leave PeerBeam running in the tray, **off by default**
+  (Settings → "Keep running when I close it"). Off is the safe default because a
+  person who closes a window generally believes they closed the program, and it
+  would otherwise keep receiving files. Quit is always in the tray menu.
+
+  **Linux needs `libayatana-appindicator3-1` at runtime** (`-dev` to build). It
+  is a hard dependency — a NEEDED entry on the binary, not an optional feature —
+  so the `.deb`, `.rpm` and PKGBUILD all declare it.
 
 > GUI dialogs (picker/save) cannot be driven in a headless test run; they are
 > verified by compilation + integration wiring here, and require a manual pass

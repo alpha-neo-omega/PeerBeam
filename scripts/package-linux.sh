@@ -83,6 +83,7 @@ Version: $VER
 Section: net
 Priority: optional
 Architecture: $DARCH
+Depends: libgtk-3-0, libayatana-appindicator3-1
 Maintainer: PeerBeam Contributors <noreply@peerbeam>
 Description: Secure, zero-config file & clipboard sharing
 CTRL
@@ -116,8 +117,12 @@ Summary:        Secure, zero-config file & clipboard sharing
 License:        AGPL-3.0-or-later
 URL:            https://github.com/alpha-neo-omega/PeerBeam
 BuildArch:      $RARCH
-# The GUI links GTK3 at runtime; everything else is static in the bundle.
+# The GUI links GTK3 and Ayatana's app-indicator (the tray icon) at runtime;
+# everything else is static in the bundle. Both are hard requirements rather
+# than optional: they are NEEDED entries on the binary, so a missing one means
+# the app does not start at all rather than losing a feature.
 Requires:       gtk3
+Requires:       libayatana-appindicator-gtk3
 # The payload is a prebuilt Flutter bundle: already stripped, and its .so files
 # are not meant to be picked apart by rpm's automatic dependency generator.
 AutoReqProv:    no

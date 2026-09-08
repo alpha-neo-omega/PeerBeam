@@ -6,6 +6,24 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **A tray / menu-bar icon on desktop.** Windows puts it in the notification
+  area, macOS in the menu bar (it has no taskbar), Linux via Ayatana's
+  app-indicator. The menu shows what is happening — transfers in progress with
+  their percentage, devices online now — and offers Open, Send files… and Quit.
+  Long lists are capped with a line saying how many were not shown, rather than
+  stopping silently at five as though that were all of them.
+- **Optionally keep running when the window closes**, off by default
+  (Settings → "Keep running when I close it"). With it on, closing hides to the
+  tray and PeerBeam keeps receiving; Quit is always in the tray menu. Off is the
+  default deliberately: somebody who closes a window generally believes they
+  closed the program, and a build that kept accepting files after that would be
+  deciding something about their machine for them.
+
+  Linux packages now depend on `libayatana-appindicator3-1` (and the `.deb`
+  declares `libgtk-3-0`, which it never had). Both are linked at runtime, so a
+  missing one stops the app starting rather than costing it a feature.
+
 ### Changed
 - **The update check now asks the project's own site, not GitHub's API.** One
   HTTPS GET to `peerbeam.pages.dev/releases.json`, a two-field document the site

@@ -42,6 +42,15 @@ endif()
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_14)
   target_compile_options(${TARGET} PRIVATE -Wall -Werror)
+  # ...but a *deprecation* is a warning, not an error, and this function is
+  # applied to plugin targets as well as our own (see the note above). Ayatana's
+  # `app_indicator_new` is deprecated and is what `tray_manager` must call to
+  # put an icon in the notification area, so with a bare `-Werror` the Linux
+  # desktop build fails inside a dependency's C code that we do not maintain and
+  # cannot fix. Everything else still fails the build; this narrows one class of
+  # warning that tracks other people's platform APIs aging, not our own code
+  # being wrong.
+  target_compile_options(${TARGET} PRIVATE -Wno-error=deprecated-declarations)
   target_compile_options(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
   target_compile_definitions(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>")
 endfunction()

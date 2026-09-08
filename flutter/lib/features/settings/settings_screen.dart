@@ -301,7 +301,9 @@ class SettingsScreen extends StatelessWidget {
                       AnimatedBuilder(
                         animation: state.view,
                         builder: (context, _) => SwitchListTile.adaptive(
-                          secondary: const Icon(Icons.notification_important_outlined),
+                          secondary: const Icon(
+                            Icons.notification_important_outlined,
+                          ),
                           title: const Text('Ask when a file arrives'),
                           // The subtitle has to kill the obvious misreading.
                           // "Ask when a file arrives", turned off, reads like
@@ -318,6 +320,33 @@ class SettingsScreen extends StatelessWidget {
                               unawaited(state.view.setAskOnReceive(v)),
                         ),
                       ),
+                      // Desktop only, because there is no tray to stay in
+                      // anywhere else — Android has its foreground service and
+                      // a headless box has `peerbeam daemon`.
+                      if (isDesktop)
+                        ListenableBuilder(
+                          listenable: state.view,
+                          builder: (context, _) => SwitchListTile(
+                            secondary: const Icon(
+                              Icons.dock_rounded,
+                              semanticLabel: 'Tray',
+                            ),
+                            title: const Text('Keep running when I close it'),
+                            // Says the consequence, not the mechanism. The
+                            // thing a person needs to know is that closing
+                            // the window will stop meaning "stop the app" —
+                            // it keeps receiving — and where the off switch
+                            // went.
+                            subtitle: const Text(
+                              'Closing the window hides PeerBeam in the tray '
+                              'instead of quitting, so it keeps receiving. '
+                              'Quit from the tray icon.',
+                            ),
+                            value: state.view.keepInTray,
+                            onChanged: (v) =>
+                                unawaited(state.view.setKeepInTray(v)),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -430,7 +459,8 @@ class SettingsScreen extends StatelessWidget {
                                 // once and never sent a file sat here forever.
                                 // The engine and the CLI could both approve it;
                                 // only the GUI could not.
-                                if (!pins[i].approved) _ApproveRow(device: pins[i]),
+                                if (!pins[i].approved)
+                                  _ApproveRow(device: pins[i]),
                               ],
                             ),
                             isThreeLine: !pins[i].approved,
@@ -684,9 +714,9 @@ class SettingsScreen extends StatelessWidget {
   static Future<void> _copyFingerprint(BuildContext context, String fp) async {
     await Clipboard.setData(ClipboardData(text: fp));
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Full fingerprint copied')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Full fingerprint copied')));
   }
 
   /// First 16 hex chars of the fingerprint, grouped for readability.
