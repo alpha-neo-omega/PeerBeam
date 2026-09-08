@@ -6,6 +6,30 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Changed
+- **The update check now asks the project's own site, not GitHub's API.** One
+  HTTPS GET to `peerbeam.pages.dev/releases.json`, a two-field document the site
+  generates at build time from the same constant that renders its download
+  links — so it can only advertise a release whose files that page can actually
+  hand you. The release feed answered a slightly different question ("what is
+  the newest tag"), and a tag that exists before the site is rebuilt would have
+  sent everyone who acted on the prompt to a filename that is not there yet. It
+  also keeps the one request PeerBeam makes that is not to a peer on an origin
+  the project controls, and off a third-party API whose unauthenticated rate
+  limit is shared by everyone behind a NAT. Still one GET, no identifiers, no
+  retry, and now no fallback to a second host. The URL you are offered is
+  compiled in rather than read from the response, so the served document cannot
+  send anyone anywhere. `docs/SECURITY.md` is updated to match.
+- **"An update is available" now sends you to the project's own download page**
+  (<https://peerbeam.pages.dev/download>) rather than the GitHub releases list.
+  The page names the file for the platform you are on and how to install it; the
+  releases page is a directory of twenty-three assets you have to choose between
+  correctly, which is the wrong thing to hand someone who has just been told to
+  act. The bytes are unchanged — the page links each file to the same
+  `releases/latest/download/…` asset — so this changes where a person is sent,
+  not where anything is hosted, and puts no new party in the path of a download.
+  The version is still read from the GitHub release feed.
+
 ### Fixed
 - **"Trust" on a receive prompt did not stop the asking.** The primary button —
   labelled "Trust", tooltipped "Accept and always trust this device" — recorded

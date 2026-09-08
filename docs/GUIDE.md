@@ -15,8 +15,12 @@ terminal. Written against **v0.11.0**.
 
 ## 1. Download
 
-Everything is attached to the release:
-**<https://github.com/alpha-neo-omega/PeerBeam/releases/latest>**
+**<https://peerbeam.pages.dev/download>** — it names the file for the platform
+you are on and links straight to it.
+
+The bytes come from the GitHub release either way, so if you would rather pick
+from the full list of files yourself, everything is attached to
+<https://github.com/alpha-neo-omega/PeerBeam/releases/latest>.
 
 | You want | File |
 |---|---|

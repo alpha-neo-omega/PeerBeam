@@ -278,7 +278,7 @@ fn render_scalar(v: &serde_json::Value) -> String {
 
 // ── doctor ──────────────────────────────────────────────────────
 
-/// Ask the release feed what the newest published version is.
+/// Ask the project's site what the newest published version is.
 ///
 /// Deliberately thin: it prints what it was told and stops. Amendment A1 permits
 /// a check, not an updater — nothing here downloads, installs, or changes
@@ -342,7 +342,7 @@ async fn check_updates(ctx: &Ctx) -> CliResult {
             } else {
                 ctx.line(&format!(
                     "could not check for updates — {e}\nyou have {current}; see {}",
-                    peerbeam_update::RELEASES_PAGE
+                    peerbeam_update::DOWNLOAD_PAGE
                 ));
             }
             Ok(())

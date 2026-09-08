@@ -14,39 +14,80 @@
 //!   PeerBeam-specific header. What the server learns is what a bare HTTPS
 //!   request unavoidably tells it.
 //! * **Inert response.** [`Release`] is a version and a URL. Nothing downloads,
-//!   nothing installs, no behaviour anywhere changes on the strength of it.
+//!   nothing installs, no behaviour anywhere changes on the strength of it —
+//!   and the URL is compiled in rather than read from the response, so the
+//!   document cannot send anyone anywhere. See [`newest`].
 //! * **Never a precondition.** Every failure is a plain `Err` the caller is
 //!   expected to shrug at. Offline is normal for this app.
 //! * **Opt-in per use.** There is no timer and no constructor that starts
 //!   anything; a check happens because someone called [`check`].
 //!
+//! # Where the answer comes from
+//!
+//! The project's own site, at [`MANIFEST_URL`] — a two-field document generated
+//! by `scripts/write-releases-json.mjs` in the website repository, from the same
+//! constant that renders the download page's links.
+//!
+//! It used to be the GitHub release feed. That answers "what is the newest
+//! tag", which is a slightly different question: the download page links exact
+//! asset filenames, so a tag that exists before the site is rebuilt would send
+//! everyone who acted on the prompt to a file that is not there. Asking the page
+//! what it can actually offer removes that window, and keeps the request on one
+//! origin the project controls instead of a third-party API whose
+//! unauthenticated rate limit is shared by everyone behind a NAT.
+//!
 //! # Why the parsing is separate from the fetching
 //!
-//! [`newest`] is a pure function over a JSON body. The release feed's shape —
-//! that this project publishes pre-releases, so `/releases/latest` is not the
-//! answer — is a rule worth testing without a network, and worth stating
-//! somewhere it cannot silently drift.
+//! [`newest`] is a pure function over a JSON body, so the document's shape is a
+//! rule that can be tested without a network and cannot silently drift from the
+//! generator that writes it.
 
 use serde::Deserialize;
 
-/// Where releases are published. Constant, and deliberately not derived from
-/// the crate manifest: `rust/Cargo.toml` carried a `repository` URL naming a
-/// repo that does not exist for most of this project's life, and an updater
-/// pointed at the wrong repository fails in a way nobody debugs.
-pub const RELEASES_API: &str = "https://api.github.com/repos/alpha-neo-omega/PeerBeam/releases";
+/// The update manifest: a two-field JSON document the project's own site
+/// publishes for exactly this purpose.
+///
+/// Constant, and deliberately not derived from the crate manifest:
+/// `rust/Cargo.toml` carried a `repository` URL naming a repo that does not
+/// exist for most of this project's life, and an updater pointed at the wrong
+/// place fails in a way nobody debugs.
+///
+/// # Why the site and not the GitHub release feed
+///
+/// The feed answers "what is the newest tag", which is not quite the question.
+/// The site's download page links exact asset filenames
+/// (`peerbeam-0.11.0-amd64.deb`), so a tag that exists before the page is
+/// rebuilt would send everyone who acted on the prompt to a 404. The manifest
+/// is generated from the same constant that renders those links, so it can only
+/// advertise a version the page can actually hand someone.
+///
+/// It is also one request to one origin the project controls, rather than a
+/// call to a third-party API with an unauthenticated rate limit shared by
+/// everyone behind a NAT.
+pub const MANIFEST_URL: &str = "https://peerbeam.pages.dev/releases.json";
 
-/// Where a person goes to read about and download a release.
-pub const RELEASES_PAGE: &str = "https://github.com/alpha-neo-omega/PeerBeam/releases";
+/// Where a person goes to download a release.
+///
+/// The project's own download page, not the GitHub releases list. It names the
+/// file for the platform the reader is on and says how to install it, which a
+/// directory of twenty-three assets does not — and a user told "an update is
+/// available" is being sent somewhere to act, not to browse.
+///
+/// The bytes still come from the GitHub release: the page links each asset to
+/// `releases/latest/download/<file>`. So this changes where a person is sent,
+/// not where anything is hosted, and it does not put a new party in the path of
+/// the download.
+pub const DOWNLOAD_PAGE: &str = "https://peerbeam.pages.dev/download";
 
 /// What went wrong. Every variant is something the caller should treat as "no
 /// answer", never as a reason to block anything.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// The request did not complete — offline, DNS, TLS, timeout, refused.
-    #[error("could not reach the release feed: {0}")]
+    #[error("could not reach the update manifest: {0}")]
     Unreachable(String),
     /// It completed and said something this build cannot read.
-    #[error("the release feed was unreadable: {0}")]
+    #[error("the update manifest was unreadable: {0}")]
     Unreadable(String),
 }
 
@@ -59,34 +100,38 @@ pub struct Release {
     pub url: String,
 }
 
+/// The manifest as published. `url` is accepted but never used — see
+/// [`newest`].
 #[derive(Deserialize)]
-struct Entry {
-    tag_name: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    html_url: String,
+struct Manifest {
+    version: String,
 }
 
-/// The newest release in a feed body, or `None` when there is none to report.
+/// The release a manifest body describes, or `None` when it names no version.
 ///
-/// **Not `/releases/latest`.** GitHub excludes pre-releases from that endpoint,
-/// and this project published every release as one for its whole history — so
-/// the "latest" endpoint answered 404 while five releases existed. Reading the
-/// full list and taking the first entry is the only form that survives either
-/// choice. Drafts are skipped: they are not published to anybody.
+/// Pure, and separate from the fetching, so the document's shape is a rule that
+/// can be tested without a network and cannot silently drift.
 ///
-/// The feed is newest-first, which is GitHub's documented order.
+/// The manifest's own `url` field is deliberately **not** trusted as the place
+/// to send the user. It arrives over the network, and the one thing this
+/// feature does with its answer is offer to open a link — so the destination is
+/// the compiled-in [`DOWNLOAD_PAGE`] and a served document cannot redirect
+/// anybody anywhere. The field is still published for other readers, and this
+/// accepts a body containing it without complaint.
+///
+/// A blank version is `None` rather than a release with an empty name:
+/// [`is_newer`] parses unknown parts as 0, so an empty string would compare as
+/// older than everything and quietly mean "you are up to date, forever".
 pub fn newest(body: &str) -> Result<Option<Release>, UpdateError> {
-    let entries: Vec<Entry> =
+    let manifest: Manifest =
         serde_json::from_str(body).map_err(|e| UpdateError::Unreadable(e.to_string()))?;
-    Ok(entries.into_iter().find(|e| !e.draft).map(|e| Release {
-        version: e.tag_name.trim_start_matches('v').to_string(),
-        url: if e.html_url.is_empty() {
-            RELEASES_PAGE.to_string()
-        } else {
-            e.html_url
-        },
+    let version = manifest.version.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Release {
+        version,
+        url: DOWNLOAD_PAGE.to_string(),
     }))
 }
 
@@ -116,22 +161,24 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
-/// Ask the release feed what the newest published version is.
+/// Ask the project's site what the newest published version is.
 ///
-/// One GET, no identifiers, no retry. A caller that wants to try again asks
-/// again — a retry loop here would be the "ongoing, unattended" shape A1 does
-/// not cover.
+/// One GET, no identifiers, no retry, **and no fallback**. A caller that wants
+/// to try again asks again; a second request to a different host on failure
+/// would be the "ongoing, unattended" shape A1 does not cover, and would put
+/// the check back on a third-party API the moment the first one hiccuped.
+/// Unreachable is an ordinary answer here — offline is normal for this app.
 pub async fn check() -> Result<Option<Release>, UpdateError> {
-    // A User-Agent is required by the GitHub API, and this one names the
-    // product and nothing else: no version, no device, no install id. That is
-    // the most a bare request can avoid disclosing while still being served.
+    // A User-Agent naming the product and nothing else: no version, no device,
+    // no install id. That is the most a bare request can avoid disclosing while
+    // still being served.
     let client = reqwest::Client::builder()
         .user_agent("PeerBeam")
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| UpdateError::Unreachable(e.to_string()))?;
     let body = client
-        .get(RELEASES_API)
+        .get(MANIFEST_URL)
         .send()
         .await
         .map_err(|e| UpdateError::Unreachable(e.to_string()))?
@@ -145,59 +192,84 @@ pub async fn check() -> Result<Option<Release>, UpdateError> {
 mod tests {
     use super::*;
 
-    const FEED: &str = r#"[
-      {"tag_name":"v0.9.0","draft":false,"html_url":"https://example.invalid/9"},
-      {"tag_name":"v0.8.2","draft":false,"html_url":"https://example.invalid/8"}
-    ]"#;
+    /// The manifest exactly as `scripts/write-releases-json.mjs` publishes it
+    /// in the website repo. If that generator's shape changes, this fails.
+    const MANIFEST: &str = r#"{
+      "version": "0.11.0",
+      "url": "https://peerbeam.pages.dev/download"
+    }"#;
 
     #[test]
-    fn the_first_published_entry_is_the_newest() {
-        let r = newest(FEED).unwrap().expect("a release");
-        assert_eq!(r.version, "0.9.0");
-        assert_eq!(r.url, "https://example.invalid/9");
+    fn the_manifest_version_is_the_release() {
+        let r = newest(MANIFEST).unwrap().expect("a release");
+        assert_eq!(r.version, "0.11.0");
+        assert_eq!(r.url, DOWNLOAD_PAGE);
     }
 
-    /// This project published every release as a pre-release, so
-    /// `/releases/latest` answered 404 while five existed. A pre-release must
-    /// still be reported here, or the check says "up to date" forever.
+    /// The site publishes a bare version; a `v` prefix is accepted anyway so
+    /// the two spellings of the same release cannot mean different things.
     #[test]
-    fn a_prerelease_still_counts_as_published() {
-        let body = r#"[{"tag_name":"v1.0.0-rc1","draft":false,"prerelease":true,"html_url":"u"}]"#;
+    fn a_leading_v_is_not_part_of_the_version() {
+        for body in [r#"{"version":"v1.2.3"}"#, r#"{"version":"1.2.3"}"#] {
+            assert_eq!(newest(body).unwrap().unwrap().version, "1.2.3");
+        }
+    }
+
+    /// A pre-release is a version like any other here. The site decides what it
+    /// is willing to advertise; this reports whatever it says.
+    #[test]
+    fn a_prerelease_is_reported_like_anything_else() {
+        let body = r#"{"version":"1.0.0-rc1"}"#;
         assert_eq!(newest(body).unwrap().unwrap().version, "1.0.0-rc1");
     }
 
-    /// A draft is not published to anybody, so reporting one would point a user
-    /// at a page they cannot open.
+    /// **A blank version is "nothing to report", not a release named "".**
+    /// `is_newer` parses unknown parts as 0, so an empty string would compare
+    /// as older than every build and quietly mean "up to date" forever — the
+    /// exact failure an update check exists to avoid.
     #[test]
-    fn a_draft_is_skipped() {
-        let body = r#"[
-          {"tag_name":"v2.0.0","draft":true,"html_url":"u"},
-          {"tag_name":"v1.0.0","draft":false,"html_url":"v"}
-        ]"#;
-        assert_eq!(newest(body).unwrap().unwrap().version, "1.0.0");
+    fn a_blank_version_reports_nothing_rather_than_an_empty_release() {
+        for body in [r#"{"version":""}"#, r#"{"version":"   "}"#] {
+            assert_eq!(newest(body).unwrap(), None, "{body}");
+        }
     }
 
     #[test]
-    fn an_empty_feed_reports_nothing_rather_than_failing() {
-        assert_eq!(newest("[]").unwrap(), None);
-    }
-
-    #[test]
-    fn a_body_that_is_not_a_feed_is_an_error_not_a_panic() {
+    fn a_body_that_is_not_a_manifest_is_an_error_not_a_panic() {
         assert!(newest("not json").is_err());
-        assert!(newest(r#"{"message":"Not Found"}"#).is_err());
+        // The SPA shell, which is what a mis-deployed site serves in place of
+        // the manifest — it must read as unreadable rather than as a release.
+        assert!(newest("<!doctype html><html></html>").is_err());
+        // Valid JSON, no version field.
+        assert!(newest(r#"{"url":"https://example.invalid/"}"#).is_err());
     }
 
+    /// A manifest carrying extra fields keeps working: the site may publish
+    /// more for other readers than this build knows how to want.
     #[test]
-    fn a_missing_url_falls_back_to_the_releases_page() {
-        let body = r#"[{"tag_name":"v1.2.3","draft":false}]"#;
-        assert_eq!(newest(body).unwrap().unwrap().url, RELEASES_PAGE);
+    fn unknown_fields_do_not_break_the_read() {
+        let body = r#"{"version":"9.9.9","url":"u","notes":"...","channel":"beta"}"#;
+        assert_eq!(newest(body).unwrap().unwrap().version, "9.9.9");
     }
 
+    /// **The served document cannot redirect anybody.** The one action this
+    /// feature offers is opening a link, so the destination is compiled in and
+    /// a `url` on the wire is ignored however inviting it looks.
     #[test]
-    fn the_leading_v_is_not_part_of_the_version() {
-        let body = r#"[{"tag_name":"v1.2.3","draft":false,"html_url":"u"}]"#;
-        assert_eq!(newest(body).unwrap().unwrap().version, "1.2.3");
+    fn the_manifests_own_url_is_never_where_the_user_is_sent() {
+        let body = r#"{"version":"1.2.3","url":"https://evil.invalid/payload"}"#;
+        assert_eq!(newest(body).unwrap().unwrap().url, DOWNLOAD_PAGE);
+    }
+
+    /// The download page is the project's own, and it is HTTPS. A plain-http
+    /// URL here would be an update prompt pointing at a downgradeable page.
+    #[test]
+    fn the_download_page_is_this_projects_own_https_page() {
+        assert!(DOWNLOAD_PAGE.starts_with("https://"), "{DOWNLOAD_PAGE}");
+        assert!(
+            DOWNLOAD_PAGE.contains("peerbeam.pages.dev"),
+            "{DOWNLOAD_PAGE}"
+        );
     }
 
     /// A string comparison gets this backwards, which is the classic way an
