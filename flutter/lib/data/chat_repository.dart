@@ -506,10 +506,24 @@ class ChatRepository extends ChangeNotifier {
     if (api == null) return;
     // The watermark is the newest message *they* sent: telling a peer we read
     // our own messages would be nonsense.
+    //
+    // **The highest id, not the last row.** `ChatStore::apply_receipt` marks
+    // every row whose `id` is lexicographically at or below `read_through`, so
+    // the watermark has to be the maximum id or it silently covers less. This
+    // used to be `theirs.last.id`, which was the same thing only while the list
+    // was in engine (id) order; sorting the transcript by `storedAt` broke that
+    // equivalence for exactly the case the sort exists for — a peer whose clock
+    // runs behind mints lower ids for messages that arrive later, so the
+    // last-arrived row is not the highest. The receipt would then permanently
+    // under-report: a watermark only moves forward, so those messages never get
+    // a read tick on the sender's device at all.
     final theirs = _byPeer[peerId]?.where((m) => !m.isMine).toList();
     if (theirs == null || theirs.isEmpty) return;
+    final watermark = theirs
+        .map((m) => m.id)
+        .reduce((a, b) => a.compareTo(b) >= 0 ? a : b);
     try {
-      await api.chatMarkRead(peerId, theirs.last.id);
+      await api.chatMarkRead(peerId, watermark);
     } catch (_) {
       // A receipt is a courtesy; failing to send one is never worth surfacing.
     }

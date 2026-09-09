@@ -918,8 +918,15 @@ class ChatSearchHit {
   /// The message's id within that conversation.
   final String messageId;
 
-  /// When the message was stamped. Best-effort recency for an inbound row,
-  /// whose timestamp came off the peer's own clock.
+  /// When this hit happened, by **this device's** clock — the same instant the
+  /// engine ranked the results by.
+  ///
+  /// Prefers the engine's `stored_at` and falls back to the row's own
+  /// `timestamp` only for an engine too old to report it. It used to be the
+  /// timestamp alone, which is the sender's claim on an inbound row: the list
+  /// was then ordered by one clock and dated by another, so a peer running fast
+  /// read "just now" indefinitely and a hit could be labelled older than the
+  /// ones below it. Null for a row nothing can date.
   final DateTime? at;
 
   /// `'out'` or `'in'`, spelled as [ChatMessage.direction] is.
@@ -951,7 +958,9 @@ class ChatSearchHit {
   factory ChatSearchHit.fromJson(Map<String, dynamic> j) => ChatSearchHit(
     peerId: j['peer_id'] as String? ?? '',
     messageId: j['message_id'] as String? ?? '',
-    at: DateTime.tryParse(j['timestamp'] as String? ?? ''),
+    at:
+        DateTime.tryParse(j['stored_at'] as String? ?? '') ??
+        DateTime.tryParse(j['timestamp'] as String? ?? ''),
     direction: j['direction'] as String? ?? 'in',
     kind: j['kind'] as String? ?? ChatMessageKind.text,
     snippet: j['snippet'] as String? ?? '',

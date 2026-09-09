@@ -584,7 +584,7 @@ class SettingsScreen extends StatelessWidget {
                     // can open anything on its own.
                     ListTile(
                       leading: const Icon(Icons.open_in_new_rounded),
-                      title: const Text('Releases'),
+                      title: const Text('Downloads'),
                       subtitle: const Text(
                         '$_releasesUrl\n'
                         'PeerBeam never checks for updates on its own — that '
@@ -594,7 +594,7 @@ class SettingsScreen extends StatelessWidget {
                       isThreeLine: true,
                       trailing: IconButton(
                         icon: const Icon(Icons.copy_rounded),
-                        tooltip: 'Copy the releases address',
+                        tooltip: 'Copy the download address',
                         onPressed: () {
                           Clipboard.setData(
                             const ClipboardData(text: _releasesUrl),
@@ -603,7 +603,7 @@ class SettingsScreen extends StatelessWidget {
                             ..hideCurrentSnackBar()
                             ..showSnackBar(
                               const SnackBar(
-                                content: Text('Releases address copied'),
+                                content: Text('Download address copied'),
                               ),
                             );
                         },
@@ -699,8 +699,19 @@ class SettingsScreen extends StatelessWidget {
   ///
   /// A constant rather than something derived at runtime: deriving it would
   /// mean asking somewhere, and not asking is the point.
-  static const String _releasesUrl =
-      'https://github.com/alpha-neo-omega/PeerBeam/releases';
+  /// Where a person goes to get a build.
+  ///
+  /// The project's own download page, matching `peerbeam_update::DOWNLOAD_PAGE`
+  /// in the engine and what `peerbeam check-updates` prints. It names the file
+  /// for the platform the reader is on; the releases list is a directory of
+  /// twenty-three assets they would have to choose between correctly, which is
+  /// the wrong thing to hand someone who has just been told to update.
+  ///
+  /// Hardcoded rather than read from the update check's answer on purpose: the
+  /// address is shown even when no check has been run, and a URL that arrived
+  /// over the network must not be what a person is pointed at — see the note on
+  /// `newest()` in peerbeam-update.
+  static const String _releasesUrl = 'https://peerbeam.pages.dev/download';
 
   /// The About line. The version is whatever the engine reports; with no engine
   /// to ask, it says so rather than inventing a number — an app stating a

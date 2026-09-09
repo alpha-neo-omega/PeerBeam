@@ -85,17 +85,49 @@ class TrayService with TrayListener, WindowListener {
       ? 'assets/brand/tray/peerbeam.ico'
       : 'assets/brand/tray/peerbeam.png';
 
-  /// Coalesce bursts. A running transfer emits progress continuously and
-  /// rebuilding a native menu per frame is both wasteful and visibly janky on
-  /// Windows, where an open menu closes when it is replaced.
+  /// The shortest gap between two native menu rebuilds. Rebuilding per event
+  /// is wasteful and visibly janky on Windows, where an open menu closes when
+  /// it is replaced.
+  static const _renderEvery = Duration(milliseconds: 500);
+
+  /// Time since the last completed render, for the throttle below.
+  final Stopwatch _sinceRender = Stopwatch();
   Timer? _pending;
+
+  /// Throttle, **not** debounce.
+  ///
+  /// This was `_pending?.cancel()` followed by a fresh 500 ms timer — a
+  /// trailing-edge debounce, which never fires while events keep arriving. The
+  /// engine emits `transfer_progress` every 50 ms
+  /// (`PROGRESS_INTERVAL`, peerbeam-ffi/src/transfer.rs), so the timer was
+  /// cancelled and restarted ten times per interval and the menu was never
+  /// redrawn for the whole of any transfer lasting longer than half a second —
+  /// which is to say, for every transfer worth showing. The tray's live status
+  /// only appeared once the transfer had already finished and left the list.
+  ///
+  /// A throttle renders on the leading edge and then at most once per
+  /// [_renderEvery], so the first event is immediate and a continuous stream
+  /// still redraws twice a second.
   void _scheduleRender() {
-    _pending?.cancel();
-    _pending = Timer(const Duration(milliseconds: 500), _render);
+    if (_pending != null) return; // a render is already booked
+    final elapsed = _sinceRender.isRunning
+        ? _sinceRender.elapsed
+        : _renderEvery;
+    if (elapsed >= _renderEvery) {
+      unawaited(_render());
+      return;
+    }
+    _pending = Timer(_renderEvery - elapsed, () {
+      _pending = null;
+      unawaited(_render());
+    });
   }
 
   Future<void> _render() async {
     if (!_started) return;
+    _sinceRender
+      ..reset()
+      ..start();
     final model = trayModel(
       devices: state.device.devices,
       transfers: state.transfer.transfers,

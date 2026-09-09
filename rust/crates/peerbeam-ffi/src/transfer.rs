@@ -5428,7 +5428,40 @@ impl Manager {
                 // they did not cause; saying nothing meant the next connection
                 // asked again with no hint why, which reads as the button not
                 // working.
-                if let Err(e) = self.trust.approve(peer_id) {
+                // Preserve a deadline the user set deliberately.
+                //
+                // `approve()` is `approve_for(.., None)`, and `None` **clears**
+                // any window already on the record — that is what a plain
+                // `trust approve` asks for. Here it would be wrong: somebody
+                // who ran `trust approve alice --for 30m` time-boxed that
+                // device on purpose, and one tap on a file prompt must not
+                // silently convert 30 minutes into forever. It matters more now
+                // that this path also grants standing auto-accept: lifting the
+                // window would turn a deliberately temporary grant into
+                // permanent silent acceptance, which is the opposite of what
+                // the user asked for.
+                //
+                // Re-approving with the SAME instant keeps both decisions: the
+                // device auto-accepts for exactly as long as it was trusted,
+                // and `auto_accepts_at` — which requires `is_approved_at` —
+                // starts prompting again by itself when the window closes.
+                //
+                // A window that has ALREADY lapsed is not preserved. The grant
+                // has run its course, so this tap is a fresh decision and gets
+                // the indefinite approval the button offers; keeping the dead
+                // deadline would leave the button doing nothing at all.
+                let deadline = self
+                    .trust
+                    .lookup(peer_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.expires_at)
+                    .filter(|at| *at > chrono::Utc::now());
+                let recorded = match deadline {
+                    Some(at) => self.trust.approve_for(peer_id, Some(at)),
+                    None => self.trust.approve(peer_id),
+                };
+                if let Err(e) = recorded {
                     tracing::warn!(
                         error = %e,
                         peer = %peer_id.0,
@@ -6649,6 +6682,14 @@ fn search_hit_dto(hit: &SearchHit) -> Value {
         "peer_id": hit.peer_id,
         "message_id": hit.message_id,
         "timestamp": hit.timestamp,
+        // When THIS device stored the row, which is what the hits are ranked
+        // by (`SearchHit::order`). Shipped so a surface can date a hit with the
+        // same clock the ordering used: without it the list was sorted by the
+        // local clock and labelled with the sender's, so a peer with a fast
+        // clock read "just now" forever and a result could be labelled older
+        // than the ones below it — the exact split this is elsewhere at pains
+        // to avoid. Null for a row this device cannot date.
+        "stored_at": hit.at.map(|at| at.to_rfc3339()),
         "direction": hit.direction,
         "kind": hit.kind,
         "snippet": hit.snippet,
@@ -8963,6 +9004,74 @@ mod tests {
             ),
             FileAdmission::AutoAccept,
             "the device the user chose to trust is still being asked about"
+        );
+    }
+
+    /// **A deliberate time box survives "Always accept".**
+    ///
+    /// `approve()` clears any deadline on the record, which is right for a
+    /// plain `trust approve` and wrong here: somebody who ran
+    /// `trust approve alice --for 30m` time-boxed that device on purpose, and
+    /// one tap on a file prompt must not turn 30 minutes into forever — the
+    /// more so now that this path also grants standing auto-accept, which would
+    /// make the lifted window permanently silent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accept_and_trust_does_not_lift_a_time_limited_approval() {
+        let (mgr, _chat, _dir) = test_manager_full("timeboxer", 0);
+        let peer = DeviceId::from("pb-bob");
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(30);
+        mgr.trust
+            .record(peerbeam_domain::entity::TrustRecord {
+                mine: false,
+                auto_accept: false,
+                device: peer.clone(),
+                fingerprint: "ff".into(),
+                name: "Bob".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: false,
+                permissions: peerbeam_domain::entity::PermissionSet::none(),
+                expires_at: None,
+            })
+            .expect("pin the peer");
+        // The user's deliberate decision: trusted, but only for half an hour.
+        mgr.trust
+            .approve_for(&peer, Some(deadline))
+            .expect("time-limited approval");
+
+        let m = Arc::new(mgr);
+        let waiter = {
+            let m = m.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move { m.wait_for_accept("tx-1", &peer).await })
+        };
+        for _ in 0..50 {
+            if m.pending.lock().unwrap().contains_key("tx-1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        m.accept_trust("tx-1", true).expect("accept and trust");
+        assert!(waiter.await.expect("the waiter task").accepted());
+
+        let record = m
+            .trust
+            .lookup(&peer)
+            .expect("readable")
+            .expect("the peer is on record");
+        assert_eq!(
+            record.expires_at,
+            Some(deadline),
+            "the window the user set was lifted — 30 minutes became forever"
+        );
+        // It does still stop the asking, for as long as the grant lasts...
+        assert!(m.trust.auto_accepts(&peer), "auto-accept was not granted");
+        // ...and not one moment longer: past the deadline the device is not
+        // approved, so it is neither auto-accepting nor admitted silently.
+        let after = deadline + chrono::Duration::seconds(1);
+        assert!(
+            !m.trust.auto_accepts_at(&peer, after),
+            "auto-accept outlived the approval it depends on"
         );
     }
 

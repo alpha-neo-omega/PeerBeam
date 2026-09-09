@@ -45,17 +45,26 @@ Every release attaches **`SHA256SUMS`**. Download it into the same directory as
 the file you fetched and check them together:
 
 ```bash
-# Linux / macOS
-sha256sum -c SHA256SUMS            # or: shasum -a 256 -c SHA256SUMS
+# Linux
+sha256sum --ignore-missing -c SHA256SUMS
 
-# Windows PowerShell — compare one file against the list
-(Get-FileHash .\peerbeam-0.11.0-windows-x64-portable.zip -Algorithm SHA256).Hash
-Select-String -Path .\SHA256SUMS -Pattern 'windows-x64-portable'
+# macOS (shasum has no --ignore-missing; check just what you downloaded)
+grep "$(basename PeerBeam-*.dmg)" SHA256SUMS | shasum -a 256 -c
 ```
 
-`sha256sum -c` prints `OK` per file it can find and exits non-zero if any hash
-disagrees. It ignores lines for files you did not download, so checking one file
-out of twenty-three is fine.
+```powershell
+# Windows PowerShell — -eq is case-insensitive, which is what makes this work:
+# Get-FileHash returns uppercase, SHA256SUMS is lowercase.
+$file = '.\peerbeam-0.11.0-windows-x64-portable.zip'
+$want = (Select-String -Path .\SHA256SUMS -Pattern ([regex]::Escape((Split-Path $file -Leaf)))).Line.Split(' ')[0]
+if ((Get-FileHash $file -Algorithm SHA256).Hash -eq $want) { 'OK' } else { 'MISMATCH' }
+```
+
+**`--ignore-missing` is not optional.** `SHA256SUMS` lists every file in the
+release, and without that flag `sha256sum -c` prints `FAILED open or read` for
+each of the twenty-two you did not download and **exits non-zero** — which reads
+exactly like a corrupt download. With it, only what you actually have is
+checked, and a real mismatch still fails.
 
 > **What this proves, and what it does not.** A matching hash means the bytes are
 > the bytes the release was built from — not truncated by a dropped connection,

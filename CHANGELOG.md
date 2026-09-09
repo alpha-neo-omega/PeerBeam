@@ -6,6 +6,56 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **The tray's live status never appeared during a transfer.** The menu rebuild
+  was a trailing-edge debounce with a 500 ms delay, and the engine emits
+  progress every 50 ms — so the timer was cancelled ten times per interval and
+  never fired for the whole of any transfer. The menu only redrew once the
+  transfer had finished and left the list, which is the one moment its contents
+  did not matter. It is a throttle now: immediate on the first event, then at
+  most twice a second.
+- **"Always accept" silently lifted a deliberate time limit.** `approve()`
+  clears any deadline on a trust record — right for a plain `trust approve`,
+  wrong on a file prompt: `trust approve alice --for 30m` followed by one tap
+  became indefinite approval, and since that tap now also grants standing
+  auto-accept, permanently silent. A live deadline is preserved, so the device
+  auto-accepts for exactly as long as it was trusted and starts asking again by
+  itself when the window closes. A window that has already lapsed is not
+  revived — that tap is a fresh decision.
+- **The AppImage and portable tarball would not start** on any host without
+  Ayatana's app-indicator. `libtray_manager_plugin.so` is a direct `NEEDED` of
+  the runner, so the linker resolves that chain at process start: a missing
+  library is not a lost tray icon, it is a launch failure. Packages declare the
+  dependency; those two formats cannot, and "any distribution, installs
+  nothing" is what an AppImage is for. They now carry the five libraries and a
+  launcher that can find them — the plugin's own `RUNPATH` is an absolute path
+  into the *build* machine's Flutter directory, and `RUNPATH` is not inherited,
+  so bundling alone would not have worked.
+- **Read receipts silently covered fewer messages than they said.**
+  `apply_receipt` marks every row at or below the watermark *by id*, and
+  `markRead` sent the last row in the list. Those agreed only while the
+  transcript was in id order; sorting it by arrival broke that for exactly the
+  case the sort exists for — a peer whose clock runs behind mints lower ids for
+  later-arriving messages. The watermark is now the maximum id.
+- **Chat search was ordered by one clock and dated by another.** Hits are ranked
+  by `stored_at`, but the DTO shipped only the sender's `timestamp`, so a peer
+  running fast read "just now" indefinitely and a result could be dated older
+  than the ones below it. `stored_at` is now carried through.
+- **The About screen still sent people to the GitHub asset list**, though the
+  engine had been changed to point at the download page and the reasoning for
+  that change was published in this file. It now shows the same address the
+  engine and the CLI do.
+- `docs/GUIDE.md` told people to run `sha256sum -c SHA256SUMS` and said it
+  "ignores lines for files you did not download". It does not: it prints
+  `FAILED open or read` for each of the other twenty-two and exits non-zero,
+  which reads exactly like a corrupt download. The documented command now
+  passes `--ignore-missing`, macOS gets a form that works with `shasum`, and the
+  PowerShell recipe compares case-insensitively instead of eyeballing an
+  uppercase hash against a lowercase list.
+- `humantime`'s doc claimed the new compound output kept it "the inverse of
+  `parse_duration`". It never was one — `parse_duration` reads a single
+  `<number><unit>` and rejects `2h00m` just as it rejects `1m30s`.
+
 ### Added
 - **Releases now attach `SHA256SUMS`.** Generated over exactly the files being
   uploaded, named by basename so `sha256sum -c SHA256SUMS` works in whatever

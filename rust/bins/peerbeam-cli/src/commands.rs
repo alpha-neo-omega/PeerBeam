@@ -1094,7 +1094,13 @@ pub(crate) async fn send_paths(
 /// understated a window the user had just set by a third of it, and a caller who
 /// waited the duration it printed found the messages still readable. A value
 /// that lands exactly on a unit still reads as it always did (`2h` → `2h00m`),
-/// which is what keeps it the inverse of [`parse_duration`].
+/// so what a person typed stays recognisable in what is printed back.
+///
+/// It is **not** an inverse of [`parse_duration`], and never was:
+/// `parse_duration` reads a single `<number><unit>`, so it rejects `2h00m`
+/// exactly as it rejects the `1m30s` this now produces. What the two share is
+/// the four units, not the grammar — `what_is_typed_reads_back_as_what_is_printed`
+/// checks the one direction that does hold.
 pub(crate) fn humantime(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -3919,8 +3925,10 @@ mod duration_tests {
             (3_601, "1h00m01s"),
             (86_401, "1d00h00m01s"),
             (86_460, "1d00h01m"),
-            // Exactly on a unit still reads as it always did — that is what
-            // keeps this the inverse of `parse_duration`.
+            // Exactly on a unit still reads as it always did, so what a
+            // person typed stays recognisable. (Not a round trip: see the note
+            // on `humantime` — `parse_duration` takes one `<number><unit>` and
+            // has never accepted `1h00m` either.)
             (60, "1m"),
             (3_600, "1h00m"),
             (86_400, "1d00h"),
