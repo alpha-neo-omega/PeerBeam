@@ -2469,7 +2469,16 @@ fn timeline_cmd(
         for rec in chat.history(&peer).unwrap_or_default() {
             events.push(Entry {
                 kind: "chat",
-                at: rec.timestamp.clone(),
+                // When THIS device stored the row, not the sender's claim
+                // about its own clock — the same basis `Manager::timeline`
+                // uses. Every other row in this list is stamped locally, so a
+                // chat row on a peer's clock would not merely label itself
+                // wrongly, it would sort itself wrongly against all of them.
+                // Falls back to the row's own timestamp only for a legacy row
+                // with no `stored_at`.
+                at: rec
+                    .age_basis()
+                    .map_or_else(|| rec.timestamp.clone(), |at| at.to_rfc3339()),
                 peer: peer.0.clone(),
                 // Never the body. A timeline is for recognising when something
                 // happened; `chat history` reads conversations properly.
@@ -2497,7 +2506,22 @@ fn timeline_cmd(
         }
     }
 
-    events.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.kind.cmp(b.kind)));
+    // Newest first, comparing parsed instants rather than text. These strings
+    // come from several producers, and a text comparison equals a chronological
+    // one only while every one of them agrees on UTC offset and
+    // fractional-second width: `…00.900Z` sorts before `…00Z` because `.`
+    // precedes `Z`, and any offset other than `+00:00` sorts by its wall-clock
+    // text. A row that will not parse sorts oldest rather than claiming the top.
+    fn instant(at: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    }
+    events.sort_by(|a, b| {
+        instant(&b.at)
+            .cmp(&instant(&a.at))
+            .then_with(|| a.kind.cmp(b.kind))
+    });
     let truncated = events.len() > args.limit;
     events.truncate(args.limit);
 

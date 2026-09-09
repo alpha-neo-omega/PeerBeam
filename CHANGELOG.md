@@ -7,6 +7,31 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Fixed
+- **The receive prompt could dismiss the wrong thing.** Its self-withdrawal
+  popped whichever route was topmost on the root navigator, which is not
+  reliably the prompt: the pairing-confirmation sheet opens over it, and so does
+  anything else reached while it is up. A decision landing at that moment closed
+  *that* and left the prompt behind. It now removes the route it opened, which
+  is exact wherever it sits in the stack.
+- **Close-to-tray could leave the app unreachable.** If the icon or its menu
+  would not draw — a Linux session with no status-notifier host, the case the
+  code already anticipated — hiding the window left no window, no icon and no
+  menu to quit from. Close-to-tray now requires the menu to have drawn at least
+  once.
+- **The tray's "Send files…" dead-ended.** Files were staged and nothing
+  appeared, so unless you happened to be on Home there was no recipient chooser
+  and no confirmation. It opens the staged sheet, as Home's own button does.
+- **`peerbeam timeline` kept both defects the app's timeline was fixed for**,
+  being a second implementation of the same merge: it dated chat rows with the
+  sender's clock and sorted the merged list as text.
+- **The Activity timeline invented a time for a row it could not date**,
+  labelling it "just now" — a different "just now" on each refresh — while the
+  engine deliberately ranks such a row oldest. So the newest-looking row sat at
+  the bottom of a newest-first list.
+- **A group message arriving while that member's private thread was open was
+  rendered inside it.**
+- The prompt copy told people to turn auto-accept off "under Trusted devices",
+  where there is no such control. It is in the conversation's ⋮ menu.
 - **The tray's live status never appeared during a transfer.** The menu rebuild
   was a trailing-edge debounce with a 500 ms delay, and the engine emits
   progress every 50 ms — so the timer was cancelled ten times per interval and
@@ -55,6 +80,13 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 - `humantime`'s doc claimed the new compound output kept it "the inverse of
   `parse_duration`". It never was one — `parse_duration` reads a single
   `<number><unit>` and rejects `2h00m` just as it rejects `1m30s`.
+- `docs/FFI.md` claimed every ordering the engine reports is by `stored_at`;
+  `pb_chat_history` is still store-key (sender-minted id) order, and the doc now
+  says so and tells a surface to sort. `docs/SECURITY.md` and amendment A1 still
+  justified the `PeerBeam` User-Agent as required by "the GitHub API" after the
+  check moved hosts — A1 carries a dated note rather than a rewritten clause,
+  since it is constitutional. The CHANGELOG entry above also contradicted itself
+  about where the version comes from.
 
 ### Added
 - **Releases now attach `SHA256SUMS`.** Generated over exactly the files being
@@ -103,7 +135,7 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   act. The bytes are unchanged — the page links each file to the same
   `releases/latest/download/…` asset — so this changes where a person is sent,
   not where anything is hosted, and puts no new party in the path of a download.
-  The version is still read from the GitHub release feed.
+  The version is read from that manifest, not from GitHub's release feed.
 
 ### Fixed
 - **"Trust" on a receive prompt did not stop the asking.** The primary button —

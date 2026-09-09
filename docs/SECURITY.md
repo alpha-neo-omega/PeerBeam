@@ -728,10 +728,12 @@ is now disclosed to the project's own host rather than to GitHub.
 
 **What it does not carry.** No device id, no install id, nothing derived from the
 identity keypair, no cookie or persistent client state, and no custom headers.
-The one header naming this product is the `User-Agent`, which GitHub's API will
-not serve a request without: it is the bare word `PeerBeam`, with no version in
-it, and there is no query string, so the request does not say which build is
-asking either: the manifest is asked what the newest release is, and the
+The one header naming this product is the `User-Agent`: the bare word
+`PeerBeam`, with no version in it. Cloudflare Pages, unlike the GitHub API this
+check used to call, will serve a request with no User-Agent at all — the header
+is kept because omitting it would not reduce what travels, and a request
+carrying none is itself distinctive. There is no query string either, so the
+request does not say which build is asking: the manifest is asked what the newest release is, and the
 comparison against the running version happens here. The answer is inert as
 well. A `Release` is a version string and a URL; nothing downloads, installs or
 changes behaviour on the strength of what the server said, and there is no retry

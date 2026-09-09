@@ -193,6 +193,14 @@ them is outside A1 and back in conflict with I4.
    could take as forbidding the very `User-Agent` the API will not serve a
    request without. The intent — that nothing distinguishing this install or
    this build travels — is unchanged, and so is the shipped request.)*
+   *(Host changed 2026-09-08: the check now GETs
+   `peerbeam.pages.dev/releases.json` instead of the GitHub API, so the clause
+   "which the GitHub API requires" no longer states why the header is sent —
+   Cloudflare Pages serves a request without one. The header is kept anyway,
+   still the bare word `PeerBeam`, because dropping it would not reduce what
+   travels and a request with no User-Agent is itself distinctive. Nothing this
+   condition forbids has changed: no identifier, no query string, no other
+   header.)*
 3. **The response is inert.** A version string is displayed. No download, no
    install, no behaviour anywhere changes on the strength of what the server
    said. (I4 — "Forbids: … remote feature flags".)

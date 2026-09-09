@@ -292,7 +292,18 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
           await windowManager.show();
           await windowManager.focus();
           final picked = await pickFilesToStage(keep: _state.staging.paths);
-          if (picked.isNotEmpty) _state.staging.add(picked);
+          if (picked.isEmpty) return;
+          final added = _state.staging.add(picked);
+          // Show the sheet, exactly as Home's own "Send Files" does. Without
+          // it the action dead-ended: files were staged and nothing appeared,
+          // so unless the user happened to be looking at Home there was no
+          // recipient chooser, no confirmation, and no sign anything had
+          // happened. The tray's whole point is being usable without the
+          // window in front of you.
+          final nav = rootNavigatorKey.currentContext;
+          if (added > 0 && nav != null && nav.mounted) {
+            await showStagedFilesSheet(nav, _state.staging);
+          }
         },
         quit: () async {
           // Past the close-to-tray interception, or `destroy` would be caught

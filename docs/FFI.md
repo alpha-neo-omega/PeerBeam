@@ -451,10 +451,17 @@ other's job.
 | `stored_at` | **this device's** | *Ordering and recency.* When the row was written here. Cannot be skewed or chosen by a peer. `null` only for a row written before the engine recorded it. |
 
 `stored_at` is additive (ABI still v1) and is what the engine already measures a
-disappearing-message window against. Every ordering the engine reports — chat
-search, `pb_chat_conversations`, the `pb_timeline` chat rows — is by `stored_at`,
-falling back to a parsed `timestamp` only for a legacy row, and a row that can be
-dated by neither sorts oldest rather than claiming the newest slot.
+disappearing-message window against. Chat search, `pb_chat_conversations`,
+`pb_group_history` and the `pb_timeline` chat rows are ordered by it, falling
+back to a parsed `timestamp` only for a legacy row, and a row that can be dated
+by neither sorts oldest rather than claiming the newest slot.
+
+**`pb_chat_history` is the exception, and a surface must handle it.** It returns
+a conversation in store-key order, which is message-id order — and an inbound
+row's id was minted by the *sender*, so that order trusts the peer's clock. A
+peer running behind has its reply returned before the message it answers. Sort
+by `stored_at` yourself, as the Flutter client does; the engine-side fix is
+deliberately not in yet because it changes an order this API has always had.
 
 Two rules follow for a surface:
 

@@ -111,6 +111,10 @@ class _IncomingTransferPromptState extends State<IncomingTransferPrompt> {
 
   Future<void> _prompt(Transfer transfer) async {
     final state = _app!;
+    // The dialog's own route, captured by the builder below so the withdrawal
+    // can target exactly it.
+    ModalRoute<void>? route;
+
     // Withdraw the dialog if the question stops being one while it is open.
     //
     // Belt to the engine's braces: `needs_decision` keeps the prompt from
@@ -119,61 +123,81 @@ class _IncomingTransferPromptState extends State<IncomingTransferPrompt> {
     // Transfers screen, the chat row's own inline Accept, the CLI, or the
     // engine's accept timeout. Without it the dialog outlived its transfer and
     // the next tap answered a decision that no longer existed.
+    //
+    // **`removeRoute`, not `pop`.** This was `Navigator.of(context,
+    // rootNavigator: true).pop()`, which pops whichever route is topmost — and
+    // that is not reliably this dialog. The pairing-confirmation sheet opens
+    // over it (`acceptWithPairingCheck`), and anything else the user reaches
+    // while it is up sits above it too; a decision landing at that moment
+    // dismissed *their* route and left the prompt behind. Removing the route we
+    // opened is exact wherever it sits in the stack, and is a no-op once it has
+    // already gone.
     void closeIfSettled() {
       if (!mounted) return;
       final live = state.transfer.awaitingApproval.any(
         (t) => t.id == transfer.id,
       );
       if (live) return;
-      final nav = Navigator.of(context, rootNavigator: true);
-      if (nav.canPop()) nav.pop();
+      final r = route;
+      if (r == null || !r.isActive) return;
+      Navigator.of(context, rootNavigator: true).removeRoute(r);
     }
 
     state.transfer.addListener(closeIfSettled);
     try {
-      await _show(transfer, state);
+      await _show(transfer, state, (r) => route = r);
     } finally {
       state.transfer.removeListener(closeIfSettled);
     }
   }
 
-  Future<void> _show(Transfer transfer, AppState state) async {
+  Future<void> _show(
+    Transfer transfer,
+    AppState state,
+    void Function(ModalRoute<void>?) captureRoute,
+  ) async {
     await showDialog<void>(
       context: context,
       // Dismissable on purpose: see the class doc. Dismissal answers nothing.
       barrierDismissible: true,
-      builder: (dialogContext) => _IncomingDialog(
-        transfer: transfer,
-        needsConfirmation: state.transfer.needsPairingConfirmation(transfer.id),
-        onDecline: () {
-          Navigator.of(dialogContext).pop();
-          state.transfer.reject(transfer.id);
-        },
-        onAccept: () async {
-          Navigator.of(dialogContext).pop();
-          await acceptWithPairingCheck(
-            context,
-            transfer,
-            needsConfirmation: state.transfer.needsPairingConfirmation(
-              transfer.id,
-            ),
-            accept: ({required confirmed}) =>
-                state.transfer.accept(transfer.id, confirmed: confirmed),
-          );
-        },
-        onTrust: () async {
-          Navigator.of(dialogContext).pop();
-          await acceptWithPairingCheck(
-            context,
-            transfer,
-            needsConfirmation: state.transfer.needsPairingConfirmation(
-              transfer.id,
-            ),
-            accept: ({required confirmed}) =>
-                state.transfer.acceptTrust(transfer.id, confirmed: confirmed),
-          );
-        },
-      ),
+      builder: (dialogContext) {
+        // Runs on every rebuild; assigning the same route again is harmless.
+        captureRoute(ModalRoute.of(dialogContext));
+        return _IncomingDialog(
+          transfer: transfer,
+          needsConfirmation: state.transfer.needsPairingConfirmation(
+            transfer.id,
+          ),
+          onDecline: () {
+            Navigator.of(dialogContext).pop();
+            state.transfer.reject(transfer.id);
+          },
+          onAccept: () async {
+            Navigator.of(dialogContext).pop();
+            await acceptWithPairingCheck(
+              context,
+              transfer,
+              needsConfirmation: state.transfer.needsPairingConfirmation(
+                transfer.id,
+              ),
+              accept: ({required confirmed}) =>
+                  state.transfer.accept(transfer.id, confirmed: confirmed),
+            );
+          },
+          onTrust: () async {
+            Navigator.of(dialogContext).pop();
+            await acceptWithPairingCheck(
+              context,
+              transfer,
+              needsConfirmation: state.transfer.needsPairingConfirmation(
+                transfer.id,
+              ),
+              accept: ({required confirmed}) =>
+                  state.transfer.acceptTrust(transfer.id, confirmed: confirmed),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -254,7 +278,7 @@ class _IncomingDialog extends StatelessWidget {
         Tooltip(
           message:
               'Accept this file, and accept files from this device without '
-              'asking. Change it later under Trusted devices.',
+              "asking. Turn it off from the conversation's ⋮ menu.",
           child: FilledButton(
             onPressed: onTrust,
             child: const Text('Always accept'),

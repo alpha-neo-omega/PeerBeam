@@ -49,10 +49,6 @@ class TrayService with TrayListener, WindowListener {
 
   bool _started = false;
 
-  /// Whether the window is currently hidden into the tray, so the icon's
-  /// primary click knows whether to show or focus.
-  bool _hidden = false;
-
   TrayService({
     required this.state,
     required this.showWindow,
@@ -160,12 +156,27 @@ class TrayService with TrayListener, WindowListener {
     try {
       await trayManager.setToolTip(model.tooltip);
       await trayManager.setContextMenu(Menu(items: items));
+      _menuDrew = true;
     } catch (_) {
       // A tray that will not draw is not a reason to take the app down with
       // it: the window is the primary surface and still works. Some Linux
       // desktops have no status-notifier host at all.
+      //
+      // It *is* a reason not to hide the window into it — see
+      // `_applyCloseBehaviour`.
+      _menuDrew = false;
+      await _applyCloseBehaviour();
     }
   }
+
+  /// Whether the menu has been handed to the OS successfully at least once.
+  ///
+  /// Close-to-tray is only safe while there is a tray to close into. If the
+  /// icon or its menu will not draw — the case the catch above anticipates, a
+  /// Linux session with no status-notifier host — then hiding the window would
+  /// leave the app running with no window, no icon, and no menu to quit from:
+  /// unreachable except by killing the process.
+  bool _menuDrew = false;
 
   static MenuItem _item(TrayLine line) =>
       MenuItem(label: line.label, disabled: !line.enabled);
@@ -173,8 +184,12 @@ class TrayService with TrayListener, WindowListener {
   /// Ask the window manager to hand us the close event, or stop asking.
   Future<void> _applyCloseBehaviour() async {
     if (!isDesktop) return;
+    // Both halves must hold: the user asked for it, AND there is a tray to be
+    // hidden into. Arming this without a drawable tray produces an app with no
+    // window and no icon, which can only be quit by killing the process.
+    final hide = state.view.keepInTray && _menuDrew;
     try {
-      await windowManager.setPreventClose(state.view.keepInTray);
+      await windowManager.setPreventClose(hide);
     } catch (_) {
       // If this fails the window closes normally, which is the safe direction:
       // the app quits rather than silently staying resident.
@@ -185,10 +200,7 @@ class TrayService with TrayListener, WindowListener {
   void onWindowClose() {
     // Only reached while `setPreventClose(true)` is in force, i.e. while the
     // preference is on. Hide rather than exit; Quit is in the menu.
-    unawaited(() async {
-      await windowManager.hide();
-      _hidden = true;
-    }());
+    unawaited(windowManager.hide());
   }
 
   @override
@@ -213,14 +225,7 @@ class TrayService with TrayListener, WindowListener {
     }
   }
 
-  Future<void> _open() async {
-    await showWindow();
-    _hidden = false;
-  }
-
-  /// Whether the window is hidden in the tray right now. For tests and for the
-  /// shell, which must not report "closed" while the app is still resident.
-  bool get isHidden => _hidden;
+  Future<void> _open() async => showWindow();
 
   Future<void> dispose() async {
     if (!_started) return;

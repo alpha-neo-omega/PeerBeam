@@ -1533,8 +1533,8 @@ class _FileBody extends StatelessWidget {
                           // `incoming_prompt.dart`.
                           message:
                               'Accept this file, and accept files from this '
-                              'device without asking. Change it later under '
-                              'Trusted devices.',
+                              "device without asking. Turn it off from the "
+                              "conversation's ⋮ menu.",
                           child: FilledButton(
                             onPressed: () => acceptWithPairingCheck(
                               context,

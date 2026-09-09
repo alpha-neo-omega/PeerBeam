@@ -128,7 +128,10 @@ class _TimelineScreenState extends State<TimelineScreen> {
     };
   }
 
-  static String _when(DateTime at) {
+  /// Null renders as nothing rather than as "just now": a row the engine could
+  /// not date is one this screen has nothing true to say about.
+  static String _when(DateTime? at) {
+    if (at == null) return '';
     final d = DateTime.now().difference(at);
     if (d.inMinutes < 1) return 'just now';
     if (d.inHours < 1) return '${d.inMinutes}m ago';

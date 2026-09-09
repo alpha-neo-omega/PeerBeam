@@ -787,6 +787,15 @@ class ChatRepository extends ChangeNotifier {
   }
 
   void _onReceived(ChatMessage m) {
+    // A group message belongs to the group's transcript, not to a private
+    // thread with whoever happened to send it. `ChatStore` files it under the
+    // sender's namespace either way, and `group` is what tells the two apart —
+    // without this guard a group message arriving while that member's private
+    // conversation was open was rendered inside it.
+    if (m.group != null) {
+      notifyListeners();
+      return;
+    }
     // Inserted in time order rather than appended. An arrival is usually the
     // newest thing in the thread, but not always: a peer that was offline
     // queues its messages and flushes them on reconnect, so a burst of rows

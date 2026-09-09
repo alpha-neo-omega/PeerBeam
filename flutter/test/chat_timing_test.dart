@@ -433,6 +433,78 @@ void main() {
     });
   });
 
+  group('the mid-view retention sweep', () {
+    // The fix was a `Timer.periodic` in chat_screen that ticks `sweepRetention`
+    // while the thread is on screen. The repository-level test below it proves
+    // the sweep works when called; nothing proved the timer ever calls it, so
+    // deleting `_armRetentionTick` left every test passing.
+    testWidgets('clears expired messages without leaving the screen', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      fake.retention['pb-bob'] = 60; // a 60s window ticks every 15s
+      fake.chatHistories['pb-bob'] = [
+        _msg('m1', at: DateTime.parse('2026-01-01T10:00:00Z')),
+      ];
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(peerId: 'pb-bob', peer: _probePeer),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.text('m1'), findsOneWidget);
+
+      // The window closes: the engine stops returning the row.
+      fake.chatHistories['pb-bob'] = [];
+      // Nothing re-reads it on its own except the timer.
+      await tester.pump(const Duration(seconds: 20));
+      await tester.pump();
+
+      expect(
+        find.text('m1'),
+        findsNothing,
+        reason: 'an expired message stayed on screen; the timer never ticked',
+      );
+    });
+
+    testWidgets('a thread with no window arms no timer', (tester) async {
+      final fake = FakePeerBeam();
+      fake.chatHistories['pb-bob'] = [
+        _msg('m1', at: DateTime.parse('2026-01-01T10:00:00Z')),
+      ];
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(peerId: 'pb-bob', peer: _probePeer),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      fake.calls.clear();
+
+      await tester.pump(const Duration(seconds: 90));
+      await tester.pump();
+
+      // No window means nothing can have expired, so a tick would be pure
+      // cost — and `pumpAndSettle` would hang forever on a periodic timer.
+      expect(
+        fake.calls.where((c) => c.startsWith('pruneChat')),
+        isEmpty,
+        reason: 'a thread that keeps its messages forever woke a timer',
+      );
+    });
+  });
+
   group('what the screen actually renders', () {
     // The transcript is a `reverse: true` ListView that ALSO indexes
     // `items[length - 1 - i]` (chat_screen.dart:827-832). Two reversals that

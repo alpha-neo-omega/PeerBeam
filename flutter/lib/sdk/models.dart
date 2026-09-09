@@ -1201,7 +1201,15 @@ class BrowseListing {
 class TimelineEvent {
   /// One of `transfer`, `chat`, `clipboard`.
   final String kind;
-  final DateTime at;
+
+  /// When it happened, or null when this build cannot date it.
+  ///
+  /// Nullable rather than defaulted to `DateTime.now()`, which is what this
+  /// used to do. A fabricated "now" is not a missing value but a wrong one, and
+  /// here it disagreed with the engine on purpose: the engine sorts a row it
+  /// cannot date *oldest*, so a row labelled "just now" sat at the bottom of a
+  /// newest-first list — and read as a different "just now" on every refresh.
+  final DateTime? at;
 
   /// The other device, or empty when this device acted alone.
   final String peer;
@@ -1222,7 +1230,7 @@ class TimelineEvent {
 
   factory TimelineEvent.fromJson(Map<String, dynamic> j) => TimelineEvent(
     kind: j['kind'] as String? ?? '',
-    at: DateTime.tryParse(j['at'] as String? ?? '') ?? DateTime.now(),
+    at: DateTime.tryParse(j['at'] as String? ?? ''),
     peer: j['peer'] as String? ?? '',
     detail: j['detail'] as String? ?? '',
     ok: j['ok'] as bool? ?? true,
