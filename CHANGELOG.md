@@ -7,6 +7,32 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Fixed
+- **IPv6 peers could never be dialled, on any platform.** The QUIC client
+  endpoint bound `0.0.0.0` only, so every IPv6 address was unreachable — and a
+  Tailscale peer advertises a tailnet IPv6 (`fd7a:…`) alongside its IPv4, with a
+  MagicDNS name that can resolve to the IPv6 first. The transport now keeps an
+  IPv6 endpoint too (best-effort: a host without IPv6 simply has none, and says
+  so when a dial needs it), and picks the endpoint by each socket's real family.
+- **Only the first resolved address was ever tried.** A hostname resolving to
+  several addresses — as a MagicDNS name does — was dialled once, at whichever
+  the resolver happened to return first, with no regard for family and no second
+  attempt. Every address is now tried, IPv4 first because that socket always
+  exists.
+- **Chat was offered for devices that cannot hold a conversation.** A chat row
+  is filed under `chat-<device id>`, and the store rejects any namespace outside
+  `[A-Za-z0-9._-]`. A Tailscale peer's id is `ts:<node id>` — the colon makes
+  every store call fail with `invalid namespace`, so the thread opened, stayed
+  empty, and swallowed whatever was typed. The action is now withheld, with a
+  sentence saying why and that sending files still works. The saved-device card
+  already withheld it for the same underlying reason; the discovered-device row
+  did not, and could also be reached *through* a saved entry, because a
+  by-address match resolves on host and port and a Tailscale device advertises
+  both.
+- **"Send to address" could only send files.** All three send paths fell through
+  to a file picker when nothing was staged, so through that button there was no
+  folder option and no text option at all — which is exactly how it looked. They
+  now ask what to send. Staging first always worked; only the way in was
+  missing.
 - **The receive prompt could dismiss the wrong thing.** Its self-withdrawal
   popped whichever route was topmost on the root navigator, which is not
   reliably the prompt: the pairing-confirmation sheet opens over it, and so does

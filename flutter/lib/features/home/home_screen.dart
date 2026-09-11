@@ -39,6 +39,9 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+/// What the "what do you want to send" sheet returned.
+enum _SendKind { files, folder, text }
+
 class _HomeScreenState extends State<HomeScreen> {
   /// Open a search over discovered devices; on pick, send files to it.
   Future<void> _searchDevices(BuildContext context) async {
@@ -139,7 +142,68 @@ class _HomeScreenState extends State<HomeScreen> {
       await sendStaged(context, target, target.name);
       return;
     }
-    await _pickFilesAndSend(context, target, target.name);
+    await _pickWhatToSendAndSend(context, target, target.name);
+  }
+
+  /// Ask what to send when the stack is empty, then send it to [target].
+  ///
+  /// **Files, a folder, or text — not files alone.** This tail used to go
+  /// straight to the file picker, so the only way to reach a typed address or a
+  /// Tailscale peer with a folder or a message was to know to stage it first
+  /// from Home. Through the "Send to address" button the app simply had no
+  /// folder and no text option at all, which is exactly what it looked like:
+  /// you could not send them that way. Everything below was already supported
+  /// by `sendStaged` for any target; only the way in was missing.
+  Future<void> _pickWhatToSendAndSend(
+    BuildContext context,
+    PeerTarget target,
+    String name,
+  ) async {
+    final scope = AppScope.of(context);
+    final choice = await showModalBottomSheet<_SendKind>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_rounded),
+              title: const Text('Files'),
+              onTap: () => Navigator.pop(ctx, _SendKind.files),
+            ),
+            // Desktop only, matching Home's own attach row: Android has no
+            // folder picker wired to staging.
+            if (isDesktop)
+              ListTile(
+                leading: const Icon(Icons.folder_rounded),
+                title: const Text('Folder'),
+                onTap: () => Navigator.pop(ctx, _SendKind.folder),
+              ),
+            ListTile(
+              leading: const Icon(Icons.notes_rounded),
+              title: const Text('Text'),
+              onTap: () => Navigator.pop(ctx, _SendKind.text),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !context.mounted) return;
+
+    switch (choice) {
+      case _SendKind.files:
+        await _pickFilesAndSend(context, target, name);
+      case _SendKind.folder:
+        final folder = await pickFolderToStage();
+        if (folder == null || !context.mounted) return;
+        scope.staging.add([folder]);
+        await sendStaged(context, target, name);
+      case _SendKind.text:
+        final text = await composeText(context);
+        if (text == null || text.trim().isEmpty || !context.mounted) return;
+        scope.staging.addText(text);
+        await sendStaged(context, target, name);
+    }
   }
 
   /// Pick files with the native picker and send them straight to [target] (no
@@ -463,7 +527,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await sendStaged(context, target, d.name);
       return;
     }
-    await _pickFilesAndSend(context, target, d.name);
+    await _pickWhatToSendAndSend(context, target, d.name);
   }
 
   /// Send to a discovered device. Content-first: if the stack has items, send
@@ -482,7 +546,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await sendStaged(context, target, device.name);
       return;
     }
-    await _pickFilesAndSend(context, target, device.name);
+    await _pickWhatToSendAndSend(context, target, device.name);
   }
 
   /// Pick a device from the persistent bar and send the current stack.
@@ -500,6 +564,25 @@ class _HomeScreenState extends State<HomeScreen> {
   /// reports its own failure. The one hard stop is a device with no address at
   /// all, where there is nothing to send to even when it comes back.
   void _chatWith(BuildContext context, Device device) {
+    // The guard belongs here as well as on the buttons, because `_discovered`
+    // resolves a saved by-address entry by host and port — and a Tailscale
+    // device advertises those same addresses. So the check written to stop a
+    // saved entry opening a misfiled thread could itself hand back a `ts:`
+    // device and open exactly the thread it was guarding against.
+    if (!canChatWithDeviceId(device.id)) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              '${device.name} was found over Tailscale, which does not yet '
+              'carry its PeerBeam identity — so a conversation cannot be '
+              'filed against it. Sending files still works.',
+            ),
+          ),
+        );
+      return;
+    }
     final target = AppScope.of(context).device.peerTarget(device.id);
     if (target == null) {
       ScaffoldMessenger.of(context)
@@ -890,7 +973,18 @@ class _HomeScreenState extends State<HomeScreen> {
                                 child: DeviceTile(
                                   device: devices[i],
                                   onSend: () => _sendTo(context, devices[i]),
-                                  onChat: () => _chatWith(context, devices[i]),
+                                  // Withheld for a device whose id cannot carry
+                                  // a conversation — a Tailscale peer's
+                                  // `ts:<node>` in particular. Offering it was
+                                  // a promise the engine refuses: every store
+                                  // call for that namespace fails, so the
+                                  // thread opened, stayed empty, and swallowed
+                                  // whatever was typed into it. The saved-device
+                                  // card a few lines up already withholds it for
+                                  // the same reason; this row did not.
+                                  onChat: canChatWithDeviceId(devices[i].id)
+                                      ? () => _chatWith(context, devices[i])
+                                      : null,
                                 ),
                               ),
                             );

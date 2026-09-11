@@ -143,3 +143,44 @@ async fn dial_to_dead_address_errors() {
         assert!(r.is_err(), "dial to a dead port must error");
     }
 }
+
+/// **An IPv6 peer is dialable.** `QuicTransport::new()` used to bind `0.0.0.0`
+/// alone, so every IPv6 address — including the tailnet `fd7a:` address a
+/// Tailscale peer always advertises — was unreachable on every platform. This
+/// serves on IPv6 loopback and dials it, which cannot connect without the
+/// second endpoint `new()` now creates.
+///
+/// Both halves are bounded: an unbounded `incoming.next()` here hangs the whole
+/// suite when the dial fails, which is exactly what the first version of this
+/// test did.
+#[tokio::test]
+async fn an_ipv6_peer_can_be_dialled() {
+    let server = QuicTransport::new().expect("transport");
+    let (local, incoming) = match server.serve_addr_on("[::1]:0".parse().expect("addr")).await {
+        Ok(pair) => pair,
+        // A host with IPv6 disabled cannot serve on it either; that is not a
+        // failure of this code and must not fail the suite.
+        Err(_) => return,
+    };
+    assert!(local.is_ipv6(), "expected an IPv6 listener, got {local}");
+
+    let client = QuicTransport::new().expect("transport");
+    let route = direct_route("::1", local.port());
+    let sess = session();
+
+    // Only the dial is asserted. A successful `dial` means quinn completed the
+    // QUIC handshake with that IPv6 listener — which is the whole property
+    // under test. The server's `incoming` deliberately does NOT yield yet: per
+    // `dial`'s own doc the stream "materialises on the server once the first
+    // frame is written by the engine", so awaiting an accept here would hang
+    // waiting for a transfer this test never starts.
+    let dialed = tokio::time::timeout(Duration::from_secs(10), client.dial(&route, &sess))
+        .await
+        .expect("dial timed out — the IPv6 endpoint did not connect");
+    assert!(
+        dialed.is_ok(),
+        "an IPv6 peer could not be dialled: {:?}",
+        dialed.err()
+    );
+    drop(incoming);
+}
