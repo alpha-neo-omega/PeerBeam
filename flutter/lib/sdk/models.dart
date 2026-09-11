@@ -1588,3 +1588,40 @@ class GroupSendResult {
     this.skipped = const [],
   });
 }
+
+/// Who answered at an address, as `pb_peer_identify` reports it.
+///
+/// The point of the call is [deviceId]: a conversation is filed under the
+/// peer's authenticated id, and neither a Tailscale-discovered peer (known here
+/// as `ts:<node id>`) nor a typed address carries one. Everything else here is
+/// what a first contact is entitled to see before trusting the answer.
+class PeerIdentity {
+  /// The authenticated device id — what actually completed the handshake, not
+  /// what the caller guessed.
+  final String deviceId;
+
+  /// The name that device calls itself.
+  final String name;
+
+  /// Whether this handshake was the first contact with it, so its key was
+  /// pinned just now.
+  final bool newlyTrusted;
+
+  /// The safety number both devices derive from the keys they negotiated.
+  /// Worth showing on first contact and meaningless otherwise.
+  final String pairingCode;
+
+  const PeerIdentity({
+    required this.deviceId,
+    required this.name,
+    required this.newlyTrusted,
+    required this.pairingCode,
+  });
+
+  factory PeerIdentity.fromJson(Map<String, dynamic> j) => PeerIdentity(
+    deviceId: j['device_id'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    newlyTrusted: j['newly_trusted'] == true,
+    pairingCode: j['pairing_code'] as String? ?? '',
+  );
+}

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -514,6 +515,68 @@ class _HomeScreenState extends State<HomeScreen> {
     if (confirmed == true) await scope.saved.remove(d.id);
   }
 
+  /// Resolve a peer we only know by a provider's own name, then open its
+  /// conversation under the identity that answered.
+  ///
+  /// A chat row is filed under the peer's authenticated device id. A
+  /// Tailscale-discovered device carries `ts:<node id>` instead — Tailscale's
+  /// name for it, which the engine's store refuses outright — and a saved
+  /// address carries nothing. Neither can be guessed, so the engine asks the
+  /// address directly (`peerIdentify`): it dials, completes the ordinary
+  /// handshake, and reports who answered. Nothing is sent by asking, and
+  /// nothing is approved.
+  ///
+  /// Done on the tap rather than in the background on discovery, deliberately:
+  /// dialling every peer the moment it appears would make the app reach out to
+  /// machines the user never asked it to touch.
+  Future<void> _chatAfterIdentifying(
+    BuildContext context,
+    Device device,
+  ) async {
+    final scope = AppScope.of(context);
+    final target = scope.device.peerTarget(device.id);
+    void snack(String m) => ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+    if (target == null) {
+      snack('${device.name} is not reachable right now');
+      return;
+    }
+    final identity = await withProcessing(
+      context,
+      'Asking ${device.name} who it is…',
+      () => scope.device.identify(target),
+    );
+    if (identity == null || !context.mounted) {
+      if (context.mounted) {
+        snack('Could not reach ${device.name} to start a conversation');
+      }
+      return;
+    }
+    if (!canChatWithDeviceId(identity.deviceId)) {
+      // A peer chooses its own id and nothing on the wire constrains it, so
+      // the answer gets the same check the discovered id got.
+      snack(
+        '${identity.name} reported an id a conversation cannot be filed '
+        'under, so one cannot be opened with it.',
+      );
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ChatScreen(
+          peerId: identity.deviceId,
+          peer: PeerTarget(
+            id: identity.deviceId,
+            name: identity.name.isEmpty ? device.name : identity.name,
+            addresses: target.addresses,
+            port: target.port,
+          ),
+        ),
+      ),
+    );
+  }
+
   /// Send to a saved device. Content-first (send the stack if non-empty).
   Future<void> _sendToSaved(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
@@ -570,17 +633,10 @@ class _HomeScreenState extends State<HomeScreen> {
     // saved entry opening a misfiled thread could itself hand back a `ts:`
     // device and open exactly the thread it was guarding against.
     if (!canChatWithDeviceId(device.id)) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          SnackBar(
-            content: Text(
-              '${device.name} was found over Tailscale, which does not yet '
-              'carry its PeerBeam identity — so a conversation cannot be '
-              'filed against it. Sending files still works.',
-            ),
-          ),
-        );
+      // Found by a provider that names it its own way — Tailscale calls it
+      // `ts:<node>`. Ask the address who is actually there, then open the
+      // thread under that id. Nothing is sent by asking.
+      unawaited(_chatAfterIdentifying(context, device));
       return;
     }
     final target = AppScope.of(context).device.peerTarget(device.id);

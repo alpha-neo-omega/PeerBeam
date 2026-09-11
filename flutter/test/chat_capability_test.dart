@@ -9,7 +9,12 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/sdk/models.dart' show PeerIdentity, PeerTarget;
 import 'package:peerbeam/state/models.dart';
+
+import 'package:peerbeam/data/discovery_repository.dart';
+
+import 'sdk/fake_peerbeam.dart';
 
 void main() {
   group('a Tailscale peer cannot be chatted with', () {
@@ -60,6 +65,62 @@ void main() {
     // the engine would reject the namespace it produces.
     test('an id that is valid only on its first line is refused', () {
       expect(canChatWithDeviceId('good\nbad:id'), isFalse);
+    });
+  });
+
+  group('a provider-scoped peer is resolved by asking the address', () {
+    // The engine dials, completes the ordinary handshake, and reports who
+    // answered. That is the only way a `ts:` peer or a typed address can get
+    // the authenticated id a conversation must be filed under.
+    test('identify returns the id that answered, not the one we had', () async {
+      final fake = FakePeerBeam();
+      fake.identities['100.101.102.103:49600'] = const PeerIdentity(
+        deviceId: 'pb-alice-laptop',
+        name: 'alice-laptop',
+        newlyTrusted: true,
+        pairingCode: '482913',
+      );
+      final repo = DiscoveryRepository(api: fake);
+      addTearDown(repo.dispose);
+
+      final found = await repo.identify(
+        const PeerTarget(
+          id: 'ts:nodeidabc123',
+          name: 'alice-laptop',
+          addresses: ['100.101.102.103'],
+          port: 49600,
+        ),
+      );
+
+      expect(found, isNotNull);
+      expect(found!.deviceId, 'pb-alice-laptop');
+      // And the answer is one a conversation can actually be filed under.
+      expect(canChatWithDeviceId(found.deviceId), isTrue);
+      expect(found.newlyTrusted, isTrue);
+      expect(found.pairingCode, '482913');
+    });
+
+    test('an unreachable address answers null rather than throwing', () async {
+      final fake = FakePeerBeam();
+      final repo = DiscoveryRepository(api: fake);
+      addTearDown(repo.dispose);
+
+      final found = await repo.identify(
+        const PeerTarget(
+          id: 'ts:gone',
+          name: 'gone',
+          addresses: ['100.64.0.9'],
+          port: 49600,
+        ),
+      );
+
+      expect(found, isNull, reason: 'unreachable is an answer, not a crash');
+    });
+
+    // A peer picks its own id and nothing on the wire constrains it, so the
+    // answer gets the same check the discovered id got.
+    test('an answer that still cannot be filed is caught', () {
+      expect(canChatWithDeviceId('still:bad'), isFalse);
     });
   });
 }

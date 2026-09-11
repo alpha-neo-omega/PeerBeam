@@ -21,6 +21,13 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   makes no such inference, and is right not to: it did not choose where the
   connection came from. Here the caller named the address, so what answers at it
   is by construction what that address is.
+- **Chat with a Tailscale peer now works**, by asking. Tapping chat on a device
+  the app knows only by a provider's own name resolves it first — one dial, one
+  handshake, no bytes sent — and opens the conversation under the identity that
+  answered, so replies land in the thread you are looking at and queued messages
+  can flush. Done on the tap, not in the background on discovery: dialling every
+  peer the moment it appears would reach out to machines nobody asked it to
+  touch.
 
 ### Fixed
 - **IPv6 peers could never be dialled, on any platform.** The QUIC client

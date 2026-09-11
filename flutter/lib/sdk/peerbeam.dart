@@ -176,6 +176,17 @@ abstract class PeerBeamApi {
   /// not send files is inert.
   Future<bool> trustSetAutoAccept(String id, bool autoAccept);
 
+  /// Ask an address which device answers there.
+  ///
+  /// Dials, completes the authenticated handshake, and reports the device id
+  /// that answered. **Nothing is sent and nothing is approved** — the handshake
+  /// pins a key exactly as any first contact does.
+  ///
+  /// This is how a Tailscale-discovered peer (known here only by Tailscale's
+  /// own `ts:<node>` id) or a typed address (no id at all) gets the
+  /// authenticated identity a conversation has to be filed under.
+  Future<PeerIdentity> peerIdentify(PeerTarget peer);
+
   /// Replace the ordered auto-save rule list. Returns how many were stored.
   ///
   /// **The whole list at once**, because the order *is* the tie-break: the
@@ -838,6 +849,14 @@ class PeerBeam implements PeerBeamApi {
       ),
     );
     return data['changed'] == true;
+  }
+
+  @override
+  Future<PeerIdentity> peerIdentify(PeerTarget peer) async {
+    final data = _data(
+      _req().peerIdentify(jsonEncode({'peer': peer.toJson()})),
+    );
+    return PeerIdentity.fromJson(data);
   }
 
   @override

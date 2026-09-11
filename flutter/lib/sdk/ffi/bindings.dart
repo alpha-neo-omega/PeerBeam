@@ -63,6 +63,7 @@ class Bindings {
   final _ArgRetDart _trustRemove;
   final _ArgRetDart _trustSetPermission;
   final _ArgRetDart _trustSetAutoAccept;
+  final _ArgRetDart _peerIdentify;
   final _ArgRetDart _rulesSet;
   final _RetDart _historyClear;
   final _RetDart _settingsGet;
@@ -174,6 +175,9 @@ class Bindings {
       ),
       _trustSetPermission = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_trust_set_permission',
+      ),
+      _peerIdentify = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
+        'pb_peer_identify',
       ),
       _trustSetAutoAccept = lib.lookupFunction<_ArgRetC, _ArgRetDart>(
         'pb_trust_set_auto_accept',
@@ -357,6 +361,8 @@ class Bindings {
   String trustRemove(String json) => _withArg(json, _trustRemove);
   String trustSetPermission(String json) => _withArg(json, _trustSetPermission);
   String trustSetAutoAccept(String json) => _withArg(json, _trustSetAutoAccept);
+
+  String peerIdentify(String json) => _withArg(json, _peerIdentify);
   String rulesSet(String json) => _withArg(json, _rulesSet);
   String historyClear() => _consume(_historyClear());
   String settingsGet() => _consume(_settingsGet());
