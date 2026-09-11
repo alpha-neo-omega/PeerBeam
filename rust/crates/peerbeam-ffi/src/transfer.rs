@@ -948,6 +948,77 @@ impl Manager {
         Ok(json!({ "queued": queued, "sync": true }))
     }
 
+    /// Learn who actually answers at an address:
+    /// `{peer:{addresses,port,name?}}` → `{device_id, name, newly_trusted, pairing_code}`.
+    ///
+    /// # Why this exists
+    ///
+    /// Two kinds of peer reach the UI without the identity a conversation needs.
+    /// A Tailscale-discovered device is keyed `ts:<node id>` — Tailscale's name
+    /// for it, not PeerBeam's — and a device the user typed an address for has
+    /// no id at all. Chat rows are filed under `chat-<device id>` and inbound
+    /// records are keyed by the **authenticated** id, so a thread opened under
+    /// either would collect our own messages under a name the peer has never
+    /// heard of: replies would land in a different thread and queued messages
+    /// could never flush. The store refuses the Tailscale one outright, because
+    /// a colon is not legal in a namespace.
+    ///
+    /// This closes that gap the only way it can be closed honestly: **ask**.
+    /// It dials the address the caller names, completes the ordinary
+    /// authenticated handshake, and reports the device id that answered.
+    ///
+    /// # Why the answer can be trusted as much as any other
+    ///
+    /// `session_exec::dial` is the same call every send makes, so the identity
+    /// comes from the same handshake, pinned by the same TOFU rule, with the
+    /// same pairing code available for the user to compare. Nothing is
+    /// special-cased.
+    ///
+    /// The inbound side deliberately does *not* make this inference — see the
+    /// note in `session_exec::accept`, "nothing here can prove the two name one
+    /// machine". That is right for a connection that arrived: we did not choose
+    /// where it came from. Here we did. The caller named the address, so what
+    /// answers at it is, by construction, what that address is.
+    ///
+    /// # What it does not do
+    ///
+    /// **Nothing is sent** — no file, no message, not a typed frame of any
+    /// kind. It is the handshake and then a close. It grants nothing either:
+    /// the handshake pins a key exactly as any first contact does, and
+    /// `newly_trusted`/`pairing_code` come back so a surface can show the same
+    /// verification panel a first-contact transfer shows. Approving a device
+    /// remains a separate, explicit act (I6).
+    pub fn peer_identify(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let me = self.clone();
+        crate::runtime::block_on(async move {
+            let meta = me.session(&format!("identify-{}", device.id.0), device.id.clone(), 0);
+            let session = crate::session_exec::dial(
+                &me.quic,
+                &me.rm,
+                &device,
+                &meta,
+                me.identity(),
+                me.enc.clone(),
+                me.trust.clone(),
+                // Wired like every other dial site: a session that cannot
+                // receive what the peer pushes back is a half-open one, and the
+                // peer does not know this connection is only asking a question.
+                Some(me.chat_wiring()),
+                Some(me.presence_wiring()),
+            )
+            .await?;
+            let answer = json!({
+                "device_id": session.peer_device.0,
+                "name": session.peer_name,
+                "newly_trusted": session.newly_trusted,
+                "pairing_code": session.pairing_code,
+            });
+            session.close().await;
+            Ok(answer)
+        })
+    }
+
     /// Dial one peer and offer it the clip. Best-effort and silent on failure:
     /// an unreachable device simply does not get this clip, and nothing is
     /// retried or stored.

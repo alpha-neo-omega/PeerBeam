@@ -276,6 +276,7 @@ char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} 
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
 char* pb_chat_mark_read(const char* json);      // {peer, read_through} → {sent}
+char* pb_peer_identify(const char* json);       // {peer} → {device_id,name,newly_trusted,pairing_code}
 char* pb_chat_retention_get(const char* json);  // {peer_id} → {seconds|null}
 char* pb_chat_retention_set(const char* json);  // {peer_id, seconds?} → {seconds|null}
 char* pb_chat_prune(const char* json);          // {peer_id?} → {messages, queued}

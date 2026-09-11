@@ -6,6 +6,22 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **`peerbeam identify <host>`, and `pb_peer_identify` behind it** — ask an
+  address which device answers there. It dials, completes the ordinary
+  authenticated handshake, reports the device id that answered, and closes.
+  Nothing is sent and nothing is approved; the handshake pins a key exactly as
+  any first contact does, and the pairing code comes back so it can be checked.
+
+  This is the missing half of chat with a Tailscale or typed-address peer. A
+  conversation is filed under the peer's **authenticated** id, and those two
+  kinds of peer reach a surface without one — Tailscale supplies its own node id
+  (`ts:<node>`, which the store refuses outright), a typed address supplies
+  nothing. Neither can be guessed, so this asks. The inbound side deliberately
+  makes no such inference, and is right not to: it did not choose where the
+  connection came from. Here the caller named the address, so what answers at it
+  is by construction what that address is.
+
 ### Fixed
 - **IPv6 peers could never be dialled, on any platform.** The QUIC client
   endpoint bound `0.0.0.0` only, so every IPv6 address was unreachable — and a

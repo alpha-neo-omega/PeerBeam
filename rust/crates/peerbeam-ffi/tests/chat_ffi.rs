@@ -3141,3 +3141,114 @@ async fn deleting_a_conversation_keeps_a_queued_file_and_the_drain_still_deliver
     announce_task.abort();
     pb_shutdown();
 }
+
+/// **Identify reports who actually answered, not what the caller guessed.**
+///
+/// This is what gives a Tailscale-discovered peer (`ts:<node id>`) and a
+/// typed-address peer (no id at all) the authenticated identity a conversation
+/// must be filed under: the store keys chat by that id, and it refuses a
+/// namespace containing a colon outright.
+///
+/// The call is handed a peer whose `name` is wrong and whose id is absent, so
+/// the only way to return the right answer is to have completed the handshake
+/// and read it off the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn peer_identify_reports_the_authenticated_device_id() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49912, dir.path());
+
+    let (enc, trust, identity) = peer_identity(dir.path(), "the-real-id");
+    let peer_quic = QuicTransport::new().unwrap();
+    let (addr, mut incoming) = peer_quic
+        .serve_channels_on("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let peer_port = addr.port();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let qc = incoming.next().await.unwrap().unwrap();
+        let transport: Arc<dyn ChannelTransport> = Arc::new(qc);
+        let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
+        let trust: Arc<dyn TrustStore> = Arc::new(trust);
+        let (ev, _e) = tokio::sync::mpsc::unbounded_channel();
+        let (ch, _c) = tokio::sync::mpsc::unbounded_channel();
+        let (inc, _i) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SessionConfig::new(chat_only_caps());
+        let Ok(mut ps) = PeerSession::open(
+            transport,
+            SessionRole::Responder,
+            cfg,
+            ev,
+            ch,
+            inc,
+            None,
+            identity,
+            enc,
+            trust,
+        )
+        .await
+        else {
+            return;
+        };
+        let _ = ps.run().await;
+    });
+
+    // Deliberately misleading: a name that is not the peer's, and no id — the
+    // shape a typed address has, and the shape a `ts:` row reduces to once its
+    // provider-scoped id is recognised as unusable.
+    let answer = call_json(
+        pb_peer_identify,
+        &json!({
+            "peer": {
+                "name": "whatever the user typed",
+                "addresses": ["127.0.0.1"],
+                "port": peer_port,
+            }
+        }),
+    );
+    assert_eq!(answer["ok"], true, "identify failed: {answer}");
+    assert_eq!(
+        answer["data"]["device_id"], "the-real-id",
+        "identify must report the id that answered the handshake, not the \
+         caller's guess: {answer}"
+    );
+    // And the verification material a first contact is entitled to, so a
+    // surface can show the same pairing panel a first-contact transfer shows.
+    assert_eq!(answer["data"]["newly_trusted"], true);
+    assert!(
+        answer["data"]["pairing_code"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
+        "a first contact must come back with a pairing code: {answer}"
+    );
+}
+
+/// An address with nothing behind it fails with a reason rather than hanging —
+/// the call is synchronous on the Dart side, so "may never return" would park
+/// the isolate that draws.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn peer_identify_on_a_dead_address_fails_rather_than_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    init_ffi(49913, dir.path());
+
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(|| {
+            call_json(
+                pb_peer_identify,
+                &json!({"peer": {"name": "nobody", "addresses": ["127.0.0.1"], "port": 1}}),
+            )
+        }),
+    )
+    .await
+    .expect("identify hung on a dead address")
+    .expect("join");
+
+    assert_eq!(
+        answer["ok"], false,
+        "a dead address must not report success"
+    );
+}
