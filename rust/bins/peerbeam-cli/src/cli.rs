@@ -110,6 +110,8 @@ pub enum Command {
     Snippet(SnippetArgs),
     /// PIN-pair with a device, proving first contact reached the right one.
     Pair(PairArgs),
+    /// Ask an address which device answers there.
+    Identify(IdentifyArgs),
     /// Show or export this device's recent log lines.
     Logs(LogsArgs),
     /// Run the background daemon.
@@ -774,6 +776,28 @@ pub struct RingArgs {
     /// How long to keep signalling, in seconds (max 60).
     #[arg(long, default_value_t = 15)]
     pub seconds: u16,
+}
+
+/// Ask an address who is there.
+///
+/// Dials, completes the ordinary authenticated handshake, prints the device id
+/// that answered, and closes. **Nothing is sent** — no file, no message — and
+/// nothing is approved: the handshake pins a key exactly as any first contact
+/// does, and the pairing code is printed so it can be compared against the
+/// other device's screen.
+///
+/// What it is for: a Tailscale-discovered peer is known to this app by
+/// Tailscale's own node id (`ts:<node>`), and an address typed by hand has no
+/// id at all. A conversation is filed under the peer's **authenticated** id, so
+/// neither can hold one until somebody asks the address who it is. This is that
+/// question.
+#[derive(Args)]
+pub struct IdentifyArgs {
+    /// Host, IP, or MagicDNS name.
+    pub host: String,
+    /// Transfer port.
+    #[arg(long, default_value_t = 49600)]
+    pub port: u16,
 }
 
 /// Notes kept on this device.

@@ -301,7 +301,9 @@ class SettingsScreen extends StatelessWidget {
                       AnimatedBuilder(
                         animation: state.view,
                         builder: (context, _) => SwitchListTile.adaptive(
-                          secondary: const Icon(Icons.notification_important_outlined),
+                          secondary: const Icon(
+                            Icons.notification_important_outlined,
+                          ),
                           title: const Text('Ask when a file arrives'),
                           // The subtitle has to kill the obvious misreading.
                           // "Ask when a file arrives", turned off, reads like
@@ -318,6 +320,33 @@ class SettingsScreen extends StatelessWidget {
                               unawaited(state.view.setAskOnReceive(v)),
                         ),
                       ),
+                      // Desktop only, because there is no tray to stay in
+                      // anywhere else — Android has its foreground service and
+                      // a headless box has `peerbeam daemon`.
+                      if (isDesktop)
+                        ListenableBuilder(
+                          listenable: state.view,
+                          builder: (context, _) => SwitchListTile(
+                            secondary: const Icon(
+                              Icons.dock_rounded,
+                              semanticLabel: 'Tray',
+                            ),
+                            title: const Text('Keep running when I close it'),
+                            // Says the consequence, not the mechanism. The
+                            // thing a person needs to know is that closing
+                            // the window will stop meaning "stop the app" —
+                            // it keeps receiving — and where the off switch
+                            // went.
+                            subtitle: const Text(
+                              'Closing the window hides PeerBeam in the tray '
+                              'instead of quitting, so it keeps receiving. '
+                              'Quit from the tray icon.',
+                            ),
+                            value: state.view.keepInTray,
+                            onChanged: (v) =>
+                                unawaited(state.view.setKeepInTray(v)),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -430,7 +459,8 @@ class SettingsScreen extends StatelessWidget {
                                 // once and never sent a file sat here forever.
                                 // The engine and the CLI could both approve it;
                                 // only the GUI could not.
-                                if (!pins[i].approved) _ApproveRow(device: pins[i]),
+                                if (!pins[i].approved)
+                                  _ApproveRow(device: pins[i]),
                               ],
                             ),
                             isThreeLine: !pins[i].approved,
@@ -554,7 +584,7 @@ class SettingsScreen extends StatelessWidget {
                     // can open anything on its own.
                     ListTile(
                       leading: const Icon(Icons.open_in_new_rounded),
-                      title: const Text('Releases'),
+                      title: const Text('Downloads'),
                       subtitle: const Text(
                         '$_releasesUrl\n'
                         'PeerBeam never checks for updates on its own — that '
@@ -564,7 +594,7 @@ class SettingsScreen extends StatelessWidget {
                       isThreeLine: true,
                       trailing: IconButton(
                         icon: const Icon(Icons.copy_rounded),
-                        tooltip: 'Copy the releases address',
+                        tooltip: 'Copy the download address',
                         onPressed: () {
                           Clipboard.setData(
                             const ClipboardData(text: _releasesUrl),
@@ -573,7 +603,7 @@ class SettingsScreen extends StatelessWidget {
                             ..hideCurrentSnackBar()
                             ..showSnackBar(
                               const SnackBar(
-                                content: Text('Releases address copied'),
+                                content: Text('Download address copied'),
                               ),
                             );
                         },
@@ -669,8 +699,19 @@ class SettingsScreen extends StatelessWidget {
   ///
   /// A constant rather than something derived at runtime: deriving it would
   /// mean asking somewhere, and not asking is the point.
-  static const String _releasesUrl =
-      'https://github.com/alpha-neo-omega/PeerBeam/releases';
+  /// Where a person goes to get a build.
+  ///
+  /// The project's own download page, matching `peerbeam_update::DOWNLOAD_PAGE`
+  /// in the engine and what `peerbeam check-updates` prints. It names the file
+  /// for the platform the reader is on; the releases list is a directory of
+  /// twenty-three assets they would have to choose between correctly, which is
+  /// the wrong thing to hand someone who has just been told to update.
+  ///
+  /// Hardcoded rather than read from the update check's answer on purpose: the
+  /// address is shown even when no check has been run, and a URL that arrived
+  /// over the network must not be what a person is pointed at — see the note on
+  /// `newest()` in peerbeam-update.
+  static const String _releasesUrl = 'https://peerbeam.pages.dev/download';
 
   /// The About line. The version is whatever the engine reports; with no engine
   /// to ask, it says so rather than inventing a number — an app stating a
@@ -684,9 +725,9 @@ class SettingsScreen extends StatelessWidget {
   static Future<void> _copyFingerprint(BuildContext context, String fp) async {
     await Clipboard.setData(ClipboardData(text: fp));
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Full fingerprint copied')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Full fingerprint copied')));
   }
 
   /// First 16 hex chars of the fingerprint, grouped for readability.

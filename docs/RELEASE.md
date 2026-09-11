@@ -33,6 +33,32 @@ Config reads certs/keys from env/secrets. Without them, builds still produce
 **unsigned/test** artifacts (Linux tar.gz, unsigned MSIX, un-notarized DMG,
 debug-signed APK) — usable for testing, not for distribution.
 
+**The debug-signed APK is worse than it sounds.** An Android debug keystore is
+generated per machine, and CI runners are ephemeral, so each release is signed
+with a *different* throwaway key: `v0.11.0`'s certificate is
+`CN=Android Debug` with `notBefore` set to the minute that build ran. Android
+refuses to install over a package whose signature differs, so every release
+fails to upgrade the last one — users get "App not installed as package
+conflicts with an existing package" and have to uninstall, losing that device's
+identity, trust store and chat history each time. Setting
+`ANDROID_KEYSTORE_BASE64` + `ANDROID_KEY_PROPERTIES` once fixes this
+permanently, and costs nothing: `keytool` generates the keystore and Android has
+no certificate authority.
+
+## Checksums
+Every release attaches **`SHA256SUMS`**, generated in the `release` job over
+exactly the files being uploaded and attached in the same `gh release create`
+call — a separate upload step could fail *after* the release exists and leave
+artifacts with no checksums and no visible error.
+
+Names in it are basenames, so `sha256sum -c SHA256SUMS` works in whatever
+directory somebody downloaded into. `docs/GUIDE.md` documents the user side.
+
+It is **integrity, not authenticity**: the file sits beside the artifacts it
+describes, so whoever could swap one could swap both. It catches truncation and
+corruption, and lets two people confirm they hold the same bytes. Proving origin
+needs a signature over a key published elsewhere.
+
 ## Signing a macOS build locally
 `scripts/package-macos.sh` does codesign → DMG → notarize → staple. Run it on a
 Mac with three env vars set. Requires an **Apple Developer Program** membership.

@@ -948,6 +948,77 @@ impl Manager {
         Ok(json!({ "queued": queued, "sync": true }))
     }
 
+    /// Learn who actually answers at an address:
+    /// `{peer:{addresses,port,name?}}` → `{device_id, name, newly_trusted, pairing_code}`.
+    ///
+    /// # Why this exists
+    ///
+    /// Two kinds of peer reach the UI without the identity a conversation needs.
+    /// A Tailscale-discovered device is keyed `ts:<node id>` — Tailscale's name
+    /// for it, not PeerBeam's — and a device the user typed an address for has
+    /// no id at all. Chat rows are filed under `chat-<device id>` and inbound
+    /// records are keyed by the **authenticated** id, so a thread opened under
+    /// either would collect our own messages under a name the peer has never
+    /// heard of: replies would land in a different thread and queued messages
+    /// could never flush. The store refuses the Tailscale one outright, because
+    /// a colon is not legal in a namespace.
+    ///
+    /// This closes that gap the only way it can be closed honestly: **ask**.
+    /// It dials the address the caller names, completes the ordinary
+    /// authenticated handshake, and reports the device id that answered.
+    ///
+    /// # Why the answer can be trusted as much as any other
+    ///
+    /// `session_exec::dial` is the same call every send makes, so the identity
+    /// comes from the same handshake, pinned by the same TOFU rule, with the
+    /// same pairing code available for the user to compare. Nothing is
+    /// special-cased.
+    ///
+    /// The inbound side deliberately does *not* make this inference — see the
+    /// note in `session_exec::accept`, "nothing here can prove the two name one
+    /// machine". That is right for a connection that arrived: we did not choose
+    /// where it came from. Here we did. The caller named the address, so what
+    /// answers at it is, by construction, what that address is.
+    ///
+    /// # What it does not do
+    ///
+    /// **Nothing is sent** — no file, no message, not a typed frame of any
+    /// kind. It is the handshake and then a close. It grants nothing either:
+    /// the handshake pins a key exactly as any first contact does, and
+    /// `newly_trusted`/`pairing_code` come back so a surface can show the same
+    /// verification panel a first-contact transfer shows. Approving a device
+    /// remains a separate, explicit act (I6).
+    pub fn peer_identify(self: &Arc<Self>, req: &Value) -> Op {
+        let device = device_from(req.get("peer"))?;
+        let me = self.clone();
+        crate::runtime::block_on(async move {
+            let meta = me.session(&format!("identify-{}", device.id.0), device.id.clone(), 0);
+            let session = crate::session_exec::dial(
+                &me.quic,
+                &me.rm,
+                &device,
+                &meta,
+                me.identity(),
+                me.enc.clone(),
+                me.trust.clone(),
+                // Wired like every other dial site: a session that cannot
+                // receive what the peer pushes back is a half-open one, and the
+                // peer does not know this connection is only asking a question.
+                Some(me.chat_wiring()),
+                Some(me.presence_wiring()),
+            )
+            .await?;
+            let answer = json!({
+                "device_id": session.peer_device.0,
+                "name": session.peer_name,
+                "newly_trusted": session.newly_trusted,
+                "pairing_code": session.pairing_code,
+            });
+            session.close().await;
+            Ok(answer)
+        })
+    }
+
     /// Dial one peer and offer it the clip. Best-effort and silent on failure:
     /// an unreachable device simply does not get this clip, and nothing is
     /// retried or stored.
@@ -2223,10 +2294,26 @@ impl Manager {
         }
     }
 
-    /// Accept an incoming transfer AND trust the sending device: future
-    /// transfers from it are auto-accepted whenever auto-accept is enabled.
-    /// The only path that ever approves a device — a plain [`accept`](Self::accept)
-    /// never does.
+    /// Accept an incoming transfer AND trust the sending device: files from it
+    /// are accepted without asking from now on.
+    ///
+    /// The only path that ever approves a device — a plain
+    /// [`accept`](Self::accept) never does — and the only one that turns on a
+    /// device's own auto-accept bit.
+    ///
+    /// It sets **both**, and that is the point. Approval alone only makes a
+    /// device *eligible*: `admit_transfer_for` then asks
+    /// `global_auto_accept || per_device_auto_accept`, and the global setting
+    /// defaults off. Approving without the per-device bit is what made this
+    /// call appear not to work — the user pressed a button reading "Trust",
+    /// the approval was written, and the next file prompted anyway.
+    ///
+    /// Deliberately the *narrow* grant: this device, not every trusted device.
+    /// Revoked from the Trusted Devices screen's own switch
+    /// (`pb_trust_set_auto_accept`), and still ANDed with
+    /// [`Permission::Files`](peerbeam_domain::entity::Permission::Files) in the
+    /// gate, so it changes what the user is **asked** and never what a peer is
+    /// **allowed**.
     ///
     /// `confirmed` carries the same meaning as on [`accept`](Self::accept), and
     /// is gated identically. If anything this path needs it more: it is the one
@@ -2380,7 +2467,17 @@ impl Manager {
                     for rec in history {
                         events.push(json!({
                             "kind": "chat",
-                            "at": rec.timestamp,
+                            // When THIS device stored the row, not the
+                            // sender's claim about its own clock: every other
+                            // kind of row in this list is stamped locally, and
+                            // one row on a peer's clock does not just label
+                            // itself wrongly, it sorts itself wrongly against
+                            // all of them. Falls back to the row's own
+                            // timestamp only for a legacy row with no
+                            // `stored_at`, which is the best this device has.
+                            "at": rec
+                                .age_basis()
+                                .map_or_else(|| rec.timestamp.clone(), |at| at.to_rfc3339()),
                             "peer": peer.0,
                             "detail": match rec.kind {
                                 peerbeam_chat::Kind::File => rec
@@ -2411,14 +2508,27 @@ impl Manager {
             }
         }
 
-        // Newest first, with the id as a stable tiebreak so two events in the
-        // same second do not swap places between calls.
+        // Newest first, with the kind as a stable tiebreak so two events in
+        // the same instant do not swap places between calls.
+        //
+        // Compared as parsed instants, never as text. These strings come from
+        // three different producers, and a text comparison is only the same as
+        // a chronological one while all of them agree on UTC offset and
+        // fractional-second width. `2026-01-01T00:00:00.900Z` sorts *before*
+        // `2026-01-01T00:00:00Z` as text, because `.` precedes `Z`, and any
+        // offset other than `+00:00` sorts by its wall-clock text rather than
+        // its instant. A row that will not parse sorts oldest, so it lands at
+        // the end instead of claiming the top of the user's activity list.
+        fn instant(v: &Value) -> chrono::DateTime<chrono::Utc> {
+            v.get("at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map_or(chrono::DateTime::<chrono::Utc>::MIN_UTC, |t| {
+                    t.with_timezone(&chrono::Utc)
+                })
+        }
         events.sort_by(|a, b| {
-            let (x, y) = (
-                a.get("at").and_then(Value::as_str).unwrap_or_default(),
-                b.get("at").and_then(Value::as_str).unwrap_or_default(),
-            );
-            y.cmp(x).then_with(|| {
+            instant(b).cmp(&instant(a)).then_with(|| {
                 let (ka, kb) = (
                     a.get("kind").and_then(Value::as_str).unwrap_or_default(),
                     b.get("kind").and_then(Value::as_str).unwrap_or_default(),
@@ -4890,11 +5000,36 @@ impl Manager {
     /// you for `n` decisions. A thread with unread *text* therefore reads 0,
     /// which is the honest answer to a question this product cannot yet ask.
     ///
-    /// `last_timestamp` is the newest row's timestamp, or `null` for a thread
-    /// whose rows this build cannot read. Sorted newest-first (ties broken by
-    /// peer id, so the order is stable), which is what a conversation list
-    /// wants — but note that an inbound row's timestamp came off the peer's own
-    /// clock, so this is best-effort recency and not a trusted ordering.
+    /// Two times are reported for the newest row, and they answer different
+    /// questions. `last_timestamp` is the row's own timestamp — for an inbound
+    /// row, the **sender's** claim about its own clock — and is what a surface
+    /// may *display* as when the message was sent. `last_at` is
+    /// [`ChatRecord::age_basis`]: the instant **this** device stored the row,
+    /// which is what a surface must use for *recency* ("last message 5m ago")
+    /// and what this list is sorted by. Either is `null` for a thread whose
+    /// rows this build cannot read, and `last_at` is additionally `null` for a
+    /// legacy row whose unvalidated timestamp will not parse.
+    ///
+    /// Sorted newest-first by `last_at`, ties broken by peer id so the order is
+    /// stable, and a thread with no datable row sorts last rather than first.
+    ///
+    /// # Why not the timestamp
+    ///
+    /// This used to take the newest row as `history.last()` — the greatest
+    /// store key, so the row whose *author's* clock read latest — and then sort
+    /// the threads by comparing those timestamp strings as text. Both handed a
+    /// peer control of the user's conversation list. A peer whose clock ran
+    /// hours ahead pinned its thread to the top and labelled it "just now"
+    /// indefinitely; a peer whose clock ran behind buried a thread a message
+    /// had just arrived in, under quieter ones. Comparing as text also broke on
+    /// its own: an offset of `+05:30` reads as five and a half hours later than
+    /// the same instant in `+00:00`, and `…00.900Z` sorts *before* `…00Z`
+    /// because `.` precedes `Z`.
+    ///
+    /// `stored_at` exists for exactly this reason and is already what a
+    /// disappearing-message window is measured against — see
+    /// [`ChatRecord::stored_at`]. Using it here makes the ordering this list
+    /// always wanted actually true, rather than best-effort.
     ///
     /// Cost: one namespace scan plus one full history read per conversation.
     /// [`AppStore`](peerbeam_domain::port::AppStore) has no "last key" call, so
@@ -4906,7 +5041,16 @@ impl Manager {
             .chat
             .conversations()
             .map_err(|e| (Code::Internal, e.to_string()))?;
-        let mut rows: Vec<(String, Option<String>, usize)> = Vec::with_capacity(peers.len());
+        struct Row {
+            peer_id: String,
+            /// The newest row's own timestamp — the sender's string on an
+            /// inbound row. For display only.
+            last_timestamp: Option<String>,
+            /// When this device stored that row. Orders the list.
+            last_at: Option<chrono::DateTime<chrono::Utc>>,
+            unread_hint: usize,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(peers.len());
         for peer in peers {
             // A thread whose records cannot be read still exists and must still
             // be listed — dropping it would hide the very conversation this
@@ -4916,25 +5060,52 @@ impl Manager {
                 tracing::warn!(error = %e, peer_id = %peer.0, "conversation summary unreadable");
                 Vec::new()
             });
-            let last = history.last().map(|rec| rec.timestamp.clone());
+            // The newest row by when THIS device stored it, not by store key
+            // (the author's clock) and not by comparing timestamp strings. The
+            // id is the tiebreak so a thread whose rows share a stored_at
+            // resolves the same way on every call. A row this device cannot
+            // date loses to any it can, and only wins when nothing else is
+            // datable — so a junk timestamp cannot claim the thread's summary.
+            let newest = history
+                .iter()
+                .max_by(|a, b| {
+                    a.age_basis()
+                        .cmp(&b.age_basis())
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+                .map(|rec| (rec.timestamp.clone(), rec.age_basis()));
             let awaiting = history
                 .iter()
                 .filter(|rec| {
                     rec.direction == ChatDirection::In && rec.status == ChatStatus::PendingApproval
                 })
                 .count();
-            rows.push((peer.0, last, awaiting));
+            let (last_timestamp, last_at) = match newest {
+                Some((ts, at)) => (Some(ts), at),
+                None => (None, None),
+            };
+            rows.push(Row {
+                peer_id: peer.0,
+                last_timestamp,
+                last_at,
+                unread_hint: awaiting,
+            });
         }
-        // Newest first. `None` sorts below every `Some`, so an unreadable
-        // thread lands at the bottom rather than the top.
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Newest first. `None` sorts below every `Some`, so a thread this build
+        // cannot date lands at the bottom rather than the top.
+        rows.sort_by(|a, b| {
+            b.last_at
+                .cmp(&a.last_at)
+                .then_with(|| a.peer_id.cmp(&b.peer_id))
+        });
         let peers: Vec<Value> = rows
             .into_iter()
-            .map(|(peer_id, last_timestamp, unread_hint)| {
+            .map(|row| {
                 json!({
-                    "peer_id": peer_id,
-                    "last_timestamp": last_timestamp,
-                    "unread_hint": unread_hint,
+                    "peer_id": row.peer_id,
+                    "last_timestamp": row.last_timestamp,
+                    "last_at": row.last_at.map(|at| at.to_rfc3339()),
+                    "unread_hint": row.unread_hint,
                 })
             })
             .collect();
@@ -5328,12 +5499,80 @@ impl Manager {
                 // they did not cause; saying nothing meant the next connection
                 // asked again with no hint why, which reads as the button not
                 // working.
-                if let Err(e) = self.trust.approve(peer_id) {
+                // Preserve a deadline the user set deliberately.
+                //
+                // `approve()` is `approve_for(.., None)`, and `None` **clears**
+                // any window already on the record — that is what a plain
+                // `trust approve` asks for. Here it would be wrong: somebody
+                // who ran `trust approve alice --for 30m` time-boxed that
+                // device on purpose, and one tap on a file prompt must not
+                // silently convert 30 minutes into forever. It matters more now
+                // that this path also grants standing auto-accept: lifting the
+                // window would turn a deliberately temporary grant into
+                // permanent silent acceptance, which is the opposite of what
+                // the user asked for.
+                //
+                // Re-approving with the SAME instant keeps both decisions: the
+                // device auto-accepts for exactly as long as it was trusted,
+                // and `auto_accepts_at` — which requires `is_approved_at` —
+                // starts prompting again by itself when the window closes.
+                //
+                // A window that has ALREADY lapsed is not preserved. The grant
+                // has run its course, so this tap is a fresh decision and gets
+                // the indefinite approval the button offers; keeping the dead
+                // deadline would leave the button doing nothing at all.
+                let deadline = self
+                    .trust
+                    .lookup(peer_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.expires_at)
+                    .filter(|at| *at > chrono::Utc::now());
+                let recorded = match deadline {
+                    Some(at) => self.trust.approve_for(peer_id, Some(at)),
+                    None => self.trust.approve(peer_id),
+                };
+                if let Err(e) = recorded {
                     tracing::warn!(
                         error = %e,
                         peer = %peer_id.0,
                         "accepted the transfer but could not record the approval — \
                          this device will be asked about again"
+                    );
+                }
+                // ...and stop asking about THIS device, which is the other
+                // half of what the button says.
+                //
+                // Approving alone did not do that. Approval makes a device
+                // *eligible* for auto-accept; whether it is actually asked
+                // about is then `global_auto_accept || per_device_auto_accept`
+                // (`admit_transfer_for`), and the global setting defaults off
+                // (`DeviceConfig::auto_accept_trusted`). So the app offered a
+                // primary button reading "Trust", tooltipped "Accept and
+                // always trust this device", and then asked again on the very
+                // next file — the user's explicit consent was recorded and
+                // then not acted on. That is the defect a user reports as
+                // "auto-accept is not working".
+                //
+                // Setting the per-device bit is what that consent means, and
+                // it is the narrow form of it: this device, not everybody.
+                // I6 requires consent for auto-accept to be **explicit,
+                // revocable and per-capability** — a button naming this device
+                // and this file is explicit, the Trusted Devices screen's own
+                // auto-accept switch (`pb_trust_set_auto_accept`) is where it
+                // is revoked, and `admit_transfer` still ANDs the whole
+                // decision with `may(Files)`, so this widens what the user is
+                // *asked* and never what a peer is *allowed*.
+                //
+                // Best-effort for the same reason as the approval above: the
+                // file the user just accepted is not held hostage to a disk
+                // write, and a failure says so rather than passing silently.
+                if let Err(e) = self.trust.set_auto_accept(peer_id, true) {
+                    tracing::warn!(
+                        error = %e,
+                        peer = %peer_id.0,
+                        "accepted and approved this device but could not record \
+                         auto-accept — it will be asked about again"
                     );
                 }
                 AcceptOutcome::Accepted
@@ -5615,19 +5854,6 @@ impl Manager {
         // A no-op for the vast majority (an ordinary transfer has no row), and
         // a no-op when the peek learned nothing (empty name).
         self.chat_set_landing(&active, &preview.name, preview.size);
-        events::transfer(
-            &id,
-            "transfer_queued",
-            json!({
-                "peer": peer,
-                "peer_id": session.peer_device.0,
-                "incoming": true,
-                "file": display,
-                "size": preview.size,
-                "newly_trusted": session.newly_trusted,
-                "pairing_code": session.pairing_code.clone(),
-            }),
-        );
         // Record first contact before any decision can be taken, so the accept
         // gate and the refusal un-pin both see it. `newly_trusted` is the only
         // moment this is knowable: the handshake has already pinned the peer,
@@ -5669,6 +5895,36 @@ impl Manager {
         // interruption must not turn an unanswered prompt into a yes (I6).
         let resuming =
             self.resumes_accepted_receive(&id, &session.peer_device, &preview.name, preview.size);
+        // Announce the transfer only now that it is known whether anyone will
+        // be asked about it, and say which.
+        //
+        // This used to be emitted *before* the gate ran, and `needs_decision`
+        // did not exist. A surface has no other way to tell "queued, waiting
+        // for you" from "queued, already admitted", so the app raised its modal
+        // for every inbound file and then had nothing to withdraw it with: the
+        // auto-accepted file landed while the user was still looking at
+        // "Decline / Accept". Auto-accept appeared not to work at all, because
+        // the only part of it a user can see is whether they get asked.
+        //
+        // `false` covers all three ways nobody is asked — auto-accepted,
+        // refused outright by a revoked `files` permission, or resuming a
+        // transfer this user already accepted. Ordering the emit after
+        // `resumes_accepted_receive` is what lets the resume leg be honest too.
+        let needs_decision = matches!(admission, FileAdmission::Prompt) && !resuming;
+        events::transfer(
+            &id,
+            "transfer_queued",
+            json!({
+                "peer": peer,
+                "peer_id": session.peer_device.0,
+                "incoming": true,
+                "file": display,
+                "size": preview.size,
+                "newly_trusted": session.newly_trusted,
+                "pairing_code": session.pairing_code.clone(),
+                "needs_decision": needs_decision,
+            }),
+        );
         let outcome = match admission {
             // A revoked `files` permission beats a resume: the user's decision
             // is newer than the checkpoint.
@@ -6497,6 +6753,14 @@ fn search_hit_dto(hit: &SearchHit) -> Value {
         "peer_id": hit.peer_id,
         "message_id": hit.message_id,
         "timestamp": hit.timestamp,
+        // When THIS device stored the row, which is what the hits are ranked
+        // by (`SearchHit::order`). Shipped so a surface can date a hit with the
+        // same clock the ordering used: without it the list was sorted by the
+        // local clock and labelled with the sender's, so a peer with a fast
+        // clock read "just now" forever and a result could be labelled older
+        // than the ones below it — the exact split this is elsewhere at pains
+        // to avoid. Null for a row this device cannot date.
+        "stored_at": hit.at.map(|at| at.to_rfc3339()),
         "direction": hit.direction,
         "kind": hit.kind,
         "snippet": hit.snippet,
@@ -8724,6 +8988,164 @@ mod tests {
         DeviceId::from("pb-bob")
     }
 
+    /// **The button does what it says.** "Trust" on the receive prompt is
+    /// tooltipped "Accept and always trust this device", and it used to write
+    /// only the approval — which makes a device *eligible* for auto-accept
+    /// while `admit_transfer_for` still asks
+    /// `global_auto_accept || per_device_auto_accept`, and the global setting
+    /// defaults off. So the user's explicit consent was recorded and then not
+    /// acted on, and the very next file prompted again: the defect reported as
+    /// "auto-accept is not working, it asks every time".
+    ///
+    /// Asserted end to end — the real `FsTrust`, the real decision channel —
+    /// because the bug was precisely that two writes that both had to happen
+    /// did not, and a test of either one alone passed throughout.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accept_and_trust_stops_the_device_being_asked_about_again() {
+        let (mgr, _chat, _dir) = test_manager_full("truster", 0);
+        let peer = DeviceId::from("pb-bob");
+        // Pinned by the handshake, as every peer reaching the gate has been.
+        mgr.trust
+            .record(peerbeam_domain::entity::TrustRecord {
+                mine: false,
+                auto_accept: false,
+                device: peer.clone(),
+                fingerprint: "ff".into(),
+                name: "Bob".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: false,
+                permissions: peerbeam_domain::entity::PermissionSet::none(),
+                expires_at: None,
+            })
+            .expect("pin the peer");
+
+        // Nothing is granted yet: a merely pinned device is prompted.
+        assert_eq!(
+            admit_transfer_for(
+                mgr.auto_accept.load(Ordering::SeqCst),
+                mgr.trust.auto_accepts(&peer),
+                mgr.trust.as_ref(),
+                &peer,
+            ),
+            FileAdmission::Prompt,
+            "a pinned but unapproved device must still be asked about"
+        );
+
+        // The user taps "Trust" on a live prompt.
+        let m = Arc::new(mgr);
+        let waiter = {
+            let m = m.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move { m.wait_for_accept("tx-1", &peer).await })
+        };
+        // Let `wait_for_accept` register its pending entry first.
+        for _ in 0..50 {
+            if m.pending.lock().unwrap().contains_key("tx-1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        m.accept_trust("tx-1", true).expect("accept and trust");
+        assert!(
+            waiter.await.expect("the waiter task").accepted(),
+            "the transfer itself must still go through"
+        );
+
+        // Both writes landed...
+        assert!(m.trust.is_approved(&peer), "the approval was not recorded");
+        assert!(
+            m.trust.auto_accepts(&peer),
+            "the per-device auto-accept bit was not set — this is the bug"
+        );
+
+        // ...and the next file from this device is not asked about, with the
+        // GLOBAL setting still off, which is the whole point of the narrow
+        // grant.
+        assert!(
+            !m.auto_accept.load(Ordering::SeqCst),
+            "this test is only meaningful while the global setting is off"
+        );
+        assert_eq!(
+            admit_transfer_for(
+                m.auto_accept.load(Ordering::SeqCst),
+                m.trust.auto_accepts(&peer),
+                m.trust.as_ref(),
+                &peer,
+            ),
+            FileAdmission::AutoAccept,
+            "the device the user chose to trust is still being asked about"
+        );
+    }
+
+    /// **A deliberate time box survives "Always accept".**
+    ///
+    /// `approve()` clears any deadline on the record, which is right for a
+    /// plain `trust approve` and wrong here: somebody who ran
+    /// `trust approve alice --for 30m` time-boxed that device on purpose, and
+    /// one tap on a file prompt must not turn 30 minutes into forever — the
+    /// more so now that this path also grants standing auto-accept, which would
+    /// make the lifted window permanently silent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accept_and_trust_does_not_lift_a_time_limited_approval() {
+        let (mgr, _chat, _dir) = test_manager_full("timeboxer", 0);
+        let peer = DeviceId::from("pb-bob");
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(30);
+        mgr.trust
+            .record(peerbeam_domain::entity::TrustRecord {
+                mine: false,
+                auto_accept: false,
+                device: peer.clone(),
+                fingerprint: "ff".into(),
+                name: "Bob".into(),
+                trusted_at: chrono::Utc::now(),
+                approved: false,
+                permissions: peerbeam_domain::entity::PermissionSet::none(),
+                expires_at: None,
+            })
+            .expect("pin the peer");
+        // The user's deliberate decision: trusted, but only for half an hour.
+        mgr.trust
+            .approve_for(&peer, Some(deadline))
+            .expect("time-limited approval");
+
+        let m = Arc::new(mgr);
+        let waiter = {
+            let m = m.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move { m.wait_for_accept("tx-1", &peer).await })
+        };
+        for _ in 0..50 {
+            if m.pending.lock().unwrap().contains_key("tx-1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        m.accept_trust("tx-1", true).expect("accept and trust");
+        assert!(waiter.await.expect("the waiter task").accepted());
+
+        let record = m
+            .trust
+            .lookup(&peer)
+            .expect("readable")
+            .expect("the peer is on record");
+        assert_eq!(
+            record.expires_at,
+            Some(deadline),
+            "the window the user set was lifted — 30 minutes became forever"
+        );
+        // It does still stop the asking, for as long as the grant lasts...
+        assert!(m.trust.auto_accepts(&peer), "auto-accept was not granted");
+        // ...and not one moment longer: past the deadline the device is not
+        // approved, so it is neither auto-accepting nor admitted silently.
+        let after = deadline + chrono::Duration::seconds(1);
+        assert!(
+            !m.trust.auto_accepts_at(&peer, after),
+            "auto-accept outlived the approval it depends on"
+        );
+    }
+
     /// Leg 2, and the compatibility statement for this whole change: an
     /// approved device with its permissions intact auto-accepts exactly as it
     /// did before permissions existed.
@@ -10023,6 +10445,125 @@ mod tests {
         let mut sorted = times.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(times, sorted, "the timeline was not newest-first");
+    }
+
+    /// **A peer does not get to choose where its message sits in the user's
+    /// activity list.** Every other kind of row in the timeline is stamped by
+    /// this device; a chat row used to be stamped with `rec.timestamp`, which
+    /// on an inbound row is the sender's own unvalidated claim about its own
+    /// clock. A peer claiming next year pinned itself to the top of the list
+    /// and — a negative age reading as `just now` in the surface's `_when` —
+    /// labelled itself the most recent thing that had happened.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peers_clock_does_not_decide_where_its_message_sits_in_the_timeline() {
+        let (mgr, chat, _dir) = test_manager_full("timeliner3", 0);
+        let peer = DeviceId::from("pb-bob");
+
+        // Arrived first, but claims to be from next year.
+        let mut liar = peerbeam_chat::ChatMessage::new("from the future").expect("message");
+        liar.timestamp = "2099-01-01T00:00:00Z".to_string();
+        let mut early = peerbeam_chat::ChatRecord::received(&peer, &liar);
+        early.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&early).expect("append the future-stamped row");
+
+        // Arrived second, stamped honestly.
+        let honest = peerbeam_chat::ChatMessage::new("from now").expect("message");
+        let mut late = peerbeam_chat::ChatRecord::received(&peer, &honest);
+        late.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&late).expect("append the honest row");
+
+        let out = mgr.timeline(&json!({})).expect("timeline");
+        let events = out["events"].as_array().expect("array");
+        let times: Vec<&str> = events.iter().filter_map(|e| e["at"].as_str()).collect();
+
+        // Both rows are dated by when they arrived here, so nothing in the
+        // list claims to be from 2099.
+        assert!(
+            !times.iter().any(|t| t.starts_with("2099")),
+            "a peer's claimed clock reached the timeline: {times:?}"
+        );
+        // And the honest row, which arrived an hour later, leads.
+        assert_eq!(
+            times.first().map(|t| &t[..13]),
+            Some("2026-01-01T11"),
+            "the timeline ordered by the peer's claim rather than by arrival: {times:?}"
+        );
+    }
+
+    /// **The conversations list is ordered by this device's clock, and says so
+    /// honestly.** It used to take the newest row as `history.last()` — the
+    /// greatest store key, so whichever row's *author* had the latest clock —
+    /// and then order the threads by comparing those timestamp strings as text.
+    /// A peer running fast held the top of the list and read "just now"
+    /// indefinitely; a peer running slow buried a thread a message had just
+    /// arrived in.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peers_clock_does_not_decide_the_conversations_order_or_its_recency() {
+        let (mgr, chat, _dir) = test_manager_full("lister", 0);
+        let fast = DeviceId::from("pb-fast");
+        let quiet = DeviceId::from("pb-quiet");
+
+        // The fast peer's row arrived FIRST and claims next year.
+        let mut liar = peerbeam_chat::ChatMessage::new("tomorrow").expect("message");
+        liar.timestamp = "2099-01-01T00:00:00Z".to_string();
+        let mut early = peerbeam_chat::ChatRecord::received(&fast, &liar);
+        early.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&early).expect("append");
+
+        // The quiet peer's row arrived an hour later, stamped honestly.
+        let honest = peerbeam_chat::ChatMessage::new("today").expect("message");
+        let mut late = peerbeam_chat::ChatRecord::received(&quiet, &honest);
+        late.stored_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        chat.append(&late).expect("append");
+
+        let out = mgr
+            .chat_conversations(&json!({}))
+            .expect("chat_conversations");
+        let peers = out["peers"].as_array().expect("array");
+        let ids: Vec<&str> = peers.iter().filter_map(|p| p["peer_id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pb-quiet", "pb-fast"],
+            "the list was ordered by the peers' own clocks"
+        );
+
+        // `last_at` is what a surface reads recency from, and it is this
+        // device's clock — so nothing in it claims to be from 2099.
+        let fast_row = peers
+            .iter()
+            .find(|p| p["peer_id"] == "pb-fast")
+            .expect("the fast peer is still listed");
+        assert_eq!(
+            fast_row["last_at"].as_str().map(|t| &t[..13]),
+            Some("2026-01-01T10"),
+            "last_at carried the peer's claim"
+        );
+        // `last_timestamp` still reports what the sender actually said, so a
+        // surface can show the claimed send time. The two are different
+        // questions and both are answered.
+        assert_eq!(
+            fast_row["last_timestamp"].as_str(),
+            Some("2099-01-01T00:00:00Z"),
+            "the sender's own stamp is no longer reported at all"
+        );
     }
 
     #[tokio::test]

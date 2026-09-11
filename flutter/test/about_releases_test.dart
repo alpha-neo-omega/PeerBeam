@@ -33,11 +33,17 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  testWidgets('the releases address is shown', (tester) async {
+  testWidgets('the download address is shown', (tester) async {
     await pump(tester, FakePeerBeam());
+    // The project's own download page, the same address the engine reports and
+    // `peerbeam check-updates` prints — not the releases list, which is a
+    // directory of twenty-three files to choose between.
+    expect(find.textContaining('peerbeam.pages.dev/download'), findsOneWidget);
     expect(
       find.textContaining('github.com/alpha-neo-omega/PeerBeam/releases'),
-      findsOneWidget,
+      findsNothing,
+      reason:
+          'the GUI kept pointing at the asset list after the engine stopped',
     );
   });
 
@@ -62,11 +68,11 @@ void main() {
       },
     );
     await pump(tester, FakePeerBeam());
-    await tester.tap(find.byTooltip('Copy the releases address'));
+    await tester.tap(find.byTooltip('Copy the download address'));
     await tester.pumpAndSettle();
 
-    expect(copied, ['https://github.com/alpha-neo-omega/PeerBeam/releases']);
-    expect(find.text('Releases address copied'), findsOneWidget);
+    expect(copied, ['https://peerbeam.pages.dev/download']);
+    expect(find.text('Download address copied'), findsOneWidget);
   });
 
   testWidgets('nothing is checked until the button is pressed', (tester) async {

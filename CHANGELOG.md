@@ -6,7 +6,274 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **`peerbeam identify <host>`, and `pb_peer_identify` behind it** — ask an
+  address which device answers there. It dials, completes the ordinary
+  authenticated handshake, reports the device id that answered, and closes.
+  Nothing is sent and nothing is approved; the handshake pins a key exactly as
+  any first contact does, and the pairing code comes back so it can be checked.
+
+  This is the missing half of chat with a Tailscale or typed-address peer. A
+  conversation is filed under the peer's **authenticated** id, and those two
+  kinds of peer reach a surface without one — Tailscale supplies its own node id
+  (`ts:<node>`, which the store refuses outright), a typed address supplies
+  nothing. Neither can be guessed, so this asks. The inbound side deliberately
+  makes no such inference, and is right not to: it did not choose where the
+  connection came from. Here the caller named the address, so what answers at it
+  is by construction what that address is.
+- **Chat with a Tailscale peer now works**, by asking. Tapping chat on a device
+  the app knows only by a provider's own name resolves it first — one dial, one
+  handshake, no bytes sent — and opens the conversation under the identity that
+  answered, so replies land in the thread you are looking at and queued messages
+  can flush. Done on the tap, not in the background on discovery: dialling every
+  peer the moment it appears would reach out to machines nobody asked it to
+  touch.
+
+### Fixed
+- **IPv6 peers could never be dialled, on any platform.** The QUIC client
+  endpoint bound `0.0.0.0` only, so every IPv6 address was unreachable — and a
+  Tailscale peer advertises a tailnet IPv6 (`fd7a:…`) alongside its IPv4, with a
+  MagicDNS name that can resolve to the IPv6 first. The transport now keeps an
+  IPv6 endpoint too (best-effort: a host without IPv6 simply has none, and says
+  so when a dial needs it), and picks the endpoint by each socket's real family.
+- **Only the first resolved address was ever tried.** A hostname resolving to
+  several addresses — as a MagicDNS name does — was dialled once, at whichever
+  the resolver happened to return first, with no regard for family and no second
+  attempt. Every address is now tried, IPv4 first because that socket always
+  exists.
+- **Chat was offered for devices that cannot hold a conversation.** A chat row
+  is filed under `chat-<device id>`, and the store rejects any namespace outside
+  `[A-Za-z0-9._-]`. A Tailscale peer's id is `ts:<node id>` — the colon makes
+  every store call fail with `invalid namespace`, so the thread opened, stayed
+  empty, and swallowed whatever was typed. The action is now withheld, with a
+  sentence saying why and that sending files still works. The saved-device card
+  already withheld it for the same underlying reason; the discovered-device row
+  did not, and could also be reached *through* a saved entry, because a
+  by-address match resolves on host and port and a Tailscale device advertises
+  both.
+- **"Send to address" could only send files.** All three send paths fell through
+  to a file picker when nothing was staged, so through that button there was no
+  folder option and no text option at all — which is exactly how it looked. They
+  now ask what to send. Staging first always worked; only the way in was
+  missing.
+- **The receive prompt could dismiss the wrong thing.** Its self-withdrawal
+  popped whichever route was topmost on the root navigator, which is not
+  reliably the prompt: the pairing-confirmation sheet opens over it, and so does
+  anything else reached while it is up. A decision landing at that moment closed
+  *that* and left the prompt behind. It now removes the route it opened, which
+  is exact wherever it sits in the stack.
+- **Close-to-tray could leave the app unreachable.** If the icon or its menu
+  would not draw — a Linux session with no status-notifier host, the case the
+  code already anticipated — hiding the window left no window, no icon and no
+  menu to quit from. Close-to-tray now requires the menu to have drawn at least
+  once.
+- **The tray's "Send files…" dead-ended.** Files were staged and nothing
+  appeared, so unless you happened to be on Home there was no recipient chooser
+  and no confirmation. It opens the staged sheet, as Home's own button does.
+- **`peerbeam timeline` kept both defects the app's timeline was fixed for**,
+  being a second implementation of the same merge: it dated chat rows with the
+  sender's clock and sorted the merged list as text.
+- **The Activity timeline invented a time for a row it could not date**,
+  labelling it "just now" — a different "just now" on each refresh — while the
+  engine deliberately ranks such a row oldest. So the newest-looking row sat at
+  the bottom of a newest-first list.
+- **A group message arriving while that member's private thread was open was
+  rendered inside it.**
+- The prompt copy told people to turn auto-accept off "under Trusted devices",
+  where there is no such control. It is in the conversation's ⋮ menu.
+- **The tray's live status never appeared during a transfer.** The menu rebuild
+  was a trailing-edge debounce with a 500 ms delay, and the engine emits
+  progress every 50 ms — so the timer was cancelled ten times per interval and
+  never fired for the whole of any transfer. The menu only redrew once the
+  transfer had finished and left the list, which is the one moment its contents
+  did not matter. It is a throttle now: immediate on the first event, then at
+  most twice a second.
+- **"Always accept" silently lifted a deliberate time limit.** `approve()`
+  clears any deadline on a trust record — right for a plain `trust approve`,
+  wrong on a file prompt: `trust approve alice --for 30m` followed by one tap
+  became indefinite approval, and since that tap now also grants standing
+  auto-accept, permanently silent. A live deadline is preserved, so the device
+  auto-accepts for exactly as long as it was trusted and starts asking again by
+  itself when the window closes. A window that has already lapsed is not
+  revived — that tap is a fresh decision.
+- **The AppImage and portable tarball would not start** on any host without
+  Ayatana's app-indicator. `libtray_manager_plugin.so` is a direct `NEEDED` of
+  the runner, so the linker resolves that chain at process start: a missing
+  library is not a lost tray icon, it is a launch failure. Packages declare the
+  dependency; those two formats cannot, and "any distribution, installs
+  nothing" is what an AppImage is for. They now carry the five libraries and a
+  launcher that can find them — the plugin's own `RUNPATH` is an absolute path
+  into the *build* machine's Flutter directory, and `RUNPATH` is not inherited,
+  so bundling alone would not have worked.
+- **Read receipts silently covered fewer messages than they said.**
+  `apply_receipt` marks every row at or below the watermark *by id*, and
+  `markRead` sent the last row in the list. Those agreed only while the
+  transcript was in id order; sorting it by arrival broke that for exactly the
+  case the sort exists for — a peer whose clock runs behind mints lower ids for
+  later-arriving messages. The watermark is now the maximum id.
+- **Chat search was ordered by one clock and dated by another.** Hits are ranked
+  by `stored_at`, but the DTO shipped only the sender's `timestamp`, so a peer
+  running fast read "just now" indefinitely and a result could be dated older
+  than the ones below it. `stored_at` is now carried through.
+- **The About screen still sent people to the GitHub asset list**, though the
+  engine had been changed to point at the download page and the reasoning for
+  that change was published in this file. It now shows the same address the
+  engine and the CLI do.
+- `docs/GUIDE.md` told people to run `sha256sum -c SHA256SUMS` and said it
+  "ignores lines for files you did not download". It does not: it prints
+  `FAILED open or read` for each of the other twenty-two and exits non-zero,
+  which reads exactly like a corrupt download. The documented command now
+  passes `--ignore-missing`, macOS gets a form that works with `shasum`, and the
+  PowerShell recipe compares case-insensitively instead of eyeballing an
+  uppercase hash against a lowercase list.
+- `humantime`'s doc claimed the new compound output kept it "the inverse of
+  `parse_duration`". It never was one — `parse_duration` reads a single
+  `<number><unit>` and rejects `2h00m` just as it rejects `1m30s`.
+- `docs/FFI.md` claimed every ordering the engine reports is by `stored_at`;
+  `pb_chat_history` is still store-key (sender-minted id) order, and the doc now
+  says so and tells a surface to sort. `docs/SECURITY.md` and amendment A1 still
+  justified the `PeerBeam` User-Agent as required by "the GitHub API" after the
+  check moved hosts — A1 carries a dated note rather than a rewritten clause,
+  since it is constitutional. The CHANGELOG entry above also contradicted itself
+  about where the version comes from.
+
+### Added
+- **Releases now attach `SHA256SUMS`.** Generated over exactly the files being
+  uploaded, named by basename so `sha256sum -c SHA256SUMS` works in whatever
+  directory you downloaded into, and attached in the same call that creates the
+  release — a separate upload step could fail after the release existed and
+  leave artifacts unchecksummed with nothing to notice. It proves a download is
+  intact, not that it came from this project: the list sits beside the files it
+  describes. `docs/GUIDE.md` says how to check one, and says that plainly.
+- **A tray / menu-bar icon on desktop.** Windows puts it in the notification
+  area, macOS in the menu bar (it has no taskbar), Linux via Ayatana's
+  app-indicator. The menu shows what is happening — transfers in progress with
+  their percentage, devices online now — and offers Open, Send files… and Quit.
+  Long lists are capped with a line saying how many were not shown, rather than
+  stopping silently at five as though that were all of them.
+- **Optionally keep running when the window closes**, off by default
+  (Settings → "Keep running when I close it"). With it on, closing hides to the
+  tray and PeerBeam keeps receiving; Quit is always in the tray menu. Off is the
+  default deliberately: somebody who closes a window generally believes they
+  closed the program, and a build that kept accepting files after that would be
+  deciding something about their machine for them.
+
+  Linux packages now depend on `libayatana-appindicator3-1` (and the `.deb`
+  declares `libgtk-3-0`, which it never had). Both are linked at runtime, so a
+  missing one stops the app starting rather than costing it a feature.
+
+### Changed
+- **The update check now asks the project's own site, not GitHub's API.** One
+  HTTPS GET to `peerbeam.pages.dev/releases.json`, a two-field document the site
+  generates at build time from the same constant that renders its download
+  links — so it can only advertise a release whose files that page can actually
+  hand you. The release feed answered a slightly different question ("what is
+  the newest tag"), and a tag that exists before the site is rebuilt would have
+  sent everyone who acted on the prompt to a filename that is not there yet. It
+  also keeps the one request PeerBeam makes that is not to a peer on an origin
+  the project controls, and off a third-party API whose unauthenticated rate
+  limit is shared by everyone behind a NAT. Still one GET, no identifiers, no
+  retry, and now no fallback to a second host. The URL you are offered is
+  compiled in rather than read from the response, so the served document cannot
+  send anyone anywhere. `docs/SECURITY.md` is updated to match.
+- **"An update is available" now sends you to the project's own download page**
+  (<https://peerbeam.pages.dev/download>) rather than the GitHub releases list.
+  The page names the file for the platform you are on and how to install it; the
+  releases page is a directory of twenty-three assets you have to choose between
+  correctly, which is the wrong thing to hand someone who has just been told to
+  act. The bytes are unchanged — the page links each file to the same
+  `releases/latest/download/…` asset — so this changes where a person is sent,
+  not where anything is hosted, and puts no new party in the path of a download.
+  The version is read from that manifest, not from GitHub's release feed.
+
+### Fixed
+- **"Trust" on a receive prompt did not stop the asking.** The primary button —
+  labelled "Trust", tooltipped "Accept and always trust this device" — recorded
+  the approval and nothing else. Approval only makes a device *eligible*:
+  whether it is actually asked about is `global_auto_accept ||
+  per_device_auto_accept`, and the global setting defaults off. So the user's
+  explicit consent was written to disk and then not acted on, and the very next
+  file prompted again. Accept-and-trust now also sets that device's own
+  auto-accept bit — the narrow grant, this device rather than everybody,
+  revocable from the switch on the Trusted Devices screen and still ANDed with
+  the `files` permission in the gate, so it changes what the user is *asked* and
+  never what a peer is *allowed*. The button now reads **Always accept** and
+  says what it will do before the tap rather than in a tooltip after it.
+
+  This was also why a file shared **in a chat** asked every time: those bytes go
+  through the same admission gate, so they failed for the same reason.
+- **The approval prompt was raised for every incoming file, including ones the
+  engine had already auto-accepted.** The engine announced a transfer
+  (`transfer_queued`) *before* running the admission gate, and the event said
+  nothing about whether anyone was being asked — so the app raised its modal off
+  the resulting `pending` row for every arrival, and had nothing to withdraw it
+  with. An auto-accepted file landed while the user was still looking at
+  "Decline / Accept", which is the whole of what auto-accept looks like from the
+  outside: it read as auto-accept doing nothing at all. The decision is now
+  settled before the announcement, which carries `needs_decision`, and a prompt
+  already on screen withdraws itself when the answer arrives from anywhere else
+  (another screen, the CLI, or the accept timeout).
+- **A group transcript was ordered by each member's own clock, and opened on the
+  oldest message.** `group_history` sorted on the message id under a comment
+  claiming that was chronological "without trusting any peer's clock" — but an
+  id embeds the *minting* device's millis and an inbound row's id comes straight
+  off the wire, so every member's clock decided where its messages sat: a member
+  running behind had its reply drawn above the question. It now orders by
+  `stored_at`, which fixes the GUI and `peerbeam group history` together. The
+  screen itself also rendered unreversed and never used its scroll controller,
+  so it presented the oldest end of a conversation where the one-to-one thread
+  presents the newest.
+- **A chat row's clock could be the sender's, and its position could be too.**
+  A record carries two times: `timestamp`, minted by whoever sent it, and
+  `stored_at`, written by this device on arrival. `stored_at` existed and was
+  wired only to disappearing messages; every other surface still trusted the
+  sender's. So a peer's clock decided where its messages sat and how recent they
+  looked — one running fast held the top of the Conversations list reading "just
+  now" indefinitely, one running slow buried a thread a message had just arrived
+  in. Ordering and recency now come from `stored_at` everywhere (chat search, the
+  Conversations list, the Activity timeline, the transcript); `timestamp` is
+  still what a bubble *displays*, because "when was this sent" is the question a
+  transcript's clock answers. `stored_at` is additive on the FFI — ABI still v1.
+  See *Which clock a chat row is dated by* in `docs/FFI.md`.
+- **Timestamps were compared as text rather than as instants.** Chat search, the
+  Conversations list and the timeline all sorted RFC 3339 *strings*, which only
+  matches chronological order while every row shares one UTC offset and one
+  fractional-second width. A peer stamping `+05:30` sorted five and a half hours
+  ahead of the same instant in `+00:00`, and `…00.900Z` sorted *before* `…00Z`
+  because `.` precedes `Z`.
+- **An unparseable timestamp displayed as the current time.** The app read a
+  chat time as `tryParse(…) ?? DateTime.now()`, so a peer-supplied string this
+  build could not parse did not render as unknown — it rendered as the clock you
+  were looking at, and being re-derived on every read it advanced each time the
+  thread was reopened. Such a row now shows no time at all, which is what the
+  Conversations list already did with the same string. Same fix for a reaction's
+  timestamp.
+- **A late-delivered message was drawn in one place and labelled with another.**
+  A row was ordered by when it arrived and labelled with when its sender says it
+  was sent, and those differ for any message a peer queued while offline: the
+  outbox flush carries the original timestamp while arrival is stamped locally,
+  so a burst composed at 08:00 landed at the newest end reading "08:00" beneath
+  a bubble reading "14:30". The two are now one number — the local one — so a
+  bubble's time and its position can no longer disagree. From the receiving side
+  "sent long ago, delivered late" and "sent just now by a device whose clock is
+  behind" are the same two numbers, so there is no rule that shows the sender's
+  time only in the honest case; what this device can state as fact is when the
+  message reached it. A share the engine refused is likewise no longer pinned
+  below every later message for the rest of the session.
+- **Messages did not disappear while you were watching them.** A
+  disappearing-message window that closed with the thread open left the expired
+  messages readable on screen — under a strip saying they disappear after an hour
+  — until the screen was left and re-entered. The engine had already stopped
+  returning them.
+- **`copyWith` silently dropped a message's `group`**, though it documents that
+  an omitted argument never clears a field. Any status settling on a group row —
+  the ordinary path for an outgoing one — turned it back into a one-to-one
+  message.
+- **`peerbeam chat retention` understated the window it had just set.** The
+  duration renderer dropped whatever did not fit its coarsest unit, so
+  `--after 90s` printed `1m`: messages stayed readable for 30 seconds after the
+  CLI said they were gone. Shared with `trust list`, which understated a
+  time-limited approval the same way.
 
 ## [0.11.0] - 2026-08-28
 

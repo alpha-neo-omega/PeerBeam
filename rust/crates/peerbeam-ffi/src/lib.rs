@@ -505,6 +505,25 @@ pub unsafe extern "C" fn pb_trust_set_auto_accept(json: *const c_char) -> *mut c
     })
 }
 
+/// Ask an address who is there: `{peer:{addresses,port,name?}}` →
+/// `{device_id, name, newly_trusted, pairing_code}`.
+///
+/// Dials, completes the ordinary authenticated handshake, reports the device id
+/// that answered, and closes. **Nothing is sent and nothing is granted** — see
+/// `Manager::peer_identify` for why this is the only honest way to give a
+/// Tailscale-discovered or typed-address peer the identity a conversation has
+/// to be filed under.
+///
+/// Blocks for the length of a dial plus a handshake, both already bounded
+/// (`CONNECT_TIMEOUT`, `AUTH_TIMEOUT`), so it cannot park the caller.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_peer_identify(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| runtime::manager()?.peer_identify(&read_json(json)?))()))
+}
+
 /// Grant or withhold one per-device permission:
 /// `{id, permission, granted}` → `{changed}`. Emits `trust_changed`.
 ///

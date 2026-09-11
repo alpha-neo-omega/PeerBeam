@@ -12,9 +12,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 class ViewPrefsRepository extends ChangeNotifier {
   static const _hideOfflineKey = 'view_hide_offline_v1';
   static const _askOnReceiveKey = 'view_ask_on_receive_v1';
+  static const _keepInTrayKey = 'view_keep_in_tray_v1';
 
   bool _hideOffline = false;
   bool _askOnReceive = true;
+  bool _keepInTray = false;
   bool _disposed = false;
 
   /// Whether Home's nearby list shows only devices that are reachable now.
@@ -39,12 +41,30 @@ class ViewPrefsRepository extends ChangeNotifier {
   /// transfer needs an answer, this decides only *where the question appears*.
   bool get askOnReceive => _askOnReceive;
 
+  /// Whether closing the window leaves PeerBeam running in the tray.
+  ///
+  /// **Off by default, and that default is the whole point.** With it on, the
+  /// window closing does not stop the app: it stays discoverable and keeps
+  /// accepting transfers, which is what a tray app is for and also a thing
+  /// somebody can be wrong about. A person who closed a window generally
+  /// believes they closed the program, and a build that silently kept
+  /// receiving files after that would be making a decision about their machine
+  /// on their behalf. So it is opt-in, the tray menu always offers Quit, and
+  /// the first close after turning it on says where the app went.
+  ///
+  /// A view preference rather than an engine setting, for the reason the class
+  /// doc gives: it is an answer to "what should this window do", and it would
+  /// be meaningless to a headless server, which has `peerbeam daemon` for the
+  /// same job.
+  bool get keepInTray => _keepInTray;
+
   /// Load the stored preferences (call once at startup).
   Future<void> load() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       _hideOffline = prefs.getBool(_hideOfflineKey) ?? false;
       _askOnReceive = prefs.getBool(_askOnReceiveKey) ?? true;
+      _keepInTray = prefs.getBool(_keepInTrayKey) ?? false;
     } catch (_) {
       // A platform without a preferences implementation (a unit test, a host
       // build missing the plugin) keeps the defaults rather than failing
@@ -80,6 +100,20 @@ class ViewPrefsRepository extends ChangeNotifier {
       await prefs.setBool(_askOnReceiveKey, value);
     } catch (_) {
       // As above: the preference holds for this session either way.
+    }
+  }
+
+  /// Keep running in the tray when the window closes, or quit as before.
+  Future<void> setKeepInTray(bool value) async {
+    if (value == _keepInTray) return;
+    _keepInTray = value;
+    notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_keepInTrayKey, value);
+    } catch (_) {
+      // As above. Note the failure direction is safe: a preference that did
+      // not persist reverts to quitting on close, never to staying resident.
     }
   }
 

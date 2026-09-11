@@ -311,6 +311,22 @@ class FakePeerBeam implements PeerBeamApi {
   /// When set, `trustSetAutoAccept` throws it.
   Object? trustSetAutoAcceptError;
 
+  /// What `peerIdentify` should answer, keyed by `host:port`. A host with no
+  /// entry behaves like an address with nothing behind it.
+  final Map<String, PeerIdentity> identities = {};
+
+  @override
+  Future<PeerIdentity> peerIdentify(PeerTarget peer) async {
+    _maybeFail('peerIdentify');
+    final key = '${peer.addresses.firstOrNull ?? ''}:${peer.port}';
+    calls.add('peerIdentify:$key');
+    final found = identities[key];
+    if (found == null) {
+      throw const ConnectionException('could not reach that address');
+    }
+    return found;
+  }
+
   @override
   Future<bool> trustSetAutoAccept(String id, bool autoAccept) async {
     autoAcceptCalls.add((id: id, autoAccept: autoAccept));

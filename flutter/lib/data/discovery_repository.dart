@@ -25,6 +25,25 @@ class DiscoveryRepository extends ChangeNotifier {
   }
 
   List<Device> get devices => List.unmodifiable(_byId.values);
+
+  /// Ask an address which device answers there, or null when it cannot be
+  /// reached.
+  ///
+  /// Straight through to the engine — nothing is cached. A provider-scoped id
+  /// (Tailscale's `ts:<node>`) or a typed address cannot carry a conversation,
+  /// and the authenticated id is the only thing that can; the engine learns it
+  /// by dialling and completing the ordinary handshake. Nothing is sent by
+  /// asking, and nothing is approved.
+  Future<PeerIdentity?> identify(PeerTarget peer) async {
+    try {
+      return await _api?.peerIdentify(peer);
+    } catch (_) {
+      // Unreachable is an ordinary answer here, not an error worth throwing
+      // into a build: the caller shows its own message.
+      return null;
+    }
+  }
+
   bool get scanning => _scanning;
   int get onlineCount => _byId.values.where((d) => d.online).length;
 

@@ -13,7 +13,7 @@ pkgdesc="Zero-configuration, secure, cross-platform file & clipboard sharing"
 arch=('x86_64')
 url="https://github.com/alpha-neo-omega/PeerBeam"
 license=('AGPL-3.0-or-later')
-depends=('gtk3')
+depends=('gtk3' 'libayatana-appindicator')
 options=('!strip')   # the bundle ships already-stripped binaries
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/peerbeam-$pkgver-linux-x64.tar.gz")
 # Replace with the real digest for the version you are packaging:

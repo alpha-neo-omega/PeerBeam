@@ -80,13 +80,53 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 /// call binds its own server endpoint (kept alive by the returned stream).
 pub struct QuicTransport {
     id: ProviderId,
+    /// IPv4 client endpoint. Always present.
     client: quinn::Endpoint,
+    /// IPv6 client endpoint, when the host can bind one. See [`Self::new`] for
+    /// why this is a second socket rather than one dual-stack socket.
+    client_v6: Option<quinn::Endpoint>,
 }
 
 impl QuicTransport {
-    /// Create a transport with an IPv4 client endpoint on an ephemeral port.
+    /// Create a transport that can dial both address families.
+    ///
+    /// **Two endpoints, not one.** A QUIC endpoint can only dial a peer whose
+    /// address family matches its own socket, and this used to bind `0.0.0.0`
+    /// alone — so every IPv6 address was undialable, on every platform. That is
+    /// not an edge case here: a Tailscale peer advertises a tailnet IPv6
+    /// (`fd7a:…`) alongside its IPv4, and a MagicDNS name can resolve to the
+    /// IPv6 first, so the one form the tailnet always has was the one form this
+    /// could never reach.
+    ///
+    /// The alternative — a single dual-stack `[::]` socket relying on
+    /// IPv4-mapped addresses — is not used deliberately: whether a mapped
+    /// address works depends on the host's `IPV6_V6ONLY` default, which differs
+    /// across the platforms this ships on. Two explicit sockets behave the same
+    /// everywhere.
+    ///
+    /// The IPv6 endpoint is **best-effort**: a host with IPv6 disabled cannot
+    /// bind it, and that must not stop the app from starting. Its absence means
+    /// an IPv6 dial fails with a reason rather than being attempted.
     pub fn new() -> Result<Self> {
-        Self::bound("0.0.0.0:0".parse().expect("valid addr"))
+        let mut transport = Self::bound("0.0.0.0:0".parse().expect("valid addr"))?;
+        transport.client_v6 = match "[::]:0".parse().map(quinn::Endpoint::client) {
+            Ok(Ok(mut endpoint)) => {
+                let mut config = tls::client_config()?;
+                config.transport_config(transport_config());
+                endpoint.set_default_client_config(config);
+                tracing::debug!("quic IPv6 client endpoint ready");
+                Some(endpoint)
+            }
+            _ => {
+                // Common and not an error: IPv6 disabled on the host.
+                tracing::info!(
+                    "no IPv6 client endpoint — IPv6 peers, including tailnet \
+                     fd7a: addresses, cannot be dialled from this machine"
+                );
+                None
+            }
+        };
+        Ok(transport)
     }
 
     /// Create a transport whose client endpoint is bound to `bind`. Use an
@@ -101,6 +141,7 @@ impl QuicTransport {
         Ok(Self {
             id: ProviderId::from("quic"),
             client,
+            client_v6: None,
         })
     }
 
@@ -131,15 +172,69 @@ impl QuicTransport {
         Ok((local, stream))
     }
 
+    /// The endpoint whose socket family matches `addr`, if this transport has
+    /// one.
+    ///
+    /// Chosen by each endpoint's **actual bound address**, not by assuming
+    /// `client` is IPv4. `bound()` takes whatever the caller gives it — the
+    /// network tests bind it to `[::]` — so an assumption here silently broke
+    /// IPv6 for every transport not built by `new()`.
+    fn endpoint_for(&self, addr: SocketAddr) -> Option<&quinn::Endpoint> {
+        let same_family = |endpoint: &quinn::Endpoint| {
+            endpoint
+                .local_addr()
+                .map(|local| local.is_ipv4() == addr.is_ipv4())
+                .unwrap_or(false)
+        };
+        if same_family(&self.client) {
+            return Some(&self.client);
+        }
+        self.client_v6.as_ref().filter(|e| same_family(e))
+    }
+
     /// Connect to `route`, returning the raw QUIC connection (bounded handshake).
     async fn connect(&self, route: &Route, session: &TransferSession) -> Result<quinn::Connection> {
-        let addr = resolve_addr(&route.address, route.port).await?;
-        tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
-        let connecting = self.client.connect(addr, SERVER_NAME).map_err(conn_err)?;
-        tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-            .await
-            .map_err(|_| conn_err("connect timed out — peer unreachable"))?
-            .map_err(conn_err)
+        // EVERY resolved address, not just the first.
+        //
+        // `resolve_addrs` used to be `resolve_addr` and returned
+        // `addrs.next()` — one address, whichever the resolver happened to put
+        // first, with no regard for family. A MagicDNS name whose AAAA record
+        // sorts first therefore produced an IPv6 address and nothing else was
+        // ever tried, even though the same name also resolves to a reachable
+        // tailnet IPv4.
+        let addrs = resolve_addrs(&route.address, route.port).await?;
+        let mut last: Option<DomainError> = None;
+        for addr in addrs {
+            let endpoint = match self.endpoint_for(addr) {
+                Some(endpoint) => endpoint,
+                None => {
+                    last = Some(DomainError::Connection(format!(
+                        "{addr} is IPv{} and this transport has no socket of \
+                         that family",
+                        if addr.is_ipv4() { "4" } else { "6" }
+                    )));
+                    continue;
+                }
+            };
+            tracing::info!(peer = %session.peer.0, %addr, kind = ?route.kind, "quic dial");
+            let attempt = async {
+                let connecting = endpoint.connect(addr, SERVER_NAME).map_err(conn_err)?;
+                tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                    .await
+                    .map_err(|_| conn_err("connect timed out — peer unreachable"))?
+                    .map_err(conn_err)
+            };
+            match attempt.await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    tracing::debug!(%addr, error = %e, "quic dial failed, trying the next address");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            DomainError::Connection(format!("no usable address for {}", route.address))
+        }))
     }
 
     /// Dial `route` and present the connection as a multi-channel transport
@@ -256,18 +351,25 @@ impl TransferProvider for QuicTransport {
 /// blocking `getaddrinfo` call on a blocking-pool thread instead of the async
 /// worker thread, and the whole resolution is bounded by [`CONNECT_TIMEOUT`]
 /// so a slow/unreachable resolver can't stall the dial (or the runtime).
-async fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
+async fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let lookup = tokio::net::lookup_host((host, port));
-    let mut addrs = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
+    let addrs = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
         .await
         .map_err(|_| DomainError::Connection(format!("resolve {host}: timed out")))?
         .map_err(|e| DomainError::Connection(format!("resolve {host}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| DomainError::Connection(format!("no address for {host}")))
+    // IPv4 first. Not a preference for IPv4 as such: an IPv6 dial needs the
+    // optional v6 endpoint, so trying the family that always has a socket first
+    // means the common case connects on the first attempt instead of after a
+    // failure. Order within each family is the resolver's.
+    let (mut v4, v6): (Vec<_>, Vec<_>) = addrs.partition(|a| a.is_ipv4());
+    v4.extend(v6);
+    if v4.is_empty() {
+        return Err(DomainError::Connection(format!("no address for {host}")));
+    }
+    Ok(v4)
 }
 
 /// Accept one inbound connection and its first bidirectional stream.
@@ -295,21 +397,40 @@ mod tests {
 
     /// IP literals must short-circuit without touching the resolver.
     #[tokio::test]
-    async fn resolve_addr_ip_literal_is_immediate() {
-        let addr = resolve_addr("127.0.0.1", 9000).await.unwrap();
-        assert_eq!(addr, "127.0.0.1:9000".parse::<SocketAddr>().unwrap());
+    async fn resolve_addrs_ip_literal_is_immediate() {
+        let addrs = resolve_addrs("127.0.0.1", 9000).await.unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:9000".parse::<SocketAddr>().unwrap()]);
 
-        let addr = resolve_addr("::1", 9000).await.unwrap();
-        assert_eq!(addr, "[::1]:9000".parse::<SocketAddr>().unwrap());
+        let addrs = resolve_addrs("::1", 9000).await.unwrap();
+        assert_eq!(addrs, vec!["[::1]:9000".parse::<SocketAddr>().unwrap()]);
     }
 
     /// A hostname is resolved via the async, non-blocking resolver (this must
     /// not deadlock or block the single-threaded test runtime — the old
     /// synchronous `to_socket_addrs()` call ran directly on the async task).
     #[tokio::test]
-    async fn resolve_addr_hostname_resolves_via_async_lookup() {
-        let addr = resolve_addr("localhost", 9000).await.unwrap();
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 9000);
+    async fn resolve_addrs_hostname_resolves_via_async_lookup() {
+        let addrs = resolve_addrs("localhost", 9000).await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()));
+        assert!(addrs.iter().all(|a| a.port() == 9000));
+    }
+
+    /// **Every address, not just the first.** This returned `addrs.next()`, so
+    /// a name whose AAAA record sorts first was dialled as IPv6 and nothing
+    /// else was attempted — even when the same name also resolves to a
+    /// reachable IPv4. `localhost` resolves to both families on a normal host,
+    /// which is what makes it a usable probe for the ordering rule.
+    #[tokio::test]
+    async fn resolve_addrs_puts_ipv4_first_and_keeps_the_rest() {
+        let addrs = resolve_addrs("localhost", 9000).await.unwrap();
+        // Whatever the resolver returned, no IPv6 may precede an IPv4: the v6
+        // endpoint is optional, so trying v4 first is what makes the common
+        // case connect without a failed attempt.
+        let first_v6 = addrs.iter().position(|a| a.is_ipv6());
+        let last_v4 = addrs.iter().rposition(|a| a.is_ipv4());
+        if let (Some(v6), Some(v4)) = (first_v6, last_v4) {
+            assert!(v4 < v6, "IPv6 sorted before IPv4 in {addrs:?}");
+        }
     }
 }

@@ -68,9 +68,77 @@ for s in 32 64 128 256 512; do
   fi
 done
 
+
+# ---- tray libraries, for the formats that cannot declare a dependency ----
+#
+# `libtray_manager_plugin.so` is a direct NEEDED of the runner, so the dynamic
+# linker resolves its own NEEDED chain — Ayatana's app-indicator and dbusmenu —
+# at process start. A host without them does not lose the tray icon: the app
+# does not launch at all.
+#
+# `.deb`, `.rpm` and the PKGBUILD declare that dependency and correctly use the
+# system copy. The **tarball and AppImage cannot declare anything**, and "any
+# distribution, installs nothing" is exactly what the AppImage promises, so for
+# those two the chain travels with the payload — together with a launcher that
+# sets `LD_LIBRARY_PATH`.
+#
+# The launcher is not optional. The runner's own RUNPATH is `$ORIGIN/lib`, but
+# the library that needs the chain is `libtray_manager_plugin.so`, whose RUNPATH
+# is an absolute path into the BUILD machine's Flutter ephemeral directory — and
+# RUNPATH, unlike the older RPATH, is not inherited by a dependency's own
+# dependencies. So a copy dropped in `lib/` is invisible to the plugin that
+# needs it, and only an explicit search path makes it findable.
+#
+# Deliberately narrow: only the indicator/dbusmenu chain, resolved from the
+# plugin itself. Bundling everything `ldd` reports would drag GTK and glib along
+# and produce the cross-distro breakage that bundling is supposed to avoid.
+bundle_tray_libs() {
+  local dest="$1/lib" plugin="$1/lib/libtray_manager_plugin.so"
+  [ -f "$plugin" ] || { echo "FAIL: $plugin missing" >&2; exit 1; }
+  local found=0
+  while read -r name _arrow path _rest; do
+    case "$name" in
+      libayatana-*|libdbusmenu-*|libindicator*)
+        [ -f "$path" ] || continue
+        cp -L "$path" "$dest/$name"
+        found=$((found + 1))
+        ;;
+    esac
+  done < <(ldd "$plugin")
+  if [ "$found" -eq 0 ]; then
+    echo "FAIL: no app-indicator libraries found to bundle. Install " \
+         "libayatana-appindicator3-dev (Debian) or " \
+         "libayatana-appindicator-gtk3-devel (Fedora) and rebuild — without " \
+         "them this AppImage/tarball would not start on any host that also " \
+         "lacks them, which is every host an AppImage exists for." >&2
+    exit 1
+  fi
+  echo "    bundled $found tray libraries into $(basename "$1")/lib"
+}
+
 # ---- tar.gz (always) ----
+#
+# Built from a COPY of the staging tree with the tray libraries added. `$STAGE`
+# itself stays clean, because `.deb` and `.rpm` are built from it and they
+# declare the dependency instead — shipping a second copy inside those packages
+# would shadow the system's.
+PORTABLE="$DIST/portable"
+rm -rf "$PORTABLE"; cp -r "$STAGE" "$PORTABLE"
+bundle_tray_libs "$PORTABLE/opt/$APP"
+# A launcher rather than the plain symlink `$STAGE` carries, so the bundled
+# chain is actually found — see `bundle_tray_libs` for why the rpath cannot do
+# it. `exec` so the process is replaced and signals reach the app unchanged.
+rm -f "$PORTABLE/usr/bin/$APP"
+cat > "$PORTABLE/usr/bin/$APP" <<LAUNCH
+#!/bin/sh
+# PeerBeam portable launcher. The app's own libraries ship beside it.
+exec env LD_LIBRARY_PATH="/opt/$APP/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
+  "/opt/$APP/$APP" "\$@"
+LAUNCH
+chmod 755 "$PORTABLE/usr/bin/$APP"
 TGZ="$DIST/${APP}-${VER}-linux-${FARCH}.tar.gz"
-tar -C "$STAGE" -czf "$TGZ" .
+tar -C "$PORTABLE" -czf "$TGZ" .
+rm -rf "$PORTABLE"
 echo "OK  $TGZ"
 
 # ---- .deb (if dpkg-deb) ----
@@ -83,6 +151,7 @@ Version: $VER
 Section: net
 Priority: optional
 Architecture: $DARCH
+Depends: libgtk-3-0, libayatana-appindicator3-1
 Maintainer: PeerBeam Contributors <noreply@peerbeam>
 Description: Secure, zero-config file & clipboard sharing
 CTRL
@@ -116,8 +185,12 @@ Summary:        Secure, zero-config file & clipboard sharing
 License:        AGPL-3.0-or-later
 URL:            https://github.com/alpha-neo-omega/PeerBeam
 BuildArch:      $RARCH
-# The GUI links GTK3 at runtime; everything else is static in the bundle.
+# The GUI links GTK3 and Ayatana's app-indicator (the tray icon) at runtime;
+# everything else is static in the bundle. Both are hard requirements rather
+# than optional: they are NEEDED entries on the binary, so a missing one means
+# the app does not start at all rather than losing a feature.
 Requires:       gtk3
+Requires:       libayatana-appindicator-gtk3
 # The payload is a prebuilt Flutter bundle: already stripped, and its .so files
 # are not meant to be picked apart by rpm's automatic dependency generator.
 AutoReqProv:    no
@@ -164,9 +237,20 @@ fi
 if command -v appimagetool >/dev/null; then
   APPDIR="$DIST/${APP}.AppDir"; rm -rf "$APPDIR"; install -d "$APPDIR"
   cp -r "$BUNDLE"/. "$APPDIR/"
+  bundle_tray_libs "$APPDIR"
   cp packaging/linux/peerbeam.desktop "$APPDIR/$APP.desktop"
   [ -f "$ICONS/256.png" ] && cp "$ICONS/256.png" "$APPDIR/$APP.png"
-  ln -sf "$APP" "$APPDIR/AppRun"
+  # A wrapper, not a symlink to the binary: the bundled indicator chain is only
+  # findable through an explicit search path (see `bundle_tray_libs`). Without
+  # this the AppImage does not start on a host that lacks those libraries, which
+  # is the only kind of host an AppImage exists for.
+  cat > "$APPDIR/AppRun" <<'LAUNCH'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+exec env LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$HERE/peerbeam" "$@"
+LAUNCH
+  chmod 755 "$APPDIR/AppRun"
   # appimagetool cannot always infer the architecture from the payload; state it.
   ARCH=$RARCH appimagetool "$APPDIR" "$DIST/${APP}-${VER}-${RARCH}.AppImage"
   rm -rf "$APPDIR"

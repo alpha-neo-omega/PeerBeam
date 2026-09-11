@@ -165,6 +165,19 @@ class Transfer {
   /// be inventing the one check the code exists to make the user perform.
   final String pairingCode;
 
+  /// Whether the engine is waiting on this user to accept or decline.
+  ///
+  /// An incoming transfer is `pending` for two quite different reasons — the
+  /// engine is asking, or it has already admitted the file and simply has not
+  /// started moving bytes yet — and only the first is a question. Without this
+  /// the app raised its approval modal for every inbound file and had nothing
+  /// to withdraw it with, so an auto-accepted file landed while the user was
+  /// still being asked about it. That is the whole of what auto-accept looks
+  /// like from the outside, so it read as auto-accept not working.
+  ///
+  /// True for an outgoing transfer's row only because nothing reads it there.
+  final bool needsDecision;
+
   const Transfer({
     required this.id,
     required this.peerName,
@@ -178,6 +191,7 @@ class Transfer {
     this.resumable = false,
     this.newlyTrusted = false,
     this.pairingCode = '',
+    this.needsDecision = true,
   });
 
   double get progress =>
@@ -207,6 +221,7 @@ class Transfer {
     // first-contact prompt lose the very thing it exists to show.
     newlyTrusted: newlyTrusted,
     pairingCode: pairingCode,
+    needsDecision: needsDecision,
   );
 }
 
@@ -288,3 +303,29 @@ String formatEta(int? seconds) {
   final h = m ~/ 60;
   return '${h}h ${m % 60}m left';
 }
+
+/// Whether a conversation can be held with a device carrying this id.
+///
+/// A chat row is filed on disk under `chat-<device id>`, and the engine's
+/// store rejects any namespace outside `[A-Za-z0-9._-]`
+/// (`peerbeam-appstore-fs`'s `namespace_dir`). A Tailscale-discovered peer's id
+/// is `ts:<node id>` — the colon makes every store call for it fail with
+/// `invalid namespace`, so the thread opens, stays empty, and nothing can be
+/// sent.
+///
+/// The deeper reason it would not work even if the colon were legal: a
+/// provider-scoped id is not the peer's **authenticated** device id, and
+/// inbound records are keyed by that. Our rows would be filed under a name the
+/// peer has never heard of, so replies would land in a different thread and
+/// queued messages could never flush — the same reasoning
+/// `home_screen.dart`'s `_discovered` gives for withholding chat from a saved
+/// by-address entry.
+///
+/// So this is a check about *identity*, not about spelling: reconciling a
+/// provider id to the authenticated one is what would make chat work, and
+/// `peerbeam-discovery-tailscale`'s own module doc records that as unbuilt.
+bool canChatWithDeviceId(String id) =>
+    id.isNotEmpty &&
+    id != '.' &&
+    id != '..' &&
+    RegExp(r'^[A-Za-z0-9._-]+$').hasMatch(id);

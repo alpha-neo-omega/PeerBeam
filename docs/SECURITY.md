@@ -704,9 +704,15 @@ exception, and it is written down here because a privacy claim with an
 unmentioned exception in it is worth nothing.
 
 `peerbeam check-updates`, and the **Check for updates** button in the app's About
-section, make one HTTPS GET to the release feed
-(`api.github.com/repos/alpha-neo-omega/PeerBeam/releases`) and report what came
-back.
+section, make one HTTPS GET to the project's own update manifest
+(`peerbeam.pages.dev/releases.json`) and report what came back. It is a two-field
+document — a version and a page — generated at site build time from the same
+constant that renders the download page's links, so it can only ever advertise a
+release that page can actually hand someone.
+
+It used to be GitHub's release feed. Asking the site instead keeps this one
+request on an origin the project controls rather than a third-party API, which
+also means one fewer party learning that somebody, somewhere, opened PeerBeam.
 
 **Only when a person asks.** There is no timer, no check at launch, and no check
 as a side effect of anything else: `peerbeam_update::check` has exactly two
@@ -714,23 +720,31 @@ callers, the CLI command and the FFI entry point behind that button, and pressin
 the button is the opt-in each time. Using PeerBeam therefore never tells a server
 that PeerBeam is being used.
 
-**What the request unavoidably discloses.** GitHub sees the connecting IP
-address, and so an approximate location, and the time of the request — which is a
-moment somebody was at this machine running this app. Any HTTPS request discloses
-that much; it is the honest cost of the feature.
+**What the request unavoidably discloses.** The site's host — Cloudflare Pages —
+sees the connecting IP address, and so an approximate location, and the time of
+the request, which is a moment somebody was at this machine running this app. Any
+HTTPS request discloses that much; it is the honest cost of the feature, and it
+is now disclosed to the project's own host rather than to GitHub.
 
 **What it does not carry.** No device id, no install id, nothing derived from the
 identity keypair, no cookie or persistent client state, and no custom headers.
-The one header naming this product is the `User-Agent`, which GitHub's API will
-not serve a request without: it is the bare word `PeerBeam`, with no version in
-it, and there is no query string, so the request does not say which build is
-asking either: the feed is asked what the newest release is, and
-the comparison against the running version happens here. The answer is inert
-as well. A `Release` is a version string and a URL; nothing downloads, installs
-or changes behaviour on the strength of what the server said, and there is no
-retry — a caller that wants to ask again asks again.
+The one header naming this product is the `User-Agent`: the bare word
+`PeerBeam`, with no version in it. Cloudflare Pages, unlike the GitHub API this
+check used to call, will serve a request with no User-Agent at all — the header
+is kept because omitting it would not reduce what travels, and a request
+carrying none is itself distinctive. There is no query string either, so the
+request does not say which build is asking: the manifest is asked what the newest release is, and the
+comparison against the running version happens here. The answer is inert as
+well. A `Release` is a version string and a URL; nothing downloads, installs or
+changes behaviour on the strength of what the server said, and there is no retry
+and no fallback to a second host — a caller that wants to ask again asks again.
 
-Failing is not a problem anybody has to solve. An unreachable feed reports
+The URL a person is offered is **compiled into the app**, not read out of the
+response. The manifest publishes one too, for other readers, and this ignores it:
+the single action this feature offers is opening a link, so a served document is
+not allowed to choose where that goes.
+
+Failing is not a problem anybody has to solve. An unreachable manifest reports
 `reachable: false` and exits 0, because a machine with no route out is a normal
 machine for this app, and nothing here may become a precondition for using it.
 

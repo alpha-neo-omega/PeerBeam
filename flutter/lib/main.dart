@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
@@ -10,13 +11,25 @@ import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
 import 'platform/engine_config.dart';
+import 'platform/desktop_files.dart';
 import 'platform/notifications.dart';
 import 'platform/saf.dart';
+import 'platform/tray.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
 
-void main() => runApp(const PeerBeamApp());
+void main() async {
+  // `window_manager` has to be initialized before the first frame for
+  // `setPreventClose` to be honoured, and that needs the bindings up first.
+  // Desktop only: on Android the plugin is not registered and calling it
+  // throws, so this is gated rather than merely harmless.
+  if (isDesktop) {
+    WidgetsFlutterBinding.ensureInitialized();
+    await windowManager.ensureInitialized();
+  }
+  runApp(const PeerBeamApp());
+}
 
 /// Root widget. Holds the shared [AppState] + router for the app's lifetime and
 /// drives all state from **live engine events** — no mock/sample data.
@@ -59,6 +72,10 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     history: _state.history,
     api: _api,
   );
+
+  /// The tray / menu-bar icon. Null off desktop and in widget tests, where
+  /// there is no tray plugin to talk to.
+  TrayService? _tray;
 
   @override
   void initState() {
@@ -104,6 +121,11 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         await _android.start();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
+        // The tray reads the repositories above, so it is started once they
+        // are live — an icon whose menu says "no devices" because discovery
+        // had not begun would be wrong for the first few seconds. A no-op off
+        // desktop.
+        await _startTray();
         _state.engine.started();
       } catch (e) {
         // **Kept, not swallowed.** This used to be `catch (_) {}`, and a failed
@@ -253,8 +275,53 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
     }
   }
 
+  /// Install the tray icon, wiring its three actions to the ones the window
+  /// already offers. A no-op off desktop, and a failure here never stops boot:
+  /// some Linux sessions have no status-notifier host, and the window is the
+  /// primary surface regardless.
+  Future<void> _startTray() async {
+    if (!isDesktop) return;
+    try {
+      final tray = TrayService(
+        state: _state,
+        showWindow: () async {
+          await windowManager.show();
+          await windowManager.focus();
+        },
+        sendFiles: () async {
+          await windowManager.show();
+          await windowManager.focus();
+          final picked = await pickFilesToStage(keep: _state.staging.paths);
+          if (picked.isEmpty) return;
+          final added = _state.staging.add(picked);
+          // Show the sheet, exactly as Home's own "Send Files" does. Without
+          // it the action dead-ended: files were staged and nothing appeared,
+          // so unless the user happened to be looking at Home there was no
+          // recipient chooser, no confirmation, and no sign anything had
+          // happened. The tray's whole point is being usable without the
+          // window in front of you.
+          final nav = rootNavigatorKey.currentContext;
+          if (added > 0 && nav != null && nav.mounted) {
+            await showStagedFilesSheet(nav, _state.staging);
+          }
+        },
+        quit: () async {
+          // Past the close-to-tray interception, or `destroy` would be caught
+          // by the very handler that keeps the app alive.
+          await windowManager.setPreventClose(false);
+          await windowManager.destroy();
+        },
+      );
+      await tray.start();
+      _tray = tray;
+    } catch (_) {
+      // No tray. The app is otherwise unaffected.
+    }
+  }
+
   @override
   void dispose() {
+    unawaited(_tray?.dispose());
     _errSub?.cancel();
     _clipSub?.cancel();
     _clipNoticeSub?.cancel();

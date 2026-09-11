@@ -28,7 +28,11 @@ import '../../state/app_scope.dart';
 import '../../widgets/common.dart';
 
 class GroupChatScreen extends StatefulWidget {
-  const GroupChatScreen({super.key, required this.group, required this.nameFor});
+  const GroupChatScreen({
+    super.key,
+    required this.group,
+    required this.nameFor,
+  });
 
   final Group group;
 
@@ -167,10 +171,21 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                   )
                 : ListView.builder(
                     controller: _scroll,
+                    // Reversed, and indexed from the end, exactly as the
+                    // one-to-one thread is (`chat_screen.dart`): index 0 paints
+                    // at the BOTTOM, so `_messages.last` — the newest — is
+                    // where the viewport opens and stays as messages arrive.
+                    //
+                    // Without this the group transcript opened on the OLDEST
+                    // message and never moved: `_scroll` was constructed, handed
+                    // here, and never used, so sending a message scrolled
+                    // nothing and the reply appeared off-screen below. The two
+                    // transcripts presented opposite ends of a conversation.
+                    reverse: true,
                     padding: const EdgeInsets.all(AppSpace.md),
                     itemCount: _messages.length,
                     itemBuilder: (context, i) {
-                      final m = _messages[i];
+                      final m = _messages[_messages.length - 1 - i];
                       return Align(
                         key: Key('group-message-${m.id}'),
                         alignment: (m.direction == 'out')

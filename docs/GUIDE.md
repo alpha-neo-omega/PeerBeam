@@ -15,8 +15,12 @@ terminal. Written against **v0.11.0**.
 
 ## 1. Download
 
-Everything is attached to the release:
-**<https://github.com/alpha-neo-omega/PeerBeam/releases/latest>**
+**<https://peerbeam.pages.dev/download>** — it names the file for the platform
+you are on and links straight to it.
+
+The bytes come from the GitHub release either way, so if you would rather pick
+from the full list of files yourself, everything is attached to
+<https://github.com/alpha-neo-omega/PeerBeam/releases/latest>.
 
 | You want | File |
 |---|---|
@@ -34,6 +38,41 @@ Everything is attached to the release:
 
 The GUI and the CLI are two frontends over the same engine. Installing both on
 one machine is normal and they share the same identity, trust store and history.
+
+### Checking a download arrived intact
+
+Every release attaches **`SHA256SUMS`**. Download it into the same directory as
+the file you fetched and check them together:
+
+```bash
+# Linux
+sha256sum --ignore-missing -c SHA256SUMS
+
+# macOS (shasum has no --ignore-missing; check just what you downloaded)
+grep "$(basename PeerBeam-*.dmg)" SHA256SUMS | shasum -a 256 -c
+```
+
+```powershell
+# Windows PowerShell — -eq is case-insensitive, which is what makes this work:
+# Get-FileHash returns uppercase, SHA256SUMS is lowercase.
+$file = '.\peerbeam-0.11.0-windows-x64-portable.zip'
+$want = (Select-String -Path .\SHA256SUMS -Pattern ([regex]::Escape((Split-Path $file -Leaf)))).Line.Split(' ')[0]
+if ((Get-FileHash $file -Algorithm SHA256).Hash -eq $want) { 'OK' } else { 'MISMATCH' }
+```
+
+**`--ignore-missing` is not optional.** `SHA256SUMS` lists every file in the
+release, and without that flag `sha256sum -c` prints `FAILED open or read` for
+each of the twenty-two you did not download and **exits non-zero** — which reads
+exactly like a corrupt download. With it, only what you actually have is
+checked, and a real mismatch still fails.
+
+> **What this proves, and what it does not.** A matching hash means the bytes are
+> the bytes the release was built from — not truncated by a dropped connection,
+> not corrupted in transit or on disk. It does **not** prove they came from this
+> project: `SHA256SUMS` sits beside the files it describes, so anyone able to
+> replace an artifact could replace the list too. Proving origin needs a
+> signature verified against a key published somewhere else, which PeerBeam does
+> not yet have — see [Signing status](RELEASE.md#signing-status).
 
 ---
 

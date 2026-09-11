@@ -105,11 +105,20 @@ class TransferRepository extends ChangeNotifier {
   /// and was never anyone's to approve, and a transfer already transferring,
   /// paused, completed or failed has had its decision made. Both are excluded
   /// so a bulk action can only ever touch what is genuinely waiting.
+  /// Incoming transfers the engine is **waiting on a decision for**.
+  ///
+  /// `pending` is necessary but not sufficient: an auto-accepted transfer is
+  /// also `pending` between being admitted and its first byte, and asking about
+  /// one of those is exactly the prompt auto-accept exists to remove. The
+  /// engine reports which it is (`needs_decision` on `transfer_queued`), and
+  /// this is the only place that distinction has to be made — every surface
+  /// that raises an approval reads this list.
   List<Transfer> get awaitingApproval => _byId.values
       .where(
         (t) =>
             t.direction == TransferDirection.receiving &&
-            t.state == TransferState.pending,
+            t.state == TransferState.pending &&
+            t.needsDecision,
       )
       .toList(growable: false);
 
@@ -392,6 +401,9 @@ class TransferRepository extends ChangeNotifier {
           // this row feeds is rendered long after the handshake is over.
           newlyTrusted: e.newlyTrusted,
           pairingCode: e.pairingCode,
+          // Whether anyone is actually being asked. `pending` alone does not
+          // say — see [Transfer.needsDecision].
+          needsDecision: e.needsDecision,
         );
       case 'transfer_started':
         _update(id, state: TransferState.transferring);

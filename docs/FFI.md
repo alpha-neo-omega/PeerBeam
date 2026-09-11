@@ -269,13 +269,14 @@ char* pb_chat_send(const char* json);           // {peer, text} → {id}
 char* pb_chat_send_file(const char* json);      // {peer, path} → {id}  (id is also the transfer id)
 char* pb_chat_history(const char* json);        // {peer_id} → {messages:[…]}
 char* pb_chat_reconcile(const char* json);      // {peer_id} → {changed}
-char* pb_chat_conversations(const char* json);  // {} or null → {peers:[{peer_id,last_timestamp,unread_hint}]}
+char* pb_chat_conversations(const char* json);  // {} or null → {peers:[{peer_id,last_timestamp,last_at,unread_hint}]}
 char* pb_chat_cancel(const char* json);         // {peer_id, message_id} → {cancelled}
 char* pb_chat_delete(const char* json);         // {peer_id} → {removed, kept}
 char* pb_chat_delete_messages(const char* json);// {peer_id, message_ids:[…]} → {removed, kept:[…]}
 char* pb_chat_search(const char* json);         // {query, limit?} → {hits:[…], truncated, limit}
 char* pb_chat_react(const char* json);          // {peer, id, emoji, remove?} → {applied, delivered}
 char* pb_chat_mark_read(const char* json);      // {peer, read_through} → {sent}
+char* pb_peer_identify(const char* json);       // {peer} → {device_id,name,newly_trusted,pairing_code}
 char* pb_chat_retention_get(const char* json);  // {peer_id} → {seconds|null}
 char* pb_chat_retention_set(const char* json);  // {peer_id, seconds?} → {seconds|null}
 char* pb_chat_prune(const char* json);          // {peer_id?} → {messages, queued}
@@ -430,12 +431,52 @@ wrong answer rather than a partial one. `limit` is echoed back so a surface can
 say how many it is showing without knowing whether it passed one.
 
 Hits are newest first, ties broken by peer id then message id — a total order,
-so paging and tests are stable. Each carries the **conversation it was read
-from** (not a `peer_id` copied out of the row), the message id, its timestamp,
-`direction`/`kind` in the same spellings a history row uses, and a `snippet`
-that is a substring of the stored text, never re-rendered. A row this build
-cannot decode is skipped exactly as `pb_chat_history` skips it; a genuine store
-failure is reported rather than quietly dropping that thread's matches.
+so paging and tests are stable. "Newest" is by **`stored_at`**, the instant this
+device wrote the row, and the comparison is between parsed instants rather than
+timestamp strings; see *Which clock a chat row is dated by* below. Each hit
+carries the **conversation it was read from** (not a `peer_id` copied out of the
+row), the message id, its timestamp, `direction`/`kind` in the same spellings a
+history row uses, and a `snippet` that is a substring of the stored text, never
+re-rendered. A row this build cannot decode is skipped exactly as
+`pb_chat_history` skips it; a genuine store failure is reported rather than
+quietly dropping that thread's matches.
+
+### Which clock a chat row is dated by
+
+A chat record carries **two** times, and a surface must not use one for the
+other's job.
+
+| Field | Whose clock | What it is for |
+| --- | --- | --- |
+| `timestamp` | the **sender's** | *Display.* "When was this sent." On an inbound row this is the peer's own claim, and nothing on the wire validates its shape — it may be skewed, in the future, or not RFC 3339 at all. |
+| `stored_at` | **this device's** | *Ordering and recency.* When the row was written here. Cannot be skewed or chosen by a peer. `null` only for a row written before the engine recorded it. |
+
+`stored_at` is additive (ABI still v1) and is what the engine already measures a
+disappearing-message window against. Chat search, `pb_chat_conversations`,
+`pb_group_history` and the `pb_timeline` chat rows are ordered by it, falling
+back to a parsed `timestamp` only for a legacy row, and a row that can be dated
+by neither sorts oldest rather than claiming the newest slot.
+
+**`pb_chat_history` is the exception, and a surface must handle it.** It returns
+a conversation in store-key order, which is message-id order — and an inbound
+row's id was minted by the *sender*, so that order trusts the peer's clock. A
+peer running behind has its reply returned before the message it answers. Sort
+by `stored_at` yourself, as the Flutter client does; the engine-side fix is
+deliberately not in yet because it changes an order this API has always had.
+
+Two rules follow for a surface:
+
+- **Never order by `timestamp`.** A peer whose clock runs fast would place its
+  messages above ones sent after them; one running slow would bury a message
+  beneath the reply it is answering.
+- **Never substitute the current time for a missing one.** A fabricated "now" is
+  not a missing value but a wrong one: it reads as a real send time, and being
+  re-derived on every read it changes every time the row is parsed again. Report
+  that the time is unknown and show nothing.
+
+`pb_chat_conversations` reports both for a thread's newest row: `last_timestamp`
+(the sender's, for display) and `last_at` (`stored_at`, which the list is sorted
+by and which a surface must read recency from).
 
 ### Trust and permissions (additive — ABI still v1)
 
