@@ -843,14 +843,25 @@ class _ChatScreenState extends State<ChatScreen> {
                 ?_retentionStrip(state, peer),
                 Expanded(
                   child: items.isEmpty
-                      // A conversation this device could not read is not a
-                      // conversation with nothing in it, and "No messages yet"
-                      // is a statement about the user's own history that a
-                      // failed read has no grounds to make. Only when there is
-                      // genuinely nothing on screen: a thread that loaded once
-                      // and failed to reload keeps its messages, because stale
-                      // messages beat an error page over messages that are
-                      // right there.
+                      // Three states, not two, and the difference is the whole
+                      // point. A conversation this device could not read is
+                      // not a conversation with nothing in it, and one it has
+                      // not read *yet* is neither — "No messages yet" is a
+                      // statement about the user's own history, and only a
+                      // completed read gives any grounds to make it.
+                      //
+                      // The read is fired post-frame and awaits three engine
+                      // calls (`openThread`), so the un-read state is not
+                      // theoretical: every thread passed through it, showing
+                      // "Send a message to start the conversation" over a
+                      // conversation that was merely still being fetched. On a
+                      // long thread or a slow disk it is on screen long enough
+                      // to read and believe.
+                      //
+                      // Emptiness is only claimed when there is genuinely
+                      // nothing on screen: a thread that loaded once and failed
+                      // to reload keeps its messages, because stale messages
+                      // beat an error page over messages that are right there.
                       ? (failure != null
                             ? ErrorState(
                                 error: failure,
@@ -858,6 +869,8 @@ class _ChatScreenState extends State<ChatScreen> {
                                 onRetry: () =>
                                     state.chat.openThread(widget.peerId),
                               )
+                            : !state.chat.hasLoaded(widget.peerId)
+                            ? const Center(child: CircularProgressIndicator())
                             : const EmptyState(
                                 icon: Icons.chat_bubble_outline_rounded,
                                 title: 'No messages yet',

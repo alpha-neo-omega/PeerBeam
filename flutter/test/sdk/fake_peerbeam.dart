@@ -462,7 +462,13 @@ class FakePeerBeam implements PeerBeamApi {
   List<ChatMessage> groupMessages = [];
 
   @override
-  Future<List<ChatMessage>> groupHistory(String group) async => groupMessages;
+  Future<List<ChatMessage>> groupHistory(String group) async {
+    // Failable like every other read: a transcript the engine cannot produce
+    // is an ordinary state, and the screen has to be drivable into it.
+    _maybeFail('groupHistory');
+    calls.add('groupHistory:$group');
+    return groupMessages;
+  }
 
   /// Set to make [trustRemove] throw, so a test can drive the refusal path.
   Object? trustRemoveError;

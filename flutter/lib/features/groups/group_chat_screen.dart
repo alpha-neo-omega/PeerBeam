@@ -96,12 +96,24 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     super.dispose();
   }
 
+  /// Why the last read of this transcript failed, or null when it came back.
+  ///
+  /// Kept apart from an empty list on purpose: "Nothing said yet" is a claim
+  /// about what the group has written, and a read that failed has no standing
+  /// to make it.
+  Object? _error;
+
   Future<void> _load() async {
     final repo = AppScope.of(context).groups;
-    final messages = await repo.history(widget.group.id);
+    final read = await repo.history(widget.group.id);
     if (!mounted) return;
     setState(() {
-      _messages = messages;
+      // A failed reload keeps what is already on screen: stale messages beat
+      // an error page drawn over messages that are right there.
+      if (read.error == null || _messages.isEmpty) {
+        _messages = read.messages;
+      }
+      _error = read.error;
       _loading = false;
     });
   }
@@ -174,6 +186,12 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
+                : _messages.isEmpty && _error != null
+                ? ErrorState(
+                    error: _error!,
+                    title: 'Could not open this group',
+                    onRetry: _load,
+                  )
                 : _messages.isEmpty
                 ? const EmptyState(
                     icon: Icons.forum_outlined,

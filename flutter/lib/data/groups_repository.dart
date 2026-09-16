@@ -173,16 +173,27 @@ class GroupsRepository extends ChangeNotifier {
   }
 
   /// A group's messages, gathered across its members.
-  Future<List<ChatMessage>> history(String group) async {
+  /// A group's transcript, **and** why the read failed if it did.
+  ///
+  /// It used to return a bare list and swallow the failure, and the comment
+  /// here defended that by pointing at the error state the screen renders from
+  /// `error` — but that field is about the **group list**, not about one
+  /// group's messages. So a transcript the engine could not read came back as
+  /// an empty list and the screen said "Nothing said yet": a claim about what
+  /// people had written, made by something that had failed to find out.
+  ///
+  /// Still never throws into a build. The caller is simply told.
+  Future<({List<ChatMessage> messages, Object? error})> history(
+    String group,
+  ) async {
     final api = _api;
-    if (api == null) return const [];
+    if (api == null) {
+      return (messages: const <ChatMessage>[], error: null);
+    }
     try {
-      return await api.groupHistory(group);
-    } catch (_) {
-      // A failed read shows nothing rather than throwing into a build: the
-      // screen renders its own error state from `error` when the list read
-      // failed, and a thread that cannot be read is not a crash.
-      return const [];
+      return (messages: await api.groupHistory(group), error: null);
+    } catch (e) {
+      return (messages: const <ChatMessage>[], error: e);
     }
   }
 }

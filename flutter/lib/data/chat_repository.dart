@@ -101,6 +101,22 @@ class ChatRepository extends ChangeNotifier {
   List<ChatMessage> messagesFor(String peerId) =>
       List.unmodifiable(_byPeer[peerId] ?? const []);
 
+  /// Conversations this device has actually read at least once.
+  final Set<String> _loaded = <String>{};
+
+  /// Whether the thread with [peerId] has been read from disk yet.
+  ///
+  /// The third state, and the one that was missing. A surface could tell a
+  /// failed read ([loadErrorFor]) from a successful one, but not a read that
+  /// has not happened — both look like an empty list. So opening any
+  /// conversation rendered "No messages yet. Send a message to start the
+  /// conversation." over a thread that was merely still being fetched, which
+  /// is the same class of defect this repository already refuses elsewhere: a
+  /// statement about the user's own history made by something with no grounds
+  /// to make it. On a long thread, or a slow disk, it is on screen long enough
+  /// to read and believe.
+  bool hasLoaded(String peerId) => _loaded.contains(peerId);
+
   /// Every conversation on disk, newest first. Empty until
   /// [refreshConversations] has run.
   List<ChatConversation> get conversations => List.unmodifiable(_conversations);
@@ -248,6 +264,7 @@ class ChatRepository extends ChangeNotifier {
       // the rest of the session: a bubble stamped 12:00 sat below every
       // message sent after it, and physically jumped down past each new one.
       _byPeer[peerId] = _ordered([...msgs, ...?_unsent[peerId]]);
+      _loaded.add(peerId);
       _loadErrors.remove(peerId);
       notifyListeners();
     } catch (e) {
