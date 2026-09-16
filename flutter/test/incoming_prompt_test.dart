@@ -265,4 +265,24 @@ void main() {
     expect(find.text('first.bin'), findsOneWidget);
     expect(find.text('second.bin'), findsNothing);
   });
+  // "Always accept" does not only stop the asking: it approves the device, and
+  // approval writes `PermissionSet::granted_on_approval()` — files, messages,
+  // clipboard, presence and pipe. Five capabilities behind a label about
+  // files. The only statement of that lived in a Tooltip, which a touch screen
+  // shows on long-press and most people never see, so on a phone the prompt
+  // said nothing at all about what the button granted.
+  testWidgets('the prompt says on screen what trusting the device allows', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _pump(tester, fake);
+    fake.emit(_queued('in-1', file: 'holiday.zip'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Always accept'), findsOneWidget);
+    // Visible text, not a tooltip, and it must name what is granted beyond the
+    // files the button is labelled for.
+    expect(find.textContaining('trusts this device'), findsOneWidget);
+    expect(find.textContaining('clipboard'), findsOneWidget);
+  });
 }
