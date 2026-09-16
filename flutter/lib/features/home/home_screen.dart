@@ -12,13 +12,14 @@ import '../../data/discovery_repository.dart' show DiscoveryRepository;
 import '../../data/saved_devices_repository.dart' show SavedDevice;
 import '../../platform/desktop_files.dart';
 import '../../sdk/error_text.dart';
-import '../../sdk/models.dart' show PeerTarget;
+import '../../sdk/models.dart' show PeerIdentity, PeerTarget;
 import '../../state/app_scope.dart';
 import '../../state/models.dart';
 import '../../state/staging.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/brand_mark.dart';
 import '../../widgets/common.dart';
+import '../../widgets/pairing.dart';
 import '../../widgets/processing.dart';
 import '../../widgets/device_tile.dart';
 import '../chat/chat_screen.dart';
@@ -529,6 +530,17 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Done on the tap rather than in the background on discovery, deliberately:
   /// dialling every peer the moment it appears would make the app reach out to
   /// machines the user never asked it to touch.
+  /// The devices an identify dial is in flight for.
+  ///
+  /// A dial takes as long as a dial takes — up to `CONNECT_TIMEOUT` (8s) per
+  /// resolved address, and a MagicDNS name resolves to several. Now that the
+  /// call runs off the UI isolate the app stays responsive throughout, which is
+  /// the fix *and* the reason this set is needed: a responsive app is one whose
+  /// chat button can be pressed again, and a second press would open a second
+  /// connection to the same machine and then push a second identical screen on
+  /// top of the first.
+  final Set<String> _identifying = <String>{};
+
   Future<void> _chatAfterIdentifying(
     BuildContext context,
     Device device,
@@ -542,15 +554,31 @@ class _HomeScreenState extends State<HomeScreen> {
       snack('${device.name} is not reachable right now');
       return;
     }
-    final identity = await withProcessing(
-      context,
-      'Asking ${device.name} who it is…',
-      () => scope.device.identify(target),
-    );
-    if (identity == null || !context.mounted) {
-      if (context.mounted) {
-        snack('Could not reach ${device.name} to start a conversation');
-      }
+    if (!_identifying.add(device.id)) return; // already asking this one
+    final ({PeerIdentity? identity, Object? error}) answer;
+    try {
+      answer = await withProcessing(
+        context,
+        'Asking ${device.name} who it is…',
+        () => scope.device.identify(target),
+      );
+    } finally {
+      _identifying.remove(device.id);
+    }
+    if (!context.mounted) return;
+
+    final identity = answer.identity;
+    if (identity == null) {
+      // Say *which* failure. "Could not reach it" was shown for a refusal, a
+      // withheld permission and an engine that was not running, and it sent
+      // the user to look at their network for three problems that were not
+      // there.
+      final why = answer.error;
+      snack(
+        why == null
+            ? 'Could not reach ${device.name} to start a conversation'
+            : '${device.name}: ${friendlyError(why)}',
+      );
       return;
     }
     if (!canChatWithDeviceId(identity.deviceId)) {
@@ -562,6 +590,33 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       return;
     }
+
+    // First contact: the handshake this dial just completed **pinned that
+    // device's key**, and this is the only moment the code can be compared.
+    // The CLI has always printed it here; the GUI pinned in silence, which
+    // made the one check that detects an interception impossible to perform.
+    if (identity.newlyTrusted && identity.pairingCode.isNotEmpty) {
+      final choice = await confirmFirstContact(
+        context,
+        peerName: identity.name.isEmpty ? device.name : identity.name,
+        pairingCode: identity.pairingCode,
+        mustConfirm: scope.settings.requirePairingConfirmation,
+      );
+      if (!context.mounted) return;
+      if (choice == FirstContactChoice.forget) {
+        // Drop the record this handshake wrote, so the next contact is a first
+        // contact again and nothing was silently pinned on the user's behalf.
+        final refused = await scope.trust.remove(identity.deviceId);
+        if (!context.mounted) return;
+        snack(
+          refused ??
+              'Forgot ${identity.name.isEmpty ? device.name : identity.name}',
+        );
+        return;
+      }
+      if (choice != FirstContactChoice.open) return;
+    }
+
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => ChatScreen(
@@ -1029,18 +1084,30 @@ class _HomeScreenState extends State<HomeScreen> {
                                 child: DeviceTile(
                                   device: devices[i],
                                   onSend: () => _sendTo(context, devices[i]),
-                                  // Withheld for a device whose id cannot carry
+                                  // **Offered for every discovered device**,
+                                  // including one whose id cannot itself carry
                                   // a conversation — a Tailscale peer's
-                                  // `ts:<node>` in particular. Offering it was
-                                  // a promise the engine refuses: every store
-                                  // call for that namespace fails, so the
-                                  // thread opened, stayed empty, and swallowed
-                                  // whatever was typed into it. The saved-device
-                                  // card a few lines up already withholds it for
-                                  // the same reason; this row did not.
-                                  onChat: canChatWithDeviceId(devices[i].id)
-                                      ? () => _chatWith(context, devices[i])
-                                      : null,
+                                  // `ts:<node>`.
+                                  //
+                                  // This row used to withhold it for exactly
+                                  // those, and withholding was right while
+                                  // opening the thread was the only thing the
+                                  // tap could do: the engine refuses that
+                                  // namespace, so the thread opened, stayed
+                                  // empty, and swallowed whatever was typed
+                                  // into it.
+                                  //
+                                  // It stopped being right the moment
+                                  // `_chatAfterIdentifying` existed. The tap
+                                  // now asks the address who is actually there
+                                  // and opens the thread under the answer — so
+                                  // the guard was hiding the button on the
+                                  // precise devices the identify flow was built
+                                  // for, which made that whole flow
+                                  // unreachable from this list. `_chatWith`
+                                  // picks the route and reports its own
+                                  // failures.
+                                  onChat: () => _chatWith(context, devices[i]),
                                 ),
                               ),
                             );

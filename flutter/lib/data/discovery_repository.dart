@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../sdk/events.dart';
+import '../sdk/exceptions.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 import '../state/models.dart';
@@ -34,13 +35,26 @@ class DiscoveryRepository extends ChangeNotifier {
   /// and the authenticated id is the only thing that can; the engine learns it
   /// by dialling and completing the ordinary handshake. Nothing is sent by
   /// asking, and nothing is approved.
-  Future<PeerIdentity?> identify(PeerTarget peer) async {
+  /// Returns the identity **and** why it failed, never one without the other.
+  ///
+  /// This used to return a bare nullable and swallow the exception, so every
+  /// failure reached the user as the same sentence — "could not reach it" —
+  /// whether the peer was unreachable, refused the connection, withheld a
+  /// permission, or the engine was not running at all. The CLI has always said
+  /// which (`could not reach host:port: <reason>`); the GUI blamed the network
+  /// for all four. The error is an ordinary answer here, not something to
+  /// throw into a build, but it is an answer the caller has to be *given*.
+  Future<({PeerIdentity? identity, Object? error})> identify(
+    PeerTarget peer,
+  ) async {
+    final api = _api;
+    if (api == null) {
+      return (identity: null, error: const PeerBeamUnavailable('no engine'));
+    }
     try {
-      return await _api?.peerIdentify(peer);
-    } catch (_) {
-      // Unreachable is an ordinary answer here, not an error worth throwing
-      // into a build: the caller shows its own message.
-      return null;
+      return (identity: await api.peerIdentify(peer), error: null);
+    } catch (e) {
+      return (identity: null, error: e);
     }
   }
 
