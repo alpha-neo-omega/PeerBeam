@@ -7,6 +7,34 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Chat notifications.** A message arriving while PeerBeam is not the thing
+  you are looking at now raises an OS notification, on desktop as well as
+  Android. Desktop had no notification backend at all — a message that arrived
+  behind another window was invisible until someone thought to look.
+
+  What it does *not* do is as deliberate as what it does. It stays quiet for a
+  thread that is open **and** focused, for your own messages, and for a row
+  merely settling from `pending` to `sent`. It carries at most 120 characters of
+  the message, because a notification is drawn on a lock screen and over other
+  applications and the app cannot take it back. One notification per
+  conversation, replaced rather than stacked, and withdrawn when you open the
+  thread. Clicking one on desktop opens that conversation.
+
+  Group messages notify too, under the group's name and with the speaker's name
+  leading the body — a group notification that omitted who spoke would leave the
+  one question a group message raises unanswered. Conversations are keyed
+  (`chatThreadKey`) so the two kinds cannot be confused: reading Bob's private
+  thread does not silence the group he also posted in, and vice versa. The keys
+  cannot collide by construction — the engine's store forbids a colon in a
+  device id, which is the same rule that makes `ts:<node>` unusable as a chat
+  key.
+
+  The decision and the copy are pure functions with tests
+  (`lib/platform/chat_notifications.dart`); which window is open is tracked
+  locally and never persisted or sent — it is not a read receipt (those remain
+  opt-in and engine-owned) and not an unread count, which this app still refuses
+  to claim. Desktop delivery is build-verified on Linux and unverified on
+  Windows and macOS, the same standing as the tray.
 - **`peerbeam identify <host>`, and `pb_peer_identify` behind it** — ask an
   address which device answers there. It dials, completes the ordinary
   authenticated handshake, reports the device id that answered, and closes.

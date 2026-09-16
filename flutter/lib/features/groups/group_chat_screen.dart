@@ -24,7 +24,9 @@ import 'package:flutter/material.dart';
 import '../../app/theme.dart';
 import '../../sdk/events.dart';
 import '../../sdk/models.dart';
+import '../../platform/chat_notifications.dart' show groupThreadKey;
 import '../../state/app_scope.dart';
+import '../../state/chat_presence.dart';
 import '../../widgets/common.dart';
 
 class GroupChatScreen extends StatefulWidget {
@@ -53,12 +55,22 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   bool _started = false;
   StreamSubscription<BridgeEvent>? _events;
 
+  /// Held from [didChangeDependencies] because `dispose` may not look an
+  /// inherited widget up — by then this element is being unmounted.
+  ChatPresence? _presence;
+
   // `didChangeDependencies`, not `initState`: `AppScope.of` establishes an
   // inherited-widget dependency, which Flutter forbids before `initState`
   // completes. Guarded so a later dependency change does not re-fetch.
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // Outside the `_started` guard: this has to be re-asserted whenever the
+    // scope changes, and it is cheap and idempotent. Keyed by the group, not
+    // by any member — a group message must not be filed under, or silenced
+    // by, a private thread with whoever happened to send it.
+    _presence = AppScope.of(context).chatPresence
+      ..enter(groupThreadKey(widget.group.id));
     if (_started) return;
     _started = true;
     _load();
@@ -80,6 +92,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     _events?.cancel();
     _composer.dispose();
     _scroll.dispose();
+    _presence?.leave(groupThreadKey(widget.group.id));
     super.dispose();
   }
 

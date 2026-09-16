@@ -24,6 +24,14 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Required by flutter_local_notifications, which is compiled against
+        // java.time APIs that only exist from API 26. minSdk is lower than
+        // that, so without desugaring D8 fails the build outright — this is a
+        // prerequisite of having the dependency at all, not of using it.
+        // PeerBeam only calls that plugin on desktop (see
+        // lib/platform/desktop_notifier.dart); Android notifications still go
+        // through this module's own NotificationChannel code.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     defaultConfig {
@@ -91,6 +99,9 @@ dependencies {
     // ContentResolver belongs on a device, and everything worth asserting here
     // is reachable as a pure function with its lookups injected.
     testImplementation("junit:junit:4.13.2")
+
+    // The backport the desugaring above links against. See `compileOptions`.
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
 
 flutter {

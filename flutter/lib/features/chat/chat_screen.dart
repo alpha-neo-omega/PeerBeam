@@ -10,6 +10,7 @@ import '../../platform/saf.dart';
 import '../../sdk/error_text.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
+import '../../state/chat_presence.dart';
 import '../../state/models.dart';
 import '../../state/stores.dart';
 import '../../widgets/appear.dart';
@@ -106,7 +107,30 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _retentionTick?.cancel();
     _controller.dispose();
+    // Passing the peer id matters: pushing one thread on top of another builds
+    // the new screen before disposing the old, so an unconditional clear here
+    // would blank the thread that had just registered.
+    _presence?.leave(widget.peerId);
     super.dispose();
+  }
+
+  /// Held from [didChangeDependencies] because `dispose` may not look an
+  /// inherited widget up — by then this element is being unmounted.
+  ChatPresence? _presence;
+
+  /// Announce that this thread is on screen, so a message arriving in it
+  /// raises no notification about something the user is already reading — and
+  /// so a notification already standing for it comes down. Local to this
+  /// process: nothing is persisted and nothing is sent (see [ChatPresence]).
+  ///
+  /// Here rather than in `initState`, which may not read an inherited widget,
+  /// and rather than in the post-frame callback above, which awaits two engine
+  /// calls — a message can arrive inside that gap. This runs before the first
+  /// build, and [ChatPresence.enter] ignores a repeat.
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _presence = AppScope.of(context).chatPresence..enter(widget.peerId);
   }
 
   /// (Re)start the sweep that clears messages whose window closes while the

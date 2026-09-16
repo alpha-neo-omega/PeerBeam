@@ -6,15 +6,21 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
+import 'features/chat/chat_screen.dart';
+import 'features/groups/group_chat_screen.dart';
 import 'features/send/send_text.dart';
 import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
 import 'platform/bridge.dart';
+import 'platform/chat_notifications.dart';
+import 'platform/chat_notifier.dart';
+import 'platform/desktop_notifier.dart';
 import 'platform/engine_config.dart';
 import 'platform/desktop_files.dart';
 import 'platform/notifications.dart';
 import 'platform/saf.dart';
 import 'platform/tray.dart';
+import 'sdk/models.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
@@ -46,7 +52,7 @@ class PeerBeamApp extends StatefulWidget {
   State<PeerBeamApp> createState() => _PeerBeamAppState();
 }
 
-class _PeerBeamAppState extends State<PeerBeamApp> {
+class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
   late final PeerBeamApi _api;
   late final AppState _state;
   final _router = buildRouter();
@@ -77,11 +83,34 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
   /// there is no tray plugin to talk to.
   TrayService? _tray;
 
+  /// Desktop notifications. Constructed everywhere — it is inert off desktop —
+  /// so the delivery closures below need no second platform check.
+  final DesktopNotifier _desktopNotifier = DesktopNotifier();
+
+  /// Turns arriving messages into notifications. Built in `initState`, where
+  /// `_state` exists.
+  late final ChatNotifier _chatNotifier;
+
   @override
   void initState() {
     super.initState();
     _api = widget.api ?? PeerBeam();
     _state = AppState.live(_api);
+
+    // Which thread is open is half of "can the user already see this"; the
+    // other half is whether the app has the foreground, which only the binding
+    // reports.
+    WidgetsBinding.instance.addObserver(this);
+    _chatNotifier = ChatNotifier(
+      events: _api.events,
+      presence: _state.chatPresence,
+      enabled: () => _state.settings.notifications,
+      nameOf: _peerName,
+      groupNameOf: _groupName,
+      post: _postChatNotice,
+      withdraw: _withdrawChatNotice,
+    );
+    _chatNotifier.start();
 
     // Boot the engine, then start discovery so screens fill with live data.
     // Failures (missing native lib) degrade gracefully to empty state.
@@ -126,6 +155,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
         // had not begun would be wrong for the first few seconds. A no-op off
         // desktop.
         await _startTray();
+        // After the tray, and for the same reason: a notification that opens a
+        // conversation needs the repositories behind it to be live.
+        await _desktopNotifier.start(onOpen: _openConversation);
         _state.engine.started();
       } catch (e) {
         // **Kept, not swallowed.** This used to be `catch (_) {}`, and a failed
@@ -172,6 +204,133 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
 
     // Persist theme choices (the controller itself stays engine-agnostic).
     _state.theme.addListener(_persistTheme);
+  }
+
+  /// Foreground state, from the only thing that knows it.
+  ///
+  /// `resumed` is the one state in which the user is actually looking at this
+  /// app: on desktop a window that loses focus reports `inactive`, and on
+  /// Android a backgrounded app reports `paused` or `hidden`. Anything but
+  /// `resumed` is therefore "they cannot see this", which is exactly the
+  /// question a notification has to answer.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _state.chatPresence.setForeground(state == AppLifecycleState.resumed);
+  }
+
+  /// What to call a peer, for a notification title. Falls back to the device
+  /// id, which `chatNotice` then uses rather than inventing a name.
+  String _peerName(String peerId) {
+    final known = _state.device.devices
+        .where((d) => d.id == peerId)
+        .map((d) => d.name)
+        .firstOrNull;
+    if (known != null && known.isNotEmpty) return known;
+    return _state.saved.devices
+            .where((d) => d.id == peerId)
+            .map((d) => d.name)
+            .firstOrNull ??
+        peerId;
+  }
+
+  /// What to call a group, for a notification title. Falls back to its id.
+  String _groupName(String groupId) =>
+      _state.groups.groups
+          .where((g) => g.id == groupId)
+          .map((g) => g.name)
+          .firstOrNull ??
+      groupId;
+
+  /// Show a chat notification on whichever backend this platform has.
+  ///
+  /// Android keeps its own: the foreground service and its channels are
+  /// hand-written in `android/`, they are what survives the app being
+  /// backgrounded, and routing chat through a second notification system would
+  /// leave two of them fighting over the same tray. Desktop has no such thing,
+  /// so it gets the plugin. Everywhere else — a widget test, most obviously —
+  /// this does nothing.
+  Future<void> _postChatNotice(ChatNotice notice) async {
+    if (isDesktop) {
+      await _desktopNotifier.show(notice);
+      return;
+    }
+    if (!Platform.isAndroid) return;
+    await _android.bridge.showNotification(
+      NotificationContent(
+        id: notice.id,
+        title: notice.title,
+        body: notice.body,
+        // The receive icon: a message arriving is incoming, and the alternative
+        // is the upload glyph.
+        incoming: true,
+      ),
+    );
+  }
+
+  /// Take a chat notification down again.
+  Future<void> _withdrawChatNotice(int id) async {
+    if (isDesktop) {
+      await _desktopNotifier.clear(id);
+      return;
+    }
+    if (!Platform.isAndroid) return;
+    await _android.bridge.cancelNotification(id);
+  }
+
+  /// Open a conversation because its notification was clicked.
+  ///
+  /// Desktop only: the Android notification's content intent opens the app
+  /// itself, which is what that platform's own notification code has always
+  /// done and is not this change's to alter.
+  ///
+  /// The window is raised first — a thread pushed behind another application
+  /// would be a click that appeared to do nothing.
+  Future<void> _openConversation(String threadKey) async {
+    if (isDesktop) {
+      try {
+        await windowManager.show();
+        await windowManager.focus();
+      } catch (_) {
+        // A window that will not come forward is not a reason to skip the
+        // navigation: the thread is still opened, and it is there when they
+        // reach the window themselves.
+      }
+    }
+    final context = rootNavigatorKey.currentContext;
+    if (context == null || !context.mounted) return;
+
+    if (threadKey.startsWith('group:')) {
+      final id = threadKey.substring('group:'.length);
+      final group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
+      // A group this device has since left, or one the list has not loaded
+      // back yet. Nothing sensible to open, and inventing a placeholder group
+      // would offer a composer that sends to nobody.
+      if (group == null) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
+        ),
+      );
+      return;
+    }
+
+    // The same fallback the Conversations list uses: discovery's target when
+    // it has one, an address-less placeholder otherwise. The chat screen
+    // re-resolves it while open, so a peer that reappears becomes sendable
+    // there and then.
+    final target =
+        _state.device.peerTarget(threadKey) ??
+        PeerTarget(
+          id: threadKey,
+          name: _peerName(threadKey),
+          addresses: const [],
+          port: 0,
+        );
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(peerId: threadKey, peer: target),
+      ),
+    );
   }
 
   void _applyPersistedTheme() {
@@ -321,6 +480,8 @@ class _PeerBeamAppState extends State<PeerBeamApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _chatNotifier.dispose();
     unawaited(_tray?.dispose());
     _errSub?.cancel();
     _clipSub?.cancel();

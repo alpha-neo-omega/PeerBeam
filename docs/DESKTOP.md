@@ -46,7 +46,7 @@ each without platform-specific assumptions in shared code:
 | File picker (send) | ✓ | ✓ | ✓ | `file_selector` `openFiles()` |
 | Save-directory dialog | ✓ | ✓ | ✓ | `file_selector` `getDirectoryPath()` |
 | Networked transfer (QUIC) | ✓ | ✓ | ✓ | Rust engine (`peerbeam` CLI/engine) |
-| OS notifications | ✗ | ✗ | ✗ | Not implemented on desktop (in-app UI only) |
+| OS notifications | ✓ | ✓ | ✓ | `flutter_local_notifications` (chat + group messages) |
 | System tray / menu bar | ✓ | ✓ | ✓ | `tray_manager` + `window_manager` |
 | Background service | — | — | — | Android-only concept; N/A on desktop |
 
@@ -62,8 +62,13 @@ each without platform-specific assumptions in shared code:
   to guidance (tested in `test/desktop_test.dart`).
 - **Save dialog** — `pickSaveDirectory()` (`file_selector.getDirectoryPath`)
   wired to Settings → "Save to" (desktop only); updates the save directory.
-- **Notifications** — no desktop OS-notification backend yet. Transfer status is
-  shown in-app. (Android uses native notifications via the platform bridge.)
+- **Notifications** — arriving chat messages raise an OS notification
+  (`lib/platform/desktop_notifier.dart`). Transfer status is still in-app only.
+  Whether to notify, and what the notification says, are pure functions with
+  unit tests (`lib/platform/chat_notifications.dart`,
+  `test/chat_notifications_test.dart`); only the delivery call needs a desktop
+  session, and it is **build-verified on Linux, unverified on Windows and
+  macOS** — the same standing as the tray.
 - **Tray integration** — a status icon with live transfers and online devices,
   plus Open / Send files… / Quit. Windows draws it in the notification area,
   macOS in the menu bar, Linux via Ayatana's app-indicator. The menu's *content*
@@ -86,9 +91,14 @@ each without platform-specific assumptions in shared code:
 
 ## Platform-specific differences
 
-- **Notifications.** Android shows native + foreground-service notifications.
-  Desktop currently surfaces status in-app only. A desktop notifier
-  (`local_notifier` / `flutter_local_notifications` desktop) is a follow-up.
+- **Notifications.** Android keeps its own path — the foreground service and
+  hand-written channels in `android/` — because that is what survives the app
+  being backgrounded. Desktop uses `flutter_local_notifications`. So:
+  - **macOS** asks for notification permission the first time a message would
+    raise one, not at launch. A refusal is remembered for that session.
+  - **Clicking a desktop notification opens that conversation.** On Android the
+    notification's content intent opens the app, as it always has.
+  - Transfer progress and completion still notify on Android only.
 - **Background operation.** The Android foreground service, battery-optimization
   exemption, and Wi-Fi multicast lock have no desktop equivalent and are no-ops
   off Android.
@@ -108,7 +118,7 @@ each without platform-specific assumptions in shared code:
 
 1. Run `flutter build windows` and `flutter build macos` on their hosts (or CI).
 2. Manual pass of picker/save dialogs and drag & drop on Windows and macOS.
-3. (Optional) Desktop OS notifications and system-tray integration.
+3. Confirm notifications actually appear on Windows and macOS (Linux verified).
 
 ## Build commands
 
