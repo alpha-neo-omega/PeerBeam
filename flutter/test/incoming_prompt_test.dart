@@ -25,13 +25,32 @@ import 'sdk/fake_peerbeam.dart';
 
 /// A `transfer_queued` for [id]; inbound ones land in `pending`, which is the
 /// only state that awaits an answer.
-TransferEvent _queued(String id, {bool incoming = true, String? file}) =>
-    TransferEvent(
-      kind: 'transfer_queued',
-      transferId: id,
-      timestamp: '',
-      payload: {'peer': 'Bob', 'file': file ?? '$id.bin', 'incoming': incoming},
-    );
+TransferEvent _queued(
+  String id, {
+  bool incoming = true,
+  String? file,
+  bool? needsDecision,
+}) => TransferEvent(
+  kind: 'transfer_queued',
+  transferId: id,
+  timestamp: '',
+  payload: {
+    'peer': 'Bob',
+    'file': file ?? '$id.bin',
+    'incoming': incoming,
+    // Omitted unless a test is about it: absent means "an engine too old to
+    // say", which defaults to asking — the safe direction.
+    'needs_decision': ?needsDecision,
+  },
+);
+
+/// The engine reporting that bytes have started moving.
+TransferEvent _started(String id) => TransferEvent(
+  kind: 'transfer_started',
+  transferId: id,
+  timestamp: '',
+  payload: const {'peer': 'Bob'},
+);
 
 /// Mount the prompt over a stand-in screen that is deliberately **not**
 /// Transfers — the case the prompt exists for.
@@ -173,6 +192,64 @@ void main() {
 
     expect(find.text('Incoming file'), findsNothing);
     expect(state.transfer.awaitingApproval, hasLength(1));
+  });
+
+  // THE REPORTED SYMPTOM: auto-accept "not working — it asks every time".
+  //
+  // The engine settles admission BEFORE it announces the transfer, and says
+  // whether anyone is being asked (`needs_decision`). It used to announce
+  // first and decide after, so every inbound file — auto-accepted or not —
+  // raised this modal, and nothing withdrew it. The file landed while the user
+  // was still looking at "Decline / Accept", which is the entire visible
+  // surface of auto-accept.
+  testWidgets('an auto-accepted file raises no prompt at all', (tester) async {
+    final fake = FakePeerBeam();
+    final state = await _pump(tester, fake);
+
+    fake.emit(_queued('in-1', file: 'holiday.zip', needsDecision: false));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Incoming file'), findsNothing);
+    expect(
+      state.transfer.awaitingApproval,
+      isEmpty,
+      reason: 'a transfer nobody is being asked about is not awaiting approval',
+    );
+    // The transfer itself is still tracked — it is arriving, just unasked.
+    expect(state.transfer.transfers.map((t) => t.id), contains('in-1'));
+  });
+
+  testWidgets('an engine too old to say still asks', (tester) async {
+    final fake = FakePeerBeam();
+    await _pump(tester, fake);
+
+    // No `needs_decision` key at all.
+    fake.emit(_queued('in-1', file: 'holiday.zip'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Incoming file'), findsOneWidget);
+  });
+
+  testWidgets('a prompt already open is withdrawn when the answer comes from '
+      'somewhere else', (tester) async {
+    final fake = FakePeerBeam();
+    final state = await _pump(tester, fake);
+
+    fake.emit(_queued('in-1', file: 'holiday.zip'));
+    await tester.pumpAndSettle();
+    expect(find.text('Incoming file'), findsOneWidget);
+
+    // Accepted from the Transfers screen, the chat row, or the CLI — the
+    // engine reports it started, so the question is gone.
+    fake.emit(_started('in-1'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('Incoming file'),
+      findsNothing,
+      reason: 'the dialog outlived the decision it was asking about',
+    );
+    expect(state.transfer.awaitingApproval, isEmpty);
   });
 
   testWidgets('two arrivals are asked one at a time', (tester) async {

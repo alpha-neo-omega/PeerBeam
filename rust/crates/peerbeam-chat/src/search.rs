@@ -35,6 +35,7 @@
 
 use std::cmp::Reverse;
 
+use chrono::{DateTime, Utc};
 use peerbeam_domain::id::DeviceId;
 
 use crate::message::ChatError;
@@ -70,6 +71,15 @@ pub struct SearchHit {
     /// The row's id, which is also its key in that conversation.
     pub message_id: String,
     pub timestamp: String,
+    /// The instant this hit is **ordered** by: [`ChatRecord::age_basis`], which
+    /// is the local `stored_at` where there is one and the parsed `timestamp`
+    /// only for a row written before that field existed.
+    ///
+    /// Deliberately not [`timestamp`](Self::timestamp), which a surface still
+    /// gets to *display*. `timestamp` is the sender's own string, so ordering
+    /// by it hands a peer the arrangement of the user's search results — see
+    /// [`SearchHit::order`]. `None` is a row this device cannot date at all.
+    pub at: Option<DateTime<Utc>>,
     pub direction: Direction,
     pub kind: Kind,
     /// A **substring of the stored text** that matched — the body for a text
@@ -90,9 +100,28 @@ impl SearchHit {
     /// and tests flaky. `(peer_id, message_id)` is unique (a message id is its
     /// key within one conversation's namespace), so this is a *total* order:
     /// two runs over the same stored rows return the same sequence.
-    fn order(&self) -> (Reverse<&str>, &str, &str) {
+    ///
+    /// # Why an instant and not the timestamp string
+    ///
+    /// This used to compare `timestamp` **as text**, which is only the same as
+    /// comparing instants while every row happens to carry the same UTC offset
+    /// and the same fractional-second width. Neither is guaranteed: the
+    /// timestamp on an inbound row is the peer's own string and
+    /// [is not validated anywhere on the wire](ChatRecord::age_basis), so a
+    /// peer stamping `+05:30` — the same instant, five and a half hours further
+    /// along in text — sorted its messages to the top of the user's results and
+    /// held them there. `2026-01-01T00:00:00.900Z` also sorted *before*
+    /// `2026-01-01T00:00:00Z`, because `.` precedes `Z`, putting the later of
+    /// two rows in the same second first.
+    ///
+    /// Ordering by [`at`](Self::at) — `stored_at`, the instant *this* device
+    /// wrote the row — takes the arrangement of the user's own search results
+    /// out of a peer's hands. A row this device cannot date sorts oldest, so it
+    /// lands at the end rather than claiming the newest slot; it is never
+    /// dropped, because a hit the user can read is still a hit.
+    fn order(&self) -> (Reverse<DateTime<Utc>>, &str, &str) {
         (
-            Reverse(self.timestamp.as_str()),
+            Reverse(self.at.unwrap_or(DateTime::<Utc>::MIN_UTC)),
             self.peer_id.as_str(),
             self.message_id.as_str(),
         )
@@ -202,6 +231,7 @@ fn hit(peer: &DeviceId, rec: &ChatRecord, needle: &str) -> Option<SearchHit> {
         peer_id: peer.0.clone(),
         message_id: rec.id.clone(),
         timestamp: rec.timestamp.clone(),
+        at: rec.age_basis(),
         direction: rec.direction,
         kind: rec.kind,
         snippet,
@@ -877,5 +907,107 @@ mod tests {
 
         let found = cs.search("invoice", 10).unwrap();
         assert_eq!(found.hits[0].peer_id, "pb-long-gone");
+    }
+
+    /// **Newest-first means newest in time, not last in the alphabet.** Hits
+    /// used to be ordered by comparing the timestamp *string*, which is the
+    /// same as comparing instants only while every row shares one UTC offset
+    /// and one fractional-second width. A peer stamping the same instant as
+    /// `+05:30` sorted five and a half hours ahead of everyone else and held
+    /// the top of the user's results; with `--limit` it also pushed genuinely
+    /// newer matches out of the answer while `truncated` blamed the limit.
+    #[test]
+    fn a_peers_utc_offset_does_not_decide_where_its_matches_rank() {
+        let (cs, _raw, _dir) = new_store();
+        // Three rows, one hour apart, each written in a different but equally
+        // valid RFC 3339 spelling. In real time: a, then b, then c.
+        cs.append(&text("pb-a", "m1", "2026-01-01T10:00:00Z", "invoice a"))
+            .unwrap();
+        cs.append(&text(
+            "pb-b",
+            "m2",
+            "2026-01-01T16:30:00+05:30",
+            "invoice b",
+        ))
+        .unwrap();
+        cs.append(&text(
+            "pb-c",
+            "m3",
+            "2026-01-01T12:00:00.000+00:00",
+            "invoice c",
+        ))
+        .unwrap();
+
+        // Newest first: c (12:00Z), b (11:00Z), a (10:00Z). Compared as text,
+        // b's "16:30" would have led.
+        assert_eq!(ids(&cs.search("invoice", 10).unwrap()), ["m3", "m2", "m1"]);
+
+        // And the limit now cuts the genuinely oldest, not whichever spelling
+        // sorted worst.
+        let top = cs.search("invoice", 1).unwrap();
+        assert_eq!(ids(&top), ["m3"]);
+        assert!(top.truncated);
+    }
+
+    /// A fraction is later than no fraction within the same second, but sorts
+    /// earlier as text, because `.` precedes `Z`. Two rows a tenth of a second
+    /// apart used to come back in the wrong order.
+    #[test]
+    fn a_fractional_second_is_not_read_as_earlier_than_a_whole_one() {
+        let (cs, _raw, _dir) = new_store();
+        cs.append(&text("pb-a", "m1", "2026-01-01T10:00:00Z", "invoice one"))
+            .unwrap();
+        cs.append(&text(
+            "pb-a",
+            "m2",
+            "2026-01-01T10:00:00.900Z",
+            "invoice two",
+        ))
+        .unwrap();
+
+        assert_eq!(ids(&cs.search("invoice", 10).unwrap()), ["m2", "m1"]);
+    }
+
+    /// A row this device cannot date is still findable — a hit the user can
+    /// read is a hit — but it does not get to claim the newest slot. It sorts
+    /// last, where "we do not know when this was" belongs.
+    #[test]
+    fn an_undatable_row_is_found_but_never_ranked_newest() {
+        let (cs, _raw, _dir) = new_store();
+        cs.append(&text("pb-a", "m1", "2026-01-01T10:00:00Z", "invoice dated"))
+            .unwrap();
+        // A peer's timestamp is its own unvalidated string; this is what an
+        // older build let through.
+        cs.append(&text("pb-a", "m2", "not a timestamp", "invoice undated"))
+            .unwrap();
+
+        assert_eq!(ids(&cs.search("invoice", 10).unwrap()), ["m1", "m2"]);
+    }
+
+    /// `stored_at` wins over the timestamp when both are present: it is this
+    /// device's own clock, so it is the one a peer cannot choose. A peer
+    /// stamping itself a year in the future is ordered by when it actually
+    /// arrived.
+    #[test]
+    fn a_future_stamp_is_ordered_by_when_the_row_actually_arrived() {
+        let (cs, _raw, _dir) = new_store();
+        let mut old = text("pb-a", "m1", "2026-01-01T10:00:00Z", "invoice real");
+        old.stored_at = Some(
+            DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let mut liar = text("pb-b", "m2", "2027-01-01T00:00:00Z", "invoice liar");
+        liar.stored_at = Some(
+            DateTime::parse_from_rfc3339("2026-01-01T09:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        cs.append(&old).unwrap();
+        cs.append(&liar).unwrap();
+
+        // The peer claimed next year; it arrived an hour before the other row,
+        // and that is where it ranks.
+        assert_eq!(ids(&cs.search("invoice", 10).unwrap()), ["m1", "m2"]);
     }
 }

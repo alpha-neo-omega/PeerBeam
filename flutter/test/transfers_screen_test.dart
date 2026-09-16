@@ -247,7 +247,7 @@ void main() {
       // The per-card actions are untouched and still the way to answer it.
       expect(find.text('Accept'), findsOneWidget);
       expect(find.text('Decline'), findsOneWidget);
-      expect(find.text('Trust'), findsOneWidget);
+      expect(find.text('Always accept'), findsOneWidget);
     });
 
     testWidgets('shown from two waiting transfers up, alongside — never '
@@ -266,7 +266,7 @@ void main() {
       // Each card keeps its own three actions.
       expect(find.text('Accept'), findsNWidgets(2));
       expect(find.text('Decline'), findsNWidgets(2));
-      expect(find.text('Trust'), findsNWidgets(2));
+      expect(find.text('Always accept'), findsNWidgets(2));
       // And there is exactly one place to grant lasting trust: the card.
       expect(find.text('Trust all'), findsNothing);
     });
@@ -712,7 +712,7 @@ void main() {
       expect(find.text('2 items waiting for approval'), findsOneWidget);
       expect(find.text('Select'), findsOneWidget);
       expect(
-        find.text('Trust'),
+        find.text('Always accept'),
         findsNWidgets(2),
         reason: 'the per-card actions are back',
       );
@@ -761,7 +761,7 @@ void main() {
       );
       expect(find.text('Select'), findsOneWidget);
       expect(
-        find.text('Trust'),
+        find.text('Always accept'),
         findsNWidgets(2),
         reason: 'and the per-card Decline/Accept/Trust must be back',
       );

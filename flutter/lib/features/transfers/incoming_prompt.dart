@@ -111,42 +111,93 @@ class _IncomingTransferPromptState extends State<IncomingTransferPrompt> {
 
   Future<void> _prompt(Transfer transfer) async {
     final state = _app!;
+    // The dialog's own route, captured by the builder below so the withdrawal
+    // can target exactly it.
+    ModalRoute<void>? route;
+
+    // Withdraw the dialog if the question stops being one while it is open.
+    //
+    // Belt to the engine's braces: `needs_decision` keeps the prompt from
+    // being raised for a transfer nobody is being asked about, and this closes
+    // one already on screen when the answer arrives from somewhere else — the
+    // Transfers screen, the chat row's own inline Accept, the CLI, or the
+    // engine's accept timeout. Without it the dialog outlived its transfer and
+    // the next tap answered a decision that no longer existed.
+    //
+    // **`removeRoute`, not `pop`.** This was `Navigator.of(context,
+    // rootNavigator: true).pop()`, which pops whichever route is topmost — and
+    // that is not reliably this dialog. The pairing-confirmation sheet opens
+    // over it (`acceptWithPairingCheck`), and anything else the user reaches
+    // while it is up sits above it too; a decision landing at that moment
+    // dismissed *their* route and left the prompt behind. Removing the route we
+    // opened is exact wherever it sits in the stack, and is a no-op once it has
+    // already gone.
+    void closeIfSettled() {
+      if (!mounted) return;
+      final live = state.transfer.awaitingApproval.any(
+        (t) => t.id == transfer.id,
+      );
+      if (live) return;
+      final r = route;
+      if (r == null || !r.isActive) return;
+      Navigator.of(context, rootNavigator: true).removeRoute(r);
+    }
+
+    state.transfer.addListener(closeIfSettled);
+    try {
+      await _show(transfer, state, (r) => route = r);
+    } finally {
+      state.transfer.removeListener(closeIfSettled);
+    }
+  }
+
+  Future<void> _show(
+    Transfer transfer,
+    AppState state,
+    void Function(ModalRoute<void>?) captureRoute,
+  ) async {
     await showDialog<void>(
       context: context,
       // Dismissable on purpose: see the class doc. Dismissal answers nothing.
       barrierDismissible: true,
-      builder: (dialogContext) => _IncomingDialog(
-        transfer: transfer,
-        needsConfirmation: state.transfer.needsPairingConfirmation(transfer.id),
-        onDecline: () {
-          Navigator.of(dialogContext).pop();
-          state.transfer.reject(transfer.id);
-        },
-        onAccept: () async {
-          Navigator.of(dialogContext).pop();
-          await acceptWithPairingCheck(
-            context,
-            transfer,
-            needsConfirmation: state.transfer.needsPairingConfirmation(
-              transfer.id,
-            ),
-            accept: ({required confirmed}) =>
-                state.transfer.accept(transfer.id, confirmed: confirmed),
-          );
-        },
-        onTrust: () async {
-          Navigator.of(dialogContext).pop();
-          await acceptWithPairingCheck(
-            context,
-            transfer,
-            needsConfirmation: state.transfer.needsPairingConfirmation(
-              transfer.id,
-            ),
-            accept: ({required confirmed}) =>
-                state.transfer.acceptTrust(transfer.id, confirmed: confirmed),
-          );
-        },
-      ),
+      builder: (dialogContext) {
+        // Runs on every rebuild; assigning the same route again is harmless.
+        captureRoute(ModalRoute.of(dialogContext));
+        return _IncomingDialog(
+          transfer: transfer,
+          needsConfirmation: state.transfer.needsPairingConfirmation(
+            transfer.id,
+          ),
+          onDecline: () {
+            Navigator.of(dialogContext).pop();
+            state.transfer.reject(transfer.id);
+          },
+          onAccept: () async {
+            Navigator.of(dialogContext).pop();
+            await acceptWithPairingCheck(
+              context,
+              transfer,
+              needsConfirmation: state.transfer.needsPairingConfirmation(
+                transfer.id,
+              ),
+              accept: ({required confirmed}) =>
+                  state.transfer.accept(transfer.id, confirmed: confirmed),
+            );
+          },
+          onTrust: () async {
+            Navigator.of(dialogContext).pop();
+            await acceptWithPairingCheck(
+              context,
+              transfer,
+              needsConfirmation: state.transfer.needsPairingConfirmation(
+                transfer.id,
+              ),
+              accept: ({required confirmed}) =>
+                  state.transfer.acceptTrust(transfer.id, confirmed: confirmed),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -213,9 +264,25 @@ class _IncomingDialog extends StatelessWidget {
       actions: [
         TextButton(onPressed: onDecline, child: const Text('Decline')),
         TextButton(onPressed: onAccept, child: const Text('Accept')),
+        // Named for its consequence, not for the internal state it writes.
+        // "Trust" read as a fact about the device rather than a standing
+        // permission, so someone who wanted this file and knew the laptop
+        // pressed it and was surprised to be asked again — the more so because
+        // the engine, until this was fixed, recorded the approval and then
+        // still asked. The engine now stops asking; this says so before the
+        // tap rather than in a tooltip after it.
+        //
+        // The plain "Accept" beside it keeps its label: it is the one-time
+        // answer, it reads that way already, and it is the same word the bulk
+        // approval action uses.
         Tooltip(
-          message: 'Accept and always trust this device',
-          child: FilledButton(onPressed: onTrust, child: const Text('Trust')),
+          message:
+              'Accept this file, and accept files from this device without '
+              "asking. Turn it off from the conversation's ⋮ menu.",
+          child: FilledButton(
+            onPressed: onTrust,
+            child: const Text('Always accept'),
+          ),
         ),
       ],
     );

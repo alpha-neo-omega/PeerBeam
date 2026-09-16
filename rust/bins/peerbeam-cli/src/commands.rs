@@ -73,6 +73,7 @@ pub async fn dispatch(cmd: Command, ctx: &Ctx, cfg_override: Option<String>) -> 
         Command::Sync(a) => crate::browse::sync(ctx, a, cfg_override.as_deref()).await,
         Command::Snippet(a) => crate::chat::snippet(ctx, a, cfg_override.as_deref()).await,
         Command::Pair(a) => crate::pair::pair(ctx, a, cfg_override.as_deref()).await,
+        Command::Identify(a) => crate::identify::identify(ctx, a, cfg_override.as_deref()).await,
         Command::Logs(a) => crate::logs::logs(ctx, a, cfg_override.as_deref()),
         Command::Daemon(a) => daemon(ctx, a, cfg_override.as_deref()).await,
         Command::Session(a) => session_cmd(ctx, a).await,
@@ -278,7 +279,7 @@ fn render_scalar(v: &serde_json::Value) -> String {
 
 // ── doctor ──────────────────────────────────────────────────────
 
-/// Ask the release feed what the newest published version is.
+/// Ask the project's site what the newest published version is.
 ///
 /// Deliberately thin: it prints what it was told and stops. Amendment A1 permits
 /// a check, not an updater — nothing here downloads, installs, or changes
@@ -342,7 +343,7 @@ async fn check_updates(ctx: &Ctx) -> CliResult {
             } else {
                 ctx.line(&format!(
                     "could not check for updates — {e}\nyou have {current}; see {}",
-                    peerbeam_update::RELEASES_PAGE
+                    peerbeam_update::DOWNLOAD_PAGE
                 ));
             }
             Ok(())
@@ -1085,18 +1086,53 @@ pub(crate) async fn send_paths(
 /// Shared with `trust list`, which prints how long a time-limited approval has
 /// left: the CLI must say a duration the same way everywhere, or `--for 2h` and
 /// the row it produces would not obviously be about the same thing.
+///
+/// **Exact, never rounded down.** This renders two things a user is entitled to
+/// hold this device to — how long a disappearing-message window keeps a message
+/// readable (`chat retention`), and how long a time-limited approval has left
+/// (`trust list`) — so a remainder that does not fit the coarsest unit is
+/// appended rather than dropped. `90s` reads `1m30s`, not `1m`: the earlier form
+/// understated a window the user had just set by a third of it, and a caller who
+/// waited the duration it printed found the messages still readable. A value
+/// that lands exactly on a unit still reads as it always did (`2h` → `2h00m`),
+/// so what a person typed stays recognisable in what is printed back.
+///
+/// It is **not** an inverse of [`parse_duration`], and never was:
+/// `parse_duration` reads a single `<number><unit>`, so it rejects `2h00m`
+/// exactly as it rejects the `1m30s` this now produces. What the two share is
+/// the four units, not the grammar — `what_is_typed_reads_back_as_what_is_printed`
+/// checks the one direction that does hold.
 pub(crate) fn humantime(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        // Days once there are any. A week-long trust window rendered as
-        // `168h00m` is a number nobody reads as a week.
-        format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600)
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        let (m, s) = (secs / 60, secs % 60);
+        return if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s:02}s")
+        };
+    }
+    if secs < 86_400 {
+        let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        let hm = format!("{h}h{m:02}m");
+        return if s == 0 { hm } else { format!("{hm}{s:02}s") };
+    }
+    // Days once there are any. A week-long trust window rendered as
+    // `168h00m` is a number nobody reads as a week.
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    let dh = format!("{d}d{h:02}h");
+    match (m, s) {
+        (0, 0) => dh,
+        (_, 0) => format!("{dh}{m:02}m"),
+        _ => format!("{dh}{m:02}m{s:02}s"),
     }
 }
 
@@ -2434,7 +2470,16 @@ fn timeline_cmd(
         for rec in chat.history(&peer).unwrap_or_default() {
             events.push(Entry {
                 kind: "chat",
-                at: rec.timestamp.clone(),
+                // When THIS device stored the row, not the sender's claim
+                // about its own clock — the same basis `Manager::timeline`
+                // uses. Every other row in this list is stamped locally, so a
+                // chat row on a peer's clock would not merely label itself
+                // wrongly, it would sort itself wrongly against all of them.
+                // Falls back to the row's own timestamp only for a legacy row
+                // with no `stored_at`.
+                at: rec
+                    .age_basis()
+                    .map_or_else(|| rec.timestamp.clone(), |at| at.to_rfc3339()),
                 peer: peer.0.clone(),
                 // Never the body. A timeline is for recognising when something
                 // happened; `chat history` reads conversations properly.
@@ -2462,7 +2507,22 @@ fn timeline_cmd(
         }
     }
 
-    events.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.kind.cmp(b.kind)));
+    // Newest first, comparing parsed instants rather than text. These strings
+    // come from several producers, and a text comparison equals a chronological
+    // one only while every one of them agrees on UTC offset and
+    // fractional-second width: `…00.900Z` sorts before `…00Z` because `.`
+    // precedes `Z`, and any offset other than `+00:00` sorts by its wall-clock
+    // text. A row that will not parse sorts oldest rather than claiming the top.
+    fn instant(at: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    }
+    events.sort_by(|a, b| {
+        instant(&b.at)
+            .cmp(&instant(&a.at))
+            .then_with(|| a.kind.cmp(b.kind))
+    });
     let truncated = events.len() > args.limit;
     events.truncate(args.limit);
 
@@ -3872,6 +3932,72 @@ mod duration_tests {
             let seconds = std::time::Duration::from_secs(parsed.num_seconds() as u64);
             assert_eq!(humantime(seconds), printed, "{spec}");
         }
+    }
+
+    /// **A window is never printed shorter than it is.** `humantime` renders how
+    /// long a disappearing-message window keeps a message readable and how long
+    /// a trust approval has left, and it used to drop whatever did not fit the
+    /// coarsest unit: `--after 90s` printed `1m`, so the CLI told the user their
+    /// messages were gone a full third of the window before they were. Every
+    /// remainder now survives, and a caller can wait exactly what was printed.
+    #[test]
+    fn a_duration_is_never_printed_shorter_than_it_is() {
+        for (secs, printed) in [
+            (90u64, "1m30s"),
+            (61, "1m01s"),
+            (119, "1m59s"),
+            (3_690, "1h01m30s"),
+            (3_601, "1h00m01s"),
+            (86_401, "1d00h00m01s"),
+            (86_460, "1d00h01m"),
+            // Exactly on a unit still reads as it always did, so what a
+            // person typed stays recognisable. (Not a round trip: see the note
+            // on `humantime` — `parse_duration` takes one `<number><unit>` and
+            // has never accepted `1h00m` either.)
+            (60, "1m"),
+            (3_600, "1h00m"),
+            (86_400, "1d00h"),
+        ] {
+            assert_eq!(
+                humantime(std::time::Duration::from_secs(secs)),
+                printed,
+                "{secs}s"
+            );
+        }
+
+        // The property the examples above are instances of: what is printed
+        // parses back to no less than what went in, for every second up to a
+        // day and change. A renderer that rounds down fails this immediately.
+        for secs in (0u64..90_000).step_by(37) {
+            let printed = humantime(std::time::Duration::from_secs(secs));
+            let back = re_read(&printed);
+            assert_eq!(
+                back, secs,
+                "{secs}s printed as {printed}, which reads back as {back}s"
+            );
+        }
+    }
+
+    /// Sum the `<n><unit>` runs in a `humantime` string back into seconds.
+    fn re_read(s: &str) -> u64 {
+        let mut total = 0u64;
+        let mut n = 0u64;
+        for c in s.chars() {
+            if let Some(d) = c.to_digit(10) {
+                n = n * 10 + u64::from(d);
+                continue;
+            }
+            total += n * match c {
+                's' => 1,
+                'm' => 60,
+                'h' => 3_600,
+                'd' => 86_400,
+                other => panic!("unknown unit {other} in {s}"),
+            };
+            n = 0;
+        }
+        assert_eq!(n, 0, "trailing digits with no unit in {s}");
+        total
     }
 }
 

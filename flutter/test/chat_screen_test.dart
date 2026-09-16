@@ -303,7 +303,7 @@ void main() {
     await _open(tester, fake);
 
     expect(find.text('Accept'), findsOneWidget);
-    expect(find.text('Trust'), findsOneWidget);
+    expect(find.text('Always accept'), findsOneWidget);
     expect(find.text('Decline'), findsOneWidget);
 
     // The ids match by construction: the chat message id IS the transfer id.
@@ -311,7 +311,7 @@ void main() {
     await tester.pump();
     expect(fake.calls, contains('accept:fr-1'));
 
-    await tester.tap(find.text('Trust'));
+    await tester.tap(find.text('Always accept'));
     await tester.pump();
     expect(fake.calls, contains('acceptTrust:fr-1'));
 
@@ -364,7 +364,7 @@ void main() {
     // pass by never rendering anything.
     expect(find.text('Accept'), findsOneWidget);
     expect(find.text('Decline'), findsOneWidget);
-    expect(find.text('Trust'), findsOneWidget);
+    expect(find.text('Always accept'), findsOneWidget);
 
     // The engine registers the transfer and starts it in the same breath —
     // that is what auto-accept looks like on the event stream.
@@ -394,7 +394,7 @@ void main() {
 
     expect(find.text('Accept'), findsNothing);
     expect(find.text('Decline'), findsNothing);
-    expect(find.text('Trust'), findsNothing);
+    expect(find.text('Always accept'), findsNothing);
     // The row itself is still there — only the dead controls are gone.
     expect(find.text('report.pdf'), findsOneWidget);
   });

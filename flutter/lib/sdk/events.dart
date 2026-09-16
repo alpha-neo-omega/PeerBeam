@@ -248,6 +248,19 @@ class TransferEvent extends BridgeEvent {
   /// comparison is the user's, out of band, and it is the whole point.
   String get pairingCode => payload['pairing_code'] as String? ?? '';
 
+  /// Whether the engine is actually waiting for the user to decide about this
+  /// incoming transfer.
+  ///
+  /// False when nobody will be asked — the device is auto-accepted, a revoked
+  /// `files` permission refused it outright, or it is resuming a transfer this
+  /// user already accepted. The engine now settles that BEFORE it emits
+  /// `transfer_queued`, precisely so a surface does not have to guess.
+  ///
+  /// Defaults to **true** for an engine too old to report it, which is the safe
+  /// direction: an unnecessary prompt is a nuisance, a file that lands with no
+  /// prompt the user was owed is not.
+  bool get needsDecision => payload['needs_decision'] as bool? ?? true;
+
   /// Direction as the engine spells it (`transfer_interrupted`, whose row is
   /// rebuilt from a checkpoint rather than from a `transfer_queued` this
   /// session saw).

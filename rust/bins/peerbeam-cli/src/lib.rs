@@ -11,6 +11,7 @@ pub mod exit;
 pub mod groups;
 pub mod groups_sync;
 pub mod history;
+pub mod identify;
 pub mod logs;
 pub mod notes;
 pub mod output;

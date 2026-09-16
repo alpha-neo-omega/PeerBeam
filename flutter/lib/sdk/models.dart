@@ -593,16 +593,25 @@ abstract final class ChatStatusValue {
 class ChatReaction {
   final String emoji;
   final String by; // 'out' (mine) | 'in' (theirs)
-  final DateTime at;
 
-  const ChatReaction({required this.emoji, required this.by, required this.at});
+  /// When the reaction was stamped, or null when the string was absent or not
+  /// ISO-8601.
+  ///
+  /// Nullable rather than defaulted to `DateTime.now()`, which is what this
+  /// used to do: the timestamp on a reaction from the peer is the peer's own
+  /// unvalidated string, and a fabricated "now" is not a missing value, it is
+  /// a wrong one — it reads as a real instant, and re-reads as a *different*
+  /// real instant every time the row is parsed again.
+  final DateTime? at;
+
+  const ChatReaction({required this.emoji, required this.by, this.at});
 
   bool get isMine => by == 'out';
 
   factory ChatReaction.fromJson(Map<String, dynamic> j) => ChatReaction(
     emoji: j['emoji'] as String? ?? '',
     by: j['by'] as String? ?? 'in',
-    at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
+    at: DateTime.tryParse(j['timestamp'] as String? ?? ''),
   );
 }
 
@@ -611,7 +620,33 @@ class ChatMessage {
   final String peerId;
   final String direction; // 'out' | 'in'
   final String body;
-  final DateTime at;
+
+  /// When the message was **sent**, as its sender stamped it — or null when
+  /// there is no usable stamp.
+  ///
+  /// On an inbound row this is the peer's own claim about its own clock, and
+  /// nothing on the wire validates its shape. Nullable, and deliberately not
+  /// defaulted to `DateTime.now()`, which is what this used to do: a
+  /// fabricated "now" is not a missing value but a wrong one. It reads as a
+  /// real send time, it is the *current* time rather than any time the message
+  /// relates to, and because it is minted afresh on every parse the same
+  /// bubble showed a later clock after each reload — while the Conversations
+  /// list, fed the same string, correctly said it knew nothing. Compare
+  /// [ChatConversation.lastAt] and [ChatSearchHit.at], which already keep null.
+  ///
+  /// Use [shownAt] for the time a surface shows and sorts by; this field is
+  /// the sender's claim, and is not that.
+  final DateTime? at;
+
+  /// When **this device** stored the row, or null for a row written before the
+  /// engine recorded that.
+  ///
+  /// The trustworthy half of the pair: it is this device's own clock, so it
+  /// cannot be skewed or chosen by a peer. It is what the engine already
+  /// measures a disappearing-message window against, and it is what a surface
+  /// must order by — ordering by [at] hands a peer with a fast clock the
+  /// arrangement of the user's transcript.
+  final DateTime? storedAt;
 
   /// One of [ChatStatusValue].
   final String status;
@@ -667,6 +702,7 @@ class ChatMessage {
     required this.body,
     required this.at,
     required this.status,
+    this.storedAt,
     this.kind = ChatMessageKind.text,
     this.fileName,
     this.fileSize,
@@ -678,6 +714,43 @@ class ChatMessage {
   });
 
   bool get isMine => direction == 'out';
+
+  /// The row's time: **[storedAt] when there is one**, else [at]. Null when
+  /// nothing is known, which renders as no time at all — never as "now".
+  ///
+  /// One getter, used for both what is shown and what the transcript is sorted
+  /// by, because the two must not be allowed to disagree. This briefly was two
+  /// — display from the sender's `at`, order from the local `storedAt` — and
+  /// the pair is unstable: any row whose arrival is materially later than its
+  /// send time then sits in one place while claiming another. A message a peer
+  /// queued while offline is exactly that row. It arrives stamped 08:00 (the
+  /// outbox flush carries the original `timestamp`) but is stored on arrival at
+  /// 14:30 (`ChatRecord::received` stamps `Utc::now()` unconditionally), so it
+  /// correctly sorted last and then printed "08:00" underneath a bubble reading
+  /// "14:30".
+  ///
+  /// # Why the local clock wins
+  ///
+  /// It is the only clock every row in a transcript shares. The sender's stamp
+  /// cannot be used for ordering: a peer whose clock runs fast would place its
+  /// messages above ones sent after them, and one running slow would bury its
+  /// reply beneath the message it is answering — the defect this whole area was
+  /// fixed for.
+  ///
+  /// And it cannot be used for *display* either, given that. From the
+  /// receiver's side "sent long ago, delivered late" and "sent just now by a
+  /// device whose clock is behind" are the same two numbers; there is no way to
+  /// tell them apart, so there is no rule that shows the send time only in the
+  /// honest case. What this device can always state as fact is when the message
+  /// reached it, so that is what it says.
+  ///
+  /// [at] is still carried, and is the right field for anything that wants the
+  /// sender's claim as a claim.
+  DateTime? get shownAt => storedAt ?? at;
+
+  /// The time to **order** this row by. An alias of [shownAt] — see there for
+  /// why ordering and display are deliberately the same number.
+  DateTime? get orderedAt => shownAt;
 
   /// Whether this message answers another.
   bool get isReply => inReplyTo != null;
@@ -701,7 +774,8 @@ class ChatMessage {
       peerId: j['peer_id'] as String? ?? '',
       direction: j['direction'] as String? ?? 'in',
       body: j['body'] as String? ?? '',
-      at: DateTime.tryParse(j['timestamp'] as String? ?? '') ?? DateTime.now(),
+      at: DateTime.tryParse(j['timestamp'] as String? ?? ''),
+      storedAt: DateTime.tryParse(j['stored_at'] as String? ?? ''),
       status: j['status'] as String? ?? ChatStatusValue.received,
       kind: j['kind'] as String? ?? ChatMessageKind.text,
       fileName: file?['name'] as String?,
@@ -715,7 +789,7 @@ class ChatMessage {
           const [],
       readAt: DateTime.tryParse(j['read_at'] as String? ?? ''),
       inReplyTo: j['in_reply_to'] as String?,
-          group: j['group'] as String?,
+      group: j['group'] as String?,
     );
   }
 
@@ -741,6 +815,7 @@ class ChatMessage {
     direction: direction,
     body: body,
     at: at,
+    storedAt: storedAt,
     status: status ?? this.status,
     kind: kind ?? this.kind,
     fileName: fileName ?? this.fileName,
@@ -749,6 +824,13 @@ class ChatMessage {
     reactions: reactions ?? this.reactions,
     readAt: readAt ?? this.readAt,
     inReplyTo: inReplyTo ?? this.inReplyTo,
+    // Carried, though no caller passes it. This method documents that an
+    // omitted argument never clears a field, and `group` was being dropped:
+    // any status settling on a group row — the ordinary path for an outgoing
+    // one — turned it back into a one-to-one message, which is the difference
+    // between it appearing in the group's transcript and appearing in a
+    // private thread with whoever sent it.
+    group: group,
   );
 }
 
@@ -766,12 +848,17 @@ class ChatMessage {
 class ChatConversation {
   final String peerId;
 
-  /// When the newest record in the thread was stamped, or null for a thread
-  /// this build could not read. Such a thread is still listed — dropping it
-  /// would hide the very conversation this list exists to make reachable.
+  /// When **this device** stored the newest record in the thread, or null for a
+  /// thread this build could not read (or one whose only rows predate the
+  /// engine recording it). Such a thread is still listed — dropping it would
+  /// hide the very conversation this list exists to make reachable.
   ///
-  /// Best-effort recency only: an inbound record's timestamp came off the
-  /// peer's own clock.
+  /// Real recency, not best-effort: the engine reports this from the row's
+  /// `stored_at`, so it is this device's own clock. It used to be the newest
+  /// record's `timestamp`, which on an inbound row is the peer's claim about
+  /// its own clock — a peer running hours fast held the top of the list and
+  /// read "just now" indefinitely, and a peer running slow buried a thread a
+  /// message had just arrived in.
   final DateTime? lastAt;
 
   /// How many **inbound file offers in this thread are still awaiting the
@@ -803,7 +890,12 @@ class ChatConversation {
     peerId: j['peer_id'] as String? ?? '',
     // Absent, explicitly null, or unparseable all mean the same thing here:
     // nothing is known about when this thread last moved.
-    lastAt: DateTime.tryParse(j['last_timestamp'] as String? ?? ''),
+    // `last_at` is when this device stored the newest row; `last_timestamp` is
+    // that row's own stamp, which on an inbound row is the peer's. Prefer the
+    // local one and fall back only for an engine too old to report it.
+    lastAt:
+        DateTime.tryParse(j['last_at'] as String? ?? '') ??
+        DateTime.tryParse(j['last_timestamp'] as String? ?? ''),
     unreadHint: (j['unread_hint'] as num?)?.toInt() ?? 0,
   );
 }
@@ -826,8 +918,15 @@ class ChatSearchHit {
   /// The message's id within that conversation.
   final String messageId;
 
-  /// When the message was stamped. Best-effort recency for an inbound row,
-  /// whose timestamp came off the peer's own clock.
+  /// When this hit happened, by **this device's** clock — the same instant the
+  /// engine ranked the results by.
+  ///
+  /// Prefers the engine's `stored_at` and falls back to the row's own
+  /// `timestamp` only for an engine too old to report it. It used to be the
+  /// timestamp alone, which is the sender's claim on an inbound row: the list
+  /// was then ordered by one clock and dated by another, so a peer running fast
+  /// read "just now" indefinitely and a hit could be labelled older than the
+  /// ones below it. Null for a row nothing can date.
   final DateTime? at;
 
   /// `'out'` or `'in'`, spelled as [ChatMessage.direction] is.
@@ -859,7 +958,9 @@ class ChatSearchHit {
   factory ChatSearchHit.fromJson(Map<String, dynamic> j) => ChatSearchHit(
     peerId: j['peer_id'] as String? ?? '',
     messageId: j['message_id'] as String? ?? '',
-    at: DateTime.tryParse(j['timestamp'] as String? ?? ''),
+    at:
+        DateTime.tryParse(j['stored_at'] as String? ?? '') ??
+        DateTime.tryParse(j['timestamp'] as String? ?? ''),
     direction: j['direction'] as String? ?? 'in',
     kind: j['kind'] as String? ?? ChatMessageKind.text,
     snippet: j['snippet'] as String? ?? '',
@@ -1100,7 +1201,15 @@ class BrowseListing {
 class TimelineEvent {
   /// One of `transfer`, `chat`, `clipboard`.
   final String kind;
-  final DateTime at;
+
+  /// When it happened, or null when this build cannot date it.
+  ///
+  /// Nullable rather than defaulted to `DateTime.now()`, which is what this
+  /// used to do. A fabricated "now" is not a missing value but a wrong one, and
+  /// here it disagreed with the engine on purpose: the engine sorts a row it
+  /// cannot date *oldest*, so a row labelled "just now" sat at the bottom of a
+  /// newest-first list — and read as a different "just now" on every refresh.
+  final DateTime? at;
 
   /// The other device, or empty when this device acted alone.
   final String peer;
@@ -1121,7 +1230,7 @@ class TimelineEvent {
 
   factory TimelineEvent.fromJson(Map<String, dynamic> j) => TimelineEvent(
     kind: j['kind'] as String? ?? '',
-    at: DateTime.tryParse(j['at'] as String? ?? '') ?? DateTime.now(),
+    at: DateTime.tryParse(j['at'] as String? ?? ''),
     peer: j['peer'] as String? ?? '',
     detail: j['detail'] as String? ?? '',
     ok: j['ok'] as bool? ?? true,
@@ -1478,4 +1587,41 @@ class GroupSendResult {
     required this.sent,
     this.skipped = const [],
   });
+}
+
+/// Who answered at an address, as `pb_peer_identify` reports it.
+///
+/// The point of the call is [deviceId]: a conversation is filed under the
+/// peer's authenticated id, and neither a Tailscale-discovered peer (known here
+/// as `ts:<node id>`) nor a typed address carries one. Everything else here is
+/// what a first contact is entitled to see before trusting the answer.
+class PeerIdentity {
+  /// The authenticated device id — what actually completed the handshake, not
+  /// what the caller guessed.
+  final String deviceId;
+
+  /// The name that device calls itself.
+  final String name;
+
+  /// Whether this handshake was the first contact with it, so its key was
+  /// pinned just now.
+  final bool newlyTrusted;
+
+  /// The safety number both devices derive from the keys they negotiated.
+  /// Worth showing on first contact and meaningless otherwise.
+  final String pairingCode;
+
+  const PeerIdentity({
+    required this.deviceId,
+    required this.name,
+    required this.newlyTrusted,
+    required this.pairingCode,
+  });
+
+  factory PeerIdentity.fromJson(Map<String, dynamic> j) => PeerIdentity(
+    deviceId: j['device_id'] as String? ?? '',
+    name: j['name'] as String? ?? '',
+    newlyTrusted: j['newly_trusted'] == true,
+    pairingCode: j['pairing_code'] as String? ?? '',
+  );
 }

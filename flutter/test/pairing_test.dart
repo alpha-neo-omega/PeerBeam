@@ -198,7 +198,7 @@ void main() {
       state.settings.setRequirePairingConfirmation(true);
       await _emit(tester, fake, newlyTrusted: true, pairingCode: _code);
 
-      await _tap(tester, find.text('Trust'));
+      await _tap(tester, find.text('Always accept'));
       expect(_decisions(fake), isEmpty);
       await _tap(tester, find.text('The codes match'));
       expect(_decisions(fake), ['acceptTrust:tx-new:confirmed']);

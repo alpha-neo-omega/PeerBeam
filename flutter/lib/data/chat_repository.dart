@@ -196,6 +196,31 @@ class ChatRepository extends ChangeNotifier {
     await refresh(peerId);
   }
 
+  /// Re-apply a disappearing-message window that may have closed since the
+  /// thread was opened, and re-read what is left.
+  ///
+  /// A no-op for a conversation with no window, so a caller can tick this
+  /// unconditionally.
+  ///
+  /// [openThread] does this once, when the thread opens. That is not enough on
+  /// its own: a window closes while the user is *looking* at the thread, and
+  /// nothing re-read it, so expired messages stayed readable on screen —
+  /// directly beneath a strip saying they disappear after an hour — until the
+  /// screen was left and re-entered. The engine had already stopped returning
+  /// them, and a prune may already have deleted them from disk; only the
+  /// surface still had them.
+  Future<void> sweepRetention(String peerId) async {
+    if (retentionFor(peerId).seconds == null) return;
+    try {
+      await _api?.pruneChat(peerId: peerId);
+    } catch (_) {
+      // Best-effort, exactly as in [openThread]: filtering still holds, so a
+      // failed prune is a stale disk rather than a wrong screen.
+    }
+    if (_disposed) return;
+    await refresh(peerId);
+  }
+
   /// Pull the persisted conversation with [peerId] from the engine.
   ///
   /// A failure keeps whatever is already on screen — a stale conversation is
@@ -216,9 +241,13 @@ class ChatRepository extends ChangeNotifier {
       //
       // Engine history is authoritative for everything it knows about, but it
       // cannot know about a share the engine refused before persisting
-      // anything — so those rows are carried across, newest last (they were
-      // created just now, and nothing will ever deliver them). See [_unsent].
-      _byPeer[peerId] = [...msgs, ...?_unsent[peerId]];
+      // anything — so those rows are carried across. See [_unsent].
+      //
+      // Ordered, not concatenated. `_unsent` rows were appended after all of
+      // history, which pinned a refused share to the bottom of the thread for
+      // the rest of the session: a bubble stamped 12:00 sat below every
+      // message sent after it, and physically jumped down past each new one.
+      _byPeer[peerId] = _ordered([...msgs, ...?_unsent[peerId]]);
       _loadErrors.remove(peerId);
       notifyListeners();
     } catch (e) {
@@ -477,10 +506,24 @@ class ChatRepository extends ChangeNotifier {
     if (api == null) return;
     // The watermark is the newest message *they* sent: telling a peer we read
     // our own messages would be nonsense.
+    //
+    // **The highest id, not the last row.** `ChatStore::apply_receipt` marks
+    // every row whose `id` is lexicographically at or below `read_through`, so
+    // the watermark has to be the maximum id or it silently covers less. This
+    // used to be `theirs.last.id`, which was the same thing only while the list
+    // was in engine (id) order; sorting the transcript by `storedAt` broke that
+    // equivalence for exactly the case the sort exists for — a peer whose clock
+    // runs behind mints lower ids for messages that arrive later, so the
+    // last-arrived row is not the highest. The receipt would then permanently
+    // under-report: a watermark only moves forward, so those messages never get
+    // a read tick on the sender's device at all.
     final theirs = _byPeer[peerId]?.where((m) => !m.isMine).toList();
     if (theirs == null || theirs.isEmpty) return;
+    final watermark = theirs
+        .map((m) => m.id)
+        .reduce((a, b) => a.compareTo(b) >= 0 ? a : b);
     try {
-      await api.chatMarkRead(peerId, theirs.last.id);
+      await api.chatMarkRead(peerId, watermark);
     } catch (_) {
       // A receipt is a courtesy; failing to send one is never worth surfacing.
     }
@@ -676,6 +719,9 @@ class ChatRepository extends ChangeNotifier {
     if (list != null && i >= 0) {
       final failed = list[i].copyWith(status: ChatStatusValue.failed);
       list[i] = failed;
+      // Appended to `_unsent` (a set of rows to carry across a refresh, whose
+      // own order does not matter), but `refresh` re-orders the merged list —
+      // see [_ordered]. It must not simply concatenate them onto the end.
       (_unsent[peerId] ??= <ChatMessage>[]).add(failed);
     }
     notifyListeners();
@@ -687,8 +733,75 @@ class ChatRepository extends ChangeNotifier {
     return i >= 0 ? norm.substring(i + 1) : norm;
   }
 
+  /// The order a transcript is displayed in: oldest first, by when **this
+  /// device** learned of each row, with the message id as a stable tiebreak.
+  ///
+  /// [ChatMessage.orderedAt] and not [ChatMessage.at]: `at` is the sender's own
+  /// stamp, so ordering by it lets a peer whose clock runs fast place its
+  /// messages above ones sent after them, and buries a peer whose clock runs
+  /// slow underneath the message it is answering.
+  ///
+  /// Sorted here rather than trusted from the engine because two of the rows in
+  /// this list never reach the engine at all — an optimistic row awaiting its
+  /// reply, and an [_unsent] row the engine refused — so the surface is the
+  /// only place that can see all of them at once.
+  static List<ChatMessage> _ordered(List<ChatMessage> rows) {
+    final sorted = [...rows];
+    sorted.sort(_byTime);
+    return sorted;
+  }
+
+  /// Oldest first, by [ChatMessage.orderedAt], with the message id as a
+  /// tiebreak.
+  ///
+  /// A row this device cannot date at all sorts **oldest** — before everything
+  /// it can date — matching what the engine does with the same row (see
+  /// `SearchHit::order`, which substitutes the minimum instant). It is
+  /// deliberately not "fall back to comparing ids", which reads as the gentler
+  /// choice and is not a valid ordering at all: with one undatable row `b`, ids
+  /// could put `a` after `b` and `b` after `c` while the two datable rows' times
+  /// put `a` before `c`. A comparator that contradicts itself like that leaves
+  /// `List.sort` free to return any arrangement, which is the flakiness this
+  /// tiebreak exists to prevent.
+  static int _byTime(ChatMessage a, ChatMessage b) {
+    final byTime = _epoch(a).compareTo(_epoch(b));
+    return byTime != 0 ? byTime : a.id.compareTo(b.id);
+  }
+
+  /// [ChatMessage.orderedAt] as a sortable integer, with an undatable row
+  /// pinned to the oldest end. Not a claim that the row happened at the epoch —
+  /// nothing displays this — only a definite place for "we do not know when".
+  static int _epoch(ChatMessage m) =>
+      m.orderedAt?.microsecondsSinceEpoch ?? -1 << 62;
+
+  /// Insert [m] into [list] at its place in [_byTime] order.
+  ///
+  /// A linear scan from the end, because the overwhelmingly common case is an
+  /// arrival that belongs last and finds its slot on the first comparison.
+  static void _insert(List<ChatMessage> list, ChatMessage m) {
+    var i = list.length;
+    while (i > 0 && _byTime(list[i - 1], m) > 0) {
+      i--;
+    }
+    list.insert(i, m);
+  }
+
   void _onReceived(ChatMessage m) {
-    (_byPeer[m.peerId] ??= <ChatMessage>[]).add(m);
+    // A group message belongs to the group's transcript, not to a private
+    // thread with whoever happened to send it. `ChatStore` files it under the
+    // sender's namespace either way, and `group` is what tells the two apart —
+    // without this guard a group message arriving while that member's private
+    // conversation was open was rendered inside it.
+    if (m.group != null) {
+      notifyListeners();
+      return;
+    }
+    // Inserted in time order rather than appended. An arrival is usually the
+    // newest thing in the thread, but not always: a peer that was offline
+    // queues its messages and flushes them on reconnect, so a burst of rows
+    // stamped hours ago used to land *below* messages the user had sent
+    // minutes earlier — and then jump back up on the next refresh.
+    _insert(_byPeer[m.peerId] ??= <ChatMessage>[], m);
     notifyListeners();
     // A record can create a conversation that did not exist a moment ago —
     // which is exactly the thread the Conversations list exists to surface —

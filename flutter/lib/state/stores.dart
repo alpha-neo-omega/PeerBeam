@@ -16,6 +16,7 @@ import '../data/trust_repository.dart';
 import '../sdk/events.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
+import 'chat_presence.dart';
 import 'staging.dart';
 
 /// Per-domain state. Screens listen to only the piece they need (via
@@ -423,6 +424,13 @@ class AppState {
   /// Group conversations, and the invitations waiting for an answer.
   final GroupsRepository groups;
 
+  /// Which chat thread is on screen, and whether the app has the foreground.
+  ///
+  /// Not a constructor argument: it is this process's knowledge about its own
+  /// window, so there is never an alternative one to inject. Distinct from
+  /// [presence], which is what *peers* have told us about themselves.
+  final ChatPresence chatPresence = ChatPresence();
+
   /// Set while another device is looking for this one.
   final RingAlert ring;
   final PresenceRepository presence;
@@ -523,6 +531,7 @@ class AppState {
     device.dispose();
     trust.dispose();
     chat.dispose();
+    chatPresence.dispose();
     presence.dispose();
     transfer.dispose();
     history.dispose();

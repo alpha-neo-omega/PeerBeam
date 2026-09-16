@@ -458,10 +458,28 @@ impl ChatStore {
                 }
             }
         }
-        // Ids are time-ordered, so this is chronological across members without
-        // trusting any peer's clock — the same property the per-conversation
-        // listing gets for free from the store's key order.
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        // Chronological across members by **this device's** clock, with the id
+        // as a stable tiebreak so two rows stored in the same instant resolve
+        // the same way on every call.
+        //
+        // This used to sort on the id alone, with a comment claiming that was
+        // chronological "without trusting any peer's clock". It was not: a
+        // `mint_id` embeds 13 digits of the *minting* device's millis, and an
+        // inbound row's id is copied straight off the wire
+        // (`ChatRecord::received`/`file_in`). So every member's own clock
+        // decided where its messages sat in the shared transcript — a member
+        // running behind had its newest message drawn above the one it was
+        // answering, and a member running fast pinned itself to the end.
+        //
+        // `age_basis` is `stored_at`, when this device wrote the row, falling
+        // back to the parsed timestamp only for a row written before that field
+        // existed. A row datable by neither sorts oldest rather than claiming
+        // the newest slot, and is never dropped.
+        out.sort_by(|a, b| {
+            a.age_basis()
+                .cmp(&b.age_basis())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(out)
     }
 
@@ -1756,6 +1774,57 @@ mod tests {
             "a group message leaked into the private thread"
         );
         assert_eq!(one_to_one[0].body, "just between us");
+    }
+
+    /// **A member's own clock does not decide where its messages sit.** The
+    /// transcript used to be sorted on the message id alone, under a comment
+    /// claiming that was chronological "without trusting any peer's clock" — a
+    /// `mint_id` embeds the *minting* device's millis, and an inbound row's id
+    /// comes straight off the wire, so it trusted every member's clock at once.
+    /// A member running behind had its reply drawn above the question.
+    #[test]
+    fn a_group_transcript_is_ordered_by_this_devices_clock_not_each_members() {
+        let (cs, _store, _dir) = new_store();
+        let bob = DeviceId::from("pb-bob");
+
+        // My question, stored at 11:00.
+        let mut mine = ChatMessage::new("shall we meet at six").unwrap();
+        mine.group = Some("g-1".into());
+        let mut question = ChatRecord::sent(&bob, &mine);
+        question.stored_at = Some(
+            DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        cs.append(&question).unwrap();
+
+        // Bob's reply. His clock runs three hours behind, so his id and
+        // timestamp are 08:00 — but it reached us at 12:00.
+        let mut hers = ChatMessage::new("six works").unwrap();
+        hers.group = Some("g-1".into());
+        hers.id = "0000000000000aaaaaaaaaaaaaaaaaaa".to_string();
+        hers.timestamp = "2026-01-01T08:00:00Z".to_string();
+        let mut reply = ChatRecord::received(&bob, &hers);
+        reply.stored_at = Some(
+            DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        cs.append(&reply).unwrap();
+
+        // Bob's id sorts first by every string comparison there is; the reply
+        // still comes second, because that is when it got here.
+        assert!(
+            reply.id < question.id,
+            "the test needs Bob's id to sort first"
+        );
+        let thread = cs.group_history("g-1").unwrap();
+        let bodies: Vec<&str> = thread.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["shall we meet at six", "six works"],
+            "a member's reply was ordered above the message it answers"
+        );
     }
 
     /// The group transcript is gathered across the members it was sent to, and
