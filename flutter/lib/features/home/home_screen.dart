@@ -530,6 +530,33 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Done on the tap rather than in the background on discovery, deliberately:
   /// dialling every peer the moment it appears would make the app reach out to
   /// machines the user never asked it to touch.
+  /// Open the thread for a provider-scoped [device] whose authenticated id is
+  /// already known.
+  ///
+  /// The target is looked up by the **resolved** id, which `peerTarget` knows
+  /// how to find through the same mapping — and comes back null while the peer
+  /// is offline, which opens the thread read-only rather than refusing it.
+  void _openResolvedThread(
+    BuildContext context,
+    Device device,
+    String deviceId,
+  ) {
+    final scope = AppScope.of(context);
+    final target =
+        scope.device.peerTarget(deviceId) ??
+        PeerTarget(
+          id: deviceId,
+          name: device.name,
+          addresses: const [],
+          port: 0,
+        );
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ChatScreen(peerId: deviceId, peer: target),
+      ),
+    );
+  }
+
   /// The devices an identify dial is in flight for.
   ///
   /// A dial takes as long as a dial takes — up to `CONNECT_TIMEOUT` (8s) per
@@ -691,6 +718,16 @@ class _HomeScreenState extends State<HomeScreen> {
       // Found by a provider that names it its own way — Tailscale calls it
       // `ts:<node>`. Ask the address who is actually there, then open the
       // thread under that id. Nothing is sent by asking.
+      //
+      // Unless it has been asked before. A remembered answer opens the thread
+      // at once, costs no connection, and — the part that matters — works
+      // while the peer is offline, which a dial cannot. A conversation is
+      // local history; needing the peer up to read it would be backwards.
+      final known = AppScope.of(context).device.resolvedIdFor(device.id);
+      if (known != null && canChatWithDeviceId(known)) {
+        _openResolvedThread(context, device, known);
+        return;
+      }
       unawaited(_chatAfterIdentifying(context, device));
       return;
     }

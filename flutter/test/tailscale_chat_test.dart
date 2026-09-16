@@ -22,6 +22,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/discovery_repository.dart';
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/features/home/home_screen.dart';
 import 'package:peerbeam/sdk/error_text.dart';
@@ -31,6 +32,8 @@ import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/state/app_scope.dart';
 import 'package:peerbeam/state/stores.dart';
 import 'package:peerbeam/widgets/pairing.dart';
+
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'sdk/fake_peerbeam.dart';
 
@@ -83,6 +86,11 @@ Future<void> _tapChat(WidgetTester tester) async {
 }
 
 void main() {
+  // Every path here records what a dial learned, and that write goes to
+  // shared_preferences — so the whole file needs a store, not just the group
+  // that reads one back.
+  setUp(() => SharedPreferences.setMockInitialValues({}));
+
   group('first contact is shown, not swallowed', () {
     testWidgets('the pairing code and what to do with it are put on screen', (
       tester,
@@ -185,6 +193,121 @@ void main() {
 
       expect(find.text(firstContactTitle), findsNothing);
       expect(find.byType(ChatScreen), findsOneWidget);
+    });
+  });
+
+  // The thread is filed under the id that ANSWERED, and discovery only ever
+  // reports `ts:<node>`. Without a mapping between the two, reopening the
+  // conversation asked for a target under an id discovery has never heard of,
+  // got null, and rendered a disabled composer that said the peer was
+  // unreachable — while that peer sat online in the device list one screen
+  // away. The conversation was openable exactly once.
+  group('a resolved identity is remembered', () {
+    testWidgets('the thread can find its peer again after being left', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      fake.identities[_identityKey] = const PeerIdentity(
+        deviceId: 'pb-alice-laptop',
+        name: 'alice-laptop',
+        newlyTrusted: false,
+        pairingCode: '',
+      );
+      final state = await _pump(tester, fake);
+      await _tapChat(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+
+      // Reopening from Conversations asks by the ANSWERED id, which is all a
+      // thread knows. That must still resolve to a live, sendable route.
+      final target = state.device.peerTarget('pb-alice-laptop');
+      expect(target, isNotNull);
+      expect(target!.addresses, ['100.101.102.103']);
+      expect(target.port, 49600);
+      // Carrying the answered id, never `ts:` — the engine files the
+      // conversation by this, and its store refuses a colon.
+      expect(target.id, 'pb-alice-laptop');
+    });
+
+    testWidgets('a second visit opens without dialling again', (tester) async {
+      final fake = FakePeerBeam();
+      fake.identities[_identityKey] = const PeerIdentity(
+        deviceId: 'pb-alice-laptop',
+        name: 'alice-laptop',
+        newlyTrusted: false,
+        pairingCode: '',
+      );
+      await _pump(tester, fake);
+      await _tapChat(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+
+      await tester.pageBack();
+      // Pumped by hand: the chat screen keeps animations alive, so a settle
+      // waits on something that never finishes.
+      for (var i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+      await _tapChat(tester);
+
+      expect(find.byType(ChatScreen), findsOneWidget);
+      expect(
+        fake.calls.where((c) => c.startsWith('peerIdentify:')).length,
+        1,
+        reason: 'the answer was already known; asking again costs a connection',
+      );
+    });
+
+    testWidgets('what was learned survives a restart', (tester) async {
+      final fake = FakePeerBeam();
+      fake.identities[_identityKey] = const PeerIdentity(
+        deviceId: 'pb-alice-laptop',
+        name: 'alice-laptop',
+        newlyTrusted: false,
+        pairingCode: '',
+      );
+      await _pump(tester, fake);
+      await _tapChat(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+
+      // A fresh repository over the same store — what the next launch builds.
+      final next = DiscoveryRepository(api: FakePeerBeam());
+      addTearDown(next.dispose);
+      await next.loadIdentities();
+
+      expect(next.resolvedIdFor('ts:nodeidabc123'), 'pb-alice-laptop');
+    });
+
+    // A conversation is local history. Needing the peer up to read what it
+    // already said would be backwards, and a dial cannot succeed anyway.
+    testWidgets('an offline peer still opens its thread, read-only', (
+      tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        'resolved_identities_v1': '{"ts:nodeidabc123":"pb-alice-laptop"}',
+      });
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await state.device.loadIdentities();
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(home: HomeScreen()),
+        ),
+      );
+      await tester.pump();
+      fake.emit(const DeviceAdded(_tailscale));
+      fake.emit(const DeviceStatusChanged('ts:nodeidabc123', false));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      await _tapChat(tester);
+
+      expect(find.byType(ChatScreen), findsOneWidget);
+      expect(
+        fake.calls.where((c) => c.startsWith('peerIdentify:')),
+        isEmpty,
+        reason: 'nothing was dialled — the answer was already on disk',
+      );
     });
   });
 

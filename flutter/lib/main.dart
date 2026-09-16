@@ -148,6 +148,11 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // baseline is seeded from real history, not an empty list — otherwise
         // every historical send would look "new" on cold start.
         await _android.start();
+        // The identities earlier sessions resolved by dialling — which peer a
+        // `ts:<node>` turned out to be. Read before discovery starts, so a
+        // conversation opened in the first seconds already knows how to reach
+        // its peer instead of offering a dead composer.
+        await _state.device.loadIdentities();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
         // The tray reads the repositories above, so it is started once they

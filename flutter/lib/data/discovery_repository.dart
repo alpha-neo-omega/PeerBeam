@@ -1,7 +1,9 @@
 // ignore_for_file: prefer_initializing_formals
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../sdk/events.dart';
 import '../sdk/exceptions.dart';
@@ -21,8 +23,75 @@ class DiscoveryRepository extends ChangeNotifier {
   StreamSubscription<BridgeEvent>? _sub;
   bool _disposed = false;
 
+  /// Provider-scoped id → the authenticated device id that answered there.
+  ///
+  /// A Tailscale peer is discovered as `ts:<node>`, which is Tailscale's name
+  /// for it and not one a conversation can be filed under. [identify] dials and
+  /// learns the real one, and **this is where that answer survives the tap**.
+  ///
+  /// Without it the thread was openable exactly once. It is filed under the
+  /// answered id, so reopening it from Conversations asks [peerTarget] for an
+  /// id discovery has never reported — `_raw` is keyed by what the provider
+  /// said — which came back null, and a null target is a disabled composer.
+  /// The conversation became permanently read-only the moment you left it, and
+  /// said the peer was unreachable while it sat online in the device list.
+  ///
+  /// It maps id to **id**, never id to address: the address always comes from
+  /// whatever discovery is reporting right now, so a node that moves cannot
+  /// leave a stale route behind. A tailnet node id is stable, which is what
+  /// makes it worth persisting at all.
+  final Map<String, String> _identified = {};
+
+  /// Where [_identified] is kept between runs. Versioned, because the shape of
+  /// what an id means is exactly the kind of thing that changes.
+  static const _identifiedKey = 'resolved_identities_v1';
+
   DiscoveryRepository({PeerBeamApi? api}) : _api = api {
     _sub = _api?.events.listen(_onEvent);
+  }
+
+  /// Read the remembered identities. Call once at boot; safe to call again.
+  Future<void> loadIdentities() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_identifiedKey);
+      if (raw == null) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      for (final entry in decoded.entries) {
+        final key = entry.key;
+        final value = entry.value;
+        if (key is String &&
+            value is String &&
+            key.isNotEmpty &&
+            value.isNotEmpty) {
+          _identified[key] = value;
+        }
+      }
+      if (_identified.isNotEmpty && !_disposed) notifyListeners();
+    } catch (_) {
+      // A store that will not read is a conversation that needs one more dial,
+      // not a boot failure.
+    }
+  }
+
+  /// The authenticated id already known for [providerId], or null.
+  ///
+  /// Lets a surface skip the dial entirely for a peer it has identified before
+  /// — including while that peer is offline, where the dial could not succeed
+  /// and the thread is still worth reading.
+  String? resolvedIdFor(String providerId) => _identified[providerId];
+
+  Future<void> _rememberIdentity(String providerId, String deviceId) async {
+    if (_identified[providerId] == deviceId) return;
+    _identified[providerId] = deviceId;
+    if (!_disposed) notifyListeners();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_identifiedKey, jsonEncode(_identified));
+    } catch (_) {
+      // Kept for this session even if it could not be written.
+    }
   }
 
   List<Device> get devices => List.unmodifiable(_byId.values);
@@ -52,7 +121,16 @@ class DiscoveryRepository extends ChangeNotifier {
       return (identity: null, error: const PeerBeamUnavailable('no engine'));
     }
     try {
-      return (identity: await api.peerIdentify(peer), error: null);
+      final identity = await api.peerIdentify(peer);
+      // Remember which discovered device this answer belongs to, so the
+      // conversation can find its peer again after the screen is closed.
+      // A target with no id of its own — a typed address — has nothing to key
+      // the memory by, and is dialled afresh each time.
+      final providerId = peer.id;
+      if (providerId != null && providerId.isNotEmpty) {
+        await _rememberIdentity(providerId, identity.deviceId);
+      }
+      return (identity: identity, error: null);
     } catch (e) {
       return (identity: null, error: e);
     }
@@ -61,12 +139,33 @@ class DiscoveryRepository extends ChangeNotifier {
   bool get scanning => _scanning;
   int get onlineCount => _byId.values.where((d) => d.online).length;
 
-  /// A send target for a discovered device, or null if unknown/unaddressed.
+  /// A send target for [id], or null when nothing addressable answers to it.
+  ///
+  /// [id] is looked up as a discovered id first and, failing that, as an
+  /// **authenticated** one that [identify] has previously tied to a discovered
+  /// device — see [_identified]. That second lookup is what lets a conversation
+  /// with a Tailscale peer be reopened: the thread knows the peer only by the
+  /// id that answered, and discovery knows it only as `ts:<node>`.
+  ///
+  /// The returned target carries the id it was **asked** for, not the one the
+  /// route was found under. That matters: the engine files a conversation by
+  /// `peer.id`, so handing back the `ts:` id here would write the thread into a
+  /// namespace its own store refuses.
   PeerTarget? peerTarget(String id) {
-    final d = _raw[id];
-    if (d == null || d.addresses.isEmpty || d.port == 0) return null;
+    final direct = _raw[id];
+    if (direct != null) return _targetFor(direct, id);
+    for (final entry in _identified.entries) {
+      if (entry.value != id) continue;
+      final raw = _raw[entry.key];
+      if (raw != null) return _targetFor(raw, id);
+    }
+    return null;
+  }
+
+  PeerTarget? _targetFor(SdkDevice d, String id) {
+    if (d.addresses.isEmpty || d.port == 0) return null;
     return PeerTarget(
-      id: d.id,
+      id: id,
       name: d.name,
       addresses: d.addresses,
       port: d.port,
