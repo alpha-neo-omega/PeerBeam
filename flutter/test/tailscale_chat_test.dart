@@ -311,6 +311,75 @@ void main() {
     });
   });
 
+  // "Send to address" reaches a server, a headless box, or a tailnet peer that
+  // discovery cannot see. It offered files, a folder and a one-off text — and
+  // no way to start a conversation, which is the thing you would want with a
+  // machine you have to type the address of.
+  group('a conversation can be started from a typed address', () {
+    testWidgets('the sheet offers Chat alongside the sends', (tester) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(home: HomeScreen()),
+        ),
+      );
+      await tester.pump();
+
+      await tester.tap(find.byTooltip('Send to address'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, '100.64.0.7');
+      await tester.tap(find.text('Next'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Files'), findsOneWidget);
+      expect(find.text('Text'), findsOneWidget);
+      expect(find.text('Chat'), findsOneWidget);
+    });
+
+    testWidgets('choosing it asks the address who is there, then opens', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      fake.identities['100.64.0.7:49600'] = const PeerIdentity(
+        deviceId: 'pb-server',
+        name: 'server',
+        newlyTrusted: false,
+        pairingCode: '',
+      );
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(home: HomeScreen()),
+        ),
+      );
+      await tester.pump();
+
+      await tester.tap(find.byTooltip('Send to address'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, '100.64.0.7');
+      await tester.tap(find.text('Next'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Chat'));
+      for (var i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      expect(fake.calls, contains('peerIdentify:100.64.0.7:49600'));
+      expect(find.byType(ChatScreen), findsOneWidget);
+      // Filed under the id that answered — a typed address has none of its
+      // own, which is the whole reason it has to ask.
+      expect(
+        tester.widget<ChatScreen>(find.byType(ChatScreen)).peerId,
+        'pb-server',
+      );
+    });
+  });
+
   group('the dial itself', () {
     // A responsive app is one whose button can be pressed again. Before the
     // call went off the UI isolate the second tap was impossible because

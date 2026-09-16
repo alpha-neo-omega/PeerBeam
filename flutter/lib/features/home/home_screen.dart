@@ -42,7 +42,15 @@ class HomeScreen extends StatefulWidget {
 }
 
 /// What the "what do you want to send" sheet returned.
-enum _SendKind { files, folder, text }
+/// What to do with a target once one has been chosen — a typed address, a
+/// saved device, or a discovered one.
+///
+/// [chat] is not a send at all, which is why this is no longer only about
+/// sending: it opens a conversation. It belongs on the same sheet because the
+/// question a person is answering is the same one — *I have this device, now
+/// what?* — and having to know that chat lives somewhere else is how it came
+/// to be unreachable by address in the first place.
+enum _SendKind { files, folder, text, chat }
 
 class _HomeScreenState extends State<HomeScreen> {
   /// Open a search over discovered devices; on pick, send files to it.
@@ -184,7 +192,14 @@ class _HomeScreenState extends State<HomeScreen> {
             ListTile(
               leading: const Icon(Icons.notes_rounded),
               title: const Text('Text'),
+              subtitle: const Text('One message, sent like a file'),
               onTap: () => Navigator.pop(ctx, _SendKind.text),
+            ),
+            ListTile(
+              leading: const Icon(Icons.chat_bubble_outline_rounded),
+              title: const Text('Chat'),
+              subtitle: const Text('Open a conversation you can come back to'),
+              onTap: () => Navigator.pop(ctx, _SendKind.chat),
             ),
           ],
         ),
@@ -205,6 +220,20 @@ class _HomeScreenState extends State<HomeScreen> {
         if (text == null || text.trim().isEmpty || !context.mounted) return;
         scope.staging.addText(text);
         await sendStaged(context, target, name);
+      case _SendKind.chat:
+        // A conversation is filed under the peer's **authenticated** id, and a
+        // typed address carries none — so this asks, exactly as tapping chat
+        // on a Tailscale device does. Keyed by the address, since there is no
+        // device id to key concurrent taps by.
+        final id = target.id;
+        await _chatAfterIdentifying(
+          context,
+          target: target,
+          label: name,
+          key: id != null && id.isNotEmpty
+              ? id
+              : '${target.addresses.firstOrNull ?? ''}:${target.port}',
+        );
     }
   }
 
@@ -236,248 +265,202 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Dialog to collect a host/IP (or MagicDNS name) and port → [PeerTarget].
   Future<PeerTarget?> _promptForAddress(BuildContext context) async {
-    final host = TextEditingController();
-    final port = TextEditingController(text: '49600');
     String? error;
-    try {
-      return await showDialog<PeerTarget>(
-        context: context,
-        builder: (context) => StatefulBuilder(
-          builder: (context, setState) => AlertDialog(
-            title: const Text('Send to address'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: host,
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Host / IP or MagicDNS name',
-                  ),
-                ),
-                const Gap(AppSpace.sm),
-                TextField(
-                  controller: port,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'Port'),
-                ),
-                if (error != null) ...[
-                  const Gap(AppSpace.sm),
-                  Text(
-                    error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+    return showDialog<PeerTarget>(
+      context: context,
+      // The fields belong to the dialog, not to this function — see
+      // [_FormFields] for what disposing them here instead used to throw.
+      builder: (context) => _FormFields(
+        initial: const ['', '49600'],
+        builder: (context, fields) {
+          final host = fields[0];
+          final port = fields[1];
+          return StatefulBuilder(
+            builder: (context, setState) => AlertDialog(
+              title: const Text('Send to address'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: host,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Host / IP or MagicDNS name',
                     ),
                   ),
+                  const Gap(AppSpace.sm),
+                  TextField(
+                    controller: port,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Port'),
+                  ),
+                  if (error != null) ...[
+                    const Gap(AppSpace.sm),
+                    Text(
+                      error!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ],
                 ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final h = host.text.trim();
+                    final p = int.tryParse(port.text.trim()) ?? 0;
+                    if (h.isEmpty || p <= 0 || p > 65535) {
+                      setState(
+                        () => error =
+                            'Enter a host and a port between 1 and 65535',
+                      );
+                      return;
+                    }
+                    Navigator.pop(
+                      context,
+                      PeerTarget(name: h, addresses: [h], port: p),
+                    );
+                  },
+                  child: const Text('Next'),
+                ),
               ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final h = host.text.trim();
-                  final p = int.tryParse(port.text.trim()) ?? 0;
-                  if (h.isEmpty || p <= 0 || p > 65535) {
-                    setState(
-                      () =>
-                          error = 'Enter a host and a port between 1 and 65535',
-                    );
-                    return;
-                  }
-                  Navigator.pop(
-                    context,
-                    PeerTarget(name: h, addresses: [h], port: p),
-                  );
-                },
-                child: const Text('Next'),
-              ),
-            ],
-          ),
-        ),
-      );
-    } finally {
-      host.dispose();
-      port.dispose();
-    }
+          );
+        },
+      ),
+    );
   }
 
   /// Save a device (name + host/IP or MagicDNS + port) to the persistent book.
   Future<void> _addSavedDevice(BuildContext context) async {
     final scope = AppScope.of(context);
-    final name = TextEditingController();
-    final host = TextEditingController();
-    final port = TextEditingController(text: '49600');
+    final entry = await _promptForDeviceEntry(
+      context,
+      title: 'Add device',
+      action: 'Save',
+    );
+    if (entry == null) return;
+    await scope.saved.add(name: entry.name, host: entry.host, port: entry.port);
+  }
+
+  /// The add/edit form, which is the same three fields either way.
+  ///
+  /// Returns the **values**, not a yes/no. It used to pop a bool and then read
+  /// the controllers back here afterwards, which is the mirror image of the
+  /// disposal bug [_FormFields] describes: the fields belong to a dialog that
+  /// has closed, and reaching back into them works only for as long as nothing
+  /// has cleaned them up.
+  Future<_DeviceEntry?> _promptForDeviceEntry(
+    BuildContext context, {
+    required String title,
+    required String action,
+    String name = '',
+    String host = '',
+    int port = 49600,
+  }) {
     String? error;
-    try {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (context) => StatefulBuilder(
-          builder: (context, setState) => AlertDialog(
-            // See `_editSavedDevice` for why this is scrollable — same three
-            // fields, same keyboard.
-            scrollable: true,
-            title: const Text('Add device'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: name,
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Name'),
-                ),
-                const Gap(AppSpace.sm),
-                TextField(
-                  controller: host,
-                  decoration: const InputDecoration(
-                    labelText: 'Host / IP or MagicDNS name',
+    return showDialog<_DeviceEntry>(
+      context: context,
+      builder: (context) => _FormFields(
+        initial: [name, host, '$port'],
+        builder: (context, fields) {
+          final nameField = fields[0];
+          final hostField = fields[1];
+          final portField = fields[2];
+          return StatefulBuilder(
+            builder: (context, setState) => AlertDialog(
+              // Scrollable: three fields plus an error line, with a software
+              // keyboard over them on a phone.
+              scrollable: true,
+              title: Text(title),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameField,
+                    autofocus: true,
+                    decoration: const InputDecoration(labelText: 'Name'),
                   ),
-                ),
-                const Gap(AppSpace.sm),
-                TextField(
-                  controller: port,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'Port'),
-                ),
-                if (error != null) ...[
                   const Gap(AppSpace.sm),
-                  Text(
-                    error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+                  TextField(
+                    controller: hostField,
+                    decoration: const InputDecoration(
+                      labelText: 'Host / IP or MagicDNS name',
                     ),
                   ),
+                  const Gap(AppSpace.sm),
+                  TextField(
+                    controller: portField,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Port'),
+                  ),
+                  if (error != null) ...[
+                    const Gap(AppSpace.sm),
+                    Text(
+                      error!,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ],
                 ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final h = hostField.text.trim();
+                    final p = int.tryParse(portField.text.trim()) ?? 0;
+                    if (h.isEmpty || p <= 0 || p > 65535) {
+                      setState(
+                        () => error =
+                            'Enter a host and a port between 1 and 65535',
+                      );
+                      return;
+                    }
+                    final n = nameField.text.trim();
+                    Navigator.pop(context, (
+                      name: n.isEmpty ? h : n,
+                      host: h,
+                      port: p,
+                    ));
+                  },
+                  child: Text(action),
+                ),
               ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final h = host.text.trim();
-                  final p = int.tryParse(port.text.trim()) ?? 0;
-                  if (h.isEmpty || p <= 0 || p > 65535) {
-                    setState(
-                      () =>
-                          error = 'Enter a host and a port between 1 and 65535',
-                    );
-                    return;
-                  }
-                  Navigator.pop(context, true);
-                },
-                child: const Text('Save'),
-              ),
-            ],
-          ),
-        ),
-      );
-      if (ok != true) return;
-      final h = host.text.trim();
-      final p = int.tryParse(port.text.trim()) ?? 0;
-      final n = name.text.trim().isEmpty ? h : name.text.trim();
-      if (h.isEmpty || p <= 0 || p > 65535) return;
-      await scope.saved.add(name: n, host: h, port: p);
-    } finally {
-      name.dispose();
-      host.dispose();
-      port.dispose();
-    }
+          );
+        },
+      ),
+    );
   }
 
   /// Edit a saved device's name/address in place.
   Future<void> _editSavedDevice(BuildContext context, SavedDevice d) async {
     final scope = AppScope.of(context);
-    final name = TextEditingController(text: d.name);
-    final host = TextEditingController(text: d.host);
-    final port = TextEditingController(text: '${d.port}');
-    String? error;
-    try {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (context) => StatefulBuilder(
-          builder: (context, setState) => AlertDialog(
-            // Scrollable, because three fields plus the validation line is
-            // taller than what a phone keyboard leaves of a 720px screen.
-            // `AlertDialog` shrinks itself to the space above the keyboard and
-            // gives the remainder to `content`, so an unscrolled Column
-            // overflowed — and the error line explaining what to fix was the
-            // first thing to fall off the bottom, which is the one part the
-            // user needed to read.
-            scrollable: true,
-            title: const Text('Edit device'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: name,
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Name'),
-                ),
-                const Gap(AppSpace.sm),
-                TextField(
-                  controller: host,
-                  decoration: const InputDecoration(
-                    labelText: 'Host / IP or MagicDNS name',
-                  ),
-                ),
-                const Gap(AppSpace.sm),
-                TextField(
-                  controller: port,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'Port'),
-                ),
-                if (error != null) ...[
-                  const Gap(AppSpace.sm),
-                  Text(
-                    error!,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  ),
-                ],
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  final h = host.text.trim();
-                  final p = int.tryParse(port.text.trim()) ?? 0;
-                  if (h.isEmpty || p <= 0 || p > 65535) {
-                    setState(
-                      () =>
-                          error = 'Enter a host and a port between 1 and 65535',
-                    );
-                    return;
-                  }
-                  Navigator.pop(context, true);
-                },
-                child: const Text('Save'),
-              ),
-            ],
-          ),
-        ),
-      );
-      if (ok != true) return;
-      final h = host.text.trim();
-      final p = int.tryParse(port.text.trim()) ?? 0;
-      final n = name.text.trim().isEmpty ? h : name.text.trim();
-      if (h.isEmpty || p <= 0 || p > 65535) return;
-      await scope.saved.update(d.id, name: n, host: h, port: p);
-    } finally {
-      name.dispose();
-      host.dispose();
-      port.dispose();
-    }
+    final entry = await _promptForDeviceEntry(
+      context,
+      title: 'Edit device',
+      action: 'Save',
+      name: d.name,
+      host: d.host,
+      port: d.port,
+    );
+    if (entry == null) return;
+    await scope.saved.update(
+      d.id,
+      name: entry.name,
+      host: entry.host,
+      port: entry.port,
+    );
   }
 
   /// Confirm before removing a saved device.
@@ -569,28 +552,28 @@ class _HomeScreenState extends State<HomeScreen> {
   final Set<String> _identifying = <String>{};
 
   Future<void> _chatAfterIdentifying(
-    BuildContext context,
-    Device device,
-  ) async {
+    BuildContext context, {
+    required PeerTarget target,
+    required String label,
+
+    /// What to de-duplicate concurrent dials by — a discovered device's id, or
+    /// the address itself when there is no device behind it.
+    required String key,
+  }) async {
     final scope = AppScope.of(context);
-    final target = scope.device.peerTarget(device.id);
     void snack(String m) => ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(m)));
-    if (target == null) {
-      snack('${device.name} is not reachable right now');
-      return;
-    }
-    if (!_identifying.add(device.id)) return; // already asking this one
+    if (!_identifying.add(key)) return; // already asking this one
     final ({PeerIdentity? identity, Object? error}) answer;
     try {
       answer = await withProcessing(
         context,
-        'Asking ${device.name} who it is…',
+        'Asking $label who it is…',
         () => scope.device.identify(target),
       );
     } finally {
-      _identifying.remove(device.id);
+      _identifying.remove(key);
     }
     if (!context.mounted) return;
 
@@ -603,8 +586,8 @@ class _HomeScreenState extends State<HomeScreen> {
       final why = answer.error;
       snack(
         why == null
-            ? 'Could not reach ${device.name} to start a conversation'
-            : '${device.name}: ${friendlyError(why)}',
+            ? 'Could not reach $label to start a conversation'
+            : '$label: ${friendlyError(why)}',
       );
       return;
     }
@@ -625,7 +608,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (identity.newlyTrusted && identity.pairingCode.isNotEmpty) {
       final choice = await confirmFirstContact(
         context,
-        peerName: identity.name.isEmpty ? device.name : identity.name,
+        peerName: identity.name.isEmpty ? label : identity.name,
         pairingCode: identity.pairingCode,
         mustConfirm: scope.settings.requirePairingConfirmation,
       );
@@ -636,8 +619,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final refused = await scope.trust.remove(identity.deviceId);
         if (!context.mounted) return;
         snack(
-          refused ??
-              'Forgot ${identity.name.isEmpty ? device.name : identity.name}',
+          refused ?? 'Forgot ${identity.name.isEmpty ? label : identity.name}',
         );
         return;
       }
@@ -650,7 +632,7 @@ class _HomeScreenState extends State<HomeScreen> {
           peerId: identity.deviceId,
           peer: PeerTarget(
             id: identity.deviceId,
-            name: identity.name.isEmpty ? device.name : identity.name,
+            name: identity.name.isEmpty ? label : identity.name,
             addresses: target.addresses,
             port: target.port,
           ),
@@ -728,7 +710,25 @@ class _HomeScreenState extends State<HomeScreen> {
         _openResolvedThread(context, device, known);
         return;
       }
-      unawaited(_chatAfterIdentifying(context, device));
+      final target = AppScope.of(context).device.peerTarget(device.id);
+      if (target == null) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text('${device.name} is not reachable right now'),
+            ),
+          );
+        return;
+      }
+      unawaited(
+        _chatAfterIdentifying(
+          context,
+          target: target,
+          label: device.name,
+          key: device.id,
+        ),
+      );
       return;
     }
     final target = AppScope.of(context).device.peerTarget(device.id);
@@ -1506,3 +1506,52 @@ class _SelectionBar extends StatelessWidget {
     );
   }
 }
+
+/// A dialog body that owns its text controllers.
+///
+/// Creating the controllers beside `showDialog` and disposing them in a
+/// `finally` is the obvious shape, and it is wrong. `showDialog`'s future
+/// completes when the route is **popped**, not when it is gone: the dialog
+/// keeps building through its exit transition, and the very next rebuild hits
+/// a controller that has already been disposed — "A TextEditingController was
+/// used after being disposed", thrown from deep inside the framework while the
+/// user watches a dialog fade out.
+///
+/// Owning them here ties their life to this element's, which Flutter disposes
+/// once the route is actually finished. Callers must therefore take what they
+/// need out of the fields **before** popping, and pop the values — reading a
+/// controller after the dialog has closed is the same mistake from the other
+/// end.
+class _FormFields extends StatefulWidget {
+  const _FormFields({required this.initial, required this.builder});
+
+  /// One starting value per field, in the order the builder indexes them.
+  final List<String> initial;
+
+  final Widget Function(BuildContext context, List<TextEditingController> f)
+  builder;
+
+  @override
+  State<_FormFields> createState() => _FormFieldsState();
+}
+
+class _FormFieldsState extends State<_FormFields> {
+  late final List<TextEditingController> _fields = [
+    for (final text in widget.initial) TextEditingController(text: text),
+  ];
+
+  @override
+  void dispose() {
+    for (final field in _fields) {
+      field.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.builder(context, _fields);
+}
+
+/// What the add/edit dialogs hand back: the values, taken while the fields
+/// were still alive.
+typedef _DeviceEntry = ({String name, String host, int port});
