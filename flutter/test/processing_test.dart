@@ -143,4 +143,85 @@ void main() {
     await _pumpFrames(tester);
     expect(find.text('working…'), findsNothing);
   });
+
+  group('a spinner the user can leave', () {
+    // The reason this exists: a dial is as long as the peer decides. 8s per
+    // resolved address, 120s if one answers and then stalls. Behind a
+    // `canPop: false` barrier with no action, that is a frozen app.
+    testWidgets('gives up and answers null', (tester) async {
+      final gate = Completer<String>();
+      String? result = 'untouched';
+      var completed = false;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (ctx) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () async {
+                    result = await withCancellableProcessing(
+                      ctx,
+                      'asking…',
+                      () => gate.future,
+                    );
+                    completed = true;
+                  },
+                  child: const Text('go'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('go'));
+      await tester.pump();
+      expect(find.text('asking…'), findsOneWidget);
+
+      await tester.tap(find.text('Stop waiting'));
+      await _pumpFrames(tester);
+
+      expect(completed, isTrue);
+      expect(result, isNull);
+      expect(find.text('asking…'), findsNothing);
+
+      // The engine call is not aborted — nothing here can do that — and it
+      // finishing later must not blow up the app that stopped listening.
+      gate.complete('late');
+      await _pumpFrames(tester);
+    });
+
+    testWidgets('an answer that arrives first is returned as normal', (
+      tester,
+    ) async {
+      String? result;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (ctx) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () async {
+                    result = await withCancellableProcessing(
+                      ctx,
+                      'asking…',
+                      () async => 'answered',
+                    );
+                  },
+                  child: const Text('go'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('go'));
+      await _pumpFrames(tester);
+
+      expect(result, 'answered');
+      expect(find.text('asking…'), findsNothing);
+    });
+  });
 }

@@ -238,13 +238,20 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         peerId;
   }
 
-  /// What to call a group, for a notification title. Falls back to its id.
+  /// What to call a group, for a notification title.
+  ///
+  /// Returns empty rather than the id when the group list has not been read —
+  /// which, since nothing loads it until the Groups screen is opened, is the
+  /// ordinary state on a fresh start. A group id is a 32-character hex string;
+  /// putting that on a lock screen as the name of a conversation tells the
+  /// reader nothing and looks like a fault. `chatNotice` renders an empty
+  /// group name as a plain heading instead.
   String _groupName(String groupId) =>
       _state.groups.groups
           .where((g) => g.id == groupId)
           .map((g) => g.name)
           .firstOrNull ??
-      groupId;
+      '';
 
   /// Show a chat notification on whichever backend this platform has.
   ///
@@ -268,6 +275,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // The receive icon: a message arriving is incoming, and the alternative
         // is the upload glyph.
         incoming: true,
+        // Its own channel — audible, and separately silenceable. See
+        // [NotificationContent.chat].
+        chat: true,
       ),
     );
   }
@@ -301,19 +311,39 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // reach the window themselves.
       }
     }
-    final context = rootNavigatorKey.currentContext;
+    // Already looking at it. Clicking a notification for the thread that is
+    // open would otherwise push a second copy of it on top of the first, so
+    // leaving took two backs out of a conversation the user never left.
+    if (_state.chatPresence.openConversation == threadKey) return;
+
+    var context = rootNavigatorKey.currentContext;
     if (context == null || !context.mounted) return;
 
     if (threadKey.startsWith('group:')) {
       final id = threadKey.substring('group:'.length);
-      final group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
-      // A group this device has since left, or one the list has not loaded
-      // back yet. Nothing sensible to open, and inventing a placeholder group
-      // would offer a composer that sends to nobody.
-      if (group == null) return;
+      var group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
+      if (group == null) {
+        // Nothing reads the group list until the Groups screen is opened, so
+        // on a fresh start this is simply not loaded yet — and the click did
+        // nothing at all, silently, which is the worst of both. Read it and
+        // look again.
+        await _state.groups.refresh();
+        group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
+      }
+      final current = rootNavigatorKey.currentContext;
+      if (current == null || !current.mounted) return;
+      context = current;
+      if (group == null) {
+        // A group this device has genuinely left, or one the read could not
+        // recover. Say so: a click that does nothing reads as a broken app.
+        _messengerKey.currentState?.showSnackBar(
+          const SnackBar(content: Text('That group is no longer available')),
+        );
+        return;
+      }
       await Navigator.of(context).push(
         MaterialPageRoute(
-          builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
+          builder: (_) => GroupChatScreen(group: group!, nameFor: _peerName),
         ),
       );
       return;

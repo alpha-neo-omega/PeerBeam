@@ -18,6 +18,16 @@ class NotificationContent {
   /// selects the download small-icon instead of the upload one.
   final bool incoming;
 
+  /// True for an arriving message, which is posted on its own Android channel.
+  ///
+  /// Not cosmetic. Transfers are `IMPORTANCE_LOW` with `setOnlyAlertOnce`,
+  /// which is right for a progress bar and wrong for a message: on that
+  /// channel a message lands in the shade without a sound and is seen whenever
+  /// the phone is next unlocked. The channel is also the only handle Android
+  /// gives the **user** — one channel means silencing transfer noise silences
+  /// their conversations too, with no way to separate them.
+  final bool chat;
+
   const NotificationContent({
     required this.id,
     required this.title,
@@ -25,6 +35,7 @@ class NotificationContent {
     this.ongoing = false,
     this.progress,
     this.incoming = false,
+    this.chat = false,
   });
 }
 
@@ -160,6 +171,7 @@ class AndroidBridge implements PlatformBridge {
         'ongoing': c.ongoing,
         'progress': c.progress,
         'incoming': c.incoming,
+        'chat': c.chat,
       });
 
   @override

@@ -565,9 +565,12 @@ class _HomeScreenState extends State<HomeScreen> {
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(m)));
     if (!_identifying.add(key)) return; // already asking this one
-    final ({PeerIdentity? identity, Object? error}) answer;
+    // Cancellable, because the length of this is the peer's to decide: 8s per
+    // resolved address before it gives up, and 120s if one answers and then
+    // stalls mid-handshake. Behind a plain barrier that is a frozen app.
+    final ({PeerIdentity? identity, Object? error})? answer;
     try {
-      answer = await withProcessing(
+      answer = await withCancellableProcessing(
         context,
         'Asking $label who it is…',
         () => scope.device.identify(target),
@@ -576,6 +579,10 @@ class _HomeScreenState extends State<HomeScreen> {
       _identifying.remove(key);
     }
     if (!context.mounted) return;
+    // They stopped waiting. Nothing to say — they know what they did, and the
+    // dial finishes on its own; whatever it learns is still recorded, so
+    // trying again may well be instant.
+    if (answer == null) return;
 
     final identity = answer.identity;
     if (identity == null) {

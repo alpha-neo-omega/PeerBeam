@@ -1021,4 +1021,86 @@ void main() {
       reason: 'the corner of the target did not open the reaction picker',
     );
   });
+  // A phone's return key is the only key it has for a line break. The composer
+  // set `textInputAction: TextInputAction.send`, which turns that key into
+  // Send — so a field that grows to five lines could never reach the second
+  // one, and every attempt at a paragraph sent the message instead.
+  group('the composer', () {
+    testWidgets('return inserts a newline rather than sending', (tester) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(
+              peerId: 'pb-bob',
+              peer: PeerTarget(
+                id: 'pb-bob',
+                name: 'Bob',
+                addresses: ['10.0.0.2'],
+                port: 49600,
+              ),
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      await tester.enterText(find.byType(TextField), 'first line');
+      await tester.testTextInput.receiveAction(TextInputAction.newline);
+      await tester.pump();
+
+      expect(
+        fake.calls.where((c) => c.startsWith('chatSend:')),
+        isEmpty,
+        reason: 'return is for a line break; the button sends',
+      );
+    });
+
+    // Sending rebuilds the screen. Without a focus node owned above that
+    // rebuild, the field lost focus every time — the keyboard closed after
+    // each message on a phone, and on desktop the next thing typed went
+    // nowhere.
+    testWidgets('focus stays in the composer after a send', (tester) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(
+              peerId: 'pb-bob',
+              peer: PeerTarget(
+                id: 'pb-bob',
+                name: 'Bob',
+                addresses: ['10.0.0.2'],
+                port: 49600,
+              ),
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.tap(find.byTooltip('Send'));
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.focusNode?.hasFocus, isTrue);
+    });
+  });
 }

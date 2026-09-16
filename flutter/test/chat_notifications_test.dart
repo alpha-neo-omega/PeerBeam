@@ -226,9 +226,19 @@ void main() {
         expect(n.threadKey, 'group:g1');
       });
 
-      test('an unnamed group falls back to its id', () {
-        final n = chatNotice(_msg(group: 'g1'), peerName: 'Bob');
-        expect(n.title, 'g1');
+      // Nothing reads the group list until Groups is opened, so an arriving
+      // group message on a fresh start has no name to use. A group id is 32
+      // hex characters — as a conversation's name on a lock screen it tells
+      // the reader nothing and looks like a fault.
+      test('an unnamed group gets a heading, never its raw id', () {
+        final n = chatNotice(
+          _msg(group: '7f3a9c21b04e4d8fa1c6e5720b93d4aa', body: 'ping'),
+          peerName: 'Bob',
+        );
+        expect(n.title, 'New group message');
+        expect(n.title, isNot(contains('7f3a')));
+        // The part that makes it worth having is still there.
+        expect(n.body, 'Bob: ping');
       });
 
       test('an unnamed speaker falls back to their device id', () {

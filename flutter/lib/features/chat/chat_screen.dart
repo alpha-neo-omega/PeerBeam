@@ -55,6 +55,10 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
 
+  /// The composer's focus, owned here so it outlives the rebuild a send
+  /// causes. See [_send].
+  final _composerFocus = FocusNode();
+
   /// Message ids the user has picked out of this thread.
   ///
   /// Selection **is** this set being non-empty — there is no separate mode
@@ -107,6 +111,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _retentionTick?.cancel();
     _controller.dispose();
+    _composerFocus.dispose();
     // Passing the peer id matters: pushing one thread on top of another builds
     // the new screen before disposing the old, so an unconditional clear here
     // would blank the thread that had just registered.
@@ -223,6 +228,11 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.trim().isEmpty) return;
     final state = AppScope.of(context);
     _controller.clear();
+    // Stay in the composer. Sending rebuilds the screen, and without this the
+    // field lost focus every time — so the keyboard closed after each message
+    // on a phone, and on desktop the next thing typed went nowhere. A chat
+    // where every message costs an extra tap to start typing again.
+    _composerFocus.requestFocus();
     // Resolved as the message goes out, not as the thread was opened: an
     // address that arrived in between is the address this send needs.
     final replyTo = _replyToId;
@@ -973,6 +983,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 _Composer(
                   controller: _controller,
+                  focusNode: _composerFocus,
                   onSend: _send,
                   onAttach: _attach,
                   enabled: canSend,
@@ -2045,11 +2056,16 @@ class _AttachOption extends StatelessWidget {
 /// nothing can be typed into a message that could not exist.
 class _Composer extends StatelessWidget {
   final TextEditingController controller;
+
+  /// Kept by the screen, not by this widget, so focus survives the rebuild
+  /// that sending causes.
+  final FocusNode focusNode;
   final VoidCallback onSend;
   final VoidCallback onAttach;
   final bool enabled;
   const _Composer({
     required this.controller,
+    required this.focusNode,
     required this.onSend,
     required this.onAttach,
     this.enabled = true,
@@ -2075,22 +2091,54 @@ class _Composer extends StatelessWidget {
             ),
             const Gap(AppSpace.xxs),
             Expanded(
-              child: TextField(
-                controller: controller,
-                enabled: enabled,
-                textInputAction: TextInputAction.send,
-                minLines: 1,
-                maxLines: 5,
-                decoration: InputDecoration(
-                  hintText: enabled ? 'Message' : 'Not reachable right now',
-                  border: const OutlineInputBorder(
-                    borderRadius: BorderRadius.all(
-                      Radius.circular(AppRadius.xl),
+              // Enter is handled here rather than through `onSubmitted`,
+              // because what it should do differs by platform and the field
+              // cannot express both.
+              //
+              // It used to be `textInputAction: TextInputAction.send`, which
+              // turns the keyboard's return key into Send — and that is the
+              // only key a phone has for a line break. So a composer that
+              // grows to five lines had no way to reach the second one: every
+              // attempt at a new paragraph sent the message instead. On
+              // desktop the same setting made Enter send with no modifier
+              // reaching the field either.
+              //
+              // Now the field always treats Enter as a newline, and on desktop
+              // a bare Enter is intercepted before it gets there and sends.
+              // Shift+Enter is not intercepted, so it breaks the line. Phones
+              // keep Enter as a newline and send with the button, which is
+              // what every other messaging app on the platform does.
+              child: Focus(
+                onKeyEvent: (node, event) {
+                  if (!isDesktop || !enabled) return KeyEventResult.ignored;
+                  if (event is! KeyDownEvent) return KeyEventResult.ignored;
+                  if (event.logicalKey != LogicalKeyboardKey.enter &&
+                      event.logicalKey != LogicalKeyboardKey.numpadEnter) {
+                    return KeyEventResult.ignored;
+                  }
+                  if (HardwareKeyboard.instance.isShiftPressed) {
+                    return KeyEventResult.ignored;
+                  }
+                  onSend();
+                  return KeyEventResult.handled;
+                },
+                child: TextField(
+                  controller: controller,
+                  focusNode: focusNode,
+                  enabled: enabled,
+                  textInputAction: TextInputAction.newline,
+                  minLines: 1,
+                  maxLines: 5,
+                  decoration: InputDecoration(
+                    hintText: enabled ? 'Message' : 'Not reachable right now',
+                    border: const OutlineInputBorder(
+                      borderRadius: BorderRadius.all(
+                        Radius.circular(AppRadius.xl),
+                      ),
                     ),
+                    isDense: true,
                   ),
-                  isDense: true,
                 ),
-                onSubmitted: (_) => onSend(),
               ),
             ),
             const Gap(AppSpace.xs),

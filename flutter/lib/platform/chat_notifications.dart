@@ -125,9 +125,11 @@ int chatNoticeId(String threadKey) =>
 
 /// The notice for [message], assuming [shouldNotifyForMessage] said yes.
 ///
-/// [peerName] is what to call the sender and [groupName] what to call the
-/// group. Either being empty falls back to the id — ugly but true; inventing a
-/// friendly name for something we cannot name would be worse.
+/// [peerName] is what to call the sender; empty falls back to the device id,
+/// which is ugly but true — inventing a friendly name for a device we cannot
+/// name would be worse. [groupName] is what to call the group, and empty falls
+/// back to a plain heading rather than to the id, which would be 32 hex
+/// characters of nothing.
 ChatNotice chatNotice(
   ChatMessage message, {
   required String peerName,
@@ -146,7 +148,12 @@ ChatNotice chatNotice(
   }
   return ChatNotice(
     id: chatNoticeId(key),
-    title: groupName.trim().isEmpty ? group : groupName.trim(),
+    // A group whose name this device has not read yet gets a heading, not its
+    // id. Group ids are 32 hex characters; one of those on a lock screen as
+    // the name of a conversation tells the reader nothing and reads as a
+    // fault. The body still names who spoke, which is the part that makes the
+    // notification worth having.
+    title: groupName.trim().isEmpty ? 'New group message' : groupName.trim(),
     // Who spoke, then what they said. In a one-to-one thread the title already
     // answers "who"; in a group it answers "which conversation", and a body
     // without the speaker leaves the one question a group message raises

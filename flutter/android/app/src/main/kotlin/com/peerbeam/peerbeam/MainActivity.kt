@@ -199,6 +199,11 @@ class MainActivity : FlutterActivity() {
                     call.argument<Boolean>("ongoing") ?: false,
                     call.argument<Int>("progress"),
                     call.argument<Boolean>("incoming") ?: false,
+                    channelId = if (call.argument<Boolean>("chat") == true) {
+                        Notifications.CHAT_CHANNEL_ID
+                    } else {
+                        Notifications.CHANNEL_ID
+                    },
                 )
                 Notifications.show(this, call.argument<Int>("id") ?: 0, n)
                 result.success(null)
