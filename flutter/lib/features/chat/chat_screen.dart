@@ -1168,26 +1168,51 @@ class _Reactions extends StatelessWidget {
       runSpacing: AppSpace.xxs,
       children: [
         for (final e in groups.entries)
-          InkWell(
-            onTap: onTap == null
-                ? null
-                : () => onTap!(e.key, remove: e.value.mine),
-            borderRadius: BorderRadius.circular(AppRadius.sm),
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppSpace.xs,
-                vertical: 1,
-              ),
-              decoration: BoxDecoration(
-                color: fg.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-                border: e.value.mine
-                    ? Border.all(color: scheme.primary, width: 1)
-                    : null,
-              ),
-              child: Text(
-                e.value.count > 1 ? '${e.key} ${e.value.count}' : e.key,
-                style: text.labelSmall?.copyWith(color: fg),
+          Semantics(
+            button: onTap != null,
+            // "👍 2" alone says nothing about what tapping does, and the
+            // difference — adding a reaction or withdrawing your own — is
+            // carried purely by a 1px border.
+            label: e.value.mine
+                ? '${e.key} ${e.value.count}, you reacted, tap to withdraw'
+                : '${e.key} ${e.value.count}, tap to react',
+            excludeSemantics: true,
+            child: InkWell(
+              onTap: onTap == null
+                  ? null
+                  : () => onTap!(e.key, remove: e.value.mine),
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+              // **A real target around a small chip.** The visual chip is about
+              // 18px tall and sits inside the bubble's own tap area, so a miss
+              // did not do nothing — it hit the bubble behind, which on a
+              // received file row opens the file with the OS handler, and on a
+              // slightly long press starts selection instead. The chip keeps
+              // its size; the box that catches the thumb does not.
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(
+                  minHeight: kMinInteractiveDimension,
+                  minWidth: kMinInteractiveDimension,
+                ),
+                child: Center(
+                  widthFactor: 1,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpace.xs,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: fg.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(AppRadius.sm),
+                      border: e.value.mine
+                          ? Border.all(color: scheme.primary, width: 1)
+                          : null,
+                    ),
+                    child: Text(
+                      e.value.count > 1 ? '${e.key} ${e.value.count}' : e.key,
+                      style: text.labelSmall?.copyWith(color: fg),
+                    ),
+                  ),
+                ),
               ),
             ),
           ),
@@ -1325,169 +1350,189 @@ class _ChatBubble extends StatelessWidget {
                 color: bg,
                 borderRadius: BorderRadius.circular(AppRadius.lg),
                 clipBehavior: Clip.antiAlias,
-                child: InkWell(
-                  onTap: selecting
-                      ? onToggle
-                      : (message.isFile && _openablePath(message) != null
-                            ? () => _open(context, message)
-                            : null),
-                  // Long-press is the touch idiom for entering selection; a
-                  // long-press with a mouse is not, so desktop gets the
-                  // right-click it expects. Both land in the same toggle, so the
-                  // first one selects and any later one just adds or removes.
-                  onLongPress: onToggle,
-                  onSecondaryTap: onToggle,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpace.sm,
-                      vertical: AppSpace.xs,
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        // Keyed off `inReplyTo`, not off `parent`: a reply whose
-                        // answered message has gone must still say it is a reply.
-                        if (message.isReply) _ReplyMarker(parent: parent),
-                        if (message.isFile)
-                          _FileBody(
-                            message: message,
-                            fg: fg,
-                            selecting: selecting,
-                          )
-                        else
-                          Text(
-                            message.body,
-                            style: text.bodyMedium?.copyWith(color: fg),
-                          ),
-                        if (error != null) ...[
-                          const Gap(AppSpace.xxs),
-                          Text(
-                            error!,
-                            style: text.labelSmall?.copyWith(
-                              color: scheme.error,
-                            ),
-                          ),
-                        ],
-                        const Gap(AppSpace.xxs),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
+                // **A keyboard way in.** Selection is the gateway to Reply,
+                // Copy, Forward and Delete for a single message, and every way
+                // to start it was a pointer gesture: long-press on touch,
+                // right-click on desktop. A keyboard-only user could Tab onto a
+                // bubble and press Enter, which maps to `onTap` — null on a
+                // text message unless a selection is already open — so those
+                // four actions were unreachable without a mouse.
+                //
+                // Shift+Enter rather than Enter, because Enter already opens a
+                // file on a file row and that is the more common intent.
+                child: CallbackShortcuts(
+                  bindings: {
+                    const SingleActivator(
+                      LogicalKeyboardKey.enter,
+                      shift: true,
+                    ): onToggle,
+                  },
+                  child: InkWell(
+                    onTap: selecting
+                        ? onToggle
+                        : (message.isFile && _openablePath(message) != null
+                              ? () => _open(context, message)
+                              : null),
+                    // Long-press is the touch idiom for entering selection; a
+                    // long-press with a mouse is not, so desktop gets the
+                    // right-click it expects. Both land in the same toggle, so the
+                    // first one selects and any later one just adds or removes.
+                    onLongPress: onToggle,
+                    onSecondaryTap: onToggle,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpace.sm,
+                        vertical: AppSpace.xs,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Keyed off `inReplyTo`, not off `parent`: a reply whose
+                          // answered message has gone must still say it is a reply.
+                          if (message.isReply) _ReplyMarker(parent: parent),
+                          if (message.isFile)
+                            _FileBody(
+                              message: message,
+                              fg: fg,
+                              selecting: selecting,
+                            )
+                          else
                             Text(
-                              _time(message.shownAt),
+                              message.body,
+                              style: text.bodyMedium?.copyWith(color: fg),
+                            ),
+                          if (error != null) ...[
+                            const Gap(AppSpace.xxs),
+                            Text(
+                              error!,
                               style: text.labelSmall?.copyWith(
-                                color: fg.withValues(alpha: 0.7),
+                                color: scheme.error,
                               ),
                             ),
-                            if (mine) ...[
-                              const Gap(AppSpace.xxs),
-                              Builder(
-                                builder: (context) {
-                                  // A read message earns its own glyph rather
-                                  // than a second tick: "delivered" and "read"
-                                  // are different claims, and only one of them
-                                  // is something the peer chose to tell us.
-                                  //
-                                  // **But failure outranks it.** `read_at` is
-                                  // about the chat *row*; a file row's bytes
-                                  // fail, are declined, or are left interrupted
-                                  // quite separately, and the peer may well have
-                                  // read the row before turning the file down.
-                                  // Reading the receipt first painted the blue
-                                  // "read" tick over a file that never arrived —
-                                  // the one glyph on the row, saying the message
-                                  // got there, above a bubble saying it did not.
-                                  final failed = _failedStatus(message.status);
-                                  final read =
-                                      !failed && message.readAt != null;
-                                  return Icon(
-                                    read
-                                        ? Icons.done_all_rounded
-                                        : _deliveryGlyph(message.status),
-                                    size: 14,
-                                    color: read
-                                        ? scheme.primary
-                                        : (failed
-                                              ? scheme.error
-                                              : fg.withValues(alpha: 0.7)),
-                                  );
-                                },
-                              ),
-                            ],
-                            // An explicit control rather than a gesture. A
-                            // double-tap here would put a double-tap recognizer
-                            // in the arena around the whole bubble, which delays
-                            // every tap inside it — including this row's Accept
-                            // and Decline — by the double-tap timeout. A visible
-                            // button costs a few pixels and no latency.
-                            if (onPickReaction != null && !selecting) ...[
-                              const Gap(AppSpace.xxs),
-                              // A full [kMinInteractiveDimension] square. The
-                              // glyph stays 14px — this row is metadata, not a
-                              // toolbar — but the *target* was 18px too, which
-                              // is a third of the minimum: a thumb aimed at it
-                              // landed on the bubble instead, and the bubble's
-                              // own onTap opens the file. The row grows to 48
-                              // and every bubble with it, which is the cheaper
-                              // half of the trade — a control that cannot be
-                              // hit is not a smaller control, it is an absent
-                              // one.
-                              InkWell(
-                                onTap: onPickReaction,
-                                // Named. Every other control on this screen is
-                                // an `IconButton` with a tooltip; this one is a
-                                // bare `InkWell`, so it was announced as an
-                                // unlabelled button — and a tooltip is what
-                                // gives a pointer user the name too.
-                                //
-                                // `excludeFromSemantics` is deliberately not
-                                // set: the bubble around it is a semantics
-                                // container, and a nameless button inside a
-                                // labelled row is exactly what this is fixing.
-                                // The label rides on the Tooltip.
-                                borderRadius: BorderRadius.circular(
-                                  kMinInteractiveDimension / 2,
+                          ],
+                          const Gap(AppSpace.xxs),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                _time(message.shownAt),
+                                style: text.labelSmall?.copyWith(
+                                  color: fg.withValues(alpha: 0.7),
                                 ),
-                                child: Tooltip(
-                                  message: 'Add reaction',
-                                  child: SizedBox(
-                                    width: kMinInteractiveDimension,
-                                    height: kMinInteractiveDimension,
-                                    child: Center(
-                                      child: Icon(
-                                        Icons.add_reaction_outlined,
-                                        size: 14,
-                                        color: fg.withValues(alpha: 0.7),
+                              ),
+                              if (mine) ...[
+                                const Gap(AppSpace.xxs),
+                                Builder(
+                                  builder: (context) {
+                                    // A read message earns its own glyph rather
+                                    // than a second tick: "delivered" and "read"
+                                    // are different claims, and only one of them
+                                    // is something the peer chose to tell us.
+                                    //
+                                    // **But failure outranks it.** `read_at` is
+                                    // about the chat *row*; a file row's bytes
+                                    // fail, are declined, or are left interrupted
+                                    // quite separately, and the peer may well have
+                                    // read the row before turning the file down.
+                                    // Reading the receipt first painted the blue
+                                    // "read" tick over a file that never arrived —
+                                    // the one glyph on the row, saying the message
+                                    // got there, above a bubble saying it did not.
+                                    final failed = _failedStatus(
+                                      message.status,
+                                    );
+                                    final read =
+                                        !failed && message.readAt != null;
+                                    return Icon(
+                                      read
+                                          ? Icons.done_all_rounded
+                                          : _deliveryGlyph(message.status),
+                                      size: 14,
+                                      color: read
+                                          ? scheme.primary
+                                          : (failed
+                                                ? scheme.error
+                                                : fg.withValues(alpha: 0.7)),
+                                    );
+                                  },
+                                ),
+                              ],
+                              // An explicit control rather than a gesture. A
+                              // double-tap here would put a double-tap recognizer
+                              // in the arena around the whole bubble, which delays
+                              // every tap inside it — including this row's Accept
+                              // and Decline — by the double-tap timeout. A visible
+                              // button costs a few pixels and no latency.
+                              if (onPickReaction != null && !selecting) ...[
+                                const Gap(AppSpace.xxs),
+                                // A full [kMinInteractiveDimension] square. The
+                                // glyph stays 14px — this row is metadata, not a
+                                // toolbar — but the *target* was 18px too, which
+                                // is a third of the minimum: a thumb aimed at it
+                                // landed on the bubble instead, and the bubble's
+                                // own onTap opens the file. The row grows to 48
+                                // and every bubble with it, which is the cheaper
+                                // half of the trade — a control that cannot be
+                                // hit is not a smaller control, it is an absent
+                                // one.
+                                InkWell(
+                                  onTap: onPickReaction,
+                                  // Named. Every other control on this screen is
+                                  // an `IconButton` with a tooltip; this one is a
+                                  // bare `InkWell`, so it was announced as an
+                                  // unlabelled button — and a tooltip is what
+                                  // gives a pointer user the name too.
+                                  //
+                                  // `excludeFromSemantics` is deliberately not
+                                  // set: the bubble around it is a semantics
+                                  // container, and a nameless button inside a
+                                  // labelled row is exactly what this is fixing.
+                                  // The label rides on the Tooltip.
+                                  borderRadius: BorderRadius.circular(
+                                    kMinInteractiveDimension / 2,
+                                  ),
+                                  child: Tooltip(
+                                    message: 'Add reaction',
+                                    child: SizedBox(
+                                      width: kMinInteractiveDimension,
+                                      height: kMinInteractiveDimension,
+                                      child: Center(
+                                        child: Icon(
+                                          Icons.add_reaction_outlined,
+                                          size: 14,
+                                          color: fg.withValues(alpha: 0.7),
+                                        ),
                                       ),
                                     ),
                                   ),
                                 ),
-                              ),
+                              ],
                             ],
-                          ],
-                        ),
-                        if (message.reactions.isNotEmpty) ...[
-                          const Gap(AppSpace.xxs),
-                          _Reactions(
-                            reactions: message.reactions,
-                            fg: fg,
-                            onTap: selecting ? null : onReact,
                           ),
-                        ],
-                        // Nothing else will ever clear this row — it exists only
-                        // in this session, because the engine refused to send it
-                        // and therefore persisted nothing. A full-size action,
-                        // not a cramped glyph: it is the only way out. Withheld
-                        // while selecting, like every other in-bubble action.
-                        if (onDismiss != null && !selecting)
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: TextButton(
-                              onPressed: onDismiss,
-                              child: const Text('Dismiss'),
+                          if (message.reactions.isNotEmpty) ...[
+                            const Gap(AppSpace.xxs),
+                            _Reactions(
+                              reactions: message.reactions,
+                              fg: fg,
+                              onTap: selecting ? null : onReact,
                             ),
-                          ),
-                      ],
+                          ],
+                          // Nothing else will ever clear this row — it exists only
+                          // in this session, because the engine refused to send it
+                          // and therefore persisted nothing. A full-size action,
+                          // not a cramped glyph: it is the only way out. Withheld
+                          // while selecting, like every other in-bubble action.
+                          if (onDismiss != null && !selecting)
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton(
+                                onPressed: onDismiss,
+                                child: const Text('Dismiss'),
+                              ),
+                            ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -2411,10 +2456,22 @@ class _Composer extends StatelessWidget {
               ),
             ),
             const Gap(AppSpace.xs),
-            IconButton.filled(
-              onPressed: enabled ? onSend : null,
-              icon: const Icon(Icons.send_rounded),
-              tooltip: 'Send',
+            // **Live exactly when it can send.** It was `enabled ? onSend :
+            // null`, so with nothing typed — or only spaces — the filled,
+            // primary-coloured button looked ready, took the tap with a ripple,
+            // and did nothing at all: no message, no hint, no engine call. The
+            // most prominent control on the screen was inert and said nothing
+            // about it.
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: controller,
+              builder: (context, value, _) {
+                final ready = enabled && value.text.trim().isNotEmpty;
+                return IconButton.filled(
+                  onPressed: ready ? onSend : null,
+                  icon: const Icon(Icons.send_rounded),
+                  tooltip: 'Send',
+                );
+              },
             ),
           ],
         ),

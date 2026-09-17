@@ -734,6 +734,13 @@ void main() {
     await _open(tester, fake);
 
     expect(find.textContaining('No address known'), findsNothing);
+    // The composer is what "working" means here. The send button is separately
+    // gated on there being something to send — see the group below — so an
+    // empty field leaves it inert whether or not the peer is reachable.
+    expect(tester.widget<TextField>(find.byType(TextField)).enabled, isTrue);
+
+    await tester.enterText(find.byType(TextField), 'still reachable');
+    await tester.pump();
     expect(
       tester
           .widget<IconButton>(
@@ -745,6 +752,50 @@ void main() {
           .onPressed,
       isNotNull,
     );
+  });
+
+  // The filled, primary-coloured send button was live with nothing typed: it
+  // took the tap with a ripple and did nothing at all — no message, no hint, no
+  // engine call. The most prominent control on the screen, inert and silent
+  // about it.
+  group('the send button', () {
+    IconButton send(WidgetTester tester) => tester.widget<IconButton>(
+      find.ancestor(
+        of: find.byTooltip('Send'),
+        matching: find.byType(IconButton),
+      ),
+    );
+
+    testWidgets('is inert while there is nothing to send', (tester) async {
+      await _open(tester, FakePeerBeam());
+      expect(send(tester).onPressed, isNull);
+
+      // Whitespace is nothing, and `_send` already refuses it.
+      await tester.enterText(find.byType(TextField), '   ');
+      await tester.pump();
+      expect(send(tester).onPressed, isNull);
+    });
+
+    testWidgets('becomes live as soon as there is', (tester) async {
+      await _open(tester, FakePeerBeam());
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.pump();
+      expect(send(tester).onPressed, isNotNull);
+    });
+
+    testWidgets('goes inert again once the message has gone', (tester) async {
+      final fake = FakePeerBeam();
+      await _open(tester, fake);
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.pump();
+      await tester.tap(find.byTooltip('Send'));
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      expect(fake.calls.where((c) => c.startsWith('chatSend:')), hasLength(1));
+      expect(send(tester).onPressed, isNull);
+    });
   });
 
   testWidgets('tapping a received file whose recorded copy is gone falls back '

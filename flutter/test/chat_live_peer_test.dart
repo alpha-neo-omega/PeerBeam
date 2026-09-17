@@ -84,11 +84,29 @@ Future<void> _settle(WidgetTester tester) async {
 bool _composerEnabled(WidgetTester tester) =>
     tester.widget<TextField>(find.byType(TextField)).enabled ?? true;
 
-bool _sendEnabled(WidgetTester tester) =>
-    tester
-        .widget<IconButton>(find.widgetWithIcon(IconButton, Icons.send_rounded))
-        .onPressed !=
-    null;
+/// Whether the send button would act **given something to send**.
+///
+/// It is separately gated on the composer being non-empty (an always-live
+/// button that does nothing was its own defect), so this types first and
+/// clears after — the question here is about reachability, not about content.
+Future<bool> _sendEnabled(WidgetTester tester) async {
+  final field = find.byType(TextField);
+  if (!(tester.widget<TextField>(field).enabled ?? true)) return false;
+  await tester.tap(field);
+  await tester.pump();
+  await tester.enterText(field, 'probe');
+  await tester.pump();
+  final live =
+      tester
+          .widget<IconButton>(
+            find.widgetWithIcon(IconButton, Icons.send_rounded),
+          )
+          .onPressed !=
+      null;
+  await tester.enterText(field, '');
+  await tester.pump();
+  return live;
+}
 
 bool _attachEnabled(WidgetTester tester) =>
     tester
@@ -108,7 +126,7 @@ void main() {
     // The state the Conversations list opens this thread in: readable, and
     // honest about not being sendable.
     expect(_composerEnabled(tester), isFalse);
-    expect(_sendEnabled(tester), isFalse);
+    expect(await _sendEnabled(tester), isFalse);
     expect(_attachEnabled(tester), isFalse);
     expect(find.textContaining('No address known for x1'), findsOneWidget);
 
@@ -122,13 +140,16 @@ void main() {
       reason: 'the screen went on saying the peer is unreachable',
     );
     expect(_composerEnabled(tester), isTrue);
-    expect(_sendEnabled(tester), isTrue);
+    expect(await _sendEnabled(tester), isTrue);
     expect(_attachEnabled(tester), isTrue);
     // The bar names the device discovery is advertising, not the raw id the
     // thread was opened under.
     expect(find.text('Live Laptop'), findsOneWidget);
 
     await tester.enterText(find.byType(TextField), 'are you back?');
+    // Pumped before the tap: the send button rebuilds from the controller, so
+    // it is still inert in the frame the text was typed into.
+    await tester.pump();
     await tester.tap(find.widgetWithIcon(IconButton, Icons.send_rounded));
     await _settle(tester);
 
@@ -166,6 +187,7 @@ void main() {
     expect(find.text('Live Laptop'), findsOneWidget);
 
     await tester.enterText(find.byType(TextField), 'still here?');
+    await tester.pump();
     await tester.tap(find.widgetWithIcon(IconButton, Icons.send_rounded));
     await _settle(tester);
 
@@ -186,7 +208,7 @@ void main() {
     await _settle(tester);
 
     expect(_composerEnabled(tester), isFalse);
-    expect(_sendEnabled(tester), isFalse);
+    expect(await _sendEnabled(tester), isFalse);
     expect(find.textContaining('No address known for x1'), findsOneWidget);
     expect(find.text('Someone Else'), findsNothing);
   });
