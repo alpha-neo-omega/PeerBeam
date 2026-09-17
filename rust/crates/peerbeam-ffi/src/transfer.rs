@@ -3310,7 +3310,15 @@ impl Manager {
         if let Err(e) = self.chat.outbox_remove(id) {
             tracing::warn!(error = %e, message_id = %id, "queued file not dequeued");
         }
-        self.staging.remove(staged_path);
+        // Reported like its neighbour. One of these two failures was logged and
+        // the other discarded, though both leave the same entry half-released.
+        if !self.staging.remove(staged_path) {
+            tracing::warn!(
+                message_id = %id,
+                path = %staged_path,
+                "dropped file's staged bytes are still on disk"
+            );
+        }
     }
 
     /// Take this peer's one file-in-flight slot, if it is free.

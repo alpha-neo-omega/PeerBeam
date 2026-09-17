@@ -200,8 +200,9 @@ impl StagingStore {
             Err(e) => {
                 // Never leave a partial blob: the sweep only knows about
                 // orphans, and a half-copied file that looks staged would be
-                // sent as if it were whole.
-                self.remove(&dest);
+                // sent as if it were whole. A failure here is already on its
+                // way back to the caller, and the sweep is the backstop.
+                let _ = self.remove(&dest);
                 Err(e)
             }
         }
@@ -249,9 +250,48 @@ impl StagingStore {
         }
     }
 
-    /// Delete a staged blob. Best-effort: a blob already gone is success.
-    pub fn remove(&self, staged_path: &str) {
-        let _ = std::fs::remove_file(staged_path);
+    /// Delete a staged blob. Reports whether the bytes are actually gone.
+    ///
+    /// A blob that was never there is success — the caller wanted it gone and
+    /// it is. Anything else is **not**, and used to be discarded by a bare
+    /// `let _ =`: the one failure this can have is the one nobody heard about.
+    /// Its own caller, `drop_queued_file`, logs a warning when the queue entry
+    /// will not dequeue and said nothing at all about the bytes.
+    ///
+    /// # Why it retries
+    ///
+    /// On Windows a file cannot be deleted while any handle to it is open, and
+    /// this is called the moment a transfer stops — which is exactly when the
+    /// reader that was offering those bytes may not have dropped its handle
+    /// yet. POSIX unlinks regardless, so the race is invisible on Linux and
+    /// macOS. Left alone, a declined file's bytes stay on disk for good, and
+    /// `outbox-blobs/` is documented as able to hold gigabytes.
+    ///
+    /// A few short attempts, because the handle closes on its own within
+    /// milliseconds or not at all. **Unverified on Windows** — the platform
+    /// this is for is the one platform there is no way to run it on here.
+    #[must_use]
+    pub fn remove(&self, staged_path: &str) -> bool {
+        const ATTEMPTS: usize = 4;
+        for attempt in 0..ATTEMPTS {
+            match std::fs::remove_file(staged_path) {
+                Ok(()) => return true,
+                // Already gone: that is the outcome the caller asked for.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) if attempt + 1 < ATTEMPTS => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %staged_path,
+                        "staged blob could not be deleted; its bytes are still on disk"
+                    );
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     /// Delete every blob no queue entry owns, returning how many went.
@@ -698,10 +738,16 @@ mod tests {
             .await
             .unwrap();
 
-        staging.remove(&staged.staged_path);
+        assert!(staging.remove(&staged.staged_path), "the blob was there");
         assert_eq!(blobs(&tmp), 0);
-        staging.remove(&staged.staged_path); // already gone: still fine
-        staging.remove("/no/such/blob");
+        // Already gone is the outcome the caller asked for, so it is success —
+        // and that is the one case that must not be confused with a delete
+        // that failed, which on Windows leaves the bytes on disk for good.
+        assert!(
+            staging.remove(&staged.staged_path),
+            "already gone is success"
+        );
+        assert!(staging.remove("/no/such/blob"), "never there is success");
     }
 
     /// A directory is not a chat attachment, and neither is a fifo, socket or
