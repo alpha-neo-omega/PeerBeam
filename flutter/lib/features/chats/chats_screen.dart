@@ -443,7 +443,21 @@ class _ChatsScreenState extends State<ChatsScreen> {
         return ErrorState(
           error: failure,
           title: 'Could not read your conversations',
-          onRetry: () => chat.refreshConversations(),
+          // Says something either way. A retry that fails again leaves the
+          // identical error on screen, so the tap looked like it had not
+          // registered and the only way to tell was to keep tapping.
+          onRetry: () async {
+            // The messenger is taken before the await; `mounted` below is this
+            // State's, which is what outlives the call.
+            final messenger = ScaffoldMessenger.of(context);
+            await chat.refreshConversations();
+            if (!mounted || chat.conversationsError == null) return;
+            messenger
+              ..hideCurrentSnackBar()
+              ..showSnackBar(
+                const SnackBar(content: Text('Still could not read them')),
+              );
+          },
         );
       }
       // And a list nobody has asked for yet is not an empty one. The read is

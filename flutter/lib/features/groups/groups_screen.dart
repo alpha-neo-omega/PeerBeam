@@ -131,7 +131,16 @@ class _GroupsScreenState extends State<GroupsScreen> {
 
   Future<void> _decline(GroupInvite invite) async {
     final error = await AppScope.of(context).groups.decline(invite.group);
-    _say(error ?? 'Declined — ${_nameFor(invite.from)} is not told');
+    // "Ignored", to match the button. The label was chosen deliberately —
+    // nothing is sent, so a word implying a reply would misdescribe it — and
+    // then the confirmation said "Declined" anyway, which is the word the
+    // button was careful not to use. It also says the door is not shut: the
+    // invitation is gone from here, and the other device can send another.
+    _say(
+      error ??
+          'Ignored — ${_nameFor(invite.from)} is not told, and can invite '
+              'you again',
+    );
   }
 
   /// Open the group's conversation.
@@ -211,7 +220,7 @@ class _GroupsScreenState extends State<GroupsScreen> {
     _say(
       error ??
           'Invited ${chosen.name} — nothing changes on their device until '
-          'they accept',
+              'they accept',
     );
   }
 
