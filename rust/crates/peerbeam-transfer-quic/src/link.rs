@@ -274,6 +274,22 @@ impl Link for QuicLink {
         Ok(())
     }
 
+    async fn finish_send(&mut self) -> Result<()> {
+        // `graceful_close` without the `conn.close()`. Every channel of a
+        // session is its own bidirectional stream over one shared connection,
+        // so a channel finishing must not tear down the connection its
+        // neighbours are still using — but it must still get its last frame
+        // acknowledged, because the connection close that comes afterwards
+        // drops anything not yet transmitted.
+        //
+        // `stopped()` resolves once the peer has acknowledged all data and the
+        // FIN. A gone peer just hits the timeout, after which the caller
+        // carries on closing.
+        let _ = self.send.finish();
+        let _ = tokio::time::timeout(GRACE, self.send.stopped()).await;
+        Ok(())
+    }
+
     fn progress_sink(&self) -> Option<Box<dyn ProgressSink>> {
         Some(Box::new(QuicProgressSink {
             conn: self.conn.clone(),

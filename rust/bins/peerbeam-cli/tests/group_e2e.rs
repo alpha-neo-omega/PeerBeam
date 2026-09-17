@@ -31,7 +31,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use peerbeam_config::EngineConfig;
@@ -118,10 +118,15 @@ fn an_invitation_reaches_the_other_device_and_waits_there() {
                 "0",
             ])
             .stdout(Stdio::piped())
-            // Discarded rather than inherited: B is a long-running host that logs
-            // while it waits, and piping that into the test runner's own stderr
-            // buys nothing a failure message does not already say.
-            .stderr(Stdio::null())
+            // **Captured, not discarded.** It used to be `Stdio::null()`, on the
+            // reasoning that a failure message already says enough. It does not:
+            // when the invitation fails to arrive, everything about why is on
+            // this stream — whether B accepted a connection, whether the
+            // handshake completed, whether a frame was dispatched — and the
+            // assertion could only report that nothing showed up 30 seconds
+            // later. Collected into a buffer and printed only on failure, so a
+            // passing run is as quiet as before.
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn B"),
     );
@@ -129,6 +134,18 @@ fn an_invitation_reaches_the_other_device_and_waits_there() {
     // Read B's stdout until it announces the port it bound. An OS-assigned
     // port, so two of these tests can run at once without colliding — the
     // fixed-port habit is what made `chat_ffi` flaky for weeks.
+    // B's log, kept for the failure path.
+    let b_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let stderr = b.0.stderr.take().unwrap();
+        let sink = b_log.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                sink.lock().unwrap().push(line);
+            }
+        });
+    }
+
     let stdout = b.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -172,6 +189,16 @@ fn an_invitation_reaches_the_other_device_and_waits_there() {
         String::from_utf8_lossy(&invited.stdout),
         String::from_utf8_lossy(&invited.stderr)
     );
+    // **Exit status is not delivery.** `with_device` answers `false` — and the
+    // command still exits 0 — when the peer may not be messaged, printing
+    // "skipped" instead of "invited". Asserting only on the status made a
+    // deliberate skip indistinguishable from a lost frame, and both then failed
+    // 30 seconds later at the poll below with the same unhelpful message.
+    let invite_out = String::from_utf8_lossy(&invited.stdout).to_string();
+    assert!(
+        invite_out.contains("invited "),
+        "`group invite` exited 0 without sending an invitation:\n{invite_out}"
+    );
 
     // B should now be holding an offer. Polled rather than slept on: delivery
     // is a round trip through a handshake, and a fixed sleep would either be
@@ -194,7 +221,10 @@ fn an_invitation_reaches_the_other_device_and_waits_there() {
         invites.len(),
         1,
         "the invitation did not arrive — either the receiving half is not wired, \
-         or the sender closed the session before the frame reached the wire"
+         or the sender closed the session before the frame reached the wire.\n\
+         A said:\n{invite_out}\n\
+         B's log:\n{}",
+        b_log.lock().unwrap().join("\n")
     );
     assert_eq!(invites[0]["name"], "Trip");
 

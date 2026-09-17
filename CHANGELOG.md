@@ -76,6 +76,23 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   was ever in a tagged one.
 
 ### Fixed
+- **A message sent immediately before a session closed could vanish, silently.**
+  `send_on_channel` answers once a frame is queued for its channel actor, not
+  once it is on the wire; session close then signalled the channels shut and
+  closed the shared QUIC connection, which discards anything not yet
+  transmitted. The control stream had been given exactly this treatment, with a
+  comment explaining why — the channel streams never were.
+
+  It affected every dial-send-close path: `chat send`, `group invite`,
+  clipboard push, `peerbeam identify`. The command reported success and the
+  peer never received it. Reproduced about one time in twelve; `group_e2e`
+  caught it and named the cause in its own assertion, where it had been read as
+  CI noise. Present in 0.11.0 — not a regression.
+
+  Links can now finish their own stream and wait for the acknowledgement
+  without closing the connection their neighbours share, channel actors do that
+  before stopping, and a closing session waits for them rather than only asking.
+
 - **A dial that froze the whole app.** `peerIdentify` ran on the UI isolate
   while every other dialing call hops off it. It blocks on a QUIC connect plus
   the handshake **per resolved address** — four 8s timeouts for a MagicDNS name,
