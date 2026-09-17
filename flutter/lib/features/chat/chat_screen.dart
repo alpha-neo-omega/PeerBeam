@@ -731,27 +731,43 @@ class _ChatScreenState extends State<ChatScreen> {
     // send it twice while the first is still going out.
     _clearSelection();
     final chat = scope.chat;
+    // Counted, not assumed. `send`/`sendFile` do not throw — a refusal is
+    // recorded on the row and the loop completes either way — so this used to
+    // announce "Forwarded 3 messages" while all three had been refused, with
+    // the only evidence three red bubbles in the *other* conversation, which
+    // the user has no reason to open after being told it worked. A refusal is
+    // the ordinary case here, not an exotic one: the engine checks the chat
+    // permission before persisting anything.
+    var forwarded = 0;
     for (final entry in sendable) {
       final m = entry.message;
-      if (m.isFile) {
-        await chat.sendFile(
-          peerId,
-          target,
-          entry.path,
-          name: m.fileName,
-          size: m.fileSize,
-        );
-      } else {
-        await chat.send(peerId, target, m.body);
-      }
+      final ok = m.isFile
+          ? await chat.sendFile(
+              peerId,
+              target,
+              entry.path,
+              name: m.fileName,
+              size: m.fileSize,
+            )
+          : await chat.send(peerId, target, m.body);
+      if (ok) forwarded++;
     }
-    final sent = sendable.length == 1
+    if (forwarded == 0) {
+      _snack(
+        messenger,
+        'Nothing was forwarded to ${picked.name} — it would not accept them.',
+      );
+      return;
+    }
+    final refused = sendable.length - forwarded;
+    final sent = forwarded == 1
         ? 'Forwarded 1 message to ${picked.name}'
-        : 'Forwarded ${sendable.length} messages to ${picked.name}';
-    _snack(
-      messenger,
-      missing.isEmpty ? sent : '$sent · ${_missingText(missing)}',
-    );
+        : 'Forwarded $forwarded messages to ${picked.name}';
+    final notes = [
+      if (refused > 0) '$refused ${refused == 1 ? 'was' : 'were'} refused',
+      if (missing.isNotEmpty) _missingText(missing),
+    ];
+    _snack(messenger, notes.isEmpty ? sent : '$sent · ${notes.join(' · ')}');
   }
 
   /// The peer's real device id behind a picked target, or null when discovery

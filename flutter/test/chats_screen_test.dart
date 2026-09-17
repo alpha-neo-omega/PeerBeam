@@ -7,6 +7,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/features/chats/chats_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -590,5 +591,60 @@ void main() {
     });
     expect(private.group, isNull);
     expect(private.isGroup, isFalse);
+  });
+  // `main.dart` holds only the root navigator, which sits above `AppShell` and
+  // so above the `DropZone` wrapping its content. A chat pushed from there
+  // cannot claim the drop, and the shell's own zone stays armed underneath it:
+  // a file dragged onto that conversation lit two overlays and, on release,
+  // was both sent to the peer and staged for a second unrelated send.
+  //
+  // So the request is handed to this screen, which is inside the shell.
+  testWidgets('a requested thread is opened from inside the shell', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: ChatsScreen()),
+      ),
+    );
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    state.pendingThread.value = 'pb-bob';
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(find.byType(ChatScreen), findsOneWidget);
+    // And taken down, so it cannot be answered a second time.
+    expect(state.pendingThread.value, isNull);
+  });
+
+  testWidgets('a request made before the screen exists is still answered', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    // The cold-start case: the click is what builds this screen.
+    state.pendingThread.value = 'pb-bob';
+
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: ChatsScreen()),
+      ),
+    );
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(find.byType(ChatScreen), findsOneWidget);
   });
 }

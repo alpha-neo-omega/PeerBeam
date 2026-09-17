@@ -637,14 +637,24 @@ class ChatRepository extends ChangeNotifier {
   /// `refresh` reconciles with the persisted record once the call resolves,
   /// and a `chat_status` event later flips the message's status in place
   /// (via [_onStatus]) once it's actually delivered.
-  Future<void> send(
+  /// Returns whether the engine **accepted** the message — that is, persisted
+  /// it, whether or not it has reached the peer yet. False means it was
+  /// refused and nothing was queued.
+  ///
+  /// This used to return nothing, and the failure lived only in the row. That
+  /// is right for the composer, where the row is what the user is looking at,
+  /// and wrong for a caller acting on behalf of a batch: forwarding reported
+  /// "Forwarded 3 messages" while all three were refused, because the loop
+  /// completed normally and there was nothing else to ask. Callers that fire
+  /// and forget may still ignore this.
+  Future<bool> send(
     String peerId,
     PeerTarget peer,
     String text, {
     String? inReplyTo,
   }) async {
     final body = text.trim();
-    if (body.isEmpty) return;
+    if (body.isEmpty) return false;
     final optimistic = ChatMessage(
       id: 'local-${++_optimisticSeq}',
       peerId: peerId,
@@ -667,6 +677,7 @@ class ChatRepository extends ChangeNotifier {
       // Conversations list for exactly as long as it is unreachable — which is
       // when reaching it matters most.
       unawaited(refreshConversations());
+      return true;
     } on PeerBeamException catch (e) {
       // The engine **refused** the message: an over-long body, an engine that
       // never started. That is not the unreachable-peer case — enqueueing is
@@ -688,6 +699,7 @@ class ChatRepository extends ChangeNotifier {
       // async one — the row itself is the answer.
       _fail(peerId, optimistic.id, 'Could not send this message');
     }
+    return false;
   }
 
   /// Share the file at [path] inside the conversation with [peer].
@@ -706,14 +718,16 @@ class ChatRepository extends ChangeNotifier {
   /// Call this once per picked file. A multi-select fans out here, never at
   /// the engine — sending only the first of several files the user chose is
   /// silent data loss.
-  Future<void> sendFile(
+  /// Returns whether the engine accepted the share. See [send] for why this
+  /// is reported rather than left to the row alone.
+  Future<bool> sendFile(
     String peerId,
     PeerTarget peer,
     String path, {
     String? name,
     int? size,
   }) async {
-    if (path.isEmpty) return;
+    if (path.isEmpty) return false;
     final id = 'local-${++_optimisticSeq}';
     (_byPeer[peerId] ??= <ChatMessage>[]).add(
       ChatMessage(
@@ -741,6 +755,7 @@ class ChatRepository extends ChangeNotifier {
       // Same reason as [send]: a file queued for a peer that never turns up
       // must still put its thread on the Conversations list.
       unawaited(refreshConversations());
+      return true;
     } on PeerBeamException catch (e) {
       // The engine refused the path itself (missing file, a folder): nothing
       // was persisted and nothing was sent, so a `refresh` here would silently
@@ -753,6 +768,7 @@ class ChatRepository extends ChangeNotifier {
       // button, so an escaping error would be an unhandled async one.
       _fail(peerId, id, 'Could not share ${name ?? _basename(path)}');
     }
+    return false;
   }
 
   /// Mark a message failed in place, remember why, and — because the engine

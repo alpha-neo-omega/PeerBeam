@@ -6,8 +6,6 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
-import 'features/chat/chat_screen.dart';
-import 'features/groups/group_chat_screen.dart';
 import 'features/send/send_text.dart';
 import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
@@ -20,7 +18,6 @@ import 'platform/desktop_files.dart';
 import 'platform/notifications.dart';
 import 'platform/saf.dart';
 import 'platform/tray.dart';
-import 'sdk/models.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
@@ -322,56 +319,18 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
     // leaving took two backs out of a conversation the user never left.
     if (_state.chatPresence.openConversation == threadKey) return;
 
-    var context = rootNavigatorKey.currentContext;
-    if (context == null || !context.mounted) return;
-
-    if (threadKey.startsWith('group:')) {
-      final id = threadKey.substring('group:'.length);
-      var group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
-      if (group == null) {
-        // Nothing reads the group list until the Groups screen is opened, so
-        // on a fresh start this is simply not loaded yet — and the click did
-        // nothing at all, silently, which is the worst of both. Read it and
-        // look again.
-        await _state.groups.refresh();
-        group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
-      }
-      final current = rootNavigatorKey.currentContext;
-      if (current == null || !current.mounted) return;
-      context = current;
-      if (group == null) {
-        // A group this device has genuinely left, or one the read could not
-        // recover. Say so: a click that does nothing reads as a broken app.
-        _messengerKey.currentState?.showSnackBar(
-          const SnackBar(content: Text('That group is no longer available')),
-        );
-        return;
-      }
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => GroupChatScreen(group: group!, nameFor: _peerName),
-        ),
-      );
-      return;
-    }
-
-    // The same fallback the Conversations list uses: discovery's target when
-    // it has one, an address-less placeholder otherwise. The chat screen
-    // re-resolves it while open, so a peer that reappears becomes sendable
-    // there and then.
-    final target =
-        _state.device.peerTarget(threadKey) ??
-        PeerTarget(
-          id: threadKey,
-          name: _peerName(threadKey),
-          addresses: const [],
-          port: 0,
-        );
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ChatScreen(peerId: threadKey, peer: target),
-      ),
-    );
+    // **Asked for, not pushed from here.** This layer holds only the root
+    // navigator, which sits above `AppShell` and so above the `DropZone`
+    // wrapping its content — a chat pushed there cannot claim the drop, and
+    // the shell's own zone stays armed underneath it. Dragging a file onto
+    // such a conversation lit two overlays and, on release, sent it to the
+    // peer *and* opened the staged-files sheet for a second unrelated send.
+    //
+    // The Chats screen does the push, from inside the shell, where it is
+    // whole. Switching to that tab is also where a person would expect a
+    // clicked chat notification to leave them.
+    _state.pendingThread.value = threadKey;
+    _router.go('/chats');
   }
 
   void _applyPersistedTheme() {

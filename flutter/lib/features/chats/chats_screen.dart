@@ -91,10 +91,67 @@ class _ChatsScreenState extends State<ChatsScreen> {
   /// Re-renders the relative timestamps. See [initState].
   Timer? _tick;
 
+  /// The request channel for a thread to open.
+  ValueNotifier<String?>? _pending;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // A conversation something outside the widget tree asked to open — a
+    // clicked desktop notification. Subscribed here because **this** context
+    // is inside the shell, and therefore inside the `DropZone` a chat screen
+    // has to claim from; pushed from `main.dart` it could not, and a file
+    // dropped on the thread was then handled twice. See
+    // `AppState.pendingThread`.
+    //
+    // Not `initState`, which may not read an inherited widget.
+    final pending = AppScope.of(context).pendingThread;
+    if (identical(pending, _pending)) return;
+    _pending?.removeListener(_openPending);
+    _pending = pending..addListener(_openPending);
+    // A request that arrived before this screen existed — the ordinary case on
+    // a cold start, where the click is what builds it.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openPending());
+  }
+
+  /// Open whatever was asked for, and take the request down so it cannot be
+  /// answered twice.
+  void _openPending() {
+    final key = _pending?.value;
+    if (key == null || !mounted) return;
+    _pending!.value = null;
+    if (key.startsWith('group:')) {
+      _openGroup(key.substring('group:'.length));
+      return;
+    }
+    _open(key);
+  }
+
+  /// Open a group's transcript by id, saying so when it is gone rather than
+  /// doing nothing at all.
+  void _openGroup(String id) {
+    final state = AppScope.of(context);
+    final group = state.groups.groups.where((g) => g.id == id).firstOrNull;
+    if (group == null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('That group is no longer available')),
+        );
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _timer?.cancel();
     _tick?.cancel();
+    _pending?.removeListener(_openPending);
     _search.dispose();
     super.dispose();
   }
@@ -200,23 +257,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       _open(hit.peerId);
       return;
     }
-    final state = AppScope.of(context);
-    final group = state.groups.groups
-        .where((g) => g.id == hit.group)
-        .firstOrNull;
-    if (group == null) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          const SnackBar(content: Text('That group is no longer available')),
-        );
-      return;
-    }
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
-      ),
-    );
+    _openGroup(hit.group ?? '');
   }
 
   /// The best name we can put to a conversation's peer id.

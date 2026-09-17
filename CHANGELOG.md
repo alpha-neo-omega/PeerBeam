@@ -127,6 +127,18 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   the spinner up for good — the exact failure its retry was added to prevent.
   Three dialogs also disposed their text fields while the closing animation was
   still rebuilding them.
+- **Forward claimed success when the engine refused everything.** `send` and
+  `sendFile` record a refusal on the row and never throw, so the loop always
+  completed and announced "Forwarded 3 messages" while all three were refused —
+  the only evidence being red bubbles in the *other* conversation, which nobody
+  opens after being told it worked. They now report acceptance and the count is
+  real.
+- **A chat opened from a desktop notification handled a dropped file twice.**
+  It was pushed on the root navigator, which is above the shell's `DropZone`,
+  so the conversation could not claim the drop and the shell's zone stayed
+  armed underneath: one drop both sent the file and opened the staged-files
+  sheet for a second, unrelated send. The click now asks the Chats screen to
+  open it, from inside the shell.
 - Smaller ones: a queued group message no longer looks delivered; the group
   header no longer lists this device by a raw id or hides members it cannot
   reach; a bubble carries the date when it is not today's; a peer with an empty

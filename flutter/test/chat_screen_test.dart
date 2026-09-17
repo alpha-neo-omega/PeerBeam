@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/chat_repository.dart';
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -1224,5 +1225,48 @@ void main() {
       fake.calls.where((c) => c.startsWith('chatMarkRead:')).length,
       before,
     );
+  });
+  // `send`/`sendFile` do not throw — a refusal is recorded on the row and the
+  // loop completes either way — so forward announced "Forwarded 3 messages"
+  // while all three had been refused. The only evidence was red bubbles in the
+  // *other* conversation, which the user has no reason to open after being
+  // told it worked. A refusal is ordinary here: the engine checks the chat
+  // permission before persisting anything.
+  test('a refused send reports itself rather than passing as sent', () async {
+    final fake = FakePeerBeam()..failing.add('chatSend');
+    final repo = ChatRepository(api: fake);
+    addTearDown(repo.dispose);
+
+    final ok = await repo.send(
+      'pb-bob',
+      const PeerTarget(
+        id: 'pb-bob',
+        name: 'Bob',
+        addresses: ['10.0.0.2'],
+        port: 49600,
+      ),
+      'hello',
+    );
+
+    expect(ok, isFalse);
+  });
+
+  test('an accepted send says so', () async {
+    final fake = FakePeerBeam();
+    final repo = ChatRepository(api: fake);
+    addTearDown(repo.dispose);
+
+    final ok = await repo.send(
+      'pb-bob',
+      const PeerTarget(
+        id: 'pb-bob',
+        name: 'Bob',
+        addresses: ['10.0.0.2'],
+        port: 49600,
+      ),
+      'hello',
+    );
+
+    expect(ok, isTrue);
   });
 }

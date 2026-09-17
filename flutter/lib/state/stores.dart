@@ -424,6 +424,21 @@ class AppState {
   /// Group conversations, and the invitations waiting for an answer.
   final GroupsRepository groups;
 
+  /// A conversation something outside the widget tree has asked to open —
+  /// a clicked desktop notification — as a `chatThreadKey`.
+  ///
+  /// A request rather than a push, because **who** performs the push matters.
+  /// `main.dart` only has the root navigator, which sits above `AppShell` and
+  /// therefore above the `DropZone` wrapping its content. A chat pushed there
+  /// never gets to claim the drop (`DropClaims.maybeOf` finds nothing), so the
+  /// shell's own drop zone stays armed underneath: dragging a file onto that
+  /// conversation lit two overlays and, on release, both sent it to the peer
+  /// and opened the staged-files sheet for a second unrelated send.
+  ///
+  /// The Chats screen consumes this and pushes from inside the shell, which is
+  /// the only place a push is whole.
+  final ValueNotifier<String?> pendingThread = ValueNotifier<String?>(null);
+
   /// Which chat thread is on screen, and whether the app has the foreground.
   ///
   /// Not a constructor argument: it is this process's knowledge about its own
@@ -532,6 +547,7 @@ class AppState {
     trust.dispose();
     chat.dispose();
     chatPresence.dispose();
+    pendingThread.dispose();
     presence.dispose();
     transfer.dispose();
     history.dispose();
