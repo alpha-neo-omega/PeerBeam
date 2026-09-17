@@ -79,6 +79,8 @@ sealed class BridgeEvent {
           text: p['text'] as String? ?? '',
           sentAt: p['sent_at'] as String? ?? '',
         );
+      case 'groups_changed':
+        return const GroupsChanged();
       case 'chat_received':
         return ChatReceived(ChatMessage.fromJson(_map(j['message'])));
       case 'chat_status':
@@ -288,6 +290,23 @@ class HistoryUpdated extends BridgeEvent {
 
 class TrustChanged extends BridgeEvent {
   const TrustChanged();
+}
+
+/// A group was created, renamed, joined, left, or its roster changed — and the
+/// same event announces an invitation arriving.
+///
+/// The engine has emitted this all along (`groups_changed`, from
+/// `Manager::groups_*` and the `groups_sync` handler); nothing on this side
+/// decoded it, so the only thing that ever read the group list was opening the
+/// Groups screen. An invitation that arrived while that screen was already
+/// open never appeared, and until the screen had been visited once the list
+/// was empty — which is why a group chat notification arriving first could
+/// name the group only by its raw id.
+///
+/// Carries no payload: the lists are small and read whole, and a partial
+/// update is a second source of truth that can drift from the store.
+class GroupsChanged extends BridgeEvent {
+  const GroupsChanged();
 }
 
 /// Hint that the device-change stream lagged and dropped transitions; the

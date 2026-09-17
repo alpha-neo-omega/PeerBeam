@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../sdk/error_text.dart';
+import '../sdk/events.dart';
+import '../sdk/exceptions.dart';
 import '../sdk/models.dart';
 import '../sdk/peerbeam.dart';
 
@@ -20,10 +24,32 @@ import '../sdk/peerbeam.dart';
 /// returns a sentence to show, and the screens show it.
 class GroupsRepository extends ChangeNotifier {
   final PeerBeamApi? _api;
+  StreamSubscription<BridgeEvent>? _sub;
+  bool _disposed = false;
 
   GroupsRepository({PeerBeamApi? api})
     // ignore: prefer_initializing_formals
-    : _api = api;
+    : _api = api {
+    // **Live, like every other repository here.** The engine has always emitted
+    // `groups_changed` — on create, rename, join, leave, and when a sync brings
+    // an invitation in — and nothing on this side listened. So the only thing
+    // that ever read the list was opening the Groups screen: an invitation
+    // arriving while the user was already looking at it never appeared, and a
+    // roster change never reached the card. It also left the list empty until
+    // that screen had been visited once, which is why a group chat
+    // notification arriving before then could name its group only by the raw
+    // id.
+    _sub = _api?.events.listen((e) {
+      if (e is GroupsChanged) unawaited(refresh());
+    });
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _sub?.cancel();
+    super.dispose();
+  }
 
   List<Group> groups = const [];
 
@@ -39,6 +65,25 @@ class GroupsRepository extends ChangeNotifier {
   /// The last read's failure, or null. Distinct from an empty list: one means
   /// there are no groups, the other means we do not know.
   Object? error;
+
+  /// A sentence for a **group** write's failure.
+  ///
+  /// Prefers the engine's own words. `friendlyError` deliberately maps every
+  /// engine error onto a small set of generic sentences, because most of them
+  /// name internals a user cannot act on — but the refusals a group write
+  /// produces are the opposite: they are about the user's own groups and say
+  /// exactly what is wrong. Flattened, "Family has nobody this device may
+  /// message" became "Something went wrong. Please try again.", and `there is
+  /// already a group called "Family"` became "That action can't be completed."
+  /// — both inviting a retry that could not possibly succeed, naming nothing
+  /// the user could change.
+  ///
+  /// Anything that is not a `PeerBeamException` has no sentence worth showing
+  /// and falls back as before.
+  static String _reason(Object error) =>
+      error is PeerBeamException && error.message.trim().isNotEmpty
+      ? error.message
+      : friendlyError(error);
 
   Future<void> refresh() async {
     final api = _api;
@@ -58,6 +103,7 @@ class GroupsRepository extends ChangeNotifier {
       // empty state that would read as "you are in no groups".
       error = e;
     }
+    if (_disposed) return;
     loaded = true;
     notifyListeners();
   }
@@ -75,7 +121,7 @@ class GroupsRepository extends ChangeNotifier {
       await refresh();
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -88,7 +134,7 @@ class GroupsRepository extends ChangeNotifier {
       await refresh();
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -101,7 +147,7 @@ class GroupsRepository extends ChangeNotifier {
       await refresh();
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -117,7 +163,7 @@ class GroupsRepository extends ChangeNotifier {
       await api.inviteToGroup(id, peer);
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -134,7 +180,7 @@ class GroupsRepository extends ChangeNotifier {
       await refresh();
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -147,7 +193,7 @@ class GroupsRepository extends ChangeNotifier {
       await refresh();
       return null;
     } catch (e) {
-      return friendlyError(e);
+      return _reason(e);
     }
   }
 
@@ -168,7 +214,7 @@ class GroupsRepository extends ChangeNotifier {
     try {
       return (result: await api.sendToGroup(id, text), error: null);
     } catch (e) {
-      return (result: null, error: friendlyError(e));
+      return (result: null, error: _reason(e));
     }
   }
 

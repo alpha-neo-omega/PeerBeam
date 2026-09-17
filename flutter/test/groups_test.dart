@@ -9,6 +9,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/groups_repository.dart';
+import 'package:peerbeam/features/groups/group_chat_screen.dart';
 import 'package:peerbeam/features/groups/groups_screen.dart';
 import 'package:peerbeam/features/groups/join_dialog.dart';
 import 'package:peerbeam/sdk/events.dart';
@@ -35,7 +37,10 @@ Future<AppState> _open(WidgetTester tester, FakePeerBeam fake) async {
   final state = AppState.live(fake);
   addTearDown(state.dispose);
   await tester.pumpWidget(
-    AppScope(state: state, child: const MaterialApp(home: GroupsScreen())),
+    AppScope(
+      state: state,
+      child: const MaterialApp(home: GroupsScreen()),
+    ),
   );
   await tester.pumpAndSettle();
   return state;
@@ -263,7 +268,9 @@ void main() {
 
     /// Inviting is the other half that was missing, and it must state the
     /// disclosure before it happens — A2, condition 5.
-    testWidgets('inviting says what it costs before it is sent', (tester) async {
+    testWidgets('inviting says what it costs before it is sent', (
+      tester,
+    ) async {
       final fake = FakePeerBeam()
         ..groupsList = [
           const Group(
@@ -281,7 +288,10 @@ void main() {
 
       // With nobody reachable the screen says so rather than offering a
       // device the engine would refuse.
-      expect(find.textContaining('has to see a trusted device'), findsOneWidget);
+      expect(
+        find.textContaining('has to see a trusted device'),
+        findsOneWidget,
+      );
     });
   });
 
@@ -337,5 +347,109 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
 
     expect(find.text('six works for me'), findsOneWidget);
+  });
+  group('what the transcript says about the group', () {
+    // `members` includes THIS device, whose id `nameFor` cannot resolve — so
+    // every header began with a raw `pb-…` string presented as a participant.
+    // And an unreachable member looked exactly like a reachable one, so the
+    // screen where a message is composed claimed participants a send would
+    // never reach.
+    testWidgets('the header names who can be reached, and never this device', (
+      tester,
+    ) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: MaterialApp(
+            home: GroupChatScreen(
+              group: const Group(
+                id: 'g1',
+                name: 'Family',
+                members: ['pb-me', 'pb-alice', 'pb-bob'],
+                reachable: ['pb-alice'],
+                unreachable: ['pb-bob'],
+              ),
+              nameFor: (id) => switch (id) {
+                'pb-alice' => 'Alice',
+                'pb-bob' => 'Bob',
+                _ => id,
+              },
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      expect(find.textContaining('pb-me'), findsNothing);
+      expect(find.textContaining('Alice'), findsWidgets);
+      expect(find.textContaining('cannot be messaged'), findsOneWidget);
+    });
+
+    // A group send enqueues a copy per member and returns. With everyone
+    // offline it "succeeds", raises no snackbar, and used to render exactly
+    // like a delivered message — which it might not be for days.
+    testWidgets('a queued message does not look delivered', (tester) async {
+      final fake = FakePeerBeam();
+      fake.groupMessages = [
+        ChatMessage(
+          id: 'm1',
+          peerId: 'pb-alice',
+          direction: 'out',
+          body: 'anyone about?',
+          at: null,
+          storedAt: DateTime.utc(2026, 1, 1),
+          status: ChatStatusValue.pending,
+          group: 'g1',
+        ),
+      ];
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: MaterialApp(
+            home: GroupChatScreen(
+              group: const Group(
+                id: 'g1',
+                name: 'Family',
+                members: ['pb-me', 'pb-alice'],
+                reachable: ['pb-alice'],
+              ),
+              nameFor: (id) => id,
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      expect(find.text('Queued'), findsOneWidget);
+      expect(find.text('Sent'), findsNothing);
+    });
+  });
+
+  // The engine has emitted `groups_changed` all along and nothing decoded it,
+  // so the only thing that ever read the list was opening the Groups screen —
+  // an invitation arriving while it was already open never appeared.
+  test('a groups_changed event re-reads the list', () async {
+    final fake = FakePeerBeam();
+    final repo = GroupsRepository(api: fake);
+    addTearDown(repo.dispose);
+    await repo.refresh();
+    final before = fake.calls.where((c) => c == 'groups').length;
+
+    fake.emit(const GroupsChanged());
+    await Future(() {});
+    await Future(() {});
+
+    expect(fake.calls.where((c) => c == 'groups').length, greaterThan(before));
   });
 }

@@ -381,6 +381,9 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<GroupsView> groups() async {
     _maybeFail('groups');
+    // Recorded so a test can assert the list is re-read when the engine says
+    // it changed, rather than only when a screen is opened.
+    calls.add('groups');
     return GroupsView(groups: groupsList, invites: groupInvites);
   }
 

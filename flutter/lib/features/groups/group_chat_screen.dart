@@ -161,6 +161,28 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     await _load();
   }
 
+  /// Who this message actually reaches, said the way the group card says it.
+  ///
+  /// `members` was rendered raw, and that is wrong twice. It includes **this
+  /// device**, whose id `nameFor` cannot resolve — so every group header began
+  /// with a raw `pb-…` string the user had never seen, presented as a
+  /// participant. And it makes a member this device may not message look
+  /// exactly like one it can, so the header of the screen where a message is
+  /// composed claimed three participants where a send would reach one; the
+  /// truth arrived only in the snackbar afterwards, or by going back to the
+  /// Groups list, which has marked it correctly all along.
+  String _roster() {
+    final reachable = widget.group.reachable.map(widget.nameFor);
+    final unreachable = widget.group.unreachable.map(
+      (id) => '${widget.nameFor(id)} · cannot be messaged',
+    );
+    final everyone = [...reachable, ...unreachable];
+    // `reachable`/`unreachable` already exclude this device (the engine's
+    // `recipients(&me)`), so a group of one really does have nobody else in it
+    // and should say so rather than rendering an empty line.
+    return everyone.isEmpty ? 'Only you' : everyone.join(', ');
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -180,7 +202,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                widget.group.members.map(widget.nameFor).join(', '),
+                _roster(),
                 style: theme.textTheme.bodySmall,
                 overflow: TextOverflow.ellipsis,
               ),
@@ -248,6 +270,22 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                                     style: theme.textTheme.labelSmall,
                                   ),
                                 Text(m.body),
+                                // What happened to it. A group send enqueues a
+                                // copy per member and returns; with everyone
+                                // offline it "succeeds", raises no snackbar,
+                                // and used to render exactly like a delivered
+                                // message — which it might not be for days.
+                                // The one-to-one thread has shown this state
+                                // all along.
+                                if (m.direction == 'out') ...[
+                                  const Gap(AppSpace.xxs),
+                                  Text(
+                                    _groupStatusLabel(m.status),
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
                               ],
                             ),
                           ),
@@ -292,3 +330,19 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 }
+
+/// What an outgoing group row's status means to a reader.
+///
+/// Deliberately cautious about delivery. `group_history` dedupes the copies by
+/// id and keeps one arbitrary member's — so the status on the row this screen
+/// renders is **one** recipient's, not the group's. Saying "Sent" from that
+/// would claim delivery to everybody on the strength of one copy, so the
+/// delivered case says what it can actually support.
+String _groupStatusLabel(String status) => switch (status) {
+  ChatStatusValue.pending => 'Queued',
+  ChatStatusValue.staging || ChatStatusValue.transferring => 'Sending…',
+  ChatStatusValue.failed => 'Failed',
+  ChatStatusValue.declined => 'Declined',
+  ChatStatusValue.interrupted => 'Interrupted',
+  _ => 'Sent',
+};

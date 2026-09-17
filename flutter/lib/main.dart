@@ -148,6 +148,12 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // baseline is seeded from real history, not an empty list — otherwise
         // every historical send would look "new" on cold start.
         await _android.start();
+        // Groups, read once at boot rather than only when the Groups screen
+        // is first opened. A group chat notification arriving before that
+        // could otherwise name its group only by the raw id, and clicking it
+        // found nothing to open. The repository keeps itself current from
+        // `groups_changed` after this.
+        await _state.groups.refresh();
         // The identities earlier sessions resolved by dialling — which peer a
         // `ts:<node>` turned out to be. Read before discovery starts, so a
         // conversation opened in the first seconds already knows how to reach

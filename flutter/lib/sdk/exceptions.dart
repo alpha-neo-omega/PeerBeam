@@ -17,6 +17,7 @@ sealed class PeerBeamException implements Exception {
       'encryption' => EncryptionException(message),
       'unimplemented' => UnimplementedException(message),
       'unsupported' => UnsupportedPlatformException(message),
+      'permission_denied' => PermissionDeniedException(message),
       'queue_unreadable' => QueueUnreadableException(message),
       _ => InternalException(message),
     };
@@ -77,6 +78,18 @@ class UnsupportedPlatformException extends PeerBeamException {
 /// read, and it could not rule out that entry backing something still waiting
 /// to go out. Unlike every other exception here, retrying the same call will
 /// not clear this on its own — see `friendlyError` for the user-facing text.
+/// The engine refused because this device may not do that — a peer without the
+/// permission, a group with nobody reachable, a capability withheld.
+///
+/// The engine has always emitted `permission_denied` (`Code::PermissionDenied`
+/// in `peerbeam-ffi/src/error.rs`); this side had no case for it, so every
+/// refusal in the app fell through to `InternalException` and was shown as
+/// "Something went wrong. Please try again." — which invites a retry that
+/// cannot possibly succeed and names nothing the user could change.
+class PermissionDeniedException extends PeerBeamException {
+  const PermissionDeniedException(super.message);
+}
+
 class QueueUnreadableException extends PeerBeamException {
   const QueueUnreadableException(super.message);
 }
