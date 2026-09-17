@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-17
+
 ### Added
 - **Chat from a typed address.** "Send to address" offered files, a folder and
   a one-off text and no way to start a conversation — the thing you would want
