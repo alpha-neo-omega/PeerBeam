@@ -389,6 +389,13 @@ pub struct PeerSession {
 /// progress at all, and still finite, which is the entire requirement.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a closing session waits for its channels to flush.
+///
+/// A backstop, not the real bound: each channel actor's own flush is already
+/// bounded by the transport's grace period, so this only catches an actor
+/// wedged for some other reason. Closing is not a place to hang.
+const CLOSE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl PeerSession {
     /// Open a session over an authenticated, secured `transport`.
     ///
@@ -726,7 +733,11 @@ impl PeerSession {
     /// the session `Recovering`.
     fn capture_loss(&mut self) -> RunExit {
         let preserved = self.preserve();
-        self.manager.shutdown_all();
+        // The flush handles are dropped on purpose: the transport is already
+        // gone, so there is nothing to flush to and waiting would only stall
+        // recovery. Dropping a handle detaches the task rather than killing it,
+        // so each actor still winds itself up.
+        drop(self.manager.shutdown_all());
         if self.state.can_transition_to(SessionState::Recovering) {
             self.state = SessionState::Recovering;
             // Reflect the recovering state in the registry so diagnostics
@@ -1166,7 +1177,33 @@ impl PeerSession {
             &ControlMessage::Shutdown("local close".into()),
         )
         .await;
-        self.manager.shutdown_all();
+        // **Wait for the channels to flush, not just ask them to.**
+        //
+        // `shutdown_all` signals each actor and returns; the actors then finish
+        // their own streams and wait for the peer to acknowledge. The
+        // `graceful_close` below closes the shared connection, and that
+        // discards anything not yet transmitted — so closing without waiting
+        // here undoes the flush the actors are in the middle of.
+        //
+        // The same reasoning as the control stream, one layer down, and it was
+        // missing: a frame sent immediately before a session closed was dropped
+        // about one time in twelve while the send reported success.
+        // `tests/group_e2e.rs` is what caught it, and it names the symptom in
+        // its own assertion.
+        //
+        // Bounded, because a peer that has gone away must not hold a close
+        // open: each actor's own wait is already bounded by the transport's
+        // grace period, and this is the backstop for an actor that is wedged
+        // for some other reason.
+        let flushing = self.manager.shutdown_all();
+        if !flushing.is_empty() {
+            let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, async {
+                for task in flushing {
+                    let _ = task.await;
+                }
+            })
+            .await;
+        }
         // Gracefully close the control stream — which shares the one QUIC
         // connection — so the Shutdown frame above is delivered before the
         // connection tears down. An abrupt transport close here would drop the
@@ -1182,7 +1219,10 @@ impl PeerSession {
             return;
         }
         self.state = SessionState::Closed;
-        self.manager.shutdown_all();
+        // Not the graceful path: this is an abrupt or peer-initiated close, and
+        // there is no orderly flush to wait for. See `close_gracefully` for the
+        // one that does wait.
+        drop(self.manager.shutdown_all());
         self.finish_close(reason);
     }
 

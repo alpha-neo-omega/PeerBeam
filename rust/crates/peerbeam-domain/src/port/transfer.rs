@@ -94,6 +94,27 @@ pub trait Link: Send + Sync {
         self.close().await
     }
 
+    /// Flush this link's **own** outbound stream and wait (bounded) for the
+    /// peer to acknowledge it — without closing the connection underneath.
+    ///
+    /// The piece [`graceful_close`](Link::graceful_close) could not provide. On
+    /// a multiplexed transport every channel is its own stream over one shared
+    /// connection, so a channel that is finishing must not take the connection
+    /// with it; but it still has to get its last frame acknowledged, because
+    /// the connection close that follows discards whatever has not been
+    /// transmitted.
+    ///
+    /// Without this a frame written immediately before a session closes was
+    /// dropped on the floor, intermittently, while the send reported success —
+    /// `send_on_channel` answers once the frame is queued for the channel
+    /// actor, not once it is on the wire.
+    ///
+    /// Defaults to doing nothing, which is right for a transport whose close
+    /// already delivers buffered data, and for one with no separate streams.
+    async fn finish_send(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Receiver side: open the progress back-channel to report received bytes.
     /// `None` if the transport doesn't support it (falls back to bytes-sent).
     /// Owned so it can be driven concurrently with frame I/O.

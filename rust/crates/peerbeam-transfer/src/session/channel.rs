@@ -119,6 +119,10 @@ pub struct Channel {
     state: ChannelState,
     stats: Arc<Mutex<ChannelStats>>,
     commands: Option<UnboundedSender<ActorCommand>>,
+    /// The actor's task, so a closing session can wait for it to finish
+    /// flushing before it closes the connection out from under it. `None` for a
+    /// stream channel, which has no actor.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Channel {
@@ -131,6 +135,7 @@ impl Channel {
             state: ChannelState::Open,
             stats: Arc::new(Mutex::new(ChannelStats::default())),
             commands: None,
+            task: None,
         }
     }
 }
@@ -181,6 +186,11 @@ impl Channel {
             let _ = tx.send(ActorCommand::Close);
         }
     }
+
+    /// Take the actor's task, so a caller can wait for it to stop.
+    pub(crate) fn take_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.task.take()
+    }
 }
 
 /// Recover a poisoned lock rather than panicking.
@@ -206,7 +216,7 @@ pub(crate) fn spawn_channel(
     let stats = Arc::new(Mutex::new(ChannelStats::default()));
     let actor_stats = stats.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 cmd = command_rx.recv() => match cmd {
@@ -237,7 +247,20 @@ pub(crate) fn spawn_channel(
                     // Close requested, or the manager dropped the channel handle.
                     // Dropping the stream (loop break) closes only this channel;
                     // the whole connection is closed via ChannelTransport::close.
-                    Some(ActorCommand::Close) | None => break,
+                    //
+                    // **Flush first.** Commands arrive in order, so any queued
+                    // `Send` has already been written to the link by now — but
+                    // "written to the link" is not "on the wire": the session
+                    // closes the shared connection moments later, and that
+                    // discards whatever has not been transmitted. Finishing
+                    // this stream and waiting for the acknowledgement is what
+                    // makes the last frame before a close actually arrive.
+                    // Without it a `group invite` reported success and the
+                    // invitation never showed up, about one time in twelve.
+                    Some(ActorCommand::Close) | None => {
+                        let _ = link.finish_send().await;
+                        break;
+                    }
                 },
                 inbound = link.recv_frame() => match inbound {
                     Ok(Some(frame)) => {
@@ -294,5 +317,6 @@ pub(crate) fn spawn_channel(
         state,
         stats,
         commands: Some(commands),
+        task: Some(task),
     }
 }
