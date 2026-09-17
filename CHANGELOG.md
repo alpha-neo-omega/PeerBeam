@@ -7,10 +7,6 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
-- **Chat with a Tailscale peer actually reachable.** The identify flow shipped
-  last release and the device row withheld the chat button for exactly the ids
-  that need it, so it could not be reached from the only screen that lists
-  Tailscale devices. The row now always offers chat and the tap picks its route.
 - **Chat from a typed address.** "Send to address" offered files, a folder and
   a one-off text and no way to start a conversation — the thing you would want
   with a machine you have to type the address of. It asks the address who is
@@ -67,13 +63,17 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   makes no such inference, and is right not to: it did not choose where the
   connection came from. Here the caller named the address, so what answers at it
   is by construction what that address is.
-- **Chat with a Tailscale peer now works**, by asking. Tapping chat on a device
-  the app knows only by a provider's own name resolves it first — one dial, one
-  handshake, no bytes sent — and opens the conversation under the identity that
-  answered, so replies land in the thread you are looking at and queued messages
-  can flush. Done on the tap, not in the background on discovery: dialling every
-  peer the moment it appears would reach out to machines nobody asked it to
-  touch.
+- **Chat with a Tailscale peer.** Tapping chat on a device the app knows only
+  by a provider's own name resolves it first — one dial, one handshake, no bytes
+  sent — and opens the conversation under the identity that answered, so replies
+  land in the thread you are looking at and queued messages can flush. Done on
+  the tap, not in the background on discovery: dialling every peer the moment it
+  appears would reach out to machines nobody asked it to touch.
+
+  The first cut of this shipped behind a guard that hid the chat button for
+  exactly the ids it was built for, so it could not be reached from the only
+  screen that lists Tailscale devices. Both halves are in this release; neither
+  was ever in a tagged one.
 
 ### Fixed
 - **A dial that froze the whole app.** `peerIdentify` ran on the UI isolate
