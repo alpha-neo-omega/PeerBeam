@@ -7,6 +7,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/features/chats/chats_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -532,5 +533,118 @@ void main() {
     await searchFor(tester, '   ');
     expect(fake.calls.where((c) => c.startsWith('chatSearch')), isEmpty);
     expect(find.text('pb-bob'), findsOneWidget);
+  });
+  // Group messages are the user's own messages. `history` filters group rows
+  // out of the private thread they are stored in — correctly — and search
+  // walked `history`, so text written in a group was unfindable while the
+  // screen answered "No messages match" as a fact about the user's own disk.
+  //
+  // A group hit's `peerId` is whichever member's namespace held the copy the
+  // engine read, so it must never be used to open it.
+  test('a group hit is filed under its group, not under a member', () {
+    const hit = ChatSearchHit(
+      peerId: 'pb-alice',
+      messageId: 'm1',
+      at: null,
+      direction: 'out',
+      kind: ChatMessageKind.text,
+      snippet: 'the quarterly figures',
+      group: 'g-team',
+    );
+
+    expect(hit.isGroup, isTrue);
+    expect(hit.group, 'g-team');
+  });
+
+  test('a private hit reports no group', () {
+    const hit = ChatSearchHit(
+      peerId: 'pb-alice',
+      messageId: 'm1',
+      at: null,
+      direction: 'in',
+      kind: ChatMessageKind.text,
+      snippet: 'just between us',
+    );
+
+    expect(hit.isGroup, isFalse);
+  });
+
+  test('the group rides the wire and is decoded', () {
+    final hit = ChatSearchHit.fromJson(const {
+      'peer_id': 'pb-alice',
+      'message_id': 'm1',
+      'direction': 'out',
+      'kind': 'text',
+      'snippet': 'hi',
+      'group': 'g-team',
+    });
+    expect(hit.group, 'g-team');
+    expect(hit.isGroup, isTrue);
+
+    // Absent means private, and must not become an empty-string group.
+    final private = ChatSearchHit.fromJson(const {
+      'peer_id': 'pb-alice',
+      'message_id': 'm2',
+      'direction': 'in',
+      'kind': 'text',
+      'snippet': 'hi',
+    });
+    expect(private.group, isNull);
+    expect(private.isGroup, isFalse);
+  });
+  // `main.dart` holds only the root navigator, which sits above `AppShell` and
+  // so above the `DropZone` wrapping its content. A chat pushed from there
+  // cannot claim the drop, and the shell's own zone stays armed underneath it:
+  // a file dragged onto that conversation lit two overlays and, on release,
+  // was both sent to the peer and staged for a second unrelated send.
+  //
+  // So the request is handed to this screen, which is inside the shell.
+  testWidgets('a requested thread is opened from inside the shell', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: ChatsScreen()),
+      ),
+    );
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    state.pendingThread.value = 'pb-bob';
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(find.byType(ChatScreen), findsOneWidget);
+    // And taken down, so it cannot be answered a second time.
+    expect(state.pendingThread.value, isNull);
+  });
+
+  testWidgets('a request made before the screen exists is still answered', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    final state = AppState.live(fake);
+    addTearDown(state.dispose);
+    // The cold-start case: the click is what builds this screen.
+    state.pendingThread.value = 'pb-bob';
+
+    await tester.pumpWidget(
+      AppScope(
+        state: state,
+        child: const MaterialApp(home: ChatsScreen()),
+      ),
+    );
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(find.byType(ChatScreen), findsOneWidget);
   });
 }

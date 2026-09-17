@@ -259,6 +259,31 @@ class _IncomingDialog extends StatelessWidget {
             const Gap(AppSpace.md),
             PairingCodePanel(transfer: transfer),
           ],
+          // **What "Always accept" actually grants**, on screen rather than in
+          // a tooltip.
+          //
+          // The button approves the device, and approval writes the default
+          // permission set — `PermissionSet::granted_on_approval()`, which is
+          // files, messages, clipboard, presence and pipe. Five capabilities
+          // behind a label about files, and the only statement of it was in a
+          // tooltip, which a touch screen shows on long-press and most people
+          // never see. Someone accepting a photo was also letting that device
+          // push their clipboard.
+          //
+          // Phrased as what trusting *means* rather than as what this tap will
+          // change, because the prompt cannot tell the two apart: `Transfer`
+          // carries no device id, and approval is written only on the
+          // transition — so for a device already approved with narrowed
+          // permissions, "it will now be able to" would be its own lie.
+          const Gap(AppSpace.md),
+          Text(
+            '"Always accept" trusts this device. A trusted device can send '
+            "files and messages, share clipboard, and see when you're "
+            'online — narrow that any time in Trusted devices.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
         ],
       ),
       actions: [
@@ -279,6 +304,8 @@ class _IncomingDialog extends StatelessWidget {
           message:
               'Accept this file, and accept files from this device without '
               "asking. Turn it off from the conversation's ⋮ menu.",
+          // The tooltip stays for pointer platforms; the sentence in the body
+          // above is what a touch screen actually shows.
           child: FilledButton(
             onPressed: onTrust,
             child: const Text('Always accept'),

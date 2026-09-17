@@ -92,15 +92,20 @@ void main() {
         ),
       );
 
-      expect(found, isNotNull);
-      expect(found!.deviceId, 'pb-alice-laptop');
+      expect(found.error, isNull);
+      final identity = found.identity;
+      expect(identity, isNotNull);
+      expect(identity!.deviceId, 'pb-alice-laptop');
       // And the answer is one a conversation can actually be filed under.
-      expect(canChatWithDeviceId(found.deviceId), isTrue);
-      expect(found.newlyTrusted, isTrue);
-      expect(found.pairingCode, '482913');
+      expect(canChatWithDeviceId(identity.deviceId), isTrue);
+      // First contact, with the code that is the only way to detect an
+      // interception. The GUI must put this in front of the user — see
+      // `confirmFirstContact` and `home_screen._chatAfterIdentifying`.
+      expect(identity.newlyTrusted, isTrue);
+      expect(identity.pairingCode, '482913');
     });
 
-    test('an unreachable address answers null rather than throwing', () async {
+    test('an unreachable address answers the reason, not a crash', () async {
       final fake = FakePeerBeam();
       final repo = DiscoveryRepository(api: fake);
       addTearDown(repo.dispose);
@@ -114,7 +119,11 @@ void main() {
         ),
       );
 
-      expect(found, isNull, reason: 'unreachable is an answer, not a crash');
+      expect(found.identity, isNull, reason: 'unreachable is an answer');
+      // And it says WHY. Returning a bare null made every failure — refused,
+      // permission withheld, engine not running — read to the user as "could
+      // not reach it", which sent them to look at a network that was fine.
+      expect(found.error, isNotNull);
     });
 
     // A peer picks its own id and nothing on the wire constrains it, so the

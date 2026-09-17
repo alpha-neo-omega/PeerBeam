@@ -8,6 +8,7 @@ import '../../platform/desktop_files.dart';
 import '../../platform/open_path.dart';
 import '../../platform/saf.dart';
 import '../../sdk/error_text.dart';
+import '../../sdk/events.dart';
 import '../../sdk/models.dart';
 import '../../state/app_scope.dart';
 import '../../state/chat_presence.dart';
@@ -54,6 +55,18 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
+
+  /// The composer's focus, owned here so it outlives the rebuild a send
+  /// causes. See [_send].
+  final _composerFocus = FocusNode();
+
+  /// The transcript's scroll position.
+  ///
+  /// The list is `reverse: true`, so offset 0 is the **newest** message. Held
+  /// here so a send can return to it: someone reading back through a thread who
+  /// then writes a reply had it appended out of sight below them, with nothing
+  /// saying where it went and no control to follow it.
+  final _scroll = ScrollController();
 
   /// Message ids the user has picked out of this thread.
   ///
@@ -103,10 +116,16 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  /// Watches for messages landing in this thread while it is being read.
+  StreamSubscription<BridgeEvent>? _incoming;
+
   @override
   void dispose() {
     _retentionTick?.cancel();
+    _incoming?.cancel();
     _controller.dispose();
+    _composerFocus.dispose();
+    _scroll.dispose();
     // Passing the peer id matters: pushing one thread on top of another builds
     // the new screen before disposing the old, so an unconditional clear here
     // would blank the thread that had just registered.
@@ -130,7 +149,34 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _presence = AppScope.of(context).chatPresence..enter(widget.peerId);
+    // **Only when it actually changes.** `didChangeDependencies` fires for any
+    // inherited change — a theme switch, a metrics change — including while
+    // this route is buried under another thread. Re-entering there would
+    // re-register a screen the user cannot see as the one in front.
+    final scope = AppScope.of(context);
+    if (identical(scope.chatPresence, _presence)) return;
+    _presence?.leave(widget.peerId);
+    _presence = scope.chatPresence..enter(widget.peerId);
+
+    // **Read receipts for anything that arrives while the thread is open.**
+    // Marking read ran exactly once, in the post-frame callback above, so
+    // during a live back-and-forth the other person's device never learned
+    // that anything after the first batch had been read: their bubbles kept
+    // the "delivered" tick however long this screen sat open, and the receipt
+    // appeared only if the reader backed out and came in again — an opted-in
+    // feature that looks broken to the person who opted in.
+    //
+    // The engine still gates on the opt-in and the watermark only ever moves
+    // forward, so re-asserting it is cheap and cannot over-report. `scope` is
+    // captured rather than looked up inside the callback, which outlives the
+    // frame.
+    _incoming?.cancel();
+    _incoming = scope.api?.events.listen((e) {
+      if (e is! ChatReceived) return;
+      final m = e.message;
+      if (m.group != null || m.isMine || m.peerId != widget.peerId) return;
+      unawaited(scope.chat.markRead(widget.peerId));
+    });
   }
 
   /// (Re)start the sweep that clears messages whose window closes while the
@@ -223,6 +269,23 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.trim().isEmpty) return;
     final state = AppScope.of(context);
     _controller.clear();
+    // Stay in the composer. Sending rebuilds the screen, and without this the
+    // field lost focus every time — so the keyboard closed after each message
+    // on a phone, and on desktop the next thing typed went nowhere. A chat
+    // where every message costs an extra tap to start typing again.
+    _composerFocus.requestFocus();
+    // And go to where the message will appear. The list is reversed, so the
+    // newest row is at offset 0; scrolled back through a thread, a reply was
+    // appended out of sight below with nothing saying so. After the frame,
+    // because the row does not exist until the append has been built.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    });
     // Resolved as the message goes out, not as the thread was opened: an
     // address that arrived in between is the address this send needs.
     final replyTo = _replyToId;
@@ -289,34 +352,48 @@ class _ChatScreenState extends State<ChatScreen> {
     '\u{1F622}',
   ];
 
-  /// Apply a reaction and say so only when it did **not** reach the peer.
+  /// Apply a reaction and say what actually happened when it was not simply
+  /// delivered.
   ///
   /// Silence on success is deliberate: a reaction is a small gesture and a
-  /// toast for every one would be louder than the thing it reports. But a
-  /// reaction the peer never saw — offline, or a build too old to have
-  /// negotiated them — would otherwise look identical to one that landed, and
-  /// that is the case the user cannot recover from without being told.
+  /// toast for every one would be louder than the thing it reports. But there
+  /// are three ways for it not to succeed and they are not the same news:
+  ///
+  ///  * The call **failed** — nothing was saved anywhere.
+  ///  * The engine **did not apply** it, which means the message it names is
+  ///    no longer in the store (deleted, or its window closed).
+  ///  * It was saved here and could not be **delivered** — the peer is offline
+  ///    or too old to have negotiated reactions.
+  ///
+  /// Only the third is "Saved here", and that sentence used to be shown for
+  /// all three: the repository returned one bool for every outcome, so a
+  /// reaction that had not been stored at all told the user it was safe on
+  /// their own device.
   Future<void> _react(
     String messageId,
     String emoji, {
     required bool remove,
   }) async {
     final state = AppScope.of(context);
-    final delivered = await state.chat.react(
+    final result = await state.chat.react(
       widget.peerId,
       messageId,
       emoji,
       remove: remove,
     );
-    if (!mounted || delivered) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Saved here, but not delivered — the device is offline or its '
-          'app is too old for reactions.',
-        ),
-      ),
-    );
+    if (!mounted || (result.applied && result.delivered)) return;
+    final message = switch (result) {
+      (applied: _, delivered: _, error: final Object e) =>
+        'Could not react: ${friendlyError(e)}',
+      (applied: false, delivered: _, error: _) =>
+        'That message is no longer in this conversation.',
+      _ =>
+        'Saved here, but not delivered — the device is offline or its '
+            'app is too old for reactions.',
+    };
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   /// Offer the quick reactions for [messageId]. Opened by the button on the
@@ -614,16 +691,34 @@ class _ChatScreenState extends State<ChatScreen> {
     // no longer on this device cannot be forwarded at all, and handing the
     // engine a path that is not there would produce a row of failed bubbles in
     // the other thread having warned nobody.
-    final sendable = <ChatMessage>[];
+    // Each sendable file carries the path the engine will actually read, which
+    // is not always the one on the row.
+    final sendable = <({ChatMessage message, String path})>[];
     final missing = <String>[];
     for (final m in chosen) {
-      final path = m.isFile ? (m.localPath ?? '') : '';
-      if (!m.isFile || localFileExists(path)) {
-        sendable.add(m);
+      if (!m.isFile) {
+        sendable.add((message: m, path: ''));
+        continue;
+      }
+      final path = m.localPath ?? '';
+      if (localFileExists(path)) {
+        sendable.add((message: m, path: path));
+        continue;
+      }
+      // On Android a received file's engine-private copy is **deleted** once it
+      // has been published into the user's folder, so the recorded path dangles
+      // by design (`open_path.dart` says so, and `_open` already falls back for
+      // it). Forwarding had no such fallback, so every received file reported
+      // itself gone — while tapping the very same row opened it. Copy it back
+      // out of the user's folder and forward that.
+      final staged = m.isMine ? null : await Saf.stage(m.fileName ?? '');
+      if (staged != null && staged.isNotEmpty) {
+        sendable.add((message: m, path: staged));
       } else {
         missing.add(m.fileName ?? 'That file');
       }
     }
+    if (!mounted) return;
     if (sendable.isEmpty) {
       _snack(
         messenger,
@@ -636,26 +731,43 @@ class _ChatScreenState extends State<ChatScreen> {
     // send it twice while the first is still going out.
     _clearSelection();
     final chat = scope.chat;
-    for (final m in sendable) {
-      if (m.isFile) {
-        await chat.sendFile(
-          peerId,
-          target,
-          m.localPath ?? '',
-          name: m.fileName,
-          size: m.fileSize,
-        );
-      } else {
-        await chat.send(peerId, target, m.body);
-      }
+    // Counted, not assumed. `send`/`sendFile` do not throw — a refusal is
+    // recorded on the row and the loop completes either way — so this used to
+    // announce "Forwarded 3 messages" while all three had been refused, with
+    // the only evidence three red bubbles in the *other* conversation, which
+    // the user has no reason to open after being told it worked. A refusal is
+    // the ordinary case here, not an exotic one: the engine checks the chat
+    // permission before persisting anything.
+    var forwarded = 0;
+    for (final entry in sendable) {
+      final m = entry.message;
+      final ok = m.isFile
+          ? await chat.sendFile(
+              peerId,
+              target,
+              entry.path,
+              name: m.fileName,
+              size: m.fileSize,
+            )
+          : await chat.send(peerId, target, m.body);
+      if (ok) forwarded++;
     }
-    final sent = sendable.length == 1
+    if (forwarded == 0) {
+      _snack(
+        messenger,
+        'Nothing was forwarded to ${picked.name} — it would not accept them.',
+      );
+      return;
+    }
+    final refused = sendable.length - forwarded;
+    final sent = forwarded == 1
         ? 'Forwarded 1 message to ${picked.name}'
-        : 'Forwarded ${sendable.length} messages to ${picked.name}';
-    _snack(
-      messenger,
-      missing.isEmpty ? sent : '$sent · ${_missingText(missing)}',
-    );
+        : 'Forwarded $forwarded messages to ${picked.name}';
+    final notes = [
+      if (refused > 0) '$refused ${refused == 1 ? 'was' : 'were'} refused',
+      if (missing.isNotEmpty) _missingText(missing),
+    ];
+    _snack(messenger, notes.isEmpty ? sent : '$sent · ${notes.join(' · ')}');
   }
 
   /// The peer's real device id behind a picked target, or null when discovery
@@ -843,14 +955,25 @@ class _ChatScreenState extends State<ChatScreen> {
                 ?_retentionStrip(state, peer),
                 Expanded(
                   child: items.isEmpty
-                      // A conversation this device could not read is not a
-                      // conversation with nothing in it, and "No messages yet"
-                      // is a statement about the user's own history that a
-                      // failed read has no grounds to make. Only when there is
-                      // genuinely nothing on screen: a thread that loaded once
-                      // and failed to reload keeps its messages, because stale
-                      // messages beat an error page over messages that are
-                      // right there.
+                      // Three states, not two, and the difference is the whole
+                      // point. A conversation this device could not read is
+                      // not a conversation with nothing in it, and one it has
+                      // not read *yet* is neither — "No messages yet" is a
+                      // statement about the user's own history, and only a
+                      // completed read gives any grounds to make it.
+                      //
+                      // The read is fired post-frame and awaits three engine
+                      // calls (`openThread`), so the un-read state is not
+                      // theoretical: every thread passed through it, showing
+                      // "Send a message to start the conversation" over a
+                      // conversation that was merely still being fetched. On a
+                      // long thread or a slow disk it is on screen long enough
+                      // to read and believe.
+                      //
+                      // Emptiness is only claimed when there is genuinely
+                      // nothing on screen: a thread that loaded once and failed
+                      // to reload keeps its messages, because stale messages
+                      // beat an error page over messages that are right there.
                       ? (failure != null
                             ? ErrorState(
                                 error: failure,
@@ -858,6 +981,8 @@ class _ChatScreenState extends State<ChatScreen> {
                                 onRetry: () =>
                                     state.chat.openThread(widget.peerId),
                               )
+                            : !state.chat.hasLoaded(widget.peerId)
+                            ? const Center(child: CircularProgressIndicator())
                             : const EmptyState(
                                 icon: Icons.chat_bubble_outline_rounded,
                                 title: 'No messages yet',
@@ -882,6 +1007,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             // Reversed so the latest message stays pinned to
                             // the bottom without a manual scroll controller.
                             return ListView.builder(
+                              controller: _scroll,
                               reverse: true,
                               padding: const EdgeInsets.all(AppSpace.md),
                               itemCount: items.length,
@@ -897,6 +1023,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                   index: i,
                                   child: _ChatBubble(
                                     message: message,
+                                    peerName: peer.name,
                                     maxWidth: column * 0.75,
                                     // Resolved against the rows on screen only. A
                                     // parent that has disappeared resolves to null
@@ -960,6 +1087,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 _Composer(
                   controller: _controller,
+                  focusNode: _composerFocus,
                   onSend: _send,
                   onAttach: _attach,
                   enabled: canSend,
@@ -1084,8 +1212,14 @@ class _ChatBubble extends StatelessWidget {
   /// is the wrong answer inside a capped [ContentPane].
   final double maxWidth;
 
+  /// What to call the other side, for the screen-reader label. Everything
+  /// visual says whose message this is by alignment and colour, neither of
+  /// which a screen reader can convey.
+  final String peerName;
+
   const _ChatBubble({
     required this.message,
+    required this.peerName,
     required this.selecting,
     required this.selected,
     required this.onToggle,
@@ -1105,170 +1239,265 @@ class _ChatBubble extends StatelessWidget {
     final bg = mine ? scheme.primaryContainer : scheme.surfaceContainerHighest;
     final fg = mine ? scheme.onPrimaryContainer : scheme.onSurface;
 
-    return Container(
-      // The tint spans the whole row rather than the bubble, so a one-word
-      // message is as legibly selected as a long one.
-      color: selected ? scheme.primary.withValues(alpha: 0.12) : null,
-      padding: const EdgeInsets.only(bottom: AppSpace.xs),
-      child: Row(
-        mainAxisAlignment: mine
-            ? MainAxisAlignment.end
-            : MainAxisAlignment.start,
-        children: [
-          if (selecting) ...[
-            Icon(
-              selected
-                  ? Icons.check_circle_rounded
-                  : Icons.radio_button_unchecked_rounded,
-              size: AppIcons.md,
-              color: selected ? scheme.primary : scheme.onSurfaceVariant,
-            ),
-            const Gap(AppSpace.xs),
-          ],
-          ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: maxWidth),
-            child: Material(
-              color: bg,
-              borderRadius: BorderRadius.circular(AppRadius.lg),
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                onTap: selecting
-                    ? onToggle
-                    : (message.isFile && _openablePath(message) != null
-                          ? () => _open(context, message)
-                          : null),
-                // Long-press is the touch idiom for entering selection; a
-                // long-press with a mouse is not, so desktop gets the
-                // right-click it expects. Both land in the same toggle, so the
-                // first one selects and any later one just adds or removes.
-                onLongPress: onToggle,
-                onSecondaryTap: onToggle,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: AppSpace.sm,
-                    vertical: AppSpace.xs,
+    return Semantics(
+      // **One node per message, read as a sentence.** Without this a thread is
+      // announced as a bare list of message texts: whose message it is was
+      // conveyed only by alignment and colour, its state only by an unlabelled
+      // 14px glyph, and its selection only by a decorative icon. None of the
+      // three survives being read aloud.
+      container: true,
+      selected: selecting ? selected : null,
+      label: _semanticLabel(),
+      child: Container(
+        // The tint spans the whole row rather than the bubble, so a one-word
+        // message is as legibly selected as a long one.
+        color: selected ? scheme.primary.withValues(alpha: 0.12) : null,
+        padding: const EdgeInsets.only(bottom: AppSpace.xs),
+        child: Row(
+          mainAxisAlignment: mine
+              ? MainAxisAlignment.end
+              : MainAxisAlignment.start,
+          children: [
+            if (selecting) ...[
+              // Tappable, because it looks exactly like a checkbox. It was a
+              // bare `Icon` — a thumb aimed at the obvious target hit nothing,
+              // and the only way to toggle was to hit the bubble beside it. Sized
+              // to the minimum target rather than the glyph.
+              InkWell(
+                onTap: onToggle,
+                customBorder: const CircleBorder(),
+                child: SizedBox(
+                  width: kMinInteractiveDimension,
+                  height: kMinInteractiveDimension,
+                  child: Center(
+                    child: Icon(
+                      selected
+                          ? Icons.check_circle_rounded
+                          : Icons.radio_button_unchecked_rounded,
+                      size: AppIcons.md,
+                      color: selected
+                          ? scheme.primary
+                          : scheme.onSurfaceVariant,
+                    ),
                   ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      // Keyed off `inReplyTo`, not off `parent`: a reply whose
-                      // answered message has gone must still say it is a reply.
-                      if (message.isReply) _ReplyMarker(parent: parent),
-                      if (message.isFile)
-                        _FileBody(
-                          message: message,
-                          fg: fg,
-                          selecting: selecting,
-                        )
-                      else
-                        Text(
-                          message.body,
-                          style: text.bodyMedium?.copyWith(color: fg),
-                        ),
-                      if (error != null) ...[
-                        const Gap(AppSpace.xxs),
-                        Text(
-                          error!,
-                          style: text.labelSmall?.copyWith(color: scheme.error),
-                        ),
-                      ],
-                      const Gap(AppSpace.xxs),
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
+                ),
+              ),
+              const Gap(AppSpace.xs),
+            ],
+            ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: maxWidth),
+              child: Material(
+                color: bg,
+                borderRadius: BorderRadius.circular(AppRadius.lg),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  onTap: selecting
+                      ? onToggle
+                      : (message.isFile && _openablePath(message) != null
+                            ? () => _open(context, message)
+                            : null),
+                  // Long-press is the touch idiom for entering selection; a
+                  // long-press with a mouse is not, so desktop gets the
+                  // right-click it expects. Both land in the same toggle, so the
+                  // first one selects and any later one just adds or removes.
+                  onLongPress: onToggle,
+                  onSecondaryTap: onToggle,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpace.sm,
+                      vertical: AppSpace.xs,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Keyed off `inReplyTo`, not off `parent`: a reply whose
+                        // answered message has gone must still say it is a reply.
+                        if (message.isReply) _ReplyMarker(parent: parent),
+                        if (message.isFile)
+                          _FileBody(
+                            message: message,
+                            fg: fg,
+                            selecting: selecting,
+                          )
+                        else
                           Text(
-                            _time(message.shownAt),
+                            message.body,
+                            style: text.bodyMedium?.copyWith(color: fg),
+                          ),
+                        if (error != null) ...[
+                          const Gap(AppSpace.xxs),
+                          Text(
+                            error!,
                             style: text.labelSmall?.copyWith(
-                              color: fg.withValues(alpha: 0.7),
+                              color: scheme.error,
                             ),
                           ),
-                          if (mine) ...[
-                            const Gap(AppSpace.xxs),
-                            Icon(
-                              // A read message earns its own glyph rather than
-                              // a second tick: "delivered" and "read" are
-                              // different claims, and only one of them is
-                              // something the peer chose to tell us.
-                              message.readAt != null
-                                  ? Icons.done_all_rounded
-                                  : _deliveryGlyph(message.status),
-                              size: 14,
-                              color: message.readAt != null
-                                  ? scheme.primary
-                                  : (_failedStatus(message.status)
-                                        ? scheme.error
-                                        : fg.withValues(alpha: 0.7)),
-                            ),
-                          ],
-                          // An explicit control rather than a gesture. A
-                          // double-tap here would put a double-tap recognizer
-                          // in the arena around the whole bubble, which delays
-                          // every tap inside it — including this row's Accept
-                          // and Decline — by the double-tap timeout. A visible
-                          // button costs a few pixels and no latency.
-                          if (onPickReaction != null && !selecting) ...[
-                            const Gap(AppSpace.xxs),
-                            // A full [kMinInteractiveDimension] square. The
-                            // glyph stays 14px — this row is metadata, not a
-                            // toolbar — but the *target* was 18px too, which
-                            // is a third of the minimum: a thumb aimed at it
-                            // landed on the bubble instead, and the bubble's
-                            // own onTap opens the file. The row grows to 48
-                            // and every bubble with it, which is the cheaper
-                            // half of the trade — a control that cannot be
-                            // hit is not a smaller control, it is an absent
-                            // one.
-                            InkWell(
-                              onTap: onPickReaction,
-                              borderRadius: BorderRadius.circular(
-                                kMinInteractiveDimension / 2,
+                        ],
+                        const Gap(AppSpace.xxs),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              _time(message.shownAt),
+                              style: text.labelSmall?.copyWith(
+                                color: fg.withValues(alpha: 0.7),
                               ),
-                              child: SizedBox(
-                                width: kMinInteractiveDimension,
-                                height: kMinInteractiveDimension,
-                                child: Center(
-                                  child: Icon(
-                                    Icons.add_reaction_outlined,
+                            ),
+                            if (mine) ...[
+                              const Gap(AppSpace.xxs),
+                              Builder(
+                                builder: (context) {
+                                  // A read message earns its own glyph rather
+                                  // than a second tick: "delivered" and "read"
+                                  // are different claims, and only one of them
+                                  // is something the peer chose to tell us.
+                                  //
+                                  // **But failure outranks it.** `read_at` is
+                                  // about the chat *row*; a file row's bytes
+                                  // fail, are declined, or are left interrupted
+                                  // quite separately, and the peer may well have
+                                  // read the row before turning the file down.
+                                  // Reading the receipt first painted the blue
+                                  // "read" tick over a file that never arrived —
+                                  // the one glyph on the row, saying the message
+                                  // got there, above a bubble saying it did not.
+                                  final failed = _failedStatus(message.status);
+                                  final read =
+                                      !failed && message.readAt != null;
+                                  return Icon(
+                                    read
+                                        ? Icons.done_all_rounded
+                                        : _deliveryGlyph(message.status),
                                     size: 14,
-                                    color: fg.withValues(alpha: 0.7),
+                                    color: read
+                                        ? scheme.primary
+                                        : (failed
+                                              ? scheme.error
+                                              : fg.withValues(alpha: 0.7)),
+                                  );
+                                },
+                              ),
+                            ],
+                            // An explicit control rather than a gesture. A
+                            // double-tap here would put a double-tap recognizer
+                            // in the arena around the whole bubble, which delays
+                            // every tap inside it — including this row's Accept
+                            // and Decline — by the double-tap timeout. A visible
+                            // button costs a few pixels and no latency.
+                            if (onPickReaction != null && !selecting) ...[
+                              const Gap(AppSpace.xxs),
+                              // A full [kMinInteractiveDimension] square. The
+                              // glyph stays 14px — this row is metadata, not a
+                              // toolbar — but the *target* was 18px too, which
+                              // is a third of the minimum: a thumb aimed at it
+                              // landed on the bubble instead, and the bubble's
+                              // own onTap opens the file. The row grows to 48
+                              // and every bubble with it, which is the cheaper
+                              // half of the trade — a control that cannot be
+                              // hit is not a smaller control, it is an absent
+                              // one.
+                              InkWell(
+                                onTap: onPickReaction,
+                                // Named. Every other control on this screen is
+                                // an `IconButton` with a tooltip; this one is a
+                                // bare `InkWell`, so it was announced as an
+                                // unlabelled button — and a tooltip is what
+                                // gives a pointer user the name too.
+                                //
+                                // `excludeFromSemantics` is deliberately not
+                                // set: the bubble around it is a semantics
+                                // container, and a nameless button inside a
+                                // labelled row is exactly what this is fixing.
+                                // The label rides on the Tooltip.
+                                borderRadius: BorderRadius.circular(
+                                  kMinInteractiveDimension / 2,
+                                ),
+                                child: Tooltip(
+                                  message: 'Add reaction',
+                                  child: SizedBox(
+                                    width: kMinInteractiveDimension,
+                                    height: kMinInteractiveDimension,
+                                    child: Center(
+                                      child: Icon(
+                                        Icons.add_reaction_outlined,
+                                        size: 14,
+                                        color: fg.withValues(alpha: 0.7),
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
+                            ],
                           ],
-                        ],
-                      ),
-                      if (message.reactions.isNotEmpty) ...[
-                        const Gap(AppSpace.xxs),
-                        _Reactions(
-                          reactions: message.reactions,
-                          fg: fg,
-                          onTap: selecting ? null : onReact,
                         ),
-                      ],
-                      // Nothing else will ever clear this row — it exists only
-                      // in this session, because the engine refused to send it
-                      // and therefore persisted nothing. A full-size action,
-                      // not a cramped glyph: it is the only way out. Withheld
-                      // while selecting, like every other in-bubble action.
-                      if (onDismiss != null && !selecting)
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: TextButton(
-                            onPressed: onDismiss,
-                            child: const Text('Dismiss'),
+                        if (message.reactions.isNotEmpty) ...[
+                          const Gap(AppSpace.xxs),
+                          _Reactions(
+                            reactions: message.reactions,
+                            fg: fg,
+                            onTap: selecting ? null : onReact,
                           ),
-                        ),
-                    ],
+                        ],
+                        // Nothing else will ever clear this row — it exists only
+                        // in this session, because the engine refused to send it
+                        // and therefore persisted nothing. A full-size action,
+                        // not a cramped glyph: it is the only way out. Withheld
+                        // while selecting, like every other in-bubble action.
+                        if (onDismiss != null && !selecting)
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton(
+                              onPressed: onDismiss,
+                              child: const Text('Dismiss'),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
+  }
+
+  /// What a screen reader says for this row.
+  ///
+  /// Everything the sighted reading relies on — alignment for who sent it,
+  /// colour for the same, a 14px glyph for what happened to it, a decorative
+  /// circle for whether it is selected — is assembled here into one sentence,
+  /// in the order a person would want it: who, what, how it went, when.
+  String _semanticLabel() {
+    final who = message.isMine
+        ? 'Me'
+        : (peerName.trim().isEmpty ? 'Them' : peerName.trim());
+    final what = message.isFile
+        ? 'file ${message.fileName ?? 'unnamed'}'
+        : message.body;
+    final parts = <String>[who, if (what.trim().isNotEmpty) what.trim()];
+    if (message.isReply) parts.add('in reply');
+    if (message.isMine) {
+      // The same precedence the glyph uses: a failure outranks a read receipt.
+      if (_failedStatus(message.status)) {
+        parts.add(_statusWord(message.status));
+      } else if (message.readAt != null) {
+        parts.add('read');
+      } else {
+        parts.add(_statusWord(message.status));
+      }
+    }
+    final at = message.shownAt;
+    if (at != null) parts.add(_time(at));
+    if (message.reactions.isNotEmpty) {
+      parts.add(
+        '${message.reactions.length} reaction'
+        '${message.reactions.length == 1 ? '' : 's'}',
+      );
+    }
+    return parts.join(', ');
   }
 
   // The engine persists timestamps as UTC (RFC3339); the optimistic message
@@ -1286,8 +1515,22 @@ class _ChatBubble extends StatelessWidget {
   String _time(DateTime? t) {
     if (t == null) return '';
     final local = t.toLocal();
-    return '${local.hour.toString().padLeft(2, '0')}:'
+    final clock =
+        '${local.hour.toString().padLeft(2, '0')}:'
         '${local.minute.toString().padLeft(2, '0')}';
+    // **The date, when it is not today's.** A bare "09:14" reads as this
+    // morning whatever month it is from, and a thread scrolled back far enough
+    // was a wall of times with nothing to place them. Only when it differs, so
+    // the ordinary case — a conversation happening now — stays as short as it
+    // was.
+    final now = DateTime.now();
+    final sameDay =
+        local.year == now.year &&
+        local.month == now.month &&
+        local.day == now.day;
+    if (sameDay) return clock;
+    return '${local.day.toString().padLeft(2, '0')}/'
+        '${local.month.toString().padLeft(2, '0')} $clock';
   }
 }
 
@@ -1638,15 +1881,22 @@ class _FileBody extends StatelessWidget {
     // time the engine answers.
     final messenger = ScaffoldMessenger.of(context);
     final chat = AppScope.of(context).chat;
-    final cancelled = await chat.cancelFile(m.peerId, m.id);
-    if (cancelled) return;
+    final outcome = await chat.cancelFile(m.peerId, m.id);
+    if (outcome.cancelled) return;
     final name = m.fileName ?? 'that file';
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
           content: Text(
-            'Could not cancel $name — it is no longer waiting to be sent.',
+            // Two different things, and they were the same sentence. "It is no
+            // longer waiting" is the engine's answer; a call that *failed* has
+            // no idea whether the file went, and saying it did — next to a row
+            // still showing as queued — is the screen contradicting itself.
+            outcome.error != null
+                ? 'Could not cancel $name: ${friendlyError(outcome.error!)}'
+                : 'Could not cancel $name — it is no longer waiting to be '
+                      'sent.',
           ),
         ),
       );
@@ -2032,11 +2282,16 @@ class _AttachOption extends StatelessWidget {
 /// nothing can be typed into a message that could not exist.
 class _Composer extends StatelessWidget {
   final TextEditingController controller;
+
+  /// Kept by the screen, not by this widget, so focus survives the rebuild
+  /// that sending causes.
+  final FocusNode focusNode;
   final VoidCallback onSend;
   final VoidCallback onAttach;
   final bool enabled;
   const _Composer({
     required this.controller,
+    required this.focusNode,
     required this.onSend,
     required this.onAttach,
     this.enabled = true,
@@ -2062,22 +2317,54 @@ class _Composer extends StatelessWidget {
             ),
             const Gap(AppSpace.xxs),
             Expanded(
-              child: TextField(
-                controller: controller,
-                enabled: enabled,
-                textInputAction: TextInputAction.send,
-                minLines: 1,
-                maxLines: 5,
-                decoration: InputDecoration(
-                  hintText: enabled ? 'Message' : 'Not reachable right now',
-                  border: const OutlineInputBorder(
-                    borderRadius: BorderRadius.all(
-                      Radius.circular(AppRadius.xl),
+              // Enter is handled here rather than through `onSubmitted`,
+              // because what it should do differs by platform and the field
+              // cannot express both.
+              //
+              // It used to be `textInputAction: TextInputAction.send`, which
+              // turns the keyboard's return key into Send — and that is the
+              // only key a phone has for a line break. So a composer that
+              // grows to five lines had no way to reach the second one: every
+              // attempt at a new paragraph sent the message instead. On
+              // desktop the same setting made Enter send with no modifier
+              // reaching the field either.
+              //
+              // Now the field always treats Enter as a newline, and on desktop
+              // a bare Enter is intercepted before it gets there and sends.
+              // Shift+Enter is not intercepted, so it breaks the line. Phones
+              // keep Enter as a newline and send with the button, which is
+              // what every other messaging app on the platform does.
+              child: Focus(
+                onKeyEvent: (node, event) {
+                  if (!isDesktop || !enabled) return KeyEventResult.ignored;
+                  if (event is! KeyDownEvent) return KeyEventResult.ignored;
+                  if (event.logicalKey != LogicalKeyboardKey.enter &&
+                      event.logicalKey != LogicalKeyboardKey.numpadEnter) {
+                    return KeyEventResult.ignored;
+                  }
+                  if (HardwareKeyboard.instance.isShiftPressed) {
+                    return KeyEventResult.ignored;
+                  }
+                  onSend();
+                  return KeyEventResult.handled;
+                },
+                child: TextField(
+                  controller: controller,
+                  focusNode: focusNode,
+                  enabled: enabled,
+                  textInputAction: TextInputAction.newline,
+                  minLines: 1,
+                  maxLines: 5,
+                  decoration: InputDecoration(
+                    hintText: enabled ? 'Message' : 'Not reachable right now',
+                    border: const OutlineInputBorder(
+                      borderRadius: BorderRadius.all(
+                        Radius.circular(AppRadius.xl),
+                      ),
                     ),
+                    isDense: true,
                   ),
-                  isDense: true,
                 ),
-                onSubmitted: (_) => onSend(),
               ),
             ),
             const Gap(AppSpace.xs),
@@ -2289,3 +2576,16 @@ class _AutoAcceptAction extends StatelessWidget {
     );
   }
 }
+
+/// One word for a status, for a screen reader. The visual row shows a glyph,
+/// which has nothing to read aloud.
+String _statusWord(String status) => switch (status) {
+  ChatStatusValue.pending => 'queued',
+  ChatStatusValue.staging => 'preparing',
+  ChatStatusValue.transferring => 'sending',
+  ChatStatusValue.pendingApproval => 'waiting for a decision',
+  ChatStatusValue.failed => 'failed',
+  ChatStatusValue.declined => 'declined',
+  ChatStatusValue.interrupted => 'interrupted',
+  _ => 'sent',
+};

@@ -156,7 +156,12 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'sure, go ahead');
-    await tester.testTextInput.receiveAction(TextInputAction.done);
+    // The Send button, not the keyboard's return key. The composer no longer
+    // turns return into Send — on a phone that key is the only way to reach a
+    // second line, and a five-line composer with no line break was the defect.
+    // The button is the platform-independent path and the one a phone user
+    // takes.
+    await tester.tap(find.byTooltip('Send'));
     await tester.pumpAndSettle();
 
     expect(

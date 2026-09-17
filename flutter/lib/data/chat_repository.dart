@@ -101,9 +101,35 @@ class ChatRepository extends ChangeNotifier {
   List<ChatMessage> messagesFor(String peerId) =>
       List.unmodifiable(_byPeer[peerId] ?? const []);
 
+  /// Conversations this device has actually read at least once.
+  final Set<String> _loaded = <String>{};
+
+  /// Whether the thread with [peerId] has been read from disk yet.
+  ///
+  /// The third state, and the one that was missing. A surface could tell a
+  /// failed read ([loadErrorFor]) from a successful one, but not a read that
+  /// has not happened — both look like an empty list. So opening any
+  /// conversation rendered "No messages yet. Send a message to start the
+  /// conversation." over a thread that was merely still being fetched, which
+  /// is the same class of defect this repository already refuses elsewhere: a
+  /// statement about the user's own history made by something with no grounds
+  /// to make it. On a long thread, or a slow disk, it is on screen long enough
+  /// to read and believe.
+  bool hasLoaded(String peerId) => _loaded.contains(peerId);
+
   /// Every conversation on disk, newest first. Empty until
   /// [refreshConversations] has run.
   List<ChatConversation> get conversations => List.unmodifiable(_conversations);
+
+  bool _conversationsLoaded = false;
+
+  /// Whether the conversation list has been read from the engine yet.
+  ///
+  /// The same third state [hasLoaded] adds for one thread. Without it an empty
+  /// list meant both "you have never chatted" and "nobody has asked yet", and
+  /// the screen said the first about the second — on every open, before the
+  /// read it fires post-frame has answered.
+  bool get conversationsLoaded => _conversationsLoaded;
 
   /// How far the staging copy behind [messageId] has got, or null when this
   /// session has seen no progress for it — which is the ordinary state for the
@@ -248,6 +274,7 @@ class ChatRepository extends ChangeNotifier {
       // the rest of the session: a bubble stamped 12:00 sat below every
       // message sent after it, and physically jumped down past each new one.
       _byPeer[peerId] = _ordered([...msgs, ...?_unsent[peerId]]);
+      _loaded.add(peerId);
       _loadErrors.remove(peerId);
       notifyListeners();
     } catch (e) {
@@ -282,6 +309,7 @@ class ChatRepository extends ChangeNotifier {
         final list = await api.chatConversations();
         if (_disposed) return;
         _conversations = list;
+        _conversationsLoaded = true;
         _conversationsError = null;
         notifyListeners();
       } while (_conversationsStale);
@@ -531,24 +559,34 @@ class ChatRepository extends ChangeNotifier {
 
   /// React to a message, or withdraw that reaction.
   ///
-  /// Returns whether the peer was told. The local half is applied by the
-  /// engine either way and re-read here, so the reaction appears on this
-  /// device even when the peer is unreachable — but the caller is handed the
-  /// delivery answer so it can say so rather than implying the gesture landed.
-  Future<bool> react(
+  /// Reports all three outcomes separately, because they call for three
+  /// different things to be said. This used to return a bare `delivered` bool,
+  /// so a call that **threw**, one the engine **refused to apply**, and one
+  /// that was applied but could not be delivered were the same `false` — and
+  /// the surface says "Saved here, but not delivered" to that. For the first
+  /// two nothing was saved anywhere, and the user was told their reaction was
+  /// safe on their own device when it did not exist.
+  ///
+  /// The local half is applied by the engine even when the peer is
+  /// unreachable, and re-read here, so a reaction still appears on this device
+  /// — that is the case the original message was written for, and it is only
+  /// one of the three.
+  Future<({bool applied, bool delivered, Object? error})> react(
     String peerId,
     String messageId,
     String emoji, {
     bool remove = false,
   }) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) {
+      return (applied: false, delivered: false, error: null);
+    }
     try {
       final r = await api.chatReact(peerId, messageId, emoji, remove: remove);
       if (r.applied) await refresh(peerId);
-      return r.delivered;
-    } catch (_) {
-      return false;
+      return (applied: r.applied, delivered: r.delivered, error: null);
+    } catch (e) {
+      return (applied: false, delivered: false, error: e);
     }
   }
 
@@ -564,20 +602,28 @@ class ChatRepository extends ChangeNotifier {
   /// Nothing is re-read on success: the engine settles the row and emits the
   /// `chat_status` that [_onStatus] applies, so refreshing here would be a
   /// second, racier path to the same state.
-  Future<bool> cancelFile(String peerId, String messageId) async {
+  Future<({bool cancelled, Object? error})> cancelFile(
+    String peerId,
+    String messageId,
+  ) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) {
+      return (cancelled: false, error: null);
+    }
     var cancelled = false;
+    Object? failure;
     try {
       cancelled = await api.chatCancel(peerId, messageId);
-    } catch (_) {
-      // A refused id (never persisted, so never cancellable) reads exactly
-      // like the engine's own "there was nothing to cancel".
-      cancelled = false;
+    } catch (e) {
+      // Kept apart from the engine's own "there was nothing to cancel". Both
+      // came back as a bare `false`, and the surface says "it is no longer
+      // waiting to be sent" to that — so a call that failed outright told the
+      // user their file had already gone, beside a row still plainly queued.
+      failure = e;
     }
-    if (_disposed) return cancelled;
+    if (_disposed) return (cancelled: cancelled, error: failure);
     if (!cancelled) await refresh(peerId);
-    return cancelled;
+    return (cancelled: cancelled, error: failure);
   }
 
   /// Send [text] to [peer], filed under [peerId] in the conversation map.
@@ -591,14 +637,24 @@ class ChatRepository extends ChangeNotifier {
   /// `refresh` reconciles with the persisted record once the call resolves,
   /// and a `chat_status` event later flips the message's status in place
   /// (via [_onStatus]) once it's actually delivered.
-  Future<void> send(
+  /// Returns whether the engine **accepted** the message — that is, persisted
+  /// it, whether or not it has reached the peer yet. False means it was
+  /// refused and nothing was queued.
+  ///
+  /// This used to return nothing, and the failure lived only in the row. That
+  /// is right for the composer, where the row is what the user is looking at,
+  /// and wrong for a caller acting on behalf of a batch: forwarding reported
+  /// "Forwarded 3 messages" while all three were refused, because the loop
+  /// completed normally and there was nothing else to ask. Callers that fire
+  /// and forget may still ignore this.
+  Future<bool> send(
     String peerId,
     PeerTarget peer,
     String text, {
     String? inReplyTo,
   }) async {
     final body = text.trim();
-    if (body.isEmpty) return;
+    if (body.isEmpty) return false;
     final optimistic = ChatMessage(
       id: 'local-${++_optimisticSeq}',
       peerId: peerId,
@@ -621,6 +677,7 @@ class ChatRepository extends ChangeNotifier {
       // Conversations list for exactly as long as it is unreachable — which is
       // when reaching it matters most.
       unawaited(refreshConversations());
+      return true;
     } on PeerBeamException catch (e) {
       // The engine **refused** the message: an over-long body, an engine that
       // never started. That is not the unreachable-peer case — enqueueing is
@@ -642,6 +699,7 @@ class ChatRepository extends ChangeNotifier {
       // async one — the row itself is the answer.
       _fail(peerId, optimistic.id, 'Could not send this message');
     }
+    return false;
   }
 
   /// Share the file at [path] inside the conversation with [peer].
@@ -660,14 +718,16 @@ class ChatRepository extends ChangeNotifier {
   /// Call this once per picked file. A multi-select fans out here, never at
   /// the engine — sending only the first of several files the user chose is
   /// silent data loss.
-  Future<void> sendFile(
+  /// Returns whether the engine accepted the share. See [send] for why this
+  /// is reported rather than left to the row alone.
+  Future<bool> sendFile(
     String peerId,
     PeerTarget peer,
     String path, {
     String? name,
     int? size,
   }) async {
-    if (path.isEmpty) return;
+    if (path.isEmpty) return false;
     final id = 'local-${++_optimisticSeq}';
     (_byPeer[peerId] ??= <ChatMessage>[]).add(
       ChatMessage(
@@ -695,6 +755,7 @@ class ChatRepository extends ChangeNotifier {
       // Same reason as [send]: a file queued for a peer that never turns up
       // must still put its thread on the Conversations list.
       unawaited(refreshConversations());
+      return true;
     } on PeerBeamException catch (e) {
       // The engine refused the path itself (missing file, a folder): nothing
       // was persisted and nothing was sent, so a `refresh` here would silently
@@ -707,6 +768,7 @@ class ChatRepository extends ChangeNotifier {
       // button, so an escaping error would be an unhandled async one.
       _fail(peerId, id, 'Could not share ${name ?? _basename(path)}');
     }
+    return false;
   }
 
   /// Mark a message failed in place, remember why, and — because the engine

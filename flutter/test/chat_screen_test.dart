@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/chat_repository.dart';
 import 'package:peerbeam/features/chat/chat_screen.dart';
 import 'package:peerbeam/sdk/events.dart';
 import 'package:peerbeam/sdk/models.dart';
@@ -69,6 +70,7 @@ ChatMessage _file({
   String name = 'report.pdf',
   int size = _fixtureSize,
   String? localPath,
+  DateTime? readAt,
 }) => ChatMessage(
   id: id,
   peerId: 'pb-bob',
@@ -80,6 +82,7 @@ ChatMessage _file({
   fileName: name,
   fileSize: size,
   localPath: localPath,
+  readAt: readAt,
 );
 
 void main() {
@@ -237,6 +240,46 @@ void main() {
     // Exactly one tick: the row that really was delivered.
     expect(find.byIcon(Icons.check_rounded), findsOneWidget);
     expect(find.byIcon(Icons.error_outline_rounded), findsWidgets);
+  });
+
+  // `read_at` is about the chat ROW. A file row's bytes fail, are declined, or
+  // are left interrupted quite separately — and the peer may well have read the
+  // row before turning the file down. The read tick was checked first, so the
+  // blue "read" glyph was painted over a file that never arrived: the one
+  // marker on the row saying it got there, above a bubble saying it did not.
+  testWidgets('a read receipt never overrides a failure', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.declined,
+        readAt: DateTime.utc(2026, 1, 1, 9),
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.byIcon(Icons.done_all_rounded), findsNothing);
+    // Two: the file row's own status icon and the trailing delivery glyph.
+    // Both say declined, which is the point.
+    expect(find.byIcon(Icons.block_rounded), findsWidgets);
+  });
+
+  testWidgets('a delivered row that was read does show the read tick', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.sent,
+        readAt: DateTime.utc(2026, 1, 1, 9),
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.byIcon(Icons.done_all_rounded), findsOneWidget);
   });
 
   testWidgets('an in-flight outgoing row shows a pending marker, not a tick', (
@@ -1020,5 +1063,210 @@ void main() {
       findsOneWidget,
       reason: 'the corner of the target did not open the reaction picker',
     );
+  });
+  // A phone's return key is the only key it has for a line break. The composer
+  // set `textInputAction: TextInputAction.send`, which turns that key into
+  // Send — so a field that grows to five lines could never reach the second
+  // one, and every attempt at a paragraph sent the message instead.
+  group('the composer', () {
+    testWidgets('return inserts a newline rather than sending', (tester) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(
+              peerId: 'pb-bob',
+              peer: PeerTarget(
+                id: 'pb-bob',
+                name: 'Bob',
+                addresses: ['10.0.0.2'],
+                port: 49600,
+              ),
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      await tester.enterText(find.byType(TextField), 'first line');
+      await tester.testTextInput.receiveAction(TextInputAction.newline);
+      await tester.pump();
+
+      expect(
+        fake.calls.where((c) => c.startsWith('chatSend:')),
+        isEmpty,
+        reason: 'return is for a line break; the button sends',
+      );
+    });
+
+    // Sending rebuilds the screen. Without a focus node owned above that
+    // rebuild, the field lost focus every time — the keyboard closed after
+    // each message on a phone, and on desktop the next thing typed went
+    // nowhere.
+    testWidgets('focus stays in the composer after a send', (tester) async {
+      final fake = FakePeerBeam();
+      final state = AppState.live(fake);
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(
+        AppScope(
+          state: state,
+          child: const MaterialApp(
+            home: ChatScreen(
+              peerId: 'pb-bob',
+              peer: PeerTarget(
+                id: 'pb-bob',
+                name: 'Bob',
+                addresses: ['10.0.0.2'],
+                port: 49600,
+              ),
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.tap(find.byTooltip('Send'));
+      for (var i = 0; i < 4; i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.focusNode?.hasFocus, isTrue);
+    });
+  });
+  // Marking read ran exactly once, in the post-frame callback. During a live
+  // back-and-forth the sender's device therefore never learned that anything
+  // after the first batch had been read: their bubbles kept the "delivered"
+  // tick however long the reader sat in the thread, and the receipt appeared
+  // only if they backed out and came in again.
+  testWidgets('a message arriving in the open thread is marked read too', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+    final before = fake.calls
+        .where((c) => c.startsWith('chatMarkRead:'))
+        .length;
+
+    fake.emit(
+      ChatReceived(
+        ChatMessage(
+          id: 'm-live',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: 'still there?',
+          at: null,
+          storedAt: DateTime.utc(2026, 1, 1),
+          status: ChatStatusValue.received,
+        ),
+      ),
+    );
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(
+      fake.calls.where((c) => c.startsWith('chatMarkRead:')).length,
+      greaterThan(before),
+    );
+  });
+
+  // Our own echo must not re-assert anything, and a group row belongs to a
+  // different transcript entirely.
+  testWidgets('our own message and a group row do not mark the thread read', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+    final before = fake.calls
+        .where((c) => c.startsWith('chatMarkRead:'))
+        .length;
+
+    for (final m in [
+      ChatMessage(
+        id: 'mine',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'hi',
+        at: null,
+        storedAt: DateTime.utc(2026, 1, 1),
+        status: ChatStatusValue.sent,
+      ),
+      ChatMessage(
+        id: 'grp',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: 'group ping',
+        at: null,
+        storedAt: DateTime.utc(2026, 1, 1),
+        status: ChatStatusValue.received,
+        group: 'g1',
+      ),
+    ]) {
+      fake.emit(ChatReceived(m));
+    }
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(
+      fake.calls.where((c) => c.startsWith('chatMarkRead:')).length,
+      before,
+    );
+  });
+  // `send`/`sendFile` do not throw — a refusal is recorded on the row and the
+  // loop completes either way — so forward announced "Forwarded 3 messages"
+  // while all three had been refused. The only evidence was red bubbles in the
+  // *other* conversation, which the user has no reason to open after being
+  // told it worked. A refusal is ordinary here: the engine checks the chat
+  // permission before persisting anything.
+  test('a refused send reports itself rather than passing as sent', () async {
+    final fake = FakePeerBeam()..failing.add('chatSend');
+    final repo = ChatRepository(api: fake);
+    addTearDown(repo.dispose);
+
+    final ok = await repo.send(
+      'pb-bob',
+      const PeerTarget(
+        id: 'pb-bob',
+        name: 'Bob',
+        addresses: ['10.0.0.2'],
+        port: 49600,
+      ),
+      'hello',
+    );
+
+    expect(ok, isFalse);
+  });
+
+  test('an accepted send says so', () async {
+    final fake = FakePeerBeam();
+    final repo = ChatRepository(api: fake);
+    addTearDown(repo.dispose);
+
+    final ok = await repo.send(
+      'pb-bob',
+      const PeerTarget(
+        id: 'pb-bob',
+        name: 'Bob',
+        addresses: ['10.0.0.2'],
+        port: 49600,
+      ),
+      'hello',
+    );
+
+    expect(ok, isTrue);
   });
 }

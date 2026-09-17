@@ -194,3 +194,89 @@ Future<void> acceptWithPairingCheck(
   if (!await confirmPairingCode(context, transfer)) return;
   accept(confirmed: true);
 }
+
+/// What the user chose when a conversation's first contact was shown to them.
+enum FirstContactChoice {
+  /// Go ahead and open the conversation.
+  open,
+
+  /// Do not open it, and drop the key this handshake just pinned.
+  forget,
+
+  /// Do not open it, and leave the pin alone.
+  cancel,
+}
+
+/// Show the first-contact code for a peer that was just *identified*, and ask
+/// what to do.
+///
+/// The identify flow — how a Tailscale peer or a typed address becomes a device
+/// id a conversation can be filed under — completes a real authenticated
+/// handshake, and a handshake with a device this one has never met **pins its
+/// key**, by TOFU, before this function is ever called. The CLI says so out
+/// loud (`peerbeam identify` prints the code and tells you to compare it); the
+/// GUI said nothing at all, which made the one moment the key can be checked
+/// pass silently.
+///
+/// So this does not pretend to be a gate on the pin — it cannot be, the pin has
+/// happened. What it does is put the code in front of the person while it still
+/// means something, and give them the action that actually undoes it:
+/// [FirstContactChoice.forget], which drops the record so the next handshake is
+/// a first contact again. Pinned is not approved — the device still may do
+/// nothing until it is trusted — and the copy says that rather than implying a
+/// verification this device cannot perform.
+///
+/// [mustConfirm] mirrors the "require pairing confirmation" setting: when it is
+/// on, the affirmative action is an explicit *the codes match* and a dismissal
+/// counts as a refusal, exactly as it does on the approval prompt.
+Future<FirstContactChoice> confirmFirstContact(
+  BuildContext context, {
+  required String peerName,
+  required String pairingCode,
+  required bool mustConfirm,
+}) async {
+  final who = peerName.trim().isEmpty ? 'This device' : peerName.trim();
+  final choice = await showDialog<FirstContactChoice>(
+    context: context,
+    builder: (context) => AlertDialog(
+      icon: const Icon(Icons.new_releases_outlined),
+      title: const Text(firstContactTitle),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$who has not connected to this one before, so its key has '
+            'been recorded now. It is not trusted by that — it still may '
+            'send nothing until you approve it.',
+          ),
+          const Gap(AppSpace.md),
+          PairingCodeText(code: pairingCode),
+          const Gap(AppSpace.md),
+          Text(pairingCodeInstruction),
+          const Gap(AppSpace.sm),
+          Text(
+            'If the codes are different, someone may be intercepting the '
+            'connection. Forget it instead.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(FirstContactChoice.forget),
+          child: const Text('Forget it'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(FirstContactChoice.open),
+          child: Text(mustConfirm ? 'The codes match' : 'Open conversation'),
+        ),
+      ],
+    ),
+  );
+  // A dismissed dialog answers null. With confirmation required that is a
+  // refusal, the same bar `confirmPairingCode` sets; without it, backing out of
+  // the dialog is just backing out — it should not quietly discard a key.
+  return choice ??
+      (mustConfirm ? FirstContactChoice.forget : FirstContactChoice.cancel);
+}

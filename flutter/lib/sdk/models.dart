@@ -942,6 +942,15 @@ class ChatSearchHit {
   /// the real thing.
   final String snippet;
 
+  /// The group this message was written in, or null for a private one.
+  ///
+  /// **[peerId] is not where a group hit should be opened.** A group message is
+  /// stored as one copy per member, so the hit's peer is whichever member's
+  /// namespace the engine happened to read it from — not a conversation the
+  /// user would recognise, and opening it would show a private thread that does
+  /// not contain the message. Use [isGroup] to route.
+  final String? group;
+
   const ChatSearchHit({
     required this.peerId,
     required this.messageId,
@@ -949,11 +958,15 @@ class ChatSearchHit {
     required this.direction,
     required this.kind,
     required this.snippet,
+    this.group,
   });
 
   bool get isMine => direction == 'out';
 
   bool get isFile => kind == ChatMessageKind.file;
+
+  /// Whether this hit belongs to a group transcript rather than a private one.
+  bool get isGroup => (group ?? '').isNotEmpty;
 
   factory ChatSearchHit.fromJson(Map<String, dynamic> j) => ChatSearchHit(
     peerId: j['peer_id'] as String? ?? '',
@@ -964,6 +977,7 @@ class ChatSearchHit {
     direction: j['direction'] as String? ?? 'in',
     kind: j['kind'] as String? ?? ChatMessageKind.text,
     snippet: j['snippet'] as String? ?? '',
+    group: j['group'] as String?,
   );
 }
 

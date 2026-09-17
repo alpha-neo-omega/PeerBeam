@@ -649,7 +649,7 @@ pub unsafe extern "C" fn pb_chat_history(json: *const c_char) -> *mut c_char {
 }
 
 /// Search this device's stored chat history:
-/// `{query, limit?}` → `{hits:[{peer_id,message_id,timestamp,direction,kind,snippet}], truncated, limit}`.
+/// `{query, limit?}` → `{hits:[{peer_id,message_id,timestamp,direction,kind,snippet,group?}], truncated, limit}`.
 ///
 /// **A pure local read.** Nothing goes on the wire, no peer is dialled, and no
 /// peer can observe that it happened — it reads the same conversation

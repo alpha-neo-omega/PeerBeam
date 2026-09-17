@@ -6,8 +6,6 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app/router.dart';
 import 'app/theme.dart';
-import 'features/chat/chat_screen.dart';
-import 'features/groups/group_chat_screen.dart';
 import 'features/send/send_text.dart';
 import 'features/send/staged_sheet.dart';
 import 'platform/android_integration.dart';
@@ -20,7 +18,6 @@ import 'platform/desktop_files.dart';
 import 'platform/notifications.dart';
 import 'platform/saf.dart';
 import 'platform/tray.dart';
-import 'sdk/models.dart';
 import 'sdk/peerbeam.dart';
 import 'state/app_scope.dart';
 import 'state/stores.dart';
@@ -148,6 +145,17 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // baseline is seeded from real history, not an empty list — otherwise
         // every historical send would look "new" on cold start.
         await _android.start();
+        // Groups, read once at boot rather than only when the Groups screen
+        // is first opened. A group chat notification arriving before that
+        // could otherwise name its group only by the raw id, and clicking it
+        // found nothing to open. The repository keeps itself current from
+        // `groups_changed` after this.
+        await _state.groups.refresh();
+        // The identities earlier sessions resolved by dialling — which peer a
+        // `ts:<node>` turned out to be. Read before discovery starts, so a
+        // conversation opened in the first seconds already knows how to reach
+        // its peer instead of offering a dead composer.
+        await _state.device.loadIdentities();
         // Through the repo, so the Scan/Stop control reflects reality.
         await _state.device.start();
         // The tray reads the repositories above, so it is started once they
@@ -233,13 +241,20 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         peerId;
   }
 
-  /// What to call a group, for a notification title. Falls back to its id.
+  /// What to call a group, for a notification title.
+  ///
+  /// Returns empty rather than the id when the group list has not been read —
+  /// which, since nothing loads it until the Groups screen is opened, is the
+  /// ordinary state on a fresh start. A group id is a 32-character hex string;
+  /// putting that on a lock screen as the name of a conversation tells the
+  /// reader nothing and looks like a fault. `chatNotice` renders an empty
+  /// group name as a plain heading instead.
   String _groupName(String groupId) =>
       _state.groups.groups
           .where((g) => g.id == groupId)
           .map((g) => g.name)
           .firstOrNull ??
-      groupId;
+      '';
 
   /// Show a chat notification on whichever backend this platform has.
   ///
@@ -263,6 +278,9 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // The receive icon: a message arriving is incoming, and the alternative
         // is the upload glyph.
         incoming: true,
+        // Its own channel — audible, and separately silenceable. See
+        // [NotificationContent.chat].
+        chat: true,
       ),
     );
   }
@@ -296,41 +314,23 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
         // reach the window themselves.
       }
     }
-    final context = rootNavigatorKey.currentContext;
-    if (context == null || !context.mounted) return;
+    // Already looking at it. Clicking a notification for the thread that is
+    // open would otherwise push a second copy of it on top of the first, so
+    // leaving took two backs out of a conversation the user never left.
+    if (_state.chatPresence.openConversation == threadKey) return;
 
-    if (threadKey.startsWith('group:')) {
-      final id = threadKey.substring('group:'.length);
-      final group = _state.groups.groups.where((g) => g.id == id).firstOrNull;
-      // A group this device has since left, or one the list has not loaded
-      // back yet. Nothing sensible to open, and inventing a placeholder group
-      // would offer a composer that sends to nobody.
-      if (group == null) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
-        ),
-      );
-      return;
-    }
-
-    // The same fallback the Conversations list uses: discovery's target when
-    // it has one, an address-less placeholder otherwise. The chat screen
-    // re-resolves it while open, so a peer that reappears becomes sendable
-    // there and then.
-    final target =
-        _state.device.peerTarget(threadKey) ??
-        PeerTarget(
-          id: threadKey,
-          name: _peerName(threadKey),
-          addresses: const [],
-          port: 0,
-        );
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ChatScreen(peerId: threadKey, peer: target),
-      ),
-    );
+    // **Asked for, not pushed from here.** This layer holds only the root
+    // navigator, which sits above `AppShell` and so above the `DropZone`
+    // wrapping its content — a chat pushed there cannot claim the drop, and
+    // the shell's own zone stays armed underneath it. Dragging a file onto
+    // such a conversation lit two overlays and, on release, sent it to the
+    // peer *and* opened the staged-files sheet for a second unrelated send.
+    //
+    // The Chats screen does the push, from inside the shell, where it is
+    // whole. Switching to that tab is also where a person would expect a
+    // clicked chat notification to leave them.
+    _state.pendingThread.value = threadKey;
+    _router.go('/chats');
   }
 
   void _applyPersistedTheme() {

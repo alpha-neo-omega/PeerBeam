@@ -7,6 +7,20 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Chat from a typed address.** "Send to address" offered files, a folder and
+  a one-off text and no way to start a conversation — the thing you would want
+  with a machine you have to type the address of. It asks the address who is
+  there and opens the thread under the answer.
+- **A resolved Tailscale identity is remembered**, so a conversation opens
+  again after you leave it, without a second dial, and while the peer is
+  offline — a conversation is local history and does not need the peer to be
+  read. Mapped id-to-id, never id-to-address, so a node that moves cannot leave
+  a stale route behind.
+- **Group messages are searchable**, under the group's name, opening the
+  group's transcript. They were filtered out of search by accident and the
+  screen said "No messages match" as a fact about the user's own disk.
+- **Chat bubbles are readable by a screen reader** — one node per message,
+  read as who, what, how it went, when.
 - **Chat notifications.** A message arriving while PeerBeam is not the thing
   you are looking at now raises an OS notification, on desktop as well as
   Android. Desktop had no notification backend at all — a message that arrived
@@ -49,15 +63,87 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   makes no such inference, and is right not to: it did not choose where the
   connection came from. Here the caller named the address, so what answers at it
   is by construction what that address is.
-- **Chat with a Tailscale peer now works**, by asking. Tapping chat on a device
-  the app knows only by a provider's own name resolves it first — one dial, one
-  handshake, no bytes sent — and opens the conversation under the identity that
-  answered, so replies land in the thread you are looking at and queued messages
-  can flush. Done on the tap, not in the background on discovery: dialling every
-  peer the moment it appears would reach out to machines nobody asked it to
-  touch.
+- **Chat with a Tailscale peer.** Tapping chat on a device the app knows only
+  by a provider's own name resolves it first — one dial, one handshake, no bytes
+  sent — and opens the conversation under the identity that answered, so replies
+  land in the thread you are looking at and queued messages can flush. Done on
+  the tap, not in the background on discovery: dialling every peer the moment it
+  appears would reach out to machines nobody asked it to touch.
+
+  The first cut of this shipped behind a guard that hid the chat button for
+  exactly the ids it was built for, so it could not be reached from the only
+  screen that lists Tailscale devices. Both halves are in this release; neither
+  was ever in a tagged one.
 
 ### Fixed
+- **A dial that froze the whole app.** `peerIdentify` ran on the UI isolate
+  while every other dialing call hops off it. It blocks on a QUIC connect plus
+  the handshake **per resolved address** — four 8s timeouts for a MagicDNS name,
+  and 120s if a peer answers and then stalls. Now off-isolate, and the spinner
+  it shows can be left.
+- **First contact was pinned in silence.** Identifying a peer completes a real
+  handshake, which pins its key. The CLI prints the pairing code and says to
+  compare it; the GUI threw it away, so the one moment an interception can be
+  detected passed with nothing on screen. It now shows the code and offers to
+  forget the device — the only action that undoes the pin.
+- **"Always accept" said less than it did.** It approves the device, and
+  approval grants files, messages, clipboard, presence and pipe. The only
+  statement of that was a tooltip, which a phone shows on long-press and nobody
+  sees. It is now in the prompt, in plain text.
+- **A composer with no line break.** `TextInputAction.send` turns a phone's
+  return key into Send, and that is the only key a phone has for a newline — so
+  a five-line composer could never reach its second line. Return is a newline
+  now; desktop sends on Enter and breaks the line on Shift+Enter.
+- **Focus left the composer after every send**, closing the keyboard on a phone
+  and swallowing the next keystrokes on desktop.
+- **Chat notifications were silent.** They were posted on the transfers
+  channel, which is `IMPORTANCE_LOW` with `setOnlyAlertOnce` — right for a
+  progress bar, wrong for a message. Messages have their own channel now, which
+  also means transfer noise can be silenced without silencing conversations.
+- **Every group member became a phantom conversation.** A group message is N
+  one-to-one sends, so one message populated a namespace for everyone in the
+  group; the Chats list filled with private conversations for people the user
+  had never messaged, each of which opened empty.
+- **Three surfaces claimed a conversation was empty before reading it** — a
+  thread, the Chats tab, and a group transcript whose read had actually failed.
+- **Groups never updated except by opening their screen**, so an invitation
+  arriving while it was open never appeared, and a group notification before
+  that could name its group only by a raw id.
+- **Every group refusal read "Something went wrong. Please try again."** The
+  engine's own sentence — "Family has nobody this device may message" — was
+  discarded. That uncovered a wider one: `permission_denied` had no Dart case at
+  all, so every permission refusal in the app read that way.
+- **A read receipt outranked a failure**, painting the blue "read" tick over a
+  file that was declined or never arrived.
+- **Read receipts stopped after the first batch**, so in a live back-and-forth
+  the other device never learned anything more had been read.
+- **Forwarding a received file always failed on Android**, blaming a missing
+  file for a path that dangles by design — while tapping the same row opened it.
+- **A failed reaction and a failed cancel both reported success-ish outcomes**:
+  "Saved here, but not delivered" for a reaction that was never stored, and "it
+  is no longer waiting to be sent" for a cancel that simply failed.
+- **A blocking spinner could eat the dialog opened after it.** `withProcessing`
+  dismissed by popping the top route rather than its own, so a fast action left
+  the spinner up for good — the exact failure its retry was added to prevent.
+  Three dialogs also disposed their text fields while the closing animation was
+  still rebuilding them.
+- **Forward claimed success when the engine refused everything.** `send` and
+  `sendFile` record a refusal on the row and never throw, so the loop always
+  completed and announced "Forwarded 3 messages" while all three were refused —
+  the only evidence being red bubbles in the *other* conversation, which nobody
+  opens after being told it worked. They now report acceptance and the count is
+  real.
+- **A chat opened from a desktop notification handled a dropped file twice.**
+  It was pushed on the root navigator, which is above the shell's `DropZone`,
+  so the conversation could not claim the drop and the shell's zone stayed
+  armed underneath: one drop both sent the file and opened the staged-files
+  sheet for a second, unrelated send. The click now asks the Chats screen to
+  open it, from inside the shell.
+- Smaller ones: a queued group message no longer looks delivered; the group
+  header no longer lists this device by a raw id or hides members it cannot
+  reach; a bubble carries the date when it is not today's; a peer with an empty
+  name no longer renders a blank conversation title; sending while scrolled back
+  returns to the message; and the conversation list's relative times now move.
 - **IPv6 peers could never be dialled, on any platform.** The QUIC client
   endpoint bound `0.0.0.0` only, so every IPv6 address was unreachable — and a
   Tailscale peer advertises a tailnet IPv6 (`fd7a:…`) alongside its IPv4, with a

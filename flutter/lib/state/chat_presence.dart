@@ -51,11 +51,24 @@ class ChatPresence extends ChangeNotifier {
   /// another window is precisely the case a notification exists for.
   bool isWatching(String peerId) => _foreground && openConversation == peerId;
 
-  /// A thread was opened. Idempotent for the thread already in front, so a
-  /// screen may call it on every dependency change.
+  /// A thread was opened.
+  ///
+  /// A key appears at most once. Without that, a screen that registered while
+  /// buried under another — `didChangeDependencies` fires for an ordinary
+  /// theme change, not only on the way in — pushed a **second** copy of
+  /// itself, and `leave` removes one occurrence. The leftover entry then sat on
+  /// the stack for the rest of the session claiming that thread was on screen,
+  /// so messages arriving in it stopped raising notifications with nothing
+  /// open at all.
+  ///
+  /// The screens also no longer re-enter on every dependency change (see
+  /// `ChatScreen.didChangeDependencies`); this is the invariant holding
+  /// regardless.
   void enter(String peerId) {
     if (openConversation == peerId) return;
-    _stack.add(peerId);
+    _stack
+      ..remove(peerId)
+      ..add(peerId);
     notifyListeners();
   }
 
@@ -66,11 +79,7 @@ class ChatPresence extends ChangeNotifier {
   /// another is not a change of attention.
   void leave(String peerId) {
     final was = openConversation;
-    // The last occurrence: if the same conversation is open twice, this screen
-    // is the newer of the two.
-    final at = _stack.lastIndexOf(peerId);
-    if (at < 0) return;
-    _stack.removeAt(at);
+    if (!_stack.remove(peerId)) return;
     if (openConversation != was) notifyListeners();
   }
 

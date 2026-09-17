@@ -1239,7 +1239,7 @@ void main() {
         ];
         await repo.refresh('pb-bob');
 
-        expect(await repo.cancelFile('pb-bob', 'fr-1'), isTrue);
+        expect((await repo.cancelFile('pb-bob', 'fr-1')).cancelled, isTrue);
         await flush();
 
         expect(fake.calls, contains('chatCancel:pb-bob/fr-1'));
@@ -1273,7 +1273,11 @@ void main() {
         ];
         await repo.refresh('pb-bob');
 
-        expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
+        final refused = await repo.cancelFile('pb-bob', 'fr-1');
+        expect(refused.cancelled, isFalse);
+        // The engine answered; nothing failed. Kept apart because the surface
+        // says "it is no longer waiting to be sent" only to this case.
+        expect(refused.error, isNull);
         await flush();
 
         final row = repo.messagesFor('pb-bob').single;
@@ -1310,12 +1314,29 @@ void main() {
       ];
       await repo.refresh('pb-bob');
 
-      expect(await repo.cancelFile('pb-bob', 'fr-1'), isFalse);
+      expect((await repo.cancelFile('pb-bob', 'fr-1')).cancelled, isFalse);
       expect(
         repo.messagesFor('pb-bob').single.status,
         ChatStatusValue.pendingApproval,
       );
     });
+
+    // "It is no longer waiting to be sent" is the engine's answer, and a call
+    // that FAILED has no idea whether the file went. Both came back as a bare
+    // `false`, so a failed cancel told the user their file had already gone —
+    // beside a row still plainly showing as queued.
+    test(
+      'a cancel that failed outright is not reported as a refusal',
+      () async {
+        final fake = FakePeerBeam()..failing.add('chatCancel');
+        final repo = ChatRepository(api: fake);
+        addTearDown(repo.dispose);
+
+        final outcome = await repo.cancelFile('pb-bob', 'fr-1');
+        expect(outcome.cancelled, isFalse);
+        expect(outcome.error, isNotNull);
+      },
+    );
 
     test('refreshConversations lists every thread, newest first, keyed by the '
         'peer id', () async {

@@ -6764,6 +6764,12 @@ fn search_hit_dto(hit: &SearchHit) -> Value {
         "direction": hit.direction,
         "kind": hit.kind,
         "snippet": hit.snippet,
+        // The group this was written in, when it was. Absent for a private
+        // message. A surface needs it because a group hit's `peer_id` is
+        // whichever member's namespace held the copy that was read — not a
+        // conversation the user would recognise, and not where the message
+        // should be opened.
+        "group": hit.group,
     })
 }
 

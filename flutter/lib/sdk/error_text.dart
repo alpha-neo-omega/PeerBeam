@@ -33,6 +33,10 @@ String _forException(PeerBeamException e) => switch (e) {
   // someone waiting for a build that is never coming.
   UnsupportedPlatformException() =>
     "This device can't do that — see the note in Settings for why.",
+  // Named, not retried. A refusal does not become a success on a second
+  // attempt, and "try again" is the one thing this must not say.
+  PermissionDeniedException() =>
+    "That isn't allowed — check the device's permissions in Trusted devices.",
   QueueUnreadableException() =>
     "Something still queued to send can't be read right now, so deleting "
         "is on hold — that could discard it before it goes out.",

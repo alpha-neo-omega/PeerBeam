@@ -381,6 +381,9 @@ class FakePeerBeam implements PeerBeamApi {
   @override
   Future<GroupsView> groups() async {
     _maybeFail('groups');
+    // Recorded so a test can assert the list is re-read when the engine says
+    // it changed, rather than only when a screen is opened.
+    calls.add('groups');
     return GroupsView(groups: groupsList, invites: groupInvites);
   }
 
@@ -462,7 +465,13 @@ class FakePeerBeam implements PeerBeamApi {
   List<ChatMessage> groupMessages = [];
 
   @override
-  Future<List<ChatMessage>> groupHistory(String group) async => groupMessages;
+  Future<List<ChatMessage>> groupHistory(String group) async {
+    // Failable like every other read: a transcript the engine cannot produce
+    // is an ordinary state, and the screen has to be drivable into it.
+    _maybeFail('groupHistory');
+    calls.add('groupHistory:$group');
+    return groupMessages;
+  }
 
   /// Set to make [trustRemove] throw, so a test can drive the refusal path.
   Object? trustRemoveError;
@@ -700,6 +709,9 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<bool> chatCancel(String peerId, String messageId) async {
+    // Failable: a call that throws and one the engine refuses are different
+    // answers, and only one of them means the file has already gone.
+    _maybeFail('chatCancel');
     calls.add('chatCancel:$peerId/$messageId');
     final rows = chatHistories[peerId];
     final i = rows?.indexWhere((m) => m.id == messageId) ?? -1;

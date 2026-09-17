@@ -117,6 +117,34 @@ void main() {
       expect(rec.calls.single.symbol, 'pb_chat_react');
     });
 
+    /// The longest-blocking of them all, and the one that was left behind when
+    /// this seam was introduced. It performs a full QUIC connect plus the
+    /// authenticated handshake, **per resolved address** — a MagicDNS name
+    /// resolving to four addresses is four 8s `CONNECT_TIMEOUT`s before it
+    /// gives up, and a peer that answers and then stalls holds it for the 120s
+    /// `AUTH_TIMEOUT`. On the UI isolate that is not a slow spinner, it is a
+    /// frozen app: no frames, no input, and an ANR on Android.
+    ///
+    /// It is also the one a person reaches by tapping chat on a Tailscale
+    /// device, which is the case least likely to answer quickly.
+    test('peerIdentify asks pb_peer_identify with the peer', () async {
+      rec.response = jsonEncode({
+        'ok': true,
+        'data': {
+          'device_id': 'pb-real',
+          'name': 'laptop',
+          'newly_trusted': false,
+          'pairing_code': '',
+        },
+      });
+      final identity = await api.peerIdentify(peer);
+
+      expect(rec.calls.single.symbol, 'pb_peer_identify');
+      final sent = jsonDecode(rec.calls.single.arg!) as Map<String, dynamic>;
+      expect((sent['peer'] as Map)['id'], 'pb-1234');
+      expect(identity.deviceId, 'pb-real');
+    });
+
     /// Takes no argument, so it must be invoked through the niladic C
     /// signature. Passing a pointer to a function that declares no parameter
     /// is an ABI mismatch, not a spare argument.

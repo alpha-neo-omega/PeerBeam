@@ -853,8 +853,20 @@ class PeerBeam implements PeerBeamApi {
 
   @override
   Future<PeerIdentity> peerIdentify(PeerTarget peer) async {
-    final data = _data(
-      _req().peerIdentify(jsonEncode({'peer': peer.toJson()})),
+    // **Off the UI isolate.** This one dials: the engine blocks on a full QUIC
+    // connect plus the authenticated handshake, and it does so per resolved
+    // address — a MagicDNS name resolving to four addresses is four
+    // `CONNECT_TIMEOUT`s (8s each) before it gives up, and a peer that answers
+    // but stalls mid-handshake holds it for `AUTH_TIMEOUT` (120s).
+    //
+    // Run on the UI isolate, as this was, that is not a spinner — it is the
+    // whole app frozen: no animation, no input, no way to leave the screen,
+    // and an ANR on Android. Every other call that dials a peer (`chatReact`,
+    // `notesSync`, `presenceRing`, `browse`, `syncFolder`) already hops; this
+    // one is the longest-blocking of them and was the one that did not.
+    final data = await _off(
+      'pb_peer_identify',
+      jsonEncode({'peer': peer.toJson()}),
     );
     return PeerIdentity.fromJson(data);
   }

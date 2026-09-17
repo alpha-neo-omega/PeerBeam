@@ -226,9 +226,19 @@ void main() {
         expect(n.threadKey, 'group:g1');
       });
 
-      test('an unnamed group falls back to its id', () {
-        final n = chatNotice(_msg(group: 'g1'), peerName: 'Bob');
-        expect(n.title, 'g1');
+      // Nothing reads the group list until Groups is opened, so an arriving
+      // group message on a fresh start has no name to use. A group id is 32
+      // hex characters — as a conversation's name on a lock screen it tells
+      // the reader nothing and looks like a fault.
+      test('an unnamed group gets a heading, never its raw id', () {
+        final n = chatNotice(
+          _msg(group: '7f3a9c21b04e4d8fa1c6e5720b93d4aa', body: 'ping'),
+          peerName: 'Bob',
+        );
+        expect(n.title, 'New group message');
+        expect(n.title, isNot(contains('7f3a')));
+        // The part that makes it worth having is still there.
+        expect(n.body, 'Bob: ping');
       });
 
       test('an unnamed speaker falls back to their device id', () {
@@ -340,6 +350,26 @@ void main() {
 
       expect(p.openConversation, 'pb-carol');
       expect(n, 0, reason: 'attention did not move');
+    });
+
+    // The leak. `didChangeDependencies` fires for any inherited change — a
+    // theme switch will do — including while a screen is buried under another
+    // thread. Entering twice and leaving once left a stale entry on the stack
+    // for the rest of the session, and that thread then counted as "on screen"
+    // forever: its arriving messages stopped notifying with nothing open.
+    test('a key can never appear twice', () {
+      final p = ChatPresence()..enter('pb-bob');
+      p.enter('pb-carol');
+      p.enter('pb-bob'); // a buried screen re-registering
+      p.leave('pb-bob');
+
+      expect(
+        p.openConversation,
+        'pb-carol',
+        reason: 'one leave must remove it completely',
+      );
+      p.leave('pb-carol');
+      expect(p.openConversation, isNull);
     });
 
     test('leaving them all ends with no thread open', () {

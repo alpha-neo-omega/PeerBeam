@@ -99,6 +99,8 @@ each without platform-specific assumptions in shared code:
   - **Clicking a desktop notification opens that conversation.** On Android the
     notification's content intent opens the app, as it always has.
   - Transfer progress and completion still notify on Android only.
+  - **Android has a separate "Messages" channel** for chat, at high importance,
+    so transfer noise and conversations can be silenced independently.
 - **Background operation.** The Android foreground service, battery-optimization
   exemption, and Wi-Fi multicast lock have no desktop equivalent and are no-ops
   off Android.
