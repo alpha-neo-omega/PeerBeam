@@ -33,6 +33,7 @@
 //! because of where a file happens to sit on disk — `/home/alice/…` would
 //! return every file anyone ever sent.
 
+use std::collections::HashSet;
 use std::cmp::Reverse;
 
 use chrono::{DateTime, Utc};
@@ -88,6 +89,14 @@ pub struct SearchHit {
     /// it in here itself, and a snippet that had been reformatted would no
     /// longer be evidence of what is actually stored.
     pub snippet: String,
+    /// The group this message was written in, or `None` for a private one.
+    ///
+    /// What lets a surface label the hit with the group's name and open the
+    /// group's transcript rather than the private thread with whichever member
+    /// happened to hold the copy that was read — see
+    /// [`peer_id`](Self::peer_id), which for a group hit is that member and not
+    /// a conversation the user would recognise.
+    pub group: Option<String>,
 }
 
 impl SearchHit {
@@ -202,8 +211,28 @@ impl ChatStore {
             return Ok(SearchResults::default());
         }
         let mut top = TopHits::new(limit);
-        for peer in self.conversations()? {
-            for rec in self.history(&peer)? {
+        // **Group messages are searched too.**
+        //
+        // This walked `conversations()` and `history()`, and `history` filters
+        // every group row out — correctly, since a group message is not part of
+        // the private thread it is stored in. Search inherited that by
+        // accident, so text the user had written in a group was unfindable and
+        // the screen answered "No messages match" as a fact about their own
+        // disk.
+        //
+        // `peer_namespaces` rather than `conversations`, because the copies of
+        // a group message live in each member's namespace — including members
+        // with no private thread, which `conversations` now excludes.
+        //
+        // One hit per group message, not one per member: a group send stores a
+        // copy per recipient and they share an id, so without this a message to
+        // five people would answer five times.
+        let mut seen_group: HashSet<String> = HashSet::new();
+        for peer in self.peer_namespaces()? {
+            for rec in self.records(&peer, true)? {
+                if rec.group.is_some() && !seen_group.insert(rec.id.clone()) {
+                    continue;
+                }
                 if let Some(hit) = hit(&peer, &rec, &needle) {
                     top.push(hit);
                 }
@@ -235,6 +264,7 @@ fn hit(peer: &DeviceId, rec: &ChatRecord, needle: &str) -> Option<SearchHit> {
         direction: rec.direction,
         kind: rec.kind,
         snippet,
+        group: rec.group.clone(),
     })
 }
 
@@ -379,6 +409,50 @@ mod tests {
         let app: Arc<dyn AppStore> =
             Arc::new(FsAppStore::open(dir.path().join("appstore"), key, enc));
         (ChatStore::new(app.clone()), app, dir)
+    }
+
+    /// Group messages are the user's own messages, and search said they did
+    /// not exist. `history` filters group rows out of the private thread they
+    /// are stored in — correctly — and search walked `history`, so text written
+    /// in a group was unfindable while the screen answered "No messages match"
+    /// as a fact about the user's own disk.
+    #[test]
+    fn a_group_message_is_findable_once_and_carries_its_group() {
+        let (cs, _store, _tmp) = new_store();
+
+        // A group send stores one copy per recipient, sharing an id.
+        let mut msg = ChatMessage::new("the quarterly figures").unwrap();
+        msg.group = Some("g-team".to_string());
+        for member in ["pb-alice", "pb-bob", "pb-carol"] {
+            cs.enqueue(&DeviceId::from(member), &msg).unwrap();
+        }
+
+        let results = cs.search("quarterly", 20).unwrap();
+
+        assert_eq!(
+            results.hits.len(),
+            1,
+            "one message, not one per recipient: {:?}",
+            results.hits
+        );
+        assert_eq!(results.hits[0].group.as_deref(), Some("g-team"));
+        assert!(results.hits[0].snippet.contains("quarterly"));
+    }
+
+    /// And a private message still reports no group, so a surface can tell
+    /// which transcript to open.
+    #[test]
+    fn a_private_message_carries_no_group() {
+        let (cs, _store, _tmp) = new_store();
+        cs.append(&ChatRecord::received(
+            &DeviceId::from("pb-alice"),
+            &ChatMessage::new("just between us").unwrap(),
+        ))
+        .unwrap();
+
+        let results = cs.search("between", 20).unwrap();
+        assert_eq!(results.hits.len(), 1);
+        assert!(results.hits[0].group.is_none());
     }
 
     fn text(peer: &str, id: &str, ts: &str, body: &str) -> ChatRecord {

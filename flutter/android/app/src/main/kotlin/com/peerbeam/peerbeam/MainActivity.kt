@@ -293,6 +293,10 @@ class MainActivity : FlutterActivity() {
                 val name = call.argument<String>("name") ?: ""
                 result.success(openInTree(name) || openInDownloads(name))
             }
+            "safStage" -> {
+                val name = call.argument<String>("name") ?: ""
+                replyFromPublisher(result) { stageFromTree(name) }
+            }
             else -> result.notImplemented()
         }
     }
@@ -683,6 +687,36 @@ class MainActivity : FlutterActivity() {
             true
         } catch (e: Exception) {
             false
+        }
+    }
+
+    /// Copy the published copy of [name] back into app cache and return its
+    /// path, or null when there is no published copy to read.
+    ///
+    /// Needed because the engine's own copy of a received file is **deleted**
+    /// once it has been published into the user's folder — by design, so the
+    /// same bytes are not held twice. Every path that only has to *show* the
+    /// file works from the tree directly (`safOpen`), but anything that has to
+    /// hand the file to the engine needs a real readable path, and the recorded
+    /// one dangles. Forwarding a received file was the case that exposed it:
+    /// the row opened perfectly and forwarding reported it as gone.
+    ///
+    /// Copied into `cacheDir`, so the OS may reclaim it and nothing here has to
+    /// own a lifetime. An existing staged copy is reused rather than rewritten.
+    private fun stageFromTree(name: String): String? {
+        val uri = persistedTree() ?: return null
+        val tree = DocumentFile.fromTreeUri(this, uri) ?: return null
+        val doc = tree.findFile(publishedName(name)) ?: return null
+        if (!doc.isFile || !doc.canRead()) return null
+        return try {
+            val out = java.io.File(java.io.File(cacheDir, "forward").apply { mkdirs() }, name)
+            if (out.exists() && out.length() == doc.length()) return out.absolutePath
+            contentResolver.openInputStream(doc.uri)?.use { input ->
+                out.outputStream().use { output -> input.copyTo(output) }
+            } ?: return null
+            out.absolutePath
+        } catch (e: Exception) {
+            null
         }
     }
 

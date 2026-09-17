@@ -709,6 +709,9 @@ class FakePeerBeam implements PeerBeamApi {
 
   @override
   Future<bool> chatCancel(String peerId, String messageId) async {
+    // Failable: a call that throws and one the engine refuses are different
+    // answers, and only one of them means the file has already gone.
+    _maybeFail('chatCancel');
     calls.add('chatCancel:$peerId/$messageId');
     final rows = chatHistories[peerId];
     final i = rows?.indexWhere((m) => m.id == messageId) ?? -1;

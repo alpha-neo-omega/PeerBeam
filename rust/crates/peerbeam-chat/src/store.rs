@@ -292,7 +292,7 @@ impl ChatStore {
     /// the set [`conversations`](Self::conversations) excludes. Anything
     /// answering the question *"which conversations does the user have?"* wants
     /// the filtered list; only a group's own transcript wants this one.
-    fn peer_namespaces(&self) -> Result<Vec<DeviceId>, ChatError> {
+    pub(crate) fn peer_namespaces(&self) -> Result<Vec<DeviceId>, ChatError> {
         let names = self
             .store
             .namespaces("chat-")
@@ -398,6 +398,22 @@ impl ChatStore {
     /// Filtering happens **before** `with_landing`, so a row on its way out is
     /// never written back on the way past.
     pub fn history(&self, peer: &DeviceId) -> Result<Vec<ChatRecord>, ChatError> {
+        self.records(peer, false)
+    }
+
+    /// [`history`](Self::history), with the choice of whether group rows come
+    /// with it.
+    ///
+    /// One code path, because the window has to be enforced on every read and a
+    /// second loop is a second place to forget it. `include_groups` is true for
+    /// exactly one caller — [`search`](Self::search), which searches the user's
+    /// own messages and has no business pretending the ones they wrote in a
+    /// group are not theirs. Every other reader wants the private thread.
+    pub(crate) fn records(
+        &self,
+        peer: &DeviceId,
+        include_groups: bool,
+    ) -> Result<Vec<ChatRecord>, ChatError> {
         let ns = namespace(peer);
         let raw = self
             .store
@@ -424,7 +440,7 @@ impl ChatStore {
                 // would show fragments of every group shared with them,
                 // interleaved with the private thread and indistinguishable
                 // from it. `group_history` is where they belong.
-                Ok(rec) if rec.group.is_some() => {}
+                Ok(rec) if rec.group.is_some() && !include_groups => {}
                 // Through `with_landing` like `get`: the conversation view is
                 // where a person reads the filename they are about to approve,
                 // so it must not be the one path that shows the peer's claim.

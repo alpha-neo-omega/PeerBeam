@@ -11,6 +11,7 @@ import '../../state/models.dart';
 import '../../widgets/appear.dart';
 import '../../widgets/common.dart';
 import '../chat/chat_screen.dart';
+import '../groups/group_chat_screen.dart';
 
 /// Chats — every conversation this device holds, whether or not discovery can
 /// currently see the peer.
@@ -148,22 +149,62 @@ class _ChatsScreenState extends State<ChatsScreen> {
   /// Group hits by conversation, keeping the engine's newest-first order: the
   /// threads appear in the order their newest hit did, and the hits inside each
   /// stay as they came.
-  static List<({String peerId, List<ChatSearchHit> hits})> _grouped(
+  ///
+  /// Keyed by the **transcript**, not by `peerId`. A group message is stored as
+  /// one copy per member, so its hit's peer is whichever member's namespace the
+  /// engine read it from — filing it under that peer would put it in a private
+  /// conversation that does not contain it.
+  static List<({String key, List<ChatSearchHit> hits})> _grouped(
     List<ChatSearchHit> hits,
   ) {
     final order = <String>[];
-    final byPeer = <String, List<ChatSearchHit>>{};
+    final byThread = <String, List<ChatSearchHit>>{};
     for (final hit in hits) {
-      byPeer
-          .putIfAbsent(hit.peerId, () {
-            order.add(hit.peerId);
+      final key = hit.isGroup ? 'group:${hit.group}' : hit.peerId;
+      byThread
+          .putIfAbsent(key, () {
+            order.add(key);
             return <ChatSearchHit>[];
           })
           .add(hit);
     }
-    return [
-      for (final peerId in order) (peerId: peerId, hits: byPeer[peerId]!),
-    ];
+    return [for (final key in order) (key: key, hits: byThread[key]!)];
+  }
+
+  /// The heading for one group of results — a peer's name, or a group's.
+  String _threadName(String key) {
+    if (!key.startsWith('group:')) return _peerName(key);
+    final id = key.substring('group:'.length);
+    final state = AppScope.of(context);
+    final group = state.groups.groups.where((g) => g.id == id).firstOrNull;
+    // The id is a poor heading, but it is the truth; the group list is read at
+    // boot and kept current, so this is a narrow window.
+    return group?.name ?? id;
+  }
+
+  /// Open whichever transcript this hit is actually in.
+  void _openHit(ChatSearchHit hit) {
+    if (!hit.isGroup) {
+      _open(hit.peerId);
+      return;
+    }
+    final state = AppScope.of(context);
+    final group = state.groups.groups
+        .where((g) => g.id == hit.group)
+        .firstOrNull;
+    if (group == null) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(content: Text('That group is no longer available')),
+        );
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => GroupChatScreen(group: group, nameFor: _peerName),
+      ),
+    );
   }
 
   /// The best name we can put to a conversation's peer id.
@@ -175,10 +216,14 @@ class _ChatsScreenState extends State<ChatsScreen> {
   String _peerName(String peerId) {
     final state = AppScope.of(context);
     for (final d in state.device.devices) {
-      if (d.id == peerId) return d.name;
+      // A device name comes off the wire and a peer may send an empty one. It
+      // was returned as-is, so the conversation rendered with a blank title and
+      // its delete prompt asked `Delete ""?` — a question naming nothing, about
+      // a thread the user cannot identify.
+      if (d.id == peerId && d.name.trim().isNotEmpty) return d.name;
     }
     for (final t in state.trust.items) {
-      if (t.id == peerId && t.name.isNotEmpty) return t.name;
+      if (t.id == peerId && t.name.trim().isNotEmpty) return t.name;
     }
     return peerId;
   }
@@ -417,9 +462,9 @@ class _ChatsScreenState extends State<ChatsScreen> {
     }
     final rows = <_ResultRow>[
       if (results.truncated) _TruncatedRow(results.limit),
-      for (final group in _grouped(results.hits)) ...[
-        _PeerRow(group.peerId, group.hits.length),
-        for (final hit in group.hits) _HitRow(hit),
+      for (final thread in _grouped(results.hits)) ...[
+        _PeerRow(thread.key, thread.hits.length),
+        for (final hit in thread.hits) _HitRow(hit),
       ],
     ];
     return Column(
@@ -445,7 +490,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
       itemBuilder: (context, i) => switch (rows[i]) {
         _TruncatedRow(:final limit) => _TruncationNotice(limit: limit),
         _PeerRow(:final peerId, :final count) => SectionHeader(
-          title: _peerName(peerId),
+          title: _threadName(peerId),
           trailing: Text(
             count == 1 ? '1 match' : '$count matches',
             style: Theme.of(context).textTheme.labelMedium?.copyWith(
@@ -455,7 +500,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
         ),
         _HitRow(:final hit) => Padding(
           padding: const EdgeInsets.only(bottom: AppSpace.xs),
-          child: SearchHitCard(hit: hit, onTap: () => _open(hit.peerId)),
+          child: SearchHitCard(hit: hit, onTap: () => _openHit(hit)),
         ),
       },
     );

@@ -602,20 +602,28 @@ class ChatRepository extends ChangeNotifier {
   /// Nothing is re-read on success: the engine settles the row and emits the
   /// `chat_status` that [_onStatus] applies, so refreshing here would be a
   /// second, racier path to the same state.
-  Future<bool> cancelFile(String peerId, String messageId) async {
+  Future<({bool cancelled, Object? error})> cancelFile(
+    String peerId,
+    String messageId,
+  ) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) {
+      return (cancelled: false, error: null);
+    }
     var cancelled = false;
+    Object? failure;
     try {
       cancelled = await api.chatCancel(peerId, messageId);
-    } catch (_) {
-      // A refused id (never persisted, so never cancellable) reads exactly
-      // like the engine's own "there was nothing to cancel".
-      cancelled = false;
+    } catch (e) {
+      // Kept apart from the engine's own "there was nothing to cancel". Both
+      // came back as a bare `false`, and the surface says "it is no longer
+      // waiting to be sent" to that — so a call that failed outright told the
+      // user their file had already gone, beside a row still plainly queued.
+      failure = e;
     }
-    if (_disposed) return cancelled;
+    if (_disposed) return (cancelled: cancelled, error: failure);
     if (!cancelled) await refresh(peerId);
-    return cancelled;
+    return (cancelled: cancelled, error: failure);
   }
 
   /// Send [text] to [peer], filed under [peerId] in the conversation map.

@@ -107,4 +107,25 @@ class Saf {
       return false;
     }
   }
+
+  /// Copy the published copy of [name] back into app storage and return a
+  /// readable path, or null when there is none.
+  ///
+  /// The counterpart to [open] for anything that has to hand the file to the
+  /// **engine** rather than to a viewer. A received file's engine-private copy
+  /// is deleted once it has been published into the user's folder, so the path
+  /// recorded on the chat row dangles by design — see `open_path.dart`. Opening
+  /// works from the tree; forwarding does not, because the engine needs a path
+  /// it can read.
+  ///
+  /// The copy lands in cache, so the OS may reclaim it; callers should use it
+  /// promptly and not store it.
+  static Future<String?> stage(String name) async {
+    if (!isSupported) return null;
+    try {
+      return await _ch.invokeMethod<String>('safStage', {'name': name});
+    } catch (_) {
+      return null;
+    }
+  }
 }

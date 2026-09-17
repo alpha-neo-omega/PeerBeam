@@ -1145,4 +1145,84 @@ void main() {
       expect(field.focusNode?.hasFocus, isTrue);
     });
   });
+  // Marking read ran exactly once, in the post-frame callback. During a live
+  // back-and-forth the sender's device therefore never learned that anything
+  // after the first batch had been read: their bubbles kept the "delivered"
+  // tick however long the reader sat in the thread, and the receipt appeared
+  // only if they backed out and came in again.
+  testWidgets('a message arriving in the open thread is marked read too', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+    final before = fake.calls
+        .where((c) => c.startsWith('chatMarkRead:'))
+        .length;
+
+    fake.emit(
+      ChatReceived(
+        ChatMessage(
+          id: 'm-live',
+          peerId: 'pb-bob',
+          direction: 'in',
+          body: 'still there?',
+          at: null,
+          storedAt: DateTime.utc(2026, 1, 1),
+          status: ChatStatusValue.received,
+        ),
+      ),
+    );
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(
+      fake.calls.where((c) => c.startsWith('chatMarkRead:')).length,
+      greaterThan(before),
+    );
+  });
+
+  // Our own echo must not re-assert anything, and a group row belongs to a
+  // different transcript entirely.
+  testWidgets('our own message and a group row do not mark the thread read', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    await _open(tester, fake);
+    final before = fake.calls
+        .where((c) => c.startsWith('chatMarkRead:'))
+        .length;
+
+    for (final m in [
+      ChatMessage(
+        id: 'mine',
+        peerId: 'pb-bob',
+        direction: 'out',
+        body: 'hi',
+        at: null,
+        storedAt: DateTime.utc(2026, 1, 1),
+        status: ChatStatusValue.sent,
+      ),
+      ChatMessage(
+        id: 'grp',
+        peerId: 'pb-bob',
+        direction: 'in',
+        body: 'group ping',
+        at: null,
+        storedAt: DateTime.utc(2026, 1, 1),
+        status: ChatStatusValue.received,
+        group: 'g1',
+      ),
+    ]) {
+      fake.emit(ChatReceived(m));
+    }
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+
+    expect(
+      fake.calls.where((c) => c.startsWith('chatMarkRead:')).length,
+      before,
+    );
+  });
 }

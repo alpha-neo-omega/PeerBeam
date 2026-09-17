@@ -533,4 +533,62 @@ void main() {
     expect(fake.calls.where((c) => c.startsWith('chatSearch')), isEmpty);
     expect(find.text('pb-bob'), findsOneWidget);
   });
+  // Group messages are the user's own messages. `history` filters group rows
+  // out of the private thread they are stored in — correctly — and search
+  // walked `history`, so text written in a group was unfindable while the
+  // screen answered "No messages match" as a fact about the user's own disk.
+  //
+  // A group hit's `peerId` is whichever member's namespace held the copy the
+  // engine read, so it must never be used to open it.
+  test('a group hit is filed under its group, not under a member', () {
+    const hit = ChatSearchHit(
+      peerId: 'pb-alice',
+      messageId: 'm1',
+      at: null,
+      direction: 'out',
+      kind: ChatMessageKind.text,
+      snippet: 'the quarterly figures',
+      group: 'g-team',
+    );
+
+    expect(hit.isGroup, isTrue);
+    expect(hit.group, 'g-team');
+  });
+
+  test('a private hit reports no group', () {
+    const hit = ChatSearchHit(
+      peerId: 'pb-alice',
+      messageId: 'm1',
+      at: null,
+      direction: 'in',
+      kind: ChatMessageKind.text,
+      snippet: 'just between us',
+    );
+
+    expect(hit.isGroup, isFalse);
+  });
+
+  test('the group rides the wire and is decoded', () {
+    final hit = ChatSearchHit.fromJson(const {
+      'peer_id': 'pb-alice',
+      'message_id': 'm1',
+      'direction': 'out',
+      'kind': 'text',
+      'snippet': 'hi',
+      'group': 'g-team',
+    });
+    expect(hit.group, 'g-team');
+    expect(hit.isGroup, isTrue);
+
+    // Absent means private, and must not become an empty-string group.
+    final private = ChatSearchHit.fromJson(const {
+      'peer_id': 'pb-alice',
+      'message_id': 'm2',
+      'direction': 'in',
+      'kind': 'text',
+      'snippet': 'hi',
+    });
+    expect(private.group, isNull);
+    expect(private.isGroup, isFalse);
+  });
 }
