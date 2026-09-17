@@ -139,6 +139,35 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   armed underneath: one drop both sent the file and opened the staged-files
   sheet for a second, unrelated send. The click now asks the Chats screen to
   open it, from inside the shell.
+- **Auto-accept could not be withdrawn once the device was blocked.** The menu
+  row was disabled whenever auto-accept could not be *granted* — so revoking a
+  device's Files permission greyed out the user's own standing consent while the
+  bit stayed set, and granting Files back later revived it. Invariant I6 calls
+  for auto-accept to be revocable; a consent that can only be given is not.
+- **The composer stayed live after Messages was revoked**, so the message was
+  typed, sent, and answered by a red bubble printing the engine's raw refusal.
+  The screen now listens to trust and closes the composer with its own sentence,
+  kept apart from the no-address case so the network is not blamed for
+  something the user did deliberately.
+- **A known peer notified as a raw device id.** Notification naming consulted
+  discovery and the saved-devices book but never the trust store, which every
+  other naming helper in the app does — so a device someone had talked to for
+  weeks notified as "pb-3f9a…" the moment it slept, and a Tailscale peer always
+  did, since discovery keys it as `ts:<node>`.
+- **A file offer's notification asked forever.** "Wants to send report.pdf" is
+  a question answered elsewhere — on the transfer prompt, or automatically for
+  a trusted device — and nothing took it down; on Android it sat directly above
+  a second notification saying the same file had been received.
+- **A reaction chip was an ~18px target inside the bubble's own tap area**, so a
+  miss opened the file behind it, and it announced itself as "👍 2" with no hint
+  that tapping would add or withdraw.
+- **Selection could not be started without a pointer** — and with it Reply,
+  Copy, Forward and Delete for a single message. Shift+Enter now starts one.
+- **The send button was live with nothing to send**, taking the tap with a
+  ripple and doing nothing at all.
+- **The disappearing-messages sheet marked nothing as current** for a window
+  only the CLI can set, which reads as "no window" in the one place a person
+  goes to check.
 - Smaller ones: a queued group message no longer looks delivered; the group
   header no longer lists this device by a raw id or hides members it cannot
   reach; a bubble carries the date when it is not today's; a peer with an empty

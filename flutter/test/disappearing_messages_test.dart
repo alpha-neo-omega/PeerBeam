@@ -279,6 +279,42 @@ void main() {
   /// A window set from the CLI can be any duration. It is shown in its own
   /// words: a 90-minute window rendered as "1 hour" or "2 hours" states that
   /// messages live for a length of time they do not.
+  // The CLI can set any window (`peerbeam chat retention --after 90m`), and for
+  // one of those the sheet showed Off / 1 hour / 1 day / 7 days with nothing
+  // marked and no sentence saying why — which reads exactly like a conversation
+  // that has no window, in the one place a person goes to check. The strip
+  // above the thread has been saying the truth all along.
+  testWidgets('a window this sheet does not offer is still shown as current', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()..retention['pb-bob'] = 5400;
+    await _open(tester, fake);
+    await _openSheet(tester);
+
+    expect(find.text('90 minutes'), findsOneWidget);
+    expect(find.textContaining('set outside this app'), findsOneWidget);
+    final tile = tester.widget<ListTile>(
+      find.ancestor(
+        of: find.text('90 minutes'),
+        matching: find.byType(ListTile),
+      ),
+    );
+    expect(tile.selected, isTrue);
+    // And nothing else claims to be.
+    expect(find.text('Current'), findsOneWidget);
+  });
+
+  testWidgets('a window the sheet does offer adds no extra row', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam()..retention['pb-bob'] = 3600;
+    await _open(tester, fake);
+    await _openSheet(tester);
+
+    expect(find.textContaining('set outside this app'), findsNothing);
+    expect(find.text('Current'), findsOneWidget);
+  });
+
   testWidgets('an odd window is shown exactly, never rounded', (tester) async {
     final fake = FakePeerBeam()..retention['pb-bob'] = 5400;
     await _open(tester, fake);

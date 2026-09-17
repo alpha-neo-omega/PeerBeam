@@ -2154,6 +2154,29 @@ Future<({int? seconds})?> _pickRetention(
                   selected: current.seconds == seconds,
                   onTap: () => Navigator.pop(ctx, (seconds: seconds)),
                 ),
+              // **A window this sheet does not offer is still the window in
+              // force.** The CLI can set any (`peerbeam chat retention --after
+              // 90m`), and for one of those the list showed Off / 1 hour /
+              // 1 day / 7 days with nothing marked and no sentence saying why —
+              // which reads exactly like a conversation that has none, in the
+              // one place a person goes to check. The strip above the thread
+              // has been saying the truth all along.
+              //
+              // Listed rather than explained in prose, so it is ticked like any
+              // other current choice; re-tapping it is a no-op that writes the
+              // window it already has.
+              if (current.known &&
+                  current.seconds != null &&
+                  !_retentionWindows.contains(current.seconds))
+                _RetentionChoice(
+                  label: _windowLabel(current.seconds!),
+                  detail:
+                      'Deleted from this device after '
+                      '${_windowLabel(current.seconds!)} — set outside this app',
+                  selected: true,
+                  onTap: () =>
+                      Navigator.pop(ctx, (seconds: current.seconds)),
+                ),
               const Gap(AppSpace.xs),
             ],
           ),
