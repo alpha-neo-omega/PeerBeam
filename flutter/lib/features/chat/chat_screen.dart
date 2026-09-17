@@ -237,6 +237,26 @@ class _ChatScreenState extends State<ChatScreen> {
   static bool _canSend(PeerTarget peer) =>
       peer.addresses.isNotEmpty && peer.port > 0;
 
+  /// Why this device may not message [peerId], or null when it may.
+  ///
+  /// The engine refuses before persisting anything (`permit_chat`), so a
+  /// message sent to a peer whose `chat` permission has been withheld never
+  /// exists — it comes back as a failed bubble printing the engine's own
+  /// sentence about a `chat` permission, at label-small size inside a bubble
+  /// capped at 75% of the column. Asking the question here instead means the
+  /// composer is honest before anything is typed into it.
+  ///
+  /// Only a device that is **approved and narrowed** answers non-null. An
+  /// unapproved or never-seen peer is a different situation — the thread is
+  /// still worth opening, and the first message is what prompts the approval —
+  /// so it is deliberately not blocked here.
+  static String? _chatRefused(AppState state, String peerId) {
+    final device = state.trust.byId(peerId);
+    if (device == null || !device.approved) return null;
+    if (device.may(PeerBeamPermission.chat)) return null;
+    return device.name.isEmpty ? 'This device' : device.name;
+  }
+
   /// Fire-and-forget: `send` awaits a synchronous dial+handshake under the
   /// hood, so the button handler must not block on it — the optimistic
   /// message (appended inside the repository, before its own await) is what
@@ -881,7 +901,11 @@ class _ChatScreenState extends State<ChatScreen> {
     // this screen — the one disabled on its account — sitting on a snapshot
     // taken before it existed. The same merge the device picker was fixed with.
     return AnimatedBuilder(
-      animation: Listenable.merge([state.chat, state.device]),
+      // Trust is merged in too: a peer's `chat` permission can be revoked from
+      // Settings while this screen is open, and nothing else here would notice.
+      // The composer stayed live, the message was typed and sent, and the only
+      // answer was a red bubble carrying the engine's raw refusal.
+      animation: Listenable.merge([state.chat, state.device, state.trust]),
       builder: (context, _) {
         final peer = _target(state);
         final items = state.chat.messagesFor(widget.peerId);
@@ -912,7 +936,11 @@ class _ChatScreenState extends State<ChatScreen> {
     Set<String> selected,
     bool selecting,
   ) {
-    final canSend = _canSend(peer);
+    // Two different reasons a message cannot go out, and they are told apart
+    // because they need different sentences: nothing to send *to*, versus a
+    // device this one may no longer message.
+    final chatRefused = _chatRefused(state, widget.peerId);
+    final canSend = _canSend(peer) && chatRefused == null;
     // Why the thread is empty, when it is empty because a read failed.
     final failure = state.chat.loadErrorFor(widget.peerId);
     return Scaffold(
@@ -1072,9 +1100,13 @@ class _ChatScreenState extends State<ChatScreen> {
                       AppSpace.xxs,
                     ),
                     child: Text(
-                      'No address known for ${peer.name} yet — this '
-                      'conversation is readable, and sending works again as soon '
-                      'as the device is discovered.',
+                      chatRefused != null
+                          ? 'You turned off Messages for $chatRefused, so this '
+                                'conversation is read-only. Turn it back on in '
+                                'Settings › Trusted devices.'
+                          : 'No address known for ${peer.name} yet — this '
+                                'conversation is readable, and sending works '
+                                'again as soon as the device is discovered.',
                       style: Theme.of(context).textTheme.labelSmall?.copyWith(
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
@@ -1088,6 +1120,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 _Composer(
                   controller: _controller,
                   focusNode: _composerFocus,
+                  disabledHint: chatRefused != null
+                      ? 'Messages are turned off for this device'
+                      : 'Not reachable right now',
                   onSend: _send,
                   onAttach: _attach,
                   enabled: canSend,
@@ -2289,12 +2324,20 @@ class _Composer extends StatelessWidget {
   final VoidCallback onSend;
   final VoidCallback onAttach;
   final bool enabled;
+
+  /// What the field says while it cannot be used. "Not reachable right now" is
+  /// only true of one of the two reasons — a peer with no address — and read as
+  /// a network problem for the other, where the user had themselves turned this
+  /// device's Messages permission off.
+  final String disabledHint;
+
   const _Composer({
     required this.controller,
     required this.focusNode,
     required this.onSend,
     required this.onAttach,
     this.enabled = true,
+    this.disabledHint = 'Not reachable right now',
   });
 
   @override
@@ -2356,7 +2399,7 @@ class _Composer extends StatelessWidget {
                   minLines: 1,
                   maxLines: 5,
                   decoration: InputDecoration(
-                    hintText: enabled ? 'Message' : 'Not reachable right now',
+                    hintText: enabled ? 'Message' : disabledHint,
                     border: const OutlineInputBorder(
                       borderRadius: BorderRadius.all(
                         Radius.circular(AppRadius.xl),
@@ -2548,7 +2591,19 @@ class _AutoAcceptAction extends StatelessWidget {
           onSelected: (v) => _set(context, v),
           itemBuilder: (context) => [
             PopupMenuItem<bool>(
-              enabled: blocked == null,
+              // **Turning it OFF is never blocked.** This was
+              // `blocked == null`, which disabled the row whenever the device
+              // could not be *granted* auto-accept — including when it already
+              // had it and the user had since revoked its Files permission.
+              // The stored consent then could not be withdrawn at all: the bit
+              // stayed set, greyed out behind a sentence explaining why the
+              // user could not touch it, and the day Files was granted back,
+              // that device's files were saved without asking again.
+              //
+              // Invariant I6 requires auto-accept to be explicit, per-capability
+              // **and revocable**. A consent that can only be given is not
+              // revocable, so this is the invariant rather than a rough edge.
+              enabled: blocked == null || on,
               value: !on,
               child: ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -2561,13 +2616,21 @@ class _AutoAcceptAction extends StatelessWidget {
                   on ? 'Ask about files again' : 'Accept files without asking',
                 ),
                 subtitle: Text(
-                  blocked ??
-                      (on
-                          ? "You'll see the approval prompt for $peerName again."
-                          : "$peerName's files will be saved straight away. "
+                  // The blocked sentence explains why it cannot be turned ON,
+                  // so it has no business appearing on the row that turns it
+                  // off — there it would read as a refusal of the very thing
+                  // the tap is about to do.
+                  on
+                      ? (blocked == null
+                            ? "You'll see the approval prompt for $peerName "
+                                  'again.'
+                            : 'Stop accepting files from $peerName without '
+                                  'asking — $blocked')
+                      : (blocked ??
+                            "$peerName's files will be saved straight away. "
                                 'Only this device.'),
                 ),
-                isThreeLine: blocked == null,
+                isThreeLine: blocked == null || on,
               ),
             ),
           ],
