@@ -339,13 +339,20 @@ class _ChatsScreenState extends State<ChatsScreen> {
       // queued file inside it included — so presenting a failed read as "no
       // conversations yet" hides the very threads it exists to surface, and
       // does it in the voice of a fact.
-      final failure = AppScope.of(context).chat.conversationsError;
+      final chat = AppScope.of(context).chat;
+      final failure = chat.conversationsError;
       if (failure != null) {
         return ErrorState(
           error: failure,
           title: 'Could not read your conversations',
-          onRetry: () => AppScope.of(context).chat.refreshConversations(),
+          onRetry: () => chat.refreshConversations(),
         );
+      }
+      // And a list nobody has asked for yet is not an empty one. The read is
+      // fired post-frame, so every open passed through this state and stated
+      // "No conversations yet" about threads it had not looked for.
+      if (!chat.conversationsLoaded) {
+        return const Center(child: CircularProgressIndicator());
       }
       return const EmptyState(
         icon: Icons.forum_outlined,

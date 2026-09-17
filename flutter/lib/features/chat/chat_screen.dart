@@ -135,7 +135,14 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _presence = AppScope.of(context).chatPresence..enter(widget.peerId);
+    // **Only when it actually changes.** `didChangeDependencies` fires for any
+    // inherited change — a theme switch, a metrics change — including while
+    // this route is buried under another thread. Re-entering there would
+    // re-register a screen the user cannot see as the one in front.
+    final presence = AppScope.of(context).chatPresence;
+    if (identical(presence, _presence)) return;
+    _presence?.leave(widget.peerId);
+    _presence = presence..enter(widget.peerId);
   }
 
   /// (Re)start the sweep that clears messages whose window closes while the
@@ -299,34 +306,48 @@ class _ChatScreenState extends State<ChatScreen> {
     '\u{1F622}',
   ];
 
-  /// Apply a reaction and say so only when it did **not** reach the peer.
+  /// Apply a reaction and say what actually happened when it was not simply
+  /// delivered.
   ///
   /// Silence on success is deliberate: a reaction is a small gesture and a
-  /// toast for every one would be louder than the thing it reports. But a
-  /// reaction the peer never saw — offline, or a build too old to have
-  /// negotiated them — would otherwise look identical to one that landed, and
-  /// that is the case the user cannot recover from without being told.
+  /// toast for every one would be louder than the thing it reports. But there
+  /// are three ways for it not to succeed and they are not the same news:
+  ///
+  ///  * The call **failed** — nothing was saved anywhere.
+  ///  * The engine **did not apply** it, which means the message it names is
+  ///    no longer in the store (deleted, or its window closed).
+  ///  * It was saved here and could not be **delivered** — the peer is offline
+  ///    or too old to have negotiated reactions.
+  ///
+  /// Only the third is "Saved here", and that sentence used to be shown for
+  /// all three: the repository returned one bool for every outcome, so a
+  /// reaction that had not been stored at all told the user it was safe on
+  /// their own device.
   Future<void> _react(
     String messageId,
     String emoji, {
     required bool remove,
   }) async {
     final state = AppScope.of(context);
-    final delivered = await state.chat.react(
+    final result = await state.chat.react(
       widget.peerId,
       messageId,
       emoji,
       remove: remove,
     );
-    if (!mounted || delivered) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Saved here, but not delivered — the device is offline or its '
-          'app is too old for reactions.',
-        ),
-      ),
-    );
+    if (!mounted || (result.applied && result.delivered)) return;
+    final message = switch (result) {
+      (applied: _, delivered: _, error: final Object e) =>
+        'Could not react: ${friendlyError(e)}',
+      (applied: false, delivered: _, error: _) =>
+        'That message is no longer in this conversation.',
+      _ =>
+        'Saved here, but not delivered — the device is offline or its '
+            'app is too old for reactions.',
+    };
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   /// Offer the quick reactions for [messageId]. Opened by the button on the
@@ -1209,20 +1230,36 @@ class _ChatBubble extends StatelessWidget {
                           ),
                           if (mine) ...[
                             const Gap(AppSpace.xxs),
-                            Icon(
-                              // A read message earns its own glyph rather than
-                              // a second tick: "delivered" and "read" are
-                              // different claims, and only one of them is
-                              // something the peer chose to tell us.
-                              message.readAt != null
-                                  ? Icons.done_all_rounded
-                                  : _deliveryGlyph(message.status),
-                              size: 14,
-                              color: message.readAt != null
-                                  ? scheme.primary
-                                  : (_failedStatus(message.status)
-                                        ? scheme.error
-                                        : fg.withValues(alpha: 0.7)),
+                            Builder(
+                              builder: (context) {
+                                // A read message earns its own glyph rather
+                                // than a second tick: "delivered" and "read"
+                                // are different claims, and only one of them
+                                // is something the peer chose to tell us.
+                                //
+                                // **But failure outranks it.** `read_at` is
+                                // about the chat *row*; a file row's bytes
+                                // fail, are declined, or are left interrupted
+                                // quite separately, and the peer may well have
+                                // read the row before turning the file down.
+                                // Reading the receipt first painted the blue
+                                // "read" tick over a file that never arrived —
+                                // the one glyph on the row, saying the message
+                                // got there, above a bubble saying it did not.
+                                final failed = _failedStatus(message.status);
+                                final read = !failed && message.readAt != null;
+                                return Icon(
+                                  read
+                                      ? Icons.done_all_rounded
+                                      : _deliveryGlyph(message.status),
+                                  size: 14,
+                                  color: read
+                                      ? scheme.primary
+                                      : (failed
+                                            ? scheme.error
+                                            : fg.withValues(alpha: 0.7)),
+                                );
+                              },
                             ),
                           ],
                           // An explicit control rather than a gesture. A

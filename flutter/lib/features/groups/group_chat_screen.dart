@@ -65,12 +65,19 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Outside the `_started` guard: this has to be re-asserted whenever the
-    // scope changes, and it is cheap and idempotent. Keyed by the group, not
-    // by any member — a group message must not be filed under, or silenced
-    // by, a private thread with whoever happened to send it.
-    _presence = AppScope.of(context).chatPresence
-      ..enter(groupThreadKey(widget.group.id));
+    // Keyed by the group, not by any member — a group message must not be
+    // filed under, or silenced by, a private thread with whoever happened to
+    // send it.
+    //
+    // **Only when the scope actually changes.** `didChangeDependencies` fires
+    // for any inherited change — a theme switch, a metrics change — including
+    // while this route is buried under another transcript. Re-entering there
+    // would re-register a screen the user cannot see as the one in front.
+    final presence = AppScope.of(context).chatPresence;
+    if (!identical(presence, _presence)) {
+      _presence?.leave(groupThreadKey(widget.group.id));
+      _presence = presence..enter(groupThreadKey(widget.group.id));
+    }
     if (_started) return;
     _started = true;
     _load();

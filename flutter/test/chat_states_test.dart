@@ -195,4 +195,25 @@ void main() {
       expect(find.text('Nothing said yet'), findsOneWidget);
     });
   });
+  group('the conversations list', () {
+    test('is not "loaded" until the engine has answered', () async {
+      final fake = FakePeerBeam();
+      final repo = ChatRepository(api: fake);
+      addTearDown(repo.dispose);
+
+      expect(repo.conversationsLoaded, isFalse);
+      await repo.refreshConversations();
+      expect(repo.conversationsLoaded, isTrue);
+    });
+
+    test('a failed read does not count as loaded', () async {
+      final fake = FakePeerBeam()..failing.add('chatConversations');
+      final repo = ChatRepository(api: fake);
+      addTearDown(repo.dispose);
+
+      await repo.refreshConversations();
+      expect(repo.conversationsLoaded, isFalse);
+      expect(repo.conversationsError, isNotNull);
+    });
+  });
 }

@@ -352,6 +352,26 @@ void main() {
       expect(n, 0, reason: 'attention did not move');
     });
 
+    // The leak. `didChangeDependencies` fires for any inherited change — a
+    // theme switch will do — including while a screen is buried under another
+    // thread. Entering twice and leaving once left a stale entry on the stack
+    // for the rest of the session, and that thread then counted as "on screen"
+    // forever: its arriving messages stopped notifying with nothing open.
+    test('a key can never appear twice', () {
+      final p = ChatPresence()..enter('pb-bob');
+      p.enter('pb-carol');
+      p.enter('pb-bob'); // a buried screen re-registering
+      p.leave('pb-bob');
+
+      expect(
+        p.openConversation,
+        'pb-carol',
+        reason: 'one leave must remove it completely',
+      );
+      p.leave('pb-carol');
+      expect(p.openConversation, isNull);
+    });
+
     test('leaving them all ends with no thread open', () {
       final p = ChatPresence()..enter('pb-bob');
       p.enter('pb-carol');

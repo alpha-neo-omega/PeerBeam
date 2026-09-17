@@ -121,6 +121,16 @@ class ChatRepository extends ChangeNotifier {
   /// [refreshConversations] has run.
   List<ChatConversation> get conversations => List.unmodifiable(_conversations);
 
+  bool _conversationsLoaded = false;
+
+  /// Whether the conversation list has been read from the engine yet.
+  ///
+  /// The same third state [hasLoaded] adds for one thread. Without it an empty
+  /// list meant both "you have never chatted" and "nobody has asked yet", and
+  /// the screen said the first about the second — on every open, before the
+  /// read it fires post-frame has answered.
+  bool get conversationsLoaded => _conversationsLoaded;
+
   /// How far the staging copy behind [messageId] has got, or null when this
   /// session has seen no progress for it — which is the ordinary state for the
   /// first moment of a share, and permanently so for one a restart interrupted.
@@ -299,6 +309,7 @@ class ChatRepository extends ChangeNotifier {
         final list = await api.chatConversations();
         if (_disposed) return;
         _conversations = list;
+        _conversationsLoaded = true;
         _conversationsError = null;
         notifyListeners();
       } while (_conversationsStale);
@@ -548,24 +559,34 @@ class ChatRepository extends ChangeNotifier {
 
   /// React to a message, or withdraw that reaction.
   ///
-  /// Returns whether the peer was told. The local half is applied by the
-  /// engine either way and re-read here, so the reaction appears on this
-  /// device even when the peer is unreachable — but the caller is handed the
-  /// delivery answer so it can say so rather than implying the gesture landed.
-  Future<bool> react(
+  /// Reports all three outcomes separately, because they call for three
+  /// different things to be said. This used to return a bare `delivered` bool,
+  /// so a call that **threw**, one the engine **refused to apply**, and one
+  /// that was applied but could not be delivered were the same `false` — and
+  /// the surface says "Saved here, but not delivered" to that. For the first
+  /// two nothing was saved anywhere, and the user was told their reaction was
+  /// safe on their own device when it did not exist.
+  ///
+  /// The local half is applied by the engine even when the peer is
+  /// unreachable, and re-read here, so a reaction still appears on this device
+  /// — that is the case the original message was written for, and it is only
+  /// one of the three.
+  Future<({bool applied, bool delivered, Object? error})> react(
     String peerId,
     String messageId,
     String emoji, {
     bool remove = false,
   }) async {
     final api = _api;
-    if (api == null) return false;
+    if (api == null) {
+      return (applied: false, delivered: false, error: null);
+    }
     try {
       final r = await api.chatReact(peerId, messageId, emoji, remove: remove);
       if (r.applied) await refresh(peerId);
-      return r.delivered;
-    } catch (_) {
-      return false;
+      return (applied: r.applied, delivered: r.delivered, error: null);
+    } catch (e) {
+      return (applied: false, delivered: false, error: e);
     }
   }
 

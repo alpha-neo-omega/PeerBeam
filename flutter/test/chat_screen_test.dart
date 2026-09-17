@@ -69,6 +69,7 @@ ChatMessage _file({
   String name = 'report.pdf',
   int size = _fixtureSize,
   String? localPath,
+  DateTime? readAt,
 }) => ChatMessage(
   id: id,
   peerId: 'pb-bob',
@@ -80,6 +81,7 @@ ChatMessage _file({
   fileName: name,
   fileSize: size,
   localPath: localPath,
+  readAt: readAt,
 );
 
 void main() {
@@ -237,6 +239,46 @@ void main() {
     // Exactly one tick: the row that really was delivered.
     expect(find.byIcon(Icons.check_rounded), findsOneWidget);
     expect(find.byIcon(Icons.error_outline_rounded), findsWidgets);
+  });
+
+  // `read_at` is about the chat ROW. A file row's bytes fail, are declined, or
+  // are left interrupted quite separately — and the peer may well have read the
+  // row before turning the file down. The read tick was checked first, so the
+  // blue "read" glyph was painted over a file that never arrived: the one
+  // marker on the row saying it got there, above a bubble saying it did not.
+  testWidgets('a read receipt never overrides a failure', (tester) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.declined,
+        readAt: DateTime.utc(2026, 1, 1, 9),
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.byIcon(Icons.done_all_rounded), findsNothing);
+    // Two: the file row's own status icon and the trailing delivery glyph.
+    // Both say declined, which is the point.
+    expect(find.byIcon(Icons.block_rounded), findsWidgets);
+  });
+
+  testWidgets('a delivered row that was read does show the read tick', (
+    tester,
+  ) async {
+    final fake = FakePeerBeam();
+    fake.chatHistories['pb-bob'] = [
+      _file(
+        id: 'fr-1',
+        direction: 'out',
+        status: ChatStatusValue.sent,
+        readAt: DateTime.utc(2026, 1, 1, 9),
+      ),
+    ];
+    await _open(tester, fake);
+
+    expect(find.byIcon(Icons.done_all_rounded), findsOneWidget);
   });
 
   testWidgets('an in-flight outgoing row shows a pending marker, not a tick', (

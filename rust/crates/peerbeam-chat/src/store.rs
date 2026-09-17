@@ -257,7 +257,42 @@ impl ChatStore {
     /// [`AppStore::namespaces`] reports only *populated* namespaces, so an
     /// empty directory — left by a `clear`, or by a crash between
     /// `create_dir_all` and the first record — is not mistaken for a thread.
+    ///
+    /// **A namespace holding only group rows is not a conversation.** A group
+    /// message is N one-to-one sends — `groups_send` enqueues one copy per
+    /// member, into that member's own `chat-<id>` — so sending or receiving a
+    /// single group message creates a populated namespace for every member of
+    /// it. Listing those made every member of every group appear in the user's
+    /// conversation list as a private thread with someone they may never have
+    /// messaged, and opening one showed nothing at all, because
+    /// [`history`](Self::history) correctly filters group rows back out. The
+    /// list filled with conversations that did not exist and could not be read.
+    ///
+    /// Cost: one `list` per candidate namespace, on top of whatever the caller
+    /// then reads. This call is already O(every record) — see
+    /// `Manager::chat_conversations` — and the alternative is a separate index
+    /// that can drift from the records, which is what deriving this from the
+    /// namespaces was chosen to avoid.
     pub fn conversations(&self) -> Result<Vec<DeviceId>, ChatError> {
+        let mut out = Vec::new();
+        for peer in self.peer_namespaces()? {
+            if self.holds_private_record(&namespace(&peer)) {
+                out.push(peer);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every peer whose `chat-<id>` namespace exists, private thread or not.
+    ///
+    /// The unfiltered form, and deliberately **not** public. It is what
+    /// [`group_history`](Self::group_history) has to walk, because a group
+    /// message's copies live in each member's own namespace — including
+    /// members this device has no private conversation with, which is exactly
+    /// the set [`conversations`](Self::conversations) excludes. Anything
+    /// answering the question *"which conversations does the user have?"* wants
+    /// the filtered list; only a group's own transcript wants this one.
+    fn peer_namespaces(&self) -> Result<Vec<DeviceId>, ChatError> {
         let names = self
             .store
             .namespaces("chat-")
@@ -269,6 +304,28 @@ impl ChatStore {
                     .map(|id| DeviceId::from(id.to_string()))
             })
             .collect())
+    }
+
+    /// Whether `ns` holds at least one record belonging to the **private**
+    /// conversation, rather than only copies of group messages.
+    ///
+    /// Retention is deliberately not applied. A thread whose messages have all
+    /// disappeared is still a conversation the user has — it keeps its window,
+    /// and it is somewhere they can write again — so it stays listed exactly as
+    /// it was before this filter existed. The only thing being excluded here is
+    /// a namespace that was never a private thread in the first place.
+    ///
+    /// Errs towards listing. An unreadable namespace, or a record this build
+    /// cannot decode, is not evidence of a group message, and hiding a thread
+    /// on that basis would be the failure `conversations` exists to prevent: a
+    /// conversation nothing can name.
+    fn holds_private_record(&self, ns: &str) -> bool {
+        match self.store.list(ns) {
+            Err(_) => true,
+            Ok(rows) => rows.iter().any(|(_, value)| {
+                ChatRecord::decode(value).map_or(true, |rec| rec.group.is_none())
+            }),
+        }
     }
 
     /// This conversation's [disappearing-message window](Retention), or
@@ -435,7 +492,13 @@ impl ChatStore {
         let mut out: Vec<ChatRecord> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let now = Utc::now();
-        for peer in self.conversations()? {
+        // `peer_namespaces`, not `conversations`: a group message's copies sit
+        // in each member's namespace, and a member the user has never
+        // privately messaged has no private conversation to be listed under —
+        // which is precisely what `conversations` now filters out. Reading the
+        // filtered list here would lose exactly the rows this function exists
+        // to gather.
+        for peer in self.peer_namespaces()? {
             let retention = self.retention(&peer)?;
             let raw = self
                 .store
@@ -3394,6 +3457,70 @@ mod tests {
     /// never a conversation, while a peer that claims the device id `outbox`
     /// is one — they are different namespaces (`chat.outbox` vs `chat-outbox`)
     /// and must stay that way.
+    #[test]
+    fn a_group_only_namespace_is_not_a_conversation() {
+        let (cs, _store, _tmp) = new_store();
+
+        // A group message is N one-to-one sends: `groups_send` enqueues one
+        // copy per member into that member's own `chat-<id>`. So one group
+        // message populates a namespace for somebody this device may never
+        // have privately messaged.
+        let colleague = DeviceId::from("pb-colleague");
+        let mut group_msg = ChatMessage::new("standup at ten").unwrap();
+        group_msg.group = Some("g-team".to_string());
+        cs.enqueue(&colleague, &group_msg).unwrap();
+
+        // And a peer with a real private thread, to prove the filter is not
+        // simply dropping everything.
+        let friend = DeviceId::from("pb-friend");
+        cs.append(&ChatRecord::received(
+            &friend,
+            &ChatMessage::new("lunch?").unwrap(),
+        ))
+        .unwrap();
+
+        let got: Vec<String> = cs
+            .conversations()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+
+        // Listing the colleague put a conversation in the user's list that did
+        // not exist — and opening it showed nothing, because `history` filters
+        // group rows straight back out.
+        assert!(
+            !got.contains(&"pb-colleague".to_string()),
+            "a namespace holding only group copies is not a private thread: {got:?}"
+        );
+        assert!(got.contains(&"pb-friend".to_string()), "{got:?}");
+    }
+
+    /// The member is a real conversation the moment there is anything private
+    /// in it, whichever order the two arrived in.
+    #[test]
+    fn a_member_with_a_private_message_too_is_still_listed() {
+        let (cs, _store, _tmp) = new_store();
+        let both = DeviceId::from("pb-both");
+
+        let mut group_msg = ChatMessage::new("group ping").unwrap();
+        group_msg.group = Some("g-team".to_string());
+        cs.enqueue(&both, &group_msg).unwrap();
+        cs.append(&ChatRecord::received(
+            &both,
+            &ChatMessage::new("and a private word").unwrap(),
+        ))
+        .unwrap();
+
+        let got: Vec<String> = cs
+            .conversations()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+        assert!(got.contains(&"pb-both".to_string()), "{got:?}");
+    }
+
     #[test]
     fn conversations_lists_every_thread_including_a_file_only_one_and_never_the_outbox() {
         let (cs, _store, _tmp) = new_store();
