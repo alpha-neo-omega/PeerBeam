@@ -33,8 +33,8 @@
 //! because of where a file happens to sit on disk — `/home/alice/…` would
 //! return every file anyone ever sent.
 
-use std::collections::HashSet;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use peerbeam_domain::id::DeviceId;
