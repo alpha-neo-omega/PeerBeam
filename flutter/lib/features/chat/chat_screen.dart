@@ -60,6 +60,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// causes. See [_send].
   final _composerFocus = FocusNode();
 
+  /// The transcript's scroll position.
+  ///
+  /// The list is `reverse: true`, so offset 0 is the **newest** message. Held
+  /// here so a send can return to it: someone reading back through a thread who
+  /// then writes a reply had it appended out of sight below them, with nothing
+  /// saying where it went and no control to follow it.
+  final _scroll = ScrollController();
+
   /// Message ids the user has picked out of this thread.
   ///
   /// Selection **is** this set being non-empty — there is no separate mode
@@ -117,6 +125,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _incoming?.cancel();
     _controller.dispose();
     _composerFocus.dispose();
+    _scroll.dispose();
     // Passing the peer id matters: pushing one thread on top of another builds
     // the new screen before disposing the old, so an unconditional clear here
     // would blank the thread that had just registered.
@@ -265,6 +274,18 @@ class _ChatScreenState extends State<ChatScreen> {
     // on a phone, and on desktop the next thing typed went nowhere. A chat
     // where every message costs an extra tap to start typing again.
     _composerFocus.requestFocus();
+    // And go to where the message will appear. The list is reversed, so the
+    // newest row is at offset 0; scrolled back through a thread, a reply was
+    // appended out of sight below with nothing saying so. After the frame,
+    // because the row does not exist until the append has been built.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    });
     // Resolved as the message goes out, not as the thread was opened: an
     // address that arrived in between is the address this send needs.
     final replyTo = _replyToId;
@@ -970,6 +991,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             // Reversed so the latest message stays pinned to
                             // the bottom without a manual scroll controller.
                             return ListView.builder(
+                              controller: _scroll,
                               reverse: true,
                               padding: const EdgeInsets.all(AppSpace.md),
                               itemCount: items.length,

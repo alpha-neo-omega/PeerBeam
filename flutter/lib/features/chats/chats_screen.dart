@@ -78,11 +78,23 @@ class _ChatsScreenState extends State<ChatsScreen> {
       if (!mounted) return;
       AppScope.of(context).chat.refreshConversations();
     });
+    // Every card says "Last message 2 minutes ago", and nothing made that
+    // number move: the list rebuilds when the engine says something changed,
+    // and time passing is not something the engine says. A thread left open
+    // read "just now" for an hour. One rebuild a minute is the resolution
+    // `formatAgo` actually has.
+    _tick = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) setState(() {});
+    });
   }
+
+  /// Re-renders the relative timestamps. See [initState].
+  Timer? _tick;
 
   @override
   void dispose() {
     _timer?.cancel();
+    _tick?.cancel();
     _search.dispose();
     super.dispose();
   }
