@@ -223,7 +223,12 @@ class FakePeerBeam implements PeerBeamApi {
   List<TrustedDevice> trusted = [];
 
   @override
-  Future<List<TrustedDevice>> trustList() async => trusted;
+  Future<List<TrustedDevice>> trustList() async {
+    // Failable: an unreadable trust store and an empty one are different
+    // answers, and only one of them means the user trusts nobody.
+    _maybeFail('trustList');
+    return trusted;
+  }
 
   /// Every `trustSetPermission` call, in order — so a test can assert what the
   /// UI actually asked the engine for, not merely what it drew afterwards.

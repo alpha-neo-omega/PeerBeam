@@ -3310,7 +3310,15 @@ impl Manager {
         if let Err(e) = self.chat.outbox_remove(id) {
             tracing::warn!(error = %e, message_id = %id, "queued file not dequeued");
         }
-        self.staging.remove(staged_path);
+        // Reported like its neighbour. One of these two failures was logged and
+        // the other discarded, though both leave the same entry half-released.
+        if !self.staging.remove(staged_path) {
+            tracing::warn!(
+                message_id = %id,
+                path = %staged_path,
+                "dropped file's staged bytes are still on disk"
+            );
+        }
     }
 
     /// Take this peer's one file-in-flight slot, if it is free.
@@ -5049,6 +5057,8 @@ impl Manager {
             /// When this device stored that row. Orders the list.
             last_at: Option<chrono::DateTime<chrono::Utc>>,
             unread_hint: usize,
+            /// Whether this thread's records could be read at all.
+            readable: bool,
         }
         let mut rows: Vec<Row> = Vec::with_capacity(peers.len());
         for peer in peers {
@@ -5056,8 +5066,18 @@ impl Manager {
             // be listed — dropping it would hide the very conversation this
             // call was added to make reachable. It just has nothing to say
             // about itself.
+            //
+            // **And it says which it is.** The failure used to be folded into
+            // an empty history, so a surface saw the same thing it sees for a
+            // thread with no datable rows — and said "No messages to show"
+            // about a conversation nobody had managed to read. That is a claim
+            // about the user's own history made by something that failed to
+            // find out, which is the one class of defect this file is most
+            // careful about everywhere else.
+            let mut readable = true;
             let history = self.chat.history(&peer).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, peer_id = %peer.0, "conversation summary unreadable");
+                readable = false;
                 Vec::new()
             });
             // The newest row by when THIS device stored it, not by store key
@@ -5089,6 +5109,7 @@ impl Manager {
                 last_timestamp,
                 last_at,
                 unread_hint: awaiting,
+                readable,
             });
         }
         // Newest first. `None` sorts below every `Some`, so a thread this build
@@ -5106,6 +5127,9 @@ impl Manager {
                     "last_timestamp": row.last_timestamp,
                     "last_at": row.last_at.map(|at| at.to_rfc3339()),
                     "unread_hint": row.unread_hint,
+                    // False only when the read failed. A surface may then say
+                    // so instead of describing a conversation it has not seen.
+                    "readable": row.readable,
                 })
             })
             .collect();

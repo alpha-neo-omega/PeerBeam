@@ -506,6 +506,78 @@ void main() {
       expect(withdrawn, isEmpty);
     });
 
+    // A file offer's notice asks a question — "Wants to send report.pdf" — and
+    // the answer is given elsewhere: on the incoming-transfer prompt, or
+    // automatically for a trusted device. Nothing took the question down, so it
+    // sat there indefinitely, on Android directly above a second notification
+    // saying the same file had been received.
+    test('a file offer stops asking once it has been answered', () async {
+      await send(
+        _msg(
+          id: 'fr-1',
+          kind: ChatMessageKind.file,
+          fileName: 'report.pdf',
+          status: ChatStatusValue.pendingApproval,
+          body: '',
+        ),
+      );
+      expect(posted, hasLength(1));
+      expect(posted.single.body, 'Wants to send report.pdf');
+
+      events.add(
+        const ChatStatus(
+          messageId: 'fr-1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.transferring,
+        ),
+      );
+      await Future(() {});
+
+      expect(withdrawn, [posted.single.id]);
+    });
+
+    test(
+      'a status for some other message leaves the notice standing',
+      () async {
+        await send(
+          _msg(
+            id: 'fr-1',
+            kind: ChatMessageKind.file,
+            fileName: 'report.pdf',
+            status: ChatStatusValue.pendingApproval,
+            body: '',
+          ),
+        );
+
+        events.add(
+          const ChatStatus(
+            messageId: 'fr-other',
+            peerId: 'pb-bob',
+            status: ChatStatusValue.received,
+          ),
+        );
+        await Future(() {});
+
+        expect(withdrawn, isEmpty);
+      },
+    );
+
+    // An ordinary message's notice is not a question, so nothing settles it —
+    // only opening the thread does.
+    test('a text notice is not withdrawn by a status event', () async {
+      await send(_msg());
+      events.add(
+        const ChatStatus(
+          messageId: 'm1',
+          peerId: 'pb-bob',
+          status: ChatStatusValue.sent,
+        ),
+      );
+      await Future(() {});
+
+      expect(withdrawn, isEmpty);
+    });
+
     test('a nameless peer is announced under its device id', () async {
       await send(_msg(peer: 'pb-zed'));
       expect(posted.single.title, 'pb-zed');

@@ -420,7 +420,15 @@ pub async fn stage_file_send(
     };
     r.size = staged.size;
     if !store.enqueue_file(peer, r, &staged)? {
-        staging.remove(&staged.staged_path);
+        // The bytes are this branch's whole point: the row is gone, so nothing
+        // will ever send them and nothing else will ever come back for them.
+        if !staging.remove(&staged.staged_path) {
+            tracing::warn!(
+                message_id = %r.id,
+                path = %staged.staged_path,
+                "staged file's bytes outlived the row they belonged to"
+            );
+        }
         tracing::info!(
             message_id = %r.id,
             peer_id = %peer.0,

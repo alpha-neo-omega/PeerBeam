@@ -156,6 +156,10 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.enterText(find.byType(TextField), 'sure, go ahead');
+    // Pumped before the tap: the send button is rebuilt from the controller's
+    // value (it is inert with nothing to send), so it is still disabled in the
+    // frame `enterText` was typed into.
+    await tester.pump();
     // The Send button, not the keyboard's return key. The composer no longer
     // turns return into Send — on a phone that key is the only way to reach a
     // second line, and a five-line composer with no line break was the defect.

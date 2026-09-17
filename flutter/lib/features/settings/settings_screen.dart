@@ -284,6 +284,18 @@ class SettingsScreen extends StatelessWidget {
                       SwitchListTile.adaptive(
                         secondary: const Icon(Icons.notifications_rounded),
                         title: const Text('Notifications'),
+                        // **Says what it covers.** It sits under "Transfers"
+                        // and was labelled as though that were all it did —
+                        // but it gates arriving messages too, so someone
+                        // turning off transfer noise silenced their
+                        // conversations with it and had nothing telling them
+                        // so. Android's two channels exist to separate exactly
+                        // these, and this switch is the master gate above both.
+                        subtitle: const Text(
+                          'Arriving files and messages. On Android you can '
+                          'silence one without the other in system settings.',
+                        ),
+                        isThreeLine: true,
                         value: state.settings.notifications,
                         onChanged: _guardedSwitch(
                           context,
@@ -363,6 +375,43 @@ class SettingsScreen extends StatelessWidget {
                 builder: (context, _) {
                   final pins = state.trust.items;
                   if (pins.isEmpty) {
+                    // Three states, and only one of them is "you trust nobody".
+                    // A read that failed looks exactly like an empty store, and
+                    // saying "No trusted devices yet" about it is a claim about
+                    // who the user trusts made by something that failed to find
+                    // out — on the screen where they would come to check.
+                    final failure = state.trust.error;
+                    if (failure != null) {
+                      return Card(
+                        child: ListTile(
+                          leading: Icon(
+                            Icons.error_outline_rounded,
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                          title: const Text(
+                            'Could not read your trusted devices',
+                          ),
+                          subtitle: Text(friendlyError(failure)),
+                          trailing: TextButton(
+                            onPressed: state.trust.refresh,
+                            child: const Text('Try again'),
+                          ),
+                        ),
+                      );
+                    }
+                    if (!state.trust.loaded) {
+                      // Stated rather than spun. A progress indicator here
+                      // never settles, which wedges every `pumpAndSettle` on
+                      // this screen — and the read is a local one that answers
+                      // in a frame or two, so the sentence is doing the work
+                      // anyway.
+                      return const Card(
+                        child: ListTile(
+                          leading: Icon(Icons.hourglass_empty_rounded),
+                          title: Text('Reading your trusted devices…'),
+                        ),
+                      );
+                    }
                     return const Card(
                       child: ListTile(
                         leading: Icon(Icons.verified_user_outlined),
@@ -444,7 +493,20 @@ class SettingsScreen extends StatelessWidget {
                                 ),
                                 if (!pins[i].approved)
                                   Text(
-                                    'Seen once — not approved.',
+                                    // An approval that RAN OUT is not a device
+                                    // nobody approved, and saying the second
+                                    // about the first describes a decision the
+                                    // user never made. The engine has reported
+                                    // `expired` and `expires_at` all along;
+                                    // nothing here read them, so a
+                                    // `trust approve --for 30m` was invisible
+                                    // while it held and misdescribed once it
+                                    // lapsed.
+                                    pins[i].expired
+                                        ? 'Approved until '
+                                              '${_expiryLabel(pins[i].expiresAt)}'
+                                              ' — that window has closed.'
+                                        : 'Seen once — not approved.',
                                     style: Theme.of(context).textTheme.bodySmall
                                         ?.copyWith(
                                           color: Theme.of(
@@ -1704,4 +1766,16 @@ class _CheckUpdatesTileState extends State<_CheckUpdatesTile> {
             child: const Text('Check'),
           ),
   );
+}
+
+/// A time-limited approval's deadline, for the trusted-devices list.
+///
+/// Local, and to the minute: the window is a decision the user made about a
+/// span of time, and seconds add nothing they were thinking about.
+String _expiryLabel(DateTime? at) {
+  if (at == null) return 'a time this build cannot read';
+  final local = at.toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${two(local.day)}/${two(local.month)} '
+      '${two(local.hour)}:${two(local.minute)}';
 }

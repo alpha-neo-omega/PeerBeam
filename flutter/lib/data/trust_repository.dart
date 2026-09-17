@@ -42,11 +42,32 @@ class TrustRepository extends ChangeNotifier {
       final devices = await api.trustList();
       if (_disposed) return;
       _items = devices;
+      _loaded = true;
+      _error = null;
       notifyListeners();
-    } catch (_) {
-      // Keep the current view on transient errors.
+    } catch (e) {
+      // Keep the current view on transient errors — **and say so**. An empty
+      // list is what a device that has never been trusted looks like, so a
+      // failed read rendered as "no trusted devices", and every screen deriving
+      // from it followed: a peer's row read "This device has not connected
+      // yet", and a chat with one would have counted as unapproved. A claim
+      // about who the user trusts, made by something that had failed to find
+      // out.
+      if (_disposed) return;
+      _error = e;
+      notifyListeners();
     }
   }
+
+  bool _loaded = false;
+  Object? _error;
+
+  /// Whether the trust store has been read at least once.
+  bool get loaded => _loaded;
+
+  /// Why the last read failed, or null when it came back. Kept apart from an
+  /// empty list for the reason [refresh] gives.
+  Object? get error => _error;
 
   /// Revoke a pin; the engine emits `trust_changed`, which refreshes us.
   ///

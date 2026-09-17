@@ -39,6 +39,22 @@ class ChatPresence extends ChangeNotifier {
 
   bool _foreground = true;
 
+  /// Whether this has been disposed.
+  ///
+  /// Teardown runs top-down: `AppState.dispose` disposes this while the chat
+  /// screen below is still mounted, and that screen's own `dispose` then calls
+  /// [leave] — touching a `ChangeNotifier` whose owner has already gone, which
+  /// asserts "A ChatPresence was used after being disposed". Every mutator
+  /// therefore has to survive being called after the end, the same guard the
+  /// repositories here keep for the same reason.
+  bool _disposed = false;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
   /// The peer whose thread is in front, or null when none is.
   String? get openConversation => _stack.isEmpty ? null : _stack.last;
 
@@ -65,7 +81,7 @@ class ChatPresence extends ChangeNotifier {
   /// `ChatScreen.didChangeDependencies`); this is the invariant holding
   /// regardless.
   void enter(String peerId) {
-    if (openConversation == peerId) return;
+    if (_disposed || openConversation == peerId) return;
     _stack
       ..remove(peerId)
       ..add(peerId);
@@ -78,6 +94,7 @@ class ChatPresence extends ChangeNotifier {
   /// the thread in front actually changed — leaving a screen buried under
   /// another is not a change of attention.
   void leave(String peerId) {
+    if (_disposed) return;
     final was = openConversation;
     if (!_stack.remove(peerId)) return;
     if (openConversation != was) notifyListeners();
@@ -85,7 +102,7 @@ class ChatPresence extends ChangeNotifier {
 
   /// The app gained or lost the foreground.
   void setForeground(bool value) {
-    if (_foreground == value) return;
+    if (_disposed || _foreground == value) return;
     _foreground = value;
     notifyListeners();
   }

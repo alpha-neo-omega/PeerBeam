@@ -33,12 +33,23 @@ class ChatDropZone extends StatefulWidget {
   /// doomed send per file and leave the user a row of failed bubbles to
   /// dismiss, having been told nothing up front.
   final bool canSend;
+
+  /// Why a drop here would be refused, when one would. Shown on the overlay
+  /// *before* the release and in the refusal after it, so the two agree.
+  ///
+  /// The zone knows only that it cannot send; the screen knows whether that is
+  /// an address it does not have or a permission the user withdrew, and those
+  /// need different sentences. Blaming the network for the second is what the
+  /// composer used to do too.
+  final String? refusal;
+
   final Widget child;
   const ChatDropZone({
     super.key,
     required this.peerId,
     required this.peer,
     required this.canSend,
+    this.refusal,
     required this.child,
   });
 
@@ -180,8 +191,9 @@ class _ChatDropZoneState extends State<ChatDropZone> {
         ..showSnackBar(
           SnackBar(
             content: Text(
-              'No address known for ${widget.peer.name} yet — files can be '
-              'sent again as soon as the device is discovered.',
+              widget.refusal ??
+                  'No address known for ${widget.peer.name} yet — files can be '
+                      'sent again as soon as the device is discovered.',
             ),
           ),
         );
@@ -233,7 +245,23 @@ class _ChatDropZoneState extends State<ChatDropZone> {
         fit: StackFit.expand,
         children: [
           widget.child,
-          Positioned.fill(child: DropOverlay(active: _active)),
+          Positioned.fill(
+            child: DropOverlay(
+              active: _active,
+              // **Says what releasing does here, and whether it will work.**
+              // The default copy is the Send flow's — "Release to stage your
+              // files" — and a chat drop does not stage anything: it sends,
+              // immediately, with no sheet to change your mind in. The overlay
+              // also used to invite a drop onto a conversation that would then
+              // refuse it, so the answer came only after the release.
+              title: widget.canSend ? 'Drop to send' : 'Cannot send here',
+              subtitle: widget.canSend
+                  ? 'Released files are sent to ${widget.peer.name} straight '
+                        'away'
+                  : (widget.refusal ??
+                        'No address known for ${widget.peer.name} yet'),
+            ),
+          ),
         ],
       ),
     );

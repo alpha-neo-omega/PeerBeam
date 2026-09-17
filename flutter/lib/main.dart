@@ -230,12 +230,25 @@ class _PeerBeamAppState extends State<PeerBeamApp> with WidgetsBindingObserver {
   /// id, which `chatNotice` then uses rather than inventing a name.
   String _peerName(String peerId) {
     final known = _state.device.devices
-        .where((d) => d.id == peerId)
+        .where((d) => d.id == peerId && d.name.isNotEmpty)
         .map((d) => d.name)
         .firstOrNull;
-    if (known != null && known.isNotEmpty) return known;
+    if (known != null) return known;
+    // **The trust store, before giving up.** Discovery only names a peer it can
+    // currently see, and the id it keys by is the provider's — a Tailscale peer
+    // is `ts:<node>` there while a chat message carries the authenticated `pb-`
+    // id, so that lookup cannot match for one at all. A peer that has ever
+    // chatted has been pinned, and a pinned record carries the name it
+    // presented. Without this, a device someone has talked to for weeks
+    // notified as a raw id the moment it went to sleep — while the Chats list
+    // on the same screen, which has always consulted trust, called it by name.
+    final pinned = _state.trust.items
+        .where((t) => t.id == peerId && t.name.isNotEmpty)
+        .map((t) => t.name)
+        .firstOrNull;
+    if (pinned != null) return pinned;
     return _state.saved.devices
-            .where((d) => d.id == peerId)
+            .where((d) => d.id == peerId && d.name.isNotEmpty)
             .map((d) => d.name)
             .firstOrNull ??
         peerId;

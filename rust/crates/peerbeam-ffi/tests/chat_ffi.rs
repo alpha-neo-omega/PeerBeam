@@ -399,12 +399,29 @@ enum OfferPeer {
 /// trust is TOFU-pinned on first contact, so re-generating a keypair per
 /// connection would make the second attempt fail authentication and every
 /// "it retried" assertion would be measuring the wrong thing.
-fn spawn_offer_peer(
+/// Stand a peer up on an **OS-assigned** port and report which one it got.
+///
+/// Every caller used to pass a hand-picked port in the 49964-49982 range, and
+/// that is what made this file flaky: two test binaries running at once, or one
+/// run following another closely enough for a socket to still be in TIME_WAIT,
+/// and the bind silently loses. The test then waits out its whole timeout for a
+/// peer that never came up and fails somewhere far from the cause — which is
+/// exactly how it reads in CI, where it failed twice in a row on two different
+/// platforms while passing locally in a tenth of a second.
+///
+/// `group_e2e.rs` already does it this way and says so: *"An OS-assigned port,
+/// so two of these tests can run at once without colliding — the fixed-port
+/// habit is what made `chat_ffi` flaky for weeks."* This is that fix, applied
+/// where the habit actually lives.
+///
+/// The listener is bound **before** the task is spawned, so the returned port
+/// is the real one and a caller can hand it to the engine immediately — there
+/// is no window in which the address exists but nothing is listening on it.
+async fn spawn_offer_peer(
     dir: &std::path::Path,
     name: &str,
-    port: u16,
     mode: OfferPeer,
-) -> Arc<Mutex<Vec<ChatRecord>>> {
+) -> (u16, Arc<Mutex<Vec<ChatRecord>>>) {
     let (enc, trust, identity) = peer_identity(dir, name);
     let enc: Arc<dyn EncryptionProvider> = Arc::new(enc);
     let trust: Arc<dyn TrustStore> = Arc::new(trust);
@@ -413,13 +430,18 @@ fn spawn_offer_peer(
     let dir = dir.to_path_buf();
     let name = name.to_string();
 
+    let quic = QuicTransport::new().expect("peer quic");
+    let (addr, mut incoming) = quic
+        .serve_channels_on("127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("peer listen");
+    let port = addr.port();
+
     tokio::spawn(async move {
         use futures::StreamExt;
-        let quic = QuicTransport::new().expect("peer quic");
-        let (_addr, mut incoming) = quic
-            .serve_channels_on(format!("127.0.0.1:{port}").parse().expect("addr"))
-            .await
-            .expect("peer listen");
+        // Held for the task's lifetime: dropping the transport closes the
+        // listener the caller was just handed a port for.
+        let _quic = quic;
         let mut conn = 0usize;
         while let Some(Ok(qc)) = incoming.next().await {
             // One task per connection: the sender dials a fresh session for
@@ -512,7 +534,7 @@ fn spawn_offer_peer(
             });
         }
     });
-    out
+    (port, out)
 }
 
 /// Poll `pb_chat_history` for one message's current status (any status), up to
@@ -2265,8 +2287,7 @@ async fn five_queued_files_start_one_transfer_not_five() {
     init_ffi(49914, dir.path());
 
     let peer_id = "stall-peer";
-    let peer_port: u16 = 49971;
-    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let (peer_port, offers) = spawn_offer_peer(dir.path(), peer_id, OfferPeer::Stall).await;
     let peer_json = json!({
         "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
     });
@@ -2364,8 +2385,7 @@ async fn a_file_at_the_head_of_the_queue_does_not_delay_a_text_message() {
     init_ffi(49915, dir.path());
 
     let peer_id = "slow-peer";
-    let peer_port: u16 = 49972;
-    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let (peer_port, offers) = spawn_offer_peer(dir.path(), peer_id, OfferPeer::Stall).await;
     let peer_json = json!({
         "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
     });
@@ -2424,8 +2444,7 @@ async fn a_declined_file_goes_terminal_and_never_re_offers() {
     init_ffi(49916, dir.path());
 
     let peer_id = "declining-peer";
-    let peer_port: u16 = 49973;
-    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Decline);
+    let (peer_port, offers) = spawn_offer_peer(dir.path(), peer_id, OfferPeer::Decline).await;
     let peer_json = json!({
         "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
     });
@@ -2519,8 +2538,7 @@ async fn three_refusals_go_terminal_but_an_unreachable_peer_never_does() {
 
     // ── (b) reachable, and refusing ─────────────────────────────────────────
     let peer_id = "refusing-peer";
-    let peer_port: u16 = 49975;
-    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Refuse);
+    let (peer_port, offers) = spawn_offer_peer(dir.path(), peer_id, OfferPeer::Refuse).await;
     let peer_json = json!({
         "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
     });
@@ -2801,8 +2819,7 @@ async fn chat_cancel_stops_a_transfer_that_is_already_moving() {
     init_ffi(49920, dir.path());
 
     let peer_id = "cancel-stall-peer";
-    let peer_port: u16 = 49980;
-    let offers = spawn_offer_peer(dir.path(), peer_id, peer_port, OfferPeer::Stall);
+    let (peer_port, offers) = spawn_offer_peer(dir.path(), peer_id, OfferPeer::Stall).await;
     let peer_json = json!({
         "id": peer_id, "name": peer_id, "addresses": ["127.0.0.1"], "port": peer_port,
     });

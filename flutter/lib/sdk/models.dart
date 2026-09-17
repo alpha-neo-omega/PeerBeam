@@ -429,11 +429,30 @@ class TrustedDevice {
     this.approved = false,
     this.permissions = const {},
     this.autoAccept = false,
+    this.expiresAt,
+    this.expired = false,
   });
 
   /// Whether this device is permitted `permission` (a [PeerBeamPermission]
   /// name).
   bool may(String permission) => permissions.contains(permission);
+
+  /// When a time-limited approval runs out, or null for an open-ended one.
+  ///
+  /// The engine has reported this all along; nothing on this side read it, so
+  /// `peerbeam trust approve alice --for 30m` was invisible in the app — and
+  /// once the window shut the row read "Seen once — not approved", which is
+  /// what an unapproved stranger reads. The user had approved it; the grant had
+  /// simply ended, and saying the first about the second describes a decision
+  /// they never made.
+  final DateTime? expiresAt;
+
+  /// Whether an approval that **was** given has since run out.
+  ///
+  /// Distinct from `!approved`, which is also true of a device nobody ever
+  /// approved. [approved] is the engine's *effective* answer, so an expired
+  /// grant reports false there and true here.
+  final bool expired;
 
   factory TrustedDevice.fromJson(Map<String, dynamic> j) => TrustedDevice(
     id: j['id'] as String? ?? '',
@@ -446,6 +465,8 @@ class TrustedDevice {
       ...?(j['permissions'] as List<dynamic>?)?.whereType<String>(),
     },
     autoAccept: j['auto_accept'] as bool? ?? false,
+    expiresAt: DateTime.tryParse(j['expires_at'] as String? ?? ''),
+    expired: j['expired'] as bool? ?? false,
   );
 }
 
@@ -876,10 +897,22 @@ class ChatConversation {
   /// 0. See [needsAttention].
   final int unreadHint;
 
+  /// Whether this device could read this thread's records at all.
+  ///
+  /// False only when the read failed. Without it a failed read and a thread
+  /// with no datable rows were the same absence, and the card said "No
+  /// messages to show" about a conversation nobody had managed to open — a
+  /// claim about the user's own history made by something that had not seen it.
+  ///
+  /// Defaults to true for an engine too old to report it: assuming a read
+  /// succeeded is the reading that changes nothing about what is displayed.
+  final bool readable;
+
   const ChatConversation({
     required this.peerId,
     required this.lastAt,
     required this.unreadHint,
+    this.readable = true,
   });
 
   /// Whether this thread is waiting on the user for a decision — the only
@@ -897,6 +930,7 @@ class ChatConversation {
         DateTime.tryParse(j['last_at'] as String? ?? '') ??
         DateTime.tryParse(j['last_timestamp'] as String? ?? ''),
     unreadHint: (j['unread_hint'] as num?)?.toInt() ?? 0,
+    readable: j['readable'] as bool? ?? true,
   );
 }
 

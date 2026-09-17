@@ -865,7 +865,13 @@ async fn send_file(
     let finish = |status: Status| {
         let _ = store.set_status(&target.id, &id, status);
         let _ = store.outbox_remove(&id);
-        staging.remove(&staged.staged_path);
+        if !staging.remove(&staged.staged_path) {
+            eprintln!(
+                "warning: the staged copy of this file could not be deleted \
+                 and its bytes are still on disk ({})",
+                staged.staged_path
+            );
+        }
     };
 
     let quic = Arc::new(QuicTransport::new().map_err(CliError::from)?);
@@ -1216,7 +1222,13 @@ async fn cancel(ctx: &Ctx, peer: String, id: String, path_override: Option<&str>
         .find(|e| e.message_id == id);
     if let Some(entry) = &queued {
         if let Some(staged) = &entry.file {
-            staging.remove(&staged.staged_path);
+            if !staging.remove(&staged.staged_path) {
+                eprintln!(
+                    "warning: the staged copy of this file could not be \
+                     deleted and its bytes are still on disk ({})",
+                    staged.staged_path
+                );
+            }
         }
         store
             .outbox_remove(&id)

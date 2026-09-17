@@ -647,4 +647,34 @@ void main() {
 
     expect(find.byType(ChatScreen), findsOneWidget);
   });
+  // A thread whose records the engine could not read came back with no date
+  // and no rows — exactly what a thread with no datable rows looks like — so
+  // the card said "No messages to show" about a conversation nobody had
+  // managed to open. The engine now reports which it is.
+  test('an unreadable thread is told apart from an empty one', () {
+    final unreadable = ChatConversation.fromJson(const {
+      'peer_id': 'pb-bob',
+      'unread_hint': 0,
+      'readable': false,
+    });
+    expect(unreadable.readable, isFalse);
+    expect(unreadable.lastAt, isNull);
+
+    final empty = ChatConversation.fromJson(const {
+      'peer_id': 'pb-carol',
+      'unread_hint': 0,
+      'readable': true,
+    });
+    expect(empty.readable, isTrue);
+  });
+
+  // An engine too old to say has not failed; assuming it read is the reading
+  // that changes nothing about what is displayed.
+  test('an engine that does not report readability is taken as readable', () {
+    final hit = ChatConversation.fromJson(const {
+      'peer_id': 'pb-bob',
+      'unread_hint': 0,
+    });
+    expect(hit.readable, isTrue);
+  });
 }

@@ -294,7 +294,14 @@ pub fn prune_conversation(
 ) -> Result<Pruned, ChatError> {
     let pruned = store.prune(peer, now)?;
     for path in &pruned.staged {
-        staging.remove(path);
+        // A disappearing-message window that leaves the bytes behind has not
+        // made the message disappear.
+        if !staging.remove(path) {
+            tracing::warn!(
+                path = %path,
+                "a disappeared message's staged bytes are still on disk"
+            );
+        }
     }
     Ok(pruned)
 }
