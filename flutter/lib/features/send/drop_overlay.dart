@@ -7,7 +7,24 @@ import '../../app/theme.dart';
 /// and scales in; a dashed, tinted target reads as a professional drop zone.
 class DropOverlay extends StatelessWidget {
   final bool active;
-  const DropOverlay({super.key, required this.active});
+
+  /// What releasing here will do.
+  ///
+  /// Parameterised because the two drop targets do different things and the
+  /// copy was written for only one of them. The Send flow **stages** files and
+  /// opens a sheet; a drop onto an open conversation **sends** them, straight
+  /// away, with no sheet and no confirmation. Promising to "stage your files"
+  /// over a conversation described the wrong act in the one place the
+  /// difference is irreversible.
+  final String title;
+  final String subtitle;
+
+  const DropOverlay({
+    super.key,
+    required this.active,
+    this.title = 'Drop to send',
+    this.subtitle = 'Release to stage your files',
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -42,14 +59,16 @@ class DropOverlay extends StatelessWidget {
                     _BouncingIcon(color: scheme.primary),
                     const SizedBox(height: 18),
                     Text(
-                      'Drop to send',
+                      title,
+                      textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.titleLarge?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      'Release to stage your files',
+                      subtitle,
+                      textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: scheme.onSurfaceVariant,
                       ),

@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:peerbeam/data/trust_repository.dart';
 import 'package:peerbeam/sdk/models.dart';
 import 'package:peerbeam/features/settings/settings_screen.dart';
 import 'package:peerbeam/state/app_scope.dart';
@@ -631,5 +632,57 @@ void main() {
       isNot(contains('pinned')),
       reason: 'a pinned-but-unapproved device is prompted for either way',
     );
+  });
+  // An empty list is what a device that has never trusted anyone looks like, so
+  // a failed read rendered as "No trusted devices yet" — a claim about who the
+  // user trusts, made by something that had failed to find out, on the screen
+  // they would come to to check.
+  test('a failed trust read is kept apart from an empty store', () async {
+    final fake = FakePeerBeam()..failing.add('trustList');
+    final repo = TrustRepository(api: fake);
+    addTearDown(repo.dispose);
+
+    await repo.refresh();
+    expect(repo.items, isEmpty);
+    expect(repo.loaded, isFalse);
+    expect(repo.error, isNotNull);
+  });
+
+  test('a read that came back empty reports no error', () async {
+    final repo = TrustRepository(api: FakePeerBeam());
+    addTearDown(repo.dispose);
+
+    await repo.refresh();
+    expect(repo.loaded, isTrue);
+    expect(repo.error, isNull);
+  });
+
+  // The engine has reported `expired` and `expires_at` all along and nothing
+  // here read them, so `trust approve alice --for 30m` was invisible while it
+  // held — and once the window shut the row read "Seen once — not approved",
+  // which is what an unapproved stranger reads. The user had approved it.
+  test('an expired approval is told apart from one never given', () {
+    final expired = TrustedDevice.fromJson(const {
+      'id': 'pb-bob',
+      'name': 'Bob',
+      'fingerprint': 'ab:cd',
+      'trusted_at': '2026-01-01T09:00:00Z',
+      'approved': false,
+      'expired': true,
+      'expires_at': '2026-01-01T09:30:00Z',
+    });
+    expect(expired.approved, isFalse);
+    expect(expired.expired, isTrue);
+    expect(expired.expiresAt, isNotNull);
+
+    final never = TrustedDevice.fromJson(const {
+      'id': 'pb-carol',
+      'name': 'Carol',
+      'fingerprint': 'ef:01',
+      'trusted_at': '2026-01-01T09:00:00Z',
+      'approved': false,
+    });
+    expect(never.expired, isFalse);
+    expect(never.expiresAt, isNull);
   });
 }

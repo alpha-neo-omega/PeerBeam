@@ -429,11 +429,30 @@ class TrustedDevice {
     this.approved = false,
     this.permissions = const {},
     this.autoAccept = false,
+    this.expiresAt,
+    this.expired = false,
   });
 
   /// Whether this device is permitted `permission` (a [PeerBeamPermission]
   /// name).
   bool may(String permission) => permissions.contains(permission);
+
+  /// When a time-limited approval runs out, or null for an open-ended one.
+  ///
+  /// The engine has reported this all along; nothing on this side read it, so
+  /// `peerbeam trust approve alice --for 30m` was invisible in the app — and
+  /// once the window shut the row read "Seen once — not approved", which is
+  /// what an unapproved stranger reads. The user had approved it; the grant had
+  /// simply ended, and saying the first about the second describes a decision
+  /// they never made.
+  final DateTime? expiresAt;
+
+  /// Whether an approval that **was** given has since run out.
+  ///
+  /// Distinct from `!approved`, which is also true of a device nobody ever
+  /// approved. [approved] is the engine's *effective* answer, so an expired
+  /// grant reports false there and true here.
+  final bool expired;
 
   factory TrustedDevice.fromJson(Map<String, dynamic> j) => TrustedDevice(
     id: j['id'] as String? ?? '',
@@ -446,6 +465,8 @@ class TrustedDevice {
       ...?(j['permissions'] as List<dynamic>?)?.whereType<String>(),
     },
     autoAccept: j['auto_accept'] as bool? ?? false,
+    expiresAt: DateTime.tryParse(j['expires_at'] as String? ?? ''),
+    expired: j['expired'] as bool? ?? false,
   );
 }
 

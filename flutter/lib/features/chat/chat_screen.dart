@@ -976,6 +976,10 @@ class _ChatScreenState extends State<ChatScreen> {
         peerId: widget.peerId,
         peer: peer,
         canSend: canSend,
+        refusal: chatRefused != null
+            ? 'You turned off Messages for $chatRefused, so files cannot be '
+                  'sent here. Turn it back on in Settings › Trusted devices.'
+            : null,
         child: SafeArea(
           child: ContentPane(
             child: Column(
@@ -2004,7 +2008,13 @@ class _FileBody extends StatelessWidget {
     ChatStatusValue.staging => 'Staging…',
     ChatStatusValue.transferring => m.isMine ? 'Sending…' : 'Receiving…',
     ChatStatusValue.sent => 'Sent',
-    ChatStatusValue.received => 'Received · tap to open',
+    // "tap to open" only where tapping opens something. The bubble's `onTap`
+    // is null unless the row has a path this device can actually reach, so on
+    // a received file whose copy is gone — the ordinary Android case, where the
+    // engine's copy is deleted once it has been published — the hint invited a
+    // tap that did nothing at all.
+    ChatStatusValue.received =>
+      _openablePath(m) != null ? 'Received · tap to open' : 'Received',
     ChatStatusValue.pendingApproval =>
       m.isMine ? 'Waiting for approval' : 'Wants to send you this',
     ChatStatusValue.declined => 'Declined',
@@ -2174,8 +2184,7 @@ Future<({int? seconds})?> _pickRetention(
                       'Deleted from this device after '
                       '${_windowLabel(current.seconds!)} — set outside this app',
                   selected: true,
-                  onTap: () =>
-                      Navigator.pop(ctx, (seconds: current.seconds)),
+                  onTap: () => Navigator.pop(ctx, (seconds: current.seconds)),
                 ),
               const Gap(AppSpace.xs),
             ],
