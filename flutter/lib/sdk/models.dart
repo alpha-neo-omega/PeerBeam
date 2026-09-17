@@ -876,10 +876,22 @@ class ChatConversation {
   /// 0. See [needsAttention].
   final int unreadHint;
 
+  /// Whether this device could read this thread's records at all.
+  ///
+  /// False only when the read failed. Without it a failed read and a thread
+  /// with no datable rows were the same absence, and the card said "No
+  /// messages to show" about a conversation nobody had managed to open — a
+  /// claim about the user's own history made by something that had not seen it.
+  ///
+  /// Defaults to true for an engine too old to report it: assuming a read
+  /// succeeded is the reading that changes nothing about what is displayed.
+  final bool readable;
+
   const ChatConversation({
     required this.peerId,
     required this.lastAt,
     required this.unreadHint,
+    this.readable = true,
   });
 
   /// Whether this thread is waiting on the user for a decision — the only
@@ -897,6 +909,7 @@ class ChatConversation {
         DateTime.tryParse(j['last_at'] as String? ?? '') ??
         DateTime.tryParse(j['last_timestamp'] as String? ?? ''),
     unreadHint: (j['unread_hint'] as num?)?.toInt() ?? 0,
+    readable: j['readable'] as bool? ?? true,
   );
 }
 

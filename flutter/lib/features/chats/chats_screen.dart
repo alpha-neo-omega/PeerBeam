@@ -809,6 +809,14 @@ class ConversationCard extends StatelessWidget {
                         // itself, rather than a fabricated date.
                         (_, final DateTime at) =>
                           'Last message ${formatAgo(at)}',
+                        // A thread this device could not read is not a thread
+                        // with nothing in it, and "No messages to show" is a
+                        // claim about the user's own history that a failed read
+                        // has no grounds to make. The thread is still listed —
+                        // dropping it would hide the conversation this list
+                        // exists to surface — it simply says what is true.
+                        _ when !conversation.readable =>
+                          'Could not read this conversation',
                         _ => 'No messages to show',
                       },
                       maxLines: 1,
