@@ -19,11 +19,13 @@ of any size with end-to-end encryption and resumable, integrity-checked
 transfers. A Rust engine does the work; a Flutter app and a first-class CLI are
 two frontends over the same core.
 
-> **Status: 🟢 Beta (v0.7.0).** PeerBeam is no longer only a file mover: it
+> **Status: 🟢 Beta (v0.12.0).** PeerBeam is no longer only a file mover: it
 > carries chat, clipboard, presence and pipes over the same authenticated
 > session, each as a negotiated channel. Engine, discovery, security, QUIC
 > transport, RouteManager, full FFI, Dart SDK, CLI and the Flutter app are
-> implemented and tested — **1135 Rust + 310 Flutter tests**, clippy/fmt clean.
+> implemented and tested — **1836 Rust + 797 Flutter tests**, with
+> `clippy -D warnings` and `flutter analyze` clean on Linux, Windows, macOS and
+> Android.
 > Networked `send`/`receive` work end to end over QUIC with mutual
 > authentication, **verified live on real hardware** (Android ↔ Linux,
 > byte-exact). Linux, Android and the CLI are build- and run-verified.
