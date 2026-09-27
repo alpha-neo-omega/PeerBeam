@@ -204,6 +204,14 @@ them is outside A1 and back in conflict with I4.
 3. **The response is inert.** A version string is displayed. No download, no
    install, no behaviour anywhere changes on the strength of what the server
    said. (I4 — "Forbids: … remote feature flags".)
+   *(Amended 2026-09-27 by [A3](#a3--downloading-a-release-the-user-asked-for-2026-09-27),
+   which permits one further request — a download of one release artifact, at a
+   person's request, verified against a project-signed checksum. The rest of
+   this condition stands unchanged and A3 restates it: nothing installs,
+   nothing executes, and no behaviour changes on the strength of what a server
+   said. In particular the artifact address stays compiled in; A3's condition 2
+   forbids taking it from the response, which is what keeps a served document
+   from choosing what lands on a user's disk.)*
 4. **Never a precondition.** Offline is a normal state for this app, not an
    error. Failure is quiet, nothing is gated on the result, and nothing nags.
    (I11 — "functions offline … never a precondition for use".)
@@ -301,6 +309,253 @@ A2 and back in conflict with I3 and the VISION non-goal.
 **Scope.** A2 covers peer-held group conversations and nothing else. It is not a
 precedent for feeds, public rooms, discovery of strangers, or any
 server-mediated feature; each of those remains refused by the same non-goal.
+
+### A3 — Downloading a release the user asked for (2026-09-27)
+
+**Invariant amended:** **A1's binding condition 3** — *"The response is inert. A
+version string is displayed. No download, no install, no behaviour anywhere
+changes on the strength of what the server said."* Because A1 states that all
+six of its conditions hold together and that a build dropping any one is "outside
+A1 and back in conflict with I4", amending condition 3 reopens **I4 — No
+mandatory cloud, no account, no tracking**. Also engages **A1's Scope clause** —
+*"It is not a precedent for any other outbound request; a second one needs its
+own amendment"* — of which this is the first invocation. Also narrows the
+permanent non-goal in [VISION.md](VISION.md) — *"Not a surveillance surface."* —
+further than A1 narrowed it.
+
+**The conflict.** Three documents refuse this, at three strengths:
+
+1. **A1 condition 3** forbids it in as many words: "No download, no install."
+   This is not a reading that can be argued around; it is the clause itself.
+2. **A1's Scope clause** requires a fresh amendment for any second outbound
+   request. Fetching an artifact is a second request, to a second origin
+   (`github.com`, where the assets live) with a second set of disclosures.
+3. **[SECURITY.md](SECURITY.md)** publishes, as a security claim about the
+   shipped build: *"A `Release` is a version string and a URL; nothing
+   downloads, installs or changes behaviour on the strength of what the server
+   said."* Shipping a downloader while that sentence stands would leave a
+   published security claim false — the same defect A1's own condition 6 was
+   written to prevent.
+
+There is a fourth consideration, which is not a refusal but is the real risk.
+Today the update check cannot send anyone anywhere: the download URL is compiled
+into the binary and the manifest's own URL field is deliberately ignored. A
+downloader turns a network response into something that writes bytes to the
+user's disk. That is a supply-chain path which does not currently exist in this
+project at all, and creating one deserves more care than the feature's size
+suggests.
+
+**Rationale for amending rather than refusing.** The argument that granted A1
+applies here with more force, not less. A1 reasoned that *"a user running a build
+with a known security fix missing is also a harm, and PeerBeam ships no
+auto-update."* A1 solved half of that: the user now learns a newer release
+exists. It left the other half exactly where it was — the user is handed a link
+to a page listing **twenty-four assets** and must choose correctly between
+`peerbeam-0.12.0-amd64.deb`, `peerbeam-0.12.0-arm64.deb`,
+`peerbeam-0.12.0-x86_64.rpm`, `peerbeam-0.12.0-aarch64.AppImage`,
+`peerbeam-0.12.0-linux-x64.tar.gz` and nineteen others. Choosing wrong is not an
+edge case; it is the ordinary outcome for anyone who does not already know their
+own architecture and packaging format. A told-but-stranded user is the state A1
+left behind, and it is not obviously better than an uninformed one.
+
+The decisive argument is that **this is safer than the status quo, not riskier.**
+A user who today follows the link and downloads in a browser gets *no integrity
+check whatsoever*. Nobody verifies `SHA256SUMS` by hand. A download that refuses
+to hand over bytes which do not match a signature the project made is strictly
+stronger than the thing it replaces. If A3 is refused, the browser path remains —
+and it remains unverified.
+
+What must **not** follow from this is auto-update. `CLAUDE.md` lists "Automatic
+updates (future)" among its user-experience goals, and that is a different
+feature with a different threat model: it requires the app to replace its own
+executable, which means elevation, silent execution of fetched code, and a
+rollback story. A3 is deliberately much smaller, and condition 4 exists to keep
+it that way. Approving A3 is not approving auto-update.
+
+**What A3 permits.** **One HTTPS GET of one release artifact, for the platform
+the app is running on, made only when a person asks for it, written to a
+location that person chose, and verified against a project-signed checksum
+before it is offered to them.** PeerBeam does not install it, execute it, or act
+on it in any other way.
+
+**Binding conditions.** All hold together; a build that drops any one of them is
+outside A3 and back in conflict with I4 and with A1.
+
+1. **Opt-in per use.** No download on launch, on a timer, on the heels of a
+   check, or as a side effect of anything else — and specifically no
+   "pre-fetching in the background so it is ready", which is the form this
+   always tries to take. One human action, one download. (I11 — "Forbids:
+   insecure defaults 'for convenience'".)
+
+2. **The artifact URL is compiled in, never served.** The manifest may say
+   *which version* is newest. It may not say *where to fetch anything*. The
+   artifact address is constructed in the app from a compiled-in host, the
+   version string, and the platform's known asset-name pattern. HTTP redirects
+   that leave the compiled-in host are refused rather than followed. A served
+   document must never be able to choose what gets written to a user's disk —
+   this is the property A1 protected by ignoring the manifest's URL field, and
+   it is the single most important line in this amendment.
+   *(Amended 2026-09-27 by [A4](#a4--a-compiled-in-allowlist-of-redirect-hosts-2026-09-27).
+   As written this clause was unsatisfiable: every GitHub release asset
+   redirects to a second host, so refusing any off-host redirect forbade
+   downloading from where the artifacts live. A4 replaces the single host with
+   an allowlist that is a literal in the binary. The property above is
+   unchanged — nothing served chooses a destination; a response can only move
+   the fetch between hosts the build already trusted.)*
+
+3. **Integrity is verified against a project signature before the file is
+   usable.** The release's `SHA256SUMS` must be signed with a key whose public
+   half is compiled into the binary; PeerBeam verifies the signature, then
+   verifies the artifact's digest against the signed list, before the file is
+   presented to the user as a download. A missing signature, a bad signature,
+   an absent entry, or a digest mismatch deletes the downloaded bytes and says
+   what happened. **There is no "unverified but probably fine" path, no
+   override, and no prompt offering one** — an integrity check a user can click
+   past is decoration. An unsigned checksum does not satisfy this condition:
+   fetched from the same origin as the artifact, it proves only that the file
+   arrived intact, which TLS already proved.
+
+4. **PeerBeam never installs, never executes, never elevates.** It writes one
+   file and stops. No replacing the running binary, no invoking an installer, no
+   privilege prompt, no restart-to-apply, no marking the file executable. The
+   user installs it exactly as they do today. (VISION — *"Not a remote-control
+   tool"*; and the boundary that separates A3 from auto-update.)
+
+5. **Never a precondition, and never a nag.** Offline stays an ordinary state.
+   A failed or refused download is quiet and costs nothing. Nothing in the app
+   is gated on having updated, no badge accumulates, and no dialog returns
+   uninvited. (I11 — "functions offline … never a precondition for use"; carries
+   A1 condition 4 forward unchanged.)
+
+6. **No identifiers, and the new disclosure is stated plainly.** The artifact
+   request carries what A1 condition 2 permits and nothing more: no device id,
+   no install id, no cookie, no query string, no header naming this build. It
+   does unavoidably disclose **which platform and architecture the user is on**,
+   because that is which file is being asked for, and it discloses it to a
+   second origin (the release host) that the check alone never contacted. That
+   is a real widening of what A1 permitted and it is recorded here rather than
+   left to be discovered in a later audit.
+
+7. **Reachable from the CLI, not GUI-only.** A `peerbeam download-update` or
+   equivalent, with the same verification and the same refusals. (I7 — "Every
+   capability is reachable headless through the engine and the CLI".)
+
+8. **The published security claim is amended in the same change.**
+   [SECURITY.md:738](SECURITY.md) states that "nothing downloads, installs or
+   changes behaviour on the strength of what the server said". That sentence
+   becomes false the moment this ships and is corrected in the commit that
+   lands the feature, not afterwards. (Follows A1 condition 6, which exists for
+   exactly this reason.)
+
+   [FINAL_SECURITY_REVIEW.md:82,88](FINAL_SECURITY_REVIEW.md) needs **no**
+   change: its claims are "no telemetry, no analytics" and "no telemetry
+   client, no beacon, nothing reporting usage", and a download a user asked for
+   is none of those. Checked rather than assumed, because A1 was granted partly
+   on the strength of noticing that its own feature falsified a certification
+   sentence there.
+
+**Approval:** granted by the repository owner, 2026-09-27.
+
+**Scope.** A3 covers fetching one release artifact at a user's request and
+nothing else. It is **not** a precedent for: automatic or background updates;
+installing, executing or replacing any binary; delta or patch downloads;
+downloading anything other than a release of PeerBeam itself; or any third
+outbound request, which would need its own amendment exactly as this one did.
+
+### A4 — A compiled-in allowlist of redirect hosts (2026-09-27)
+
+**Invariant amended:** **A3's binding condition 2**, whose text reads: *"HTTP
+redirects that leave the compiled-in host are refused rather than followed."*
+A3 states that all eight of its conditions hold together, so amending one
+reopens **I4 — No mandatory cloud, no account, no tracking**, exactly as
+amending A1's condition 3 did.
+
+**The conflict.** The clause is unsatisfiable against the place the artifacts
+actually live. A GitHub release asset answers `302` to a different host —
+verified against the live v0.12.0 release, where all four assets checked
+redirect to `release-assets.githubusercontent.com`. So the clause as written
+forbids downloading from GitHub at all.
+
+This is a defect in A3 rather than a discovery about GitHub. The condition was
+drafted without checking GitHub's redirect behaviour, and adopted with that
+error in it.
+
+**Why not simply host the files elsewhere.** That was tried first, and it is
+the honest alternative:
+
+* **Cloudflare R2** satisfies condition 2 unchanged and was the original plan.
+  It requires completing a subscription checkout, and the project would take on
+  a credential in CI, a storage quota, and a pruning chore. Rejected on cost
+  and on adding infrastructure to maintain.
+* **Cloudflare Pages** cannot hold the files: its per-file limit is 25 MiB and
+  the macOS DMG is 33.4 MiB.
+* **GitHub Pages** serves from one host and would satisfy condition 2, but the
+  artifacts must be committed to a repository, where git keeps them forever —
+  a 1 GB site limit against ~154 MiB a release, and manual pruning that never
+  fully reclaims the space.
+* **A machine of the maintainer's own** was tested end to end over Tailscale
+  with a real certificate, and works. It is not reachable by users, and making
+  it so would mean a public address, a domain, a certificate, and an uptime
+  commitment on a home connection.
+
+**Rationale for amending rather than refusing.** Condition 2 states its own
+purpose: *"A served document must never be able to choose what gets written to
+a user's disk — this is the property A1 protected by ignoring the manifest's
+URL field, and it is the single most important line in this amendment."*
+
+**An allowlist preserves that property exactly.** The set of acceptable hosts
+is a literal in the binary. Nothing served is consulted about where to go; a
+response can only move the fetch between destinations the build already
+trusted before it made the request. What changes is the size of that set, from
+one host to two — and the second is the host the first redirects to, operated
+by the same party, already trusted to serve the bytes.
+
+It is also worth being clear about which condition is load-bearing. **Condition
+3 — the signature — is what protects the user.** An attacker who could redirect
+the fetch still cannot produce an artifact that verifies. Host pinning is
+defence in depth against a party who has already lost, and A3's own text says
+the signature check is what "makes the other two links mean anything".
+
+**What A4 permits.** Following an HTTP redirect to a host named in an allowlist
+compiled into the binary, instead of only to the single host the request began
+at.
+
+**Binding conditions.** All hold together; a build that drops any one is
+outside A4 and back in conflict with A3 and I4.
+
+1. **The allowlist is a literal in source.** Not configuration, not an
+   environment variable, not read from any file, and never anything a server
+   said. A list that can be edited at runtime by whoever can write a config
+   file is not a pin.
+
+2. **It contains only hosts observed to be required**, and today that is
+   exactly two: `github.com`, where the request starts, and
+   `release-assets.githubusercontent.com`, where it is sent. A host is added by
+   a commit citing the redirect that required it — never pre-emptively, and
+   never a wildcard. `*.githubusercontent.com` would be a different and much
+   larger permission than this one.
+
+3. **Every hop is HTTPS.** A redirect that downgrades the scheme is refused
+   even when its host is on the list. (Already enforced; stated so that
+   loosening the host rule cannot be read as loosening this one.)
+
+4. **Hops are bounded**, and a redirect to a host not on the list is refused
+   with an error that says so distinctly — never folded into a generic network
+   failure. A user whose download was diverted and one who is offline must not
+   read the same message.
+
+5. **Everything else in A3 is unchanged.** The checksums and their signature
+   are still fetched first and the signature still verified before a single
+   artifact byte is requested; the artifact is still verified against the
+   signed digest before it is usable; there is still no override, no install,
+   no execution, and no elevation.
+
+**Approval:** granted by the repository owner, 2026-09-27.
+
+**Scope.** A4 covers the release download's redirect handling and nothing else.
+It is not a precedent for following redirects anywhere else, for trusting a
+host because it is adjacent to one already trusted, or for any wildcard. It
+does not widen what A3 permits to be fetched, only which hosts may serve it.
 
 <!--
 Future amendments must include:

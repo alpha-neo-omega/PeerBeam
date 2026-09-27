@@ -42,6 +42,10 @@
 //! rule that can be tested without a network and cannot silently drift from the
 //! generator that writes it.
 
+pub mod artifact;
+pub mod download;
+pub mod verify;
+
 use serde::Deserialize;
 
 /// The update manifest: a two-field JSON document the project's own site

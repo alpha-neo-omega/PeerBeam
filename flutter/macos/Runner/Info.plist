@@ -12,8 +12,17 @@
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<!-- Deliberately NOT $(PRODUCT_NAME). That stays lowercase so the bundle
+	     and binary are `peerbeam` (see Configs/AppInfo.xcconfig and the
+	     packaging script, which names the .app by it), but CFBundleName is
+	     what the menu bar, the Dock, Finder and the App menu's
+	     About/Hide/Quit items display. Taking it from PRODUCT_NAME is what
+	     made every one of those read "peerbeam" while the window title,
+	     the website and the other three platforms all said "PeerBeam". -->
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>PeerBeam</string>
+	<key>CFBundleDisplayName</key>
+	<string>PeerBeam</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

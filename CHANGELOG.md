@@ -6,6 +6,37 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **The tray icon is visible on Windows and macOS.** It was one pure-white
+  glyph, handed to both systems as ordinary pixels. On a Light-appearance macOS
+  menu bar and a Light-theme Windows taskbar — both defaults — that draws white
+  on white, so there was nothing to see. macOS now gets it as a *template*
+  image, which AppKit recolours for whichever appearance the menu bar is in;
+  Windows, which has no such concept, gets a second dark-glyph `.ico` chosen
+  from the system theme and re-chosen when the user switches theme. Linux is
+  unchanged: its common panels are dark and the existing glyph reads there,
+  which is exactly why this survived so long.
+- **macOS: the Dock icon brings a hidden window back.** Close-to-tray hides the
+  window with `orderOut:`, and AppKit will not order a hidden window back on
+  reopen by itself. Combined with the invisible menu-bar icon above, closing
+  the window left PeerBeam running with no window, no icon and no way back
+  short of killing the process. The two fixes are independent; either alone
+  would have been enough to avoid that.
+- **macOS: a left click on the menu-bar icon opens the menu**, as the platform
+  expects, instead of yanking the window forward. The code carried a comment
+  asserting the plugin already did this; it does not — `tray_manager` only
+  attaches the menu to the status item inside `popUpContextMenu`.
+- **macOS shows the app as "PeerBeam"** in the menu bar, the Dock, Finder and
+  the About/Hide/Quit items. All of them read the lowercase `peerbeam` from
+  `PRODUCT_NAME`, disagreeing with the window title, the website and the other
+  three platforms. The bundle and binary stay lowercase; only the displayed
+  names changed.
+- **macOS opens at 1280x720**, matching Windows and Linux, rather than the
+  800x600 inherited from the Flutter template. 800 points is below the shell's
+  medium breakpoint, so a first run on macOS landed in the collapsed icon-only
+  rail and looked like a different application. The window is now centred,
+  since 1280 wide is not certain to fit at the nib's hard-coded origin.
+
 ## [0.12.0] - 2026-09-17
 
 ### Added

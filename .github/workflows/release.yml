@@ -293,9 +293,27 @@ jobs:
             || echo "no existing release for $GITHUB_REF_NAME"
       # Plain `gh` instead of an action: upload errors are visible in the log
       # (softprops died twice with an opaque 'Too many retries').
+      # minisign signs the checksum list. apt rather than a third-party action:
+      # it is the upstream C implementation, in Ubuntu's own archive, and a
+      # signing step is the last place to introduce an unpinned dependency
+      # somebody else controls.
+      #
+      # Not gated on the secret being present. `sign-release.sh` warns and
+      # skips without a key, and an install that ran needlessly costs seconds,
+      # while a missing install the one time the key IS set would silently
+      # publish an unsigned release.
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Publish GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Unset in a fork or before the key exists; sign-release.sh handles
+          # both by publishing unsigned.
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # The public half, so the signature is checked back before it ships.
+          # Public by definition -- it is compiled into the app -- but read
+          # from the same place so the two cannot drift.
+          MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
         run: |
           set -x
           # Top-level files only: artifact dirs also carry build-debris
@@ -332,12 +350,17 @@ jobs:
           # already exists, which would publish artifacts with no checksums and
           # no error anybody sees until they look.
           #
-          # This is integrity, not authenticity. It lets someone confirm a
-          # download is not truncated or corrupted, and lets two people confirm
-          # they have the same bytes. It does NOT prove the bytes came from this
-          # project — the file sits beside the artifacts it describes, so
-          # whoever could replace one could replace both. That needs a signature
-          # over a key published elsewhere, which is a separate piece of work.
+          # Integrity on its own is not authenticity: this file sits beside the
+          # artifacts it describes, so whoever could replace one could replace
+          # both. The signing step below closes that when a key is configured,
+          # and `peerbeam-update` refuses any in-app download it cannot check
+          # against the signature (Amendment A3, condition 3).
+          #
+          # Without MINISIGN_SECRET_KEY the release still publishes, unsigned,
+          # exactly as every release has so far — a missing secret is not a
+          # reason to withhold six platforms' artifacts. The consequence is
+          # only that the app will not fetch it; the website download still
+          # works by hand.
           sums=/tmp/SHA256SUMS
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::no artifacts found to publish"
@@ -350,6 +373,15 @@ jobs:
           done | sort -k2 > "$sums"
           cat "$sums"
           files+=("$sums")
+          # Attached in the same `gh release create` below, for the reason the
+          # checksums are: a later step can fail after the release exists,
+          # which would publish checksums with no signature and no error
+          # anybody sees until a user's download is refused.
+          sig=$(scripts/sign-release.sh "$sums" "$GITHUB_REF_NAME" || true)
+          if [ -n "$sig" ]; then
+            files+=("$sig")
+            echo "signed: $sig"
+          fi
           # Hand-written notes when the tag carries them, generated notes when
           # it does not. This used to be an unconditional --notes-file, which
           # meant a tag without one failed the job *after* every platform had

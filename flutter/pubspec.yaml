@@ -137,8 +137,14 @@ flutter:
     # stretches a non-square one, and a real .ico because the Windows shell
     # will not take a PNG here. Sized 16-48: a tray never draws bigger, and
     # including 256 tripled the file for nothing.
+    #
+    # Two .ico files because the Windows notification area has no template
+    # image: it draws the pixels it is handed, so the light glyph disappears
+    # on a Light-theme taskbar. The PNG serves macOS in both appearances --
+    # there it is installed as a template and AppKit recolours it -- and Linux.
     - assets/brand/tray/peerbeam.png
     - assets/brand/tray/peerbeam.ico
+    - assets/brand/tray/peerbeam-dark.ico
 
   # Google Sans Flex (OFL, from Google Fonts) — bundled for offline use;
   # no runtime font fetching. See assets/fonts/README.md.
