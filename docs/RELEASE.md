@@ -18,6 +18,14 @@ Cross-building desktop installers is not supported — build each on its own OS.
 | `MACOS_TEAM_ID`, `MACOS_NOTARY_PROFILE` | notarytool credentials |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_PROPERTIES` | release keystore + key.properties |
 | `MINISIGN_SECRET_KEY` | signs `SHA256SUMS`, so the app can verify a download ([below](#signing-the-checksums-minisign)) |
+| `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | mirror artifacts to R2, where the app fetches from ([below](#where-the-app-downloads-from-r2)) |
+
+Repository **variables** (not secrets — these are public by nature):
+
+| Variable | Purpose |
+|---|---|
+| `MINISIGN_PUBLIC_KEY` | the signing key's public half, checked back against the signature before publishing |
+| `R2_BUCKET` | the R2 bucket artifacts are mirrored into |
 
 Never commit certs/keystores. Android `key.properties` + `*.jks` are git-ignored;
 use `android/key.properties.example` as a template.
@@ -131,6 +139,52 @@ hand from the website, which still works.
 If the secret key is lost or compromised, there is no revocation mechanism.
 Publish the new public key on the website and in the release notes, and treat
 the hand-download path as the recovery route.
+
+## Where the app downloads from (R2)
+
+`peerbeam download-update` fetches from an R2 bucket, not from the GitHub
+release, and the reason is mechanical rather than a preference.
+
+A GitHub release asset answers `302` to `release-assets.githubusercontent.com`
+— a different host from `github.com`. A3's second binding condition refuses a
+redirect that leaves the compiled-in host, because the whole point of compiling
+the host in is lost if the first response can send the client elsewhere. Serving
+the files from one origin the project controls keeps that condition literally
+true, instead of widening it to an allowlist of hosts.
+
+Cloudflare **Pages cannot host these**: its per-file limit is 25 MiB and the
+macOS DMG is 33.4 MiB. R2 has no such limit, and its free tier (10 GB, free
+egress) is far beyond a ~500 MiB release.
+
+**GitHub remains the source of record.** R2 is a copy, written after the
+release is published, keyed by version so that `<host>/<version>/<file>` is
+exactly the path `peerbeam-update` constructs.
+
+### Setting it up (once)
+
+1. Create an R2 bucket and enable public access. Note the public URL —
+   `https://pub-<hash>.r2.dev`, or a custom domain if you attach one.
+2. Create an API token with **Object Read & Write** on that bucket, and put it
+   in the `CLOUDFLARE_API_TOKEN` secret along with `CLOUDFLARE_ACCOUNT_ID`.
+3. Put the bucket name in the `R2_BUCKET` repository variable.
+4. Paste the public URL — scheme and host, **no trailing slash** — into
+   `ARTIFACT_HOST` in `rust/crates/peerbeam-update/src/download.rs`, and commit
+   it. Like the signing key, it is compiled in so that nothing served can
+   change it.
+
+Until step 4 is done, `ARTIFACT_HOST` is empty and every download refuses with
+"this build has no release download host compiled in". That is deliberate: a
+build that ships before the bucket exists declines rather than guessing.
+
+### What gets mirrored
+
+Every file attached to the release, re-downloaded from the release itself
+rather than re-globbed from the build artifacts — re-globbing risks mirroring a
+file the release does not carry, which `SHA256SUMS` would then not describe.
+
+The mirror step is `continue-on-error`. A release that exists without a mirror
+is strictly better than a tag with no release; the app declines to download it
+and the website link still works.
 
 ## Signing a macOS build locally
 `scripts/package-macos.sh` does codesign → DMG → notarize → staple. Run it on a

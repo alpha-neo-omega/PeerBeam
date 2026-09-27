@@ -419,3 +419,51 @@ jobs:
             while IFS= read -r line; do echo "::error::gh: ${line}"; done < /tmp/gh-err.txt
             exit 1
           fi
+      # Mirror the release to R2, which is where the app fetches from.
+      #
+      # Not a second home for convenience: a GitHub release asset answers 302
+      # to release-assets.githubusercontent.com, a different host, and A3's
+      # second condition refuses a redirect that leaves the compiled-in host.
+      # Serving from one origin the project controls keeps that condition
+      # literally true rather than negotiating it down to an allowlist.
+      #
+      # GitHub stays the source of record. This is a copy, keyed by version, so
+      # `<host>/<version>/<file>` is exactly what `peerbeam-update` builds.
+      #
+      # Skipped entirely without the token, like every other signing step here.
+      # The consequence is that the app declines to download that release and
+      # says so; the website link still works.
+      # No step-level `if:` on the bucket. A step's `if` is evaluated before
+      # its own `env:` block exists, so `env.R2_BUCKET` would read as empty
+      # there and skip the step unconditionally — the check belongs in the
+      # script, where the variable is actually set.
+      - name: Mirror release to R2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${R2_BUCKET:-}" ]; then
+            echo "::warning::CLOUDFLARE_API_TOKEN or R2_BUCKET unset — not mirroring to R2. The app will decline to download this release."
+            exit 0
+          fi
+          ver="${GITHUB_REF_NAME#v}"
+          # Re-derive the same list the release was built from, by asking the
+          # release itself. Re-globbing the artifacts directory would risk
+          # mirroring a file the release does not carry, and then SHA256SUMS
+          # would not describe it.
+          mkdir -p mirror && cd mirror
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber
+          for f in *; do
+            [ -f "$f" ] || continue
+            echo "r2: $ver/$f"
+            npx --yes wrangler@4 r2 object put "$R2_BUCKET/$ver/$f" \
+              --file "$f" --remote
+          done
+          echo "mirrored $(ls | wc -l) files to $R2_BUCKET/$ver/"
+        # Never fail the release over the mirror: the artifacts are published
+        # and downloadable from GitHub either way, and a release that exists
+        # with no mirror is strictly better than a tag with no release.
+        continue-on-error: true

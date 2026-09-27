@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 # parsing over the `rustls` already in the tree would put a bespoke,
 # unaudited network parser in a privacy-sensitive app to save a crate.
 # `default-features = false` keeps the default OpenSSL stack out.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 # Verification only. `minisign-verify` is the Ed25519 checking half of
 # minisign with no key generation and no signing code in it at all, so a
 # shipped PeerBeam cannot produce a signature even in principle -- the secret
@@ -24,6 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # `minisign` CLI, which is packaged everywhere and auditable by anyone.
 minisign-verify = "0.3"
 sha2 = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

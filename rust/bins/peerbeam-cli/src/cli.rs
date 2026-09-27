@@ -128,6 +128,19 @@ pub enum Command {
     /// downloads nothing and installs nothing. See amendment A1 in
     /// `docs/ARCHITECTURAL_INVARIANTS.md`.
     CheckUpdates,
+    /// Download the newest release for this machine, verified.
+    ///
+    /// Fetches the release artifact matching this build's platform, checks it
+    /// against the project's signed checksums, and writes it to disk. It does
+    /// **not** install it, run it, or replace the running PeerBeam -- what you
+    /// get is the file, to install exactly as you would one from the website.
+    ///
+    /// A download that cannot be verified is deleted rather than kept, and
+    /// there is no flag to skip the check. On Linux it refuses unless it can
+    /// establish which package format this copy was installed from, because
+    /// handing you the wrong one is worse than handing you nothing. See
+    /// amendment A3 in `docs/ARCHITECTURAL_INVARIANTS.md`.
+    DownloadUpdate(DownloadUpdateArgs),
     /// Measure crypto / transfer throughput.
     Benchmark(BenchmarkArgs),
     /// Show overall status.
@@ -1144,6 +1157,13 @@ pub enum ConfigAction {
     Set { key: String, value: String },
     /// Print the config file path.
     Path,
+}
+
+#[derive(Args)]
+pub struct DownloadUpdateArgs {
+    /// Where to put the file. Defaults to the current directory.
+    #[arg(long, value_name = "DIR")]
+    pub to: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]

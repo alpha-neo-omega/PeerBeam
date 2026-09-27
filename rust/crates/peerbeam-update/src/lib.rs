@@ -43,6 +43,7 @@
 //! generator that writes it.
 
 pub mod artifact;
+pub mod download;
 pub mod verify;
 
 use serde::Deserialize;
