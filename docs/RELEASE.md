@@ -17,6 +17,7 @@ Cross-building desktop installers is not supported — build each on its own OS.
 | `MACOS_SIGN_ID` | "Developer ID Application: …" identity |
 | `MACOS_TEAM_ID`, `MACOS_NOTARY_PROFILE` | notarytool credentials |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_PROPERTIES` | release keystore + key.properties |
+| `MINISIGN_SECRET_KEY` | signs `SHA256SUMS`, so the app can verify a download ([below](#signing-the-checksums-minisign)) |
 
 Never commit certs/keystores. Android `key.properties` + `*.jks` are git-ignored;
 use `android/key.properties.example` as a template.
@@ -54,10 +55,82 @@ artifacts with no checksums and no visible error.
 Names in it are basenames, so `sha256sum -c SHA256SUMS` works in whatever
 directory somebody downloaded into. `docs/GUIDE.md` documents the user side.
 
-It is **integrity, not authenticity**: the file sits beside the artifacts it
-describes, so whoever could swap one could swap both. It catches truncation and
-corruption, and lets two people confirm they hold the same bytes. Proving origin
-needs a signature over a key published elsewhere.
+On its own it is **integrity, not authenticity**: the file sits beside the
+artifacts it describes, so whoever could swap one could swap both. It catches
+truncation and corruption, and lets two people confirm they hold the same
+bytes. Proving *origin* is what the signature below adds.
+
+## Signing the checksums (minisign)
+
+`SHA256SUMS.minisig` is a [minisign](https://jedisct1.github.io/minisign/)
+signature over `SHA256SUMS`, written by `scripts/sign-release.sh` and attached
+in the same `gh release create` call for the same reason the checksums are.
+
+**Why it exists.** Amendment A3 in
+[ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#a3--downloading-a-release-the-user-asked-for-2026-09-27)
+permits PeerBeam to download a release a user asked for, and its third binding
+condition requires the bytes to be checked against a checksum list **this
+project signed**. `peerbeam-update` refuses any download it cannot verify, with
+no override and no "proceed anyway" — so an unsigned release is simply one the
+app will not fetch. The website download still works by hand, which is the
+situation today.
+
+A release with no key configured still publishes, unsigned. A missing secret is
+not a reason to withhold six platforms' artifacts.
+
+### Generating the key (once)
+
+```bash
+# -W: no password. See the custody note below for why.
+minisign -G -W -p peerbeam.pub -s peerbeam.key
+```
+
+Then:
+
+1. Put the **contents of `peerbeam.key`** in the `MINISIGN_SECRET_KEY`
+   repository *secret*.
+2. Put the **second line of `peerbeam.pub`** (the base64, not the comment) in
+   the `MINISIGN_PUBLIC_KEY` repository *variable* — the release checks its own
+   signature back against it before publishing, so a mis-pasted key fails the
+   release rather than every user's download.
+3. Paste the same base64 into `SIGNING_PUBLIC_KEY` in
+   `rust/crates/peerbeam-update/src/verify.rs` and commit it. **It belongs in
+   version control**: it is public, and committing it is what pins it. A key
+   read from configuration at runtime could be replaced by anyone who can write
+   that configuration, which defeats the point.
+4. Delete `peerbeam.key` from the machine that generated it, or keep it offline
+   — see below.
+
+### Custody
+
+The key is unencrypted, because a password-protected one cannot be used
+non-interactively and CI has nowhere to type it. The protection is therefore the
+secret store, not a passphrase. Two consequences worth accepting deliberately:
+
+- Anyone who can run a workflow on this repository can sign a release. Limit who
+  can, and prefer a protected environment on the release job.
+- If you would rather CI never hold the key, do not set the secret. Sign
+  locally instead — `MINISIGN_SECRET_KEY_FILE=/path/to/peerbeam.key
+  scripts/sign-release.sh dist/SHA256SUMS v0.13.0` — and upload the `.minisig`
+  to the release by hand. The script takes a password-protected key on that
+  path, since a person is there to type it.
+
+### Rotation
+
+`SIGNING_PUBLIC_KEY` is compiled in, so **every build trusts the key it shipped
+with**. Replacing the key does not reach installed builds: they go on trusting
+the old one and will refuse releases signed with the new one. That shows up as
+"this download could not be verified" and never as accepting something it
+should not — the failure is in the safe direction, but it is a failure.
+
+So rotation means: ship a release signed with the **old** key that carries the
+**new** public key compiled in, let it propagate, and only then switch signing
+to the new key. Anyone who skips that intermediate release must re-download by
+hand from the website, which still works.
+
+If the secret key is lost or compromised, there is no revocation mechanism.
+Publish the new public key on the website and in the release notes, and treat
+the hand-download path as the recovery route.
 
 ## Signing a macOS build locally
 `scripts/package-macos.sh` does codesign → DMG → notarize → staple. Run it on a

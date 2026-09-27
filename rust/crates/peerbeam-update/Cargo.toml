@@ -17,6 +17,13 @@ thiserror = { workspace = true }
 # unaudited network parser in a privacy-sensitive app to save a crate.
 # `default-features = false` keeps the default OpenSSL stack out.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Verification only. `minisign-verify` is the Ed25519 checking half of
+# minisign with no key generation and no signing code in it at all, so a
+# shipped PeerBeam cannot produce a signature even in principle -- the secret
+# key never comes near this binary. The release side uses the ordinary
+# `minisign` CLI, which is packaged everywhere and auditable by anyone.
+minisign-verify = "0.3"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
