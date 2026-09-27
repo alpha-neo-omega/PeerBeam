@@ -15,6 +15,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -33,7 +34,7 @@ const _kQuit = 'quit';
 /// A no-op everywhere but desktop, so callers need no platform check: on
 /// Android and in a widget test [start] returns without touching a plugin that
 /// is not there.
-class TrayService with TrayListener, WindowListener {
+class TrayService with TrayListener, WindowListener, WidgetsBindingObserver {
   final AppState state;
 
   /// Bring the window back and show it. Injected so a test can observe it
@@ -62,8 +63,11 @@ class TrayService with TrayListener, WindowListener {
     _started = true;
     trayManager.addListener(this);
     windowManager.addListener(this);
+    // Windows has to re-pick its icon when the user switches between the Light
+    // and Dark system themes — see `_applyIcon`.
+    WidgetsBinding.instance.addObserver(this);
 
-    await trayManager.setIcon(_iconPath);
+    await _applyIcon();
     await _render();
 
     // The menu is rebuilt from state, so it has to follow state. These are the
@@ -76,10 +80,74 @@ class TrayService with TrayListener, WindowListener {
     await _applyCloseBehaviour();
   }
 
-  /// The icon file, per platform. Windows will not accept a PNG here.
-  String get _iconPath => defaultTargetPlatform == TargetPlatform.windows
-      ? 'assets/brand/tray/peerbeam.ico'
-      : 'assets/brand/tray/peerbeam.png';
+  /// The icon file, per platform and — on Windows only — per system theme.
+  ///
+  /// Windows will not accept a PNG here, and its notification area has no
+  /// notion of a template image: whatever pixels it is given are the pixels it
+  /// draws. One glyph therefore cannot serve both themes, so there are two and
+  /// this picks between them. macOS and Linux take the PNG in either theme —
+  /// macOS because [isTemplateIconOn] lets AppKit recolour it, Linux because
+  /// the shipped glyph is the one its common panels already render correctly.
+  @visibleForTesting
+  static String iconPathFor(TargetPlatform platform, Brightness system) {
+    if (platform != TargetPlatform.windows) {
+      return 'assets/brand/tray/peerbeam.png';
+    }
+    return system == Brightness.dark
+        ? 'assets/brand/tray/peerbeam.ico' // light glyph, dark taskbar
+        : 'assets/brand/tray/peerbeam-dark.ico'; // dark glyph, light taskbar
+  }
+
+  /// Whether the icon is handed to the OS as a *template* image.
+  ///
+  /// macOS only. A template image is drawn from its alpha channel alone, so
+  /// AppKit inverts it to suit whichever appearance the menu bar is in. Handed
+  /// over without this, the glyph is drawn as the white pixels it actually
+  /// contains — invisible on a Light-appearance menu bar, which is the default.
+  @visibleForTesting
+  static bool isTemplateIconOn(TargetPlatform platform) =>
+      platform == TargetPlatform.macOS;
+
+  /// Whether a left click on the icon opens the menu rather than the window.
+  ///
+  /// macOS convention is that clicking a menu-bar item opens its menu; Windows
+  /// and most Linux desktops expect a left click to bring the app up and keep
+  /// the menu on the right button. `tray_manager` does not do this for us on
+  /// any platform: `setContextMenu` only stores the menu, and nothing attaches
+  /// it to the status item until `popUpContextMenu` is called.
+  @visibleForTesting
+  static bool leftClickOpensMenuOn(TargetPlatform platform) =>
+      platform == TargetPlatform.macOS;
+
+  /// The icon currently installed, so a theme change that does not change the
+  /// icon costs nothing.
+  String? _appliedIcon;
+
+  /// Install the icon for the current platform and system theme.
+  ///
+  /// Called once at [start] and again whenever the system theme changes. Only
+  /// Windows actually swaps files; elsewhere the path is constant and the
+  /// second call returns without touching the plugin.
+  Future<void> _applyIcon() async {
+    final path = iconPathFor(
+      defaultTargetPlatform,
+      WidgetsBinding.instance.platformDispatcher.platformBrightness,
+    );
+    if (path == _appliedIcon) return;
+    await trayManager.setIcon(
+      path,
+      isTemplate: isTemplateIconOn(defaultTargetPlatform),
+    );
+    _appliedIcon = path;
+  }
+
+  @override
+  void didChangePlatformBrightness() {
+    // Best-effort, and deliberately not awaited: this is a framework callback,
+    // and an icon that will not redraw is not worth an unhandled error. The
+    // old icon stays up, which is what happened before this existed at all.
+    unawaited(_applyIcon().catchError((_) {}));
+  }
 
   /// The shortest gap between two native menu rebuilds. Rebuilding per event
   /// is wasteful and visibly janky on Windows, where an open menu closes when
@@ -206,7 +274,12 @@ class TrayService with TrayListener, WindowListener {
   @override
   void onTrayIconMouseDown() {
     // Windows and most Linux desktops expect a left click to open the app;
-    // macOS expects it to open the menu, which the plugin does for us there.
+    // macOS expects it to open the menu. The plugin does neither on its own —
+    // see [leftClickOpensMenuOn].
+    if (leftClickOpensMenuOn(defaultTargetPlatform)) {
+      unawaited(trayManager.popUpContextMenu());
+      return;
+    }
     unawaited(_open());
   }
 
@@ -233,6 +306,7 @@ class TrayService with TrayListener, WindowListener {
     state.transfer.removeListener(_scheduleRender);
     state.device.removeListener(_scheduleRender);
     state.view.removeListener(_applyCloseBehaviour);
+    WidgetsBinding.instance.removeObserver(this);
     trayManager.removeListener(this);
     windowManager.removeListener(this);
     try {
