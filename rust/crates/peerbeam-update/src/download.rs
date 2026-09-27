@@ -72,6 +72,16 @@ pub enum DownloadError {
     #[error("this build has no release download host compiled in, so it cannot fetch anything")]
     NoHostCompiledIn,
 
+    /// The compiled-in host is not `https://`.
+    ///
+    /// A3 permits "one HTTPS GET of one release artifact". Plaintext would put
+    /// an installer on the wire for anyone on the path to replace -- and while
+    /// the signature would catch a substitution, it would not hide *which*
+    /// build a user is fetching from whoever is watching. Refused at the first
+    /// call rather than trusted to be set correctly.
+    #[error("the compiled-in release host is not https ({0}); A3 permits only an HTTPS fetch")]
+    InsecureHost(String),
+
     /// No artifact could be named for this machine — see [`ResolveError`].
     #[error(transparent)]
     Resolve(#[from] ResolveError),
@@ -122,6 +132,16 @@ pub struct Downloaded {
     pub bytes: u64,
 }
 
+/// Whether a URL is `https://`, case-insensitively.
+///
+/// Scheme comparison is ASCII-case-insensitive per RFC 3986, so `HTTPS://` is
+/// the same scheme. Nothing else is accepted: not `http`, and not a
+/// scheme-relative `//host` that would inherit whatever a caller assumed.
+fn is_https(url: &str) -> bool {
+    let url = url.trim();
+    url.len() > 8 && url[..8].eq_ignore_ascii_case("https://")
+}
+
 /// The host part of a URL, lowercased, or `None` if it has none.
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
@@ -143,6 +163,11 @@ fn host_of(url: &str) -> Option<String> {
 fn client_pinned_to(host: &str) -> Result<reqwest::Client, DownloadError> {
     let host = host.to_string();
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        // A same-host redirect that downgrades the scheme is still a
+        // downgrade, and `host_of` does not look at schemes.
+        if !is_https(attempt.url().as_str()) {
+            return attempt.stop();
+        }
         match host_of(attempt.url().as_str()) {
             // Same host: an ordinary redirect, and still bounded.
             Some(h) if h == host => {
@@ -222,6 +247,11 @@ where
 {
     if ARTIFACT_HOST.trim().is_empty() {
         return Err(DownloadError::NoHostCompiledIn);
+    }
+    if !is_https(ARTIFACT_HOST) {
+        return Err(DownloadError::InsecureHost(
+            ARTIFACT_HOST.trim().to_string(),
+        ));
     }
     let host = host_of(ARTIFACT_HOST).ok_or(DownloadError::NoHostCompiledIn)?;
     let client = client_pinned_to(&host)?;
@@ -401,6 +431,18 @@ mod tests {
             host_of("https://PUB-ABC.R2.DEV/x"),
             Some("pub-abc.r2.dev".into())
         );
+    }
+
+    #[test]
+    fn only_https_counts_as_https() {
+        assert!(is_https("https://pub-abc.r2.dev"));
+        assert!(is_https("HTTPS://pub-abc.r2.dev"));
+        assert!(!is_https("http://pub-abc.r2.dev"));
+        assert!(!is_https("//pub-abc.r2.dev"));
+        assert!(!is_https("https://"));
+        assert!(!is_https("ftp://pub-abc.r2.dev"));
+        // No sneaking it in later in the string.
+        assert!(!is_https("http://evil.example/?x=https://pub-abc.r2.dev"));
     }
 
     #[test]
