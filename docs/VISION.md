@@ -158,6 +158,38 @@ claim the shipped build makes false.
 
 **Approval:** granted by the repository owner, 2026-08-27.
 
+### A3 — A verified, user-asked-for release download (2026-09-27)
+
+**Non-goal narrowed:** *"Not a surveillance surface."* — further than A1
+narrowed it.
+
+**Date:** 2026-09-27.
+
+**Rationale.** A1 permitted the app to learn that a newer release exists. It
+left the user holding a link to a page of twenty-four assets, to choose between
+correctly on their own — which is the state a told-but-stranded user is in, and
+not obviously better than an uninformed one. A3 permits one further HTTPS GET,
+of one release artifact, for the platform the app is running on, made only when
+a person asks for it.
+
+It is permitted chiefly because it is **safer than the path it replaces**: a
+user who follows today's link and downloads in a browser gets no integrity
+check at all, since nobody verifies `SHA256SUMS` by hand. A3 refuses any byte
+that does not match a checksum the project signed. The second disclosure it
+adds is real and is recorded rather than glossed — asking for a file says which
+platform and architecture is asking, to an origin the check alone never
+contacted.
+
+What it is not is auto-update. PeerBeam writes one file and stops: no install,
+no execution, no elevation, no replacing the running binary. The full reasoning
+and the eight binding conditions are recorded once, in
+[ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#a3--downloading-a-release-the-user-asked-for-2026-09-27),
+against invariant I4 and against A1's own third condition; this entry exists
+because the amendment narrows this document too, and a non-goal that still read
+as absolute would be a published claim the shipped build makes false.
+
+**Approval:** granted by the repository owner, 2026-09-27.
+
 <!--
 Future amendments must include:
 - Date

@@ -167,6 +167,35 @@ the remainder.
   and carrying a per-device field for one discovery provider's opinion of a path
   route selection may not even have chosen.
 
+- **Download a release from inside the app** — constitutionally permitted as of
+  2026-09-27 by [Amendment A3](ARCHITECTURAL_INVARIANTS.md#a3--downloading-a-release-the-user-asked-for-2026-09-27),
+  and **blocked on release engineering, not on approval.** A3's third binding
+  condition requires the artifact to be verified against a checksum the project
+  *signed*, and nothing signs one today: `SHA256SUMS` ships with every release
+  but unsigned, which — fetched from the same origin as the artifact it
+  describes — proves only that the file arrived intact, a thing TLS already
+  proved. Three things are needed first, in order:
+
+  1. **A signing key.** Minisign-class; free, and *independent* of the
+     Authenticode and Apple Developer ID certificates the project lacks, so it
+     does not wait on them. The public half is compiled into the binary and is
+     therefore pinned for the life of every build that ships with it.
+  2. **A signing step in `release.yml`.** `SHA256SUMS` is already generated over
+     exactly the uploaded files (`.github/workflows/release.yml:341-352`); it
+     needs signing, and the signature uploading beside it.
+  3. **A key-rotation answer, written before the first key ships.** A pinned
+     public key means a lost or compromised secret strands every already-shipped
+     build. Deciding this afterwards is deciding it during an incident.
+
+  Two open questions the amendment deliberately left to implementation: custody
+  of the secret key (and whether CI may hold it at all), and whether the
+  download is offered on Windows and macOS while their artifacts are still
+  unsigned and un-notarized — a verified download there still hands over a file
+  the OS refuses to run without clearing quarantine or a SmartScreen warning.
+
+  Out of scope by A3's own terms: auto-update, installing, executing, delta
+  downloads. PeerBeam writes one file and stops.
+
 Explicitly **not** wanted, per the brainstorm and consistent with I4: cloud
 accounts, a central messaging server, social profiles, public user discovery,
 cloud storage.
