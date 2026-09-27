@@ -172,6 +172,27 @@ jobs:
       - name: Flutter pub get
         working-directory: flutter
         run: flutter pub get
+      # Analyze and test **on the OS itself**, not only on Linux.
+      #
+      # The `flutter` job above runs both on ubuntu, and this job already built
+      # the app here — but a build proves only that the code compiles, and none
+      # of what goes wrong on these two platforms is a compile error.
+      #
+      # Five defects reached v0.12.0 through this gap: a tray glyph that drew
+      # white on a white menu bar and a white taskbar, a Dock icon that could
+      # not bring back a window hidden into that invisible icon, a left click
+      # bound to the wrong action on macOS, an app that named itself
+      # "peerbeam", and a window opening below the shell's medium breakpoint.
+      # Every one is a rule about a platform the tests were not running on, and
+      # the tests that now assert them are worth nothing on Linux alone.
+      #
+      # Ordered before the build because it is the faster failure.
+      - name: Analyze
+        working-directory: flutter
+        run: flutter analyze
+      - name: Flutter tests
+        working-directory: flutter
+        run: flutter test
       - name: Build desktop app
         working-directory: flutter
         run: ${{ matrix.build }}
