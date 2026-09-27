@@ -18,14 +18,12 @@ Cross-building desktop installers is not supported — build each on its own OS.
 | `MACOS_TEAM_ID`, `MACOS_NOTARY_PROFILE` | notarytool credentials |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_PROPERTIES` | release keystore + key.properties |
 | `MINISIGN_SECRET_KEY` | signs `SHA256SUMS`, so the app can verify a download ([below](#signing-the-checksums-minisign)) |
-| `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | mirror artifacts to R2, where the app fetches from ([below](#where-the-app-downloads-from-r2)) |
 
 Repository **variables** (not secrets — these are public by nature):
 
 | Variable | Purpose |
 |---|---|
 | `MINISIGN_PUBLIC_KEY` | the signing key's public half, checked back against the signature before publishing |
-| `R2_BUCKET` | the R2 bucket artifacts are mirrored into |
 
 Never commit certs/keystores. Android `key.properties` + `*.jks` are git-ignored;
 use `android/key.properties.example` as a template.
@@ -140,51 +138,49 @@ If the secret key is lost or compromised, there is no revocation mechanism.
 Publish the new public key on the website and in the release notes, and treat
 the hand-download path as the recovery route.
 
-## Where the app downloads from (R2)
+## Where the app downloads from
 
-`peerbeam download-update` fetches from an R2 bucket, not from the GitHub
-release, and the reason is mechanical rather than a preference.
+`peerbeam download-update` fetches straight from the GitHub release — the same
+files the website links, at
+`https://github.com/alpha-neo-omega/PeerBeam/releases/download/v<version>/<file>`.
+There is no mirror, no bucket, and nothing extra to keep in sync.
 
-A GitHub release asset answers `302` to `release-assets.githubusercontent.com`
-— a different host from `github.com`. A3's second binding condition refuses a
-redirect that leaves the compiled-in host, because the whole point of compiling
-the host in is lost if the first response can send the client elsewhere. Serving
-the files from one origin the project controls keeps that condition literally
-true, instead of widening it to an allowlist of hosts.
+A GitHub release asset answers `302` to `release-assets.githubusercontent.com`,
+a second host. A3's condition 2 originally refused any redirect that left the
+compiled-in host, which made fetching from GitHub impossible;
+[A4](ARCHITECTURAL_INVARIANTS.md#a4--a-compiled-in-allowlist-of-redirect-hosts-2026-09-27)
+replaced the single host with a two-entry allowlist that is a literal in the
+binary. Nothing served chooses a destination: a response can only move the
+fetch between hosts the build already trusted.
 
-Cloudflare **Pages cannot host these**: its per-file limit is 25 MiB and the
-macOS DMG is 33.4 MiB. R2 has no such limit, and its free tier (10 GB, free
-egress) is far beyond a ~500 MiB release.
+**Self-hosting was examined and rejected**, and the reasoning is worth keeping
+because "just host it yourself" is the obvious suggestion:
 
-**GitHub remains the source of record.** R2 is a copy, written after the
-release is published, keyed by version so that `<host>/<version>/<file>` is
-exactly the path `peerbeam-update` constructs.
+| Option | Why not |
+|---|---|
+| Cloudflare R2 | Needs a subscription checkout, and adds a CI credential, a storage quota and a pruning chore |
+| Cloudflare Pages | 25 MiB per-file limit; the macOS DMG is 33.4 MiB |
+| GitHub Pages | Artifacts must be committed, and git keeps them forever against a 1 GB site limit |
+| A maintainer's own machine | Tested end to end over Tailscale with a real certificate; works, but is not reachable by users |
 
-### Setting it up (once)
+### If GitHub changes where assets are served
 
-1. Create an R2 bucket and enable public access. Note the public URL —
-   `https://pub-<hash>.r2.dev`, or a custom domain if you attach one.
-2. Create an API token with **Object Read & Write** on that bucket, and put it
-   in the `CLOUDFLARE_API_TOKEN` secret along with `CLOUDFLARE_ACCOUNT_ID`.
-3. Put the bucket name in the `R2_BUCKET` repository variable.
-4. Paste the public URL — scheme and host, **no trailing slash** — into
-   `ARTIFACT_HOST` in `rust/crates/peerbeam-update/src/download.rs`, and commit
-   it. Like the signing key, it is compiled in so that nothing served can
-   change it.
+Downloads refuse with "refusing a redirect to a host outside the allowlist"
+naming what was acceptable — loudly, and distinguishably from being offline.
+Add the new host to `REDIRECT_ALLOWLIST` in
+`rust/crates/peerbeam-update/src/download.rs`, in a commit citing the redirect
+that required it. A4 condition 2 forbids adding one pre-emptively, and forbids
+wildcards: `*.githubusercontent.com` would cover every user-uploaded file on
+the platform.
 
-Until step 4 is done, `ARTIFACT_HOST` is empty and every download refuses with
-"this build has no release download host compiled in". That is deliberate: a
-build that ships before the bucket exists declines rather than guessing.
+The live check that catches this:
 
-### What gets mirrored
+```bash
+cargo test -p peerbeam-update --test live_release -- --ignored
+```
 
-Every file attached to the release, re-downloaded from the release itself
-rather than re-globbed from the build artifacts — re-globbing risks mirroring a
-file the release does not carry, which `SHA256SUMS` would then not describe.
-
-The mirror step is `continue-on-error`. A release that exists without a mirror
-is strictly better than a tag with no release; the app declines to download it
-and the website link still works.
+Ignored by default because it needs the network; it fails with the new host
+named, which is the evidence a commit needs.
 
 ## Signing a macOS build locally
 `scripts/package-macos.sh` does codesign → DMG → notarize → staple. Run it on a

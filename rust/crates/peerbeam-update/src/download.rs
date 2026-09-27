@@ -41,29 +41,47 @@ use tokio::io::AsyncWriteExt;
 use crate::artifact::{self, ResolveError};
 use crate::verify::{self, VerifyError};
 
-/// Where release artifacts are served from, scheme and host, no trailing slash.
+/// Where release artifacts are served from: the project's own GitHub release
+/// download base, with no trailing slash.
 ///
-/// **Empty until the project's bucket exists**, and empty means every download
-/// refuses — the same fail-closed default as
-/// [`crate::verify::SIGNING_PUBLIC_KEY`], for the same reason: a build that
-/// ships before the infrastructure does must decline rather than guess.
+/// A release asset lives at `<this>/v<version>/<file>` — the tag carries a
+/// leading `v`, the file does not.
 ///
-/// # Why not GitHub
+/// # Why GitHub, and not somewhere the project runs
 ///
-/// The artifacts live on a GitHub release, and a GitHub release asset answers
-/// `302` to `release-assets.githubusercontent.com` — a different host. A3's
-/// second condition refuses a redirect that leaves the compiled-in host, so
-/// fetching from GitHub cannot satisfy it. Serving the files from one origin
-/// the project controls keeps the condition literally true instead of
-/// negotiating it down to an allowlist.
+/// Because it is already there, already free, and already serving these bytes.
+/// Self-hosting was examined and rejected: R2 needs a subscription and brings a
+/// credential, a quota and a pruning chore; Cloudflare Pages caps a file at
+/// 25 MiB against a 33.4 MiB DMG; GitHub Pages commits artifacts to a
+/// repository that keeps them forever. A4 records all of it.
 ///
-/// # Why one host, spelled out
+/// # Why this is not a hole
 ///
-/// Everything fetched is built from this constant. A served document cannot
-/// redirect a download anywhere, because nothing served is ever consulted about
-/// where to go — which is the property A1 established for the release check by
-/// ignoring the manifest's `url`, applied to bytes instead of a link.
-pub const ARTIFACT_HOST: &str = "";
+/// This constant is compiled in, so nothing served chooses it, and a response
+/// can only move the fetch between hosts in [`REDIRECT_ALLOWLIST`] — also
+/// compiled in. The property A3 condition 2 protects is that a served document
+/// never decides what lands on a user's disk, and that holds: the set of
+/// possible destinations is fixed before any request is made.
+pub const RELEASE_DOWNLOAD_BASE: &str =
+    "https://github.com/alpha-neo-omega/PeerBeam/releases/download";
+
+/// The only hosts a redirect may lead to.
+///
+/// A literal, per A4 condition 1: a list that could be edited at runtime by
+/// whoever can write a config file is not a pin.
+///
+/// Exactly the two observed to be required (A4 condition 2). `github.com` is
+/// where the request starts; every asset on the live v0.12.0 release answers
+/// `302` to `release-assets.githubusercontent.com`.
+/// `objects.githubusercontent.com` is deliberately absent — nothing observed
+/// needs it, and A4 forbids adding a host pre-emptively. No wildcard:
+/// `*.githubusercontent.com` would be a far larger permission, covering every
+/// user-uploaded file on the platform.
+///
+/// If GitHub ever serves assets from somewhere else, downloads refuse with
+/// [`DownloadError::RedirectedOffHost`] naming the host, and it is added here
+/// in a commit citing the redirect that required it.
+pub const REDIRECT_ALLOWLIST: &[&str] = &["github.com", "release-assets.githubusercontent.com"];
 
 /// What went wrong. Every variant means no file was produced.
 #[derive(Debug, thiserror::Error)]
@@ -100,14 +118,14 @@ pub enum DownloadError {
         why: String,
     },
 
-    /// A redirect pointed off [`ARTIFACT_HOST`].
+    /// A redirect pointed outside [`REDIRECT_ALLOWLIST`].
     ///
     /// Its own variant rather than folded into [`Self::Unreachable`] because
     /// it is the one failure that might be an attack rather than a bad day,
     /// and a person reading a log should be able to tell them apart.
-    #[error("refusing a redirect that leaves {host}")]
+    #[error("refusing a redirect to a host outside the allowlist ({host})")]
     RedirectedOffHost {
-        /// The host this build is willing to talk to.
+        /// The hosts this build is willing to talk to.
         host: String,
     },
 
@@ -155,13 +173,11 @@ fn host_of(url: &str) -> Option<String> {
     }
 }
 
-/// An HTTP client that will not follow a redirect off `host`.
+/// An HTTP client that will only follow redirects within [`REDIRECT_ALLOWLIST`].
 ///
-/// `reqwest`'s default follows up to ten redirects anywhere. A3 condition 2
-/// does not permit that: the point of compiling the host in is lost if the
-/// first response can send the client somewhere else.
-fn client_pinned_to(host: &str) -> Result<reqwest::Client, DownloadError> {
-    let host = host.to_string();
+/// `reqwest`'s default follows up to ten redirects anywhere. A4 permits a hop
+/// only to a host this build already trusted before it made the request.
+fn client_allowlisted() -> Result<reqwest::Client, DownloadError> {
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         // A same-host redirect that downgrades the scheme is still a
         // downgrade, and `host_of` does not look at schemes.
@@ -170,7 +186,7 @@ fn client_pinned_to(host: &str) -> Result<reqwest::Client, DownloadError> {
         }
         match host_of(attempt.url().as_str()) {
             // Same host: an ordinary redirect, and still bounded.
-            Some(h) if h == host => {
+            Some(h) if REDIRECT_ALLOWLIST.contains(&h.as_str()) => {
                 if attempt.previous().len() > 5 {
                     attempt.error("too many redirects")
                 } else {
@@ -218,7 +234,7 @@ async fn get_text(
 fn classify(e: reqwest::Error, what: &str) -> DownloadError {
     if e.is_redirect() {
         return DownloadError::RedirectedOffHost {
-            host: host_of(ARTIFACT_HOST).unwrap_or_else(|| ARTIFACT_HOST.to_string()),
+            host: REDIRECT_ALLOWLIST.join(", "),
         };
     }
     DownloadError::Unreachable {
@@ -245,23 +261,23 @@ pub async fn fetch<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
-    if ARTIFACT_HOST.trim().is_empty() {
+    if RELEASE_DOWNLOAD_BASE.trim().is_empty() {
         return Err(DownloadError::NoHostCompiledIn);
     }
-    if !is_https(ARTIFACT_HOST) {
+    if !is_https(RELEASE_DOWNLOAD_BASE) {
         return Err(DownloadError::InsecureHost(
-            ARTIFACT_HOST.trim().to_string(),
+            RELEASE_DOWNLOAD_BASE.trim().to_string(),
         ));
     }
-    let host = host_of(ARTIFACT_HOST).ok_or(DownloadError::NoHostCompiledIn)?;
-    let client = client_pinned_to(&host)?;
+    let client = client_allowlisted()?;
 
     // Resolving happens before anything is fetched: on a machine where the
     // package format cannot be established there is nothing to ask for, and
     // asking anyway would disclose the platform for no reason.
     let name = artifact::artifact_for_this_build(version)?;
     let v = version.trim().trim_start_matches('v');
-    let base = format!("{}/{}", ARTIFACT_HOST.trim_end_matches('/'), v);
+    // `v<version>` because that is the tag; the files inside carry no `v`.
+    let base = format!("{}/v{}", RELEASE_DOWNLOAD_BASE.trim_end_matches('/'), v);
 
     // Checksums and signature first, and both whole: they are kilobytes, and
     // fetching megabytes before knowing whether they can be checked wastes a
@@ -451,21 +467,50 @@ mod tests {
         assert_eq!(host_of("https://"), None);
     }
 
-    /// The shipped default refuses, so a build released before the bucket
-    /// exists cannot fetch from somewhere else instead.
-    #[tokio::test]
-    async fn without_a_compiled_in_host_nothing_downloads() {
-        if !ARTIFACT_HOST.trim().is_empty() {
-            return;
-        }
-        let dir = std::env::temp_dir().join("peerbeam-download-test-nohost");
-        let err = fetch("0.12.0", &dir, |_, _| {}).await.unwrap_err();
-        assert!(
-            matches!(err, DownloadError::NoHostCompiledIn),
-            "expected NoHostCompiledIn, got {err:?}"
+    /// The compiled-in base is a real https GitHub release URL.
+    #[test]
+    fn the_release_base_is_https_and_points_at_this_projects_releases() {
+        assert!(is_https(RELEASE_DOWNLOAD_BASE));
+        assert_eq!(
+            host_of(RELEASE_DOWNLOAD_BASE).as_deref(),
+            Some("github.com")
         );
-        // And it must not have created anything on the way to refusing.
-        assert!(!dir.exists(), "refusing must not create the directory");
+        assert!(RELEASE_DOWNLOAD_BASE.ends_with("/releases/download"));
+        assert!(!RELEASE_DOWNLOAD_BASE.ends_with('/'));
+    }
+
+    /// A4 condition 2: exactly the hosts observed to be required, no wildcard,
+    /// and the origin itself must be on the list or the first hop fails.
+    #[test]
+    fn the_allowlist_is_minimal_and_contains_the_origin() {
+        assert_eq!(
+            REDIRECT_ALLOWLIST,
+            &["github.com", "release-assets.githubusercontent.com"]
+        );
+        let origin = host_of(RELEASE_DOWNLOAD_BASE).expect("base has a host");
+        assert!(
+            REDIRECT_ALLOWLIST.contains(&origin.as_str()),
+            "the origin must be allowlisted or nothing can be fetched at all"
+        );
+        for h in REDIRECT_ALLOWLIST {
+            assert!(
+                !h.contains('*'),
+                "{h} is a wildcard; A4 condition 2 forbids it"
+            );
+            assert!(!h.is_empty());
+        }
+    }
+
+    /// A refused redirect names what was acceptable, so the message is
+    /// actionable rather than just a refusal.
+    #[test]
+    fn a_refused_redirect_names_the_allowlist() {
+        let e = DownloadError::RedirectedOffHost {
+            host: REDIRECT_ALLOWLIST.join(", "),
+        };
+        let m = e.to_string();
+        assert!(m.contains("github.com"));
+        assert!(m.contains("release-assets.githubusercontent.com"));
     }
 
     /// Every failure names what failed, so a log says which of the three
