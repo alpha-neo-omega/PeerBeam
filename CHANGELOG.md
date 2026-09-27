@@ -6,6 +6,29 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-27
+
+### Added
+- **Signed checksums.** `SHA256SUMS` has shipped with every release and only
+  ever proved a download was not corrupted — it sits beside the files it
+  describes, so whoever could replace one could replace both. It is now signed
+  with minisign and `SHA256SUMS.minisig` is attached alongside. Verify with
+  `minisign -Vm SHA256SUMS -P RWTGMEdNd5xF/JoeUsh7Y8S9ItJUd/MOzzDziVa53xMzW0EJuZIveB0D`.
+- **`peerbeam download-update`** fetches the release artifact for this platform,
+  verifies it against those signed checksums, and writes it to disk. It does not
+  install, execute, or replace the running binary. A download it cannot verify
+  is deleted rather than kept, and there is no flag to skip the check. On Linux
+  it refuses unless it can establish which package format was installed, because
+  handing someone the wrong one is worse than handing them nothing.
+
+  v0.12.1 is the first signed release, so there is nothing behind it to fetch
+  yet; the command becomes useful from the next release onward.
+- **Amendments A3 and A4** to `docs/ARCHITECTURAL_INVARIANTS.md`, permitting the
+  download and the redirect it requires. PeerBeam does not phone home, and every
+  exception is recorded before it is built rather than after.
+- **CI tests Flutter on Windows and macOS**, not only Linux. It already built
+  there; it never tested there, which is how the five defects below shipped.
+
 ### Fixed
 - **The tray icon is visible on Windows and macOS.** It was one pure-white
   glyph, handed to both systems as ordinary pixels. On a Light-appearance macOS
