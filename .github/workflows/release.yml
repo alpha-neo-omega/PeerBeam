@@ -450,12 +450,29 @@ jobs:
             exit 0
           fi
           ver="${GITHUB_REF_NAME#v}"
-          # Re-derive the same list the release was built from, by asking the
-          # release itself. Re-globbing the artifacts directory would risk
-          # mirroring a file the release does not carry, and then SHA256SUMS
-          # would not describe it.
+          # Only what `peerbeam-update` can actually fetch, not the whole
+          # release. The full set is ~500 MiB a release and would cross R2's
+          # 10 GB free tier in about twenty releases; this is ~154 MiB, which
+          # is nearer eighty. GitHub keeps the rest — R2 is a copy, not the
+          # source of record, and nothing but the in-app downloader reads it.
+          #
+          # Taken from the release itself rather than re-globbed from the build
+          # artifacts: re-globbing risks mirroring a file the release does not
+          # carry, which SHA256SUMS would then not describe.
+          #
+          # R2_MIRROR_PATTERNS — these must cover every name
+          # `peerbeam_update::artifact::asset_name` can produce. A test in that
+          # module reads this list back out of this file and fails if it does
+          # not, because a resolver naming a file the mirror never uploaded is
+          # a 404 handed to someone who was told an update exists.
+          patterns=( '*.deb' '*.rpm' '*.AppImage' '*-portable.zip' 'PeerBeam-*.dmg' 'SHA256SUMS' 'SHA256SUMS.minisig' )
           mkdir -p mirror && cd mirror
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber
+          for pat in "${patterns[@]}"; do
+            # A pattern matching nothing is not fatal: an arm64 leg may have
+            # failed and the release still publishes.
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$pat" --clobber || echo "::warning::no release asset matched $pat"
+          done
           for f in *; do
             [ -f "$f" ] || continue
             echo "r2: $ver/$f"

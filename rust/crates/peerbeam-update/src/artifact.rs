@@ -451,6 +451,118 @@ mod tests {
         assert_ne!(app, rpm);
     }
 
+    /// The R2 mirror uploads a subset of the release, chosen by glob patterns
+    /// in `.github/workflows/release.yml`. This module decides what the app
+    /// asks for. Those two lists are in different languages in different files
+    /// and nothing but this test connects them — and a resolver naming a file
+    /// the mirror never uploaded is a 404 handed to someone who was just told
+    /// an update exists.
+    ///
+    /// Reads the workflow rather than restating its patterns, so the test
+    /// fails when the workflow changes rather than when someone remembers to
+    /// update a copy of it here.
+    #[test]
+    fn the_r2_mirror_uploads_every_name_this_module_can_ask_for() {
+        let workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../.github/workflows/release.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", workflow.display()));
+
+        // The line is marked in the workflow precisely so this can find it.
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("patterns=("))
+            .expect("no `patterns=(` line in release.yml — did the mirror step change?");
+        let inner = line
+            .split_once('(')
+            .and_then(|(_, r)| r.rsplit_once(')'))
+            .map(|(m, _)| m)
+            .expect("malformed patterns=( ... ) line");
+        let patterns: Vec<&str> = inner
+            .split_whitespace()
+            .map(|p| p.trim_matches('\''))
+            .filter(|p| !p.is_empty())
+            .collect();
+        assert!(!patterns.is_empty(), "the mirror uploads nothing");
+
+        for name in PUBLISHED_BY_THIS_MODULE {
+            assert!(
+                patterns.iter().any(|p| glob_matches(p, name)),
+                "{name} is fetched by the app but no mirror pattern in release.yml matches it \
+                 (patterns: {patterns:?})"
+            );
+        }
+        // The verification inputs travel with the artifacts or nothing can be
+        // checked, and they are named exactly, not globbed.
+        for required in ["SHA256SUMS", "SHA256SUMS.minisig"] {
+            assert!(
+                patterns.iter().any(|p| glob_matches(p, required)),
+                "{required} is not mirrored, so no download could ever be verified"
+            );
+        }
+    }
+
+    /// Every name [`asset_name`] can produce, for a representative version.
+    const PUBLISHED_BY_THIS_MODULE: &[&str] = &[
+        "PeerBeam-0.12.0.dmg",
+        "peerbeam-0.12.0-windows-x64-portable.zip",
+        "peerbeam-0.12.0-windows-arm64-portable.zip",
+        "peerbeam-0.12.0-amd64.deb",
+        "peerbeam-0.12.0-arm64.deb",
+        "peerbeam-0.12.0-x86_64.rpm",
+        "peerbeam-0.12.0-aarch64.rpm",
+        "peerbeam-0.12.0-x86_64.AppImage",
+        "peerbeam-0.12.0-aarch64.AppImage",
+    ];
+
+    /// `*` matches any run of characters; everything else is literal. Enough
+    /// for the shell globs the workflow uses, and not a dependency.
+    fn glob_matches(pattern: &str, name: &str) -> bool {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        if parts.len() == 1 {
+            return pattern == name;
+        }
+        let mut rest = name;
+        // The first segment must sit at the start, the last at the end.
+        if let Some(first) = parts.first() {
+            match rest.strip_prefix(first) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        }
+        if let Some(last) = parts.last() {
+            if !rest.ends_with(last) || rest.len() < last.len() {
+                return false;
+            }
+            rest = &rest[..rest.len() - last.len()];
+        }
+        for mid in &parts[1..parts.len() - 1] {
+            match rest.find(mid) {
+                Some(i) => rest = &rest[i + mid.len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn the_glob_matcher_behaves() {
+        assert!(glob_matches("*.deb", "peerbeam-0.12.0-amd64.deb"));
+        assert!(!glob_matches("*.deb", "peerbeam-0.12.0-amd64.rpm"));
+        assert!(glob_matches("SHA256SUMS", "SHA256SUMS"));
+        assert!(!glob_matches("SHA256SUMS", "SHA256SUMS.minisig"));
+        assert!(glob_matches("PeerBeam-*.dmg", "PeerBeam-0.12.0.dmg"));
+        assert!(!glob_matches("PeerBeam-*.dmg", "peerbeam-0.12.0.dmg"));
+        assert!(glob_matches(
+            "*-portable.zip",
+            "peerbeam-0.12.0-windows-x64-portable.zip"
+        ));
+        assert!(!glob_matches(
+            "*-portable.zip",
+            "peerbeam-0.12.0-android.apk"
+        ));
+    }
+
     /// Whatever this machine is, resolving must either produce a published
     /// name or refuse with a reason — never panic, and never an empty string.
     #[test]
