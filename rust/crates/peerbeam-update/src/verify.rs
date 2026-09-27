@@ -78,7 +78,7 @@ use sha2::{Digest, Sha256};
 /// anything worse. That is the safe direction, and it is why rotation needs an
 /// answer written down before the first key ships rather than during an
 /// incident.
-pub const SIGNING_PUBLIC_KEY: &str = "";
+pub const SIGNING_PUBLIC_KEY: &str = "RWTGMEdNd5xF/JoeUsh7Y8S9ItJUd/MOzzDziVa53xMzW0EJuZIveB0D";
 
 /// Why a download was refused.
 ///
@@ -528,6 +528,23 @@ mod tests {
             ),
             Err(VerifyError::NotListed("peerbeam-0.12.0-arm64.deb".into()))
         );
+    }
+
+    /// The compiled-in key is a key.
+    ///
+    /// Pasted by hand from `peerbeam.pub`, and a character dropped in that
+    /// paste would otherwise surface as "could not be verified" at a user's
+    /// download, long after the release that baked it in. The release workflow
+    /// checks its own signature against MINISIGN_PUBLIC_KEY, but that is a
+    /// different copy of the same string: this asserts the one in the binary.
+    #[test]
+    fn the_compiled_in_key_parses_as_a_minisign_public_key() {
+        if SIGNING_PUBLIC_KEY.trim().is_empty() {
+            return; // Not set yet; `without_a_compiled_in_key_nothing_verifies` covers that.
+        }
+        minisign_verify::PublicKey::from_base64(SIGNING_PUBLIC_KEY.trim()).unwrap_or_else(|e| {
+            panic!("SIGNING_PUBLIC_KEY is not a valid minisign public key: {e}")
+        });
     }
 
     /// There must be no way to express "unverified but proceed".
