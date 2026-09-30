@@ -1483,6 +1483,10 @@ void main() {
       () async {
         final fake = FakePeerBeam();
         final repo = ChatRepository(api: fake);
+        // One instant and an offset, not two calls to DateTime.now(): on
+        // Windows those can return the same instant, and a thread orders equal
+        // instants by id, which puts `fr-1` ahead of `m1`.
+        final sent = DateTime.now();
 
         fake.emit(
           ChatReceived(
@@ -1491,7 +1495,7 @@ void main() {
               peerId: 'pb-bob',
               direction: 'in',
               body: 'here you go',
-              at: DateTime.now(),
+              at: sent,
               status: ChatStatusValue.received,
             ),
           ),
@@ -1503,7 +1507,7 @@ void main() {
               peerId: 'pb-bob',
               direction: 'in',
               body: '',
-              at: DateTime.now(),
+              at: sent.add(const Duration(milliseconds: 1)),
               status: ChatStatusValue.pendingApproval,
               kind: ChatMessageKind.file,
               fileName: 'a.bin',
