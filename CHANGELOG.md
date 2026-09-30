@@ -43,9 +43,7 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
   It now covers the download too: what it fetches and from where, the redirect
   list, the signature chain, what is kept and what is deleted, what the
-  requests disclose, and that it installs nothing. It also says plainly where
-  the code falls short. A redirect off the list is refused, but it is reported
-  as a failed signature rather than by naming the host.
+  requests disclose, and that it installs nothing.
 
   The same claim, either "the one request" or "nothing downloads", is corrected
   in `docs/FINAL_SECURITY_REVIEW.md`, `docs/ARCHITECTURE.md`,
@@ -57,6 +55,20 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   only the User-Agent to name the product and nothing a bare GET does not
   unavoidably carry. A test now checks that a redirected request carries
   exactly the headers the first one did.
+- **A download diverted off the redirect allowlist now says so.** The redirect
+  policy used to *stop* at a hop it refused, and the HTTP client hands a
+  stopped 3xx back as the response. So the redirect's own body was verified as
+  though it were the file, and a diverted download read as a bad signature.
+  Nothing was followed and nothing was kept, but the message was wrong. A4
+  condition 4 forbids that: a diverted download and a bad day must not read the
+  same. Now:
+  - a refused hop ends the fetch with an error naming the host it pointed at;
+  - a hop down to plain http says so;
+  - too many hops reads as a fetch that could not complete (exit `4`), not as
+    a diversion;
+  - a 3xx with no `Location` is no longer taken for the file.
+
+  `download-update` exits `5` for either refusal.
 
 ## [0.12.1] - 2026-09-27
 

@@ -109,7 +109,8 @@ pub enum DownloadError {
     #[error(transparent)]
     Unverified(#[from] VerifyError),
 
-    /// The request did not complete: offline, DNS, TLS, timeout, 404.
+    /// The request did not complete: offline, DNS, TLS, timeout, a 404, a
+    /// redirect loop, or a redirect with nowhere to go.
     #[error("could not fetch {what}: {why}")]
     Unreachable {
         /// Which file was being fetched.
@@ -121,11 +122,20 @@ pub enum DownloadError {
     /// A redirect pointed outside [`REDIRECT_ALLOWLIST`].
     ///
     /// Its own variant rather than folded into [`Self::Unreachable`] because
-    /// it is the one failure that might be an attack rather than a bad day,
-    /// and a person reading a log should be able to tell them apart.
-    #[error("refusing a redirect to a host outside the allowlist ({host})")]
+    /// it may be an attack rather than a bad day, and a person reading a log
+    /// should be able to tell them apart (A4 condition 4).
+    #[error("refusing a redirect to {host}, which is not on this build's allowlist")]
     RedirectedOffHost {
-        /// The hosts this build is willing to talk to.
+        /// The host the redirect pointed at.
+        host: String,
+    },
+
+    /// A redirect pointed at plain `http`, whatever the host (A4 condition 3).
+    /// Kept apart from [`Self::Unreachable`] for the same reason as
+    /// [`Self::RedirectedOffHost`].
+    #[error("refusing a redirect to plain http at {host}; every hop must be https")]
+    InsecureRedirect {
+        /// The host the redirect pointed at.
         host: String,
     },
 
@@ -189,22 +199,13 @@ fn client_allowlisted() -> Result<reqwest::Client, DownloadError> {
 /// Everything a download request carries, decided in one place so that a test
 /// can check exactly that.
 fn client_builder() -> reqwest::ClientBuilder {
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        // A same-host redirect that downgrades the scheme is still a
-        // downgrade, and `host_of` does not look at schemes.
-        if !is_https(attempt.url().as_str()) {
-            return attempt.stop();
-        }
-        match host_of(attempt.url().as_str()) {
-            // Same host: an ordinary redirect, and still bounded.
-            Some(h) if REDIRECT_ALLOWLIST.contains(&h.as_str()) => {
-                if attempt.previous().len() > 5 {
-                    attempt.error("too many redirects")
-                } else {
-                    attempt.follow()
-                }
-            }
-            _ => attempt.stop(),
+    // A refusal is an error, never a stop. `reqwest` hands a stopped 3xx back
+    // as the response, and the redirect's own body would then be verified as
+    // though it were the file.
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        match judge_redirect(attempt.url().as_str(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(refusal) => attempt.error(refusal),
         }
     });
     reqwest::Client::builder()
@@ -232,27 +233,122 @@ async fn get_text(
         .get(url)
         .send()
         .await
-        .map_err(|e| classify(e, what))?
-        .error_for_status()
-        .map_err(|e| DownloadError::Unreachable {
-            what: what.to_string(),
-            why: e.to_string(),
-        })?;
+        .map_err(|e| classify(e, what))?;
+    let res = the_file(res, what)?;
     res.text().await.map_err(|e| classify(e, what))
 }
 
-/// A redirect refused by the policy surfaces as an ordinary request error, so
-/// it is separated out here rather than reported as "offline".
+/// The most redirects one fetch will follow. GitHub uses one.
+const MAX_REDIRECTS: usize = 5;
+
+/// Why the redirect policy refused a hop.
+///
+/// The policy hands this to `reqwest` as the error for the request, and
+/// [`classify`] takes it back out, so what was refused survives the trip and
+/// is reported as itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectRefusal {
+    /// A host not on [`REDIRECT_ALLOWLIST`].
+    OffHost(String),
+    /// A hop that is not `https`.
+    Insecure(String),
+    /// More hops than [`MAX_REDIRECTS`].
+    TooMany,
+}
+
+impl std::fmt::Display for RedirectRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedirectRefusal::OffHost(host) => write!(f, "redirect to {host} refused"),
+            RedirectRefusal::Insecure(host) => write!(f, "redirect to http at {host} refused"),
+            RedirectRefusal::TooMany => write!(f, "more than {MAX_REDIRECTS} redirects"),
+        }
+    }
+}
+
+impl std::error::Error for RedirectRefusal {}
+
+impl RedirectRefusal {
+    /// The error a refused hop ends the fetch of `what` with.
+    fn into_error(self, what: &str) -> DownloadError {
+        match self {
+            RedirectRefusal::OffHost(host) => DownloadError::RedirectedOffHost { host },
+            RedirectRefusal::Insecure(host) => DownloadError::InsecureRedirect { host },
+            // Every host in the loop was one this build trusts, so this is not
+            // a diversion. It is a fetch that could not complete.
+            RedirectRefusal::TooMany => DownloadError::Unreachable {
+                what: what.to_string(),
+                why: format!(
+                    "more than {MAX_REDIRECTS} redirects, all between hosts on the allowlist"
+                ),
+            },
+        }
+    }
+}
+
+/// Whether to follow a redirect to `next`, with `requested` URLs already
+/// fetched in this chain, the first included.
+///
+/// Pure, so the rule is testable without a server. Where a hop leads is judged
+/// before how it gets there: a hop off the list is a diversion whatever its
+/// scheme. After that, every hop must be https (A4 condition 3), and the chain
+/// is bounded (condition 4).
+fn judge_redirect(next: &str, requested: usize) -> Result<(), RedirectRefusal> {
+    let host = host_of(next).unwrap_or_else(|| next.to_string());
+    if !REDIRECT_ALLOWLIST.contains(&host.as_str()) {
+        return Err(RedirectRefusal::OffHost(host));
+    }
+    if !is_https(next) {
+        return Err(RedirectRefusal::Insecure(host));
+    }
+    if requested > MAX_REDIRECTS {
+        return Err(RedirectRefusal::TooMany);
+    }
+    Ok(())
+}
+
+/// Turn a failed request into what went wrong.
+///
+/// A redirect the policy refused comes back from `reqwest` as an ordinary
+/// request error with the [`RedirectRefusal`] inside it. It is taken back out
+/// here so that the refusal is reported as itself, and never as being offline.
 fn classify(e: reqwest::Error, what: &str) -> DownloadError {
-    if e.is_redirect() {
-        return DownloadError::RedirectedOffHost {
-            host: REDIRECT_ALLOWLIST.join(", "),
-        };
+    let mut source = std::error::Error::source(&e);
+    while let Some(inner) = source {
+        if let Some(refusal) = inner.downcast_ref::<RedirectRefusal>() {
+            return refusal.clone().into_error(what);
+        }
+        source = inner.source();
     }
     DownloadError::Unreachable {
         what: what.to_string(),
         why: e.to_string(),
     }
+}
+
+/// The response, if it is the file that was asked for.
+///
+/// `error_for_status` passes a 3xx through. One that gets this far is a
+/// redirect the client did not follow because it had nowhere to go, and its
+/// body is not the file. Verifying that body anyway would report the release
+/// as tampered with when the server had only misbehaved.
+fn the_file(res: reqwest::Response, what: &str) -> Result<reqwest::Response, DownloadError> {
+    let res = res
+        .error_for_status()
+        .map_err(|e| DownloadError::Unreachable {
+            what: what.to_string(),
+            why: e.to_string(),
+        })?;
+    if !res.status().is_success() {
+        return Err(DownloadError::Unreachable {
+            what: what.to_string(),
+            why: format!(
+                "the server answered {} without saying where to go",
+                res.status()
+            ),
+        });
+    }
+    Ok(res)
 }
 
 /// Download the release `version`'s artifact for this machine into `dir`.
@@ -323,16 +419,12 @@ where
     let part = dir.join(format!("{name}.part"));
     let dest = dir.join(&name);
 
-    let mut res = client
+    let res = client
         .get(format!("{base}/{name}"))
         .send()
         .await
-        .map_err(|e| classify(e, &name))?
-        .error_for_status()
-        .map_err(|e| DownloadError::Unreachable {
-            what: name.clone(),
-            why: e.to_string(),
-        })?;
+        .map_err(|e| classify(e, &name))?;
+    let mut res = the_file(res, &name)?;
     let total = res.content_length();
 
     let outcome = stream_to(&part, &mut res, total, &mut progress).await;
@@ -513,16 +605,15 @@ mod tests {
         }
     }
 
-    /// A refused redirect names what was acceptable, so the message is
-    /// actionable rather than just a refusal.
+    /// A refused redirect names the host it would have gone to. That is the
+    /// evidence A4 condition 2 asks for before any host is added to the list.
     #[test]
-    fn a_refused_redirect_names_the_allowlist() {
-        let e = DownloadError::RedirectedOffHost {
-            host: REDIRECT_ALLOWLIST.join(", "),
-        };
-        let m = e.to_string();
-        assert!(m.contains("github.com"));
-        assert!(m.contains("release-assets.githubusercontent.com"));
+    fn a_refused_redirect_names_the_host_it_refused() {
+        let m = DownloadError::RedirectedOffHost {
+            host: "evil.example".into(),
+        }
+        .to_string();
+        assert!(m.contains("evil.example"), "{m}");
     }
 
     /// Every failure names what failed, so a log says which of the three
@@ -623,5 +714,162 @@ mod tests {
                 .map(|(_, v)| v.as_str());
             assert_eq!(agent, Some("PeerBeam"), "the {hop} request");
         }
+    }
+    // The redirect rule, decided without a network.
+
+    #[test]
+    fn an_allowlisted_https_hop_is_followed() {
+        for next in [
+            "https://github.com/alpha-neo-omega/PeerBeam/releases/download/v0.13.0/SHA256SUMS",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sig=x",
+            "HTTPS://GITHUB.COM/x",
+        ] {
+            assert_eq!(judge_redirect(next, 1), Ok(()), "{next}");
+        }
+    }
+
+    /// A4 condition 4: a hop off the list is refused, and the refusal names
+    /// the host. So a person can tell a diverted download from a bad day, and a
+    /// maintainer can see where GitHub has started sending people.
+    #[test]
+    fn a_hop_off_the_allowlist_is_refused_naming_the_host() {
+        for (next, host) in [
+            ("https://evil.example/SHA256SUMS", "evil.example"),
+            // A lookalike is another host.
+            (
+                "https://github.com.evil.example/x",
+                "github.com.evil.example",
+            ),
+            ("https://evilgithub.com/x", "evilgithub.com"),
+            // Adjacent to a trusted host is not trusted (A4's Scope).
+            (
+                "https://objects.githubusercontent.com/x",
+                "objects.githubusercontent.com",
+            ),
+            // Userinfo does not disguise where the request would go.
+            ("https://github.com@evil.example/x", "evil.example"),
+        ] {
+            assert_eq!(
+                judge_redirect(next, 1),
+                Err(RedirectRefusal::OffHost(host.into())),
+                "{next}"
+            );
+        }
+    }
+
+    /// A4 condition 3: every hop is https, even to a host on the list.
+    #[test]
+    fn a_hop_down_to_http_is_refused_even_to_an_allowlisted_host() {
+        assert_eq!(
+            judge_redirect("http://github.com/x", 1),
+            Err(RedirectRefusal::Insecure("github.com".into()))
+        );
+    }
+
+    /// A hop that breaks both rules is reported as the diversion. Where the
+    /// request was sent matters more than how.
+    #[test]
+    fn a_diversion_is_reported_before_a_downgrade() {
+        assert_eq!(
+            judge_redirect("http://evil.example/x", 1),
+            Err(RedirectRefusal::OffHost("evil.example".into()))
+        );
+    }
+
+    /// Hops are bounded (A4 condition 4): five redirects are followed, and a
+    /// sixth is not. `requested` counts every URL fetched in the chain so far,
+    /// the first one included.
+    #[test]
+    fn the_sixth_redirect_is_refused() {
+        assert_eq!(judge_redirect("https://github.com/x", 5), Ok(()));
+        assert_eq!(
+            judge_redirect("https://github.com/x", 6),
+            Err(RedirectRefusal::TooMany)
+        );
+    }
+
+    /// A loop between hosts that are both trusted is not an attack, and must
+    /// not read like one. It is a fetch that could not complete.
+    #[test]
+    fn too_many_redirects_is_unreachable_not_a_diversion() {
+        match RedirectRefusal::TooMany.into_error("the checksums") {
+            DownloadError::Unreachable { what, why } => {
+                assert_eq!(what, "the checksums");
+                assert!(why.contains("redirects"), "{why}");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    // The same rule, through the real client and a local server.
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// The production client, policy included, minus the environment's proxy,
+    /// so that a test run behind one still reaches the local server.
+    fn production_client() -> reqwest::Client {
+        client_builder().no_proxy().build().expect("client")
+    }
+
+    /// **A diverted fetch says where it was sent.** The policy used to *stop*
+    /// at a hop like this. `reqwest` hands a stopped 3xx back as the response,
+    /// so the redirect's own body was verified as though it were the file, and
+    /// the refusal read as a bad signature. It must name the host instead.
+    #[tokio::test]
+    async fn a_redirect_off_the_allowlist_is_refused_by_name() {
+        let (base, _) = one_request_server(redirect_to("https://evil.example/SHA256SUMS"));
+        let err = get_text(
+            &production_client(),
+            &format!("{base}/SHA256SUMS"),
+            "the checksums",
+        )
+        .await
+        .expect_err("a diverted fetch must not produce a body");
+        assert!(
+            matches!(err, DownloadError::RedirectedOffHost { ref host } if host == "evil.example"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_down_to_http_is_refused_by_name() {
+        let (base, _) = one_request_server(redirect_to("http://github.com/x"));
+        let err = get_text(
+            &production_client(),
+            &format!("{base}/SHA256SUMS"),
+            "the checksums",
+        )
+        .await
+        .expect_err("a downgraded fetch must not produce a body");
+        assert!(
+            matches!(err, DownloadError::InsecureRedirect { ref host } if host == "github.com"),
+            "{err:?}"
+        );
+    }
+
+    /// A redirect with no `Location` cannot be followed, and its body is not
+    /// the file either. Taking it for the file would report the release as
+    /// tampered with when the server had only misbehaved.
+    #[tokio::test]
+    async fn a_redirect_with_nowhere_to_go_is_not_taken_for_the_file() {
+        let (base, _) = one_request_server(
+            "HTTP/1.1 302 Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad".into(),
+        );
+        let err = get_text(
+            &production_client(),
+            &format!("{base}/SHA256SUMS"),
+            "the checksums",
+        )
+        .await
+        .expect_err("a 302 is not the checksums");
+        assert!(
+            matches!(err, DownloadError::Unreachable { ref why, .. } if why.contains("302")),
+            "{err:?}"
+        );
     }
 }

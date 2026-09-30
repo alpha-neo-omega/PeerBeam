@@ -259,6 +259,7 @@ fn exit_status(outcome: &DownloadOutcome) -> CliResult {
         )),
         DownloadError::Unverified(_)
         | DownloadError::RedirectedOffHost { .. }
+        | DownloadError::InsecureRedirect { .. }
         | DownloadError::InsecureHost(_) => {
             CliError::Integrity(format!("{why}; refused, and nothing was written"))
         }
@@ -428,6 +429,13 @@ mod tests {
                 "redirected off the allowlist",
                 refused(D::RedirectedOffHost {
                     host: "evil.example".into(),
+                }),
+                5,
+            ),
+            (
+                "redirected down to plain http",
+                refused(D::InsecureRedirect {
+                    host: "github.com".into(),
                 }),
                 5,
             ),

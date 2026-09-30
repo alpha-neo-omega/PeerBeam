@@ -801,11 +801,11 @@ anyone into a downgrade.
 redirect to `release-assets.githubusercontent.com`. A redirect is
 followed only to that host or to `github.com`, a two-entry list that is a
 literal in the binary with no wildcard (amendment A4). It is followed only over
-`https`, and at most five times. A redirect anywhere else, or down to plain
-`http`, is not followed. Today such a refusal is reported as a failed signature
-or digest check, not by naming the host: the redirect's own response is what
-gets checked, and it cannot pass. That falls short of A4's requirement that the
-refusal say so distinctly. The refusal itself does not depend on the message.
+`https`, and at most five times. A redirect anywhere else is refused with an
+error that names the host it pointed at. A redirect down to plain `http` is
+refused with an error that says so. In both cases the fetch stops before the
+other host is contacted, and neither refusal reads as being offline (A4
+condition 4). A redirect with nowhere to go is not taken for the file either.
 
 **Verified before it is kept.** Three files are fetched, in this order:
 `SHA256SUMS`, its minisign signature `SHA256SUMS.minisig`, and only then the
@@ -887,8 +887,11 @@ and a build that drops any one of them is back in conflict with I4.
     artifact byte are each refused.
   - Its `artifact` tests check every file name produced against the files a
     real release published.
-  - Its `download` tests pin the redirect allowlist, the https rule, and host
-    parsing. They also check that a redirected request carries no header the
+  - Its `download` tests pin the redirect rule: the allowlist, the https rule,
+    the hop bound, and host parsing, lookalikes included. Through the real
+    client and a local server, they check two more things. A diverted or
+    downgraded redirect is refused by name, and a redirect with nowhere to go
+    is not taken for the file. A redirected request also carries no header the
     first one did not.
   - `peerbeam-cli/tests/update_cli.rs` pins `download-update`'s exit codes
     without a network.
