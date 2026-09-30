@@ -25,5 +25,6 @@ pub mod session_transfer;
 pub mod spaces;
 pub mod transfers;
 mod trust;
+pub mod update;
 pub mod wake;
 pub mod watch;
