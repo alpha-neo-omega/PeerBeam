@@ -81,13 +81,18 @@ sensitive data" requirement.
 Settings and trust are stored under the platform app dir / FFI-provided base
 path; no cloud, no telemetry, no analytics. ✓
 
-**One outbound request exists, and it is not telemetry.** Under amendment A1
+**Two outbound requests exist, and neither is telemetry.** Under amendment A1
 ([ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments)) the app
 can check for a newer release — **only** when a person asks, off by default,
 carrying no identifier, and acting on the answer in no way beyond showing it.
+Under amendments A3 and A4, `peerbeam download-update` can then fetch that
+release, again only when a person asks. It keeps the file only if it verifies
+against the project's signed checksums, and it installs and runs nothing (see
+[Security](SECURITY.md#downloading-a-release)).
 There is still no telemetry client, no beacon, and nothing reporting usage. A
-build that checks on its own, or that acts on what the server says, is outside
-A1.
+build that checks or downloads on its own, that lets a served document choose
+what is fetched, or that installs or runs what it fetched, is outside those
+amendments.
 
 ## Dependency vulnerabilities
 

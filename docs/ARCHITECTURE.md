@@ -73,7 +73,7 @@ that's its job as the composition root.
 | `peerbeam-spaces` | Adapter | Named local sets of trusted devices over `AppStore` + `TrustStore`. Nothing goes on the wire — a fan-out is N ordinary 1:1 sends. |
 | `peerbeam-wake` | Adapter | Wake-on-LAN: the magic packet, the remembered MAC, and the approval gate. Local broadcast domain only. |
 | `peerbeam-clipboard-mem` | Adapter | In-memory `ClipboardProvider`. |
-| `peerbeam-update` | Utility | One HTTPS GET, only when a person asks, answering whether a newer release exists (amendment A1). Nothing downloads. |
+| `peerbeam-update` | Utility | The release check: one HTTPS GET, only when a person asks, answering whether a newer release exists (amendment A1). And the release download `peerbeam download-update` asks for: this platform's artifact, kept only if it verifies against the project's signed checksums, never installed or run (A3, A4). |
 | `bins/peerbeam-cli` | Frontend | `peerbeam` command-line tool. |
 
 ## Ports (the seams)

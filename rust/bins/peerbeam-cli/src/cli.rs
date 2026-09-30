@@ -122,11 +122,11 @@ pub enum Command {
     Doctor,
     /// Ask whether a newer release exists.
     ///
-    /// **The only outbound request PeerBeam makes to anyone but a peer**, and
-    /// it happens because you ran this — never on a timer, never at startup.
-    /// It sends no device id, no install id, and nothing identifying; it
-    /// downloads nothing and installs nothing. See amendment A1 in
-    /// `docs/ARCHITECTURAL_INVARIANTS.md`.
+    /// **One of only two requests PeerBeam makes to anything that is not a
+    /// peer.** The other is `download-update`. Neither happens unless you run
+    /// it: never on a timer, never at startup. This one sends no device id, no
+    /// install id, and nothing identifying, and it downloads and installs
+    /// nothing. See amendment A1 in `docs/ARCHITECTURAL_INVARIANTS.md`.
     CheckUpdates,
     /// Download the newest release for this machine, verified.
     ///

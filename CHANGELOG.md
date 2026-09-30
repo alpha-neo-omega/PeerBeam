@@ -33,6 +33,31 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   event now always carries `ok`, `downloaded`, `current` and `latest`. When no
   release was published, `--json` used to print a line of plain text instead.
 
+### Fixed
+- **`docs/SECURITY.md` no longer says that nothing downloads.** Amendment A3's
+  eighth condition required that sentence to be corrected in the change that
+  shipped `peerbeam download-update`, and v0.12.1 shipped without the
+  correction. The published security document still called the release check
+  the one request PeerBeam makes to anything that is not a peer, and never
+  mentioned the download.
+
+  It now covers the download too: what it fetches and from where, the redirect
+  list, the signature chain, what is kept and what is deleted, what the
+  requests disclose, and that it installs nothing. It also says plainly where
+  the code falls short. A redirect off the list is refused, but it is reported
+  as a failed signature rather than by naming the host.
+
+  The same claim, either "the one request" or "nothing downloads", is corrected
+  in `docs/FINAL_SECURITY_REVIEW.md`, `docs/ARCHITECTURE.md`,
+  `peerbeam check-updates --help` and the `peerbeam-update` crate docs.
+- **A download's redirected request no longer sends a `Referer`.** The HTTP
+  client adds one to every redirect it follows by default. On the hop to
+  `release-assets.githubusercontent.com` it named the GitHub URL it came from,
+  and so the product. A1 condition 2, which A3 carries to the download, allows
+  only the User-Agent to name the product and nothing a bare GET does not
+  unavoidably carry. A test now checks that a redirected request carries
+  exactly the headers the first one did.
+
 ## [0.12.1] - 2026-09-27
 
 ### Added

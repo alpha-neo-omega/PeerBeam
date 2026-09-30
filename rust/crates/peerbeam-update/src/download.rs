@@ -11,11 +11,11 @@
 //!   startup, or on the heels of a check. There is no constructor that starts
 //!   anything and no background pre-fetch; a download happens because someone
 //!   called [`fetch`].
-//! * **Condition 2 — the URL is compiled in, never served.** [`ARTIFACT_HOST`]
-//!   is a constant, the path is built from the version and
-//!   [`crate::artifact`]'s naming rules, and a redirect that leaves the host is
-//!   refused rather than followed. Nothing read from the network chooses where
-//!   any byte comes from.
+//! * **Condition 2 — the URL is compiled in, never served.**
+//!   [`RELEASE_DOWNLOAD_BASE`] is a constant, and the path is built from the
+//!   version and [`crate::artifact`]'s naming rules. A redirect is followed
+//!   only to a host in [`REDIRECT_ALLOWLIST`], which is also compiled in (A4).
+//!   Nothing read from the network chooses where any byte comes from.
 //! * **Condition 3 — verified before it is usable.** The bytes land in a
 //!   temporary file, and that file is only ever renamed into place after the
 //!   signature over `SHA256SUMS` and the artifact's own digest both check out.
@@ -178,6 +178,17 @@ fn host_of(url: &str) -> Option<String> {
 /// `reqwest`'s default follows up to ten redirects anywhere. A4 permits a hop
 /// only to a host this build already trusted before it made the request.
 fn client_allowlisted() -> Result<reqwest::Client, DownloadError> {
+    client_builder()
+        .build()
+        .map_err(|e| DownloadError::Unreachable {
+            what: "the download client".to_string(),
+            why: e.to_string(),
+        })
+}
+
+/// Everything a download request carries, decided in one place so that a test
+/// can check exactly that.
+fn client_builder() -> reqwest::ClientBuilder {
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         // A same-host redirect that downgrades the scheme is still a
         // downgrade, and `host_of` does not look at schemes.
@@ -202,12 +213,13 @@ fn client_allowlisted() -> Result<reqwest::Client, DownloadError> {
         // A3 condition 6.
         .user_agent("PeerBeam")
         .redirect(policy)
+        // `reqwest` adds a `Referer` to every redirect it follows, naming the
+        // URL it came from. A1 condition 2, carried to the download by A3
+        // condition 6, lets nothing travel that a bare GET does not
+        // unavoidably carry, and the User-Agent is the only header that may
+        // name the product.
+        .referer(false)
         .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| DownloadError::Unreachable {
-            what: "the download client".to_string(),
-            why: e.to_string(),
-        })
 }
 
 /// Fetch a small text file whole. Used for the checksums and the signature.
@@ -526,5 +538,90 @@ mod tests {
             host: "pub-abc.r2.dev".into(),
         };
         assert!(e.to_string().contains("pub-abc.r2.dev"));
+    }
+    /// A one-request HTTP/1.1 server on localhost. It records the request's
+    /// headers, answers with `response`, and hangs up.
+    fn one_request_server(
+        response: String,
+    ) -> (String, std::sync::mpsc::Receiver<Vec<(String, String)>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match conn.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let headers = String::from_utf8_lossy(&head)
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            let _ = tx.send(headers);
+            let _ = conn.write_all(response.as_bytes());
+        });
+        (base, rx)
+    }
+
+    fn header_names(headers: &[(String, String)]) -> Vec<&str> {
+        let mut names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// **A redirected request carries nothing the first one did not.** A1
+    /// condition 2, which A3 condition 6 carries over to the download, allows
+    /// nothing beyond what a bare GET unavoidably discloses. The User-Agent is
+    /// the only header that names the product. `reqwest` adds a `Referer` to
+    /// every redirect it follows, and that header would name the release URL
+    /// the redirect came from.
+    ///
+    /// The client here is the real one with a single change. Its policy is
+    /// swapped for one that follows a hop between two local servers, a hop the
+    /// real allowlist rightly refuses. Everything the request carries still
+    /// comes from [`client_builder`].
+    #[tokio::test]
+    async fn a_redirected_request_carries_only_what_the_first_one_did() {
+        let (second, second_seen) = one_request_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+        );
+        let (first, first_seen) = one_request_server(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {second}/SHA256SUMS\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let client = client_builder()
+            .redirect(reqwest::redirect::Policy::limited(1))
+            .no_proxy()
+            .build()
+            .expect("client");
+
+        let body = get_text(&client, &format!("{first}/SHA256SUMS"), "the checksums")
+            .await
+            .expect("the local redirect is followed");
+        assert_eq!(body, "ok");
+
+        let first = first_seen.recv().expect("the first request");
+        let second = second_seen.recv().expect("the redirected request");
+        for (hop, headers) in [("first", &first), ("redirected", &second)] {
+            assert_eq!(
+                header_names(headers),
+                ["accept", "host", "user-agent"],
+                "the {hop} request carried {headers:?}"
+            );
+            let agent = headers
+                .iter()
+                .find(|(k, _)| k == "user-agent")
+                .map(|(_, v)| v.as_str());
+            assert_eq!(agent, Some("PeerBeam"), "the {hop} request");
+        }
     }
 }
