@@ -6,6 +6,33 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Fixed
+- **A signing key that does not work now stops the release, before anything
+  is deleted.** v0.12.1 was published without `SHA256SUMS.minisig` while the
+  workflow reported success: the secret held only the base64 line of the key
+  file, minisign could not load it, and the failure was swallowed — on
+  purpose, because signing ran *after* the step that deletes an existing
+  release, and failing there has destroyed good releases before. The file
+  list, `SHA256SUMS` and its signature are now all produced ahead of that
+  step, so a key that is configured but unusable fails the job with the
+  previous release untouched, and re-running it once the secret is fixed is
+  safe. A key that is not configured at all still publishes unsigned, with a
+  warning, as a fork does. Two other failures that used to strike after the
+  delete now strike before it: a run with no artifacts, and two artifacts
+  sharing a file name.
+- **`scripts/sign-release.sh` no longer skips signing when it has a key but no
+  `minisign`.** It looked for the binary before looking for a key, so "no key"
+  and "a key, and nothing to sign with" were the same warning and the same
+  success. With a key configured, a missing `minisign` is now an error.
+
+### Added
+- **The release job is tested.** `scripts/test-release-workflow.sh` runs its
+  steps, read out of `release.yml`, against fake artifacts with `gh` faked
+  out, and checks what would have been published for no key, a good key and
+  three kinds of bad one. CI runs it on every push. The job runs once per tag
+  and cannot be tried without publishing, so until now every defect in it was
+  found in production.
+
 ## [0.12.1] - 2026-09-27
 
 ### Added
