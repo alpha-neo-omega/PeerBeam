@@ -433,6 +433,98 @@ async fn frames_are_ordered_per_channel_and_isolated() {
     );
 }
 
+/// A [`Recorder`] that takes its time over the first frame, holding its
+/// channel's actor busy while the rest of the session carries on.
+struct SlowFirst {
+    log: Log,
+    delay: Duration,
+}
+
+#[async_trait]
+impl MessageHandler for SlowFirst {
+    fn channel_type(&self) -> ChannelType {
+        T1
+    }
+    async fn handle(&self, frame: SessionFrame) -> Result<(), SessionError> {
+        let first = self.log.lock().expect("log").is_empty();
+        if first {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.log
+            .lock()
+            .expect("log")
+            .push((frame.channel, frame.payload.to_vec()));
+        Ok(())
+    }
+}
+
+/// **What a peer sends just before it closes still arrives.**
+///
+/// A peer closes by sending `Shutdown` on the control stream and then flushing
+/// its channels, and nothing orders two streams against each other, so the
+/// Shutdown can be read here while the peer's last frames are still waiting on
+/// a channel. This side used to stop every channel the moment it read the
+/// Shutdown, and whatever was still unread was lost: a `FileDecline` sent just
+/// before a close went missing about one time in ten, and the declined file
+/// read "failed".
+///
+/// The handler is slow over the first frame, so the Shutdown is certain to
+/// arrive while the second is still queued behind it — the case that raced.
+/// Twenty rounds, so an ordering that happens to win once proves nothing:
+/// against the old code this failed within its first three rounds on every
+/// run.
+#[tokio::test]
+async fn frames_sent_just_before_a_peer_closes_are_all_delivered() {
+    for round in 0..20 {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let slow = HandlerRegistry::new().with(Arc::new(SlowFirst {
+            log: log.clone(),
+            delay: Duration::from_millis(50),
+        }));
+        let mut p = open(
+            SessionConfig::new(caps()),
+            SessionConfig::new(caps()).with_handlers(slow),
+        )
+        .await;
+        let ch = p.a.open_channel(T1).await.expect("open");
+        next_channel_event(
+            &mut p.a_channels,
+            |e| matches!(e, ChannelEvent::Opened { channel, .. } if *channel == ch),
+        )
+        .await;
+
+        for payload in [&b"first"[..], b"last"] {
+            p.a.send_on_channel(
+                ch,
+                MessageType::new(1),
+                MessageFlags::NONE,
+                Bytes::copy_from_slice(payload),
+            )
+            .await
+            .expect("send");
+        }
+        p.a.close();
+
+        for _ in 0..200 {
+            if log.lock().expect("log").len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got: Vec<Vec<u8>> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(
+            got,
+            [b"first".to_vec(), b"last".to_vec()],
+            "round {round}: the frame sent just before the peer closed was dropped"
+        );
+    }
+}
+
 #[tokio::test]
 async fn closing_one_channel_leaves_others_open() {
     let mut p = open(SessionConfig::new(caps()), SessionConfig::new(caps())).await;

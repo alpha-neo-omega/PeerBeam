@@ -87,6 +87,9 @@ pub(crate) enum ActorCommand {
     Send(SessionFrame),
     /// Finish and close the stream.
     Close,
+    /// The peer is closing the session: read what it has already sent, to the
+    /// end of its stream, then stop. See the actor's `Drain` arm.
+    Drain,
 }
 
 /// An event from a channel's actor back to the manager.
@@ -187,6 +190,15 @@ impl Channel {
         }
     }
 
+    /// Signal the actor to read what the peer already sent, to the end of its
+    /// stream, and then stop — for a session the *peer* is closing
+    /// (best-effort). No-op for a stream channel.
+    pub(crate) fn signal_drain(&self) {
+        if let Some(tx) = &self.commands {
+            let _ = tx.send(ActorCommand::Drain);
+        }
+    }
+
     /// Take the actor's task, so a caller can wait for it to stop.
     pub(crate) fn take_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         self.task.take()
@@ -196,6 +208,37 @@ impl Channel {
 /// Recover a poisoned lock rather than panicking.
 fn lock(stats: &Arc<Mutex<ChannelStats>>) -> std::sync::MutexGuard<'_, ChannelStats> {
     stats.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Open, decode, count and dispatch one inbound frame. `Err` carries the detail
+/// an [`ActorEvent::Errored`] reports; the caller then stops the actor.
+async fn deliver(
+    frame: Frame,
+    crypto: &mut ChannelCrypto,
+    enc: &dyn EncryptionProvider,
+    stats: &Arc<Mutex<ChannelStats>>,
+    handler: Option<&Arc<dyn MessageHandler>>,
+) -> Result<(), String> {
+    // Open with this channel's key; any failure (tamper, replay, wrong key) is
+    // channel-scoped — it closes only this channel, never the session or its
+    // neighbours.
+    let plain = crypto
+        .open(enc, &frame.payload)
+        .map_err(|e| e.to_string())?;
+    let sf = SessionFrame::decode(&plain).map_err(|e| e.to_string())?;
+    {
+        let mut s = lock(stats);
+        s.frames_recv += 1;
+        s.bytes_recv += sf.payload.len() as u64;
+    }
+    // The probe frame (message type 0) only materialises the stream; never
+    // dispatch it.
+    if sf.message_type.get() != PROBE_MESSAGE_TYPE {
+        if let Some(h) = handler {
+            h.handle(sf).await.map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Create a channel by spawning its actor over `link`. The actor reads inbound
@@ -261,41 +304,37 @@ pub(crate) fn spawn_channel(
                         let _ = link.finish_send().await;
                         break;
                     }
+                    // The peer is closing the session. **Read what it already
+                    // sent before stopping.** A peer closes by sending
+                    // `Shutdown` on the control stream and then flushing this
+                    // one, and nothing orders two streams against each other —
+                    // so the Shutdown routinely arrives while the peer's last
+                    // frames are still in flight here, or sitting unread behind
+                    // a frame the handler is busy with. Stopping at once
+                    // dropped them: a `FileDecline` sent just before a close
+                    // went missing, and the file it declined read "failed".
+                    //
+                    // The peer finishes this stream as it closes (see the
+                    // `Close` arm above), so the drain ends at its FIN; a peer
+                    // that vanished instead ends it at the bound.
+                    Some(ActorCommand::Drain) => {
+                        let _ = tokio::time::timeout(super::CLOSE_FLUSH_GRACE, async {
+                            while let Ok(Some(frame)) = link.recv_frame().await {
+                                if let Err(detail) = deliver(frame, &mut crypto, &*enc, &actor_stats, handler.as_ref()).await {
+                                    let _ = actor_events.send(ActorEvent::Errored { channel: id, detail });
+                                    break;
+                                }
+                            }
+                        })
+                        .await;
+                        break;
+                    }
                 },
                 inbound = link.recv_frame() => match inbound {
                     Ok(Some(frame)) => {
-                        // Open with this channel's key; any failure (tamper,
-                        // replay, wrong key) is channel-scoped — it closes only
-                        // this channel, never the session or its neighbours.
-                        let plain = match crypto.open(&*enc, &frame.payload) {
-                            Ok(plain) => plain,
-                            Err(e) => {
-                                let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
-                                break;
-                            }
-                        };
-                        match SessionFrame::decode(&plain) {
-                            Ok(sf) => {
-                                {
-                                    let mut s = lock(&actor_stats);
-                                    s.frames_recv += 1;
-                                    s.bytes_recv += sf.payload.len() as u64;
-                                }
-                                // The probe frame (message type 0) only
-                                // materialises the stream; never dispatch it.
-                                if sf.message_type.get() != PROBE_MESSAGE_TYPE {
-                                    if let Some(h) = &handler {
-                                        if let Err(e) = h.handle(sf).await {
-                                            let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = actor_events.send(ActorEvent::Errored { channel: id, detail: e.to_string() });
-                                break;
-                            }
+                        if let Err(detail) = deliver(frame, &mut crypto, &*enc, &actor_stats, handler.as_ref()).await {
+                            let _ = actor_events.send(ActorEvent::Errored { channel: id, detail });
+                            break;
                         }
                     }
                     Ok(None) => {

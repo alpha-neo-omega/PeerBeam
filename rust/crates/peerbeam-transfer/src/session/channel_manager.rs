@@ -790,9 +790,20 @@ impl ChannelManager {
     /// Close every channel (session shutdown). Signals all actors and clears the
     /// registry; the transport itself is closed by the session.
     pub fn shutdown_all(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.stop_all(Channel::signal_close)
+    }
+
+    /// Stop every channel because the **peer** is closing the session: each
+    /// actor first reads what the peer already sent, to the end of its stream.
+    /// Otherwise exactly [`Self::shutdown_all`].
+    pub fn drain_all(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.stop_all(Channel::signal_drain)
+    }
+
+    fn stop_all(&mut self, signal: fn(&Channel)) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
         for (_, mut ch) in self.channels.drain() {
-            ch.signal_close();
+            signal(&ch);
             // Handed back so the caller can wait for each actor to flush its
             // stream before the shared connection is closed — see
             // `Session::close_gracefully`. Signalling alone only *asks*.

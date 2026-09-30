@@ -7,6 +7,19 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Fixed
+- **A message sent just before a session closed could still be lost — on
+  arrival, this time.** 0.12.0 made a closing session flush its channels
+  before closing the connection, so the last frame always reached the peer.
+  The peer could then drop it anyway: a close sends `Shutdown` on the control
+  stream *before* that flush, nothing orders two streams against each other,
+  and the receiving side stopped every channel the moment it read the
+  Shutdown, discarding whatever the sender had written last and it had not
+  yet read. The same dial-send-close paths were exposed (`chat send`,
+  `group invite`, clipboard push, `peerbeam identify`), and a declined file
+  is where it showed: the `FileDecline` went missing and the file read
+  "failed", at random on CI's Windows and macOS runners. The receiver now
+  reads each channel to its end before closing, as the session state machine
+  in `docs/STATE_MACHINES.md` always said it should.
 - **A signing key that does not work now stops the release, before anything
   is deleted.** v0.12.1 was published without `SHA256SUMS.minisig` while the
   workflow reported success: the secret held only the base64 line of the key
