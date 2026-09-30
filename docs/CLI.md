@@ -140,14 +140,50 @@ Working now:
   without waiting for someone to open it. Received files are left on disk — only
   the conversation row goes.
 - `check-updates [--json]` — asks whether a newer release exists, **once, because
-  you ran it**. This is the only request PeerBeam makes to anything that is not a
-  peer. It sends no device id, no install id, and nothing identifying; it
-  downloads nothing and installs nothing; and there is no automatic check on
-  launch or on a timer. Being unable to reach the feed exits **0** with
-  `reachable: false` — a machine with no route out is not a machine with a
-  problem, and a script running this must not fail because of it. Permitted by
-  amendment A1 in [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments),
-  which lists the conditions it is allowed on.
+  you ran it**. Together with `download-update` below, these are the only
+  requests PeerBeam makes to anything that is not a peer, and neither happens
+  unless you run it. It sends no device id, no install id, and nothing
+  identifying; it downloads nothing and installs nothing; and there is no
+  automatic check on launch or on a timer. Being unable to reach the feed exits
+  **0** with `reachable: false` — a machine with no route out is not a machine
+  with a problem, and a script running this must not fail because of it.
+  Permitted by amendment A1 in
+  [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments), which
+  lists the conditions it is allowed on.
+- `download-update [--to DIR] [--json]` — fetches the newest release for this
+  machine's platform and architecture, **verifies it**, and writes it to `DIR`
+  (default: the current directory). It does **not** install it, run it, unpack
+  it, or replace the running PeerBeam: you get a file, to install exactly as you
+  would one from the website.
+
+  Verification comes first and cannot be skipped. `SHA256SUMS` and its minisign
+  signature are fetched before a single byte of the artifact, and the signature
+  is checked against a public key compiled into the binary; only then is the
+  artifact downloaded, hashed as it streams, and renamed into place once its
+  digest matches the signed list. Anything that fails is deleted — there is no
+  flag to proceed anyway. Only `https` is used, and a redirect is followed only
+  to a host on a compiled-in list (`github.com`,
+  `release-assets.githubusercontent.com`).
+
+  On Linux it refuses unless it can establish how this copy was installed —
+  `dpkg` or `rpm` owning the running binary, or `$APPIMAGE` being set — because
+  handing you an `.rpm` when you installed a `.deb` is worse than handing you
+  nothing. A tarball or source build therefore gets a pointer to the website
+  instead. Android has no artifact here; it updates through its own install.
+
+  **It exits 0 whether or not a file was written**, including when verification
+  fails. To script it, use `--json` and check `downloaded`:
+
+  ```bash
+  peerbeam download-update --json --to /tmp/pb | jq -e '.downloaded' >/dev/null \
+    && echo "verified file in /tmp/pb"
+  ```
+
+  Each run emits one `update_download` event with `ok`, `downloaded`, `current`,
+  `latest`, and either `path`, `name` and `bytes` on success or `reason` when
+  nothing was written. Releases before v0.12.1 are unsigned, so there is nothing
+  this command can verify for them. Permitted by amendments A3 and A4 in
+  [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments).
 - `benchmark crypto|hash|loopback [--size N] [--chunk KiB]` — AES-256-GCM
   seal/open and SHA-256 throughput (MiB/s); `loopback` = end-to-end transfer
   over an in-process link. Live progress bar; `--chunk` tunes framing. There is
