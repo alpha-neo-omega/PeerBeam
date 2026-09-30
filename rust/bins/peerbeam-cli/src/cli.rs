@@ -140,6 +140,12 @@ pub enum Command {
     /// establish which package format this copy was installed from, because
     /// handing you the wrong one is worse than handing you nothing. See
     /// amendment A3 in `docs/ARCHITECTURAL_INVARIANTS.md`.
+    ///
+    /// Exits 0 only when nothing is wrong: a verified file was written, or
+    /// there is nothing newer to write. Any other exit means nothing was
+    /// written. 4: the release could not be reached. 5: it failed
+    /// verification, which may be an attack. 8: there is no file for this
+    /// machine.
     DownloadUpdate(DownloadUpdateArgs),
     /// Measure crypto / transfer throughput.
     Benchmark(BenchmarkArgs),

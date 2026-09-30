@@ -6,6 +6,33 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Changed
+- **`peerbeam download-update` exits non-zero when it did not write a verified
+  file.** In v0.12.1 it exited `0` in every case, including a failed signature
+  check. So `peerbeam download-update --to DIR && install DIR/*` ran the install
+  after a refusal, on whatever was already in `DIR`, and a refusal that may have
+  been an attack was invisible to automation. The new codes:
+  - `0`: a verified file was written, or there was nothing newer to write;
+  - `4`: the release feed or GitHub could not be reached;
+  - `5`: the download failed verification, or broke the redirect or host rule;
+  - `8`: this machine has no artifact to fetch;
+  - `1`: the file could not be written.
+
+  Offline stays an ordinary state: nothing retries or nags. But it is no longer
+  reported as success, and it never shares a code with a refusal. `docs/CLI.md`
+  documents the codes and a script that installs only the file the command
+  names.
+- **`download-update` refuses a machine it can never serve before it makes any
+  request.** A tarball or source build, Android, or an unrecognised
+  architecture used to ask the release feed first. It then refused, or said
+  "already newest", depending on the day. It now refuses at once with exit `8`,
+  and contacts nothing.
+- **`download-update` reports its failures on stderr**, on the same `error:`
+  line every other command uses, so `--quiet` no longer hides them. With
+  `--json`, every run still prints exactly one `update_download` event, and that
+  event now always carries `ok`, `downloaded`, `current` and `latest`. When no
+  release was published, `--json` used to print a line of plain text instead.
+
 ## [0.12.1] - 2026-09-27
 
 ### Added

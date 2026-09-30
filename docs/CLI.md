@@ -170,19 +170,53 @@ Working now:
   handing you an `.rpm` when you installed a `.deb` is worse than handing you
   nothing. A tarball or source build therefore gets a pointer to the website
   instead. Android has no artifact here; it updates through its own install.
+  That refusal comes **before any request is made**. No answer from the release
+  check could let such a machine download anything, so it asks nothing.
 
-  **It exits 0 whether or not a file was written**, including when verification
-  fails. To script it, use `--json` and check `downloaded`:
+  **The exit code says whether a verified file was written.** Exit codes: `0`
+  nothing is wrong: a verified file was written, or there is nothing newer to
+  write (you already have the newest release, or none is published). `4` the
+  release feed or GitHub could not be reached, or gave no usable answer (a 404,
+  say); trying again later may work. `5` refused: the signature, the digest, a
+  redirect or the release host failed a check, and anything already downloaded
+  was deleted. **This may be an attack**, and it never shares a code with being
+  offline. `8` there is no file for this machine (the Linux and Android cases
+  above). `1` the file could not be written to `DIR`. Every code except `0`
+  means nothing was written.
+
+  So `peerbeam download-update --to DIR && install …` never reaches the install
+  after a refusal. But `0` also covers "nothing newer", so install the file the
+  command names, not whatever a glob finds in `DIR`:
 
   ```bash
-  peerbeam download-update --json --to /tmp/pb | jq -e '.downloaded' >/dev/null \
-    && echo "verified file in /tmp/pb"
+  out=$(peerbeam download-update --json --to /tmp/pb) || exit  # 4, 5, 8, 1: nothing written
+  path=$(jq -r '.path // empty' <<<"$out")
+  [ -n "$path" ] && sudo apt install "$path"                   # empty: nothing newer
   ```
 
-  Each run emits one `update_download` event with `ok`, `downloaded`, `current`,
-  `latest`, and either `path`, `name` and `bytes` on success or `reason` when
-  nothing was written. Releases before v0.12.1 are unsigned, so there is nothing
-  this command can verify for them. Permitted by amendments A3 and A4 in
+  `check-updates` only asks a question, but this command was asked for a file,
+  so being offline is `4` here and not `0`. It is still an ordinary state:
+  nothing retries, nags, or waits on it. A script that can do without the file
+  can say so:
+
+  ```bash
+  peerbeam download-update --to /tmp/pb || [ $? -eq 4 ]  # offline is fine; 5 and 8 are not
+  ```
+
+  **In v0.12.1 it exited `0` in every case**, including when verification
+  failed. So `download-update && install` went on to install whatever was
+  already in the directory, and a refusal that may have been an attack was
+  invisible to automation. The reason for a failure is now reported on stderr,
+  on the same `error:` line every other command uses, so `--quiet` no longer
+  hides it.
+
+  Each run emits exactly one `update_download` event on stdout. `ok`,
+  `downloaded`, `current` and `latest` are always present. `ok` is `true`
+  exactly when the exit code is `0`. `latest` is `null` when there is no newest
+  version to report: offline, refused before asking, or nothing published. An
+  event for a written file adds `path`, `name` and `bytes`; every other event
+  adds `reason`. Releases before v0.12.1 are unsigned, so there is nothing this
+  command can verify for them. Permitted by amendments A3 and A4 in
   [ARCHITECTURAL_INVARIANTS.md](ARCHITECTURAL_INVARIANTS.md#amendments).
 - `benchmark crypto|hash|loopback [--size N] [--chunk KiB]` — AES-256-GCM
   seal/open and SHA-256 throughput (MiB/s); `loopback` = end-to-end transfer
@@ -1134,7 +1168,9 @@ prompt + config round-trip + `trust` against a throwaway store,
 transfer a file over QUIC (`tests/transfer_e2e.rs`) or a byte stream
 (`tests/pipe_e2e.rs`) — the latter walking the real approval path: first
 contact pins the sender and is refused, `peerbeam trust approve` grants it, and
-only then does the pipe succeed. Binary smoke-tested incl. `send`/`receive`
+only then does the pipe succeed. `download-update`'s exit codes are pinned
+without a network, through a local proxy that accepts and drops every
+connection (`tests/update_cli.rs`). Binary smoke-tested incl. `send`/`receive`
 over both discovery and `--addr`.
 
 ## Not yet
