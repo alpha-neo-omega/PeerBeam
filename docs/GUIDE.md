@@ -6,10 +6,10 @@ terminal. Written against **v0.11.0**.
 - Full CLI reference: [CLI.md](CLI.md)
 - Platform notes: [ANDROID.md](ANDROID.md) · [DESKTOP.md](DESKTOP.md)
 
-> **All artifacts are unsigned.** Signing secrets are not configured for this
-> project, so macOS Gatekeeper and Windows SmartScreen will warn on first open.
-> The steps below say exactly what to do about it. Nothing here asks you to
-> disable a security feature system-wide.
+> **All artifacts are unsigned.** Code-signing certificates are not configured
+> for this project, so macOS Gatekeeper and Windows SmartScreen will warn on
+> first open. The steps below say exactly what to do about it. Nothing here asks
+> you to disable a security feature system-wide.
 
 ---
 
@@ -70,9 +70,38 @@ checked, and a real mismatch still fails.
 > the bytes the release was built from — not truncated by a dropped connection,
 > not corrupted in transit or on disk. It does **not** prove they came from this
 > project: `SHA256SUMS` sits beside the files it describes, so anyone able to
-> replace an artifact could replace the list too. Proving origin needs a
-> signature verified against a key published somewhere else, which PeerBeam does
-> not yet have — see [Signing status](RELEASE.md#signing-status).
+> replace an artifact could replace the list too. Proving origin takes the
+> signature below.
+
+### Checking a download came from this project
+
+From **v0.12.1** on, releases also attach **`SHA256SUMS.minisig`**, a
+[minisign](https://jedisct1.github.io/minisign/) signature over `SHA256SUMS`.
+Download it into the same directory and check it against the project's public
+key — the same command on every platform:
+
+```bash
+minisign -Vm SHA256SUMS -P RWTGMEdNd5xF/JoeUsh7Y8S9ItJUd/MOzzDziVa53xMzW0EJuZIveB0D
+```
+
+It should print `Signature and comment signature verified` and a trusted
+comment naming the release, such as `PeerBeam v0.12.1 SHA256SUMS`. Check that
+the version is the one you downloaded: the comment is signed too, so a list
+lifted from another release cannot pass as this one's. Anything else —
+`Signature verification failed`, or a different version — means do not use the
+download.
+
+The signature says the list is the project's; the hash check above says your
+file is on it. It takes both to prove origin.
+
+Where the key comes from matters as much as the check. The release notes carry
+it too, but they sit on the same page as the download, so compare against a
+copy from somewhere else: this guide, the [changelog](../CHANGELOG.md), or the
+key compiled into PeerBeam (`SIGNING_PUBLIC_KEY` in
+`rust/crates/peerbeam-update/src/verify.rs`).
+
+Releases before v0.12.1 are unsigned. `peerbeam download-update` does all of
+this itself, and keeps nothing it cannot verify — see [CLI.md](CLI.md).
 
 ---
 

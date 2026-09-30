@@ -24,6 +24,12 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   `minisign`.** It looked for the binary before looking for a key, so "no key"
   and "a key, and nothing to sign with" were the same warning and the same
   success. With a key configured, a missing `minisign` is now an error.
+- `docs/GUIDE.md` said proving where a download came from needs a signature
+  "which PeerBeam does not yet have", and `docs/FEATURE_ROADMAP.md` still
+  listed the in-app download as blocked because "nothing signs" a release. Both
+  have been false since v0.12.1. The guide now shows how to check
+  `SHA256SUMS.minisig` and where to get the key to check it against, and the
+  roadmap marks the download built.
 
 ### Added
 - **The release job is tested.** `scripts/test-release-workflow.sh` runs its
