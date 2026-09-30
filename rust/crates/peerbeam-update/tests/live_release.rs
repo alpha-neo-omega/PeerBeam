@@ -98,3 +98,64 @@ async fn the_release_base_serves_a_known_asset() {
         "the origin must be allowlisted"
     );
 }
+
+/// The first release the whole chain can be run against in production.
+///
+/// v0.12.1 is the first signed release. Everything before it was exercised
+/// against a test server and a throwaway key; this is the real key compiled
+/// into this binary, the real `SHA256SUMS.minisig`, GitHub's real redirect to
+/// `release-assets.githubusercontent.com`, and the artifact's real bytes.
+///
+/// It needs an artifact this machine can name. On a Linux box with neither
+/// `dpkg` nor `rpm` owning the binary, set `APPIMAGE` to anything to select the
+/// AppImage, exactly as a genuine AppImage user's environment does -- without
+/// it the test reports that it skipped rather than failing, because that is
+/// correct behaviour for the resolver, not a defect in the download.
+#[tokio::test]
+#[ignore = "needs the network and downloads ~16 MB"]
+async fn the_first_signed_release_downloads_and_verifies() {
+    const FIRST_SIGNED: &str = "0.12.1";
+    let dir = std::env::temp_dir().join("peerbeam-live-signed-release-test");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let done = match download::fetch(FIRST_SIGNED, &dir, |_, _| {}).await {
+        Ok(done) => done,
+        Err(DownloadError::Resolve(e)) => {
+            eprintln!(
+                "SKIPPED: this machine cannot name its artifact ({e}); set APPIMAGE to run it"
+            );
+            return;
+        }
+        Err(e) => {
+            panic!("v{FIRST_SIGNED} did not download and verify against the compiled-in key: {e}")
+        }
+    };
+
+    assert!(
+        done.path.is_file(),
+        "reported {} but no file is there",
+        done.path.display()
+    );
+    assert!(
+        done.name.contains(FIRST_SIGNED),
+        "fetched {} for v{FIRST_SIGNED}",
+        done.name
+    );
+    assert_eq!(
+        std::fs::metadata(&done.path).expect("stat").len(),
+        done.bytes,
+        "the reported size is not the size on disk"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a .part file survived a successful download"
+    );
+
+    eprintln!("verified and saved {} ({} bytes)", done.name, done.bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
