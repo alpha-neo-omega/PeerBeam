@@ -93,12 +93,31 @@ minisign -G -W -p peerbeam.pub -s peerbeam.key
 
 Then:
 
-1. Put the **contents of `peerbeam.key`** in the `MINISIGN_SECRET_KEY`
-   repository *secret*.
+1. Set the `MINISIGN_SECRET_KEY` repository *secret* from the key file
+   itself, **both lines of it**:
+
+   ```bash
+   gh secret set MINISIGN_SECRET_KEY --repo alpha-neo-omega/PeerBeam < peerbeam.key
+   ```
+
+   Not by pasting. The secret needs the whole file — the `untrusted comment:`
+   line *and* the base64 — and step 2 below wants only the base64 of the
+   *public* key, so pasting one and then the other is an easy way to give the
+   secret only its second line. That is exactly how v0.12.1 was first published
+   without a signature. Reading from the file also keeps the key out of shell
+   history and the process list, which `--body "$(cat …)"` would not.
 2. Put the **second line of `peerbeam.pub`** (the base64, not the comment) in
-   the `MINISIGN_PUBLIC_KEY` repository *variable* — the release checks its own
-   signature back against it before publishing, so a mis-pasted key fails the
-   release rather than every user's download.
+   the `MINISIGN_PUBLIC_KEY` repository *variable*. The release checks its own
+   signature back against it before publishing.
+
+   **What a bad key does today:** `sign-release.sh` fails with an error in the
+   log naming the problem, and the release is **published without a
+   signature** — the job still reports success. It does not fail the release,
+   because the step that would fail runs after the old release has been
+   deleted, and failing there has destroyed good releases before (see the
+   comment on the publish step). So after tagging, **check that
+   `SHA256SUMS.minisig` is among the release's assets**; if it is missing, fix
+   the key and re-run the `release` job alone.
 3. Paste the same base64 into `SIGNING_PUBLIC_KEY` in
    `rust/crates/peerbeam-update/src/verify.rs` and commit it. **It belongs in
    version control**: it is public, and committing it is what pins it. A key
