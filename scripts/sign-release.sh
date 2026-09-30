@@ -92,9 +92,36 @@ fi
 # `-W` writes no password prompt for an unencrypted key. A key with a password
 # cannot be used non-interactively, which is why CI's key is unencrypted and
 # the secret store is what protects it — see docs/RELEASE.md.
-if ! minisign -S -s "$keyfile" -m "$sums" \
-     -t "PeerBeam $tag SHA256SUMS" >/dev/null 2>&1; then
+# A minisign secret key file is two lines: an "untrusted comment:" header and
+# the base64 key. Checked here because the likely way this goes wrong is a
+# secret pasted without its comment line — which is exactly what cost v0.12.1
+# its signature — and minisign's own answer to that, "Error while loading the
+# secret key file", is true but not enough to act on in a CI log.
+if ! head -1 "$keyfile" | grep -q '^untrusted comment:' || [ -z "$(sed -n '2p' "$keyfile")" ]; then
+  echo "::error::sign-release: that does not look like a minisign secret key file." >&2
+  echo "::error::It must be the COMPLETE file: two lines, the first starting" >&2
+  echo "::error::'untrusted comment:'. Not just the base64 line on its own." >&2
+  echo "::error::Set it from the file itself: gh secret set MINISIGN_SECRET_KEY < minisign.key" >&2
+  exit 1
+fi
+
+# The trusted comment is signed, unlike the untrusted one, so it is the right
+# place for anything a verifier might want to trust. The tag is there so a
+# signature lifted from one release cannot be presented as another's without
+# the mismatch being visible to a person running `minisign -V`.
+#
+# A key with a password cannot be used non-interactively, which is why CI's key
+# is generated with `-W` and the secret store is what protects it — see
+# docs/RELEASE.md.
+#
+# minisign's stderr is captured and shown, never discarded. It used to go to
+# /dev/null, so the v0.12.1 job reported only "minisign failed to sign" while
+# minisign was saying precisely what was wrong. (Its exit status was always
+# reliable — 2 on a key it cannot load — it was only the reason that was lost.)
+if ! err=$(minisign -S -s "$keyfile" -m "$sums" \
+     -t "PeerBeam $tag SHA256SUMS" 2>&1 >/dev/null); then
   echo "::error::sign-release: minisign failed to sign $sums" >&2
+  [ -n "$err" ] && echo "::error::minisign said: $err" >&2
   exit 1
 fi
 
