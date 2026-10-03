@@ -167,31 +167,19 @@ the remainder.
   and carrying a per-device field for one discovery provider's opinion of a path
   route selection may not even have chosen.
 
-- **Download a release from inside the app** — constitutionally permitted as of
-  2026-09-27 by [Amendment A3](ARCHITECTURAL_INVARIANTS.md#a3--downloading-a-release-the-user-asked-for-2026-09-27),
-  and **blocked on release engineering, not on approval.** A3's third binding
-  condition requires the artifact to be verified against a checksum the project
-  *signed*, and nothing signs one today: `SHA256SUMS` ships with every release
-  but unsigned, which — fetched from the same origin as the artifact it
-  describes — proves only that the file arrived intact, a thing TLS already
-  proved. Three things are needed first, in order:
-
-  1. **A signing key.** Minisign-class; free, and *independent* of the
-     Authenticode and Apple Developer ID certificates the project lacks, so it
-     does not wait on them. The public half is compiled into the binary and is
-     therefore pinned for the life of every build that ships with it.
-  2. **A signing step in `release.yml`.** `SHA256SUMS` is already generated over
-     exactly the uploaded files (`.github/workflows/release.yml:341-352`); it
-     needs signing, and the signature uploading beside it.
-  3. **A key-rotation answer, written before the first key ships.** A pinned
-     public key means a lost or compromised secret strands every already-shipped
-     build. Deciding this afterwards is deciding it during an incident.
-
-  Two open questions the amendment deliberately left to implementation: custody
-  of the secret key (and whether CI may hold it at all), and whether the
-  download is offered on Windows and macOS while their artifacts are still
-  unsigned and un-notarized — a verified download there still hands over a file
-  the OS refuses to run without clearing quarantine or a SmartScreen warning.
+- ~~**Download a release from inside the app**~~ — **built** in v0.12.1 as
+  `peerbeam download-update`, under
+  [Amendment A3](ARCHITECTURAL_INVARIANTS.md#a3--downloading-a-release-the-user-asked-for-2026-09-27)
+  and [A4](ARCHITECTURAL_INVARIANTS.md#a4--a-compiled-in-allowlist-of-redirect-hosts-2026-09-27).
+  It was blocked on release engineering rather than approval, and the three
+  prerequisites this entry listed all landed first: a minisign key whose public
+  half is compiled into the binary, a signing step in `release.yml` that puts
+  `SHA256SUMS.minisig` beside `SHA256SUMS`, and a rotation procedure written
+  before the key shipped. The two open questions were settled too: CI holds the
+  key, unencrypted, with the secret store as its protection; and Windows and
+  macOS are offered their zip and DMG, although the OS still warns on first
+  open. [RELEASE.md](RELEASE.md#signing-the-checksums-minisign) has signing,
+  custody and rotation; [CLI.md](CLI.md) has what the command does and refuses.
 
   Out of scope by A3's own terms: auto-update, installing, executing, delta
   downloads. PeerBeam writes one file and stops.

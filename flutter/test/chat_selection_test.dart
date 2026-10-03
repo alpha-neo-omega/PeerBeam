@@ -50,13 +50,24 @@ const _laptop = SdkDevice(
   reachableRemote: false,
 );
 
+/// A fixture's time: strictly later than the previous fixture's, on every
+/// platform.
+///
+/// `DateTime.now()` alone is not. Windows' clock is coarse enough that two
+/// fixtures built back to back share an instant, and a transcript orders equal
+/// instants by id — which put `fr-1` ahead of `m1` there and nowhere else. The
+/// offset keeps a thread in the order the test lists it.
+var _fixtureTick = 0;
+DateTime _fixtureNow() =>
+    DateTime.now().add(Duration(microseconds: ++_fixtureTick));
+
 ChatMessage _text(String id, String body, {String direction = 'out'}) =>
     ChatMessage(
       id: id,
       peerId: 'pb-bob',
       direction: direction,
       body: body,
-      at: DateTime.now(),
+      at: _fixtureNow(),
       status: ChatStatusValue.sent,
     );
 
@@ -71,7 +82,7 @@ ChatMessage _file(
   peerId: 'pb-bob',
   direction: direction,
   body: '',
-  at: DateTime.now(),
+  at: _fixtureNow(),
   status: status,
   kind: ChatMessageKind.file,
   fileName: name,

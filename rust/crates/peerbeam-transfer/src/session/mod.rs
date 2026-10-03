@@ -989,7 +989,7 @@ impl PeerSession {
                     // apart from one that died on its own. See
                     // `ChannelManager::confirm_link_alive`.
                     self.manager.confirm_link_alive();
-                    if self.route_control(&frame) == Flow::Closed {
+                    if self.route_control(&frame).await == Flow::Closed {
                         return Ok(RunExit::Closed);
                     }
                 }
@@ -1030,7 +1030,7 @@ impl PeerSession {
         }
     }
 
-    fn route_control(&mut self, frame: &SessionFrame) -> Flow {
+    async fn route_control(&mut self, frame: &SessionFrame) -> Flow {
         let msg = match ControlMessage::from_frame(frame) {
             Ok(msg) => msg,
             Err(_) => {
@@ -1057,7 +1057,7 @@ impl PeerSession {
                 self.control_out.push_back(ControlMessage::Pong(nonce));
             }
             ControlMessage::Shutdown(reason) => {
-                self.mark_closed(CloseReason::Peer(reason));
+                self.close_for_peer(reason).await;
                 return Flow::Closed;
             }
             ControlMessage::ProtocolError(detail) => {
@@ -1214,14 +1214,56 @@ impl PeerSession {
         self.finish_close(CloseReason::Local);
     }
 
+    /// The peer sent `Shutdown`: close, but **only after reading what it sent
+    /// before it**.
+    ///
+    /// This is the documented shape — STATE_MACHINES.md §6, `Shutdown` enters
+    /// DRAINING, "let channels finish" — and it used to be skipped: every
+    /// channel was stopped the instant the Shutdown was read. A peer closes by
+    /// sending the Shutdown on the control stream and *then* flushing its
+    /// channels (see `close_gracefully`), and QUIC orders nothing across
+    /// streams, so the peer's last frames were routinely still unread here when
+    /// the Shutdown arrived, and were dropped. `close_gracefully`'s flush fixed
+    /// the sending half of that loss; this is the receiving half. It surfaced
+    /// as a `FileDecline` going missing, so the file it declined read "failed",
+    /// at random in `chat_ffi`'s decline test — mostly on CI's slower Windows
+    /// and macOS runners, and locally once pinned to a single CPU.
+    ///
+    /// Each actor reads to its stream's end, and the peer finishes every
+    /// channel as it closes, so against a well-behaved peer this costs about a
+    /// round trip. The wait is bounded like the flush, for a peer that vanished
+    /// mid-close.
+    async fn close_for_peer(&mut self, reason: String) {
+        if self.state.is_terminal() {
+            return;
+        }
+        if self.state.is_active() {
+            self.state = SessionState::ShuttingDown;
+            if let Some(reg) = &self.registry {
+                reg.set_state(self.id, SessionState::ShuttingDown);
+            }
+        }
+        let draining = self.manager.drain_all();
+        if !draining.is_empty() {
+            let _ = tokio::time::timeout(CLOSE_FLUSH_GRACE, async {
+                for task in draining {
+                    let _ = task.await;
+                }
+            })
+            .await;
+        }
+        self.state = SessionState::Closed;
+        self.finish_close(CloseReason::Peer(reason));
+    }
+
     fn mark_closed(&mut self, reason: CloseReason) {
         if self.state.is_terminal() {
             return;
         }
         self.state = SessionState::Closed;
-        // Not the graceful path: this is an abrupt or peer-initiated close, and
-        // there is no orderly flush to wait for. See `close_gracefully` for the
-        // one that does wait.
+        // Not a graceful path: this is an abrupt close — a protocol error, a
+        // transport gone — and there is no orderly flush to wait for. See
+        // `close_gracefully` and `close_for_peer` for the two that do wait.
         drop(self.manager.shutdown_all());
         self.finish_close(reason);
     }
