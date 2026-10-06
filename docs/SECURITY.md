@@ -695,13 +695,14 @@ clean end, and a mismatch is an error too. Both exit non-zero. That exit code is
 the only signal a script gets, and `peerbeam pipe --listen > f` without checking
 it will happily trust a bad `f`.
 
-## The one request that is not to a peer
+## The two requests that are not to a peer
 
 Everything else PeerBeam sends goes to a peer, or onto the local network looking
 for one — the Tailscale discovery source asks `tailscaled` on this machine, over
-its Unix socket or the `tailscale` binary, and does not leave it. There is one
-exception, and it is written down here because a privacy claim with an
-unmentioned exception in it is worth nothing.
+its Unix socket or the `tailscale` binary, and does not leave it. There are two
+exceptions — asking whether a newer release exists, and downloading one — and
+they are written down here because a privacy claim with an unmentioned exception
+in it is worth nothing.
 
 `peerbeam check-updates`, and the **Check for updates** button in the app's About
 section, make one HTTPS GET to the project's own update manifest
@@ -715,10 +716,11 @@ request on an origin the project controls rather than a third-party API, which
 also means one fewer party learning that somebody, somewhere, opened PeerBeam.
 
 **Only when a person asks.** There is no timer, no check at launch, and no check
-as a side effect of anything else: `peerbeam_update::check` has exactly two
-callers, the CLI command and the FFI entry point behind that button, and pressing
-the button is the opt-in each time. Using PeerBeam therefore never tells a server
-that PeerBeam is being used.
+as a side effect of anything else. Every caller of `peerbeam_update::check` is a
+command or button a person invoked: `check-updates`, `download-update` (which
+asks first, so that it only ever fetches the newest release), and the FFI entry
+point behind that button — and invoking one is the opt-in each time. Using
+PeerBeam therefore never tells a server that PeerBeam is being used.
 
 **What the request unavoidably discloses.** The site's host — Cloudflare Pages —
 sees the connecting IP address, and so an approximate location, and the time of
@@ -735,9 +737,13 @@ is kept because omitting it would not reduce what travels, and a request
 carrying none is itself distinctive. There is no query string either, so the
 request does not say which build is asking: the manifest is asked what the newest release is, and the
 comparison against the running version happens here. The answer is inert as
-well. A `Release` is a version string and a URL; nothing downloads, installs or
-changes behaviour on the strength of what the server said, and there is no retry
-and no fallback to a second host — a caller that wants to ask again asks again.
+well. A `Release` is a version string and a URL, and asking for one downloads
+nothing, installs nothing and changes no behaviour; there is no retry and no
+fallback to a second host — a caller that wants to ask again asks again. The one
+thing the answer can lead to is the separate download described below, and only
+when a person asks for that too. What the server says can decide *which*
+version is downloaded; it never decides *where from*, and it cannot make a file
+pass the signature check.
 
 The URL a person is offered is **compiled into the app**, not read out of the
 response. The manifest publishes one too, for other readers, and this ignores it:
@@ -759,6 +765,54 @@ one of them is outside A1 and back in conflict with I4. The matching non-goal in
 [VISION.md](VISION.md) is narrowed in the same change, because leaving a
 published claim that the shipped build makes false would be worse than the check
 itself.
+
+### Downloading a release
+
+`peerbeam download-update` fetches the newest release's artifact for this
+machine, verifies it, and writes it to a directory the person names (`--to`,
+otherwise the directory they ran it in). It is permitted by amendments **A3**
+and **A4** in [the invariants](ARCHITECTURAL_INVARIANTS.md#amendments), which set
+eight binding conditions on it; what follows is what those conditions mean on
+the wire.
+
+**What it requests, in order.** First the update manifest, exactly as
+`check-updates` does, to learn which version is newest. Then three files from
+that version's GitHub release: `SHA256SUMS`, its minisign signature
+`SHA256SUMS.minisig`, and — only if the signature verifies — the artifact
+itself. Each is an HTTPS GET with the same bare `User-Agent: PeerBeam` the check
+sends, no query string, no cookie, and no identifier.
+
+**Where from is never served.** Every URL is built in the app from a
+compiled-in base (`github.com/alpha-neo-omega/PeerBeam/releases/download`), the
+version string, and the platform's known asset name. The manifest is asked only
+*which* version is newest. Redirects are followed only to hosts on a list that
+is also compiled in — `github.com` and `release-assets.githubusercontent.com`,
+the second being where GitHub serves release files from — and only over HTTPS;
+anything else stops the download.
+
+**Verified before it exists.** The signature over `SHA256SUMS` is checked
+against a public key compiled into the binary before a single byte of the
+artifact is requested, so a release this project did not sign costs the user a
+few kilobytes, not a download. The artifact then streams to a `.part` file,
+hashed as it arrives, and is renamed into place only if its digest matches the
+signed list. A bad signature, a missing one, a missing entry or a mismatched
+digest deletes what was written and says which. There is no option to keep an
+unverified file.
+
+**It never installs.** PeerBeam writes one file and stops: it does not run,
+open, unpack or mark executable what it downloaded, does not replace the
+running binary, and never asks for elevated privileges. The person installs it
+exactly as they would a file from the website. Android has no artifact here at
+all; it updates through its own install flow.
+
+**What it newly discloses.** Asking for a specific file says **which platform
+and architecture this machine is**, and it says so to a second origin — GitHub,
+which the check alone never contacts — along with the IP address and time any
+HTTPS request reveals. That is a real widening beyond the check, and A3 records
+it as one rather than leaving it to be found later.
+
+Releases are signed from v0.12.1; there is nothing this command can verify for
+any earlier release, so there is nothing it will download for one either.
 
 ## Threat notes / scope
 
