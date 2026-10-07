@@ -719,13 +719,15 @@ request on an origin the project controls rather than a third-party API, which
 also means one fewer party learning that somebody, somewhere, opened PeerBeam.
 
 **Only when a person asks.** There is no timer, no check at launch, and no check
-as a side effect of anything else. `peerbeam_update::check` has exactly three
-callers:
+as a side effect of anything else. `peerbeam_update::check` has three callers,
+and a person is behind each:
 - `peerbeam check-updates`;
-- `peerbeam download-update`, which asks it which release to fetch;
-- the FFI entry point behind that button.
+- the FFI entry point behind the app's **Check** button;
+- `peerbeam_update::newest::download_newest`, which asks it which release to
+  fetch, and which runs only when someone runs `peerbeam download-update` or
+  presses **Download** in the app.
 
-Running the command, or pressing the button, is the opt-in each time. Using
+Running a command, or pressing a button, is the opt-in each time. Using
 PeerBeam therefore never tells a server that PeerBeam is being used.
 
 **What the request unavoidably discloses.** The site's host — Cloudflare Pages —
@@ -745,9 +747,9 @@ request does not say which build is asking: the manifest is asked what the newes
 comparison against the running version happens here. The answer is inert as
 well. A `Release` is a version string and a URL. Nothing installs, runs or
 changes behaviour on the strength of what the server said. The version is
-displayed, and the only other thing it can ever do is tell
-`peerbeam download-update` which release to fetch, when a person runs that
-command too ([below](#downloading-a-release)). There is no retry and no fallback
+displayed, and the only other thing it can ever do is decide which release a
+download fetches, when a person asks for one too -- `peerbeam download-update`,
+or **Download** in the app ([below](#downloading-a-release)). There is no retry and no fallback
 to a second host — a caller that wants to ask again asks again.
 
 The URL a person is offered is **compiled into the app**, not read out of the
@@ -773,11 +775,19 @@ itself.
 
 ### Downloading a release
 
-`peerbeam download-update` fetches the newest release for this machine and
-writes it to a directory the person chose. It is the only caller of
-`peerbeam_update::download::fetch`, and the app has no download button. Nothing
-fetches a release on a timer, at startup, as a follow-on to `check-updates` or
-the app's button, or in the background so that one is ready.
+`peerbeam download-update`, and **Download** in the app's Settings, fetch the
+newest release for this machine and write it to a directory the person chose.
+Both run `peerbeam_update::newest::download_newest`, the only caller of
+`peerbeam_update::download::fetch`, so the two cannot differ in what they
+fetch, check or refuse. Nothing fetches a release on a timer, at startup, as a
+follow-on to a check, or in the background so that one is ready.
+
+In the app, **Download** appears only once a check has found a newer release,
+and pressing it fetches nothing until the person has picked a folder; the
+engine refuses a folder that is missing or relative. One download runs at a
+time. When it is done the app can show the *folder*, never the file: handing
+the file to the system's default opener would install a `.deb` or `.rpm`, or
+mount a `.dmg`. Phones are offered no download at all.
 
 **Nothing served chooses what is fetched.** The manifest may say *which version*
 is newest, and nothing else in it is used. The app builds the address itself,
@@ -793,9 +803,11 @@ from three parts:
 Anything else is refused before any request is made: a tarball install (there is
 no way to tell one from a source build), a binary two package managers both
 claim, Android or another system with no desktop release, or an architecture
-with no published build. `download-update`
-only fetches a version newer than the one running, so the manifest cannot talk
-anyone into a downgrade.
+with no published build. A download only fetches a version newer than the one
+running, so the manifest cannot talk anyone into a downgrade. Nor can it pass a
+path off as a version: the version must be `MAJOR.MINOR.PATCH`, with an
+optional pre-release suffix of letters, digits, hyphens and dots, before it is
+put into a URL or a file name. Anything else is refused at that point.
 
 **Redirects stay on a compiled-in list.** GitHub answers each fetch with a
 redirect to `release-assets.githubusercontent.com`. A redirect is
@@ -843,9 +855,10 @@ A3 records it rather than leaving it for an audit to find.
 
 **A refusal is never reported as success.** `download-update` exits `0` only
 when a verified file was written or there was nothing newer. A download that
-fails verification, or breaks the redirect or host rule, exits `5`. Being
-offline exits `4`, never the same code: one may be an attack and the other is a
-bad day ([CLI.md](CLI.md)).
+fails verification, breaks the redirect or host rule, or is handed a "version"
+that is not one, exits `5`. Being offline exits `4`, never the same code: one
+may be an attack and the other is a bad day ([CLI.md](CLI.md)). In the app, a
+refusal is a line in the Settings tile saying why, with no folder to show.
 
 **The manifest is not signed**, and nothing above depends on it being signed.
 Whoever can alter it can stop a download from happening, by naming an older
@@ -893,8 +906,20 @@ and a build that drops any one of them is back in conflict with I4.
     downgraded redirect is refused by name, and a redirect with nowhere to go
     is not taken for the file. A redirected request also carries no header the
     first one did not.
+  - Its `artifact` tests refuse a "version" carrying anything but a plain
+    release version -- `99.0.0/../../x` among them -- and `fetch` refuses one
+    before it resolves anything else.
   - `peerbeam-cli/tests/update_cli.rs` pins `download-update`'s exit codes
     without a network.
+  - `peerbeam-ffi`'s `update` tests pin what is the app's own: a folder that is
+    absolute and present, one download at a time, and progress whose unknown
+    length is `null`. `tests/ffi.rs` calls `pb_download_update` through the C
+    ABI, as Dart does.
+  - The app's `check_updates_download_test.dart` pins the tile's terms on
+    Linux, macOS and Windows: a check never starts a download or opens the
+    folder picker, nothing is fetched without a chosen folder, Show folder is
+    handed the folder and never the file, and a phone is offered nothing. Each
+    of those was mutated into the code and caught.
   - `peerbeam-update/tests/live_release.rs` runs the whole chain by hand,
     against the real release and the real key.
 

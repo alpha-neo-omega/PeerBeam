@@ -18,6 +18,22 @@ fn lib_path() -> Option<std::path::PathBuf> {
     } else {
         "libpeerbeam_ffi.so"
     };
+    // Beside this test binary first. `cargo test` builds the cdylib into the
+    // same `deps/` directory the integration test runs from, and only
+    // `cargo build` copies it up into `debug/`. Looking only in
+    // `rust/target/debug` meant this test skipped -- and reported "ok" -- on
+    // any run that had not done a separate `cargo build`, which is every CI
+    // run (it tests before it builds), and on any machine whose
+    // CARGO_TARGET_DIR is elsewhere. Next to the binary is always the library
+    // this run just built.
+    if let Some(deps) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(name)))
+    {
+        if deps.exists() {
+            return Some(deps);
+        }
+    }
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for rel in ["../../target/debug", "../../target/release"] {
         let p = manifest.join(rel).join(name);
@@ -81,5 +97,32 @@ fn cdylib_exports_and_runs() {
 
         let shutdown: Symbol<extern "C" fn()> = lib.get(b"pb_shutdown").unwrap();
         shutdown();
+    }
+}
+
+/// The app looks `pb_download_update` up by name, on a background isolate,
+/// so a missing export would surface as a symbol-lookup failure the moment
+/// someone presses Download. Called the way Dart calls it, it refuses a
+/// request that names no folder -- before any network, in the standard
+/// envelope.
+#[test]
+fn download_update_is_exported_and_refuses_without_a_folder() {
+    let Some(path) = lib_path() else {
+        eprintln!("skip: cdylib not built yet");
+        return;
+    };
+    let lib = unsafe { Library::new(&path).expect("load cdylib") };
+    unsafe {
+        let free: Symbol<extern "C" fn(*mut c_char)> = lib.get(b"pb_free_string").unwrap();
+        let download: Symbol<extern "C" fn(*const c_char) -> *mut c_char> = lib
+            .get(b"pb_download_update")
+            .expect("pb_download_update is not exported");
+        let arg = CString::new("{}").unwrap();
+        let ptr = download(arg.as_ptr());
+        let s = CStr::from_ptr(ptr).to_str().unwrap().to_string();
+        free(ptr);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("JSON");
+        assert_eq!(v["ok"], false, "{s}");
+        assert_eq!(v["error"]["code"], "invalid_argument", "{s}");
     }
 }

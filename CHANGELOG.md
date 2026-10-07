@@ -7,6 +7,18 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 ## [Unreleased]
 
 ### Added
+- **Download a release from the app.** When **Check for updates** in Settings
+  finds a newer release, it now offers **Download**. Pressing it asks where to
+  save the file -- starting at Downloads -- and fetches nothing unless a folder
+  is chosen. The file is the right one for this machine and is checked against
+  the project's signature before it is kept, exactly as `peerbeam
+  download-update` does; both now run one shared sequence in the engine, so they
+  cannot differ in what they fetch, check or refuse. Progress shows as a
+  percentage. PeerBeam still never installs anything: when the download is done
+  it can show the folder, but it never opens the file, because the system would
+  hand a `.deb`, `.rpm` or `.dmg` straight to an installer. A check never starts
+  a download by itself, a refusal says why in the tile, and phones are offered
+  no download (Android updates through its own install).
 - **The release job is tested.** `scripts/test-release-workflow.sh` runs its
   steps, read out of `release.yml`, against fake artifacts with `gh` faked
   out, and checks what would have been published for no key, a good key and
@@ -42,6 +54,23 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   release was published, `--json` used to print a line of plain text instead.
 
 ### Fixed
+- **A release "version" that is not one is refused before it can name a URL or
+  a file.** The version a download fetches comes from the release feed, a
+  served document, and nothing checked its shape: the version comparison reads
+  any unparseable part as 0, so a feed naming `99.0.0/../../x` counted as newer,
+  and v0.12.1 would have built `peerbeam-99.0.0/../../x-amd64.deb` from it. It
+  was never exploitable -- a file is kept only once its exact name appears in
+  the *signed* checksum list -- but amendment A3 promises that the feed may say
+  which version is newest and never where to fetch anything, and a crafted
+  version could still steer the request to another path on `github.com`. A
+  version must now be `MAJOR.MINOR.PATCH` with an optional pre-release suffix,
+  checked before anything else, and `download-update` exits `5` for one that is
+  not, with the other refusals.
+- **The engine's C ABI test runs instead of skipping.** `tests/ffi.rs` loads
+  the built library and calls it by name, the way the app does, but it looked
+  only where `cargo build` puts the library, and `cargo test` puts it beside the
+  test binary. CI tests before it builds, so the test printed "skip" and passed
+  on every fresh run. It now finds the library the run just built.
 - **`docs/SECURITY.md` no longer says that nothing downloads.** Amendment A3's
   eighth condition required that sentence to be corrected in the change that
   shipped `peerbeam download-update`, and v0.12.1 shipped without the

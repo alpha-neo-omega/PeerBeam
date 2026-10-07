@@ -178,9 +178,10 @@ Working now:
   write (you already have the newest release, or none is published). `4` the
   release feed or GitHub could not be reached, or gave no usable answer (a 404,
   say); trying again later may work. `5` refused: the signature, the digest, a
-  redirect or the release host failed a check, and anything already downloaded
-  was deleted. **This may be an attack**, and it never shares a code with being
-  offline. `8` there is no file for this machine (the Linux and Android cases
+  redirect or the release host failed a check, or the release feed named a
+  "version" that is not one (anything but `MAJOR.MINOR.PATCH`, with an optional
+  pre-release suffix), and anything already downloaded was deleted. **This may
+  be an attack**, and it never shares a code with being offline. `8` there is no file for this machine (the Linux and Android cases
   above). `1` the file could not be written to `DIR`. Every code except `0`
   means nothing was written.
 

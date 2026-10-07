@@ -369,6 +369,12 @@ pub async fn fetch<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
+    // First, because it is the one input that came from a served document:
+    // a "version" that is not one must not name a request or a file. Before
+    // platform resolution too, so the refusal does not depend on whether this
+    // machine happens to be able to name its artifact.
+    let v = artifact::release_version(version)?;
+
     if RELEASE_DOWNLOAD_BASE.trim().is_empty() {
         return Err(DownloadError::NoHostCompiledIn);
     }
@@ -383,7 +389,6 @@ where
     // package format cannot be established there is nothing to ask for, and
     // asking anyway would disclose the platform for no reason.
     let name = artifact::artifact_for_this_build(version)?;
-    let v = version.trim().trim_start_matches('v');
     // `v<version>` because that is the tag; the files inside carry no `v`.
     let base = format!("{}/v{}", RELEASE_DOWNLOAD_BASE.trim_end_matches('/'), v);
 
@@ -871,5 +876,30 @@ mod tests {
             matches!(err, DownloadError::Unreachable { ref why, .. } if why.contains("302")),
             "{err:?}"
         );
+    }
+
+    /// Version validation is the first thing `fetch` does that depends on its
+    /// input. Ordering is the point: checked only after platform resolution,
+    /// a machine that *can* resolve its artifact would carry a hostile string
+    /// into a request before anything stopped it. On a Linux box where
+    /// nothing owns the test binary, resolution fails first -- so this test
+    /// can only pass if the version is checked before it.
+    #[tokio::test]
+    async fn a_hostile_version_is_refused_before_any_request_or_write() {
+        let dir = std::env::temp_dir().join("peerbeam-download-test-hostile-version");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut reported = false;
+        let err = fetch("99.0.0/../../x", &dir, |_, _| reported = true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DownloadError::Resolve(crate::artifact::ResolveError::NotAVersion(_))
+            ),
+            "expected NotAVersion, got {err:?}"
+        );
+        assert!(!reported, "progress was reported for a refused version");
+        assert!(!dir.exists(), "refusing must not create the directory");
     }
 }

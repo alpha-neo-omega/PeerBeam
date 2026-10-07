@@ -51,6 +51,7 @@
 
 pub mod artifact;
 pub mod download;
+pub mod newest;
 pub mod verify;
 
 use serde::Deserialize;

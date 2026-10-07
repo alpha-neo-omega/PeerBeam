@@ -29,6 +29,7 @@ mod session_exec;
 mod settings;
 mod status;
 mod transfer;
+mod update;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -106,11 +107,13 @@ pub extern "C" fn pb_version_json() -> *mut c_char {
 
 /// Ask whether a newer release exists. **Requires an explicit request.**
 ///
-/// The only outbound request this app makes to anything but a peer, permitted
-/// by amendment A1 in `docs/ARCHITECTURAL_INVARIANTS.md` on terms this function
-/// has to keep: it runs when a person asks and never on a timer or at startup;
-/// it sends no device id, install id, or anything identifying; and the answer is
-/// a version string that nothing acts on. There is no download and no install.
+/// One of the two outbound requests this app makes to anything but a peer --
+/// [`pb_download_update`] is the other -- permitted by amendment A1 in
+/// `docs/ARCHITECTURAL_INVARIANTS.md` on terms this function has to keep: it
+/// runs when a person asks and never on a timer or at startup; it sends no
+/// device id, install id, or anything identifying; and the answer is a version
+/// string that nothing acts on. Checking downloads nothing and installs
+/// nothing; a download is a separate request a person makes after it.
 ///
 /// Being unable to reach the feed is reported as `reachable: false`, not as an
 /// error — offline is an ordinary state for this app, and nothing here is
@@ -140,6 +143,31 @@ pub extern "C" fn pb_check_updates() -> *mut c_char {
             }),
         }))
     })
+}
+
+/// Download the newest release for this platform into a folder the person
+/// chose: `{dir}` → `{ok, downloaded, current, latest, path?, name?, bytes?,
+/// reason?}`. **Requires an explicit request.**
+///
+/// Permitted by amendments A3 and A4 in `docs/ARCHITECTURAL_INVARIANTS.md`,
+/// and the same sequence as `peerbeam download-update`: a machine that can
+/// never be served is refused before anything is asked of the network; the
+/// release check decides which version, never the caller; and the file is
+/// verified against the project's signed checksums before it is offered. It
+/// writes one file and stops -- it does not install, open or run it.
+///
+/// `dir` must be absolute: the folder the person picked. Only one download
+/// runs at a time; a second is answered at once with `downloaded: false`.
+/// While it runs, progress arrives as throttled `update_download_progress`
+/// events with `done` and `total` (`null` when the server sent no length).
+/// A refusal, nothing newer, or being offline is an ordinary answer with a
+/// `reason`, not an error; only a request without a usable `dir` is.
+///
+/// # Safety
+/// `json` must be null or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn pb_download_update(json: *const c_char) -> *mut c_char {
+    guard(|| error::envelope((|| update::download(&read_json(json)?))()))
 }
 
 /// Initialise the engine. `config_json` may be empty for defaults.
