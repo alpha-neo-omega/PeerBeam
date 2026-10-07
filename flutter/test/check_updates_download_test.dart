@@ -5,6 +5,9 @@ import 'dart:async';
 // the folder dialog without a real one.
 // ignore: depend_on_referenced_packages
 import 'package:file_selector_platform_interface/file_selector_platform_interface.dart';
+// The same for path_provider_platform_interface: resolved through path_provider.
+// ignore: depend_on_referenced_packages
+import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:peerbeam/features/settings/check_updates_tile.dart';
@@ -24,6 +27,17 @@ import 'sdk/fake_peerbeam.dart';
 /// a location that person chose"), and the file is never opened -- the folder
 /// is (condition 4).
 void main() {
+  // Where Downloads is, answered at once and the same on every host. The real
+  // lookup is a platform call, and on a macOS runner it never answered under
+  // the test clock -- so the tile waited on it for ever and the folder picker
+  // was never reached. The instance is process-global, so it is put back.
+  late PathProviderPlatform realPaths;
+  setUp(() {
+    realPaths = PathProviderPlatform.instance;
+    PathProviderPlatform.instance = _Paths();
+  });
+  tearDown(() => PathProviderPlatform.instance = realPaths);
+
   const available = UpdateCheck(
     reachable: true,
     current: '0.9.0',
@@ -128,6 +142,11 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(picker.asked, 1);
+      expect(
+        picker.openedAt,
+        '/home/me/Downloads',
+        reason: 'the picker starts where downloads go',
+      );
       expect(fake.calls, contains('downloadUpdate:$folder'));
     },
     variant: TargetPlatformVariant.desktop(),
@@ -279,6 +298,7 @@ class _Picker extends FileSelectorPlatform {
 
   final String? answer;
   int asked = 0;
+  String? openedAt;
 
   @override
   Future<String?> getDirectoryPath({
@@ -286,6 +306,12 @@ class _Picker extends FileSelectorPlatform {
     String? confirmButtonText,
   }) async {
     asked++;
+    openedAt = initialDirectory;
     return answer;
   }
+}
+
+class _Paths extends PathProviderPlatform {
+  @override
+  Future<String?> getDownloadsPath() async => '/home/me/Downloads';
 }
