@@ -1,11 +1,15 @@
-//! Asking, once, whether a newer release exists.
+//! Asking, once, whether a newer release exists, and fetching it, verified,
+//! when a person asks for that too.
 //!
 //! # What this is allowed to be
 //!
 //! Amendment **A1** in `docs/ARCHITECTURAL_INVARIANTS.md` narrows invariant I4
 //! (which forbids phone-home) to permit exactly this: one HTTPS GET, made only
 //! when a person asks for it, returning a version string the app renders and
-//! acts on in no other way.
+//! acts on in no other way. Amendment **A3**, with **A4** for its redirect,
+//! permits one thing further: fetching the release that version names, which
+//! [`download`] does and [`verify`] proves before the file is kept. Each of
+//! those modules names the conditions it keeps.
 //!
 //! The conditions are not style preferences, they are the terms the amendment
 //! was granted on:
@@ -13,10 +17,13 @@
 //! * **No identifiers.** Nothing here sends a device id, an install id, or any
 //!   PeerBeam-specific header. What the server learns is what a bare HTTPS
 //!   request unavoidably tells it.
-//! * **Inert response.** [`Release`] is a version and a URL. Nothing downloads,
-//!   nothing installs, no behaviour anywhere changes on the strength of it —
-//!   and the URL is compiled in rather than read from the response, so the
-//!   document cannot send anyone anywhere. See [`newest`].
+//! * **Inert response.** [`Release`] is a version and a URL. Nothing installs
+//!   and no behaviour anywhere changes on the strength of it. The version is
+//!   the one thing a caller may act on beyond showing it, and only by handing
+//!   it to [`download::fetch`] when a person asked for that too, under
+//!   amendment A3, which amends this condition. The URL is compiled in rather
+//!   than read from the response, so the document cannot send anyone
+//!   anywhere. See [`newest`].
 //! * **Never a precondition.** Every failure is a plain `Err` the caller is
 //!   expected to shrug at. Offline is normal for this app.
 //! * **Opt-in per use.** There is no timer and no constructor that starts
@@ -44,6 +51,7 @@
 
 pub mod artifact;
 pub mod download;
+pub mod newest;
 pub mod verify;
 
 use serde::Deserialize;

@@ -1417,6 +1417,62 @@ class SaveRule {
 /// a refused connection. That is not an error and must not be shown as one:
 /// this app is expected to work with no route out, and amendment A1 makes
 /// "never a precondition" a condition of the check existing at all.
+/// What one `pb_download_update` came to: a verified file on disk, nothing
+/// newer to fetch, or the reason nothing was written.
+///
+/// The fields are the ones `peerbeam download-update --json` prints, so the
+/// GUI and the CLI describe the same download the same way.
+class UpdateDownload {
+  /// Nothing went wrong: a file was written, or there was nothing newer.
+  final bool ok;
+
+  /// Whether a verified file was written. Only ever true when the engine says
+  /// so -- see [UpdateDownload.fromJson].
+  final bool downloaded;
+
+  /// The version this build is.
+  final String current;
+
+  /// The newest published version, when the release list was reached.
+  final String? latest;
+
+  /// Where the verified file was written, when [downloaded].
+  final String? path;
+
+  /// The file's name, when [downloaded].
+  final String? name;
+
+  /// The file's size in bytes, when [downloaded].
+  final int? bytes;
+
+  /// Why nothing was written, when not [downloaded].
+  final String? reason;
+
+  const UpdateDownload({
+    required this.ok,
+    required this.downloaded,
+    required this.current,
+    this.latest,
+    this.path,
+    this.name,
+    this.bytes,
+    this.reason,
+  });
+
+  /// Missing booleans read as false: a reply that does not *say* a file was
+  /// written is never taken to mean one was.
+  factory UpdateDownload.fromJson(Map<String, dynamic> j) => UpdateDownload(
+    ok: (j['ok'] as bool?) ?? false,
+    downloaded: (j['downloaded'] as bool?) ?? false,
+    current: (j['current'] as String?) ?? 'unknown',
+    latest: j['latest'] as String?,
+    path: j['path'] as String?,
+    name: j['name'] as String?,
+    bytes: (j['bytes'] as num?)?.toInt(),
+    reason: j['reason'] as String?,
+  );
+}
+
 class UpdateCheck {
   /// Whether the release feed answered.
   final bool reachable;

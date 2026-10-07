@@ -6,7 +6,106 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **Download a release from the app.** When **Check for updates** in Settings
+  finds a newer release, it now offers **Download**. Pressing it asks where to
+  save the file -- starting at Downloads -- and fetches nothing unless a folder
+  is chosen. The file is the right one for this machine and is checked against
+  the project's signature before it is kept, exactly as `peerbeam
+  download-update` does; both now run one shared sequence in the engine, so they
+  cannot differ in what they fetch, check or refuse. Progress shows as a
+  percentage. PeerBeam still never installs anything: when the download is done
+  it can show the folder, but it never opens the file, because the system would
+  hand a `.deb`, `.rpm` or `.dmg` straight to an installer. A check never starts
+  a download by itself, a refusal says why in the tile, and phones are offered
+  no download (Android updates through its own install).
+- **The release job is tested.** `scripts/test-release-workflow.sh` runs its
+  steps, read out of `release.yml`, against fake artifacts with `gh` faked
+  out, and checks what would have been published for no key, a good key and
+  three kinds of bad one. CI runs it on every push. The job runs once per tag
+  and cannot be tried without publishing, so until now every defect in it was
+  found in production.
+
+### Changed
+- **`peerbeam download-update` exits non-zero when it did not write a verified
+  file.** In v0.12.1 it exited `0` in every case, including a failed signature
+  check. So `peerbeam download-update --to DIR && install DIR/*` ran the install
+  after a refusal, on whatever was already in `DIR`, and a refusal that may have
+  been an attack was invisible to automation. The new codes:
+  - `0`: a verified file was written, or there was nothing newer to write;
+  - `4`: the release feed or GitHub could not be reached;
+  - `5`: the download failed verification, or broke the redirect or host rule;
+  - `8`: this machine has no artifact to fetch;
+  - `1`: the file could not be written.
+
+  Offline stays an ordinary state: nothing retries or nags. But it is no longer
+  reported as success, and it never shares a code with a refusal. `docs/CLI.md`
+  documents the codes and a script that installs only the file the command
+  names.
+- **`download-update` refuses a machine it can never serve before it makes any
+  request.** A tarball or source build, Android, or an unrecognised
+  architecture used to ask the release feed first. It then refused, or said
+  "already newest", depending on the day. It now refuses at once with exit `8`,
+  and contacts nothing.
+- **`download-update` reports its failures on stderr**, on the same `error:`
+  line every other command uses, so `--quiet` no longer hides them. With
+  `--json`, every run still prints exactly one `update_download` event, and that
+  event now always carries `ok`, `downloaded`, `current` and `latest`. When no
+  release was published, `--json` used to print a line of plain text instead.
+
 ### Fixed
+- **A release "version" that is not one is refused before it can name a URL or
+  a file.** The version a download fetches comes from the release feed, a
+  served document, and nothing checked its shape: the version comparison reads
+  any unparseable part as 0, so a feed naming `99.0.0/../../x` counted as newer,
+  and v0.12.1 would have built `peerbeam-99.0.0/../../x-amd64.deb` from it. It
+  was never exploitable -- a file is kept only once its exact name appears in
+  the *signed* checksum list -- but amendment A3 promises that the feed may say
+  which version is newest and never where to fetch anything, and a crafted
+  version could still steer the request to another path on `github.com`. A
+  version must now be `MAJOR.MINOR.PATCH` with an optional pre-release suffix,
+  checked before anything else, and `download-update` exits `5` for one that is
+  not, with the other refusals.
+- **The engine's C ABI test runs instead of skipping.** `tests/ffi.rs` loads
+  the built library and calls it by name, the way the app does, but it looked
+  only where `cargo build` puts the library, and `cargo test` puts it beside the
+  test binary. CI tests before it builds, so the test printed "skip" and passed
+  on every fresh run. It now finds the library the run just built.
+- **`docs/SECURITY.md` no longer says that nothing downloads.** Amendment A3's
+  eighth condition required that sentence to be corrected in the change that
+  shipped `peerbeam download-update`, and v0.12.1 shipped without the
+  correction. The published security document still called the release check
+  the one request PeerBeam makes to anything that is not a peer, and never
+  mentioned the download.
+
+  It now covers the download too: what it fetches and from where, the redirect
+  list, the signature chain, what is kept and what is deleted, what the
+  requests disclose, and that it installs nothing.
+
+  The same claim, either "the one request" or "nothing downloads", is corrected
+  in `docs/FINAL_SECURITY_REVIEW.md`, `docs/ARCHITECTURE.md`,
+  `peerbeam check-updates --help` and the `peerbeam-update` crate docs.
+- **A download's redirected request no longer sends a `Referer`.** The HTTP
+  client adds one to every redirect it follows by default. On the hop to
+  `release-assets.githubusercontent.com` it named the GitHub URL it came from,
+  and so the product. A1 condition 2, which A3 carries to the download, allows
+  only the User-Agent to name the product and nothing a bare GET does not
+  unavoidably carry. A test now checks that a redirected request carries
+  exactly the headers the first one did.
+- **A download diverted off the redirect allowlist now says so.** The redirect
+  policy used to *stop* at a hop it refused, and the HTTP client hands a
+  stopped 3xx back as the response. So the redirect's own body was verified as
+  though it were the file, and a diverted download read as a bad signature.
+  Nothing was followed and nothing was kept, but the message was wrong. A4
+  condition 4 forbids that: a diverted download and a bad day must not read the
+  same. Now:
+  - a refused hop ends the fetch with an error naming the host it pointed at;
+  - a hop down to plain http says so;
+  - too many hops reads as a fetch that could not complete (exit `4`), not as
+    a diversion;
+  - a 3xx with no `Location` is no longer taken for the file.
+
+  `download-update` exits `5` for either refusal.
 - **A message sent just before a session closed could still be lost — on
   arrival, this time.** 0.12.0 made a closing session flush its channels
   before closing the connection, so the last frame always reached the peer.
@@ -43,14 +142,6 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   have been false since v0.12.1. The guide now shows how to check
   `SHA256SUMS.minisig` and where to get the key to check it against, and the
   roadmap marks the download built.
-
-### Added
-- **The release job is tested.** `scripts/test-release-workflow.sh` runs its
-  steps, read out of `release.yml`, against fake artifacts with `gh` faked
-  out, and checks what would have been published for no key, a good key and
-  three kinds of bad one. CI runs it on every push. The job runs once per tag
-  and cannot be tried without publishing, so until now every defect in it was
-  found in production.
 
 ## [0.12.1] - 2026-09-27
 

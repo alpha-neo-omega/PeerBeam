@@ -99,6 +99,13 @@ sealed class BridgeEvent {
                 )
               : null,
         );
+      case 'update_download_progress':
+        // Flat fields. `total` stays null when the server sent no length:
+        // zero would read as 0% for ever.
+        return UpdateDownloadProgress(
+          done: (j['done'] as num?)?.toInt() ?? 0,
+          total: (j['total'] as num?)?.toInt(),
+        );
       default:
         return null;
     }
@@ -316,6 +323,18 @@ class DeviceResync extends BridgeEvent {
 }
 
 /// A chat message received from a peer.
+/// How far a release download has got. Emitted by `pb_download_update` while
+/// it runs, throttled; there is at most one download at a time.
+class UpdateDownloadProgress extends BridgeEvent {
+  /// Bytes of the artifact received so far.
+  final int done;
+
+  /// The artifact's size, or null when the server did not say.
+  final int? total;
+
+  const UpdateDownloadProgress({required this.done, this.total});
+}
+
 class ChatReceived extends BridgeEvent {
   final ChatMessage message;
   const ChatReceived(this.message);

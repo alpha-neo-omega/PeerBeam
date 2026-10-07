@@ -695,13 +695,17 @@ clean end, and a mismatch is an error too. Both exit non-zero. That exit code is
 the only signal a script gets, and `peerbeam pipe --listen > f` without checking
 it will happily trust a bad `f`.
 
-## The one request that is not to a peer
+## The two requests that are not to a peer
 
 Everything else PeerBeam sends goes to a peer, or onto the local network looking
 for one — the Tailscale discovery source asks `tailscaled` on this machine, over
-its Unix socket or the `tailscale` binary, and does not leave it. There is one
-exception, and it is written down here because a privacy claim with an
-unmentioned exception in it is worth nothing.
+its Unix socket or the `tailscale` binary, and does not leave it. There are two
+exceptions, both made only because a person asked. The first is the release
+check. The second, from the CLI only, is a download of the release that check
+found. They are written down here because a privacy claim with an unmentioned
+exception in it is worth nothing.
+
+### The release check
 
 `peerbeam check-updates`, and the **Check for updates** button in the app's About
 section, make one HTTPS GET to the project's own update manifest
@@ -715,10 +719,16 @@ request on an origin the project controls rather than a third-party API, which
 also means one fewer party learning that somebody, somewhere, opened PeerBeam.
 
 **Only when a person asks.** There is no timer, no check at launch, and no check
-as a side effect of anything else: `peerbeam_update::check` has exactly two
-callers, the CLI command and the FFI entry point behind that button, and pressing
-the button is the opt-in each time. Using PeerBeam therefore never tells a server
-that PeerBeam is being used.
+as a side effect of anything else. `peerbeam_update::check` has three callers,
+and a person is behind each:
+- `peerbeam check-updates`;
+- the FFI entry point behind the app's **Check** button;
+- `peerbeam_update::newest::download_newest`, which asks it which release to
+  fetch, and which runs only when someone runs `peerbeam download-update` or
+  presses **Download** in the app.
+
+Running a command, or pressing a button, is the opt-in each time. Using
+PeerBeam therefore never tells a server that PeerBeam is being used.
 
 **What the request unavoidably discloses.** The site's host — Cloudflare Pages —
 sees the connecting IP address, and so an approximate location, and the time of
@@ -735,9 +745,12 @@ is kept because omitting it would not reduce what travels, and a request
 carrying none is itself distinctive. There is no query string either, so the
 request does not say which build is asking: the manifest is asked what the newest release is, and the
 comparison against the running version happens here. The answer is inert as
-well. A `Release` is a version string and a URL; nothing downloads, installs or
-changes behaviour on the strength of what the server said, and there is no retry
-and no fallback to a second host — a caller that wants to ask again asks again.
+well. A `Release` is a version string and a URL. Nothing installs, runs or
+changes behaviour on the strength of what the server said. The version is
+displayed, and the only other thing it can ever do is decide which release a
+download fetches, when a person asks for one too -- `peerbeam download-update`,
+or **Download** in the app ([below](#downloading-a-release)). There is no retry and no fallback
+to a second host — a caller that wants to ask again asks again.
 
 The URL a person is offered is **compiled into the app**, not read out of the
 response. The manifest publishes one too, for other readers, and this ignores it:
@@ -759,6 +772,103 @@ one of them is outside A1 and back in conflict with I4. The matching non-goal in
 [VISION.md](VISION.md) is narrowed in the same change, because leaving a
 published claim that the shipped build makes false would be worse than the check
 itself.
+
+### Downloading a release
+
+`peerbeam download-update`, and **Download** in the app's Settings, fetch the
+newest release for this machine and write it to a directory the person chose.
+Both run `peerbeam_update::newest::download_newest`, the only caller of
+`peerbeam_update::download::fetch`, so the two cannot differ in what they
+fetch, check or refuse. Nothing fetches a release on a timer, at startup, as a
+follow-on to a check, or in the background so that one is ready.
+
+In the app, **Download** appears only once a check has found a newer release,
+and pressing it fetches nothing until the person has picked a folder; the
+engine refuses a folder that is missing or relative. One download runs at a
+time. When it is done the app can show the *folder*, never the file: handing
+the file to the system's default opener would install a `.deb` or `.rpm`, or
+mount a `.dmg`. Phones are offered no download at all.
+
+**Nothing served chooses what is fetched.** The manifest may say *which version*
+is newest, and nothing else in it is used. The app builds the address itself,
+from three parts:
+- a compiled-in base,
+  `https://github.com/alpha-neo-omega/PeerBeam/releases/download`;
+- the tag, `v<version>`;
+- a file name that `peerbeam-update` derives from what this build is: the
+  universal `.dmg` on macOS, the portable `.zip` on Windows. On Linux it is the
+  `.deb` or `.rpm` when `dpkg` or `rpm` says it owns the running binary, and
+  the `.AppImage` when `$APPIMAGE` is set.
+
+Anything else is refused before any request is made: a tarball install (there is
+no way to tell one from a source build), a binary two package managers both
+claim, Android or another system with no desktop release, or an architecture
+with no published build. A download only fetches a version newer than the one
+running, so the manifest cannot talk anyone into a downgrade. Nor can it pass a
+path off as a version: the version must be `MAJOR.MINOR.PATCH`, with an
+optional pre-release suffix of letters, digits, hyphens and dots, before it is
+put into a URL or a file name. Anything else is refused at that point.
+
+**Redirects stay on a compiled-in list.** GitHub answers each fetch with a
+redirect to `release-assets.githubusercontent.com`. A redirect is
+followed only to that host or to `github.com`, a two-entry list that is a
+literal in the binary with no wildcard (amendment A4). It is followed only over
+`https`, and at most five times. A redirect anywhere else is refused with an
+error that names the host it pointed at. A redirect down to plain `http` is
+refused with an error that says so. In both cases the fetch stops before the
+other host is contacted, and neither refusal reads as being offline (A4
+condition 4). A redirect with nowhere to go is not taken for the file either.
+
+**Verified before it is kept.** Three files are fetched, in this order:
+`SHA256SUMS`, its minisign signature `SHA256SUMS.minisig`, and only then the
+artifact.
+- **The signature is checked before any artifact byte is requested**, against a
+  public key compiled into the binary (`peerbeam_update::verify::SIGNING_PUBLIC_KEY`).
+  Only minisign's prehashed Ed25519 form is accepted. The function that could
+  take a different key is private, so there is no path that verifies against
+  anything else.
+- **The signed list must name the artifact by its exact file name.** Names carry
+  the version, so an older release's signed list cannot vouch for a newer file.
+- **The artifact streams to `<name>.part`** beside its destination. It is hashed
+  as it arrives and never held in memory. It is renamed to its real name only
+  when its SHA-256 matches the signed entry, and bytes that do not verify are
+  deleted.
+
+Nothing is given a release's file name before it has verified. An interrupted
+download can leave a `.part` behind; it is never renamed, and the next attempt
+overwrites it. No flag, prompt or setting skips any of this.
+
+**It writes one file and stops.** It does not install, unpack, mark executable,
+run, or elevate anything, and it does not touch the running PeerBeam. The person
+installs the file exactly as they would one from the website.
+
+**What it discloses.** The three fetches go to `github.com`, and through its
+redirects to `release-assets.githubusercontent.com`. That is a second party,
+which the check alone never contacts. The requests carry what the check's
+request carries and nothing more: the bare `PeerBeam` User-Agent, no version,
+no identifier, no cookie. The hop GitHub redirects to carries no `Referer`
+either, although the HTTP client adds one by default. PeerBeam adds no query
+string of its own; the redirect URL GitHub hands back carries GitHub's. The path itself says which version is
+being fetched and which file. That reveals the platform, the architecture and,
+on Linux, the package format. It is the price of fetching the right file, and
+A3 records it rather than leaving it for an audit to find.
+
+**A refusal is never reported as success.** `download-update` exits `0` only
+when a verified file was written or there was nothing newer. A download that
+fails verification, breaks the redirect or host rule, or is handed a "version"
+that is not one, exits `5`. Being offline exits `4`, never the same code: one
+may be an attack and the other is a bad day ([CLI.md](CLI.md)). In the app, a
+refusal is a line in the Settings tile saying why, with no folder to show.
+
+**The manifest is not signed**, and nothing above depends on it being signed.
+Whoever can alter it can stop a download from happening, by naming an older
+version, which reads as "already newest". They cannot make a file land that the
+project did not sign.
+
+**This is amendment A3, with A4 for the redirect**, recorded in
+[the invariants](ARCHITECTURAL_INVARIANTS.md#amendments) rather than taken
+quietly. A3 sets eight binding conditions and A4 sets five. They hold together,
+and a build that drops any one of them is back in conflict with I4.
 
 ## Threat notes / scope
 
@@ -783,6 +893,35 @@ itself.
   pin → trust → reject-on-key-change; `SecureLink` rejects replayed and
   tampered frames; safe write refuses to overwrite and leaves `.part` on
   integrity failure.
+- **Release download**:
+  - `peerbeam-update`'s `verify` tests run the signature chain against
+    throwaway keys. A real signature verifies. A tampered list, another key's
+    signature, a garbage signature or key, an unlisted file and one changed
+    artifact byte are each refused.
+  - Its `artifact` tests check every file name produced against the files a
+    real release published.
+  - Its `download` tests pin the redirect rule: the allowlist, the https rule,
+    the hop bound, and host parsing, lookalikes included. Through the real
+    client and a local server, they check two more things. A diverted or
+    downgraded redirect is refused by name, and a redirect with nowhere to go
+    is not taken for the file. A redirected request also carries no header the
+    first one did not.
+  - Its `artifact` tests refuse a "version" carrying anything but a plain
+    release version -- `99.0.0/../../x` among them -- and `fetch` refuses one
+    before it resolves anything else.
+  - `peerbeam-cli/tests/update_cli.rs` pins `download-update`'s exit codes
+    without a network.
+  - `peerbeam-ffi`'s `update` tests pin what is the app's own: a folder that is
+    absolute and present, one download at a time, and progress whose unknown
+    length is `null`. `tests/ffi.rs` calls `pb_download_update` through the C
+    ABI, as Dart does.
+  - The app's `check_updates_download_test.dart` pins the tile's terms on
+    Linux, macOS and Windows: a check never starts a download or opens the
+    folder picker, nothing is fetched without a chosen folder, Show folder is
+    handed the folder and never the file, and a phone is offered nothing. Each
+    of those was mutated into the code and caught.
+  - `peerbeam-update/tests/live_release.rs` runs the whole chain by hand,
+    against the real release and the real key.
 
 ## Pairing code (optional first-contact verification)
 

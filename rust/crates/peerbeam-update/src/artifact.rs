@@ -107,9 +107,54 @@ pub enum ResolveError {
     #[error("no release is published for this machine's architecture")]
     UnsupportedArch,
 
-    /// The version string is empty or not a version.
+    /// The version string is empty.
     #[error("cannot build an artifact name for an empty version")]
     NoVersion,
+
+    /// The version string is not a plain release version.
+    ///
+    /// It arrives from the release manifest, a served document, and becomes
+    /// part of a URL and a file name, so a string carrying path separators or
+    /// anything else that is not `MAJOR.MINOR.PATCH[-PRERELEASE]` is refused
+    /// before it can be either -- A3 condition 2: a served document must not
+    /// say where to fetch anything.
+    #[error("the release list named {0:?}, which is not a version this build will fetch")]
+    NotAVersion(String),
+}
+
+/// The version part of a release tag, checked to be a plain release version.
+///
+/// Accepts `MAJOR.MINOR.PATCH` -- each one or more ASCII digits -- optionally
+/// followed by `-` and dot-separated pre-release identifiers made of ASCII
+/// letters, digits and hyphens. A leading `v`, the tag's spelling, is stripped.
+/// Nothing else gets through: no path separators, no empty identifiers (so no
+/// `..`), no build metadata, no whitespace inside.
+///
+/// The version comes from the release manifest, a served document, and is the
+/// one piece of what the server says that ends up in a URL and a file name. A3
+/// condition 2 says a served document may say *which* version is newest but
+/// never *where to fetch anything*; this is what keeps a "version" from
+/// carrying a path. The signature check would still refuse whatever such a
+/// path pointed at -- this stops it being asked for at all.
+pub fn release_version(version: &str) -> Result<&str, ResolveError> {
+    let v = version.trim().trim_start_matches('v');
+    if v.is_empty() {
+        return Err(ResolveError::NoVersion);
+    }
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let ident =
+        |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let core_ok = core.split('.').count() == 3 && core.split('.').all(digits);
+    let pre_ok = pre.is_none_or(|p| p.split('.').all(ident));
+    if core_ok && pre_ok {
+        Ok(v)
+    } else {
+        Err(ResolveError::NotAVersion(version.to_string()))
+    }
 }
 
 /// The basename the release publishes for this combination.
@@ -126,10 +171,7 @@ pub fn asset_name(
     linux: Option<LinuxFormat>,
     version: &str,
 ) -> Result<String, ResolveError> {
-    let v = version.trim().trim_start_matches('v');
-    if v.is_empty() {
-        return Err(ResolveError::NoVersion);
-    }
+    let v = release_version(version)?;
     Ok(match os {
         // One universal DMG, both architectures inside it, so `arch` does not
         // appear -- `package-macos.sh:68`.
@@ -462,5 +504,57 @@ mod tests {
             ),
             Err(e) => assert!(!e.to_string().is_empty()),
         }
+    }
+
+    /// The version string comes from the release manifest, a served document,
+    /// and it becomes part of a URL and of a file name. Anything that is not a
+    /// plain release version is refused before it can be either.
+    ///
+    /// The break this catches: `is_newer` reads every unparseable part as 0,
+    /// so a manifest serving `99.0.0/../../x` counts as "newer" -- and without
+    /// this check that string reached `format!` and named both the request
+    /// path and the file on disk.
+    #[test]
+    fn a_version_carrying_path_material_is_refused() {
+        for hostile in [
+            "99.0.0/../../x",
+            "1.0.0\\..\\x",
+            "../1.0.0",
+            "1.0.0/",
+            "1.0.0-rc/1",
+            "1.0.0-rc..1",
+            "1.0.0-",
+            "1.0",
+            "1.0.0.0",
+            "1.0.0+build",
+            "1..0",
+            "a.b.c",
+            "1.0.0 x",
+        ] {
+            let got = asset_name(Os::Linux, Arch::X86_64, Some(LinuxFormat::Deb), hostile);
+            assert!(
+                matches!(got, Err(ResolveError::NotAVersion(_))),
+                "{hostile:?} should be refused as not a version, got {got:?}"
+            );
+        }
+    }
+
+    /// The other side of the same check: real versions, including a `v`
+    /// prefix and a pre-release suffix, still name the file the packaging
+    /// scripts publish. An over-strict grammar would break updates outright.
+    #[test]
+    fn plain_and_prerelease_versions_still_name_their_artifacts() {
+        assert_eq!(
+            asset_name(Os::Linux, Arch::X86_64, Some(LinuxFormat::Deb), "0.12.1").unwrap(),
+            "peerbeam-0.12.1-amd64.deb"
+        );
+        assert_eq!(
+            asset_name(Os::MacOs, Arch::Aarch64, None, "v0.12.1").unwrap(),
+            "PeerBeam-0.12.1.dmg"
+        );
+        assert_eq!(
+            asset_name(Os::Windows, Arch::X86_64, None, "1.0.0-rc.1").unwrap(),
+            "peerbeam-1.0.0-rc.1-windows-x64-portable.zip"
+        );
     }
 }

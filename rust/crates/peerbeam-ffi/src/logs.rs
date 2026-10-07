@@ -99,7 +99,13 @@ mod export_path_tests {
     /// sandbox cannot write — so an export with no path given failed on the one
     /// platform whose users have no shell to give one from. The default now
     /// comes from the directory the host configured.
+    ///
+    /// Serial because the data directory is a process-wide static. The
+    /// settings and init tests point it at tempdirs of their own. If one of
+    /// them runs between `configure` and `export` here, the export goes to
+    /// that test's directory, or to nowhere once that directory is deleted.
     #[test]
+    #[serial_test::serial]
     fn the_default_export_path_follows_the_configured_data_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         crate::settings::configure(&dir.path().to_string_lossy());
@@ -117,6 +123,7 @@ mod export_path_tests {
 
     /// An explicit path still wins: the default is a fallback, not a policy.
     #[test]
+    #[serial_test::serial]
     fn an_explicit_path_is_honoured() {
         let dir = tempfile::tempdir().expect("tempdir");
         crate::settings::configure(&dir.path().to_string_lossy());

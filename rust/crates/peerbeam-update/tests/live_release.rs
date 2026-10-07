@@ -48,11 +48,12 @@ async fn the_redirect_to_githubusercontent_is_followed() {
                 "expected a 404 for the missing signature, got: {why}"
             );
         }
-        // The failure A4 exists to prevent.
+        // The failure A4 exists to prevent: GitHub now serves from a host the
+        // list does not name.
         DownloadError::RedirectedOffHost { ref host } => panic!(
-            "GitHub redirected somewhere the allowlist does not cover. \
-             Allowed: {host}. Re-check where release assets are served from \
-             and amend REDIRECT_ALLOWLIST with evidence (A4 condition 2)."
+            "GitHub redirected to {host}, which the allowlist ({REDIRECT_ALLOWLIST:?}) \
+             does not cover. Re-check where release assets are served from and \
+             amend REDIRECT_ALLOWLIST with evidence (A4 condition 2)."
         ),
         // On a machine where the Linux package format cannot be established
         // this is correct behaviour, not a failure of the allowlist.

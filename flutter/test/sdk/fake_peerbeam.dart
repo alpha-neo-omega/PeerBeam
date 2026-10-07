@@ -1053,6 +1053,28 @@ class FakePeerBeam implements PeerBeamApi {
     return updateCheck;
   }
 
+  /// What [downloadUpdate] answers. Defaults to "nothing newer to fetch".
+  UpdateDownload updateDownload = const UpdateDownload(
+    ok: true,
+    downloaded: false,
+    current: '0.9.0',
+    latest: '0.9.0',
+    reason: 'already newest',
+  );
+
+  /// When set, [downloadUpdate] holds its answer until this completes, so a
+  /// test can emit progress while the download is "running".
+  Completer<void>? downloadGate;
+
+  @override
+  Future<UpdateDownload> downloadUpdate(String dir) async {
+    _maybeFail('downloadUpdate');
+    calls.add('downloadUpdate:$dir');
+    final gate = downloadGate;
+    if (gate != null) await gate.future;
+    return updateDownload;
+  }
+
   @override
   Future<List<LogLine>> logs({int limit = 200}) async {
     _maybeFail('logs');

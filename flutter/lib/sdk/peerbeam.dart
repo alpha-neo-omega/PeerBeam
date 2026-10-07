@@ -416,6 +416,18 @@ abstract class PeerBeamApi {
   /// thrown error — offline is ordinary here.
   Future<UpdateCheck> checkForUpdates();
 
+  /// Fetch the newest release for this platform into [dir], verified against
+  /// the project's signed checksums before it is offered.
+  ///
+  /// **Only ever on a person's request**, and on amendment A3's terms: never
+  /// automatically, never as a side effect of [checkForUpdates], and [dir]
+  /// must be a folder that person chose. It writes one file and stops -- it
+  /// does not install, open or run it. Progress arrives as
+  /// [UpdateDownloadProgress] events while it runs. A refusal, or nothing
+  /// newer, comes back as [UpdateDownload.downloaded] false with a reason, not
+  /// as a thrown error.
+  Future<UpdateDownload> downloadUpdate(String dir);
+
   /// The groups this device is in, and the invitations waiting for an answer.
   ///
   /// Both in one call because an invitation is the only way into a group: one
@@ -1034,6 +1046,14 @@ class PeerBeam implements PeerBeamApi {
   @override
   Future<UpdateCheck> checkForUpdates() async =>
       UpdateCheck.fromJson(await _off('pb_check_updates'));
+
+  // Off the UI isolate: a download runs for as long as the network takes, and
+  // the progress it reports arrives on the event stream meanwhile.
+  @override
+  Future<UpdateDownload> downloadUpdate(String dir) async =>
+      UpdateDownload.fromJson(
+        await _off('pb_download_update', jsonEncode({'dir': dir})),
+      );
 
   @override
   Future<List<Space>> spaces() async {
