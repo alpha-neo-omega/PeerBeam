@@ -6414,7 +6414,7 @@ const STAGING_PROGRESS_STEP_DIVISOR: u64 = 100;
 /// finishes rather than stopping at 99%). Only the first such report: a source
 /// still being appended to keeps reporting past `total`, and treating every
 /// one of those as "final" would restore the flood at the worst moment.
-struct StagingThrottle {
+pub(crate) struct StagingThrottle {
     /// Elapsed-time floor. A field rather than a constant so a test can set it
     /// to zero and exercise the percentage leg in isolation.
     interval: Duration,
@@ -6427,7 +6427,7 @@ struct StagingThrottle {
 }
 
 impl StagingThrottle {
-    fn new() -> StagingThrottle {
+    pub(crate) fn new() -> StagingThrottle {
         StagingThrottle {
             interval: STAGING_PROGRESS_INTERVAL,
             last: None,
@@ -6438,7 +6438,7 @@ impl StagingThrottle {
 
     /// Whether this report should be emitted — and, when it should, record it
     /// as the new baseline.
-    fn due(&mut self, done: u64, total: u64) -> bool {
+    pub(crate) fn due(&mut self, done: u64, total: u64) -> bool {
         let first = self.last.is_none();
         let finishing = !self.reached_total && total > 0 && done >= total;
         let spaced = self.last.is_some_and(|t| t.elapsed() >= self.interval);
