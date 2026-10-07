@@ -29,6 +29,7 @@ Flutter → FFI Bridge → Rust Public API → Application → TransferEngine
 uint32_t pb_abi_version(void);                 // integer, checked at startup
 char*    pb_version_json(void);                // {"abi","semver"}
 char*    pb_check_updates(void);               // {reachable,current,latest?,update_available?,url?}
+char*    pb_download_update(const char* json); // {dir} → {ok,downloaded,current,latest,path?,name?,bytes?,reason?}
 char*    pb_init(const char* config_json);     // "" → defaults
 void     pb_shutdown(void);
 void     pb_set_event_callback(void (*cb)(const char*));  // null clears
@@ -60,8 +61,8 @@ port actually bound (`peerbeam_config::DiscoveryConfig::port`, default
 `start_discovery` has returned. Purely additive: `discovering` keeps its
 existing key and a caller that ignores `port` is unaffected.
 
-`pb_check_updates` is the only outbound request this app makes to anything but
-a peer, permitted by amendment A1 in
+`pb_check_updates` and `pb_download_update` are the only outbound requests this
+app makes to anything but a peer. The check is permitted by amendment A1 in
 [ARCHITECTURAL_INVARIANTS](ARCHITECTURAL_INVARIANTS.md) on terms it has to
 keep: it runs when a person asks and never on a timer or at startup, it sends
 no device id, install id or custom header — the only header naming this product
@@ -71,6 +72,19 @@ version string that nothing acts on — there is no download and no install.
 Being unable to reach the feed answers `{reachable:false, current, reason}`
 rather than failing: offline is an ordinary state for this app, and nothing
 here is allowed to become a precondition for using it.
+
+`pb_download_update({dir})` fetches the newest release for this platform into
+`dir`, verified against the project's signed checksums, on the terms of
+amendments A3 and A4. It runs `peerbeam_update::newest::download_newest`, the
+same sequence as `peerbeam download-update`, and answers the same JSON:
+`ok`, `downloaded`, `current` and `latest` always; `path`, `name` and `bytes`
+when a file was written; `reason` otherwise. A refusal, nothing newer, or
+being offline is an answer, not an error -- the only error is a request whose
+`dir` is missing or not absolute (`invalid_argument`), because the file may go
+only to a folder the person chose. One download runs at a time; a second is
+answered at once with `downloaded: false`. It writes one file and stops: it
+does not install, open or run what it fetched. While it runs it emits
+throttled `update_download_progress` events (see [Events](#events-no-polling)).
 
 ### Transfer (M2, additive — ABI still v1)
 
@@ -662,7 +676,9 @@ republishes to a broadcast `Stream`. Event types (growing per milestone):
 `device_added`, `device_updated`, `status_changed`, `latency_changed`,
 `device_removed`; (M2) `transfer_started/progress/paused/resumed/finished/
 failed`; (M3) `clipboard_updated`, `settings_changed`, `connection_changed`;
-(Phase B) `presence_updated`, `clipboard_received`.
+(Phase B) `presence_updated`, `clipboard_received`; (A3)
+`update_download_progress` `{done, total}`, where `total` is `null` when the
+server sent no length -- never 0, which would read as 0% for the whole download.
 
 The two clipboard events are **not** the same thing and a surface must not
 conflate them. `clipboard_updated` is the local slot bridge behind
@@ -678,10 +694,11 @@ background transfers continue across UI navigation. Most FFI functions are thin
 and non-blocking: they hand work to the runtime and the answer arrives as an
 event.
 
-### Seven that do block, and where they run
+### Eight that do block, and where they run
 
-This section used to end "Dart never blocks." That was not true. Seven entry
-points dial a peer and wait for the answer inside the call, and a synchronous
+This section used to end "Dart never blocks." That was not true. Eight entry
+points wait on the network inside the call -- six for a peer, and two for the
+release site or GitHub -- and a synchronous
 FFI call runs on whichever Dart isolate made it — so making them from the UI
 isolate froze the app for the whole round trip. The engine bounds three of them
 and that only bounds the freeze:
@@ -695,11 +712,12 @@ and that only bounds the freeze:
 | `pb_chat_mark_read` | a read receipt to be sent | the dial's own 30s |
 | `pb_chat_react` | a reaction to be sent | the dial's own 30s |
 | `pb_check_updates` | one HTTPS request | the request |
+| `pb_download_update` | a release download | 600s per request |
 
 `pb_chat_mark_read` was the worst of them in practice: unbounded, and fired
 every time a conversation was opened.
 
-The Dart SDK now runs exactly these seven on a background isolate
+The Dart SDK now runs exactly these eight on a background isolate
 (`lib/sdk/ffi/off_isolate.dart`), one per call so a 300s sync cannot queue
 behind a 10s browse. Everything else still runs inline, because for a local
 store read the isolate hop costs more than the work.
