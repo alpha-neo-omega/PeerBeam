@@ -55,6 +55,21 @@ void main() {
       );
     });
 
+    // The Download button reaches the engine through `_off`, the background
+    // isolate, by symbol name. A request with no usable folder is refused
+    // there -- before any network -- and arrives as the typed exception every
+    // caller already catches.
+    test('downloadUpdate without a usable folder is refused, typed', () async {
+      await expectLater(
+        api.downloadUpdate(''),
+        throwsA(isA<InvalidArgumentException>()),
+      );
+      await expectLater(
+        api.downloadUpdate('relative/folder'),
+        throwsA(isA<InvalidArgumentException>()),
+      );
+    });
+
     test('delivers engine events over the FFI callback', () async {
       await api.initialize();
       // `transfer_queued` is emitted synchronously when a send is registered —
