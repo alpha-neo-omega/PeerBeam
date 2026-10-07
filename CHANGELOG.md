@@ -6,6 +6,14 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+### Added
+- **The release job is tested.** `scripts/test-release-workflow.sh` runs its
+  steps, read out of `release.yml`, against fake artifacts with `gh` faked
+  out, and checks what would have been published for no key, a good key and
+  three kinds of bad one. CI runs it on every push. The job runs once per tag
+  and cannot be tried without publishing, so until now every defect in it was
+  found in production.
+
 ### Changed
 - **`peerbeam download-update` exits non-zero when it did not write a verified
   file.** In v0.12.1 it exited `0` in every case, including a failed signature
@@ -69,6 +77,42 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
   - a 3xx with no `Location` is no longer taken for the file.
 
   `download-update` exits `5` for either refusal.
+- **A message sent just before a session closed could still be lost — on
+  arrival, this time.** 0.12.0 made a closing session flush its channels
+  before closing the connection, so the last frame always reached the peer.
+  The peer could then drop it anyway: a close sends `Shutdown` on the control
+  stream *before* that flush, nothing orders two streams against each other,
+  and the receiving side stopped every channel the moment it read the
+  Shutdown, discarding whatever the sender had written last and it had not
+  yet read. The same dial-send-close paths were exposed (`chat send`,
+  `group invite`, clipboard push, `peerbeam identify`), and a declined file
+  is where it showed: the `FileDecline` went missing and the file read
+  "failed", at random on CI's Windows and macOS runners. The receiver now
+  reads each channel to its end before closing, as the session state machine
+  in `docs/STATE_MACHINES.md` always said it should.
+- **A signing key that does not work now stops the release, before anything
+  is deleted.** v0.12.1 was published without `SHA256SUMS.minisig` while the
+  workflow reported success: the secret held only the base64 line of the key
+  file, minisign could not load it, and the failure was swallowed — on
+  purpose, because signing ran *after* the step that deletes an existing
+  release, and failing there has destroyed good releases before. The file
+  list, `SHA256SUMS` and its signature are now all produced ahead of that
+  step, so a key that is configured but unusable fails the job with the
+  previous release untouched, and re-running it once the secret is fixed is
+  safe. A key that is not configured at all still publishes unsigned, with a
+  warning, as a fork does. Two other failures that used to strike after the
+  delete now strike before it: a run with no artifacts, and two artifacts
+  sharing a file name.
+- **`scripts/sign-release.sh` no longer skips signing when it has a key but no
+  `minisign`.** It looked for the binary before looking for a key, so "no key"
+  and "a key, and nothing to sign with" were the same warning and the same
+  success. With a key configured, a missing `minisign` is now an error.
+- `docs/GUIDE.md` said proving where a download came from needs a signature
+  "which PeerBeam does not yet have", and `docs/FEATURE_ROADMAP.md` still
+  listed the in-app download as blocked because "nothing signs" a release. Both
+  have been false since v0.12.1. The guide now shows how to check
+  `SHA256SUMS.minisig` and where to get the key to check it against, and the
+  roadmap marks the download built.
 
 ## [0.12.1] - 2026-09-27
 

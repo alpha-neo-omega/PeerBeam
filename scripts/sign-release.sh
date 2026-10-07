@@ -5,7 +5,11 @@
 #   scripts/sign-release.sh <path-to-SHA256SUMS> [tag]
 #
 # Writes <path>.minisig beside it, and prints the path on stdout so a caller
-# can attach it. Prints nothing and exits 0 when no key is available.
+# can attach it. Prints nothing and exits 0 when no key is available. Exits 1
+# when a key IS available and cannot be used — not a whole key file, not
+# loadable, no minisign to load it with, or a signature that does not verify
+# against MINISIGN_PUBLIC_KEY. release.yml runs this before it deletes
+# anything, so that stops the release rather than shipping it unsigned.
 #
 # ---------------------------------------------------------------------------
 # Why this exists
@@ -45,11 +49,6 @@ if [ ! -f "$sums" ]; then
   exit 1
 fi
 
-if ! command -v minisign >/dev/null 2>&1; then
-  echo "::warning::sign-release: minisign is not installed — publishing without a signature." >&2
-  exit 0
-fi
-
 # Resolve the key, and remember whether we made a temporary file so the trap
 # only ever deletes our own.
 keyfile=""
@@ -84,14 +83,16 @@ else
   exit 0
 fi
 
-# The trusted comment is signed, unlike the untrusted one, so it is the right
-# place for anything a verifier might want to trust. The tag is there so a
-# signature lifted from one release cannot be presented as another's without
-# the mismatch being visible to a person running `minisign -V`.
-#
-# `-W` writes no password prompt for an unencrypted key. A key with a password
-# cannot be used non-interactively, which is why CI's key is unencrypted and
-# the secret store is what protects it — see docs/RELEASE.md.
+# Only once there is a key does a missing minisign mean anything, and then it
+# is an error. This used to be checked first, as a warning and exit 0, which
+# made "no key" and "a key, but nothing to sign with" the same outcome: a
+# release that lost its install step would have published unsigned with the
+# key sitting right there.
+if ! command -v minisign >/dev/null 2>&1; then
+  echo "::error::sign-release: a minisign key is configured but minisign is not installed." >&2
+  exit 1
+fi
+
 # A minisign secret key file is two lines: an "untrusted comment:" header and
 # the base64 key. Checked here because the likely way this goes wrong is a
 # secret pasted without its comment line — which is exactly what cost v0.12.1

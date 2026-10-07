@@ -203,3 +203,20 @@ jobs:
           BIN=$(find flutter/build/macos -name peerbeam -type f -path "*MacOS*" | head -1)
           lipo -archs "$BIN"
           lipo -archs "$BIN" | grep -q x86_64 || { echo "::error::mac app is not universal"; exit 1; }
+
+  # The release job, run for real minus GitHub: its own steps, read out of
+  # release.yml, against fake artifacts with `gh` faked out. That job runs once
+  # per tag and cannot be tried without publishing, so until this existed every
+  # defect in it was found in production — three releases deleted and never
+  # put back, and v0.12.1 published unsigned while the job reported success.
+  # scripts/test-release-workflow.sh says what it holds the job to.
+  release-workflow:
+    name: Release job (simulated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # yq ships on the runner image; minisign does not.
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Simulate the release job
+        run: scripts/test-release-workflow.sh

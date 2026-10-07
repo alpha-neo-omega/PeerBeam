@@ -164,6 +164,14 @@ stateDiagram-v2
 Graceful `Shutdown` drains; a fatal error aborts. Either way the resume token is
 retained for a short window in case the peer reconnects (§7).
 
+As implemented, draining means each channel reads what the peer already sent,
+to the end of that channel's stream, before the session closes — bounded, like
+the closing side's own flush, for a peer that vanished mid-close. It matters
+because the closing side sends its `Shutdown` *before* flushing its channels,
+and QUIC orders nothing across streams: stopping on the Shutdown alone dropped
+whatever the peer had sent last. The table's final control ack is not
+implemented; the closing side does not wait for one.
+
 ## 7. Reconnect and Resume
 
 Reconnect re-establishes the *transport*; Resume re-attaches the *logical session

@@ -82,7 +82,9 @@ app will not fetch. The website download still works by hand, which is the
 situation today.
 
 A release with no key configured still publishes, unsigned. A missing secret is
-not a reason to withhold six platforms' artifacts.
+not a reason to withhold six platforms' artifacts. A key that is configured but
+does not work is a different case, and stops the release before anything is
+published or deleted — see step 2 below.
 
 ### Generating the key (once)
 
@@ -110,14 +112,18 @@ Then:
    the `MINISIGN_PUBLIC_KEY` repository *variable*. The release checks its own
    signature back against it before publishing.
 
-   **What a bad key does today:** `sign-release.sh` fails with an error in the
-   log naming the problem, and the release is **published without a
-   signature** — the job still reports success. It does not fail the release,
-   because the step that would fail runs after the old release has been
-   deleted, and failing there has destroyed good releases before (see the
-   comment on the publish step). So after tagging, **check that
-   `SHA256SUMS.minisig` is among the release's assets**; if it is missing, fix
-   the key and re-run the `release` job alone.
+   **What a bad key does:** the `release` job **fails at "Sign SHA256SUMS"**,
+   with an error annotation naming the problem — a secret holding only the
+   base64 line, bytes minisign cannot load, or a signature that does not
+   verify against `MINISIGN_PUBLIC_KEY`. Nothing is published and nothing is
+   deleted: signing runs before "Remove existing release", so a re-pushed tag
+   leaves the previous release exactly as it was. Fix the secret and re-run
+   the `release` job alone; the platform builds do not have to run again.
+
+   A key that is **not configured at all** does not fail, deliberately: the
+   release publishes unsigned, as it would in a fork, and the run carries a
+   warning annotation from "Sign SHA256SUMS" saying so. In this repository,
+   that warning means the secret has gone missing.
 3. Paste the same base64 into `SIGNING_PUBLIC_KEY` in
    `rust/crates/peerbeam-update/src/verify.rs` and commit it. **It belongs in
    version control**: it is public, and committing it is what pins it. A key
@@ -156,6 +162,27 @@ hand from the website, which still works.
 If the secret key is lost or compromised, there is no revocation mechanism.
 Publish the new public key on the website and in the release notes, and treat
 the hand-download path as the recovery route.
+
+## Testing the release job
+
+`release.yml` runs once per tag, and pushing a tag publishes a release, so it
+cannot be tried the ordinary way — which is why every defect it has had was
+found in production. `scripts/test-release-workflow.sh` runs the job's own
+steps, read out of the workflow, against fake artifacts with `gh` and `sudo`
+faked out, and checks what would have been published: signed with a good key,
+unsigned with none, and stopped before the delete by a bad key, by no
+artifacts, or by two artifacts sharing a name. CI runs it on every push;
+locally it needs `yq` (v4) and `minisign`:
+
+```bash
+scripts/test-release-workflow.sh
+```
+
+Anything in the job it does not model — an `if:`, a new action, an expression
+it has no value for — stops it with exit 2 rather than being skipped, so a
+change to the job can mean teaching it the change. The alternative is a
+throwaway tag on a fork. Never push a test tag to this repository: it
+publishes a public release.
 
 ## Where the app downloads from
 
