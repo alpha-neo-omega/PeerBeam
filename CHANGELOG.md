@@ -6,6 +6,8 @@ versioned per [Supported Versions](SUPPORTED_VERSIONS.md).
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-10-08
+
 ### Added
 - **Download a release from the app.** When **Check for updates** in Settings
   finds a newer release, it now offers **Download**. Pressing it asks where to
